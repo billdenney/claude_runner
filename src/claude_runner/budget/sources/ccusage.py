@@ -18,33 +18,55 @@ class CCUsageError(RuntimeError):
 
 
 class CCUsageSource:
-    """Parses `ccusage blocks --json` (5h sessions) and `ccusage daily --json`."""
+    """Parses `ccusage blocks --json` (5h sessions) and `ccusage daily --json`.
+
+    Resolution order for the backing command:
+      1. Explicit ``binary`` argument if it is on PATH.
+      2. ``ccusage`` on PATH (e.g. ``npm install -g ccusage``).
+      3. ``npx -y ccusage`` if ``npx`` is on PATH — lets the tool run without
+         a separate install step whenever Node.js is available.
+    """
 
     name = "ccusage"
 
     def __init__(self, *, binary: str = "ccusage") -> None:
         self._binary = binary
+        self._cmd = self._resolve_command(binary)
+
+    @staticmethod
+    def _resolve_command(binary: str) -> list[str] | None:
+        if shutil.which(binary) is not None:
+            return [binary]
+        if binary != "ccusage" and shutil.which("ccusage") is not None:
+            return ["ccusage"]
+        if shutil.which("npx") is not None:
+            return ["npx", "-y", "ccusage"]
+        return None
 
     def available(self) -> bool:
-        return shutil.which(self._binary) is not None
+        return self._cmd is not None
 
     def _run(self, *args: str) -> dict[str, object]:
-        if not self.available():
-            raise CCUsageError(f"{self._binary} not found on PATH")
+        if self._cmd is None:
+            raise CCUsageError(
+                "ccusage not found on PATH and npx is unavailable; "
+                "install Node.js or run `npm install -g ccusage`"
+            )
+        display = " ".join(self._cmd)
         try:
             result = subprocess.run(
-                [self._binary, *args, "--json"],
+                [*self._cmd, *args, "--json"],
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=60,
             )
         except subprocess.CalledProcessError as exc:
             raise CCUsageError(
-                f"{self._binary} {' '.join(args)} failed: {exc.stderr.strip()}"
+                f"{display} {' '.join(args)} failed: {exc.stderr.strip()}"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise CCUsageError(f"{self._binary} {' '.join(args)} timed out") from exc
+            raise CCUsageError(f"{display} {' '.join(args)} timed out") from exc
         try:
             parsed = json.loads(result.stdout)
         except json.JSONDecodeError as exc:

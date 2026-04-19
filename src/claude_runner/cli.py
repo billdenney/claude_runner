@@ -266,7 +266,10 @@ def _build_source(settings: Settings) -> BudgetSource | None:
         src = CCUsageSource()
         if src.available():
             return src
-        _log.warning("ccusage not on PATH; falling back to claude /context")
+        _log.warning(
+            "ccusage not available (no ccusage binary and no npx); "
+            "falling back to claude /context"
+        )
         return ContextCmdSource()
     if settings.budget_source == "context":
         return ContextCmdSource()

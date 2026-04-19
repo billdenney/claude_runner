@@ -59,6 +59,32 @@ def test_ccusage_returns_zero_when_binary_missing(monkeypatch: pytest.MonkeyPatc
     assert snap.used_week == 0
 
 
+def test_ccusage_falls_back_to_npx(
+    monkeypatch: pytest.MonkeyPatch, fake_blocks_payload: dict, fake_daily_payload: dict
+) -> None:
+    # ccusage not installed, but npx is available: we should shell out via npx.
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/npx" if name == "npx" else None
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        payload = fake_blocks_payload if "blocks" in args else fake_daily_payload
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    source = CCUsageSource()
+    assert source.available()
+    snap = source.snapshot()
+    assert snap.used_5h == 87654
+    assert calls and calls[0][:3] == ["npx", "-y", "ccusage"]
+
+
 def test_ccusage_raises_on_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
     monkeypatch.setattr(
