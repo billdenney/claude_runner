@@ -25,6 +25,7 @@ from claude_runner.git.worktree import (
 from claude_runner.models import DispatchResult, RunRecord, StopReason, TaskStatus
 from claude_runner.notify.emitter import EventEmitter
 from claude_runner.runner.backend import RunnerBackend
+from claude_runner.runner.preamble import build_preamble, should_inject
 from claude_runner.sidecar.store import SidecarStore
 from claude_runner.state.store import StateStore
 from claude_runner.todo.catalog import CatalogEntry, TodoCatalog
@@ -242,6 +243,26 @@ class Scheduler:
                 if req is not None and resp is not None:
                     preamble = self._format_resume_preamble(req, resp)
                     override["prompt"] = preamble + "\n\n" + spec.prompt
+
+        # 3. Inject runner preamble (sidecar protocol, worktree note,
+        # gh-read-only rule) unless disabled per-task or via settings.
+        if should_inject(spec=spec, settings_inject=self._settings.inject_preamble):
+            sidecar_dir: Path | None = None
+            if self._sidecar is not None:
+                sidecar_dir = self._sidecar.task_dir(spec.id)
+                sidecar_dir.mkdir(parents=True, exist_ok=True)
+            preamble_wt: Path | None = None
+            if spec.git_worktree:
+                wt_candidate = override.get("working_dir")
+                if isinstance(wt_candidate, Path):
+                    preamble_wt = wt_candidate
+            preamble_text = build_preamble(
+                spec=spec,
+                sidecar_dir=sidecar_dir,
+                worktree_path=preamble_wt,
+            )
+            existing_prompt = override.get("prompt", spec.prompt)
+            override["prompt"] = preamble_text + "\n\n" + str(existing_prompt)
 
         if not override:
             return spec

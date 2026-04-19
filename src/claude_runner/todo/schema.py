@@ -56,6 +56,7 @@ class TaskSpec(BaseModel):
     depends_on: tuple[str, ...] = ()
     priority: Priority = "normal"
     git_worktree: GitWorktreeSpec | None = None
+    inject_preamble: bool | None = None  # None → use Settings.inject_preamble
 
     @field_validator("working_dir")
     @classmethod

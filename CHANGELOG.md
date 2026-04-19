@@ -38,8 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `report_max_per_tick`.
 - `claude-runner input` subcommand with `--answers`, `--from-file`,
   `--notes`, and `--cancel` flags.
-- Test suite additions (35 new tests): `tests/test_sidecar_store.py`,
-  `tests/test_worktree.py`, `tests/test_cli_input.py`.
+- Test suite additions: `tests/test_sidecar_store.py`,
+  `tests/test_worktree.py`, `tests/test_cli_input.py`,
+  `tests/test_preamble.py`, `tests/test_scheduler_dispatch.py`.
+- **Auto-injected task preamble** that prepends to every task prompt a
+  concise description of the runtime environment the task has access to:
+  the `CLAUDE_RUNNER_TASK_ID` / `CLAUDE_RUNNER_SIDECAR_DIR` env vars, the
+  sidecar stop-and-ask protocol (with the concrete request schema and
+  resolved paths), the pre-created git worktree (when applicable), and
+  the gh-read-only rule. Opt-out via `inject_preamble: false` on a task
+  YAML or `inject_preamble = false` in `claude_runner.toml`. The goal is
+  to keep skill prompts generic — they need not embed runner-specific
+  instructions because the runner prepends them at dispatch.
 
 ### Fixed
 - Subprocess backend now passes `--verbose` to the `claude` CLI. claude CLI 2.x

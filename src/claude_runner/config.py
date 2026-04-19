@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     # it is appended as a subdirectory.
     worktree_root: str | None = None
 
+    # Whether to automatically prepend a runner-provided preamble to every
+    # task prompt explaining the runtime environment: sidecar stop-and-ask
+    # protocol (via CLAUDE_RUNNER_SIDECAR_DIR), pre-set git worktree (when
+    # applicable), and gh-read-only workflow. Individual tasks can override
+    # via ``inject_preamble: false`` on the task YAML. Default on — the
+    # preamble is small and universally helpful.
+    inject_preamble: bool = True
+
     @field_validator("failure_rolling_window")
     @classmethod
     def _rolling_gte_min_samples(cls, v: int, info: Any) -> int:
