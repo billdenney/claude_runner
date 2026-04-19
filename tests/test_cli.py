@@ -90,7 +90,7 @@ def test_run_end_to_end_with_fake_backend(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(
         cli_mod,
         "_build_backend",
-        lambda settings, *, state_store, emitter: FakeBackend(
+        lambda settings, *, state_store, emitter, sidecar_store=None: FakeBackend(
             state_store=state_store, emitter=emitter
         ),
     )
@@ -245,7 +245,7 @@ def test_run_requeues_running_and_interrupted_tasks(
     monkeypatch.setattr(
         cli_mod,
         "_build_backend",
-        lambda settings, *, state_store, emitter: NoopBackend(
+        lambda settings, *, state_store, emitter, sidecar_store=None: NoopBackend(
             state_store=state_store, emitter=emitter
         ),
     )

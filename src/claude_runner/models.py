@@ -15,6 +15,10 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     BLOCKED = "blocked"
+    AWAITING_INPUT = "awaiting_input"
+    """Task has emitted an open sidecar request and is paused for operator input."""
+    READY_TO_RESUME = "ready_to_resume"
+    """Sidecar response has arrived; task is prioritized for the next scheduler tick."""
 
 
 class StopReason(str, Enum):
@@ -78,9 +82,15 @@ class TaskState:
     def is_in_flight(self) -> bool:
         return self.status in {TaskStatus.RUNNING, TaskStatus.QUEUED}
 
+    def is_awaiting_input(self) -> bool:
+        return self.status is TaskStatus.AWAITING_INPUT
+
+    def is_ready_to_resume(self) -> bool:
+        return self.status is TaskStatus.READY_TO_RESUME
+
     def needs_resume(self) -> bool:
         return (
-            self.status in {TaskStatus.RUNNING, TaskStatus.INTERRUPTED}
+            self.status in {TaskStatus.RUNNING, TaskStatus.INTERRUPTED, TaskStatus.READY_TO_RESUME}
             and self.session_id is not None
         )
 

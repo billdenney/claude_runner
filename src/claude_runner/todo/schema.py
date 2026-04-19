@@ -13,6 +13,30 @@ from claude_runner.defaults import EFFORT_TABLE, Effort
 Priority = Literal["low", "normal", "high"]
 
 
+class GitWorktreeSpec(BaseModel):
+    """Optional ``git_worktree`` block on a task YAML.
+
+    When present, the runner creates (or reuses) a git worktree at
+    ``root`` (or ``claude_runner.toml::worktree_root`` by default) before
+    dispatch and overrides ``working_dir`` to the worktree path. The task
+    runs isolated from any other concurrent task working in the same repo.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repo: Path
+    branch_name: str = Field(min_length=1)
+    branch_from: str = "origin/main"
+    root: Path | None = None
+
+    @field_validator("repo", "root")
+    @classmethod
+    def _expand(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        return Path(v).expanduser()
+
+
 class TaskSpec(BaseModel):
     """User-authored task definition, after default resolution."""
 
@@ -31,6 +55,8 @@ class TaskSpec(BaseModel):
     estimated_input_tokens: int = Field(ge=0)
     depends_on: tuple[str, ...] = ()
     priority: Priority = "normal"
+    git_worktree: GitWorktreeSpec | None = None
+    inject_preamble: bool | None = None  # None → use Settings.inject_preamble
 
     @field_validator("working_dir")
     @classmethod
@@ -59,10 +85,21 @@ def build_task(
     prompt_value = raw.get("prompt")
     if not isinstance(prompt_value, str) or not prompt_value.strip():
         raise ValueError(f"{source_path}: 'prompt' is required and must be a non-empty string")
-    if "working_dir" not in raw:
-        raise ValueError(f"{source_path}: 'working_dir' is required")
+    has_working_dir = "working_dir" in raw and raw["working_dir"] not in (None, "")
+    has_git_worktree = "git_worktree" in raw and raw["git_worktree"]
+    if not has_working_dir and not has_git_worktree:
+        raise ValueError(f"{source_path}: one of 'working_dir' or 'git_worktree' is required")
 
     data: dict[str, object] = dict(raw)
+
+    # When git_worktree is provided but working_dir is not, seed working_dir
+    # with the repo path as a placeholder; the runner replaces it with the
+    # resolved worktree path before dispatch. Keeping the field populated
+    # here keeps the Pydantic model's invariants simple.
+    if not has_working_dir and has_git_worktree:
+        gw = data["git_worktree"]
+        if isinstance(gw, dict) and "repo" in gw:
+            data["working_dir"] = gw["repo"]
 
     data.setdefault("id", source_path.stem)
     # YAML parses bare digits as int — coerce to string so the Pydantic model accepts it.

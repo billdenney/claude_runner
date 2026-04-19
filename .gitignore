@@ -43,3 +43,6 @@ htmlcov/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Local Claude Code settings (per-repo, not shared)
+.claude/
