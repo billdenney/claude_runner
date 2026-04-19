@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately, which previously caused every subprocess-backend task to fail
   with no useful output. Added a regression test in
   `tests/test_subprocess_backend.py`.
+- Subprocess backend now raises the asyncio stream reader limit to 16 MiB
+  (was the default 64 KiB). A single stream-json message from the claude CLI
+  — especially one containing a large tool output, long extended-thinking
+  block, or verbose debug payload — could exceed 64 KiB and trigger
+  `ValueError: Separator is found, but chunk is longer than limit` mid-stream,
+  failing the whole task. Added a regression test.
 
 ## [0.1.0] — unreleased
 

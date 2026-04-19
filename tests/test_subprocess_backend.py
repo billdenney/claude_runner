@@ -283,3 +283,48 @@ async def test_subprocess_backend_line_handler_tolerates_garbage(
     assert result.success is True
     # Usage should remain zero since no recognized usage payloads.
     assert result.usage.input_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_passes_large_stream_read_limit(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: ``create_subprocess_exec`` must be called with a large ``limit``.
+
+    A single claude stream-json message can exceed asyncio's default 64 KiB
+    readline limit (large tool outputs, long extended-thinking blocks,
+    verbose debug payloads). Without a raised limit, ``readline()`` raises
+    ``ValueError: Separator is found, but chunk is longer than limit``
+    mid-stream and fails the whole task.
+    """
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+
+    captured_kwargs: list[dict[str, Any]] = []
+
+    async def fake_create(*_args: str, **kwargs: Any):
+        captured_kwargs.append(kwargs)
+        return _FakeProc([b""], rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    await backend.run_task(spec)
+
+    assert captured_kwargs, "create_subprocess_exec was not called"
+    limit = captured_kwargs[0].get("limit")
+    # Must be meaningfully larger than asyncio's 64 KiB default. Pick a
+    # threshold (1 MiB) that still fails on the unfixed default but doesn't
+    # bind the implementation to an exact byte count.
+    assert isinstance(limit, int), (
+        "subprocess backend must pass an explicit `limit` to "
+        "asyncio.create_subprocess_exec to handle oversize stream-json lines"
+    )
+    assert limit >= 1 * 1024 * 1024, (
+        f"limit={limit} is too small; a single stream-json message can exceed "
+        "the asyncio default 64 KiB and cause mid-stream readline() errors"
+    )
