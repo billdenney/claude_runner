@@ -55,6 +55,52 @@ def test_may_start_ok_on_fresh_budget() -> None:
     assert ctrl.may_start(task_estimate=10_000).kind is DecisionKind.OK
 
 
+def test_rolling_window_default_clock_paths() -> None:
+    """Record / used / next_reset without passing `at` hit the default clock."""
+    w = RollingWindow(duration=timedelta(hours=5))
+    # Empty window: oldest_event_at None, next_reset with default clock returns "now"
+    assert w.oldest_event_at() is None
+    reset = w.next_reset()
+    assert reset is not None
+    # Record and query without explicit `at`.
+    w.record(100)
+    assert w.used() == 100
+    assert w.oldest_event_at() is not None
+    # next_reset with events present uses oldest event + duration.
+    assert w.next_reset() > datetime.now(tz=UTC)
+
+
+def test_rolling_window_ignores_non_positive_record() -> None:
+    w = RollingWindow(duration=timedelta(hours=5))
+    t0 = datetime(2026, 4, 18, 12, 0, tzinfo=UTC)
+    w.record(0, at=t0)
+    w.record(-5, at=t0)
+    assert w.used(t0) == 0
+
+
+def test_weekly_window_default_clock_paths() -> None:
+    """Weekly window method calls without explicit `at` hit default clock."""
+    w = WeeklyWindow()
+    # used() with no events and default clock returns 0.
+    assert w.used() == 0
+    # Record with default clock; then immediately querying should give the same value.
+    w.record(42)
+    assert w.used() == 42
+    # next_reset and days_remaining with default clock also work.
+    assert w.next_reset() is not None
+    assert w.days_remaining() >= 0.0
+    # in_last_day with default clock.
+    _ = w.in_last_day()
+
+
+def test_weekly_window_ignores_non_positive_record() -> None:
+    w = WeeklyWindow()
+    t0 = datetime(2026, 4, 14, 12, 0, tzinfo=UTC)
+    w.record(0, at=t0)
+    w.record(-5, at=t0)
+    assert w.used(at=t0) == 0
+
+
 def test_target_concurrency_scales_with_cheap_tasks() -> None:
     settings = Settings(plan="max5", budget_source="static", max_concurrency=16)
     ctrl = TokenBudgetController(settings, source=None)

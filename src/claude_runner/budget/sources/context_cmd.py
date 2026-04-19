@@ -52,5 +52,5 @@ def _extract(regex: re.Pattern[str], text: str) -> int:
         return 0
     try:
         return int(m.group(1).replace(",", ""))
-    except (IndexError, ValueError):
+    except (IndexError, ValueError):  # pragma: no cover - regex only captures digit/comma strings
         return 0

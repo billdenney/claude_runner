@@ -140,3 +140,148 @@ async def test_asyncio_backend_errors_without_sdk(
     spec = _spec(tmp_project, settings)
     with pytest.raises(RuntimeError, match="claude-agent-sdk"):
         await backend.run_task(spec)
+
+
+@pytest.mark.asyncio
+async def test_asyncio_backend_passes_resume_when_session_id_present(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior session id on the state file should flow into options as `resume`."""
+    _install_fake_sdk(
+        monkeypatch,
+        queries=[{"subtype": "success", "usage": {"input_tokens": 1}}],
+    )
+    from claude_runner.runner.asyncio_backend import AsyncioBackend
+
+    state_store = StateStore(tmp_project / ".claude_runner")
+    # Pre-populate a session id for the task so the backend picks it up.
+    from claude_runner.models import TaskState
+
+    state_store.save(TaskState(task_id="001", session_id="prior-sid"))
+
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    backend = AsyncioBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    await backend.run_task(spec)
+
+    captured = sys.modules["claude_agent_sdk"].captured_options  # type: ignore[attr-defined]
+    assert captured.kwargs.get("resume") == "prior-sid"
+
+
+@pytest.mark.asyncio
+async def test_asyncio_backend_skips_thinking_extra_for_effort_off(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Effort=off has thinking_budget_tokens=0, so we should NOT set extra_args."""
+    _install_fake_sdk(
+        monkeypatch,
+        queries=[{"subtype": "success", "usage": {"input_tokens": 1}}],
+    )
+    from claude_runner.runner.asyncio_backend import AsyncioBackend
+    from claude_runner.todo.schema import build_task
+
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    backend = AsyncioBackend(state_store=state_store, emitter=emitter)
+    spec = build_task(
+        raw={"prompt": "go", "working_dir": str(tmp_project), "effort": "off"},
+        source_path=tmp_project / "001.yaml",
+        settings=settings,
+    )
+    await backend.run_task(spec)
+    captured = sys.modules["claude_agent_sdk"].captured_options  # type: ignore[attr-defined]
+    assert "extra_args" not in captured.kwargs
+
+
+@pytest.mark.asyncio
+async def test_asyncio_backend_ignores_init_without_session_id(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An init message without a string session_id should be silently skipped."""
+    _install_fake_sdk(
+        monkeypatch,
+        queries=[
+            {"subtype": "init", "data": {"session_id": None}},
+            {"subtype": "success", "usage": {"input_tokens": 10}},
+        ],
+    )
+    from claude_runner.runner.asyncio_backend import AsyncioBackend
+
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    backend = AsyncioBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert state_store.load(spec.id).session_id is None
+    assert result.usage.input_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_asyncio_backend_skips_usage_accumulation_when_none(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A result message whose usage is None/0 must NOT call _accumulate_usage."""
+    _install_fake_sdk(
+        monkeypatch,
+        queries=[{"subtype": "success", "usage": None, "total_cost_usd": 0.1}],
+    )
+    from claude_runner.runner.asyncio_backend import AsyncioBackend
+
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    backend = AsyncioBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    # Usage should remain zero because result_usage was falsy.
+    assert result.usage.input_tokens == 0
+    # But the cost_usd field IS still populated.
+    assert result.usage.cost_usd == 0.1
+
+
+@pytest.mark.asyncio
+async def test_asyncio_backend_usage_accumulator_handles_various_shapes(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_accumulate_usage accepts both objects with __dict__ and plain dicts, and ignores
+    other shapes."""
+
+    # First usage emitted as a plain object (goes through __dict__ branch).
+    class _UsageObj:
+        def __init__(self) -> None:
+            self.input_tokens = 10
+            self.output_tokens = 20
+            self.cache_read_tokens = 3  # alternative cache-read key
+
+    # Second usage emitted as a dict (goes through dict branch).
+    # Third usage with an unsupported shape (int) should be silently ignored.
+    _install_fake_sdk(
+        monkeypatch,
+        queries=[
+            {"subtype": "success", "usage": _UsageObj()},
+            {"subtype": "success", "usage": {"input_tokens": 5, "output_tokens": 5}},
+            {"subtype": "success", "usage": 42},
+        ],
+    )
+    from claude_runner.runner.asyncio_backend import AsyncioBackend
+
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    backend = AsyncioBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.usage.input_tokens == 15
+    assert result.usage.output_tokens == 25
+    assert result.usage.cache_read_tokens == 3

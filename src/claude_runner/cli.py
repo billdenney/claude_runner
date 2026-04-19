@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resume":
         return _cmd_resume(args)
     parser.error(f"unknown command {args.command}")
-    raise AssertionError  # unreachable — parser.error calls SystemExit
+    raise AssertionError  # pragma: no cover - parser.error always raises SystemExit
 
 
 # ----- command implementations -----------------------------------------
@@ -288,5 +288,5 @@ def _build_backend(
     return AsyncioBackend(state_store=state_store, emitter=emitter)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - module-as-script, exercised via __main__.py
     sys.exit(main())
