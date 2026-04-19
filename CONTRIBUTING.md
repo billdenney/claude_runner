@@ -7,7 +7,7 @@ maintain.
 ## Dev setup
 
 ```sh
-git clone https://github.com/wdenney/claude_runner.git
+git clone https://github.com/billdenney/claude_runner.git
 cd claude_runner
 python -m venv .venv
 source .venv/bin/activate

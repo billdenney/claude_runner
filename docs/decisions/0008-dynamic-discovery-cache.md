@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-04-19
-- Deciders: @wdenney
+- Deciders: @billdenney
 
 ## Context
 

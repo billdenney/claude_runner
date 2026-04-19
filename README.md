@@ -1,6 +1,6 @@
 # claude_runner
 
-[![CI](https://github.com/wdenney/claude_runner/actions/workflows/ci.yml/badge.svg)](https://github.com/wdenney/claude_runner/actions/workflows/ci.yml)
+[![CI](https://github.com/billdenney/claude_runner/actions/workflows/ci.yml/badge.svg)](https://github.com/billdenney/claude_runner/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 
@@ -34,10 +34,16 @@ batch analyses) and you want to:
 ## Install
 
 ```sh
-pip install claude-runner
+pip install git+https://github.com/billdenney/claude_runner
 # or, for the raw-API rate-limit regime:
-pip install "claude-runner[api]"
+pip install "claude-runner[api] @ git+https://github.com/billdenney/claude_runner"
 ```
+
+Once published to PyPI you will also be able to `pip install claude-runner`.
+
+Installing exposes three equivalent entry points: `claude-runner`,
+`claude_runner`, and the short alias `ccrunner`. Use whichever you prefer —
+examples in this README use `claude-runner`.
 
 You also need the `claude` CLI installed and authenticated (see the
 [Claude Code docs](https://code.claude.com/)). If you want the default budget
