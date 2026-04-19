@@ -26,6 +26,8 @@ from claude_runner.runner.backend import RunnerBackend
 from claude_runner.runner.scheduler import Scheduler
 from claude_runner.runner.subprocess_backend import SubprocessBackend
 from claude_runner.scaffold import init_project, write_new_task
+from claude_runner.sidecar.schema import Answer, InteractionResponse, RequestState
+from claude_runner.sidecar.store import SidecarStore, SidecarValidationError
 from claude_runner.state.store import StateStore
 from claude_runner.todo.catalog import TodoCatalog, full_load
 
@@ -63,6 +65,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("task_id")
     p_resume.add_argument("project_dir", nargs="?", default=".", type=Path)
 
+    p_input = sub.add_parser(
+        "input",
+        help="Answer a task that is AWAITING_INPUT (sidecar stop-and-ask)",
+    )
+    p_input.add_argument("task_id")
+    p_input.add_argument("project_dir", nargs="?", default=".", type=Path)
+    p_input.add_argument(
+        "--answers",
+        default=None,
+        help='Inline JSON mapping question id -> answer, e.g. \'{"source":"C"}\'',
+    )
+    p_input.add_argument(
+        "--from-file",
+        dest="from_file",
+        type=Path,
+        default=None,
+        help="Path to a JSON file containing {question_id: answer, ...}",
+    )
+    p_input.add_argument("--notes", default=None, help="Free-text notes to attach to the response")
+    p_input.add_argument(
+        "--cancel",
+        action="store_true",
+        help="Cancel the open request instead of answering (fails the task)",
+    )
+
     return parser
 
 
@@ -89,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_validate(args)
     if args.command == "resume":
         return _cmd_resume(args)
+    if args.command == "input":
+        return _cmd_input(args)
     parser.error(f"unknown command {args.command}")
     raise AssertionError  # pragma: no cover - parser.error always raises SystemExit
 
@@ -142,7 +171,9 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     project_dir: Path = args.project_dir.resolve()
     settings = load_settings(project_dir)
-    state_store = StateStore(project_dir / settings.state_subdir)
+    runner_root = project_dir / settings.state_subdir
+    state_store = StateStore(runner_root)
+    sidecar_store = SidecarStore(runner_root / "sidecar")
     catalog = TodoCatalog(
         project_dir / settings.todo_subdir, state_store=state_store, settings=settings
     )
@@ -165,6 +196,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
             e.spec.title,
         )
     console.print(table)
+
+    # Surface any AWAITING_INPUT tasks so the operator sees pending questions.
+    awaiting = [e for e in entries if e.state.is_awaiting_input()]
+    if awaiting:
+        console.print(
+            "\n[bold yellow]Tasks awaiting operator input (use `claude-runner input`):[/]"
+        )
+        for e in awaiting:
+            req = sidecar_store.find_open_request(e.spec.id)
+            summary = req.summary if req is not None else "(request unreadable)"
+            seq = req.sequence if req is not None else "?"
+            console.print(f"  [yellow]•[/] {e.spec.id} (seq {seq}): {summary}")
 
     source = _build_source(settings)
     budget = TokenBudgetController(settings, source=source)
@@ -200,13 +243,135 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_input(args: argparse.Namespace) -> int:
+    """Answer a task's sidecar stop-and-ask request.
+
+    Reads the task's newest OPEN sidecar request, validates the operator's
+    answers against the questions in that request, writes a matching
+    ``response-<seq>.json`` atomically, and flips the task from
+    ``AWAITING_INPUT`` to ``READY_TO_RESUME`` so the next scheduler tick
+    dispatches it. Passing ``--cancel`` instead marks the task FAILED.
+    """
+    import json as _json
+    from datetime import UTC, datetime
+
+    from claude_runner.models import TaskStatus
+
+    project_dir: Path = args.project_dir.resolve()
+    settings = load_settings(project_dir)
+    runner_root = project_dir / settings.state_subdir
+    state_store = StateStore(runner_root)
+    sidecar_store = SidecarStore(runner_root / "sidecar")
+
+    console = Console()
+    task_id: str = args.task_id
+
+    open_req = sidecar_store.find_open_request(task_id)
+    if open_req is None:
+        console.print(
+            f"[red]no open sidecar request found for task[/] {task_id} "
+            f"under {sidecar_store.task_dir(task_id)}"
+        )
+        return 2
+
+    # Cancel path: mark request + response CANCELLED, task FAILED.
+    if args.cancel:
+        sidecar_store.cancel_request(task_id, open_req.sequence, notes=args.notes)
+        state = state_store.load(task_id)
+        state.status = TaskStatus.FAILED
+        state.error = args.notes or "operator cancelled sidecar request"
+        state_store.save(state)
+        console.print(
+            f"[yellow]cancelled[/] sidecar request seq={open_req.sequence} "
+            f"for task {task_id}; task marked FAILED"
+        )
+        return 0
+
+    # Gather answers from --answers or --from-file.
+    answers_raw: object
+    if args.answers is not None and args.from_file is not None:
+        console.print("[red]--answers and --from-file are mutually exclusive[/]")
+        return 2
+    if args.answers is not None:
+        try:
+            answers_raw = _json.loads(args.answers)
+        except _json.JSONDecodeError as exc:
+            console.print(f"[red]--answers is not valid JSON:[/] {exc}")
+            return 2
+    elif args.from_file is not None:
+        try:
+            with Path(args.from_file).open("r", encoding="utf-8") as fh:
+                answers_raw = _json.load(fh)
+        except (OSError, _json.JSONDecodeError) as exc:
+            console.print(f"[red]could not read --from-file[/] {args.from_file}: {exc}")
+            return 2
+    else:
+        console.print(
+            "[red]must supply either --answers '<json>' or --from-file <path> (or --cancel)[/]"
+        )
+        return 2
+
+    if not isinstance(answers_raw, dict):
+        console.print(
+            f"[red]answers payload must be a JSON object mapping question id -> value[/]; "
+            f"got {type(answers_raw).__name__}"
+        )
+        return 2
+
+    # Validate answer ids before writing anything.
+    known_ids = open_req.question_ids()
+    unknown = [k for k in answers_raw if k not in known_ids]
+    if unknown:
+        console.print(
+            f"[red]unknown question id(s):[/] {sorted(unknown)}  (known: {sorted(known_ids)})"
+        )
+        return 2
+    missing = [q.id for q in open_req.questions if q.id not in answers_raw]
+    if missing:
+        console.print(f"[red]missing answers for question id(s):[/] {sorted(missing)}")
+        return 2
+
+    answers = [Answer(id=str(k), value=v) for k, v in answers_raw.items()]
+    response = InteractionResponse(
+        task_id=task_id,
+        sequence=open_req.sequence,
+        responded_at=datetime.now(tz=UTC),
+        answers=answers,
+        state=RequestState.ANSWERED,
+        notes=args.notes,
+    )
+    try:
+        sidecar_store.write_response(response, request=open_req)
+    except SidecarValidationError as exc:
+        console.print(f"[red]sidecar validation error:[/] {exc}")
+        return 2
+
+    # Flip task status. The scheduler's own promotion loop would do this on
+    # its next tick too, but we prefer an immediate flip so ``status`` shows
+    # the new state right after ``input`` returns.
+    state = state_store.load(task_id)
+    if state.status is TaskStatus.AWAITING_INPUT:
+        state.status = TaskStatus.READY_TO_RESUME
+        state.error = None
+        state_store.save(state)
+
+    console.print(
+        f"[bold green]Answered[/] task {task_id} seq={open_req.sequence}; "
+        f"status -> {state.status.value}"
+    )
+    return 0
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     project_dir: Path = args.project_dir.resolve()
     settings = load_settings(project_dir)
     todo_dir = project_dir / settings.todo_subdir
-    state_store = StateStore(project_dir / settings.state_subdir)
+    runner_root = project_dir / settings.state_subdir
+    state_store = StateStore(runner_root)
+    sidecar_store = SidecarStore(runner_root / "sidecar")
 
     # Re-queue any tasks that were running/interrupted from a prior invocation.
+    # Preserve AWAITING_INPUT and READY_TO_RESUME across restarts.
     from claude_runner.models import TaskStatus
 
     for st in state_store.iter_states():
@@ -221,7 +386,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     catalog = TodoCatalog(todo_dir, state_store=state_store, settings=settings)
     source = _build_source(settings)
     budget = TokenBudgetController(settings, source=source)
-    backend = _build_backend(settings, state_store=state_store, emitter=emitter)
+    backend = _build_backend(
+        settings,
+        state_store=state_store,
+        emitter=emitter,
+        sidecar_store=sidecar_store,
+    )
     breaker = CircuitBreaker(
         max_consecutive_failures=settings.max_consecutive_failures,
         failure_rate_threshold=settings.failure_rate_threshold,
@@ -237,6 +407,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         state_store=state_store,
         emitter=emitter,
         breaker=breaker,
+        sidecar_store=sidecar_store,
     )
 
     try:
@@ -281,11 +452,17 @@ def _build_source(settings: Settings) -> BudgetSource | None:
 
 
 def _build_backend(
-    settings: Settings, *, state_store: StateStore, emitter: EventEmitter
+    settings: Settings,
+    *,
+    state_store: StateStore,
+    emitter: EventEmitter,
+    sidecar_store: SidecarStore | None = None,
 ) -> RunnerBackend:
     if settings.backend == "subprocess":
-        return SubprocessBackend(state_store=state_store, emitter=emitter)
-    return AsyncioBackend(state_store=state_store, emitter=emitter)
+        return SubprocessBackend(
+            state_store=state_store, emitter=emitter, sidecar_store=sidecar_store
+        )
+    return AsyncioBackend(state_store=state_store, emitter=emitter, sidecar_store=sidecar_store)
 
 
 if __name__ == "__main__":  # pragma: no cover - module-as-script, exercised via __main__.py

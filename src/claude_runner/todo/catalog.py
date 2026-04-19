@@ -72,27 +72,50 @@ class TodoCatalog:
         return list(self._cached.entries)
 
     def ready_tasks(self, in_flight_ids: set[str] | None = None) -> list[CatalogEntry]:
-        """Tasks currently runnable, ordered by priority then id."""
+        """Tasks currently runnable, ordered by (resume-first, priority, id).
+
+        ``READY_TO_RESUME`` tasks — those that hit a sidecar stop-and-ask and
+        have since received a matching response — are always dispatched before
+        ordinary ``PENDING`` tasks. This keeps in-flight work moving before
+        new work starts.
+        """
         self._refresh_if_stale()
         in_flight = in_flight_ids or set()
+
+        # Statuses that are never "ready" to dispatch right now.
+        _terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED}
+        _paused = {TaskStatus.AWAITING_INPUT, TaskStatus.RUNNING}
 
         by_id = {e.spec.id: e for e in self._cached.entries}
         ready: list[CatalogEntry] = []
         for entry in self._cached.entries:
             state = entry.state
-            if state.status == TaskStatus.COMPLETED:
+            if state.status in _terminal:
                 continue
-            if state.status == TaskStatus.FAILED or state.status == TaskStatus.BLOCKED:
+            if state.status in _paused:
                 continue
             if entry.spec.id in in_flight:
-                continue
-            if state.status == TaskStatus.RUNNING:
                 continue
             if not self._deps_satisfied(entry.spec, by_id):
                 continue
             ready.append(entry)
-        ready.sort(key=lambda e: (e.spec.priority_rank(), e.spec.id))
+        # READY_TO_RESUME bucket (=0) sorts before everything else (=1).
+        ready.sort(
+            key=lambda e: (
+                0 if e.state.status is TaskStatus.READY_TO_RESUME else 1,
+                e.spec.priority_rank(),
+                e.spec.id,
+            )
+        )
         return ready
+
+    def awaiting_input_tasks(self) -> list[CatalogEntry]:
+        """Every catalog entry currently in ``AWAITING_INPUT`` status.
+
+        Used by the scheduler's reporting loop to emit snapshots.
+        """
+        self._refresh_if_stale()
+        return [e for e in self._cached.entries if e.state.status is TaskStatus.AWAITING_INPUT]
 
     def errors(self) -> list[str]:
         self._refresh_if_stale()

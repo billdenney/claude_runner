@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 
 from claude_runner.models import DispatchResult, StopReason, TaskStatus, TokenUsage
 from claude_runner.notify.emitter import EventEmitter
+from claude_runner.sidecar.store import SidecarStore
 from claude_runner.state.store import StateStore
 from claude_runner.todo.schema import TaskSpec
 
@@ -34,10 +36,12 @@ class SubprocessBackend:
         state_store: StateStore,
         emitter: EventEmitter,
         binary: str = "claude",
+        sidecar_store: SidecarStore | None = None,
     ) -> None:
         self._state_store = state_store
         self._emitter = emitter
         self._binary = binary
+        self._sidecar_store = sidecar_store
 
     async def run_task(self, spec: TaskSpec) -> DispatchResult:
         if shutil.which(self._binary) is None:
@@ -77,6 +81,13 @@ class SubprocessBackend:
         error: str | None = None
         success = True
 
+        # Expose sidecar + task_id to the child claude process so the skill
+        # can write request-<seq>.json files back to us.
+        env = os.environ.copy()
+        env["CLAUDE_RUNNER_TASK_ID"] = spec.id
+        if self._sidecar_store is not None:
+            env["CLAUDE_RUNNER_SIDECAR_DIR"] = str(self._sidecar_store.task_dir(spec.id))
+
         try:
             # claude CLI emits newline-delimited JSON on stdout. A single
             # stream-json message can easily exceed asyncio's default 64 KiB
@@ -90,6 +101,7 @@ class SubprocessBackend:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(spec.working_dir),
+                env=env,
                 limit=_STREAM_READ_LIMIT,
             )
             assert proc.stdout is not None
@@ -114,7 +126,19 @@ class SubprocessBackend:
         duration_s = (finished - started).total_seconds()
 
         final = self._state_store.load(spec.id)
-        if success:
+        awaiting_input = False
+        open_request_seq: int | None = None
+        if success and self._sidecar_store is not None:
+            open_req = self._sidecar_store.find_open_request(spec.id)
+            if open_req is not None:
+                awaiting_input = True
+                open_request_seq = open_req.sequence
+
+        if awaiting_input:
+            final.status = TaskStatus.AWAITING_INPUT
+            final.stop_reason = StopReason.END_TURN
+            final.error = None
+        elif success:
             final.status = TaskStatus.COMPLETED
             final.stop_reason = StopReason.END_TURN
             final.error = None
@@ -125,12 +149,20 @@ class SubprocessBackend:
         final.last_finished_at = finished
         self._state_store.save(final)
 
-        self._emitter.emit(
-            "task_completed" if success else "task_failed",
-            task_id=spec.id,
-            stop_reason=stop_reason.value,
-            session_id=final.session_id,
-        )
+        if awaiting_input:
+            self._emitter.emit(
+                "task_awaiting_input",
+                task_id=spec.id,
+                request_sequence=open_request_seq,
+                session_id=final.session_id,
+            )
+        else:
+            self._emitter.emit(
+                "task_completed" if success else "task_failed",
+                task_id=spec.id,
+                stop_reason=stop_reason.value,
+                session_id=final.session_id,
+            )
 
         return DispatchResult(
             task_id=spec.id,

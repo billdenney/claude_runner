@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,6 +11,7 @@ from claude_runner.defaults import EFFORT_TABLE
 from claude_runner.models import DispatchResult, StopReason, TaskStatus, TokenUsage
 from claude_runner.notify.emitter import EventEmitter
 from claude_runner.runner.stop_hook import make_stop_hook
+from claude_runner.sidecar.store import SidecarStore
 from claude_runner.state.store import StateStore
 from claude_runner.todo.schema import TaskSpec
 
@@ -19,9 +21,16 @@ _log = logging.getLogger(__name__)
 class AsyncioBackend:
     name = "asyncio"
 
-    def __init__(self, *, state_store: StateStore, emitter: EventEmitter) -> None:
+    def __init__(
+        self,
+        *,
+        state_store: StateStore,
+        emitter: EventEmitter,
+        sidecar_store: SidecarStore | None = None,
+    ) -> None:
         self._state_store = state_store
         self._emitter = emitter
+        self._sidecar_store = sidecar_store
 
     async def run_task(self, spec: TaskSpec) -> DispatchResult:
         try:
@@ -46,7 +55,20 @@ class AsyncioBackend:
             task_id=spec.id,
             state_store=self._state_store,
             emitter=self._emitter,
+            sidecar_store=self._sidecar_store,
         )
+
+        # Expose sidecar + task_id to the child process via environment
+        # variables. The Agent SDK does not accept an ``env`` kwarg today, so
+        # we set the parent process env; each subprocess it spawns inherits
+        # these. Restoring the prior values happens in a ``finally`` block
+        # below to avoid polluting concurrent tasks in the same runner.
+        _prev_env: dict[str, str | None] = {}
+        _prev_env["CLAUDE_RUNNER_TASK_ID"] = os.environ.get("CLAUDE_RUNNER_TASK_ID")
+        _prev_env["CLAUDE_RUNNER_SIDECAR_DIR"] = os.environ.get("CLAUDE_RUNNER_SIDECAR_DIR")
+        os.environ["CLAUDE_RUNNER_TASK_ID"] = spec.id
+        if self._sidecar_store is not None:
+            os.environ["CLAUDE_RUNNER_SIDECAR_DIR"] = str(self._sidecar_store.task_dir(spec.id))
 
         tier = EFFORT_TABLE[spec.effort]
         options_kwargs: dict[str, Any] = {
@@ -79,12 +101,23 @@ class AsyncioBackend:
             stop_reason = StopReason.ERROR
             error = f"{type(exc).__name__}: {exc}"
             _log.exception("task %s crashed", spec.id)
+        finally:
+            # Restore whatever env vars we overwrote so concurrent tasks in
+            # the same runner process are not affected.
+            for k, v in _prev_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
         finished = datetime.now(tz=UTC)
         duration_s = (finished - started).total_seconds()
 
         # The Stop hook usually updates state on success, but we also reconcile
-        # here so an exception path still produces a correct state file.
+        # here so an exception path still produces a correct state file. The
+        # Stop hook already promoted ``COMPLETED`` to ``AWAITING_INPUT`` when
+        # an open sidecar request exists, so we just honour whatever status
+        # it wrote.
         final = self._state_store.load(spec.id)
         if not success:
             final.status = TaskStatus.FAILED
@@ -97,7 +130,10 @@ class AsyncioBackend:
 
         return DispatchResult(
             task_id=spec.id,
-            success=success and final.status == TaskStatus.COMPLETED,
+            # Success reports to the scheduler include both COMPLETED (normal)
+            # and AWAITING_INPUT (paused pending operator input) — both mean
+            # "the task ran cleanly on this attempt; no retry is needed."
+            success=success and final.status in (TaskStatus.COMPLETED, TaskStatus.AWAITING_INPUT),
             usage=usage,
             stop_reason=stop_reason,
             session_id=final.session_id,

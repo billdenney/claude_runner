@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     todo_subdir: str = "todo"
     state_subdir: str = ".claude_runner"
 
+    # Sidecar reporting loop (see src/claude_runner/sidecar/).
+    reporting_interval_s: int = Field(default=60, ge=1)
+    """Cadence for awaiting_input_snapshot events and status_snapshot.json writes."""
+    report_max_per_tick: int = Field(default=5, ge=1)
+    """Max awaiting-input tasks emitted per reporting tick (the snapshot file always lists all)."""
+
+    # Optional default parent directory for per-task git worktrees. When set,
+    # tasks whose YAML has a ``git_worktree`` block will be checked out into
+    # ``<worktree_root>/<task_id>`` unless the YAML overrides the location. The
+    # literal token ``${task_id}`` is substituted at dispatch time; if absent
+    # it is appended as a subdirectory.
+    worktree_root: str | None = None
+
     @field_validator("failure_rolling_window")
     @classmethod
     def _rolling_gte_min_samples(cls, v: int, info: Any) -> int:
