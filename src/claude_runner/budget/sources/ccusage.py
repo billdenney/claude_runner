@@ -62,9 +62,7 @@ class CCUsageSource:
                 timeout=60,
             )
         except subprocess.CalledProcessError as exc:
-            raise CCUsageError(
-                f"{display} {' '.join(args)} failed: {exc.stderr.strip()}"
-            ) from exc
+            raise CCUsageError(f"{display} {' '.join(args)} failed: {exc.stderr.strip()}") from exc
         except subprocess.TimeoutExpired as exc:
             raise CCUsageError(f"{display} {' '.join(args)} timed out") from exc
         try:

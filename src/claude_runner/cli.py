@@ -267,8 +267,7 @@ def _build_source(settings: Settings) -> BudgetSource | None:
         if src.available():
             return src
         _log.warning(
-            "ccusage not available (no ccusage binary and no npx); "
-            "falling back to claude /context"
+            "ccusage not available (no ccusage binary and no npx); falling back to claude /context"
         )
         return ContextCmdSource()
     if settings.budget_source == "context":

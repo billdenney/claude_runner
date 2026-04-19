@@ -63,9 +63,7 @@ def test_ccusage_falls_back_to_npx(
     monkeypatch: pytest.MonkeyPatch, fake_blocks_payload: dict, fake_daily_payload: dict
 ) -> None:
     # ccusage not installed, but npx is available: we should shell out via npx.
-    monkeypatch.setattr(
-        "shutil.which", lambda name: "/usr/bin/npx" if name == "npx" else None
-    )
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/npx" if name == "npx" else None)
 
     calls: list[list[str]] = []
 

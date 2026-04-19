@@ -25,7 +25,7 @@ class ApiHeadersSource:
 
     def snapshot(self) -> UsageSnapshot:
         try:
-            import anthropic  # type: ignore[import-not-found]
+            import anthropic
         except ImportError:
             _log.warning("anthropic SDK not installed; install with claude-runner[api]")
             return UsageSnapshot(used_5h=0, used_week=0, source=self.name)
