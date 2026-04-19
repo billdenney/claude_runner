@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from claude_runner.models import RunRecord, StopReason, TaskState, TaskStatus, TokenUsage
 from claude_runner.state.store import StateStore, state_from_dict, state_to_dict
 
@@ -93,3 +95,56 @@ def test_usage_billable_total_excludes_cache_reads() -> None:
         cache_creation_tokens=100,
     )
     assert u.billable_total == 1000 - 600 - 100 + 500 + 100
+
+
+def test_parse_dt_passes_datetime_through() -> None:
+    """state/_parse_dt treats an existing datetime as a no-op."""
+    from claude_runner.state.store import _parse_dt
+
+    now = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+    assert _parse_dt(now) is now
+    assert _parse_dt(None) is None
+    # ISO string is coerced.
+    assert _parse_dt("2026-04-19T12:00:00+00:00") == now
+
+
+def test_path_helpers_compute_expected_locations(tmp_path: Path) -> None:
+    store = StateStore(tmp_path)
+    assert store.state_path("abc").name == "abc.yaml"
+    assert store.state_path("abc").parent == tmp_path / "state"
+    assert store.lock_path("abc").name == "abc.lock"
+    assert store.log_path("abc").name == "abc.ndjson"
+    assert store.events_path() == tmp_path / "events.ndjson"
+
+
+def test_save_cleans_up_tempfile_when_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If os.replace fails, the tempfile should be removed and the original
+    exception should propagate."""
+    import os
+
+    import pytest as _pytest
+
+    store = StateStore(tmp_path)
+
+    def fail_replace(_src: str, _dst: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    state = TaskState(task_id="boom")
+    with _pytest.raises(OSError, match="disk full"):
+        store.save(state)
+    # No orphan tempfile should remain in the state dir.
+    leftovers = list((tmp_path / "state").glob(".boom.*"))
+    assert not leftovers
+
+
+def test_iter_states_when_dir_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the state dir is gone after construction, iter_states returns []."""
+    import shutil
+
+    store = StateStore(tmp_path)
+    shutil.rmtree(tmp_path / "state")
+    assert store.iter_states() == []

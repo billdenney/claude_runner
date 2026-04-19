@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development",
     "Topic :: Utilities",
     "Typing :: Typed",
@@ -48,11 +49,12 @@ dev = [
 [project.scripts]
 claude-runner = "claude_runner.cli:main"
 claude_runner = "claude_runner.cli:main"
+ccrunner = "claude_runner.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/wdenney/claude_runner"
-Issues = "https://github.com/wdenney/claude_runner/issues"
-Changelog = "https://github.com/wdenney/claude_runner/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/billdenney/claude_runner"
+Issues = "https://github.com/billdenney/claude_runner/issues"
+Changelog = "https://github.com/billdenney/claude_runner/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_runner"]

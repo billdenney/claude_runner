@@ -62,3 +62,17 @@ def test_reset_clears_state() -> None:
     assert b.tripped()
     b.reset()
     assert not b.tripped()
+
+
+def test_further_failures_after_trip_are_no_ops() -> None:
+    """Once tripped, _evaluate should early-return and preserve the trip
+    reason — not overwrite it with a new reason or re-record."""
+    b = _breaker()
+    for _ in range(3):
+        b.record_failure()
+    reason = b.state().reason
+    # Keep recording — breaker stays tripped with the same reason.
+    for _ in range(5):
+        b.record_failure()
+    assert b.tripped()
+    assert b.state().reason == reason

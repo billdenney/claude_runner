@@ -59,6 +59,30 @@ def test_ccusage_returns_zero_when_binary_missing(monkeypatch: pytest.MonkeyPatc
     assert snap.used_week == 0
 
 
+def test_ccusage_falls_back_to_npx(
+    monkeypatch: pytest.MonkeyPatch, fake_blocks_payload: dict, fake_daily_payload: dict
+) -> None:
+    # ccusage not installed, but npx is available: we should shell out via npx.
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/npx" if name == "npx" else None)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        payload = fake_blocks_payload if "blocks" in args else fake_daily_payload
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    source = CCUsageSource()
+    assert source.available()
+    snap = source.snapshot()
+    assert snap.used_5h == 87654
+    assert calls and calls[0][:3] == ["npx", "-y", "ccusage"]
+
+
 def test_ccusage_raises_on_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
     monkeypatch.setattr(
@@ -107,3 +131,352 @@ def test_api_headers_source_without_anthropic_returns_zero(monkeypatch: pytest.M
     assert snap.used_5h == 0
     # Restore.
     sys.modules.pop("anthropic", None)
+
+
+def test_api_headers_source_parses_rate_limit_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the probe-success path: parse remaining vs limit headers."""
+    import sys
+    import types
+
+    fake_anthropic = types.ModuleType("anthropic")
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.headers = {
+                "anthropic-ratelimit-input-tokens-remaining": "750",
+                "anthropic-ratelimit-input-tokens-limit": "1000",
+            }
+
+    class _RawCreate:
+        def create(self, **_: object) -> _Resp:
+            return _Resp()
+
+    class _Messages:
+        with_raw_response = _RawCreate()
+
+    class _Client:
+        messages = _Messages()
+
+    fake_anthropic.Anthropic = _Client  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    from claude_runner.budget.sources.api_headers import ApiHeadersSource
+
+    snap = ApiHeadersSource(itpm_budget=1000, weekly_budget=100000).snapshot()
+    assert snap.used_5h == 250  # limit 1000 - remaining 750
+    assert snap.used_week == 0
+
+
+def test_api_headers_source_handles_probe_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    fake_anthropic = types.ModuleType("anthropic")
+
+    class _Raising:
+        def create(self, **_: object) -> object:
+            raise RuntimeError("network down")
+
+    class _Messages:
+        with_raw_response = _Raising()
+
+    class _Client:
+        messages = _Messages()
+
+    fake_anthropic.Anthropic = _Client  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    from claude_runner.budget.sources.api_headers import ApiHeadersSource
+
+    snap = ApiHeadersSource(itpm_budget=1000, weekly_budget=100000).snapshot()
+    assert snap.used_5h == 0
+    assert snap.source == "api_headers"
+
+
+def test_api_headers_int_helper_parses_and_falls_back() -> None:
+    from claude_runner.budget.sources.api_headers import _int
+
+    assert _int("42") == 42
+    assert _int(None) == 0
+    assert _int("not-a-number") == 0
+
+
+# ----- context_cmd source extra coverage ---------------------------------
+
+
+def test_context_source_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+
+    def raising(*_a: object, **_kw: object):
+        raise OSError("no such executable")
+
+    monkeypatch.setattr(subprocess, "run", raising)
+    snap = ContextCmdSource().snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+    assert snap.source == "context"
+
+
+def test_context_source_extract_regex_no_match() -> None:
+    from claude_runner.budget.sources.context_cmd import _FIVE_H_RE, _extract
+
+    # No match → returns 0 (hits the early return branch).
+    assert _extract(_FIVE_H_RE, "unrelated text with no numbers") == 0
+
+
+# ----- ccusage source extra coverage -------------------------------------
+
+
+def test_ccusage_resolution_prefers_ccusage_when_custom_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/ccusage" if name == "ccusage" else None
+    )
+    source = CCUsageSource(binary="my-custom-ccusage")
+    assert source.available()
+    # Should have resolved to plain "ccusage" on PATH, not the custom name.
+    assert source._cmd == ["ccusage"]
+
+
+def test_ccusage_run_raises_when_subprocess_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def raising(args, **_kwargs):
+        raise subprocess.CalledProcessError(returncode=1, cmd=args, stderr="oops")
+
+    monkeypatch.setattr(subprocess, "run", raising)
+    source = CCUsageSource()
+    with pytest.raises(CCUsageError, match="failed"):
+        source._run("blocks")
+
+
+def test_ccusage_run_raises_when_subprocess_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def raising(args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", raising)
+    source = CCUsageSource()
+    with pytest.raises(CCUsageError, match="timed out"):
+        source._run("blocks")
+
+
+def test_ccusage_run_raises_when_json_not_a_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            args=a, returncode=0, stdout=json.dumps([1, 2, 3]), stderr=""
+        ),
+    )
+    source = CCUsageSource()
+    with pytest.raises(CCUsageError, match="unexpected JSON type"):
+        source._run("blocks")
+
+
+def test_ccusage_run_raises_when_command_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    source = CCUsageSource()
+    with pytest.raises(CCUsageError, match="ccusage not found"):
+        source._run("blocks")
+
+
+def test_ccusage_active_block_handles_weird_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-list blocks, non-dict rows, and no-active-block all yield zero."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        # "blocks" returns a dict instead of list -> 0
+        if "blocks" in args:
+            payload = {"blocks": "not-a-list"}
+        else:
+            # "daily" returns a list containing a non-dict -> row skipped
+            payload = {"daily": ["not-a-dict", {"date": "not-a-date", "totalTokens": 5}]}
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_ccusage_active_block_skips_non_dict_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            payload = {"blocks": ["string-entry", {"isActive": False}]}
+        else:
+            payload = {"daily": []}
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+
+
+def test_ccusage_extract_ignores_non_numeric_fallback_fields() -> None:
+    """_extract_total_tokens skips fallback keys whose values aren't numeric."""
+    from claude_runner.budget.sources.ccusage import _extract_total_tokens
+
+    # No totalTokens; one fallback key has a string instead of a number — that
+    # key is skipped, the numeric ones are summed.
+    total = _extract_total_tokens(
+        {
+            "inputTokens": "not-a-number",
+            "outputTokens": 10,
+        }
+    )
+    assert total == 10
+
+
+def test_ccusage_week_total_sums_input_output_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hit the fallback that sums inputTokens+outputTokens when no totalTokens key."""
+    from datetime import datetime
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+    today = datetime.now(tz=UTC).date().isoformat()
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            payload = {"blocks": []}
+        else:
+            payload = {
+                "daily": [
+                    {
+                        "date": today,
+                        "inputTokens": 100,
+                        "outputTokens": 200,
+                        "cacheCreationTokens": 50,
+                        "cacheReadTokens": 1000,
+                    }
+                ]
+            }
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_week == 100 + 200 + 50 + 1000
+
+
+def test_ccusage_parse_dt_and_date_return_none_on_garbage() -> None:
+    from claude_runner.budget.sources.ccusage import _parse_date, _parse_dt
+
+    assert _parse_dt(None) is None
+    assert _parse_dt("not-a-timestamp") is None
+    assert _parse_date(None) is None
+    assert _parse_date("not-a-date") is None
+
+
+def test_ccusage_active_block_uses_endsAt_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Covers the `endsAt` alias path when `endTime` is missing."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            payload = {
+                "blocks": [
+                    {"active": True, "tokens": 42, "endsAt": "2026-05-01T00:00:00Z"},
+                ]
+            }
+        else:
+            payload = {"daily": []}
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_5h == 42
+    assert snap.next_5h_reset is not None
+
+
+def test_ccusage_blocks_command_error_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the `blocks` subprocess call blows up, used_5h falls back to 0."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        # `blocks` call fails; `daily` succeeds with empty list.
+        if "blocks" in args:
+            raise subprocess.CalledProcessError(returncode=1, cmd=args, stderr="boom")
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps({"daily": []}), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_ccusage_daily_command_error_is_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=json.dumps({"blocks": []}), stderr=""
+            )
+        raise subprocess.CalledProcessError(returncode=1, cmd=args, stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_week == 0
+
+
+def test_ccusage_week_total_skips_rows_before_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows dated before this week's Monday anchor are excluded from the sum."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            payload = {"blocks": []}
+        else:
+            # Dates are from 2025 — well before any "current" week anchor.
+            payload = {
+                "daily": [
+                    {"date": "2025-01-01", "totalTokens": 99_999},
+                    {"date": "2025-01-02", "totalTokens": 88_888},
+                ]
+            }
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_week == 0
+
+
+def test_ccusage_week_total_rows_not_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ccusage")
+
+    def fake_run(args, **_kwargs):
+        if "blocks" in args:
+            payload = {"blocks": []}
+        else:
+            payload = {"daily": "not-a-list"}
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = CCUsageSource()
+    snap = source.snapshot()
+    assert snap.used_week == 0

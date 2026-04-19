@@ -170,3 +170,116 @@ async def test_subprocess_backend_passes_required_cli_flags(
         "subprocess backend must pass --verbose; otherwise claude CLI exits "
         "with 'When using --print, --output-format=stream-json requires --verbose'"
     )
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_passes_resume_flag(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior session id on the state file turns into `--resume <sid>` argv."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    from claude_runner.models import TaskState
+
+    state_store.save(TaskState(task_id="001", session_id="prior-sid"))
+
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*args, **_kwargs):
+        captured["argv"] = list(args)
+        return _FakeProc([], rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    await backend.run_task(spec)
+
+    argv = captured["argv"]
+    assert "--resume" in argv
+    assert "prior-sid" in argv
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_reports_failure_when_subprocess_raises(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception from create_subprocess_exec is caught and surfaces as FAILED."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+
+    async def fake_create(*_args, **_kwargs):
+        raise OSError("cannot exec claude")
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+    assert result.success is False
+    assert result.error is not None and "cannot exec" in result.error
+    assert state_store.load(spec.id).status is TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_init_without_session_id_is_ignored(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An init message whose session_id is missing/non-string must not crash
+    or write a bogus session id."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    lines = [
+        (json.dumps({"type": "system", "subtype": "init"}) + "\n").encode(),
+        (json.dumps({"type": "system", "subtype": "init", "session_id": 42}) + "\n").encode(),
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    await backend.run_task(spec)
+    assert state_store.load(spec.id).session_id is None
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_line_handler_tolerates_garbage(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty lines, non-JSON lines, and JSON arrays should all be ignored safely."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+    lines = [
+        b"\n",  # empty-after-strip
+        b"not json at all\n",
+        b"[1, 2, 3]\n",  # JSON but not a dict
+        (json.dumps({"type": "other"}) + "\n").encode(),  # dict but unrecognized
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.success is True
+    # Usage should remain zero since no recognized usage payloads.
+    assert result.usage.input_tokens == 0

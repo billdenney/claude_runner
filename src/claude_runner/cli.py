@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resume":
         return _cmd_resume(args)
     parser.error(f"unknown command {args.command}")
-    raise AssertionError  # unreachable — parser.error calls SystemExit
+    raise AssertionError  # pragma: no cover - parser.error always raises SystemExit
 
 
 # ----- command implementations -----------------------------------------
@@ -266,7 +266,9 @@ def _build_source(settings: Settings) -> BudgetSource | None:
         src = CCUsageSource()
         if src.available():
             return src
-        _log.warning("ccusage not on PATH; falling back to claude /context")
+        _log.warning(
+            "ccusage not available (no ccusage binary and no npx); falling back to claude /context"
+        )
         return ContextCmdSource()
     if settings.budget_source == "context":
         return ContextCmdSource()
@@ -286,5 +288,5 @@ def _build_backend(
     return AsyncioBackend(state_store=state_store, emitter=emitter)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - module-as-script, exercised via __main__.py
     sys.exit(main())
