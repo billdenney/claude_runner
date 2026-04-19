@@ -33,8 +33,29 @@ class _FakeStream:
         return b""
 
 
+class _FakeStdin:
+    """Captures whatever the backend pipes in so tests can assert on it."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.closed = False
+
+    def write(self, chunk: bytes) -> None:
+        self.buf.extend(chunk)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
 class _FakeProc:
     def __init__(self, stdout_lines: list[bytes], rc: int = 0) -> None:
+        self.stdin = _FakeStdin()
         self.stdout = _FakeStream(stdout_lines)
         self.stderr = _FakeStream([])
         self._rc = rc
@@ -201,6 +222,57 @@ async def test_subprocess_backend_passes_resume_flag(
     argv = captured["argv"]
     assert "--resume" in argv
     assert "prior-sid" in argv
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_pipes_prompt_via_stdin_not_argv(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prompt text must never appear in argv — putting it on the command
+    line means any filename/keyword in the prompt is visible in
+    ``/proc/<pid>/cmdline`` and can be matched by a sub-agent's
+    ``pkill -f <keyword>``, SIGTERMing the agent itself.
+
+    Regression guard: exact-string prompt must be written to stdin; it must
+    NOT appear as any argv element.
+    """
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(),
+        log_dir=state_store.root / "logs",
+        stdout=False,
+    )
+
+    captured: dict[str, Any] = {}
+    fake_proc: list[_FakeProc] = []
+
+    async def fake_create(*args, **_kwargs):
+        captured["argv"] = list(args)
+        p = _FakeProc([], rc=0)
+        fake_proc.append(p)
+        return p
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    distinctive_prompt = "Zebra-Mango-Prompt-7F3A please kill -f this"
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings, prompt=distinctive_prompt)
+    await backend.run_task(spec)
+
+    argv = captured["argv"]
+    # The prompt MUST NOT be in the argv.
+    assert distinctive_prompt not in argv, (
+        "Prompt found in argv — this makes the prompt visible in "
+        "/proc/<pid>/cmdline and lets sub-agents self-SIGTERM via pkill -f."
+    )
+    for piece in distinctive_prompt.split():
+        assert piece not in argv, f"Prompt fragment {piece!r} leaked into argv"
+
+    # The prompt MUST be on stdin.
+    assert fake_proc, "subprocess was never started"
+    assert fake_proc[0].stdin.buf.decode("utf-8") == distinctive_prompt
+    assert fake_proc[0].stdin.closed is True
 
 
 @pytest.mark.asyncio

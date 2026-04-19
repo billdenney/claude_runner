@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Subprocess backend now pipes the prompt via stdin instead of passing
+  it as an argv.** Previously the entire prompt text was the positional
+  `prompt` argument to `claude -p`, which made it visible in
+  `ps aux` / `/proc/<pid>/cmdline`. A real extraction task then ran
+  `pkill -f "Xu_2019_sarilumab.Rmd"` to clean up a stuck `rmarkdown::render`
+  subprocess, which also matched its own parent claude process (whose argv
+  contained that filename from the task prompt) and SIGTERMed itself ~95%
+  through the task, discarding most of the work. Piping via stdin removes
+  the prompt from cmdline entirely. Regression guard in
+  `tests/test_subprocess_backend.py::test_subprocess_backend_pipes_prompt_via_stdin_not_argv`.
+- Preamble now warns the task agent explicitly against `pkill -f <pattern>`
+  with patterns that could match its own context (filenames, task ids,
+  keywords from the prompt). Points the agent at narrower alternatives
+  (`pgrep -x <program>`, match on R-internal call names, read PIDs from
+  `ps aux` first).
+
 ### Added
 - **Sidecar interaction protocol** for stop-and-ask workflows. Tasks can now
   pause for human input by writing a JSON request file to

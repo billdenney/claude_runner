@@ -101,6 +101,30 @@ down the worktree after the task reaches a terminal state; do NOT run
 `git worktree remove` yourself.
 """
 
+_PKILL_SECTION = """\
+## Do not kill processes by command-line pattern
+
+Never run `pkill -f <pattern>`, `pgrep -f`, `killall`, or any other command
+that matches processes by command-line content against a pattern that
+appears anywhere in your own context. Your parent `claude` process's
+environment includes this prompt and every filename / keyword in it; a
+pattern like `Xu_2019.Rmd` or `my-task-id` can match YOUR OWN process
+and SIGTERM the agent mid-task, losing ~90 % completed work.
+
+If you need to kill a child process you spawned (e.g. a stuck `Rscript
+rmarkdown::render`), instead:
+
+1. Capture the PID when you start it: `Rscript -e '...' & echo $!`, or
+2. Look it up narrowly by program name: `pgrep -x Rscript` (exact-match,
+   not `-f`), or
+3. Match on an argument that is guaranteed NOT in your prompt:
+   `pgrep -f 'rmarkdown::render'` (the R-internal call, not the filename).
+
+When in doubt: `ps aux | grep <program-name>`, read the PIDs yourself,
+then `kill <pid>`. Never use `pkill -f` with filenames or task
+identifiers.
+"""
+
 _GH_READONLY_SECTION = """\
 ## GitHub CLI is read-only
 
@@ -166,6 +190,7 @@ def build_preamble(
                 branch_from=spec.git_worktree.branch_from,
             )
         )
+    parts.append(_PKILL_SECTION)
     parts.append(_GH_READONLY_SECTION)
     parts.append("---\n\n# Task prompt\n")
     return "\n".join(parts)
