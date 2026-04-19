@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Subprocess backend now passes `--verbose` to the `claude` CLI. claude CLI 2.x
+  rejects `--print --output-format=stream-json` without `--verbose` and exits
+  immediately, which previously caused every subprocess-backend task to fail
+  with no useful output. Added a regression test in
+  `tests/test_subprocess_backend.py`.
+
 ## [0.1.0] — unreleased
 
 ### Added

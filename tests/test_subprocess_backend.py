@@ -124,3 +124,49 @@ async def test_subprocess_backend_raises_without_binary(
     spec = _spec(tmp_project, settings)
     with pytest.raises(RuntimeError):
         await backend.run_task(spec)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_backend_passes_required_cli_flags(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: ``--print`` + ``--output-format=stream-json`` needs ``--verbose``.
+
+    The claude CLI (v2.x) exits immediately with
+
+        Error: When using --print, --output-format=stream-json requires --verbose
+
+    if ``--verbose`` is missing.  Capture the argv passed to
+    ``asyncio.create_subprocess_exec`` and assert the required flag set is
+    present, so a future refactor cannot silently drop ``--verbose`` again.
+    """
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(), log_dir=state_store.root / "logs", stdout=False
+    )
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def fake_create(*args: str, **_kwargs: Any):
+        captured_args.append(args)
+        return _FakeProc([b""], rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    await backend.run_task(spec)
+
+    assert captured_args, "create_subprocess_exec was not called"
+    args = captured_args[0]
+
+    # --print/-p and --output-format stream-json are already required; --verbose
+    # is the regression this test guards.
+    assert "-p" in args
+    assert "--output-format" in args
+    assert args[args.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in args, (
+        "subprocess backend must pass --verbose; otherwise claude CLI exits "
+        "with 'When using --print, --output-format=stream-json requires --verbose'"
+    )

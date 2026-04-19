@@ -47,6 +47,11 @@ class SubprocessBackend:
             spec.prompt,
             "--output-format",
             "stream-json",
+            # `claude -p --output-format=stream-json` requires `--verbose`;
+            # without it the CLI exits immediately with
+            #   "When using --print, --output-format=stream-json requires --verbose"
+            # (enforced since claude CLI 2.x).
+            "--verbose",
             "--max-turns",
             str(spec.max_turns),
             "--allowedTools",
