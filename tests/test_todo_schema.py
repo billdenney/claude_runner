@@ -91,3 +91,78 @@ def test_bad_effort_errors(tmp_path: Path, settings: Settings) -> None:
     )
     with pytest.raises(ValueError):
         load_task_file(path, settings=settings)
+
+
+def test_allowed_tools_must_be_list(tmp_path: Path, settings: Settings) -> None:
+    path = _write(
+        tmp_path / "006.yaml",
+        {"prompt": "x", "working_dir": str(tmp_path), "allowed_tools": "Read,Edit"},
+    )
+    with pytest.raises(ValueError, match="allowed_tools"):
+        load_task_file(path, settings=settings)
+
+
+def test_depends_on_must_be_list(tmp_path: Path, settings: Settings) -> None:
+    path = _write(
+        tmp_path / "007.yaml",
+        {"prompt": "x", "working_dir": str(tmp_path), "depends_on": "other"},
+    )
+    with pytest.raises(ValueError, match="depends_on"):
+        load_task_file(path, settings=settings)
+
+
+def test_depends_on_null_becomes_empty_tuple(tmp_path: Path, settings: Settings) -> None:
+    """An explicit null depends_on is equivalent to omitting the field."""
+    path = _write(
+        tmp_path / "008.yaml",
+        {"prompt": "x", "working_dir": str(tmp_path), "depends_on": None},
+    )
+    spec = load_task_file(path, settings=settings)
+    assert spec.depends_on == ()
+
+
+def test_derive_title_fallback_for_whitespace_only_prompt() -> None:
+    """`_derive_title` returns "Untitled task" if no non-blank line exists."""
+    from claude_runner.todo.schema import _derive_title
+
+    assert _derive_title("   \n\t\n  ") == "Untitled task"
+    assert _derive_title("first line\nsecond") == "first line"
+
+
+def test_detect_cycles_ignores_external_deps(tmp_path: Path, settings: Settings) -> None:
+    """If a task depends on an id that isn't in the graph at all, it is
+    treated as absent (not a cycle)."""
+    from claude_runner.todo.schema import build_task, detect_cycles
+
+    a = build_task(
+        raw={"prompt": "a", "working_dir": str(tmp_path), "depends_on": ["ghost"]},
+        source_path=tmp_path / "a.yaml",
+        settings=settings,
+    )
+    assert detect_cycles([a]) == []
+
+
+def test_empty_yaml_file_errors(tmp_path: Path, settings: Settings) -> None:
+    from claude_runner.todo.loader import load_task_file
+
+    path = tmp_path / "empty.yaml"
+    path.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="empty"):
+        load_task_file(path, settings=settings)
+
+
+def test_non_mapping_yaml_errors(tmp_path: Path, settings: Settings) -> None:
+    from claude_runner.todo.loader import load_task_file
+
+    path = tmp_path / "list.yaml"
+    path.write_text("- item1\n- item2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="mapping"):
+        load_task_file(path, settings=settings)
+
+
+def test_load_todo_dir_missing_directory_returns_error(tmp_path: Path, settings: Settings) -> None:
+    from claude_runner.todo.loader import load_todo_dir
+
+    result = load_todo_dir(tmp_path / "does-not-exist", settings=settings)
+    assert result.has_errors()
+    assert result.errors[0].message == "todo directory does not exist"

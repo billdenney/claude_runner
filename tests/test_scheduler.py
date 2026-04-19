@@ -156,3 +156,113 @@ async def test_dependent_on_failed_is_blocked(
 def test_sync_wrapper() -> None:
     # Sanity: asyncio.run works on the scheduler (covered by CLI path).
     assert asyncio.iscoroutinefunction(Scheduler.run)
+
+
+async def test_backend_exception_is_captured_as_dispatch_failure(
+    scheduler_factory, make_task, state_store: StateStore
+) -> None:
+    """If a backend raises (not just returns success=False), the scheduler
+    catches the exception, records it as a failed DispatchResult, and keeps
+    running until the circuit breaker trips."""
+    from claude_runner.models import TaskStatus
+
+    class RaisingBackend:
+        name = "raising"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def run_task(self, spec):
+            self.calls.append(spec.id)
+            # Mark the task FAILED so the catalog doesn't keep offering it.
+            state = state_store.load(spec.id)
+            state.status = TaskStatus.FAILED
+            state_store.save(state)
+            raise RuntimeError("upstream went dark")
+
+    make_task("solo")
+    backend = RaisingBackend()
+    scheduler = scheduler_factory(backend)
+    outcome = await scheduler.run()
+
+    # The exception was caught inside the scheduler and surfaced as a
+    # failed DispatchResult rather than propagating out of run().
+    assert outcome.completed == 0
+    assert outcome.failed == 1
+    assert backend.calls == ["solo"]
+
+
+async def test_scheduler_stops_when_budget_says_stop(
+    tmp_project, settings, state_store: StateStore, emitter, make_task, fake_backend
+) -> None:
+    """When the budget controller returns a STOP decision, the scheduler emits
+    budget_stop and stops the run."""
+    from claude_runner.budget.circuit_breaker import CircuitBreaker
+    from claude_runner.budget.controller import (
+        Decision,
+        DecisionKind,
+        TokenBudgetController,
+    )
+    from claude_runner.runner.scheduler import Scheduler
+    from claude_runner.todo.catalog import TodoCatalog
+
+    make_task("only")
+    catalog = TodoCatalog(
+        tmp_project / "todo",
+        state_store=state_store,
+        settings=settings,
+        time_source=lambda: 0.0,
+    )
+    budget = TokenBudgetController(settings, source=None)
+    # Short-circuit may_start to always STOP.
+    budget.may_start = lambda estimate: Decision(  # type: ignore[method-assign]
+        kind=DecisionKind.STOP, reason="synthetic stop"
+    )
+    breaker = CircuitBreaker(
+        max_consecutive_failures=3,
+        failure_rate_threshold=0.5,
+        rolling_window=10,
+        min_samples=4,
+    )
+    scheduler = Scheduler(
+        settings=settings,
+        catalog=catalog,
+        backend=fake_backend,
+        budget=budget,
+        state_store=state_store,
+        emitter=emitter,
+        breaker=breaker,
+    )
+    outcome = await scheduler.run()
+    assert outcome.completed == 0
+    assert outcome.failed == 0
+    events = state_store.events_path().read_text().splitlines()
+    assert any('"budget_stop"' in line for line in events)
+    assert any('"synthetic stop"' in line for line in events)
+
+
+async def test_scheduler_terminates_when_ready_but_all_blocked_on_failed_deps(
+    scheduler_factory, make_task, state_store: StateStore, fake_backend
+) -> None:
+    """Child whose parent failed never becomes ready; scheduler exits cleanly."""
+    from claude_runner.models import DispatchResult, StopReason, TaskStatus, TokenUsage
+
+    make_task("parent")
+    make_task("child", depends_on=["parent"])
+    fake_backend.set(
+        "parent",
+        DispatchResult(
+            task_id="parent",
+            success=False,
+            usage=TokenUsage(),
+            stop_reason=StopReason.ERROR,
+            session_id=None,
+            duration_s=0.1,
+            error="nope",
+        ),
+    )
+    scheduler = scheduler_factory(fake_backend)
+    outcome = await scheduler.run()
+    assert outcome.failed == 1
+    # Child stays PENDING and the scheduler does not livelock.
+    assert state_store.load("child").status is TaskStatus.PENDING

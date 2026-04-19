@@ -98,7 +98,9 @@ class Scheduler:
                     if wait_until is not None:
                         await self._sleep_until(wait_until)
                         continue
-                    if not launched_any:
+                    if (
+                        not launched_any
+                    ):  # pragma: no branch - launched_any True implies in_flight non-empty
                         # Nothing ran, nothing in flight, but catalog claims tasks exist.
                         # Most likely all remaining tasks are blocked on failed deps.
                         break
@@ -182,13 +184,13 @@ class Scheduler:
         results: list[DispatchResult] = []
         for task in done:
             tid = next((k for k, v in self._in_flight.items() if v is task), None)
-            if tid is not None:
+            if tid is not None:  # pragma: no branch - tid is always found; defensive
                 self._in_flight.pop(tid, None)
             try:
                 results.append(task.result())
             except Exception as exc:
                 _log.exception("backend raised for task %s", tid)
-                if tid is not None:
+                if tid is not None:  # pragma: no branch - tid is always found; defensive
                     from claude_runner.models import TokenUsage
 
                     results.append(
@@ -215,7 +217,7 @@ class Scheduler:
         if not self._in_flight:
             # Block long-ish; outer wait_for will cancel this.
             await asyncio.sleep(3600)
-            return
+            return  # pragma: no cover - unreachable; sleep(3600) is always cancelled first
         await asyncio.wait(list(self._in_flight.values()), return_when=asyncio.FIRST_COMPLETED)
 
     async def _drain(self) -> None:
