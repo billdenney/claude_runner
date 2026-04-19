@@ -79,6 +79,19 @@ def test_build_preamble_omits_worktree_section_when_no_git_worktree(
     assert "Git worktree already set up" not in text
 
 
+def test_preamble_warns_against_pkill_f() -> None:
+    """Regression guard: the pkill -f footgun warning must be present.
+
+    Background: a real task was SIGTERMed mid-work because its agent ran
+    ``pkill -f Xu_2019_sarilumab.Rmd`` to clean up a stuck R render, which
+    also matched the parent claude process whose argv contained the same
+    filename. The preamble now explicitly warns against this."""
+    spec = _spec()
+    text = build_preamble(spec=spec, sidecar_dir=None, worktree_path=None)
+    assert "pkill -f" in text
+    assert "SIGTERM" in text
+
+
 def test_should_inject_task_override_wins_true() -> None:
     settings = Settings(budget_source="static", inject_preamble=False)
     spec = _spec(inject_preamble=True)

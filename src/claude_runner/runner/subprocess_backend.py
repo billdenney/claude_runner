@@ -54,10 +54,18 @@ class SubprocessBackend:
         state.error = None
         self._state_store.save(state)
 
+        # IMPORTANT: the prompt is piped via stdin rather than passed as an
+        # argv. Passing the prompt as an argv means its entire text shows up
+        # in ``ps aux`` / ``/proc/<pid>/cmdline``, which lets sub-agents
+        # accidentally SIGTERM themselves with ``pkill -f <keyword>`` if the
+        # prompt mentions <keyword>. (Observed in the wild: task 003 ran
+        # ``pkill -f Xu_2019_sarilumab.Rmd`` to clean up a stuck R render,
+        # matched its own parent claude process whose argv contained that
+        # filename, and SIGTERMed itself 95% through the task.) Piping via
+        # stdin removes the prompt text from cmdline entirely.
         args = [
             self._binary,
             "-p",
-            spec.prompt,
             "--output-format",
             "stream-json",
             # `claude -p --output-format=stream-json` requires `--verbose`;
@@ -98,6 +106,7 @@ class SubprocessBackend:
             # limit to 16 MiB — see _STREAM_READ_LIMIT.
             proc = await asyncio.create_subprocess_exec(
                 *args,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(spec.working_dir),
@@ -105,6 +114,13 @@ class SubprocessBackend:
                 limit=_STREAM_READ_LIMIT,
             )
             assert proc.stdout is not None
+            assert proc.stdin is not None
+            # Write the prompt to stdin and close it. See the note above
+            # about why we don't pass it as an argv.
+            proc.stdin.write(spec.prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
             while True:
                 line = await proc.stdout.readline()
                 if not line:
