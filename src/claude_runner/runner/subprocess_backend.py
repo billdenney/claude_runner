@@ -15,6 +15,15 @@ from claude_runner.todo.schema import TaskSpec
 
 _log = logging.getLogger(__name__)
 
+# Maximum stream-json line length (bytes) that the backend will accept from
+# the claude CLI. The asyncio StreamReader default is 64 KiB, but a single
+# stream-json message — especially one containing a large tool output, long
+# extended-thinking block, or verbose debug payload — can easily exceed that
+# and make ``readline()`` raise ``ValueError: Separator is found, but chunk is
+# longer than limit``. Real-world messages seen in the wild have topped 1 MB;
+# 16 MiB gives generous headroom without a practical memory cost.
+_STREAM_READ_LIMIT = 16 * 1024 * 1024  # 16 MiB
+
 
 class SubprocessBackend:
     name = "subprocess"
@@ -47,6 +56,11 @@ class SubprocessBackend:
             spec.prompt,
             "--output-format",
             "stream-json",
+            # `claude -p --output-format=stream-json` requires `--verbose`;
+            # without it the CLI exits immediately with
+            #   "When using --print, --output-format=stream-json requires --verbose"
+            # (enforced since claude CLI 2.x).
+            "--verbose",
             "--max-turns",
             str(spec.max_turns),
             "--allowedTools",
@@ -64,11 +78,19 @@ class SubprocessBackend:
         success = True
 
         try:
+            # claude CLI emits newline-delimited JSON on stdout. A single
+            # stream-json message can easily exceed asyncio's default 64 KiB
+            # readline limit (large tool output, long extended-thinking
+            # block, verbose debug payload), which otherwise raises
+            # ``ValueError: Separator is found, but chunk is longer than
+            # limit`` mid-stream and fails the whole task. Raise the reader
+            # limit to 16 MiB — see _STREAM_READ_LIMIT.
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(spec.working_dir),
+                limit=_STREAM_READ_LIMIT,
             )
             assert proc.stdout is not None
             while True:

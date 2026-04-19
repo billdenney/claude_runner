@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Subprocess backend now passes `--verbose` to the `claude` CLI. claude CLI 2.x
+  rejects `--print --output-format=stream-json` without `--verbose` and exits
+  immediately, which previously caused every subprocess-backend task to fail
+  with no useful output. Added a regression test in
+  `tests/test_subprocess_backend.py`.
+- Subprocess backend now raises the asyncio stream reader limit to 16 MiB
+  (was the default 64 KiB). A single stream-json message from the claude CLI
+  — especially one containing a large tool output, long extended-thinking
+  block, or verbose debug payload — could exceed 64 KiB and trigger
+  `ValueError: Separator is found, but chunk is longer than limit` mid-stream,
+  failing the whole task. Added a regression test.
+
 ## [0.1.0] — unreleased
 
 ### Added
