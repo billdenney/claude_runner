@@ -123,6 +123,62 @@ class CCUsageSource:
                 total += _extract_total_tokens(row)
         return total
 
+    def historical_block_totals(self) -> list[int]:
+        """Return totalTokens for every completed (non-active, non-gap) 5h block.
+
+        Used by ``calibrate_budgets`` to pick a realistic per-block ceiling
+        from the operator's own usage history.
+        """
+        try:
+            data = self._run("blocks")
+        except CCUsageError as exc:
+            _log.warning("ccusage blocks failed during historical read: %s", exc)
+            return []
+        blocks = data.get("blocks") or data.get("data") or []
+        if not isinstance(blocks, list):
+            return []
+        out: list[int] = []
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("isActive") or b.get("active"):
+                continue
+            if b.get("isGap") or b.get("gap"):
+                continue
+            out.append(_extract_total_tokens(b))
+        return out
+
+    def historical_weekly_totals(self) -> list[int]:
+        """Return totalTokens summed into ISO calendar weeks from ``daily``.
+
+        Excludes the current (in-progress) week. Used for weekly-budget
+        calibration alongside ``historical_block_totals``.
+        """
+        try:
+            data = self._run("daily")
+        except CCUsageError as exc:
+            _log.warning("ccusage daily failed during historical read: %s", exc)
+            return []
+        from datetime import timedelta
+
+        rows = data.get("daily") or data.get("data") or []
+        if not isinstance(rows, list):
+            return []
+        now = datetime.now(tz=UTC)
+        current_week_anchor = (now - timedelta(days=now.weekday())).date()
+        buckets: dict[tuple[int, int], int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            d = _parse_date(row.get("date"))
+            if d is None or d >= current_week_anchor:
+                continue  # skip current (incomplete) week
+            iso_year, iso_week, _ = d.isocalendar()
+            buckets[(iso_year, iso_week)] = buckets.get(
+                (iso_year, iso_week), 0
+            ) + _extract_total_tokens(row)
+        return list(buckets.values())
+
 
 def _extract_total_tokens(row: dict[str, object]) -> int:
     for key in ("totalTokens", "total_tokens", "tokens", "allTokens"):

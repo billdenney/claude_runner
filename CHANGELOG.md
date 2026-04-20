@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`plan = "auto"` budget calibration.** Static plan presets (pro / max5 /
+  max20 / team) were added when cache reads were a minor fraction of API
+  billing. Modern Claude Code workflows are cache-heavy and routinely
+  consume 50-150M tokens per 5-hour block on a Max5 subscription, which
+  is ~50-75x the `max5` preset of 2M. Setting `plan = "auto"` in
+  `claude_runner.toml` (or via env) now tells the `TokenBudgetController`
+  to consult the configured `budget_source` for the operator's own
+  historical usage and set both `budget_5h_tokens` and
+  `budget_weekly_tokens` accordingly, floored at the `max5` preset and
+  capped at 300M / 3B. The `ccusage` source grew
+  `historical_block_totals()` and `historical_weekly_totals()` methods to
+  expose that data. Calibration runs once at scheduler construction; the
+  decision is logged at INFO level and surfaced in `claude-runner
+  status` so the operator can see exactly which numbers are in effect.
+  The policy uses `max(historical blocks) * 1.25` (and the same for
+  completed weeks) as the ceiling, matching what `ccusage` itself does
+  for its "assuming X token limit" inference. This replaces an initial
+  `p90`-of-history policy that throttled the runner well below the real
+  rate limit (on a Max5 account with historical peak 135M and real cap
+  ~225M, p90 gave 100M — 45% of real; max x 1.25 gives 169M — 75% of
+  real, and self-calibrates upward as new peaks accrue). The real
+  subscription rate limit is not programmatically exposed — it only
+  surfaces in the Claude Code app UI via HTTP rate-limit headers — so
+  `max x growth` is the best retrospective signal available until
+  Anthropic exposes the limit in their CLI.
+
 ### Fixed
 - **Subprocess backend now trusts the stream-json ``{"type":"result"}``
   message over the process exit code.** Claude CLI v2 has been observed

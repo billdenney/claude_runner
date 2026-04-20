@@ -221,6 +221,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         f"Weekly:    used {report.used_week:,} / {report.budget_week:,} tokens  "
         f"target concurrency: {report.target_concurrency}"
     )
+    cal = budget.calibration
+    if cal is not None:
+        console.print(
+            f"Plan=auto: budgets calibrated from {cal.source} "
+            f"({cal.n_blocks} blocks, {cal.n_weeks} weeks). {cal.reason}."
+        )
     return 0
 
 
