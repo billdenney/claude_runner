@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
+from claude_runner.budget.calibrate import CalibrationResult
 from claude_runner.budget.sources import BudgetSource, UsageSnapshot
 from claude_runner.budget.windows import RollingWindow, WeeklyWindow
 from claude_runner.config import Settings
@@ -63,13 +64,35 @@ class TokenBudgetController:
         self._ema_duration_s: float = 60.0  # seed: 1 minute
         self._observed_min_estimate = 0
 
+        # ``plan = "auto"`` delegates the budget numbers to the historical
+        # probe on the source. Do it once at construction; the result is
+        # stable for the lifetime of the scheduler.
+        self._calibration: CalibrationResult | None = None
+        if settings.plan == "auto":
+            from claude_runner.budget.calibrate import calibrate_budgets
+
+            self._calibration = calibrate_budgets(source)
+
+    @property
+    def calibration(self) -> CalibrationResult | None:
+        """The auto-calibration result when ``plan="auto"``, else ``None``.
+
+        Exposed so ``claude-runner status`` can surface the calibration
+        decision to the operator.
+        """
+        return self._calibration
+
     @property
     def budget_5h(self) -> int:
+        if self._calibration is not None:
+            return self._calibration.budget_5h
         override = self._source_ceiling_5h()
         return override if override else self._settings.resolved_budget_5h()
 
     @property
     def budget_week(self) -> int:
+        if self._calibration is not None:
+            return self._calibration.budget_weekly
         return self._settings.resolved_budget_weekly()
 
     def _source_ceiling_5h(self) -> int:

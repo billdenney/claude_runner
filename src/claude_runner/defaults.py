@@ -55,6 +55,11 @@ PLAN_PRESETS: dict[str, PlanPreset] = {
     "max20": PlanPreset(budget_5h_tokens=8_000_000, budget_weekly_tokens=120_000_000),
     "team": PlanPreset(budget_5h_tokens=4_000_000, budget_weekly_tokens=60_000_000),
     "custom": PlanPreset(budget_5h_tokens=1_000_000, budget_weekly_tokens=15_000_000),
+    # ``auto`` is a sentinel; the actual budget comes from
+    # ``calibrate_budgets`` using the budget source's historical data. The
+    # preset values here are fallbacks used when the source is unavailable
+    # or has fewer than 10 historical non-gap blocks.
+    "auto": PlanPreset(budget_5h_tokens=2_000_000, budget_weekly_tokens=30_000_000),
 }
 
 DEFAULT_ALLOWED_TOOLS: tuple[str, ...] = ("Read", "Edit", "Bash", "Grep", "Glob")
