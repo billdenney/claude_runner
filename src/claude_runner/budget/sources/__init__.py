@@ -19,3 +19,16 @@ class BudgetSource(Protocol):
     name: str
 
     def snapshot(self) -> UsageSnapshot: ...
+
+
+class HistoricalBudgetSource(Protocol):
+    """Extension: sources that can surface historical block / week totals.
+
+    Used by ``calibrate_budgets`` (``plan = "auto"``) to infer realistic 5h
+    and weekly budgets from the operator's own historical usage rather than
+    the static plan presets, which tend to undercount cache-heavy Claude
+    Code workflows by 50-100x.
+    """
+
+    def historical_block_totals(self) -> list[int]: ...
+    def historical_weekly_totals(self) -> list[int]: ...

@@ -24,7 +24,21 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CLAUDE_RUNNER_", extra="ignore")
 
     regime: Literal["pro_max", "api"] = "pro_max"
-    plan: Literal["pro", "max5", "max20", "team", "custom"] = "max5"
+    plan: Literal["pro", "max5", "max20", "team", "custom", "auto"] = "max5"
+    """Budget plan selector.
+
+    * ``pro`` / ``max5`` / ``max20`` / ``team`` — use the static preset from
+      ``PLAN_PRESETS`` (see ``defaults.py``).
+    * ``custom`` — use ``budget_5h_tokens`` / ``budget_weekly_tokens``
+      verbatim; intended for accounts with explicit quotas.
+    * ``auto`` — probe the configured ``budget_source`` for the operator's
+      own historical usage and calibrate both budgets to the p90 of their
+      non-gap 5h blocks and their completed-week totals. Falls back to the
+      ``max5`` preset if the source exposes fewer than 10 historical
+      blocks or is unavailable. Recommended for Claude Code subscribers
+      whose real cache-heavy per-block usage (50-150M tokens) dwarfs the
+      static max5 preset (2M tokens).
+    """
 
     budget_5h_tokens: int | None = None
     budget_weekly_tokens: int | None = None

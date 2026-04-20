@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`plan = "auto"` budget calibration.** Static plan presets (pro / max5 /
+  max20 / team) were added when cache reads were a minor fraction of API
+  billing. Modern Claude Code workflows are cache-heavy and routinely
+  consume 50-150M tokens per 5-hour block on a Max5 subscription, which
+  is ~50-75x the `max5` preset of 2M. Setting `plan = "auto"` in
+  `claude_runner.toml` (or via env) now tells the `TokenBudgetController`
+  to consult the configured `budget_source` for the operator's own
+  historical usage and set both `budget_5h_tokens` and
+  `budget_weekly_tokens` to the p90 of recent non-gap blocks / completed
+  weeks, floored at the `max5` preset and capped at 300M / 3B. The
+  `ccusage` source grew `historical_block_totals()` and
+  `historical_weekly_totals()` methods to expose that data. Calibration
+  runs once at scheduler construction; the decision is logged at INFO
+  level and surfaced in `claude-runner status` so the operator can see
+  exactly which numbers are in effect. Regression context: a 10-task
+  parallel batch at `plan = "custom"` with a 500M fake ceiling burned
+  through 99M tokens in ~15 minutes before being manually SIGINT'd; the
+  same batch under `plan = "auto"` would have throttled
+  `target_concurrency` within a few minutes as the p90-derived ceiling
+  came into play.
+
 ### Fixed
 - **Subprocess backend now pipes the prompt via stdin instead of passing
   it as an argv.** Previously the entire prompt text was the positional
