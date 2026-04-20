@@ -12,18 +12,32 @@ The calibration policy:
 
 - If the source exposes fewer than 10 non-gap blocks, fall back to the
   ``max5`` preset — not enough signal to calibrate.
-- Otherwise set ``budget_5h_tokens`` to ``p90`` of the historical block
-  totals (generous enough to let typical batches run, strict enough to
-  stop a runaway 10x-concurrency burst).
-- ``budget_weekly_tokens`` comes from ``p90`` of completed-week totals
-  (excluding the current in-progress week). When there are fewer than 2
-  completed weeks of data, fall back to ``block_p90 * 14`` as a rough
-  proxy for two full weeks of typical usage.
+- Otherwise set ``budget_5h_tokens`` to ``max(historical block totals)
+  * _GROWTH_FACTOR`` — deliberately at or slightly above the observed
+  peak so the runner can push higher than history without being falsely
+  throttled. This matches what ``ccusage`` itself does (its "assuming
+  <N> token limit" line is derived from the observed max), and
+  self-calibrates upward over time: a batch that pushes to a new peak
+  will raise the ceiling for the next run.
+- ``budget_weekly_tokens`` comes from ``max(completed-week totals) *
+  _GROWTH_FACTOR`` (excluding the current in-progress week). When there
+  are fewer than 2 completed weeks of data, fall back to
+  ``block_ceiling * 14`` as a rough proxy for two full weeks.
 - Floor both values at the ``max5`` preset so the fallback path is
   always safe.
 - Cap both values at an absolute ceiling (``_HARD_5H_CAP``,
   ``_HARD_WEEK_CAP``) so an unusual historical outlier can't let the
   runner burn without bound.
+
+Rationale for ``max * growth`` over ``p90``: the Claude subscription's
+real 5h rate limit is not programmatically exposed — it only shows up in
+the Claude Code app UI (which reads it from HTTP rate-limit headers in
+the running session). ``p90`` was chosen as a "safe" estimate, but when
+ccusage's own inferred limit (observed max) is ~135M and the real cap is
+~225M (as observed on a Max5 subscription 2026-04-20), ``p90 ≈ 100M``
+throttles the runner 55 % below the real ceiling. Using ``max * 1.25``
+gets us to ~170M — still under the real cap, but much closer — and
+self-corrects as new peaks accrue.
 """
 
 from __future__ import annotations
@@ -47,6 +61,15 @@ _FLOOR_PLAN = "max5"
 
 # Minimum historical signal required to trust the calibration.
 _MIN_BLOCKS = 10
+
+# Growth factor applied to the observed peak. 1.0 would mean "never go
+# above the peak you've already seen", which under-throttles on new
+# Claude CLI versions or heavier-than-usual workloads; 1.25 gives the
+# scheduler headroom to discover a higher ceiling empirically (when the
+# runner hits the real rate limit it emits ``budget_wait`` and the next
+# session's calibration picks up the new peak). Values above ~1.5
+# approach the hard caps and defeat the "observed history" premise.
+_GROWTH_FACTOR = 1.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,23 +154,34 @@ def calibrate_budgets(source: BudgetSource | None) -> CalibrationResult:
             reason=f"only {len(blocks)} historical blocks (need {_MIN_BLOCKS})",
         )
 
-    p90_block = _percentile(blocks, 0.90)
+    max_block = max(blocks)
+    peak_block_with_growth = int(max_block * _GROWTH_FACTOR)
     if len(weeks) >= 2:
-        p90_week = _percentile(weeks, 0.90)
+        max_week = max(weeks)
+        peak_week_with_growth = int(max_week * _GROWTH_FACTOR)
     else:
         # Not enough completed weeks — approximate a realistic weekly
-        # ceiling as two full weeks of the typical per-block peak.
-        # (Claude Max plans reset every 5h, so up to 42 blocks per week.
-        # Using p90_block * 14 is roughly "7 blocks/day for 2 days" —
-        # deliberately conservative.)
-        p90_week = p90_block * 14
+        # ceiling as 14 blocks' worth of the block ceiling.
+        max_week = None
+        peak_week_with_growth = peak_block_with_growth * 14
 
-    budget_5h = max(floor.budget_5h_tokens, min(p90_block, _HARD_5H_CAP))
-    budget_weekly = max(floor.budget_weekly_tokens, min(p90_week, _HARD_WEEK_CAP))
+    budget_5h = max(floor.budget_5h_tokens, min(peak_block_with_growth, _HARD_5H_CAP))
+    budget_weekly = max(floor.budget_weekly_tokens, min(peak_week_with_growth, _HARD_WEEK_CAP))
 
-    reason = (
-        f"p90 of {len(blocks)} blocks = {p90_block:,}; p90 of {len(weeks)} weeks = {p90_week:,}"
-    )
+    if max_week is None:
+        reason = (
+            f"max of {len(blocks)} blocks = {max_block:,}; "
+            f"ceiling = max x {_GROWTH_FACTOR} = {peak_block_with_growth:,}; "
+            f"weekly approximated as 14x block ceiling = {peak_week_with_growth:,} "
+            f"(fewer than 2 completed weeks on file)"
+        )
+    else:
+        reason = (
+            f"max of {len(blocks)} blocks = {max_block:,} "
+            f"(ceiling = max x {_GROWTH_FACTOR} = {peak_block_with_growth:,}); "
+            f"max of {len(weeks)} weeks = {max_week:,} "
+            f"(ceiling = max x {_GROWTH_FACTOR} = {peak_week_with_growth:,})"
+        )
     _log.info(
         "plan=auto: calibrated from %s history — budget_5h=%s, budget_weekly=%s (%s)",
         getattr(source, "name", "unknown"),

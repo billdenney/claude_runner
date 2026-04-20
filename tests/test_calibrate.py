@@ -61,16 +61,16 @@ def test_calibrate_fallback_when_too_few_blocks() -> None:
     assert "need 10" in r.reason
 
 
-def test_calibrate_picks_p90_of_blocks() -> None:
-    # 10 blocks with totals 10M ... 100M (sorted)
+def test_calibrate_picks_max_block_with_growth_factor() -> None:
+    # 10 blocks with totals 10M ... 100M (sorted); max = 100M
     blocks = [i * 10_000_000 for i in range(1, 11)]  # [10M, 20M, ..., 100M]
     weeks = [300_000_000, 400_000_000]
     src = _FakeHistSource(blocks=blocks, weeks=weeks)
     r = calibrate_budgets(src)
-    # p90 of 10 values (indices 0..9) → index round(0.9*9)=8 → 90M
-    assert r.budget_5h == 90_000_000
-    # p90 of 2 values → index round(0.9*1)=1 → 400M
-    assert r.budget_weekly == 400_000_000
+    # max of blocks = 100M; ceiling = 100M * 1.25 = 125M
+    assert r.budget_5h == 125_000_000
+    # max of weeks = 400M; ceiling = 400M * 1.25 = 500M
+    assert r.budget_weekly == 500_000_000
     assert r.n_blocks == 10
     assert r.n_weeks == 2
 
@@ -79,8 +79,8 @@ def test_calibrate_approximates_weekly_from_block_when_few_weeks() -> None:
     blocks = [i * 10_000_000 for i in range(1, 11)]
     src = _FakeHistSource(blocks=blocks, weeks=[])  # no completed weeks
     r = calibrate_budgets(src)
-    # p90 of 10 values → 90M; approximation is 90M * 14
-    assert r.budget_weekly == 90_000_000 * 14
+    # block max = 100M; block ceiling = 125M; weekly approx = 125M * 14
+    assert r.budget_weekly == 125_000_000 * 14
 
 
 def test_calibrate_floors_at_max5_preset() -> None:
@@ -127,12 +127,13 @@ def test_controller_uses_calibration_for_budget_when_plan_is_auto() -> None:
         budget_source="static",
         plan="auto",
     )
-    blocks = [i * 10_000_000 for i in range(1, 11)]  # p90 = 90M
-    weeks = [200_000_000, 300_000_000]
+    blocks = [i * 10_000_000 for i in range(1, 11)]  # max = 100M
+    weeks = [200_000_000, 300_000_000]  # max = 300M
     source = _FakeHistSource(blocks, weeks)
     controller = TokenBudgetController(settings, source=source)
-    assert controller.budget_5h == 90_000_000
-    assert controller.budget_week == 300_000_000  # p90 of 2 = index 1 (0-based)
+    # max block * 1.25 growth = 125M; max week * 1.25 = 375M
+    assert controller.budget_5h == 125_000_000
+    assert controller.budget_week == 375_000_000
     assert controller.calibration is not None
     assert controller.calibration.n_blocks == 10
 
