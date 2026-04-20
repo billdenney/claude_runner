@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Subprocess backend now trusts the stream-json ``{"type":"result"}``
+  message over the process exit code.** Claude CLI v2 has been observed
+  to return exit code ``1`` after otherwise-successful long sessions
+  (~6-7M cache reads, 20-45 min wall-clock), evidently as a
+  non-deterministic cleanup-path quirk. Before this fix, the runner
+  classified those sessions as ``FAILED`` even though the agent had
+  committed and pushed its branch — e.g. in one production batch the
+  runner marked 4 of 6 tasks ``failed`` when in fact all 4 had
+  successfully pushed ``add-<Author>_<Year>_<drug>`` branches to origin.
+  The stream-json ``result`` message (which carries ``stop_reason``,
+  ``subtype``, ``is_error``, ``api_error_status``) is now captured and
+  treated as authoritative: if the session ended cleanly per
+  stream-json, the task is marked ``completed`` regardless of the exit
+  code, and a ``claude_cli_exit_code_mismatch`` event is emitted so the
+  operator can see the underlying CLI quirk. Converse case handled too:
+  a stream-json ``is_error=true`` overrides a spurious ``rc=0``. True
+  crashes (no ``result`` line emitted) still fall back to exit-code
+  reporting. Four regression tests in
+  ``tests/test_subprocess_backend.py``.
 - **Subprocess backend now pipes the prompt via stdin instead of passing
   it as an argv.** Previously the entire prompt text was the positional
   `prompt` argument to `claude -p`, which made it visible in

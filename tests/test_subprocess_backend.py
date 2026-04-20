@@ -276,6 +276,183 @@ async def test_subprocess_backend_pipes_prompt_via_stdin_not_argv(
 
 
 @pytest.mark.asyncio
+async def test_stream_json_success_overrides_nonzero_exit_code(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude CLI v2 has been observed to return exit code 1 after long
+    sessions that end cleanly on stop_reason=end_turn (see _StreamResult
+    docstring). When the stream-json ``result`` line reports success, the
+    runner must trust that over the exit code; otherwise the branch-pushed,
+    commit-committed work is falsely marked as failed."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(),
+        log_dir=state_store.root / "logs",
+        stdout=False,
+    )
+    lines = [
+        (json.dumps({"type": "system", "subtype": "init", "session_id": "sid-ok"}) + "\n").encode(),
+        (
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "total_cost_usd": 2.50,
+                }
+            )
+            + "\n"
+        ).encode(),
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=1)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.success is True, (
+        "exit-code-1 + successful result line must still count as success"
+    )
+    assert result.error is None
+    assert state_store.load(spec.id).status is TaskStatus.COMPLETED
+    # Runner logs the underlying CLI quirk so the operator can see it.
+    events = state_store.events_path().read_text().splitlines()
+    assert any("claude_cli_exit_code_mismatch" in line for line in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_json_is_error_true_overrides_zero_exit_code(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Converse case: stream-json says is_error=true even though exit code
+    is 0. The runner must respect the stream-json's authority here too."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(),
+        log_dir=state_store.root / "logs",
+        stdout=False,
+    )
+    lines = [
+        (
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sid-err"}) + "\n"
+        ).encode(),
+        (
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",  # misleading; is_error is the truth
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "result": "API rate limit exceeded",
+                }
+            )
+            + "\n"
+        ).encode(),
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.success is False
+    assert state_store.load(spec.id).status is TaskStatus.FAILED
+    # The user-facing error should reflect the stream-json's diagnostic.
+    assert "rate limit" in (result.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_missing_result_line_falls_back_to_exit_code(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """True crash case — claude CLI dies before emitting ``{"type":"result"}``.
+    Without a stream-json signal, the runner must still fail on rc != 0."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(),
+        log_dir=state_store.root / "logs",
+        stdout=False,
+    )
+    lines = [
+        (
+            json.dumps({"type": "system", "subtype": "init", "session_id": "sid-crash"}) + "\n"
+        ).encode(),
+        # No result line follows — simulating a true crash / SIGKILL.
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=137)  # SIGKILL
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.success is False
+    assert state_store.load(spec.id).status is TaskStatus.FAILED
+    assert "137" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_max_turns_stop_reason_maps_to_failure_via_is_error_false(
+    tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stop_reason='max_turns' with is_error=False is still a successful
+    session end from claude CLI's perspective — the agent ran its allotted
+    turns. Treat as success so the operator gets the partial work preserved
+    via the regular completion path (worktree retention, etc.). The state's
+    ``stop_reason`` carries the distinction for downstream reporting."""
+    state_store = StateStore(tmp_project / ".claude_runner")
+    emitter = EventEmitter(
+        events_path=state_store.events_path(),
+        log_dir=state_store.root / "logs",
+        stdout=False,
+    )
+    lines = [
+        (json.dumps({"type": "system", "subtype": "init", "session_id": "sid-mt"}) + "\n").encode(),
+        (
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "stop_reason": "max_turns",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                }
+            )
+            + "\n"
+        ).encode(),
+    ]
+
+    async def fake_create(*_args, **_kwargs):
+        return _FakeProc(lines, rc=0)
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    backend = SubprocessBackend(state_store=state_store, emitter=emitter)
+    spec = _spec(tmp_project, settings)
+    result = await backend.run_task(spec)
+
+    assert result.success is True
+    assert result.stop_reason.value == "max_turns"
+
+
+@pytest.mark.asyncio
 async def test_subprocess_backend_reports_failure_when_subprocess_raises(
     tmp_project: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

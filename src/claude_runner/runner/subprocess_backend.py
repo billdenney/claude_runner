@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from claude_runner.models import DispatchResult, StopReason, TaskStatus, TokenUsage
@@ -16,6 +17,29 @@ from claude_runner.state.store import StateStore
 from claude_runner.todo.schema import TaskSpec
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _StreamResult:
+    """Captured fields from the stream-json ``{"type":"result"}`` message.
+
+    Claude CLI emits this message as the last line of stream-json stdout when
+    a session ends. Its ``stop_reason`` / ``subtype`` / ``is_error`` fields
+    are more authoritative than the process exit code, which Claude CLI v2
+    has been observed to return as ``1`` after otherwise-successful long
+    sessions (~6-7M cache reads, 20-45 min wall-clock), evidently as a
+    non-deterministic cleanup-path quirk. When the stream-json says the
+    session ended on ``end_turn`` with ``is_error=false``, trust that and
+    treat the task as successful regardless of the exit code.
+    """
+
+    seen: bool = False
+    stop_reason: str | None = None
+    subtype: str | None = None
+    is_error: bool = False
+    api_error_status: int | None = None
+    result_text: str | None = None
+
 
 # Maximum stream-json line length (bytes) that the backend will accept from
 # the claude CLI. The asyncio StreamReader default is 64 KiB, but a single
@@ -85,6 +109,7 @@ class SubprocessBackend:
 
         started = datetime.now(tz=UTC)
         usage = TokenUsage()
+        stream_result = _StreamResult()
         stop_reason = StopReason.END_TURN
         error: str | None = None
         success = True
@@ -125,13 +150,59 @@ class SubprocessBackend:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                self._handle_line(spec.id, line.decode("utf-8", "replace").strip(), usage)
+                self._handle_line(
+                    spec.id,
+                    line.decode("utf-8", "replace").strip(),
+                    usage,
+                    stream_result,
+                )
             stderr = (await proc.stderr.read()).decode("utf-8", "replace") if proc.stderr else ""
             rc = await proc.wait()
-            if rc != 0:
+            # Decide success from (stream-json result, exit code). The
+            # stream-json ``result`` line is authoritative when present:
+            # Claude CLI v2 has been observed to return exit code 1 after
+            # long sessions that end cleanly on ``stop_reason=end_turn``
+            # (see _StreamResult docstring for the failure mode). Only
+            # trust the exit code when the result line is missing (true
+            # crash) or when the result itself reports an error.
+            if stream_result.seen and not stream_result.is_error:
+                # Authoritative success signal from claude CLI. Log a
+                # warning if the exit code disagrees so the operator can
+                # see the underlying CLI quirk without it breaking tasks.
+                if rc != 0:
+                    self._emitter.emit(
+                        "claude_cli_exit_code_mismatch",
+                        task_id=spec.id,
+                        rc=rc,
+                        stream_stop_reason=stream_result.stop_reason,
+                        stream_subtype=stream_result.subtype,
+                    )
+                    _log.warning(
+                        "task %s: claude CLI exited rc=%d but stream-json "
+                        "result reports stop_reason=%r subtype=%r; "
+                        "treating as success per stream-json (exit code is "
+                        "non-deterministic in claude CLI v2 for long sessions)",
+                        spec.id,
+                        rc,
+                        stream_result.stop_reason,
+                        stream_result.subtype,
+                    )
+                success = True
+                stop_reason = _stop_reason_from_stream(stream_result.stop_reason)
+            elif stream_result.seen and stream_result.is_error:
+                success = False
+                stop_reason = StopReason.ERROR
+                error = (
+                    stream_result.result_text
+                    or stderr.strip()
+                    or f"claude stream-json reported is_error=true "
+                    f"(api_error_status={stream_result.api_error_status})"
+                )
+            elif rc != 0:
                 success = False
                 stop_reason = StopReason.ERROR
                 error = stderr.strip() or f"claude exited with code {rc}"
+            # else: rc == 0 and no result line — legacy success path.
         except Exception as exc:
             success = False
             stop_reason = StopReason.ERROR
@@ -190,7 +261,13 @@ class SubprocessBackend:
             error=error,
         )
 
-    def _handle_line(self, task_id: str, line: str, usage: TokenUsage) -> None:
+    def _handle_line(
+        self,
+        task_id: str,
+        line: str,
+        usage: TokenUsage,
+        stream_result: _StreamResult,
+    ) -> None:
         if not line:
             return
         try:
@@ -204,6 +281,26 @@ class SubprocessBackend:
             if isinstance(sid, str):
                 self._state_store.write_session_id(task_id, sid)
                 self._emitter.emit("session_captured", task_id=task_id, session_id=sid)
+        if msg.get("type") == "result":
+            # Authoritative session-end signal. Subtype "success" (the happy
+            # path) plus is_error False means the agent reached its natural
+            # stopping point; we prefer this over the process exit code.
+            stream_result.seen = True
+            sr = msg.get("stop_reason")
+            if isinstance(sr, str):
+                stream_result.stop_reason = sr
+            st = msg.get("subtype")
+            if isinstance(st, str):
+                stream_result.subtype = st
+            err_flag = msg.get("is_error")
+            if isinstance(err_flag, bool):
+                stream_result.is_error = err_flag
+            api_err = msg.get("api_error_status")
+            if isinstance(api_err, int):
+                stream_result.api_error_status = api_err
+            rt = msg.get("result")
+            if isinstance(rt, str):
+                stream_result.result_text = rt
         result_usage = msg.get("usage")
         if isinstance(result_usage, dict):
             usage.input_tokens += int(result_usage.get("input_tokens") or 0)
@@ -213,3 +310,15 @@ class SubprocessBackend:
         cost = msg.get("total_cost_usd")
         if isinstance(cost, (int, float)):
             usage.cost_usd = float(cost)
+
+
+def _stop_reason_from_stream(sr: str | None) -> StopReason:
+    """Map a stream-json ``stop_reason`` string to the runner's enum."""
+    if sr is None:
+        return StopReason.END_TURN
+    try:
+        return StopReason(sr)
+    except ValueError:
+        # Unknown future values → treat as end_turn (successful) since the
+        # caller only invokes this on the happy path (is_error=False).
+        return StopReason.END_TURN
