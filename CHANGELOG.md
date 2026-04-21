@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`initial_concurrency` config key + EMA-warm ramp.** Previously the
+  budget controller computed `target_concurrency` from the per-task
+  token EMA on every tick, clamped to `max_concurrency`. The EMA is 0
+  until the first task has reported usage, which means on a cold
+  scheduler the target immediately saturated `max_concurrency` — fine
+  for small well-understood batches but dangerous for a fresh
+  100-task queue where the operator has no idea how many tokens each
+  task will burn. If `max_concurrency = 10` and each task happens to
+  cost 15M tokens, a 5-hour rate-limit reset's worth of budget can
+  evaporate in the first 15 minutes.
+
+  New behavior: if `initial_concurrency` is set (and
+  `initial_concurrency ≤ max_concurrency`), the controller returns
+  `min(initial_concurrency, max_concurrency)` from
+  `target_concurrency()` until at least `ema_warm_after` completions
+  (default 1) have contributed real usage data to the EMA. After
+  warm-up the utilization-maximizing calculation takes over, so the
+  effective concurrency grows from `initial_concurrency` toward
+  `max_concurrency` as the runner learns the real per-task cost.
+  Completions with zero reported usage (a crashed claude subprocess
+  that emitted no stream-json `result` line) do *not* count toward
+  warm-up, since they have no token signal to contribute.
+
+  `initial_concurrency` defaults to `None` (== `max_concurrency`), so
+  existing deployments see zero behavior change unless they opt in.
+  A Pydantic validator rejects `initial_concurrency >
+  max_concurrency`.
+
+  7 new tests in `tests/test_initial_concurrency.py` cover cold-start
+  behavior, warm-up transition, multi-completion thresholds
+  (`ema_warm_after > 1`), zero-usage tasks not counting, the
+  pydantic-level validation, and report-field tracking.
+
 - **`plan = "auto"` budget calibration.** Static plan presets (pro / max5 /
   max20 / team) were added when cache reads were a minor fraction of API
   billing. Modern Claude Code workflows are cache-heavy and routinely

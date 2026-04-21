@@ -63,6 +63,14 @@ class TokenBudgetController:
         self._ema_tokens: float = 0.0
         self._ema_duration_s: float = 60.0  # seed: 1 minute
         self._observed_min_estimate = 0
+        self._completed_with_usage = 0
+        # Resolved initial_concurrency: falls back to max_concurrency when
+        # unset (historical behavior — no warm-up ramp).
+        self._initial_concurrency: int = (
+            settings.initial_concurrency
+            if settings.initial_concurrency is not None
+            else settings.max_concurrency
+        )
 
         # ``plan = "auto"`` delegates the budget numbers to the historical
         # probe on the source. Do it once at construction; the result is
@@ -124,6 +132,11 @@ class TokenBudgetController:
         self._rolling.record(billable, at=now)
         self._weekly.record(billable, at=now)
         if billable > 0:
+            # Only count a "completion" for EMA-warmup purposes when the
+            # task actually reported usage — it's the usage that feeds the
+            # EMA, and a task that crashed before emitting any tokens
+            # shouldn't advance the warmup counter.
+            self._completed_with_usage += 1
             if self._ema_tokens <= 0:
                 self._ema_tokens = float(billable)
             else:
@@ -161,8 +174,33 @@ class TokenBudgetController:
     def remaining_week(self) -> int:
         return max(self.budget_week - self.used_week() - self._in_flight_estimate, 0)
 
+    def ema_is_warm(self) -> bool:
+        """True when enough tasks have reported usage for the EMA to be
+        a reliable per-task token-cost signal.
+
+        Controlled by ``Settings.ema_warm_after`` (default 1). Before
+        warm-up, ``target_concurrency`` uses ``initial_concurrency``
+        rather than trying to extrapolate from zero or one data point.
+        """
+        return self._completed_with_usage >= self._settings.ema_warm_after
+
     def target_concurrency(self) -> int:
-        """Pick N so that expected utilization ≥ min_utilization of the 5h budget."""
+        """Pick N so that expected utilization ≥ min_utilization of the 5h budget.
+
+        Before the token-per-task EMA has seen enough completions
+        (``Settings.ema_warm_after``), this returns
+        ``min(initial_concurrency, max_concurrency)`` — that's the
+        conservative starting point the operator configured for "give
+        the first task(s) a chance to establish how expensive tasks
+        are before spawning a fleet".
+
+        Once the EMA is warm, return the utilization-maximizing target
+        (``min_utilization * budget_5h / 5h`` tokens-per-second divided
+        by the EMA tokens-per-task rate), clamped to the
+        ``max_concurrency`` ceiling.
+        """
+        if not self.ema_is_warm():
+            return min(self._initial_concurrency, self._settings.max_concurrency)
         target_tps = self._settings.min_utilization * self.budget_5h / _FIVE_HOUR_SECONDS
         per_task_tps = max(self._ema_tokens / self._ema_duration_s, 1.0)
         needed = max(1, int(-(-target_tps // per_task_tps)))  # ceil
