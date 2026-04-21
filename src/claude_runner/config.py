@@ -47,6 +47,32 @@ class Settings(BaseSettings):
     backend: Literal["asyncio", "subprocess"] = "asyncio"
 
     max_concurrency: int = Field(default=8, ge=1)
+    """Ceiling on ``target_concurrency`` once the per-task token EMA has
+    warmed up. The budget controller will grow target_concurrency toward
+    this limit as observed usage allows, but never above it."""
+
+    initial_concurrency: int | None = Field(default=None, ge=1)
+    """Starting concurrency used until the per-task token EMA has at
+    least ``ema_warm_after`` completions of data to extrapolate from.
+
+    Before the EMA is warm, ``target_concurrency`` returns
+    ``min(initial_concurrency, max_concurrency)``; after it's warm, the
+    controller resumes its utilization-based sizing capped at
+    ``max_concurrency``. Defaults to ``max_concurrency`` (i.e. no
+    warm-up ramp — historical behavior) when unset.
+
+    Typical use: set ``initial_concurrency = 1`` or ``2`` at the start
+    of a large batch so the first task gives the runner a realistic
+    tokens-per-task signal before it spawns N parallel Opus sessions
+    and burns through a 5-hour rate limit in 15 minutes."""
+
+    ema_warm_after: int = Field(default=1, ge=1)
+    """How many completed tasks are required before the EMA is
+    considered reliable enough to scale concurrency off of. While
+    fewer than this many tasks have completed, ``target_concurrency``
+    is capped at ``initial_concurrency``. Default 1 — after the very
+    first completion we have a real signal."""
+
     min_utilization: float = Field(default=0.80, ge=0.0, le=1.0)
     weekly_guard: float = Field(default=0.90, ge=0.0, le=1.0)
     refresh_interval_s: int = Field(default=30, ge=1)
@@ -92,6 +118,16 @@ class Settings(BaseSettings):
         min_samples = info.data.get("failure_rate_min_samples", 4)
         if v < min_samples:
             raise ValueError("failure_rolling_window must be >= failure_rate_min_samples")
+        return v
+
+    @field_validator("initial_concurrency")
+    @classmethod
+    def _initial_le_max(cls, v: int | None, info: Any) -> int | None:
+        if v is None:
+            return None
+        max_c = info.data.get("max_concurrency", 8)
+        if v > max_c:
+            raise ValueError(f"initial_concurrency ({v}) must be <= max_concurrency ({max_c})")
         return v
 
     def resolved_budget_5h(self) -> int:
