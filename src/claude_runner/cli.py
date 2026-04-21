@@ -57,6 +57,50 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show queue and usage summary")
     p_status.add_argument("project_dir", nargs="?", default=".", type=Path)
+    p_status.add_argument(
+        "--active",
+        action="store_true",
+        help=(
+            "Show only non-terminal tasks (running, ready_to_resume, "
+            "awaiting_input, pending, queued, failed). Hides completed "
+            "tasks — much more scannable on large queues."
+        ),
+    )
+    p_status.add_argument(
+        "--filter",
+        dest="status_filter",
+        default=None,
+        help=(
+            "Comma-separated list of statuses to show "
+            "(e.g. `running,awaiting_input`). Overrides --active."
+        ),
+    )
+    p_status.add_argument(
+        "--compact",
+        "-c",
+        action="store_true",
+        help=(
+            "Skip the per-task table entirely; print only the per-status "
+            "count line + budget summary + any awaiting-input alerts. "
+            "Good for scripts and quick at-a-glance checks."
+        ),
+    )
+
+    p_awaiting = sub.add_parser(
+        "awaiting",
+        help=(
+            "List or inspect open sidecar stop-and-ask requests. "
+            "Without arguments, lists all tasks awaiting input. "
+            "With --show, pretty-prints a single task's request."
+        ),
+    )
+    p_awaiting.add_argument("project_dir", nargs="?", default=".", type=Path)
+    p_awaiting.add_argument(
+        "--show",
+        dest="show_task_id",
+        default=None,
+        help="Task id whose open request should be pretty-printed in full.",
+    )
 
     p_validate = sub.add_parser("validate", help="Parse every task YAML and report errors")
     p_validate.add_argument("project_dir", nargs="?", default=".", type=Path)
@@ -118,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_resume(args)
     if args.command == "input":
         return _cmd_input(args)
+    if args.command == "awaiting":
+        return _cmd_awaiting(args)
     parser.error(f"unknown command {args.command}")
     raise AssertionError  # pragma: no cover - parser.error always raises SystemExit
 
@@ -168,6 +214,31 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 1 if result.errors else 0
 
 
+_ACTIVE_STATUSES = {
+    "running",
+    "queued",
+    "ready_to_resume",
+    "awaiting_input",
+    "pending",
+    "failed",
+}
+
+
+def _resolve_status_filter(args: argparse.Namespace) -> set[str] | None:
+    """Figure out which TaskStatus values the operator wants to see.
+
+    Precedence: ``--filter`` (explicit list) > ``--active`` (hide completed) >
+    None (show everything). Returns the set of allowed status strings, or
+    ``None`` for "no filter".
+    """
+    raw = getattr(args, "status_filter", None)
+    if raw:
+        return {s.strip().lower() for s in raw.split(",") if s.strip()}
+    if getattr(args, "active", False):
+        return set(_ACTIVE_STATUSES)
+    return None
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     project_dir: Path = args.project_dir.resolve()
     settings = load_settings(project_dir)
@@ -179,23 +250,44 @@ def _cmd_status(args: argparse.Namespace) -> int:
     )
     entries = catalog.all_entries()
     console = Console()
-    table = Table(title=f"claude_runner status — {project_dir}")
-    table.add_column("ID")
-    table.add_column("Status")
-    table.add_column("Attempts", justify="right")
-    table.add_column("Last run")
-    table.add_column("Session")
-    table.add_column("Title")
-    for e in entries:
-        table.add_row(
-            e.spec.id,
-            e.state.status.value,
-            str(e.state.attempts),
-            e.state.last_finished_at.isoformat() if e.state.last_finished_at else "-",
-            (e.state.session_id or "-")[:12],
-            e.spec.title,
-        )
-    console.print(table)
+
+    # Always compute the per-status count line — it's scannable and cheap.
+    from collections import Counter
+
+    counts = Counter(e.state.status.value for e in entries)
+    summary_parts = [f"{v} {k}" for k, v in sorted(counts.items())]
+    console.print(f"[bold]{len(entries)} tasks:[/] " + ", ".join(summary_parts))
+
+    status_filter = _resolve_status_filter(args)
+    if status_filter is not None:
+        filtered = [e for e in entries if e.state.status.value in status_filter]
+    else:
+        filtered = entries
+
+    # Table is suppressed in compact mode or when the filter matches nothing.
+    if not args.compact and filtered:
+        title = f"claude_runner status — {project_dir}"
+        if status_filter is not None:
+            title += f" ({', '.join(sorted(status_filter))})"
+        table = Table(title=title)
+        table.add_column("ID")
+        table.add_column("Status")
+        table.add_column("Attempts", justify="right")
+        table.add_column("Last run")
+        table.add_column("Session")
+        table.add_column("Title")
+        for e in filtered:
+            table.add_row(
+                e.spec.id,
+                e.state.status.value,
+                str(e.state.attempts),
+                e.state.last_finished_at.isoformat() if e.state.last_finished_at else "-",
+                (e.state.session_id or "-")[:12],
+                e.spec.title,
+            )
+        console.print(table)
+    elif not args.compact and status_filter is not None:
+        console.print(f"  [dim](no tasks match filter {sorted(status_filter)})[/]")
 
     # Surface any AWAITING_INPUT tasks so the operator sees pending questions.
     awaiting = [e for e in entries if e.state.is_awaiting_input()]
@@ -365,6 +457,71 @@ def _cmd_input(args: argparse.Namespace) -> int:
         f"[bold green]Answered[/] task {task_id} seq={open_req.sequence}; "
         f"status -> {state.status.value}"
     )
+    return 0
+
+
+def _cmd_awaiting(args: argparse.Namespace) -> int:
+    """List or inspect open sidecar stop-and-ask requests.
+
+    Without ``--show``, prints a scannable list of every task that
+    currently has an OPEN sidecar request along with its summary and
+    request sequence — quicker than piping ``status`` through ``grep`` or
+    hunting through ``.claude_runner/sidecar/`` by hand.
+
+    With ``--show <task_id>``, pretty-prints the full newest OPEN
+    request for that task (context, each question, each option, and the
+    recommended answer) so the operator can decide without opening JSON
+    manually.
+    """
+    project_dir: Path = args.project_dir.resolve()
+    settings = load_settings(project_dir)
+    runner_root = project_dir / settings.state_subdir
+    sidecar_store = SidecarStore(runner_root / "sidecar")
+
+    console = Console()
+
+    if args.show_task_id:
+        task_id: str = args.show_task_id
+        req = sidecar_store.find_open_request(task_id)
+        if req is None:
+            console.print(f"[red]No open sidecar request for task[/] {task_id}")
+            return 1
+        console.print(
+            f"[bold cyan]Task {task_id} — request seq {req.sequence}[/] (state: {req.state.value})"
+        )
+        console.print(f"[dim]created_at:[/] {req.created_at.isoformat()}")
+        console.print(f"[bold]Summary:[/] {req.summary}")
+        if req.context:
+            console.print(f"[bold]Context:[/]\n{req.context}\n")
+        for q in req.questions:
+            console.print(f"\n[bold yellow]Q {q.id}:[/] {q.prompt}")
+            for opt in q.options:
+                marker = "[green][RECOMMENDED][/] " if q.recommended == opt.value else ""
+                console.print(f"  {marker}[{opt.value}] {opt.label}")
+            if q.recommended:
+                console.print(f"  [dim]recommended:[/] {q.recommended}")
+            if q.multi_select:
+                console.print("  [dim](multi-select)[/]")
+        console.print(
+            "\n[dim]Answer with:[/] "
+            f"claude-runner input {task_id} --answers '{{...}}' [--notes ...]"
+        )
+        return 0
+
+    # List mode.
+    task_ids = sorted(sidecar_store.list_awaiting_task_ids())
+    if not task_ids:
+        console.print("[green]No tasks awaiting operator input.[/]")
+        return 0
+    console.print(f"[bold]Tasks awaiting operator input ({len(task_ids)}):[/]")
+    for task_id in task_ids:
+        req = sidecar_store.find_open_request(task_id)
+        if req is None:
+            console.print(f"  [yellow]•[/] {task_id} (request unreadable)")
+            continue
+        summary = req.summary or "(no summary)"
+        console.print(f"  [yellow]•[/] {task_id} [dim](seq {req.sequence})[/] — {summary}")
+    console.print("\n[dim]Inspect one with:[/] claude-runner awaiting --show <task_id>")
     return 0
 
 
