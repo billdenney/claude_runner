@@ -17,6 +17,7 @@ from claude_runner.budget.controller import TokenBudgetController
 from claude_runner.budget.sources import BudgetSource
 from claude_runner.budget.sources.api_headers import ApiHeadersSource
 from claude_runner.budget.sources.ccusage import CCUsageSource
+from claude_runner.budget.sources.claude_usage import ClaudeUsageSource
 from claude_runner.budget.sources.context_cmd import ContextCmdSource
 from claude_runner.config import Settings, load_settings
 from claude_runner.defaults import Effort
@@ -603,6 +604,21 @@ def _build_source(settings: Settings) -> BudgetSource | None:
         _log.warning(
             "ccusage not available (no ccusage binary and no npx); falling back to claude /context"
         )
+        return ContextCmdSource()
+    if settings.budget_source == "claude_usage":
+        cu = ClaudeUsageSource(
+            budget_5h_tokens=settings.resolved_budget_5h(),
+            budget_weekly_tokens=settings.resolved_budget_weekly(),
+        )
+        if cu.available():
+            return cu
+        _log.warning(
+            "claude-usage helper not found on PATH; falling back to ccusage. "
+            "Install the helper at ~/.local/bin/claude-usage or change budget_source."
+        )
+        fallback = CCUsageSource()
+        if fallback.available():
+            return fallback
         return ContextCmdSource()
     if settings.budget_source == "context":
         return ContextCmdSource()

@@ -480,3 +480,191 @@ def test_ccusage_week_total_rows_not_list(monkeypatch: pytest.MonkeyPatch) -> No
     source = CCUsageSource()
     snap = source.snapshot()
     assert snap.used_week == 0
+
+
+# ----- ClaudeUsageSource --------------------------------------------------
+
+
+from claude_runner.budget.sources.claude_usage import (  # noqa: E402
+    ClaudeUsageError,
+    ClaudeUsageSource,
+)
+
+
+@pytest.fixture
+def fake_claude_usage_payload() -> dict:
+    return {
+        "five_hour": {
+            "utilization": 42.5,
+            "resets_at": "2026-04-24T20:00:00+00:00",
+        },
+        "seven_day": {
+            "utilization": 80.0,
+            "resets_at": "2026-04-30T00:00:00+00:00",
+        },
+        "seven_day_opus": None,
+        "seven_day_sonnet": {"utilization": 4.0, "resets_at": None},
+        "extra_usage": {
+            "is_enabled": True,
+            "monthly_limit": None,
+            "used_credits": 100.0,
+            "currency": "USD",
+        },
+    }
+
+
+def test_claude_usage_snapshot_scales_percent_to_tokens(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/home/bill/.local/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        assert args[-1] == "json"
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(fake_claude_usage_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+    )
+    snap = source.snapshot()
+    assert snap.source == "claude_usage"
+    # 42.5% of 1_000_000 = 425_000
+    assert snap.used_5h == 425_000
+    # 80.0% of 10_000_000 = 8_000_000
+    assert snap.used_week == 8_000_000
+    assert snap.next_5h_reset is not None
+    assert snap.next_5h_reset.year == 2026
+
+
+def test_claude_usage_absolute_path_binary(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict
+) -> None:
+    # Absolute path bypasses shutil.which; should still invoke.
+    captured_args: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        captured_args.append(list(args))
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(fake_claude_usage_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(
+        budget_5h_tokens=100,
+        budget_weekly_tokens=100,
+        binary="/home/bill/.local/bin/claude-usage",
+    )
+    assert source.available()
+    source.snapshot()
+    assert captured_args[0][0] == "/home/bill/.local/bin/claude-usage"
+
+
+def test_claude_usage_missing_binary_returns_zeros(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    assert not source.available()
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+    assert snap.source == "claude_usage"
+
+
+def test_claude_usage_http_failure_yields_zeros(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1, cmd=args, output="", stderr="API returned HTTP 401"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_handles_null_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Some windows come back null depending on plan; snapshot should treat as 0.
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        payload = {
+            "five_hour": None,
+            "seven_day": {"utilization": None, "resets_at": None},
+        }
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000_000, budget_weekly_tokens=10_000_000)
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+    assert snap.next_5h_reset is None
+
+
+def test_claude_usage_clamps_over_100_percent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        payload = {
+            "five_hour": {"utilization": 105.0, "resets_at": None},
+            "seven_day": {"utilization": -2.0, "resets_at": None},
+        }
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    snap = source.snapshot()
+    # 105% clamps to 100 → full budget
+    assert snap.used_5h == 1_000
+    # negative clamps to 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_non_json_output_yields_zeros(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="not json at all", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_timeout_yields_zeros(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_error_class_exists() -> None:
+    # Smoke-test that the error class is exported for callers that want
+    # to raise/reraise on explicit opt-in paths.
+    assert issubclass(ClaudeUsageError, RuntimeError)
