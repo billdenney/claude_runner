@@ -43,7 +43,9 @@ class Settings(BaseSettings):
     budget_5h_tokens: int | None = None
     budget_weekly_tokens: int | None = None
 
-    budget_source: Literal["ccusage", "context", "api_headers", "static"] = "ccusage"
+    budget_source: Literal["ccusage", "claude_usage", "context", "api_headers", "static"] = (
+        "ccusage"
+    )
     backend: Literal["asyncio", "subprocess"] = "asyncio"
 
     max_concurrency: int = Field(default=8, ge=1)

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`claude_usage` budget source.** New `budget_source = "claude_usage"`
+  reads the Anthropic OAuth usage API (`/api/oauth/usage`) via the
+  standalone `claude-usage` helper (`~/.local/bin/claude-usage`). This
+  is the same ground truth the `/usage` slash-command displays inside
+  Claude Code, rather than ccusage's local-transcript estimate. The
+  source receives 0-100 percentage utilization for the 5h and 7-day
+  windows and converts back to token-equivalents against
+  `budget_5h_tokens` / `budget_weekly_tokens` so
+  `TokenBudgetController`'s `budget - used - in_flight` math works in
+  a single unit. Graceful fallback to `ccusage` then `context` when the
+  helper is missing; graceful fallback to zeros (warn-log + internal
+  rolling window takes over) when the API returns a non-200.
 - **`initial_concurrency` config key + EMA-warm ramp.** Previously the
   budget controller computed `target_concurrency` from the per-task
   token EMA on every tick, clamped to `max_concurrency`. The EMA is 0
