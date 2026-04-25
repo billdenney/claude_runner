@@ -571,7 +571,14 @@ def test_claude_usage_absolute_path_binary(
 
 def test_claude_usage_missing_binary_returns_zeros(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda _: None)
-    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    # disk_cache_path=None to opt out of the disk-cache fallback layer that
+    # would otherwise serve real cached data on a developer machine where
+    # ~/.claude/usage-cache.json may exist.
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000,
+        budget_weekly_tokens=10_000,
+        disk_cache_path=None,
+    )
     assert not source.available()
     snap = source.snapshot()
     assert snap.used_5h == 0
@@ -588,7 +595,11 @@ def test_claude_usage_http_failure_yields_zeros(monkeypatch: pytest.MonkeyPatch)
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000,
+        budget_weekly_tokens=10_000,
+        disk_cache_path=None,
+    )
     snap = source.snapshot()
     assert snap.used_5h == 0
     assert snap.used_week == 0
@@ -645,7 +656,11 @@ def test_claude_usage_non_json_output_yields_zeros(monkeypatch: pytest.MonkeyPat
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000,
+        budget_weekly_tokens=10_000,
+        disk_cache_path=None,
+    )
     snap = source.snapshot()
     assert snap.used_5h == 0
     assert snap.used_week == 0
@@ -658,7 +673,11 @@ def test_claude_usage_timeout_yields_zeros(monkeypatch: pytest.MonkeyPatch) -> N
         raise subprocess.TimeoutExpired(cmd=args, timeout=10)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    source = ClaudeUsageSource(budget_5h_tokens=1_000, budget_weekly_tokens=10_000)
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000,
+        budget_weekly_tokens=10_000,
+        disk_cache_path=None,
+    )
     snap = source.snapshot()
     assert snap.used_5h == 0
     assert snap.used_week == 0
@@ -668,3 +687,380 @@ def test_claude_usage_error_class_exists() -> None:
     # Smoke-test that the error class is exported for callers that want
     # to raise/reraise on explicit opt-in paths.
     assert issubclass(ClaudeUsageError, RuntimeError)
+
+
+# ----- ClaudeUsageSource (cache + fallback layers) ------------------------
+
+
+from datetime import UTC as _UTC  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+
+
+def _make_clock(start: datetime):
+    """Return a tickable clock for tests. Call clock.tick(seconds) to advance."""
+
+    class _Clock:
+        def __init__(self, t: datetime) -> None:
+            self.t = t
+
+        def __call__(self) -> datetime:
+            return self.t
+
+        def tick(self, seconds: float) -> None:
+            self.t = self.t + timedelta(seconds=seconds)
+
+    return _Clock(start)
+
+
+def test_claude_usage_in_process_cache_serves_from_memory_within_ttl(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+    call_count = {"n": 0}
+
+    def fake_run(args, **_kwargs):
+        call_count["n"] += 1
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(fake_claude_usage_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    clock = _make_clock(datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC))
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=300,
+        clock=clock,
+    )
+
+    snap1 = source.snapshot()
+    assert call_count["n"] == 1
+    assert snap1.source == "claude_usage"  # live
+
+    clock.tick(60)  # well within the 300s TTL
+    snap2 = source.snapshot()
+    assert call_count["n"] == 1, "should have served from in-process cache"
+    assert snap2.source == "claude_usage/memory_cache"
+    # Same numbers
+    assert snap2.used_5h == snap1.used_5h
+    assert snap2.used_week == snap1.used_week
+
+    clock.tick(300)  # now past the TTL
+    snap3 = source.snapshot()
+    assert call_count["n"] == 2, "TTL expired; should have shelled out again"
+    assert snap3.source == "claude_usage"
+
+
+def test_claude_usage_falls_back_to_disk_cache_on_subprocess_failure(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict, tmp_path
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        # Simulate the helper hitting HTTP 429.
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Pre-populate disk cache with a real-looking payload.
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text(json.dumps(fake_claude_usage_payload), encoding="utf-8")
+
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,  # force live calls so disk fallback path engages
+        disk_cache_path=disk_cache,
+    )
+    snap = source.snapshot()
+    assert snap.source == "claude_usage/disk_cache"
+    # 42.5% of 1_000_000 from the fixture
+    assert snap.used_5h == 425_000
+    assert snap.used_week == 8_000_000
+
+
+def test_claude_usage_disk_cache_used_after_429_warms_memory_cache(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict, tmp_path
+) -> None:
+    """After a disk-cache fallback, subsequent calls within TTL should hit
+    the in-process cache rather than re-reading disk or re-shelling out."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+    call_count = {"n": 0}
+
+    def fake_run(args, **_kwargs):
+        call_count["n"] += 1
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text(json.dumps(fake_claude_usage_payload), encoding="utf-8")
+
+    clock = _make_clock(datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC))
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=300,
+        disk_cache_path=disk_cache,
+        clock=clock,
+    )
+
+    snap1 = source.snapshot()
+    assert snap1.source == "claude_usage/disk_cache"
+    assert call_count["n"] == 1
+
+    clock.tick(60)
+    snap2 = source.snapshot()
+    # Should now be served from in-process cache, no further subprocess call.
+    assert snap2.source == "claude_usage/memory_cache"
+    assert call_count["n"] == 1
+
+
+def test_claude_usage_no_cache_no_disk_emits_zeros(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 401",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    disk_cache = tmp_path / "does-not-exist.json"  # never created
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+        disk_cache_path=disk_cache,
+    )
+    snap = source.snapshot()
+    assert snap.source == "claude_usage"
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_disk_cache_corrupt_json_falls_through_to_zeros(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text("not valid json {{{", encoding="utf-8")
+
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+        disk_cache_path=disk_cache,
+    )
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_disk_cache_disabled_with_none(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict, tmp_path
+) -> None:
+    """Pass disk_cache_path=None to opt out of disk fallback entirely."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Even though the file exists, disk_cache_path=None should ignore it.
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text(json.dumps(fake_claude_usage_payload), encoding="utf-8")
+
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+        disk_cache_path=None,
+    )
+    snap = source.snapshot()
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+
+
+def test_claude_usage_cache_ttl_zero_disables_in_process_cache(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+    call_count = {"n": 0}
+
+    def fake_run(args, **_kwargs):
+        call_count["n"] += 1
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(fake_claude_usage_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+    )
+    source.snapshot()
+    source.snapshot()
+    source.snapshot()
+    assert call_count["n"] == 3, "TTL=0 should bypass in-process cache"
+
+
+def test_claude_usage_max_age_cap_rejects_stale_in_process_cache(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict
+) -> None:
+    """In-process cache older than max_cache_age_s must not be served,
+    even if cache_ttl_s is larger."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+    call_count = {"n": 0}
+
+    def fake_run(args, **_kwargs):
+        call_count["n"] += 1
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(fake_claude_usage_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    clock = _make_clock(datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC))
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=3600,  # 1 hour soft TTL
+        max_cache_age_s=900,  # 15 minutes hard cap
+        disk_cache_path=None,
+        clock=clock,
+    )
+    source.snapshot()
+    assert call_count["n"] == 1
+
+    clock.tick(14 * 60)  # 14 minutes — within 15-min cap
+    source.snapshot()
+    assert call_count["n"] == 1, "should still serve from in-process cache"
+
+    clock.tick(2 * 60)  # now 16 minutes total — past cap
+    source.snapshot()
+    assert call_count["n"] == 2, "cap reached; must shell out fresh"
+
+
+def test_claude_usage_disk_cache_rejected_when_file_too_old(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict, tmp_path
+) -> None:
+    """Disk cache older than max_cache_age_s must be ignored."""
+    import os
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text(json.dumps(fake_claude_usage_payload), encoding="utf-8")
+
+    # Make the file 30 minutes old (mtime = now - 30 min). The default cap
+    # is 15 min, so this should be rejected.
+    now_ts = datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC).timestamp()
+    old_mtime = now_ts - 30 * 60
+    os.utime(disk_cache, (old_mtime, old_mtime))
+
+    clock = _make_clock(datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC))
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+        max_cache_age_s=900,
+        disk_cache_path=disk_cache,
+        clock=clock,
+    )
+    snap = source.snapshot()
+    # Cache rejected as too old → zeros.
+    assert snap.used_5h == 0
+    assert snap.used_week == 0
+    assert snap.source == "claude_usage"
+
+
+def test_claude_usage_disk_cache_accepted_when_file_just_inside_cap(
+    monkeypatch: pytest.MonkeyPatch, fake_claude_usage_payload: dict, tmp_path
+) -> None:
+    """A disk cache file just inside the 15-min cap should still be served."""
+    import os
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude-usage")
+
+    def fake_run(args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            output="",
+            stderr="API returned HTTP 429",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    disk_cache = tmp_path / "usage-cache.json"
+    disk_cache.write_text(json.dumps(fake_claude_usage_payload), encoding="utf-8")
+
+    # Make the file 10 minutes old — well within the 15-min cap.
+    now_ts = datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC).timestamp()
+    recent_mtime = now_ts - 10 * 60
+    os.utime(disk_cache, (recent_mtime, recent_mtime))
+
+    clock = _make_clock(datetime(2026, 4, 25, 12, 0, 0, tzinfo=_UTC))
+    source = ClaudeUsageSource(
+        budget_5h_tokens=1_000_000,
+        budget_weekly_tokens=10_000_000,
+        cache_ttl_s=0,
+        max_cache_age_s=900,
+        disk_cache_path=disk_cache,
+        clock=clock,
+    )
+    snap = source.snapshot()
+    assert snap.source == "claude_usage/disk_cache"
+    assert snap.used_5h == 425_000  # 42.5% of 1M
