@@ -222,16 +222,13 @@ def show_task(
     task_payload = payload.get("task")
     if isinstance(task_payload, dict):
         console.print(f"  title: {task_payload.get('title')}")
-        console.print(
-            f"  model: {task_payload.get('model')}  effort: {task_payload.get('effort')}"
-        )
+        console.print(f"  model: {task_payload.get('model')}  effort: {task_payload.get('effort')}")
     if "task_error" in payload:
         console.print(f"  [red]task error:[/] {payload['task_error']}")
     state_payload = payload.get("state")
     if isinstance(state_payload, dict):
         console.print(
-            f"  status: {state_payload.get('status')}  "
-            f"attempts: {state_payload.get('attempts')}"
+            f"  status: {state_payload.get('status')}  attempts: {state_payload.get('attempts')}"
         )
         console.print(f"  session_id: {state_payload.get('session_id')}")
     if "state_error" in payload:
