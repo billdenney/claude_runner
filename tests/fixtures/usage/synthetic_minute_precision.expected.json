@@ -1,0 +1,10 @@
+{
+  "five_hour": {
+    "utilization": 77,
+    "resets_at_raw": "3:42pm (UTC)"
+  },
+  "seven_day": {
+    "utilization": 33,
+    "resets_at_raw": "May 4, 11:30pm (UTC)"
+  }
+}

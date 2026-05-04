@@ -1,0 +1,122 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-task-runner"
+version = "0.1.0"
+description = "Window-aware task runner for Claude Code. Tracks 5-hour and 7-day usage windows, throttles dispatch with EMA-driven concurrency, schedules window-start wakeups via supervisor + cron/systemd watchdog."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Bill Denney", email = "wdenney@humanpredictions.com" }]
+keywords = ["claude", "anthropic", "agent", "scheduler", "queue", "rate-limit", "tokens"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pexpect>=4.9",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyte>=0.8",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+ui = ["textual>=0.60"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.12",
+    "hypothesis>=6.100",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "types-pexpect",
+]
+
+[project.scripts]
+claude-task-runner = "claude_task_runner.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/billdenney/claude_task_runner"
+Issues = "https://github.com/billdenney/claude_task_runner/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_task_runner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/claude_task_runner/config/defaults" = "claude_task_runner/config/defaults"
+"src/claude_task_runner/skills" = "claude_task_runner/skills"
+"src/claude_task_runner/templates" = "claude_task_runner/templates"
+"src/claude_task_runner/cron/watchdog.sh" = "claude_task_runner/cron/watchdog.sh"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]  # asserts in tests are fine
+"src/claude_task_runner/cli/*.py" = ["B008"]  # typer's Option/Argument idiom requires call-in-default
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_decorators = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pexpect.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+    "live: tests that spawn the real `claude` binary (require CTR_RUN_LIVE_TESTS=1)",
+    "slow: tests that take >1s",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:pexpect.*",
+]
+
+[tool.coverage.run]
+source = ["src/claude_task_runner"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

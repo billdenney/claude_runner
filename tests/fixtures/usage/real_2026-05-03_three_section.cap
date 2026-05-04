@@ -1,0 +1,59 @@
+7[r8[?25h[?25l[?2004h[?1004h[?2031h]0;✳ Claude Code╭───[1CClaude[1CCode[1Cv2.1.122[1C─────────────────────────────────────────────────────╮
+│[52C│[1CTips[1Cfor[1Cgetting[8C│
+│[17CWelcome[1Cback[1CBill![17C│[1Cstarted[17C│
+│[52C│[1CRun[1C/init[1Cto[1Ccreate[1Ca[1C…[1C│
+│[23C▐▛███▜▌[22C│[1C───────────────────────[1C│
+│[22C▝▜█████▛▘[21C│[1CWhat's[1Cnew[14C│
+│[24C▘▘[1C▝▝[23C│[1CAdded[1C`alwaysLoad`[1Copt…[1C│
+│[4COpus[1C4.7[1C(1M[1Ccontext)[1C·[1CClaude[1CTeam[1C·[1CHuman[5C│[1CAdded[1C`claude[1Cplugin[1Cp…[1C│
+│[4CPredictions[37C│[1CAdded[1Ca[1Ctype-to-filter…[1C│
+│[12C~/github/claude_task_runner[13C│[1C/release-notes[1Cfor[1Cmore[1C│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────────────────────────────────
+❯ [7mT[27mry[1C"how[1Cdoes[1C<filepath>[1Cwork?"
+────────────────────────────────────────────────────────────────────────────────
+[2C?[1Cfor[1Cshortcuts[44C◉[1Cxhigh[1C·[1C/effort
+[2C[3A[>0q[c[2D[3B[4A❯ /usage                                                                        [1B     [1C    [1C    [1C          [1C      [2C[2B Statu[1C   Config[3CUsage[3CStats[27C [1C     [1C [1C       
+
+[2CSession
+[2CTotal[1Ccost:[12C$0.0000
+[2CTotal[1Cduration[1C(API):[2C0s
+[2CTotal[1Cduration[1C(wall):[1C2s
+[2CTotal[1Ccode[1Cchanges:[4C0[1Clines[1Cadded,[1C0[1Clines[1Cremoved
+[2CUsage:[17C0[1Cinput,[1C0[1Coutput,[1C0[1Ccache[1Cread,[1C0[1Ccache[1Cwrite
+
+[2CCurrent[1Csession
+[2C█▌[49C3%[1Cused
+[2CResets[1C11pm[1C(UTC)
+
+[2CCurrent[1Cweek[1C(all[1Cmodels)
+[2C██████████████████████████████████████████████████[1C100%[1Cused
+[2CResets[1C3am[1C(UTC)
+
+[2CRefreshing…
+
+[2CEsc[1Cto[1Ccancel
+[21C[20A[21D[20B[10C[9A0:59pm (UTC)[2C[6BCur[2Cnt week[1C(Sonnet[1Conly)[2C[1B█████[46C10%[1Cused[2C[1BRese[1Cs[1C2:59am[1C(UTC)
+
+[2CEsc[1Cto[1Ccancel
+[21C[22A[21D[22B[H[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[2K[1B[H╭───[1CClaude[1CCode[1Cv2.1.122[1C─────────────────────────────────────────────────────╮
+│[52C│[1CTips[1Cfor[1Cgetting[8C│
+│[17CWelcome[1Cback[1CBill![17C│[1Cstarted[17C│
+│[52C│[1CRun[1C/init[1Cto[1Ccreate[1Ca[1C…[1C│
+│[23C▐▛███▜▌[22C│[1C───────────────────────[1C│
+│[22C▝▜█████▛▘[21C│[1CWhat's[1Cnew[14C│
+│[24C▘▘[1C▝▝[23C│[1CAdded[1C`alwaysLoad`[1Copt…[1C│
+│[4COpus[1C4.7[1C(1M[1Ccontext)[1C·[1CClaude[1CTeam[1C·[1CHuman[5C│[1CAdded[1C`claude[1Cplugin[1Cp…[1C│
+│[4CPredictions[37C│[1CAdded[1Ca[1Ctype-to-filter…[1C│
+│[12C~/github/claude_task_runner[13C│[1C/release-notes[1Cfor[1Cmore[1C│
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+❯[1C/usage
+[2C⎿[2CStatus[1Cdialog[1Cdismissed
+
+────────────────────────────────────────────────────────────────────────────────
+❯ [7m [27m
+────────────────────────────────────────────────────────────────────────────────
+[2C?[1Cfor[1Cshortcuts[44C◉[1Cxhigh[1C·[1C/effort
+[2C[3A[?1006l[?1003l[?1002l[?1000l[2D[3B[>4m[<u[?1004l[?2031l[?2004l[?25h7[r8]9;4;0;]0;

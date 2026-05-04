@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Fake `claude` binary for integration tests.
+
+Reads command-line args from the runner's :func:`build_argv` and
+emits a deterministic stream-json sequence on stdout. Behavior is
+controlled by environment variables so each test can script a
+different scenario without rewriting the shim.
+
+Env vars:
+
+* ``SHIM_SESSION_ID`` (default ``test-session``)
+* ``SHIM_OUTPUT_TOKENS`` (default ``5``) — used in cumulative usage
+* ``SHIM_INPUT_TOKENS`` (default ``10``)
+* ``SHIM_STOP_REASON`` (default ``end_turn``)
+* ``SHIM_IS_ERROR`` (default ``false``)
+* ``SHIM_COST_USD`` (default ``0.05``)
+* ``SHIM_DURATION_MS`` (default ``500``)
+* ``SHIM_SLEEP_BETWEEN_S`` (default ``0``) — sleep between events
+* ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
+   with this message on stderr (used to test resume-fail-fast behavior)
+* ``SHIM_NUM_ASSISTANT_MSGS`` (default ``2``)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+
+def emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> int:
+    fail_fast = os.environ.get("SHIM_FAIL_FAST", "")
+    if fail_fast:
+        sys.stderr.write(fail_fast + "\n")
+        return 1
+
+    session_id = os.environ.get("SHIM_SESSION_ID", "test-session")
+    input_tokens = int(os.environ.get("SHIM_INPUT_TOKENS", "10"))
+    output_tokens = int(os.environ.get("SHIM_OUTPUT_TOKENS", "5"))
+    stop_reason = os.environ.get("SHIM_STOP_REASON", "end_turn")
+    is_error = os.environ.get("SHIM_IS_ERROR", "false").lower() == "true"
+    cost_usd = float(os.environ.get("SHIM_COST_USD", "0.05"))
+    duration_ms = int(os.environ.get("SHIM_DURATION_MS", "500"))
+    sleep_between = float(os.environ.get("SHIM_SLEEP_BETWEEN_S", "0"))
+    num_msgs = int(os.environ.get("SHIM_NUM_ASSISTANT_MSGS", "2"))
+
+    emit({"type": "system", "subtype": "init", "session_id": session_id})
+    if sleep_between:
+        time.sleep(sleep_between)
+
+    per_msg_input = input_tokens // max(num_msgs, 1)
+    per_msg_output = output_tokens // max(num_msgs, 1)
+    cumulative_input = 0
+    cumulative_output = 0
+    for _ in range(num_msgs):
+        cumulative_input += per_msg_input
+        cumulative_output += per_msg_output
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "step"}],
+                    "usage": {
+                        "input_tokens": per_msg_input,
+                        "output_tokens": per_msg_output,
+                    },
+                },
+            }
+        )
+        if sleep_between:
+            time.sleep(sleep_between)
+
+    emit(
+        {
+            "type": "result",
+            "subtype": "error" if is_error else "success",
+            "stop_reason": stop_reason,
+            "is_error": is_error,
+            "total_cost_usd": cost_usd,
+            "duration_ms": duration_ms,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+        }
+    )
+    return 1 if is_error else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

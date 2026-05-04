@@ -1,0 +1,17 @@
+{
+  "five_hour": {
+    "utilization": 3,
+    "resets_at_raw": "10:59pm (UTC)"
+  },
+  "seven_day": {
+    "utilization": 100,
+    "resets_at_raw": "3am (UTC)"
+  },
+  "extra_windows": [
+    {
+      "label": "Sonnet only",
+      "utilization_pct": 10,
+      "resets_at_raw": "2:59am (UTC)"
+    }
+  ]
+}
