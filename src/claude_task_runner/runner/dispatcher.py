@@ -125,6 +125,12 @@ def build_argv(
     if plan.strategy is ResumeStrategy.RESUME and plan.session_id:
         argv.extend(["--resume", plan.session_id])
     argv.extend(plan.extra_args)
+    # The "--" separator is required: Claude's CLI parses --allowedTools as
+    # variadic (<tools...>), so without an explicit terminator it greedily
+    # consumes the trailing positional prompt as another tool name and the
+    # subprocess errors out with "Input must be provided either through stdin
+    # or as a prompt argument when using --print".
+    argv.append("--")
     argv.append(plan.prompt)
     return argv
 
