@@ -296,13 +296,19 @@ def dispatch(
     if shutil.which(claude_executable) is None:
         raise DispatchError(f"claude binary not found: {claude_executable}")
 
-    # Pre-dispatch hook
+    # Pre-dispatch hook. Run with cwd=queue_dir (or None), NOT
+    # task.working_dir: the hook's job is often to *create*
+    # task.working_dir (e.g. `git worktree add`), so requiring it to
+    # already exist would be a chicken-and-egg failure. The hook reads
+    # $TASK_WORKING_DIR from its env (see HookEnv) when it needs to know
+    # the target path.
+    pre_hook_cwd = queue_dir if queue_dir.exists() else None
     hook_result = hooks_mod.run_pre_dispatch(
         settings_hooks,
         task,
         attempt=state.attempts + 1,
         session_id=state.session_id,
-        cwd=task.working_dir,
+        cwd=pre_hook_cwd,
     )
     if hook_result is not None and (hook_result.timed_out or hook_result.exit_code != 0):
         # Pre-dispatch hook failure aborts dispatch with an error RunRecord.
