@@ -143,24 +143,52 @@ os.replace(tmp_path, target)
 The atomic tempfile + `os.replace` write is required: a partial JSON
 file would crash the operator's `/runner-answer-sidecar` skill.
 
-### 5. Exit cleanly
+### 5. Exit cleanly — DO NOT POLL FOR THE RESPONSE
 
-After writing the file, **stop work and exit**. Do not continue with
-the extraction. Do not write a partial result. Do not best-guess the
-question's answer.
+After writing the request file, **immediately exit your process**
+(`exit` from Bash, return from the agent, stop emitting output —
+whatever it takes for the `claude --print` subprocess to terminate).
+Do not continue with the extraction. Do not write a partial result.
+Do not best-guess the question's answer.
 
-The runner's `runner.dispatcher.dispatch` checks for unanswered
-sidecars after every subprocess exit. If your sidecar request is
-present (and unanswered), the dispatcher overrides the task's final
-status to `awaiting_sidecar` regardless of how you exited (clean,
-error, cap). The orchestrator skips `awaiting_sidecar` tasks on
-subsequent ticks, so the slot frees for the next pending task.
+**ANTI-PATTERN — explicitly forbidden:**
 
-When the operator answers (`/runner-answer-sidecar` writes
-`response-<NNN>.json`), the runner's next supervisor tick re-dispatches
-this task via `claude --resume <session_id>`. Your resumed agent
-reads the response file and continues from where you stopped, using
-the operator's chosen option.
+```bash
+# ❌ DO NOT do this. Burns a concurrency slot indefinitely.
+until [ -f .../response-NNN.json ]; do sleep 10; done
+```
+
+A polling loop that waits for the response file blocks your task
+slot for as long as the operator takes to answer (often hours, even
+overnight). It defeats the entire `awaiting_sidecar` mechanism: the
+orchestrator can't free your slot to dispatch the next pending task
+because your subprocess is still alive.
+
+**What actually happens after you exit:**
+
+1. Your `claude` subprocess exits (any exit code is fine — clean,
+   error, or even cap-killed).
+2. The runner's `runner.dispatcher.dispatch` post-run code scans
+   `<queue>/.claude_task_runner/sidecar/<task_id>/` for an unanswered
+   request (any `request-NNN.json` without a matching
+   `response-NNN.json`).
+3. If found, it overrides the task's final status to
+   `awaiting_sidecar` regardless of how you exited.
+4. The orchestrator's eligibility check skips `awaiting_sidecar`
+   tasks, so your slot **frees up for the next pending task in the
+   queue**.
+5. When the operator answers (`/runner-answer-sidecar` writes
+   `response-<NNN>.json`), the next supervisor tick detects the
+   response and re-dispatches this task via
+   `claude --resume <session_id>`.
+6. The resumed agent reads the response file (your previous run's
+   request + the operator's response sit side-by-side in the sidecar
+   dir) and continues from where you stopped, using the operator's
+   chosen option.
+
+**The contract is: you write the request, you exit, the runner
+handles everything else.** Polling is the agent re-implementing the
+runner's job badly.
 
 ## What this skill does NOT do
 
