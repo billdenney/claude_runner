@@ -52,6 +52,38 @@ logger = logging.getLogger(__name__)
 
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
 
+# Task statuses that ARE eligible for (re-)dispatch.
+#
+# This is an explicit allow-list: every status defined in
+# :data:`claude_task_runner.queue.schema.TaskStatus` defaults to
+# NOT-eligible, and a status only becomes eligible by being added to
+# this set. The previous design was a deny-list ("skip these statuses,
+# everything else is eligible"); that pattern silently treated
+# `awaiting_sidecar` as eligible because it had not been added to the
+# skip set, producing an infinite re-dispatch loop where each agent
+# filed a new sidecar request and the orchestrator immediately picked
+# the task up again. An allow-list flips the failure mode: a newly
+# introduced status is fail-safe (not dispatched) until someone
+# deliberately opts it in, which is the right default for a
+# concurrency-burning side effect like dispatch.
+#
+# Currently dispatchable: tasks that have not yet started (`pending`)
+# and tasks whose previous attempt failed for a transient reason
+# (`failed`; the dispatcher's circuit breaker upgrades repeated
+# `failed`s to `failed_circuit_breaker`, which is not in this set).
+#
+# Explicitly NOT dispatched (and the rationale):
+#   - `running`               — already in flight in another thread.
+#   - `awaiting_sidecar`      — waiting for an operator response;
+#                               re-dispatch would just file another sidecar.
+#   - `possibly_hung`         — heartbeat watchdog territory; the runner
+#                               diagnoses, not the orchestrator.
+#   - `completed`             — done.
+#   - `failed_circuit_breaker`— give-up state; operator intervention required.
+#   - `weekly_paused`         — throttled; the supervisor's state machine
+#                               will lift this when the window opens.
+_DISPATCHABLE_STATUSES = frozenset({"pending", "failed"})
+
 
 def tick_dispatch(
     *,
@@ -173,9 +205,11 @@ def _eligible_candidates(
             try:
                 state = load_state(sp)
             except Exception:
+                # Unparseable state file — treat as "not yet dispatched".
+                # The next attempt will overwrite it cleanly.
                 pass
             else:
-                if state.status in ("running", "completed", "failed_circuit_breaker", "weekly_paused"):
+                if state.status not in _DISPATCHABLE_STATUSES:
                     continue
 
         unmet = [d for d in task.depends_on if d not in completed_ids]
