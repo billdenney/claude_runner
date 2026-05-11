@@ -12,7 +12,8 @@ config_dir = ""        # CLAUDE_CONFIG_DIR override; empty = use ~/.claude.
                        # Set to e.g. "/home/bill/.claude_personal" to target
                        # a non-default account whose `claude /login` was run
                        # under that dir. Lets one host run multiple accounts.
-plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" | "team".
+plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
+                       # "team_standard" | "team_premium".
                        # Determines the 5h:weekly token ratio used to derive
                        # default throttle thresholds. Operator can still
                        # override `[throttle.*]` fields explicitly below.
@@ -107,10 +108,22 @@ weekly_tokens    = 39_942_098
 band_full_dispatch_max_pct = 40
 band_slowdown_max_pct      = 60
 
-[plans.team]
-# Team plan budgets vary by org; treat as Max20x-equivalent until
-# operator overrides. Use `claude /usage` against the work account
-# to calibrate.
+[plans.team_standard]
+# Team Standard plan budgets vary by org; treat as Max20x-equivalent
+# until operator overrides. Use `claude /usage` against the work
+# account to calibrate against the actual seat allotment.
+five_hour_tokens = 99_000_000
+weekly_tokens    = 798_841_951
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.team_premium]
+# Team Premium plan: higher per-seat limits than Team Standard.
+# Placeholder values track Max20x; operator should re-calibrate via
+# `claude /usage` against the work account and update both budget
+# fields below when the actual ceiling is known. The 40/60 band
+# pacing applies the same conservative spread across the weekly
+# window regardless of plan tier.
 five_hour_tokens = 99_000_000
 weekly_tokens    = 798_841_951
 band_full_dispatch_max_pct = 40
