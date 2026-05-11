@@ -12,6 +12,12 @@ config_dir = ""        # CLAUDE_CONFIG_DIR override; empty = use ~/.claude.
                        # Set to e.g. "/home/bill/.claude_personal" to target
                        # a non-default account whose `claude /login` was run
                        # under that dir. Lets one host run multiple accounts.
+plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" | "team".
+                       # Determines the 5h:weekly token ratio used to derive
+                       # default throttle thresholds. Operator can still
+                       # override `[throttle.*]` fields explicitly below.
+                       # If empty / unrecognised, the explicit `[throttle.*]`
+                       # values are used as-is (no auto-tuning).
 
 # ---------------------------------------------------------------------------
 # Usage capture & parser
@@ -30,18 +36,35 @@ drift_recovery_clean_polls  = 3         # consecutive clean polls to leave Error
 
 # ---------------------------------------------------------------------------
 # Throttle: 5-hour window
+#
+# Tightened thresholds 2026-05-11 to pace 5h consumption against the
+# weekly cap. Rationale: on Max plans the 5h budget is roughly 1/8 of
+# the weekly budget, so 8 back-to-back 100%-utilised 5h sessions
+# exhausts weekly in ~40h vs the 168h weekly window. Capping 5h at
+# 60% leaves headroom for the operator's interactive use AND spreads
+# autonomous queue runtime across the full week.
+#
+# Plan-specific tuning: future versions will derive these from
+# `[claude].plan` against a per-plan budget table; for now the
+# defaults below are tuned for Max20x and are inherited unchanged
+# by other plans. Per-queue `claude_runner.toml` can still override
+# any of these explicitly.
 # ---------------------------------------------------------------------------
 [throttle.five_hour]
-budget_tokens               = 99_000_000   # operator-calibrated ceiling
-band_full_dispatch_max_pct  = 70           # < N% : full target concurrency
-band_slowdown_max_pct       = 90           # 70-N% : linear slowdown
-                                           # >= 90% : no new dispatch (Throttled5h)
+budget_tokens               = 99_000_000   # Max20x 5h ceiling
+band_full_dispatch_max_pct  = 40           # < 40% : full target concurrency
+band_slowdown_max_pct       = 60           # 40-60% : linear slowdown
+                                           # >= 60% : no new dispatch (Throttled5h)
 
 # ---------------------------------------------------------------------------
 # Throttle: weekly window
+#
+# Weekly thresholds left looser than 5h since the weekly cap is the
+# hard ceiling rather than the per-session pacer. The 5h throttle is
+# what spreads consumption across the week.
 # ---------------------------------------------------------------------------
 [throttle.weekly]
-budget_tokens               = 798_841_951
+budget_tokens               = 798_841_951  # Max20x weekly ceiling
 band_full_dispatch_max_pct  = 70
 band_slowdown_max_pct       = 90
 pause_at_pct                = 90
@@ -49,6 +72,49 @@ eow_push_enter_at_pct       = 90
 eow_target_pct              = 98
 eow_window_s                = 43200      # 12h
 eow_runtime_safety_factor   = 0.5
+
+# ---------------------------------------------------------------------------
+# Plan-specific budget table
+#
+# Reserved for forthcoming auto-tuning: when `[claude].plan` is one
+# of the keys below, the loader replaces `[throttle.five_hour].budget_tokens`
+# and `[throttle.weekly].budget_tokens` with the plan's values, and
+# (if the operator hasn't overridden them) replaces the band_*_max_pct
+# fields with values derived from the plan's 5h:weekly ratio.
+#
+# Current rows are approximate ceilings observed on each plan; verify
+# against `claude /usage` for the target account before relying on them.
+# The schema validator does not enforce these — they're informational
+# until the loader implements the auto-tuning.
+# ---------------------------------------------------------------------------
+[plans.max20x]
+five_hour_tokens = 99_000_000
+weekly_tokens    = 798_841_951
+# Eight 5h windows per week of budget; 168h / (8 windows × 5h) = 4.2x
+# spare capacity, so cap 5h at ~60% to spread across the week.
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.max5x]
+five_hour_tokens = 24_750_000     # ~1/4 of Max20x
+weekly_tokens    = 199_710_488
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.pro]
+five_hour_tokens = 4_950_000      # ~1/20 of Max20x
+weekly_tokens    = 39_942_098
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.team]
+# Team plan budgets vary by org; treat as Max20x-equivalent until
+# operator overrides. Use `claude /usage` against the work account
+# to calibrate.
+five_hour_tokens = 99_000_000
+weekly_tokens    = 798_841_951
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA

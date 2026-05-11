@@ -139,10 +139,31 @@ class ClaudeSettings(_StrictModel):
     own ``CLAUDE_CONFIG_DIR`` populated by ``claude /login`` once, and
     each per-queue ``claude_runner.toml`` points at the appropriate dir.
     Empty string means "use claude's default" (``~/.claude``).
+
+    ``plan`` selects an entry from the top-level ``[plans.*]`` table so
+    the loader can auto-tune ``[throttle.*]`` budgets and bands against
+    the plan's 5h:weekly token ratio. Empty string means "no auto-tune;
+    use the explicit [throttle.*] values as-is."
     """
 
     executable: str = "claude"
     config_dir: str = ""
+    plan: str = ""
+
+
+class PlanSettings(_StrictModel):
+    """Per-plan token-budget and throttle-band hints.
+
+    The loader uses these to derive ``[throttle.*]`` budgets and bands
+    when ``[claude].plan`` is set. Operator overrides in
+    ``claude_runner.toml`` still win on a per-field basis (the merged
+    explicit fields take precedence over plan-derived defaults).
+    """
+
+    five_hour_tokens: int = Field(gt=0)
+    weekly_tokens: int = Field(gt=0)
+    band_full_dispatch_max_pct: int = Field(ge=0, le=100)
+    band_slowdown_max_pct: int = Field(ge=0, le=100)
 
 
 class Settings(_StrictModel):
@@ -165,3 +186,4 @@ class Settings(_StrictModel):
     metrics: MetricsSettings
     ui: UiSettings
     fixtures: FixturesSettings
+    plans: dict[str, PlanSettings] = Field(default_factory=dict)

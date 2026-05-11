@@ -13,11 +13,35 @@ description: |
 
 # /runner-status — task runner health snapshot
 
-This skill is mechanical: it shells out to `claude-task-runner` to
-gather state, then presents a prioritized summary so the user sees
-the most-important condition first.
+This skill is mechanical: it shells out to `claude-task-runner` plus
+some `ps` / file-glob queries to gather state, then presents a
+prioritized summary so the user sees the most-important condition
+first.
 
-## Steps
+## Single-command form
+
+For a comprehensive, consistent snapshot in one shell call:
+
+```bash
+bash /home/bill/.claude/skills/runner-status/snapshot.sh --queue <CWD>
+```
+
+The bundled `snapshot.sh` produces a markdown block with: supervisor
+process liveness (PID + etime + cmd), `supervisor.json` fields
+(state / 5h / weekly / in_flight / since / scheduled_wakeup / drift),
+state-file status breakdown (completed / failed / running /
+awaiting_sidecar / possibly_hung / failed_circuit_breaker), todo/
+count, open-sidecar list (task_id + sequence), and live
+`claude-task-runner usage render` output.
+
+This is the **default invocation** when the user says
+`/runner-status` or "queue status" — produces the same output shape
+every time so snapshots can be compared across time.
+
+If the user wants a deeper investigation (e.g. focused on hung tasks
+or recent failures), follow the prioritized triage flow below.
+
+## Steps (priority-triage form)
 
 1. **Run** `claude-task-runner supervisor status --queue <CWD> --json`
    to get the supervisor snapshot, alive flag, and counts. The user's
