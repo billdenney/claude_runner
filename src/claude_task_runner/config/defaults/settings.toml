@@ -109,23 +109,20 @@ band_full_dispatch_max_pct = 40
 band_slowdown_max_pct      = 60
 
 [plans.team_standard]
-# Team Standard plan budgets vary by org; treat as Max20x-equivalent
-# until operator overrides. Use `claude /usage` against the work
-# account to calibrate against the actual seat allotment.
-five_hour_tokens = 99_000_000
-weekly_tokens    = 798_841_951
+# Team Standard: operator-noted ratio 1.25 x Pro.
+# 5h:  4_950_000 * 1.25 =  6_187_500
+# wk: 39_942_098 * 1.25 = 49_927_622
+five_hour_tokens = 6_187_500
+weekly_tokens    = 49_927_622
 band_full_dispatch_max_pct = 40
 band_slowdown_max_pct      = 60
 
 [plans.team_premium]
-# Team Premium plan: higher per-seat limits than Team Standard.
-# Placeholder values track Max20x; operator should re-calibrate via
-# `claude /usage` against the work account and update both budget
-# fields below when the actual ceiling is known. The 40/60 band
-# pacing applies the same conservative spread across the weekly
-# window regardless of plan tier.
-five_hour_tokens = 99_000_000
-weekly_tokens    = 798_841_951
+# Team Premium: operator-noted ratio 6.25 x Pro.
+# 5h:  4_950_000 * 6.25 =  30_937_500
+# wk: 39_942_098 * 6.25 = 249_638_112
+five_hour_tokens = 30_937_500
+weekly_tokens    = 249_638_112
 band_full_dispatch_max_pct = 40
 band_slowdown_max_pct      = 60
 
