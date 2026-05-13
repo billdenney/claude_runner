@@ -79,8 +79,8 @@ or rely on the watchdog.
 ## Things this skill doesn't do
 
 - Doesn't dispatch the task immediately; only writes the YAML.
-- Doesn't ask about `inject_preamble`, `depends_on`, or per-task token
-  caps unless the operator brings them up — defaults are sane.
+- Doesn't ask about `depends_on` or per-task token caps unless the
+  operator brings them up — defaults are sane.
 - Doesn't validate the prompt content; if the operator wants the
   runner to extract a paper, the operator's prompt is the source of
   truth.
