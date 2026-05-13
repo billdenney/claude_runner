@@ -63,7 +63,9 @@ def settings() -> Settings:
             "nighttime_band_slowdown_max_pct": None,
         }
     )
-    weekly_static = base.throttle.weekly.model_copy(update={"pacing_curve_enabled": False})
+    weekly_static = base.throttle.weekly.model_copy(
+        update={"pacing_curve_enabled": False, "eow_push_nighttime_only": False}
+    )
     throttle_static = base.throttle.model_copy(
         update={"five_hour": five_static, "weekly": weekly_static}
     )

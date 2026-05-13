@@ -245,6 +245,32 @@ def _effective_weekly_thresholds(
     return full, slow
 
 
+def _eow_push_nighttime_gate_ok(
+    *,
+    throttle: ThrottleSettings,
+    clock: Clock,
+) -> bool:
+    """``True`` if the EOW-push transition is allowed right now.
+
+    When ``eow_push_nighttime_only`` is ``False`` the gate is always open
+    (preserves the pre-modulation behavior). When ``True``, the gate
+    requires core nighttime per ``[throttle.time_of_day]`` — within the
+    daytime / nighttime ramps the gate stays closed so a push doesn't
+    fire just as we're sliding into daytime.
+    """
+    if not throttle.weekly.eow_push_nighttime_only:
+        return True
+    now_local = tod_mod.to_local(clock.now(), throttle.time_of_day.timezone)
+    day_start = tod_mod.parse_hhmm(throttle.time_of_day.day_start)
+    day_end = tod_mod.parse_hhmm(throttle.time_of_day.day_end)
+    return tod_mod.is_nighttime(
+        now_local,
+        day_start=day_start,
+        day_end=day_end,
+        ramp_minutes=throttle.time_of_day.ramp_minutes,
+    )
+
+
 def _compute_effective_bands(
     *,
     reading: UsageReading,
@@ -468,6 +494,8 @@ def step(
 
     # End-of-week push: only entered FROM PausedWeekly when the EOW
     # window has opened. (PausedWeekly persists otherwise.)
+    # ``eow_push_nighttime_only`` gates entry to core nighttime so the
+    # daytime 5h windows stay free for interactive use.
     if (
         target_state is SupervisorState.PAUSED_WEEKLY
         and window_mod.in_eow_push_window(
@@ -476,6 +504,10 @@ def step(
             eow_window_s=inp.settings_throttle.weekly.eow_window_s,
         )
         and reading.seven_day.utilization_pct < inp.settings_throttle.weekly.eow_target_pct
+        and _eow_push_nighttime_gate_ok(
+            throttle=inp.settings_throttle,
+            clock=clock,
+        )
     ):
         target_state = SupervisorState.END_OF_WEEK_PUSH
 

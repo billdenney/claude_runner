@@ -105,6 +105,12 @@ class ThrottleWeeklySettings(ThrottleBandSettings):
     """Dead-band (percentage points) around the target curve. The bands
     only shift when observed deviates by more than ``slack`` from target."""
 
+    eow_push_nighttime_only: bool = True
+    """When ``True`` (the default), the PAUSED_WEEKLY → END_OF_WEEK_PUSH
+    transition fires only during core nighttime per ``[throttle.time_of_day]``.
+    This keeps daytime 5h windows available for interactive use while the
+    end-of-week burn-down runs overnight. See ADR-0015."""
+
 
 class ThrottleSettings(_StrictModel):
     five_hour: ThrottleFiveHourSettings

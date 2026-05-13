@@ -95,6 +95,9 @@ eow_runtime_safety_factor   = 0.5
 pacing_curve_enabled        = true
 pre_eow_target_pct          = 80           # target % at start of EOW window
 pacing_slack_pp             = 10.0         # dead-band ±N pp around target curve
+# Nighttime-bias for EOW push: when true (default), the PAUSED_WEEKLY →
+# END_OF_WEEK_PUSH transition only fires during core nighttime. ADR-0015.
+eow_push_nighttime_only     = true
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA

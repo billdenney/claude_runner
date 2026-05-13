@@ -48,7 +48,9 @@ def settings() -> Settings:
             "nighttime_band_slowdown_max_pct": None,
         }
     )
-    weekly_static = base.throttle.weekly.model_copy(update={"pacing_curve_enabled": False})
+    weekly_static = base.throttle.weekly.model_copy(
+        update={"pacing_curve_enabled": False, "eow_push_nighttime_only": False}
+    )
     throttle_static = base.throttle.model_copy(
         update={"five_hour": five_static, "weekly": weekly_static}
     )
@@ -312,6 +314,7 @@ def _modulation_settings(
     eow_target_pct: int | None = None,
     pacing_slack_pp: float = 10.0,
     eow_window_s: float | None = None,
+    eow_push_nighttime_only: bool = False,
     timezone: str = "UTC",
     day_start: str = "06:00",
     day_end: str = "22:00",
@@ -330,6 +333,7 @@ def _modulation_settings(
         "pacing_curve_enabled": pacing_enabled,
         "pre_eow_target_pct": pre_eow_target_pct,
         "pacing_slack_pp": pacing_slack_pp,
+        "eow_push_nighttime_only": eow_push_nighttime_only,
     }
     if eow_target_pct is not None:
         weekly_update["eow_target_pct"] = eow_target_pct
@@ -524,3 +528,47 @@ class TestPacingCurveModulation:
         )
         new, _ = step(_input(snap, reading, cfg, pending=2), clock)
         assert new.state is SupervisorState.PAUSED_WEEKLY
+
+
+class TestEowPushNighttimeBias:
+    """``eow_push_nighttime_only`` gates PAUSED_WEEKLY → END_OF_WEEK_PUSH to night."""
+
+    def test_daytime_blocks_eow_push(self, settings: Settings) -> None:
+        """At noon UTC core daytime, the bias keeps state in PAUSED_WEEKLY."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 18, 0, tzinfo=UTC)  # 6h ahead, EOW window
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.PAUSED_WEEKLY
+
+    def test_nighttime_allows_eow_push(self, settings: Settings) -> None:
+        """At 02:00 UTC core nighttime, the bias allows the transition."""
+        clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 8, 0, tzinfo=UTC)  # 6h ahead, EOW window
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.END_OF_WEEK_PUSH
+
+    def test_morning_ramp_still_blocks(self, settings: Settings) -> None:
+        """At 06:00 UTC the morning ramp is active — not core nighttime, gate closed."""
+        clock = FakeClock(datetime(2026, 5, 13, 6, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.PAUSED_WEEKLY
+
+    def test_bias_disabled_allows_daytime_push(self, settings: Settings) -> None:
+        """With ``eow_push_nighttime_only=False``, daytime EOW push fires as before."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 18, 0, tzinfo=UTC)
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=False)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.END_OF_WEEK_PUSH
