@@ -39,14 +39,14 @@ class TestLoadDefaults:
         defaults = load_defaults()
         assert "usage" in defaults
         assert "throttle" in defaults
-        assert defaults["throttle"]["five_hour"]["band_full_dispatch_max_pct"] == 70
+        assert defaults["throttle"]["five_hour"]["band_full_dispatch_max_pct"] == 40
 
 
 class TestLoadSettings:
     def test_no_override(self) -> None:
         s = load_settings(None)
-        assert s.throttle.five_hour.band_full_dispatch_max_pct == 70
-        assert s.throttle.five_hour.band_slowdown_max_pct == 90
+        assert s.throttle.five_hour.band_full_dispatch_max_pct == 40
+        assert s.throttle.five_hour.band_slowdown_max_pct == 60
         assert s.usage.poll_interval_s == 60.0
         assert s.session.max_resume_attempts == 3
 

@@ -36,33 +36,76 @@ suspicious_delta_pct        = 50        # flag if util jumps > N points between 
 drift_recovery_clean_polls  = 3         # consecutive clean polls to leave ErrorDrift
 
 # ---------------------------------------------------------------------------
+# Throttle: global time-of-day boundaries
+#
+# Operator-active hours (06:00-22:00 local) get tighter dispatch caps so
+# interactive work has token headroom; the runner pushes harder at night.
+# The 30-minute ramp at each boundary avoids whipsawing dispatch at the
+# clock edge. See ADR-0015 for the math.
+#
+# Set `timezone = ""` to use the system local timezone.
+# ---------------------------------------------------------------------------
+[throttle.time_of_day]
+timezone     = ""        # IANA name (e.g. "America/New_York"); "" = system local
+day_start    = "06:00"   # HH:MM 24h — inclusive start of core daytime
+day_end      = "22:00"   # HH:MM 24h — exclusive end of core daytime
+ramp_minutes = 30        # linear interpolation width at each boundary
+
+# ---------------------------------------------------------------------------
 # Throttle: 5-hour window
 #
-# Tightened thresholds 2026-05-11 to pace 5h consumption against the
-# weekly cap. Rationale: on Max plans the 5h budget is roughly 1/8 of
-# the weekly budget, so 8 back-to-back 100%-utilised 5h sessions
-# exhausts weekly in ~40h vs the 168h weekly window. Capping 5h at
-# 60% leaves headroom for the operator's interactive use AND spreads
-# autonomous queue runtime across the full week.
+# Two layers of band thresholds operate together:
 #
-# Plan-specific tuning: future versions will derive these from
-# `[claude].plan` against a per-plan budget table; for now the
-# defaults below are tuned for Max20x and are inherited unchanged
-# by other plans. Per-queue `claude_runner.toml` can still override
-# any of these explicitly.
+# 1. Static `band_*` — pacing-agnostic safety floor. Tightened 2026-05-11
+#    from 70/90 to 40/60 so that, even with time-of-day modulation off,
+#    no single 5h session exceeds 60% of cap. On Max plans the 5h budget
+#    is ~1/8 of the weekly budget, so 8 back-to-back 100%-utilised 5h
+#    sessions would exhaust weekly in ~40h of the 168h window — capping
+#    at 60% spreads autonomous runtime across the full week.
+# 2. Daytime / nighttime overrides — when set, the supervisor uses
+#    `daytime_band_*` during 06:00-22:00 (operator-active hours) and
+#    `nighttime_band_*` overnight, linearly interpolating across the
+#    `ramp_minutes` boundary. ADR-0015. With overrides unset the static
+#    bands apply unchanged.
+#
+# Plan-specific tuning: future versions will derive `budget_tokens` and
+# the static `band_*` values from `[claude].plan` against the
+# `[plans.*]` table; for now the defaults below are tuned for Max20x and
+# inherited unchanged by other plans. Per-queue overrides always win.
 # ---------------------------------------------------------------------------
 [throttle.five_hour]
 budget_tokens               = 99_000_000   # Max20x 5h ceiling
 band_full_dispatch_max_pct  = 40           # < 40% : full target concurrency
 band_slowdown_max_pct       = 60           # 40-60% : linear slowdown
                                            # >= 60% : no new dispatch (Throttled5h)
+# Time-of-day overrides: tighter during day, looser at night.
+# Target ~22% average 5h utilization across 168h => ~95% weekly cap by reset.
+daytime_band_full_dispatch_max_pct   = 15  # tight daytime: leave 85% headroom for interactive
+daytime_band_slowdown_max_pct        = 30
+nighttime_band_full_dispatch_max_pct = 50  # push at night while operator is AFK
+nighttime_band_slowdown_max_pct      = 75
 
 # ---------------------------------------------------------------------------
 # Throttle: weekly window
 #
-# Weekly thresholds left looser than 5h since the weekly cap is the
-# hard ceiling rather than the per-session pacer. The 5h throttle is
-# what spreads consumption across the week.
+# Weekly thresholds are looser than the 5h bands because the weekly cap
+# is the hard ceiling rather than the per-session pacer — the 5h
+# throttle is what spreads consumption across the week. Two layers
+# operate on weekly utilization on top of the static thresholds:
+#
+# 1. Static bands (`band_*`, `pause_at_pct`) — hard safety floor.
+# 2. Dynamic pacing curve (`pacing_curve_enabled`) — when ON, the supervisor
+#    computes a target utilization curve from the weekly elapsed fraction
+#    (anchored to the OAuth-reported `resets_at`, NOT a fixed weekday) and
+#    shifts the effective bands by how far observed deviates from target,
+#    outside a `pacing_slack_pp` dead-band. Ahead of target → tighter
+#    bands; behind target → looser bands. ADR-0016.
+#
+# `eow_target_pct` lowered 98 → 95: leaves a 5pp safety margin so a sudden
+# burst near reset doesn't trip the hard pause.
+# `eow_window_s` widened 43_200 (12h) → 86_400 (24h): more opportunities
+# for nighttime EOW push (which is gated to nighttime in the state machine
+# so daytime 5h windows stay free for interactive use).
 # ---------------------------------------------------------------------------
 [throttle.weekly]
 budget_tokens               = 798_841_951  # Max20x weekly ceiling
@@ -70,9 +113,16 @@ band_full_dispatch_max_pct  = 70
 band_slowdown_max_pct       = 90
 pause_at_pct                = 90
 eow_push_enter_at_pct       = 90
-eow_target_pct              = 98
-eow_window_s                = 43200      # 12h
+eow_target_pct              = 95           # was 98 — leave safety margin
+eow_window_s                = 86400        # 24h — was 43200 (12h)
 eow_runtime_safety_factor   = 0.5
+# Dynamic pacing curve. ADR-0016.
+pacing_curve_enabled        = true
+pre_eow_target_pct          = 80           # target % at start of EOW window
+pacing_slack_pp             = 10.0         # dead-band ±N pp around target curve
+# Nighttime-bias for EOW push: when true (default), the PAUSED_WEEKLY →
+# END_OF_WEEK_PUSH transition only fires during core nighttime. ADR-0015.
+eow_push_nighttime_only     = true
 
 # ---------------------------------------------------------------------------
 # Plan-specific budget table
