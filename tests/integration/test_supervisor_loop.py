@@ -48,7 +48,28 @@ def _r(
 
 @pytest.fixture
 def settings() -> Settings:
-    return load_settings(None)
+    """Default test settings — time-of-day and pacing modulation disabled.
+
+    These integration scenarios script utilization values designed against
+    the static band thresholds (70/90 for both 5h and weekly). Modulation
+    layers on top is covered by unit tests in tests/unit/test_state_machine.py.
+    """
+    base = load_settings(None)
+    five_static = base.throttle.five_hour.model_copy(
+        update={
+            "daytime_band_full_dispatch_max_pct": None,
+            "daytime_band_slowdown_max_pct": None,
+            "nighttime_band_full_dispatch_max_pct": None,
+            "nighttime_band_slowdown_max_pct": None,
+        }
+    )
+    weekly_static = base.throttle.weekly.model_copy(
+        update={"pacing_curve_enabled": False, "eow_push_nighttime_only": False}
+    )
+    throttle_static = base.throttle.model_copy(
+        update={"five_hour": five_static, "weekly": weekly_static}
+    )
+    return base.model_copy(update={"throttle": throttle_static})
 
 
 @pytest.fixture
@@ -101,9 +122,9 @@ class TestScriptedDay:
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 2. Climbing: 75% (slowdown band) → SLOWING_DOWN
+            # 2. Climbing: 50% (slowdown band 40-60 with static bands) → SLOWING_DOWN
             _r(
-                five=75,
+                five=50,
                 weekly=10,
                 five_resets=five_reset_initial,
                 weekly_resets=weekly_reset,

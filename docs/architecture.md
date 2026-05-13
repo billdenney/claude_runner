@@ -83,6 +83,24 @@ The state machine itself (`supervisor/state_machine.py`) is a pure function:
 `step(state, reading, clock) → (new_state, actions)`. All I/O happens in
 `supervisor/daemon.py` based on the action list.
 
+### Per-tick band modulation
+
+`step()` consults two pure helpers before classifying the active state:
+
+- `supervisor/time_of_day.py` (ADR-0015) — converts `clock.now()` to local
+  time per `[throttle.time_of_day].timezone`, then linearly interpolates
+  between daytime / nighttime band thresholds across a ramp centered on
+  each `day_start` / `day_end` boundary. `is_nighttime` (conservative —
+  ramp regions count as not-nighttime) gates the EOW push state.
+- `supervisor/pacing.py` (ADR-0016) — anchors the elapsed-in-week fraction
+  to `reading.seven_day.resets_at` (NOT a fixed weekday), computes a
+  piecewise-linear target curve, and shifts the static weekly bands by
+  the observed-vs-target deviation outside `pacing_slack_pp`. The hard
+  `pause_at_pct` floor is read directly and is never modulated.
+
+Both helpers are pure functions of their inputs (clock + settings + reading)
+and at 100% test coverage.
+
 ## On-disk layout (per queue)
 
 ```

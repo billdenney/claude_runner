@@ -25,6 +25,7 @@ machine.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from pathlib import Path
@@ -135,10 +136,8 @@ def tick_dispatch(
 def _reap_finished(in_flight_threads: dict[str, threading.Thread]) -> None:
     finished = [tid for tid, th in in_flight_threads.items() if not th.is_alive()]
     for tid in finished:
-        try:
+        with contextlib.suppress(Exception):
             in_flight_threads[tid].join(timeout=0.1)
-        except Exception:
-            pass
         del in_flight_threads[tid]
         logger.info("reaped finished dispatch thread for task %s", tid)
 
@@ -153,7 +152,11 @@ def _target_concurrency(
     SLOWING_DOWN.
     """
     have_warmup = _has_any_completed(queue_dir)
-    base = settings.concurrency.max_concurrency if have_warmup else settings.concurrency.initial_concurrency
+    base = (
+        settings.concurrency.max_concurrency
+        if have_warmup
+        else settings.concurrency.initial_concurrency
+    )
     base = max(1, base)
     if snapshot.state is SupervisorState.SLOWING_DOWN:
         return max(1, base // 2)
