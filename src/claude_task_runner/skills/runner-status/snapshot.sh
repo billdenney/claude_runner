@@ -120,10 +120,14 @@ echo ""
 
 # ----- Open sidecars -----
 if command -v claude-task-runner > /dev/null 2>&1; then
-  SC_JSON="$(claude-task-runner sidecar list --queue "$QUEUE" --json 2>/dev/null || echo '{"sidecars":[]}')"
-  python3 - <<PY
+  SC_FILE="$(mktemp)"
+  trap 'rm -f "$SC_FILE"' EXIT
+  claude-task-runner sidecar list --queue "$QUEUE" --json > "$SC_FILE" 2>/dev/null || echo '{"sidecars":[]}' > "$SC_FILE"
+  SC_FILE="$SC_FILE" python3 - <<'PY'
 import json
-d = json.loads('''$SC_JSON''')
+import os
+with open(os.environ["SC_FILE"]) as f:
+    d = json.load(f)
 n = len(d.get("sidecars", []))
 print(f"**Open sidecars**: {n}")
 print()
