@@ -39,7 +39,12 @@ A working minimum:
 
 [claude]
 plan = "max20x"     # or "max5x" | "pro" | "team_standard" | "team_premium"
-# config_dir = ""   # set if running under a non-default ~/.claude profile
+# config_dir = ""   # CLAUDE_CONFIG_DIR override. Empty (default) = ~/.claude.
+                    # Set to e.g. "/home/bill/.claude_personal" if `claude
+                    # /login` for the dispatching account was run under a
+                    # non-default config dir. The runner's `/usage` capture
+                    # also reads from this dir, so the throttle math is
+                    # measured against the correct account's quota.
 
 [concurrency]
 max_concurrency     = 2
