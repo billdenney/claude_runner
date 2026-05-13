@@ -116,7 +116,6 @@ class Task(_StrictBase):
     priority: Priority = "normal"
     depends_on: list[str] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
-    inject_preamble: bool = True
     tags: list[str] = Field(default_factory=list)
     """Free-form labels used for cohort reporting and EMA grouping
     overrides."""

@@ -39,6 +39,15 @@ def doctor(
     ),
     queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    check_paths: bool = typer.Option(
+        True,
+        "--check-paths/--no-check-paths",
+        help=(
+            "Verify that absolute paths referenced inside each task prompt "
+            "exist on disk. Default on; disable on large queues where the "
+            "existence sweep is unwanted."
+        ),
+    ),
 ) -> None:
     """Run a battery of self-diagnostic checks against this queue.
 
@@ -47,7 +56,7 @@ def doctor(
     settings = load_settings(config)
     queue_path = queue_dir.resolve()
 
-    results = [factory() for factory in all_checks(settings, queue_path)]
+    results = [factory() for factory in all_checks(settings, queue_path, check_paths=check_paths)]
 
     if json:
         payload = {
