@@ -29,9 +29,14 @@ from datetime import timedelta
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
     SupervisorSettings,
+    ThrottleFiveHourSettings,
     ThrottleSettings,
+    ThrottleWeeklySettings,
+    TimeOfDaySettings,
     UsageSettings,
 )
+from claude_task_runner.supervisor import pacing as pacing_mod
+from claude_task_runner.supervisor import time_of_day as tod_mod
 from claude_task_runner.supervisor import window as window_mod
 from claude_task_runner.supervisor.actions import (
     Action,
@@ -104,34 +109,218 @@ def _entry(
     return snapshot.model_copy(update=update)
 
 
-def _classify_active(
+@dataclass(frozen=True)
+class _EffectiveBands:
+    """Per-tick view of throttle thresholds after time-of-day and pacing modulation.
+
+    ``static_*`` fields (e.g. ``weekly_pause_at_pct``) bypass modulation
+    intentionally — they're hard safety floors that the dynamic logic
+    must never override.
+    """
+
+    five_hour_full: float
+    five_hour_slow: float
+    weekly_full: float
+    weekly_slow: float
+    weekly_pause_at_pct: int
+
+
+def _effective_five_hour_thresholds(
+    *,
+    five_hour: ThrottleFiveHourSettings,
+    time_of_day: TimeOfDaySettings,
+    clock: Clock,
+) -> tuple[float, float]:
+    """Time-of-day-modulated 5-hour thresholds.
+
+    Falls back to the static ``band_*`` values when any of the daytime /
+    nighttime override fields is ``None``. A field that's set as a
+    daytime override but not as a nighttime override (or vice versa)
+    fills in with the static band value, so an operator who only wants
+    to tighten daytime doesn't need to repeat the static value for night.
+    """
+    static_full = float(five_hour.band_full_dispatch_max_pct)
+    static_slow = float(five_hour.band_slowdown_max_pct)
+
+    daytime_full = (
+        float(five_hour.daytime_band_full_dispatch_max_pct)
+        if five_hour.daytime_band_full_dispatch_max_pct is not None
+        else static_full
+    )
+    nighttime_full = (
+        float(five_hour.nighttime_band_full_dispatch_max_pct)
+        if five_hour.nighttime_band_full_dispatch_max_pct is not None
+        else static_full
+    )
+    daytime_slow = (
+        float(five_hour.daytime_band_slowdown_max_pct)
+        if five_hour.daytime_band_slowdown_max_pct is not None
+        else static_slow
+    )
+    nighttime_slow = (
+        float(five_hour.nighttime_band_slowdown_max_pct)
+        if five_hour.nighttime_band_slowdown_max_pct is not None
+        else static_slow
+    )
+
+    # Cheap shortcut: if both override pairs collapse to the static values,
+    # skip the tz / hh:mm work.
+    if daytime_full == nighttime_full == static_full and (
+        daytime_slow == nighttime_slow == static_slow
+    ):
+        return static_full, static_slow
+
+    now_local = tod_mod.to_local(clock.now(), time_of_day.timezone)
+    day_start = tod_mod.parse_hhmm(time_of_day.day_start)
+    day_end = tod_mod.parse_hhmm(time_of_day.day_end)
+    ramp = time_of_day.ramp_minutes
+
+    full = tod_mod.effective_threshold(
+        tod_mod.DayNightBand(daytime_pct=daytime_full, nighttime_pct=nighttime_full),
+        now_local=now_local,
+        day_start=day_start,
+        day_end=day_end,
+        ramp_minutes=ramp,
+    )
+    slow = tod_mod.effective_threshold(
+        tod_mod.DayNightBand(daytime_pct=daytime_slow, nighttime_pct=nighttime_slow),
+        now_local=now_local,
+        day_start=day_start,
+        day_end=day_end,
+        ramp_minutes=ramp,
+    )
+    return full, slow
+
+
+def _effective_weekly_thresholds(
+    *,
+    weekly: ThrottleWeeklySettings,
+    reading: UsageReading,
+    clock: Clock,
+) -> tuple[float, float]:
+    """Pacing-curve-modulated weekly thresholds.
+
+    Returns the static bands when ``pacing_curve_enabled`` is False or
+    when the OAuth ``resets_at`` couldn't be parsed (curve has nothing
+    to anchor to). The hard ``pause_at_pct`` floor is never touched.
+    """
+    static_full = float(weekly.band_full_dispatch_max_pct)
+    static_slow = float(weekly.band_slowdown_max_pct)
+
+    if not weekly.pacing_curve_enabled or reading.seven_day.resets_at is None:
+        return static_full, static_slow
+
+    elapsed = pacing_mod.elapsed_fraction(
+        resets_at=reading.seven_day.resets_at,
+        now=clock.now(),
+    )
+    eow_window_fraction = (
+        weekly.eow_window_s / pacing_mod.SEVEN_DAYS_S if weekly.eow_window_s > 0 else 0.0
+    )
+    target = pacing_mod.target_weekly_pct(
+        elapsed,
+        eow_target_pct=float(weekly.eow_target_pct),
+        eow_window_fraction=eow_window_fraction,
+        pre_eow_target_pct=float(weekly.pre_eow_target_pct),
+    )
+    observed = float(reading.seven_day.utilization_pct)
+    full = float(
+        pacing_mod.adjusted_weekly_band(
+            observed_pct=observed,
+            target_now=target,
+            base_pct=weekly.band_full_dispatch_max_pct,
+            slack_pp=weekly.pacing_slack_pp,
+            max_pct=weekly.pause_at_pct,
+        )
+    )
+    slow = float(
+        pacing_mod.adjusted_weekly_band(
+            observed_pct=observed,
+            target_now=target,
+            base_pct=weekly.band_slowdown_max_pct,
+            slack_pp=weekly.pacing_slack_pp,
+            max_pct=weekly.pause_at_pct,
+        )
+    )
+    return full, slow
+
+
+def _eow_push_nighttime_gate_ok(
+    *,
+    throttle: ThrottleSettings,
+    clock: Clock,
+) -> bool:
+    """``True`` if the EOW-push transition is allowed right now.
+
+    When ``eow_push_nighttime_only`` is ``False`` the gate is always open
+    (preserves the pre-modulation behavior). When ``True``, the gate
+    requires core nighttime per ``[throttle.time_of_day]`` — within the
+    daytime / nighttime ramps the gate stays closed so a push doesn't
+    fire just as we're sliding into daytime.
+    """
+    if not throttle.weekly.eow_push_nighttime_only:
+        return True
+    now_local = tod_mod.to_local(clock.now(), throttle.time_of_day.timezone)
+    day_start = tod_mod.parse_hhmm(throttle.time_of_day.day_start)
+    day_end = tod_mod.parse_hhmm(throttle.time_of_day.day_end)
+    return tod_mod.is_nighttime(
+        now_local,
+        day_start=day_start,
+        day_end=day_end,
+        ramp_minutes=throttle.time_of_day.ramp_minutes,
+    )
+
+
+def _compute_effective_bands(
     *,
     reading: UsageReading,
     throttle: ThrottleSettings,
+    clock: Clock,
+) -> _EffectiveBands:
+    """Compose the per-tick effective bands from the 5h and weekly helpers."""
+    five_full, five_slow = _effective_five_hour_thresholds(
+        five_hour=throttle.five_hour,
+        time_of_day=throttle.time_of_day,
+        clock=clock,
+    )
+    weekly_full, weekly_slow = _effective_weekly_thresholds(
+        weekly=throttle.weekly,
+        reading=reading,
+        clock=clock,
+    )
+    return _EffectiveBands(
+        five_hour_full=five_full,
+        five_hour_slow=five_slow,
+        weekly_full=weekly_full,
+        weekly_slow=weekly_slow,
+        weekly_pause_at_pct=throttle.weekly.pause_at_pct,
+    )
+
+
+def _classify_active(
+    *,
+    reading: UsageReading,
+    bands: _EffectiveBands,
 ) -> SupervisorState:
     """Pick between DISPATCHING / SLOWING_DOWN / THROTTLED_5H / PAUSED_WEEKLY
-    given a clean reading.
+    given a clean reading and the effective per-tick bands.
 
     PAUSED_WEEKLY beats THROTTLED_5H beats SLOWING_DOWN beats DISPATCHING
-    because weekly-cap is the strictest brake.
+    because weekly-cap is the strictest brake. The hard ``pause_at_pct``
+    floor is read directly from settings — pacing-curve modulation never
+    touches it (safety floor).
     """
     weekly_pct = reading.seven_day.utilization_pct
-    if weekly_pct >= throttle.weekly.pause_at_pct:
+    if weekly_pct >= bands.weekly_pause_at_pct:
         return SupervisorState.PAUSED_WEEKLY
 
     five_pct = reading.five_hour.utilization_pct
-    if five_pct >= throttle.five_hour.band_slowdown_max_pct:
+    if five_pct >= bands.five_hour_slow:
         return SupervisorState.THROTTLED_5H
 
-    five_in_slow = (
-        five_pct >= throttle.five_hour.band_full_dispatch_max_pct
-        and five_pct < throttle.five_hour.band_slowdown_max_pct
-    )
-    weekly_in_slow = (
-        weekly_pct >= throttle.weekly.band_full_dispatch_max_pct
-        and weekly_pct < throttle.weekly.band_slowdown_max_pct
-    )
-    weekly_in_stop = weekly_pct >= throttle.weekly.band_slowdown_max_pct
+    five_in_slow = bands.five_hour_full <= five_pct < bands.five_hour_slow
+    weekly_in_slow = bands.weekly_full <= weekly_pct < bands.weekly_slow
+    weekly_in_stop = weekly_pct >= bands.weekly_slow
 
     if weekly_in_stop:
         # Weekly stopped band but not yet pause_at — treat as throttled.
@@ -295,11 +484,18 @@ def step(
         actions.append(MonitorInFlight())
         return new_snap, actions
 
-    # Active classification: throttle bands.
-    target_state = _classify_active(reading=reading, throttle=inp.settings_throttle)
+    # Active classification: throttle bands (with time-of-day and pacing modulation).
+    effective_bands = _compute_effective_bands(
+        reading=reading,
+        throttle=inp.settings_throttle,
+        clock=clock,
+    )
+    target_state = _classify_active(reading=reading, bands=effective_bands)
 
     # End-of-week push: only entered FROM PausedWeekly when the EOW
     # window has opened. (PausedWeekly persists otherwise.)
+    # ``eow_push_nighttime_only`` gates entry to core nighttime so the
+    # daytime 5h windows stay free for interactive use.
     if (
         target_state is SupervisorState.PAUSED_WEEKLY
         and window_mod.in_eow_push_window(
@@ -308,6 +504,10 @@ def step(
             eow_window_s=inp.settings_throttle.weekly.eow_window_s,
         )
         and reading.seven_day.utilization_pct < inp.settings_throttle.weekly.eow_target_pct
+        and _eow_push_nighttime_gate_ok(
+            throttle=inp.settings_throttle,
+            clock=clock,
+        )
     ):
         target_state = SupervisorState.END_OF_WEEK_PUSH
 

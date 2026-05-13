@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -33,7 +33,28 @@ from claude_task_runner.usage.models import UsageReading, WindowReading
 
 @pytest.fixture
 def settings() -> Settings:
-    return load_settings(None)
+    """Default test settings — time-of-day and pacing modulation disabled.
+
+    These tests exercise the static band-classification path; modulation
+    is covered by dedicated tests further down. Each test that needs a
+    different shape constructs the settings it wants.
+    """
+    base = load_settings(None)
+    five_static = base.throttle.five_hour.model_copy(
+        update={
+            "daytime_band_full_dispatch_max_pct": None,
+            "daytime_band_slowdown_max_pct": None,
+            "nighttime_band_full_dispatch_max_pct": None,
+            "nighttime_band_slowdown_max_pct": None,
+        }
+    )
+    weekly_static = base.throttle.weekly.model_copy(
+        update={"pacing_curve_enabled": False, "eow_push_nighttime_only": False}
+    )
+    throttle_static = base.throttle.model_copy(
+        update={"five_hour": five_static, "weekly": weekly_static}
+    )
+    return base.model_copy(update={"throttle": throttle_static})
 
 
 @pytest.fixture
@@ -274,3 +295,280 @@ class TestStateTransitionEvents:
         assert len(transition_events) == 1
         assert transition_events[0].payload["from"] == SupervisorState.IDLE.value
         assert transition_events[0].payload["to"] == SupervisorState.DISPATCHING.value
+
+
+# ----------------------------------------------------------------------------
+# Time-of-day and pacing-curve modulation
+# ----------------------------------------------------------------------------
+
+
+def _modulation_settings(
+    base: Settings,
+    *,
+    daytime_full: int | None = None,
+    daytime_slow: int | None = None,
+    nighttime_full: int | None = None,
+    nighttime_slow: int | None = None,
+    pacing_enabled: bool = False,
+    pre_eow_target_pct: int = 80,
+    eow_target_pct: int | None = None,
+    pacing_slack_pp: float = 10.0,
+    eow_window_s: float | None = None,
+    eow_push_nighttime_only: bool = False,
+    timezone: str = "UTC",
+    day_start: str = "06:00",
+    day_end: str = "22:00",
+    ramp_minutes: int = 30,
+) -> Settings:
+    """Build a Settings with explicit modulation knobs, anchored to UTC."""
+    five = base.throttle.five_hour.model_copy(
+        update={
+            "daytime_band_full_dispatch_max_pct": daytime_full,
+            "daytime_band_slowdown_max_pct": daytime_slow,
+            "nighttime_band_full_dispatch_max_pct": nighttime_full,
+            "nighttime_band_slowdown_max_pct": nighttime_slow,
+        }
+    )
+    weekly_update: dict[str, object] = {
+        "pacing_curve_enabled": pacing_enabled,
+        "pre_eow_target_pct": pre_eow_target_pct,
+        "pacing_slack_pp": pacing_slack_pp,
+        "eow_push_nighttime_only": eow_push_nighttime_only,
+    }
+    if eow_target_pct is not None:
+        weekly_update["eow_target_pct"] = eow_target_pct
+    if eow_window_s is not None:
+        weekly_update["eow_window_s"] = eow_window_s
+    weekly = base.throttle.weekly.model_copy(update=weekly_update)
+    tod = base.throttle.time_of_day.model_copy(
+        update={
+            "timezone": timezone,
+            "day_start": day_start,
+            "day_end": day_end,
+            "ramp_minutes": ramp_minutes,
+        }
+    )
+    throttle = base.throttle.model_copy(
+        update={"five_hour": five, "weekly": weekly, "time_of_day": tod}
+    )
+    return base.model_copy(update={"throttle": throttle})
+
+
+class TestTimeOfDayModulation:
+    """Time-of-day shrinks/loosens 5h thresholds; weekly unaffected here."""
+
+    def test_daytime_tightens_5h_to_slowdown(self, settings: Settings) -> None:
+        """At noon UTC with daytime 15/30, five_pct=25 lands in SLOWING_DOWN.
+
+        (Statically 25 would be in FULL since static band_full_dispatch=70.)
+        """
+        cfg = _modulation_settings(
+            settings,
+            daytime_full=15,
+            daytime_slow=30,
+            nighttime_full=50,
+            nighttime_slow=75,
+        )
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))  # core day
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(five_pct=25, weekly_pct=5)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+    def test_daytime_throttles_at_low_pct(self, settings: Settings) -> None:
+        """At noon UTC, five_pct=35 exceeds daytime_slow=30 → THROTTLED_5H."""
+        cfg = _modulation_settings(
+            settings,
+            daytime_full=15,
+            daytime_slow=30,
+            nighttime_full=50,
+            nighttime_slow=75,
+        )
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(
+            five_pct=35,
+            weekly_pct=5,
+            five_resets=datetime(2026, 5, 13, 13, 0, tzinfo=UTC),
+        )
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.THROTTLED_5H
+
+    def test_nighttime_allows_dispatching(self, settings: Settings) -> None:
+        """At 02:00 UTC, five_pct=45 is still in FULL (below nighttime_full=50)."""
+        cfg = _modulation_settings(
+            settings,
+            daytime_full=15,
+            daytime_slow=30,
+            nighttime_full=50,
+            nighttime_slow=75,
+        )
+        clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(five_pct=45, weekly_pct=5)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.DISPATCHING
+
+    def test_nighttime_slowdown_above_50(self, settings: Settings) -> None:
+        """At 02:00 UTC, five_pct=60 enters nighttime slowdown band (50-75)."""
+        cfg = _modulation_settings(
+            settings,
+            daytime_full=15,
+            daytime_slow=30,
+            nighttime_full=50,
+            nighttime_slow=75,
+        )
+        clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(five_pct=60, weekly_pct=5)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+    def test_daytime_only_override_uses_static_at_night(self, settings: Settings) -> None:
+        """If only ``daytime_*`` is set, nighttime falls back to ``band_*``.
+
+        Static band_slowdown_max_pct=90, so at 02:00 UTC five_pct=85 is in slow.
+        """
+        cfg = _modulation_settings(
+            settings,
+            daytime_full=15,
+            daytime_slow=30,
+            # nighttime fields left None → fall back to static (70/90)
+        )
+        clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(
+            five_pct=85,
+            weekly_pct=5,
+            five_resets=datetime(2026, 5, 13, 5, 0, tzinfo=UTC),
+        )
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+    def test_no_overrides_uses_static(self, settings: Settings) -> None:
+        """With all override fields None, 5h thresholds are exactly the static bands."""
+        cfg = _modulation_settings(settings)  # all override fields None
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(five_pct=80, weekly_pct=5)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        # Static: 70 <= 80 < 90 → SLOWING_DOWN
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+
+class TestPacingCurveModulation:
+    """Dynamic pacing curve shifts weekly bands by observed-vs-target deviation."""
+
+    def test_ahead_of_target_tightens(self, settings: Settings) -> None:
+        """At mid-week (elapsed=0.5) target~47%; observed=80 → tighter weekly bands.
+
+        Target 0.5 of pre-EOW segment (0 to 80): target = 0.5/0.85 * 80 ≈ 47.
+        Deviation = 80 - 47 = 33; slack 10 → shift 23 → weekly_full = 70-23 = 47.
+        weekly_pct=80 ≥ 47 (effective full) → at least SLOWING_DOWN.
+        """
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = clock.now() + timedelta(days=3, hours=12)  # ~half-week away
+        cfg = _modulation_settings(settings, pacing_enabled=True)
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(
+            five_pct=5,
+            weekly_pct=80,
+            weekly_resets=weekly_reset,
+        )
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        # weekly slot in slowdown or stop band due to tightening
+        assert new.state in {SupervisorState.SLOWING_DOWN, SupervisorState.THROTTLED_5H}
+
+    def test_behind_target_keeps_dispatching(self, settings: Settings) -> None:
+        """Observed well behind target → bands loosen → DISPATCHING.
+
+        At elapsed=0.5, target~47%, observed=5: deviation negative beyond slack
+        loosens bands. five_pct stays low → DISPATCHING.
+        """
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = clock.now() + timedelta(days=3, hours=12)
+        cfg = _modulation_settings(settings, pacing_enabled=True)
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(five_pct=5, weekly_pct=5, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.DISPATCHING
+
+    def test_no_resets_at_falls_back_to_static(self, settings: Settings) -> None:
+        """Without a ``resets_at`` we can't pace — use the static bands."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        cfg = _modulation_settings(settings, pacing_enabled=True)
+        snap = _initial(SupervisorState.DISPATCHING)
+        # weekly=75 is in static slowdown (70-90); no resets_at provided.
+        reading = _reading(five_pct=5, weekly_pct=75)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+    def test_pacing_disabled_uses_static(self, settings: Settings) -> None:
+        """``pacing_curve_enabled = False`` ⇒ bands match the static config."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = clock.now() + timedelta(days=3)
+        cfg = _modulation_settings(settings, pacing_enabled=False)
+        snap = _initial(SupervisorState.DISPATCHING)
+        # weekly=80 statically would be in slowdown (70-90) → SLOWING_DOWN.
+        reading = _reading(five_pct=5, weekly_pct=80, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.SLOWING_DOWN
+
+    def test_pause_floor_never_overridden(self, settings: Settings) -> None:
+        """Even if behind target (curve would loosen), pause_at_pct is the floor."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = clock.now() + timedelta(days=3)
+        cfg = _modulation_settings(settings, pacing_enabled=True)
+        snap = _initial(SupervisorState.DISPATCHING)
+        # weekly=92 >= pause_at_pct=90 → must be PAUSED_WEEKLY regardless of curve
+        reading = _reading(
+            five_pct=5,
+            weekly_pct=92,
+            weekly_resets=weekly_reset,
+        )
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.PAUSED_WEEKLY
+
+
+class TestEowPushNighttimeBias:
+    """``eow_push_nighttime_only`` gates PAUSED_WEEKLY → END_OF_WEEK_PUSH to night."""
+
+    def test_daytime_blocks_eow_push(self, settings: Settings) -> None:
+        """At noon UTC core daytime, the bias keeps state in PAUSED_WEEKLY."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 18, 0, tzinfo=UTC)  # 6h ahead, EOW window
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.PAUSED_WEEKLY
+
+    def test_nighttime_allows_eow_push(self, settings: Settings) -> None:
+        """At 02:00 UTC core nighttime, the bias allows the transition."""
+        clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 8, 0, tzinfo=UTC)  # 6h ahead, EOW window
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.END_OF_WEEK_PUSH
+
+    def test_morning_ramp_still_blocks(self, settings: Settings) -> None:
+        """At 06:00 UTC the morning ramp is active — not core nighttime, gate closed."""
+        clock = FakeClock(datetime(2026, 5, 13, 6, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=True)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.PAUSED_WEEKLY
+
+    def test_bias_disabled_allows_daytime_push(self, settings: Settings) -> None:
+        """With ``eow_push_nighttime_only=False``, daytime EOW push fires as before."""
+        clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
+        weekly_reset = datetime(2026, 5, 13, 18, 0, tzinfo=UTC)
+        cfg = _modulation_settings(settings, eow_push_nighttime_only=False)
+        snap = _initial(SupervisorState.PAUSED_WEEKLY)
+        reading = _reading(five_pct=10, weekly_pct=92, weekly_resets=weekly_reset)
+        new, _ = step(_input(snap, reading, cfg, pending=2), clock)
+        assert new.state is SupervisorState.END_OF_WEEK_PUSH
