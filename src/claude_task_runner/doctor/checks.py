@@ -11,6 +11,7 @@ from running.
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -206,6 +207,104 @@ def check_task_yamls(_settings: Settings, queue_dir: Path) -> CheckResult:
     )
 
 
+# Absolute paths embedded in task prompts. Restricted to filesystem-rooted
+# directories we actually want to validate; skips URLs, env-var placeholders,
+# and template fragments like `${task_id}`.
+_PROMPT_PATH_RE = re.compile(
+    r"(?<!://)"
+    r"/(?:home|gitlab|github|var|tmp|opt|usr|etc|mnt|srv|run|data)"
+    r"/[A-Za-z0-9_.][\w./+\-]*"
+)
+# Trailing punctuation that prose puts after a path but isn't part of it.
+# ``_`` and ``-`` are stripped only when trailing — they almost always signal
+# a documentation fragment like ``_supplement_{1..N}.docx`` where the regex
+# stopped at the brace-expansion boundary.
+_PROMPT_PATH_TRIM = ".,:;)`\"'_-"
+
+
+def _extract_paths(prompt: str) -> set[Path]:
+    """Pull absolute-looking filesystem paths out of a task prompt string."""
+    found: set[Path] = set()
+    for raw in _PROMPT_PATH_RE.findall(prompt):
+        stripped = raw.rstrip(_PROMPT_PATH_TRIM)
+        # Skip env-var / shell-expansion placeholders, and anything that
+        # ended up with no extension AND no path component after the last
+        # ``/`` — those are usually directory-like sentinel matches against
+        # an opening brace that the regex didn't include.
+        if not stripped or "${" in stripped or "$(" in stripped:
+            continue
+        found.add(Path(stripped))
+    return found
+
+
+def check_task_paths(
+    _settings: Settings,
+    queue_dir: Path,
+    *,
+    enabled: bool = True,
+) -> CheckResult:
+    """Each absolute path referenced inside a Task prompt exists on disk.
+
+    Default-on; disable with ``claude-task-runner doctor --no-check-paths``.
+    A missing path is **WARN**, not FAIL: prompts also reference
+    yet-to-be-created output paths (reports, model files), and there's no
+    cheap way to tell input from output. The remediation lists the
+    offenders so the operator can triage.
+    """
+    if not enabled:
+        return CheckResult(
+            name="task_paths",
+            status=CheckStatus.PASS,
+            detail="skipped (--no-check-paths)",
+        )
+
+    missing_by_task: list[tuple[str, list[Path]]] = []
+    total_paths = 0
+    total_missing = 0
+    n_tasks = 0
+    for path in list_pending_tasks(queue_dir):
+        try:
+            task = load_task(path)
+        except (QueueIOError, QueueSchemaError):
+            # check_task_yamls reports this; don't double-count here.
+            continue
+        n_tasks += 1
+        referenced = _extract_paths(task.prompt or "")
+        if not referenced:
+            continue
+        total_paths += len(referenced)
+        missing = sorted(p for p in referenced if not p.exists())
+        if missing:
+            total_missing += len(missing)
+            missing_by_task.append((path.name, missing))
+
+    if not missing_by_task:
+        return CheckResult(
+            name="task_paths",
+            status=CheckStatus.PASS,
+            detail=f"{total_paths} referenced paths across {n_tasks} tasks all exist",
+        )
+
+    sample = []
+    for name, paths in missing_by_task[:20]:
+        sample.append(f"{name}:")
+        for p in paths[:5]:
+            sample.append(f"  - {p}")
+        if len(paths) > 5:
+            sample.append(f"  ... +{len(paths) - 5} more")
+    if len(missing_by_task) > 20:
+        sample.append(f"... +{len(missing_by_task) - 20} more tasks with missing paths")
+    return CheckResult(
+        name="task_paths",
+        status=CheckStatus.WARN,
+        detail=(
+            f"{total_missing} missing of {total_paths} referenced paths "
+            f"across {len(missing_by_task)} of {n_tasks} tasks"
+        ),
+        remediation="\n".join(sample),
+    )
+
+
 def check_state_yamls(_settings: Settings, queue_dir: Path) -> CheckResult:
     """Every YAML in ``state/`` validates."""
     bad: list[str] = []
@@ -342,14 +441,25 @@ def check_watchdog_installed(settings: Settings) -> CheckResult:
     )
 
 
-def all_checks(settings: Settings, queue_dir: Path) -> Iterable[Callable[[], CheckResult]]:
-    """Return zero-arg callables, in the order to run them."""
+def all_checks(
+    settings: Settings,
+    queue_dir: Path,
+    *,
+    check_paths: bool = True,
+) -> Iterable[Callable[[], CheckResult]]:
+    """Return zero-arg callables, in the order to run them.
+
+    ``check_paths`` toggles :func:`check_task_paths`. Defaults to True;
+    the doctor CLI exposes ``--no-check-paths`` to skip it on large
+    queues where the existence sweep is unwanted.
+    """
     return [
         lambda: check_claude_binary(settings),
         lambda: check_claude_config_dir(settings),
         lambda: check_global_lock(settings),
         lambda: check_queue_layout(settings, queue_dir),
         lambda: check_task_yamls(settings, queue_dir),
+        lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
         lambda: check_state_yamls(settings, queue_dir),
         lambda: check_supervisor_state(settings, queue_dir),
         lambda: check_ema(settings, queue_dir),
