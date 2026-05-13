@@ -8,7 +8,7 @@ from claude_task_runner.config.schema import (
     ConcurrencySettings,
     EMAPrior,
     EMASettings,
-    ThrottleBandSettings,
+    ThrottleFiveHourSettings,
     ThrottleSettings,
     ThrottleWeeklySettings,
 )
@@ -23,8 +23,8 @@ from claude_task_runner.runner.concurrency import (
 from claude_task_runner.runner.ema import EMAFile
 
 
-def _band_5h(full: int = 70, slow: int = 90, budget: int = 100_000_000) -> ThrottleBandSettings:
-    return ThrottleBandSettings(
+def _band_5h(full: int = 70, slow: int = 90, budget: int = 100_000_000) -> ThrottleFiveHourSettings:
+    return ThrottleFiveHourSettings(
         budget_tokens=budget,
         band_full_dispatch_max_pct=full,
         band_slowdown_max_pct=slow,

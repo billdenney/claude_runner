@@ -29,26 +29,72 @@ suspicious_delta_pct        = 50        # flag if util jumps > N points between 
 drift_recovery_clean_polls  = 3         # consecutive clean polls to leave ErrorDrift
 
 # ---------------------------------------------------------------------------
+# Throttle: global time-of-day boundaries
+#
+# Operator-active hours (06:00-22:00 local) get tighter dispatch caps so
+# interactive work has token headroom; the runner pushes harder at night.
+# The 30-minute ramp at each boundary avoids whipsawing dispatch at the
+# clock edge. See ADR-0015 for the math.
+#
+# Set `timezone = ""` to use the system local timezone.
+# ---------------------------------------------------------------------------
+[throttle.time_of_day]
+timezone     = ""        # IANA name (e.g. "America/New_York"); "" = system local
+day_start    = "06:00"   # HH:MM 24h — inclusive start of core daytime
+day_end      = "22:00"   # HH:MM 24h — exclusive end of core daytime
+ramp_minutes = 30        # linear interpolation width at each boundary
+
+# ---------------------------------------------------------------------------
 # Throttle: 5-hour window
+#
+# Static `band_*` thresholds apply when the daytime/nighttime overrides
+# below are unset. With the overrides set, the supervisor uses
+# `daytime_band_*` during 06:00-22:00 and `nighttime_band_*` overnight,
+# interpolating across the configured ramp. ADR-0015.
 # ---------------------------------------------------------------------------
 [throttle.five_hour]
-budget_tokens               = 99_000_000   # operator-calibrated ceiling
-band_full_dispatch_max_pct  = 70           # < N% : full target concurrency
-band_slowdown_max_pct       = 90           # 70-N% : linear slowdown
-                                           # >= 90% : no new dispatch (Throttled5h)
+budget_tokens               = 99_000_000   # Max20x 5h ceiling
+band_full_dispatch_max_pct  = 70           # static fallback (used when day/night overrides unset)
+band_slowdown_max_pct       = 90           # >= 90% : no new dispatch (Throttled5h)
+# Time-of-day overrides: tighter during day, looser at night.
+# Target ~22% average 5h utilization across 168h => ~95% weekly cap by reset.
+daytime_band_full_dispatch_max_pct   = 15  # tight daytime: leave 85% headroom for interactive
+daytime_band_slowdown_max_pct        = 30
+nighttime_band_full_dispatch_max_pct = 50  # push at night while operator is AFK
+nighttime_band_slowdown_max_pct      = 75
 
 # ---------------------------------------------------------------------------
 # Throttle: weekly window
+#
+# Two pacers operate on weekly utilization:
+#
+# 1. Static bands (`band_*`, `pause_at_pct`) — hard safety floor.
+# 2. Dynamic pacing curve (`pacing_curve_enabled`) — when ON, the supervisor
+#    computes a target utilization curve from the weekly elapsed fraction
+#    (anchored to the OAuth-reported `resets_at`, NOT a fixed weekday) and
+#    shifts the effective bands by how far observed deviates from target,
+#    outside a `pacing_slack_pp` dead-band. Ahead of target → tighter
+#    bands; behind target → looser bands. ADR-0016.
+#
+# `eow_target_pct` lowered 98 → 95: leaves a 5pp safety margin so a sudden
+# burst near reset doesn't trip the hard pause.
+# `eow_window_s` widened 43_200 (12h) → 86_400 (24h): more opportunities
+# for nighttime EOW push (which is gated to nighttime in the state machine
+# so daytime 5h windows stay free for interactive use).
 # ---------------------------------------------------------------------------
 [throttle.weekly]
-budget_tokens               = 798_841_951
+budget_tokens               = 798_841_951  # Max20x weekly ceiling
 band_full_dispatch_max_pct  = 70
 band_slowdown_max_pct       = 90
 pause_at_pct                = 90
 eow_push_enter_at_pct       = 90
-eow_target_pct              = 98
-eow_window_s                = 43200      # 12h
+eow_target_pct              = 95           # was 98 — leave safety margin
+eow_window_s                = 86400        # 24h — was 43200 (12h)
 eow_runtime_safety_factor   = 0.5
+# Dynamic pacing curve. ADR-0016.
+pacing_curve_enabled        = true
+pre_eow_target_pct          = 80           # target % at start of EOW window
+pacing_slack_pp             = 10.0         # dead-band ±N pp around target curve
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA
