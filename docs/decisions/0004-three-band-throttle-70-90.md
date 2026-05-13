@@ -1,7 +1,7 @@
 # ADR-0004: Three-band throttle (70/90) with EMA prediction
 
 - **Date:** 2026-05-03
-- **Status:** accepted
+- **Status:** accepted; amended by ADR-0015 (time-of-day modulation layered on top)
 
 ## Context
 

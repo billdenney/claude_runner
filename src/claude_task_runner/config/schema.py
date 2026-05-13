@@ -29,23 +29,93 @@ class UsageSettings(_StrictModel):
     drift_recovery_clean_polls: int = Field(ge=1)
 
 
+class TimeOfDaySettings(_StrictModel):
+    """Global day/night boundaries used by per-band time-of-day overrides.
+
+    The operator is interactive during the day (e.g. 06:00-22:00 local), so
+    dispatch should be tighter then to leave token headroom; at night the
+    runner can use the budget more aggressively. The transition is linearly
+    interpolated over a ``ramp_minutes`` window around each boundary so
+    dispatch doesn't whipsaw at the clock edge.
+
+    See ADR-0015 for the rationale and the math.
+    """
+
+    timezone: str = ""
+    """IANA timezone name (e.g. ``"America/New_York"``). Empty string means
+    "use system local time" (``datetime.astimezone(None)``)."""
+
+    day_start: str = "06:00"
+    """Inclusive start of core daytime, ``HH:MM`` 24-hour."""
+
+    day_end: str = "22:00"
+    """Exclusive end of core daytime (i.e. start of evening ramp toward night)."""
+
+    ramp_minutes: int = Field(default=30, ge=0, le=180)
+    """Width of the linear day/night interpolation ramp around each boundary."""
+
+
 class ThrottleBandSettings(_StrictModel):
+    """Static band thresholds — always available as a fallback."""
+
     budget_tokens: int = Field(gt=0)
     band_full_dispatch_max_pct: int = Field(ge=0, le=100)
     band_slowdown_max_pct: int = Field(ge=0, le=100)
 
 
+class ThrottleFiveHourSettings(ThrottleBandSettings):
+    """5-hour bands with optional daytime/nighttime overrides.
+
+    When any of the four override fields is non-None, the supervisor uses
+    it in place of the corresponding ``band_*`` value per the time-of-day
+    schedule defined in ``[throttle.time_of_day]``. Leaving them at ``None``
+    falls back to the static bands (full backward compatibility).
+    """
+
+    daytime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
+    daytime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+    nighttime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
+    nighttime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+
+
 class ThrottleWeeklySettings(ThrottleBandSettings):
+    """Weekly bands plus EOW push and dynamic pacing curve.
+
+    The pacing curve (when ``pacing_curve_enabled``) shifts the effective
+    ``band_*`` thresholds up or down based on how far the observed weekly
+    utilization is from the target curve at the current point in the
+    weekly window. See ADR-0016.
+    """
+
     pause_at_pct: int = Field(ge=0, le=100)
     eow_push_enter_at_pct: int = Field(ge=0, le=100)
     eow_target_pct: int = Field(ge=0, le=100)
     eow_window_s: float = Field(ge=0)
     eow_runtime_safety_factor: float = Field(gt=0, le=1.0)
 
+    pacing_curve_enabled: bool = False
+    """Master switch for the dynamic weekly pacing curve."""
+
+    pre_eow_target_pct: int = Field(default=80, ge=0, le=100)
+    """Target utilization at the start of the EOW push window — the curve
+    ramps from 0 to here over (1 - eow_window_fraction) of the week, then
+    from here to ``eow_target_pct`` over the EOW window."""
+
+    pacing_slack_pp: float = Field(default=10.0, ge=0, le=100)
+    """Dead-band (percentage points) around the target curve. The bands
+    only shift when observed deviates by more than ``slack`` from target."""
+
+    eow_push_nighttime_only: bool = True
+    """When ``True`` (the default), the PAUSED_WEEKLY → END_OF_WEEK_PUSH
+    transition fires only during core nighttime per ``[throttle.time_of_day]``.
+    This keeps daytime 5h windows available for interactive use while the
+    end-of-week burn-down runs overnight. See ADR-0015."""
+
 
 class ThrottleSettings(_StrictModel):
-    five_hour: ThrottleBandSettings
+    five_hour: ThrottleFiveHourSettings
     weekly: ThrottleWeeklySettings
+    time_of_day: TimeOfDaySettings = Field(default_factory=TimeOfDaySettings)
 
 
 class ConcurrencySettings(_StrictModel):
