@@ -394,9 +394,7 @@ def dispatch(
     # exited — clean exit, error, or cap. The orchestrator's eligibility
     # check skips awaiting_sidecar tasks, so the slot frees for the next
     # pending task while this one waits for the operator.
-    has_open_sidecar = any(
-        tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir)
-    )
+    has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
     if has_open_sidecar:
         final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
 
