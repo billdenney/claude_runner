@@ -152,7 +152,11 @@ def _target_concurrency(
     SLOWING_DOWN.
     """
     have_warmup = _has_any_completed(queue_dir)
-    base = settings.concurrency.max_concurrency if have_warmup else settings.concurrency.initial_concurrency
+    base = (
+        settings.concurrency.max_concurrency
+        if have_warmup
+        else settings.concurrency.initial_concurrency
+    )
     base = max(1, base)
     if snapshot.state is SupervisorState.SLOWING_DOWN:
         return max(1, base // 2)
