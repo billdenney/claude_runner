@@ -132,7 +132,8 @@ class TestIdleAndDispatching:
 class TestThrottleBands:
     def test_slowdown_5h(self, settings: Settings, clock: FakeClock) -> None:
         snap = _initial(SupervisorState.DISPATCHING)
-        reading = _reading(five_pct=80, weekly_pct=5)
+        # 50% with static bands 40/60 (modulation disabled in fixture) ⇒ slowdown.
+        reading = _reading(five_pct=50, weekly_pct=5)
         new, _ = step(_input(snap, reading, settings, pending=2), clock)
         assert new.state is SupervisorState.SLOWING_DOWN
 
@@ -427,18 +428,18 @@ class TestTimeOfDayModulation:
     def test_daytime_only_override_uses_static_at_night(self, settings: Settings) -> None:
         """If only ``daytime_*`` is set, nighttime falls back to ``band_*``.
 
-        Static band_slowdown_max_pct=90, so at 02:00 UTC five_pct=85 is in slow.
+        Static band 40/60 (PR #13 defaults), so at 02:00 UTC five_pct=50 is in slow.
         """
         cfg = _modulation_settings(
             settings,
             daytime_full=15,
             daytime_slow=30,
-            # nighttime fields left None → fall back to static (70/90)
+            # nighttime fields left None → fall back to static (40/60)
         )
         clock = FakeClock(datetime(2026, 5, 13, 2, 0, tzinfo=UTC))
         snap = _initial(SupervisorState.DISPATCHING)
         reading = _reading(
-            five_pct=85,
+            five_pct=50,
             weekly_pct=5,
             five_resets=datetime(2026, 5, 13, 5, 0, tzinfo=UTC),
         )
@@ -450,9 +451,9 @@ class TestTimeOfDayModulation:
         cfg = _modulation_settings(settings)  # all override fields None
         clock = FakeClock(datetime(2026, 5, 13, 12, 0, tzinfo=UTC))
         snap = _initial(SupervisorState.DISPATCHING)
-        reading = _reading(five_pct=80, weekly_pct=5)
+        reading = _reading(five_pct=50, weekly_pct=5)
         new, _ = step(_input(snap, reading, cfg, pending=2), clock)
-        # Static: 70 <= 80 < 90 → SLOWING_DOWN
+        # Static 40/60: 40 <= 50 < 60 → SLOWING_DOWN
         assert new.state is SupervisorState.SLOWING_DOWN
 
 

@@ -12,6 +12,13 @@ config_dir = ""        # CLAUDE_CONFIG_DIR override; empty = use ~/.claude.
                        # Set to e.g. "/home/bill/.claude_personal" to target
                        # a non-default account whose `claude /login` was run
                        # under that dir. Lets one host run multiple accounts.
+plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
+                       # "team_standard" | "team_premium".
+                       # Determines the 5h:weekly token ratio used to derive
+                       # default throttle thresholds. Operator can still
+                       # override `[throttle.*]` fields explicitly below.
+                       # If empty / unrecognised, the explicit `[throttle.*]`
+                       # values are used as-is (no auto-tuning).
 
 # ---------------------------------------------------------------------------
 # Usage capture & parser
@@ -47,15 +54,30 @@ ramp_minutes = 30        # linear interpolation width at each boundary
 # ---------------------------------------------------------------------------
 # Throttle: 5-hour window
 #
-# Static `band_*` thresholds apply when the daytime/nighttime overrides
-# below are unset. With the overrides set, the supervisor uses
-# `daytime_band_*` during 06:00-22:00 and `nighttime_band_*` overnight,
-# interpolating across the configured ramp. ADR-0015.
+# Two layers of band thresholds operate together:
+#
+# 1. Static `band_*` — pacing-agnostic safety floor. Tightened 2026-05-11
+#    from 70/90 to 40/60 so that, even with time-of-day modulation off,
+#    no single 5h session exceeds 60% of cap. On Max plans the 5h budget
+#    is ~1/8 of the weekly budget, so 8 back-to-back 100%-utilised 5h
+#    sessions would exhaust weekly in ~40h of the 168h window — capping
+#    at 60% spreads autonomous runtime across the full week.
+# 2. Daytime / nighttime overrides — when set, the supervisor uses
+#    `daytime_band_*` during 06:00-22:00 (operator-active hours) and
+#    `nighttime_band_*` overnight, linearly interpolating across the
+#    `ramp_minutes` boundary. ADR-0015. With overrides unset the static
+#    bands apply unchanged.
+#
+# Plan-specific tuning: future versions will derive `budget_tokens` and
+# the static `band_*` values from `[claude].plan` against the
+# `[plans.*]` table; for now the defaults below are tuned for Max20x and
+# inherited unchanged by other plans. Per-queue overrides always win.
 # ---------------------------------------------------------------------------
 [throttle.five_hour]
 budget_tokens               = 99_000_000   # Max20x 5h ceiling
-band_full_dispatch_max_pct  = 70           # static fallback (used when day/night overrides unset)
-band_slowdown_max_pct       = 90           # >= 90% : no new dispatch (Throttled5h)
+band_full_dispatch_max_pct  = 40           # < 40% : full target concurrency
+band_slowdown_max_pct       = 60           # 40-60% : linear slowdown
+                                           # >= 60% : no new dispatch (Throttled5h)
 # Time-of-day overrides: tighter during day, looser at night.
 # Target ~22% average 5h utilization across 168h => ~95% weekly cap by reset.
 daytime_band_full_dispatch_max_pct   = 15  # tight daytime: leave 85% headroom for interactive
@@ -66,7 +88,10 @@ nighttime_band_slowdown_max_pct      = 75
 # ---------------------------------------------------------------------------
 # Throttle: weekly window
 #
-# Two pacers operate on weekly utilization:
+# Weekly thresholds are looser than the 5h bands because the weekly cap
+# is the hard ceiling rather than the per-session pacer — the 5h
+# throttle is what spreads consumption across the week. Two layers
+# operate on weekly utilization on top of the static thresholds:
 #
 # 1. Static bands (`band_*`, `pause_at_pct`) — hard safety floor.
 # 2. Dynamic pacing curve (`pacing_curve_enabled`) — when ON, the supervisor
@@ -98,6 +123,58 @@ pacing_slack_pp             = 10.0         # dead-band ±N pp around target curv
 # Nighttime-bias for EOW push: when true (default), the PAUSED_WEEKLY →
 # END_OF_WEEK_PUSH transition only fires during core nighttime. ADR-0015.
 eow_push_nighttime_only     = true
+
+# ---------------------------------------------------------------------------
+# Plan-specific budget table
+#
+# Reserved for forthcoming auto-tuning: when `[claude].plan` is one
+# of the keys below, the loader replaces `[throttle.five_hour].budget_tokens`
+# and `[throttle.weekly].budget_tokens` with the plan's values, and
+# (if the operator hasn't overridden them) replaces the band_*_max_pct
+# fields with values derived from the plan's 5h:weekly ratio.
+#
+# Current rows are approximate ceilings observed on each plan; verify
+# against `claude /usage` for the target account before relying on them.
+# The schema validator does not enforce these — they're informational
+# until the loader implements the auto-tuning.
+# ---------------------------------------------------------------------------
+[plans.max20x]
+five_hour_tokens = 99_000_000
+weekly_tokens    = 798_841_951
+# Eight 5h windows per week of budget; 168h / (8 windows × 5h) = 4.2x
+# spare capacity, so cap 5h at ~60% to spread across the week.
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.max5x]
+five_hour_tokens = 24_750_000     # ~1/4 of Max20x
+weekly_tokens    = 199_710_488
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.pro]
+five_hour_tokens = 4_950_000      # ~1/20 of Max20x
+weekly_tokens    = 39_942_098
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.team_standard]
+# Team Standard: operator-noted ratio 1.25 x Pro.
+# 5h:  4_950_000 * 1.25 =  6_187_500
+# wk: 39_942_098 * 1.25 = 49_927_622
+five_hour_tokens = 6_187_500
+weekly_tokens    = 49_927_622
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
+
+[plans.team_premium]
+# Team Premium: operator-noted ratio 6.25 x Pro.
+# 5h:  4_950_000 * 6.25 =  30_937_500
+# wk: 39_942_098 * 6.25 = 249_638_112
+five_hour_tokens = 30_937_500
+weekly_tokens    = 249_638_112
+band_full_dispatch_max_pct = 40
+band_slowdown_max_pct      = 60
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA

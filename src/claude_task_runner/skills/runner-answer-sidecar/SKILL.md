@@ -9,85 +9,167 @@ description: |
   stop-and-ask protocol — when a dispatched task hits a question it
   can't autonomously decide (a covariate encoding ambiguity, a
   missing parameter, etc.) it pauses and writes a JSON request the
-  operator answers. This skill lists, presents, and answers them.
+  operator answers. This skill lists, presents, and answers them
+  in a single batched pass.
 ---
 
 # /runner-answer-sidecar — clear pending sidecar questions
 
-The skill is optimized for **minimum operator typing**. Each question
-maps 1:1 onto an `AskUserQuestion` invocation; the operator clicks
-once per question and the response JSON gets written. No paraphrasing,
-no manual editing.
+The skill is optimized for **minimum operator typing AND minimum
+agent-loop iteration**. Every open sidecar is fetched in one shell
+pass via the bundled `fetch_all.sh` helper script, presented to the
+operator in batched `AskUserQuestion` calls (up to 4 questions per
+call), and answered in a single batch of `claude-task-runner sidecar
+answer` invocations. This avoids the back-and-forth of fetching →
+asking → answering → fetching the next one, which both costs
+agent-loop turns and lets new sidecars sneak in mid-pass.
 
 ## Steps
 
-1. **List open sidecars.** Run
-   `claude-task-runner sidecar list --queue <CWD> --json`. The output
-   is `{"sidecars": [{task_id, sequence, summary, questions, ...}]}`.
+1. **Bulk-fetch every open sidecar's context.** Run the bundled helper
+   from the skill directory:
 
-2. **If empty**, tell the user: "No open sidecars." Stop here.
+   ```bash
+   bash /home/bill/.claude/skills/runner-answer-sidecar/fetch_all.sh \
+       --queue <CWD>
+   ```
 
-3. **If one or more**, walk through them ONE AT A TIME (don't try to
-   batch). For each:
+   Output is a single JSON document with shape:
+   ```json
+   {
+     "queue": "<dir>",
+     "n_open": <int>,
+     "sidecars": [
+       {"task_id": "...", "sequence": N,
+        "summary": "...", "context": "...",
+        "questions": [{"id": "...", "prompt": "...", "options": [...],
+                       "multi_select": <bool>, "allow_free_text": <bool>,
+                       "recommended": "..."}]},
+       ...
+     ]
+   }
+   ```
 
-   a. **Show context.** Run
-      `claude-task-runner sidecar show <task_id> <sequence> --queue <CWD> --json`
-      and report:
-      - `summary` (one line)
-      - `context` (verbatim — may be multi-paragraph)
-      - For each question: prompt, options (with `*` next to the
-        recommended option), `multi_select` flag, `allow_free_text`
-        flag.
+   The script tolerates v1-schema (legacy) sidecar requests by reading
+   the raw file directly and synthesising a v2-shaped record with a
+   `schema_warning` field so the agent can still present them.
 
-   b. **Ask each question via `AskUserQuestion`.** This is a strict
-      mapping — do NOT paraphrase or summarize:
-      - The `AskUserQuestion.question` is the sidecar's prompt verbatim.
-      - The `header` is short — derive from the question id.
-      - The `options[]` come from the sidecar's options[]. Use
-        `option.label` as the AskUserQuestion `label` and
-        `option.description` (if present) as the `description`. The
-        recommended option goes FIRST and gets " (Recommended)"
-        appended to its label.
-      - Set `multiSelect=true` if the sidecar question has
-        `multi_select=true`.
-      - DO NOT add an "Other" option manually — AskUserQuestion adds
-        one automatically. The operator only types if `allow_free_text`
-        is true AND they choose Other.
+2. **If `n_open == 0`**, tell the user "No open sidecars." and stop.
 
-   c. **Collect answers.** For multi-select questions, the operator's
-      answer is a list of values; for single-select, a single string.
+3. **Present a one-paragraph summary per sidecar to the operator.**
+   Don't dump the full context block — it's often multi-paragraph and
+   redundant once `summary` is in hand. Tabulate task_id ↔ summary so
+   the operator sees the scope of the batch before answering.
 
-   d. **Write the response.** Build a JSON list of
-      `{id, value}` objects (one per question) and pass to:
-      ```
-      claude-task-runner sidecar answer <task_id> <sequence> \
-          --queue <CWD> \
-          --answers '[{"id":"q1","value":"A"},{"id":"q2","value":["X","Y"]}]'
-      ```
-      Optional: `--notes "<short operator note>"`. Default to empty
-      if the operator didn't volunteer commentary.
+4. **Build the AskUserQuestion batches.** Count the total number of
+   `questions[]` across all sidecars (some sidecars have 2–4 questions;
+   most have 1). Group them into batches of **at most 4** questions per
+   `AskUserQuestion` call (that's the tool's hard cap). Order them to
+   keep questions from the same sidecar contiguous when possible — the
+   operator can then answer related multi-question sidecars without
+   losing context.
 
-4. **Move on to the next sidecar.** Repeat steps 3a–3d until the list
-   is exhausted.
+   For each `AskUserQuestion` question:
+   - The `question` is the sidecar's `prompt` verbatim (or a slight
+     paraphrase if too long for the UI; never paraphrase a recommended
+     option's substance).
+   - The `header` is short (≤ 12 chars) — derive from the sidecar's
+     drug + year, or task_id, or question id.
+   - The `options[]` come from the sidecar's `options[]`. Use
+     `option.label` as the AskUserQuestion `label` and
+     `option.description` (truncated to ~200 chars if long) as the
+     `description`. The recommended option goes FIRST and gets
+     " (Recommended)" appended to its label.
+   - Set `multiSelect: true` if the sidecar question has
+     `multi_select: true`.
+   - DO NOT add an "Other" option manually — AskUserQuestion adds one
+     automatically. The operator only types if `allow_free_text` is
+     true AND they pick Other.
 
-5. **Final summary.** Tell the user how many sidecars were answered
-   and which task IDs are now unblocked.
+5. **Submit all answers in a single batched run.** After the operator
+   answers all batches, build one shell block that submits every
+   sidecar response:
+
+   ```bash
+   QUEUE=<queue_path>
+   claude-task-runner sidecar answer <tid_1> <seq_1> --queue $QUEUE \
+       --answers '[{"id":"q1","value":"<answer1>"}]'
+   claude-task-runner sidecar answer <tid_2> <seq_2> --queue $QUEUE \
+       --answers '[{"id":"q1","value":"<answer1>"},{"id":"q2","value":"<answer2>"}]'
+   ...
+   ```
+
+   For multi-select questions, `value` is a JSON array of the chosen
+   option values. For free-text "Other" answers, `value` is the
+   operator's free-text string verbatim — no validation, no sanitization.
+
+6. **Verify the queue is clear.** Run `claude-task-runner sidecar list
+   --queue <CWD> --json` once more and confirm `n_open == 0`. If new
+   sidecars opened during the answer pass (the supervisor may dispatch
+   while you're working), repeat from Step 1 — the operator can decide
+   whether to handle this round or stop.
+
+7. **Final summary.** Emit a markdown table:
+
+   | # | Task | Decision |
+   |---|---|---|
+   | 1 | <task_id_1> | <one-line answer summary> |
+   | ... |
 
 ## Things this skill does NOT do
 
 - **Doesn't second-guess the operator.** Even if the recommended
   option seems "obviously right", let the operator pick.
 - **Doesn't auto-fill notes.** Notes are blank by default; only set
-  them if the operator says something specific in chat.
+  them via `--notes` if the operator says something specific in chat.
 - **Doesn't restart the supervisor.** Once responses land, the next
   supervisor tick re-dispatches via `claude --resume`.
 - **Doesn't read sidecars from other queues.** Each invocation is
   scoped to one `--queue` (default: cwd).
+- **Doesn't paraphrase the operator's free-text answers.** When a
+  question has `allow_free_text: true` and the operator types
+  something via "Other", pass the string verbatim to `--answers`.
 
-## Important nuance: free-text answers
+## Important nuances
 
-If a question has `allow_free_text: true`, the operator can type a
-custom answer via the AskUserQuestion "Other" path. When that
-happens, pass the free-text string as the `value`. Don't try to
-re-validate or sanitize — the runner accepts whatever string the
-operator wrote.
+### v1-schema (legacy) sidecars
+
+Older worktree skill versions sometimes write sidecar requests in the
+v1 schema (with `question`/`options` flat fields and `request_id`
+instead of `sequence`). The runner's `sidecar show` command rejects
+these on validation, but `fetch_all.sh` reads the raw file directly
+and synthesises a v2-shaped record. The synthesised record will carry
+a `schema_warning` field so you know the response will need to be
+written manually if `sidecar answer` rejects it; in practice the
+runner's `sidecar answer` accepts answers against legacy requests as
+long as the `--answers` JSON has the right `id` keys (the v1 schema's
+options have `id`, e.g. "A"/"B"/"C", which map directly to v2's
+`option.value`).
+
+### Batch sizing for AskUserQuestion
+
+The `AskUserQuestion` tool caps at 4 questions per call. With N
+sidecars having varying question counts:
+
+- Total questions = sum of `len(sidecar.questions)` across all open
+  sidecars.
+- Batches needed = ceil(total / 4).
+- Order: keep multi-question sidecars contiguous (don't split a
+  sidecar's q1 across one batch and q2 into the next batch unless the
+  total questions exceed 4 within that one sidecar).
+
+### When the supervisor opens new sidecars during the pass
+
+If `n_open` goes UP between Step 1 and Step 6 (the supervisor
+dispatched more tasks while the operator was answering), the new
+sidecars will show in the verification list. Decide with the operator
+whether to process the new round now or stop and let them pile.
+
+### Multi-select vs free-text
+
+- `multi_select: true` → operator's answer is a JSON array of values.
+- `allow_free_text: true` → operator may type a custom string; pass
+  it as `value` directly.
+- Both can be true simultaneously (operator picks zero-or-more from
+  the menu, plus a free-text addendum). In practice the runner accepts
+  whatever JSON you pass.

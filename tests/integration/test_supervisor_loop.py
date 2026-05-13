@@ -122,9 +122,9 @@ class TestScriptedDay:
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 2. Climbing: 75% (slowdown band) → SLOWING_DOWN
+            # 2. Climbing: 50% (slowdown band 40-60 with static bands) → SLOWING_DOWN
             _r(
-                five=75,
+                five=50,
                 weekly=10,
                 five_resets=five_reset_initial,
                 weekly_resets=weekly_reset,
