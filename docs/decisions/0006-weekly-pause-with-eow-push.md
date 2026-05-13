@@ -1,7 +1,7 @@
 # ADR-0006: Pause weekly at threshold + end-of-week push
 
 - **Date:** 2026-05-03
-- **Status:** accepted
+- **Status:** accepted; amended by ADR-0015 (nighttime-biased EOW push) and ADR-0016 (dynamic weekly pacing curve)
 
 ## Context
 
