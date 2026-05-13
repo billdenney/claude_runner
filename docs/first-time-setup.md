@@ -2,7 +2,7 @@
 
 Walks an operator from an empty directory to a running supervisor draining
 its first task. Replaces the absent `claude-task-runner config init`
-subcommand referenced in older docs (see ADR-0015).
+subcommand referenced in older docs (see ADR-0017).
 
 ## 1. Install the package
 

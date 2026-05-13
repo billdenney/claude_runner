@@ -56,10 +56,7 @@ def doctor(
     settings = load_settings(config)
     queue_path = queue_dir.resolve()
 
-    results = [
-        factory()
-        for factory in all_checks(settings, queue_path, check_paths=check_paths)
-    ]
+    results = [factory() for factory in all_checks(settings, queue_path, check_paths=check_paths)]
 
     if json:
         payload = {

@@ -1,4 +1,4 @@
-# ADR-0015: Cleanup after the superseded `claude_runner` audit
+# ADR-0017: Cleanup after the superseded `claude_runner` audit
 
 - **Date:** 2026-05-13
 - **Status:** accepted
