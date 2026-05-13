@@ -51,6 +51,7 @@ from claude_task_runner.queue.schema import (
     TaskState,
     TokenUsage,
 )
+from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
     state_path_for,
     write_state_atomic,
@@ -386,6 +387,17 @@ def dispatch(
         summary=summary,
         cap_violation=cap_violation,
     )
+
+    # Stop-and-ask override: if the agent wrote a sidecar request that has
+    # no matching response, the agent has paused for an operator decision.
+    # Mark the task awaiting_sidecar regardless of how the subprocess
+    # exited — clean exit, error, or cap. The orchestrator's eligibility
+    # check skips awaiting_sidecar tasks, so the slot frees for the next
+    # pending task while this one waits for the operator.
+    has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
+    if has_open_sidecar:
+        final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
+
     if persist_state:
         write_state_atomic(final_state, state_path_for(queue_dir, task.id))
 
