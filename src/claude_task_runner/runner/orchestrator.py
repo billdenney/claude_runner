@@ -253,6 +253,7 @@ def _dispatch_one_safely(
             settings_hooks=settings.hooks,
             settings_failure_classifier=settings.failure_classifier,
             claude_executable=claude_executable,
+            claude_config_dir=settings.claude.config_dir,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

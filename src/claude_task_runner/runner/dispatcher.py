@@ -284,6 +284,7 @@ def dispatch(
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     claude_executable: str = "claude",
+    claude_config_dir: str = "",
     persist_state: bool = True,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
@@ -340,6 +341,20 @@ def dispatch(
     argv = build_argv(task, plan, claude_executable=claude_executable)
     logger.info("dispatching task %s (attempt %d): %s", task.id, new_state.attempts, argv[0:1])
 
+    # Build the subprocess env. When `claude_config_dir` is set (per-queue
+    # config selects a non-default Claude account, e.g. ~/.claude_personal),
+    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
+    # subprocess reads the same credentials the supervisor's /usage capture
+    # uses. Without this, the supervisor sees personal-account utilization
+    # while every dispatched task hits the default ~/.claude account --
+    # which may be at a different / depleted quota.
+    spawn_env: dict[str, str] | None = None
+    if claude_config_dir:
+        config_path = Path(claude_config_dir).expanduser()
+        if not config_path.exists():
+            raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
+        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+
     process = subprocess.Popen(  # caller-controlled
         argv,
         stdout=subprocess.PIPE,
@@ -347,6 +362,7 @@ def dispatch(
         text=True,
         bufsize=1,
         cwd=str(task.working_dir) if task.working_dir else None,
+        env=spawn_env,
     )
 
     summary, cap_violation = _dispatch_loop(
