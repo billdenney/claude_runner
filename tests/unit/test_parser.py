@@ -215,3 +215,55 @@ class TestExtraWindows:
     ) -> None:
         reading = parse(_two_block(38, 20), captured_at, fake_clock)
         assert reading.extra_windows == []
+
+
+class TestPyteSquashedHeaders:
+    """Claude >= 2.1.141 sometimes renders section headers without
+    internal whitespace because pyte (the virtual terminal we feed
+    raw PTY bytes through) collapses adjacent ANSI-cursor-positioned
+    tokens. The parser's header regexes use ``\\s*`` so both shapes
+    classify as the same window type.
+    """
+
+    def test_squashed_current_session(self, captured_at: datetime, fake_clock: FakeClock) -> None:
+        raw = (
+            b"  Currentsession\r\n  13% used\r\n  Resets 10:10pm (UTC)\r\n"
+            b"  Current week (all models)\r\n  15% used\r\n  Resets May 20, 11am (UTC)\r\n"
+        )
+        reading = parse(raw, captured_at, fake_clock)
+        assert reading.five_hour.utilization_pct == 13
+        assert reading.seven_day.utilization_pct == 15
+
+    def test_squashed_current_week_all_models(
+        self, captured_at: datetime, fake_clock: FakeClock
+    ) -> None:
+        raw = (
+            b"  Current session\r\n  13% used\r\n  Resets 10:10pm (UTC)\r\n"
+            b"  Currentweek(allmodels)\r\n  15% used\r\n  Resets May 20, 11am (UTC)\r\n"
+        )
+        reading = parse(raw, captured_at, fake_clock)
+        assert reading.five_hour.utilization_pct == 13
+        assert reading.seven_day.utilization_pct == 15
+
+    def test_both_headers_squashed(self, captured_at: datetime, fake_clock: FakeClock) -> None:
+        raw = (
+            b"  Currentsession\r\n  13% used\r\n  Resets10:10pm (UTC)\r\n"
+            b"  Currentweek(allmodels)\r\n  15% used\r\n  ResetsMay 20, 11am (UTC)\r\n"
+        )
+        reading = parse(raw, captured_at, fake_clock)
+        assert reading.five_hour.utilization_pct == 13
+        assert reading.seven_day.utilization_pct == 15
+
+    def test_squashed_sonnet_only_still_classified_as_extra(
+        self, captured_at: datetime, fake_clock: FakeClock
+    ) -> None:
+        raw = (
+            b"  Current session\r\n  3% used\r\n  Resets 11pm (UTC)\r\n"
+            b"  Current week (all models)\r\n  100% used\r\n  Resets 3am (UTC)\r\n"
+            b"  Currentweek(Sonnetonly)\r\n  10% used\r\n  Resets 2:59am (UTC)\r\n"
+        )
+        reading = parse(raw, captured_at, fake_clock)
+        assert reading.seven_day.utilization_pct == 100
+        assert len(reading.extra_windows) == 1
+        assert reading.extra_windows[0].label == "Sonnetonly"
+        assert reading.extra_windows[0].utilization_pct == 10

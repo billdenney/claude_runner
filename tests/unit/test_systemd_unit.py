@@ -145,3 +145,20 @@ class TestIsSystemdUserAvailable:
         p.write_text(body)
         p.chmod(0o755)
         assert is_systemd_user_available(systemctl_executable=str(p)) is False
+
+
+def test_unit_text_includes_term_and_path_environment() -> None:
+    """Regression: systemd-user units start with a near-empty environment.
+    Without TERM the pexpect-driven `claude /usage` TUI can't render; without
+    `~/.local/bin` on PATH `shutil.which("claude")` returns None for pipx
+    installs and the supervisor's safe_poll() raises UsageCaptureSpawnError
+    forever. The generated unit must inject both.
+    """
+    text = build_unit_text(
+        supervisor_command="/usr/bin/claude-task-runner supervisor start",
+        queue_dir=Path("/home/bill/queue"),
+    )
+    assert "Environment=TERM=" in text
+    assert "Environment=PATH=" in text
+    # PATH must include the user's local bin so pipx-installed Claude resolves.
+    assert "%h/.local/bin" in text or "/.local/bin" in text

@@ -42,18 +42,29 @@ from claude_task_runner.usage.reset_times import parse_five_hour, parse_weekly
 # "NN% used" — negative lookbehind to reject "-1% used".
 _PCT_USED_RE = re.compile(r"(?<![\d.-])(\d{1,3})\s*%\s*used", re.IGNORECASE)
 # "Resets <text>" — captures everything after "Resets" on the same line.
-_RESETS_RE = re.compile(r"^\s*resets\s+(.+?)\s*$", re.IGNORECASE)
+# `\s*` instead of `\s+` for the same pyte-collapse reason as the headers
+# below: live captures from Claude >= 2.1.141 sometimes produce
+# "Resets10:10pm(UTC)" with no whitespace.
+_RESETS_RE = re.compile(r"^\s*resets\s*(.+?)\s*$", re.IGNORECASE)
 # Section header patterns observed in the live TUI.
+#
+# IMPORTANT: pyte (the virtual terminal used by render.render) sometimes
+# collapses adjacent ANSI-cursor-positioned tokens into one contiguous
+# word — e.g. "Current session" renders as "Currentsession", and
+# "Current week (all models)" renders as "Currentweek(allmodels)". Both
+# shapes appear in the same dispatch run depending on terminal width
+# and cursor moves. So we use `\s*` (not `\s+`) between every word; the
+# `^\s*...\s*$` anchors still keep us from over-matching mid-line text.
 _HEADER_5H_RE = re.compile(
-    r"^\s*(?:current\s+session|5-?hour\s+session|5-?h\s+session)\s*$",
+    r"^\s*(?:current\s*session|5-?hour\s*session|5-?h\s*session)\s*$",
     re.IGNORECASE,
 )
 _HEADER_WEEKLY_ALL_RE = re.compile(
-    r"^\s*(?:current\s+week\s*\(all\s+models\)|7-?day\s+weekly)\s*$",
+    r"^\s*(?:current\s*week\s*\(\s*all\s*models\s*\)|7-?day\s*weekly)\s*$",
     re.IGNORECASE,
 )
 _HEADER_WEEKLY_OTHER_RE = re.compile(
-    r"^\s*current\s+week\s*\(([^)]+)\)\s*$",
+    r"^\s*current\s*week\s*\(([^)]+)\)\s*$",
     re.IGNORECASE,
 )
 

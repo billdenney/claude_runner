@@ -24,6 +24,8 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0014 | Every cutoff is a TOML setting | accepted | 2026-05-03 |
 | 0015 | Time-of-day band modulation + nighttime-biased EOW push | accepted | 2026-05-13 |
 | 0016 | Dynamic weekly pacing curve anchored to OAuth reset | accepted | 2026-05-13 |
+| 0017 | Cleanup after the superseded `claude_runner` audit | accepted | 2026-05-13 |
+| 0018 | Inject TERM and PATH into the generated systemd-user unit | accepted | 2026-05-14 |
 
 ## Template
 
