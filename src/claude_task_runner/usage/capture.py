@@ -111,16 +111,33 @@ def capture(
         child.logfile_read = log_buf
 
         # Phase 1: race trust prompt vs TUI-ready marker.
+        #
+        # Two trust-prompt shapes are known:
+        #   - Claude <= 2.1.131:   "Yes, I trust this folder"  (Enter accepts)
+        #   - Claude >= 2.1.141:   "Quick safety check: Is this a project..."
+        #                          (Enter on the highlighted default accepts;
+        #                          if that ever stops working, the operator
+        #                          can pre-trust the directory by flipping
+        #                          `hasTrustDialogAccepted=true` in
+        #                          <config_dir>/.claude.json, which makes the
+        #                          prompt vanish entirely.)
+        # Either prompt -> send Enter and then wait for the "shortcuts"
+        # TUI-ready marker.
         try:
             idx = child.expect(
-                [b"Yes, I trust this folder", b"shortcuts", pexpect.TIMEOUT],
+                [
+                    b"Yes, I trust this folder",
+                    b"Quick safety check",
+                    b"shortcuts",
+                    pexpect.TIMEOUT,
+                ],
                 timeout=settings.capture_trust_timeout_s,
             )
         except pexpect.EOF as exc:
             raise UsageCaptureTimeout("claude exited before any TUI marker appeared") from exc
 
-        if idx == 0:
-            child.sendline("")  # confirm trust
+        if idx in (0, 1):
+            child.sendline("")  # confirm trust (Enter accepts the default)
             try:
                 child.expect(
                     [b"shortcuts", pexpect.TIMEOUT],
@@ -130,7 +147,7 @@ def capture(
                 raise UsageCaptureTimeout(
                     "claude exited after trust confirmation, before TUI ready"
                 ) from exc
-        elif idx == 2:
+        elif idx == 3:
             raise UsageCaptureTimeout(
                 f"TUI did not become ready within {settings.capture_trust_timeout_s}s"
             )

@@ -29,18 +29,28 @@ def _watchdog_script_path() -> Path:
     return Path(__file__).resolve().parent.parent / "cron" / "watchdog.sh"
 
 
-def _supervisor_command(queue_dir: Path) -> str:
+def _supervisor_command(queue_dir: Path, config: Path | None = None) -> str:
     """Build the absolute command line systemd should invoke.
 
     Uses ``shutil.which`` so the ExecStart= line is fully-qualified
     (systemd does not search PATH by default for user units).
+
+    When the operator passes ``--config`` to ``install``, propagate it
+    into the ExecStart line so the supervisor that systemd launches
+    reads the same per-queue TOML the operator validated against.
+    Previously the ``--config`` flag was accepted by ``install`` but
+    dropped on the floor, leaving the supervisor to fall back to
+    defaults (e.g. wrong ``config_dir`` -> wrong Claude account).
     """
     exe = shutil.which("claude-task-runner")
     if exe is None:
         raise typer.Exit(
             code=2,
         ) from RuntimeError("claude-task-runner not found on PATH; is the package installed?")
-    return f"{exe} supervisor start --queue {queue_dir}"
+    cmd = f"{exe} supervisor start --queue {queue_dir}"
+    if config is not None:
+        cmd += f" --config {config}"
+    return cmd
 
 
 def _detect_init_system(preferred: str) -> str:
@@ -94,7 +104,7 @@ def install(
 
     if init_system == "systemd":
         sd_plan = systemd_mod.build_install_plan(
-            supervisor_command=_supervisor_command(queue_path),
+            supervisor_command=_supervisor_command(queue_path, config),
             queue_dir=queue_path,
         )
         verb = "replace" if sd_plan.block_existed else "create"
