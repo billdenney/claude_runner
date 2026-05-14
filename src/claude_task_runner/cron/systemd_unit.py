@@ -119,6 +119,18 @@ def build_unit_text(
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        # systemd-user units start with a near-empty environment. The
+        # supervisor's `usage capture` spawns `claude` via pexpect, which
+        # needs (a) a working TERM for the TUI to render at all, and (b)
+        # PATH to include `~/.local/bin` so pipx-installed Claude binaries
+        # resolve under `shutil.which("claude")`. Without these,
+        # safe_poll() returns UsageCaptureSpawnError every tick and the
+        # supervisor sits in IDLE forever even though the queue has work.
+        # Operators can override with `systemctl --user edit
+        # claude-task-runner.service` if their setup differs.
+        "Environment=TERM=xterm-256color\n"
+        "Environment=PATH=%h/.local/bin:/usr/local/sbin:"
+        "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
         f"ExecStart={supervisor_command}\n"
         f"WorkingDirectory={queue_dir}\n"
         "Restart=on-failure\n"
