@@ -41,6 +41,7 @@ from pathlib import Path
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
+    FailureClassifierSettings,
     HookSettings,
     SessionSettings,
     TaskCapsSettings,
@@ -59,6 +60,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import caps as caps_mod
 from claude_task_runner.runner import heartbeat as hb_mod
 from claude_task_runner.runner import hooks as hooks_mod
+from claude_task_runner.runner import retry as retry_mod
 from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
@@ -280,6 +282,7 @@ def dispatch(
     settings_caps: TaskCapsSettings,
     settings_session: SessionSettings,
     settings_hooks: HookSettings,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
     claude_executable: str = "claude",
     persist_state: bool = True,
 ) -> DispatchOutcome:
@@ -386,6 +389,7 @@ def dispatch(
         run=run_record,
         summary=summary,
         cap_violation=cap_violation,
+        settings_failure_classifier=settings_failure_classifier,
     )
 
     # Stop-and-ask override: if the agent wrote a sidecar request that has
@@ -430,6 +434,28 @@ def dispatch(
     )
 
 
+def _count_trailing_failures(runs: list[RunRecord]) -> int:
+    """Count consecutive failure RunRecords at the tail of ``runs``.
+
+    A success interleaves the failure run and resets the count. The
+    most recent run is the last element of ``runs``.
+
+    Mirrors the criteria in `_finalize_state` for "completed": empty
+    error AND a clean stop_reason. Anything else is a failure for
+    circuit-breaker accounting purposes.
+    """
+    n = 0
+    for record in reversed(runs):
+        is_success = record.error is None and record.stop_reason in (
+            "end_turn",
+            "result",
+        )
+        if is_success:
+            break
+        n += 1
+    return n
+
+
 def _finalize_state(
     *,
     prior: TaskState,
@@ -437,8 +463,20 @@ def _finalize_state(
     run: RunRecord,
     summary: StreamSummary,
     cap_violation: caps_mod.CapViolation | None,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
 ) -> TaskState:
-    """Apply a RunRecord to a TaskState, returning the post-attempt state."""
+    """Apply a RunRecord to a TaskState, returning the post-attempt state.
+
+    When ``settings_failure_classifier`` is supplied AND consecutive
+    failures (including this one) reach the configured
+    ``failure_circuit_breaker_threshold``, the status is set to
+    ``failed_circuit_breaker`` instead of plain ``failed`` -- the
+    orchestrator excludes that status from re-dispatch, breaking the
+    auto-retry loop. Without this gate, a task that fails the same
+    way every attempt (e.g. agent exits with ``stop_sequence`` and
+    no real output) gets re-dispatched indefinitely because
+    ``_DISPATCHABLE_STATUSES = {"pending", "failed"}``.
+    """
     new_runs = [*prior.runs, run]
 
     if cap_violation is not None:
@@ -447,6 +485,17 @@ def _finalize_state(
         new_status = "completed"
     else:
         new_status = "failed"
+
+    # Trip the circuit breaker on consecutive failures so we don't
+    # auto-retry forever. The threshold is queue-configured under
+    # `[failure_classifier]`; default is 3.
+    if new_status == "failed" and settings_failure_classifier is not None:
+        consecutive = _count_trailing_failures(new_runs)
+        if retry_mod.circuit_breaker_tripped(
+            consecutive_failures=consecutive,
+            settings=settings_failure_classifier,
+        ):
+            new_status = "failed_circuit_breaker"
 
     new_session_id = summary.session_id or prior.session_id
     new_resume_attempts = (

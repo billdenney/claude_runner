@@ -251,6 +251,7 @@ def _dispatch_one_safely(
             settings_caps=settings.task_caps,
             settings_session=settings.session,
             settings_hooks=settings.hooks,
+            settings_failure_classifier=settings.failure_classifier,
             claude_executable=claude_executable,
         )
     except Exception:
