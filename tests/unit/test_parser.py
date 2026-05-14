@@ -225,9 +225,7 @@ class TestPyteSquashedHeaders:
     classify as the same window type.
     """
 
-    def test_squashed_current_session(
-        self, captured_at: datetime, fake_clock: FakeClock
-    ) -> None:
+    def test_squashed_current_session(self, captured_at: datetime, fake_clock: FakeClock) -> None:
         raw = (
             b"  Currentsession\r\n  13% used\r\n  Resets 10:10pm (UTC)\r\n"
             b"  Current week (all models)\r\n  15% used\r\n  Resets May 20, 11am (UTC)\r\n"
@@ -247,9 +245,7 @@ class TestPyteSquashedHeaders:
         assert reading.five_hour.utilization_pct == 13
         assert reading.seven_day.utilization_pct == 15
 
-    def test_both_headers_squashed(
-        self, captured_at: datetime, fake_clock: FakeClock
-    ) -> None:
+    def test_both_headers_squashed(self, captured_at: datetime, fake_clock: FakeClock) -> None:
         raw = (
             b"  Currentsession\r\n  13% used\r\n  Resets10:10pm (UTC)\r\n"
             b"  Currentweek(allmodels)\r\n  15% used\r\n  ResetsMay 20, 11am (UTC)\r\n"
