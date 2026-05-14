@@ -182,8 +182,21 @@ def capture(
                 )
             resets_seen += 1
 
+        # EARLIEST SNAPSHOT: right after both Resets markers appeared.
+        # The TUI has finished rendering the 5-hour and weekly blocks at
+        # this point (we wouldn't have seen 2 Resets otherwise). Some
+        # TUI versions then auto-navigate or scroll the panel away
+        # during the post-data-pad drain, so capturing here is the
+        # safest moment to preserve the data the parser needs.
+        snapshot_post_resets = log_buf.getvalue()
+
         # Drain post-Resets output so any in-place redraws of the
-        # placeholder by the real OAuth response are captured.
+        # placeholder by the real OAuth response are captured. Older
+        # TUI versions used in-place redraw to replace "Refreshing…"
+        # placeholders; the parser handles this by taking the LAST two
+        # blocks. Newer TUI versions auto-navigate to a daily view
+        # during this window; the snapshot above is the fallback for
+        # that case.
         if settings.capture_post_data_pad_ms > 0:
             # Process exit during the drain is fine; whatever we captured is
             # what we get.
@@ -192,6 +205,12 @@ def capture(
                     pexpect.TIMEOUT,
                     timeout=settings.capture_post_data_pad_ms / 1000.0,
                 )
+
+        # LATER SNAPSHOT: after the drain but before cleanup. Used as
+        # the primary parse target when it differs from the
+        # post-Resets snapshot AND contains usage blocks (we'll only
+        # know after attempting to parse — see the caller).
+        raw_for_parse = log_buf.getvalue()
 
         # Cleanup: Esc, then /exit, then EOF.
         child.send(b"\x1b")
@@ -208,10 +227,60 @@ def capture(
             with contextlib.suppress(OSError):
                 child.terminate(force=True)
 
-    raw = log_buf.getvalue()
-    capture_path.write_bytes(raw)
+    raw_full = log_buf.getvalue()
+    capture_path.write_bytes(raw_full)
     _rotate_captures(captures_dir, settings.capture_rotation_count)
-    return raw, capture_path
+
+    # Pick the best snapshot for the parser. We have up to three
+    # candidates, EARLIEST first:
+    #   * `snapshot_post_resets`: log_buf RIGHT after both Resets
+    #     markers appeared.
+    #   * `raw_for_parse`: log_buf after the post-data-pad drain.
+    #   * `raw_full`: log_buf including cleanup.
+    #
+    # Decision rule: render each candidate via pyte and count the
+    # blocks the parser's block-builder would extract. Return the
+    # FIRST candidate (earliest, freshest) that yields >= 2 blocks.
+    # If none reach 2 blocks, return the candidate with the most
+    # blocks; tiebreak to the latest (consistent with the original
+    # "drain handles placeholder overwrite" semantics for legacy TUIs).
+    #
+    # This rendering-aware choice handles both:
+    #   - LEGACY TUI: placeholder "Refreshing…" overwritten in-place
+    #     by API response during the drain. Late snapshots are
+    #     correct; early ones may show the placeholder.
+    #   - NEW TUI (>= 2.1.141): the /usage panel auto-navigates to a
+    #     daily-Sonnet view during the drain, removing the main
+    #     blocks from the visible screen state. Early snapshot wins.
+    #
+    # Local import to avoid module-load cycles; the parser/render
+    # modules are siblings under `usage/`.
+    from claude_task_runner.usage import parser as _parser
+    from claude_task_runner.usage import render as _render
+
+    try:
+        candidates: list[tuple[str, bytes]] = [
+            ("post_resets", snapshot_post_resets),
+            ("post_drain", raw_for_parse),
+            ("full", raw_full),
+        ]
+    except UnboundLocalError:
+        # Phase 2 didn't reach the snapshot point; return the full stream.
+        return raw_full, capture_path
+
+    best = (-1, candidates[-1][1])  # (n_blocks, raw) — start with full
+    for _, candidate in candidates:
+        try:
+            blocks = _parser._extract_blocks(_render.render(candidate))
+        except Exception:
+            continue
+        n = len(blocks)
+        if n >= 2:
+            # Earliest snapshot with at least 2 blocks wins — return now.
+            return candidate, capture_path
+        if n > best[0]:
+            best = (n, candidate)
+    return best[1], capture_path
 
 
 def _sleep_ms(milliseconds: int) -> None:
