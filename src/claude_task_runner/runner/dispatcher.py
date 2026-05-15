@@ -325,6 +325,7 @@ def dispatch(
             hook_result=hook_result,
             clock=clock,
             persist_state=persist_state,
+            settings_failure_classifier=settings_failure_classifier,
         )
 
     started_at = clock.now()
@@ -543,9 +544,19 @@ def _record_pre_dispatch_failure(
     hook_result: hooks_mod.HookResult,
     clock: Clock,
     persist_state: bool,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
 ) -> DispatchOutcome:
     """When the pre-dispatch hook fails, write a RunRecord and TaskState
-    showing the failure without ever spawning ``claude``."""
+    showing the failure without ever spawning ``claude``.
+
+    Routes through :func:`_finalize_state` so consecutive hook failures
+    are counted toward the circuit-breaker threshold. Without that,
+    a perma-deferring hook (e.g. ``DEFERRED: <paper> awaiting trim``)
+    re-attempts forever, since the orchestrator treats ``failed`` as
+    dispatchable — observed live with 71 consecutive
+    ``pre_dispatch_hook_failed`` attempts on the same task, starving
+    the rest of the queue at every tick.
+    """
     started_at = clock.now()
     finished_at = clock.now()
     run = RunRecord(
@@ -563,16 +574,24 @@ def _record_pre_dispatch_failure(
         duration_s=(finished_at - started_at).total_seconds(),
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
     )
-    new_state = state.model_copy(
+    # Bump attempts on the "prior" state we hand to _finalize_state so
+    # it ends up with the same attempts count as a normal run path
+    # would produce. (The normal dispatch flow sets `attempts =
+    # state.attempts + 1` BEFORE the run; _finalize_state preserves
+    # `prior.attempts`.)
+    prior_with_bumped_attempts = state.model_copy(
         update={
-            "status": "failed",
             "attempts": run.attempt,
             "last_started_at": started_at,
-            "last_finished_at": finished_at,
-            "stop_reason": run.stop_reason,
-            "error": run.error,
-            "runs": [*state.runs, run],
         }
+    )
+    new_state = _finalize_state(
+        prior=prior_with_bumped_attempts,
+        plan=plan,
+        run=run,
+        summary=StreamSummary(),
+        cap_violation=None,
+        settings_failure_classifier=settings_failure_classifier,
     )
     if persist_state:
         os.makedirs(state_path_for(queue_dir, task.id).parent, exist_ok=True)
