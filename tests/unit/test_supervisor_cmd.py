@@ -1,0 +1,302 @@
+"""Tests for cli.supervisor_cmd — stop / status + helpers.
+
+The ``start`` command runs the daemon loop end-to-end (which we do
+test in dedicated daemon tests with mocked sources). Here we cover the
+read-only / signal-sending surface and the two count helpers that the
+status command uses.
+"""
+
+from __future__ import annotations
+
+import json as _json
+import os
+import signal
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from typer.testing import CliRunner
+
+from claude_task_runner.cli.supervisor_cmd import (
+    _captures_dir,
+    _count_in_flight,
+    _count_pending,
+    app,
+)
+from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.queue.store import (
+    queue_runtime_dir,
+    state_path_for,
+    task_path_for,
+    todo_dir,
+    write_state_atomic,
+    write_task_atomic,
+)
+from claude_task_runner.supervisor.persistence import write_atomic as supervisor_write_atomic
+from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+
+
+@pytest.fixture
+def runner() -> CliRunner:
+    return CliRunner()
+
+
+@pytest.fixture
+def queue_dir(tmp_path: Path) -> Path:
+    qd = tmp_path / "q"
+    qd.mkdir()
+    queue_runtime_dir(qd)
+    todo_dir(qd)
+    return qd
+
+
+def _make_task(qd: Path, task_id: str) -> Task:
+    task = Task.model_validate(
+        {
+            "id": task_id,
+            "title": f"Task {task_id}",
+            "prompt": "do the thing",
+        }
+    )
+    write_task_atomic(task, task_path_for(qd, task_id))
+    return task
+
+
+def _seed_state(qd: Path, task_id: str, status: str, **kw: Any) -> TaskState:
+    state = TaskState(task_id=task_id, status=status, **kw)
+    write_state_atomic(state, state_path_for(qd, task_id))
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def test_captures_dir_path(queue_dir: Path) -> None:
+    """`_captures_dir` returns the standard path under the runtime dir."""
+    expected = queue_dir / ".claude_task_runner" / "usage_captures"
+    assert _captures_dir(queue_dir) == expected
+
+
+def test_count_pending_zero_when_empty(queue_dir: Path) -> None:
+    assert _count_pending(queue_dir) == 0
+
+
+def test_count_pending_counts_todo_yamls(queue_dir: Path) -> None:
+    _make_task(queue_dir, "t1")
+    _make_task(queue_dir, "t2")
+    _make_task(queue_dir, "t3")
+    assert _count_pending(queue_dir) == 3
+
+
+def test_count_in_flight_counts_running_and_awaiting_sidecar(queue_dir: Path) -> None:
+    _make_task(queue_dir, "running1")
+    _seed_state(queue_dir, "running1", "running")
+    _make_task(queue_dir, "awaiting1")
+    _seed_state(queue_dir, "awaiting1", "awaiting_sidecar")
+    _make_task(queue_dir, "hung1")
+    _seed_state(queue_dir, "hung1", "possibly_hung")
+    _make_task(queue_dir, "done1")
+    _seed_state(queue_dir, "done1", "completed")
+    _make_task(queue_dir, "failed1")
+    _seed_state(queue_dir, "failed1", "failed")
+    # Exactly the three "in-flight-like" statuses count.
+    assert _count_in_flight(queue_dir) == 3
+
+
+def test_count_in_flight_skips_unparseable_state(queue_dir: Path, monkeypatch) -> None:
+    """A state file that won't parse is silently skipped — the doctor
+    surfaces it separately. Counter must not crash."""
+    _make_task(queue_dir, "t1")
+    sp = state_path_for(queue_dir, "t1")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("not yaml: ][ broken\n", encoding="utf-8")
+    # Even with a broken state, the counter returns 0 and doesn't raise.
+    assert _count_in_flight(queue_dir) == 0
+
+
+# ---------------------------------------------------------------------------
+# `stop` command
+# ---------------------------------------------------------------------------
+
+
+def test_stop_no_pid_file(runner: CliRunner, queue_dir: Path) -> None:
+    result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert "No PID file" in result.stdout
+
+
+def test_stop_stale_pid(runner: CliRunner, queue_dir: Path) -> None:
+    """PID file present but the process is dead → exit 1 with a clear msg."""
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text("99999\n", encoding="utf-8")  # almost certainly not alive
+    with patch(
+        "claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=False
+    ):
+        result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert "not alive" in result.stdout
+
+
+def test_stop_happy_path_sends_sigterm(runner: CliRunner, queue_dir: Path) -> None:
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text("12345\n", encoding="utf-8")
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
+        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as mock_kill,
+    ):
+        result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    mock_kill.assert_called_once_with(12345, signal.SIGTERM)
+    assert "SIGTERM sent" in result.stdout
+
+
+def test_stop_process_disappeared(runner: CliRunner, queue_dir: Path) -> None:
+    """ProcessLookupError between the is_pid_alive check and the
+    os.kill call is a transient race; exit 1 with a clear message."""
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text("12345\n", encoding="utf-8")
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.os.kill",
+            side_effect=ProcessLookupError(),
+        ),
+    ):
+        result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert "disappeared" in result.stdout
+
+
+def test_stop_permission_error(runner: CliRunner, queue_dir: Path) -> None:
+    """If the operator can't signal the target PID (different user),
+    exit 2 (not 1 — 2 indicates an environmental problem)."""
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text("1\n", encoding="utf-8")  # init
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.os.kill",
+            side_effect=PermissionError("operation not permitted"),
+        ),
+    ):
+        result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
+    assert result.exit_code == 2
+    assert "not allowed" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `status` command
+# ---------------------------------------------------------------------------
+
+
+def _make_snapshot(state: SupervisorState, **kw: Any) -> SupervisorSnapshot:
+    base: dict[str, Any] = {
+        "state": state,
+        "since": datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
+        "last_5h_util_pct": 18,
+        "last_weekly_util_pct": 42,
+    }
+    base.update(kw)
+    return SupervisorSnapshot.model_validate(base)
+
+
+def test_status_no_snapshot_no_pidfile(runner: CliRunner, queue_dir: Path) -> None:
+    """Fresh queue dir: status shows no PID and no snapshot."""
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "No supervisor.json" in result.stdout
+    assert "not running" in result.stdout
+
+
+def test_status_with_snapshot_human_readable(runner: CliRunner, queue_dir: Path) -> None:
+    """Snapshot present: prints state, utilisation, pending and in-flight."""
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+
+    # One pending task in todo/, one running state file.
+    _make_task(queue_dir, "pending1")
+    _make_task(queue_dir, "running1")
+    _seed_state(queue_dir, "running1", "running")
+
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "dispatching" in result.stdout
+    assert "18%" in result.stdout
+    assert "42%" in result.stdout
+    assert "Pending:" in result.stdout
+    assert "In-flight:" in result.stdout
+
+
+def test_status_json_output(runner: CliRunner, queue_dir: Path) -> None:
+    snap = _make_snapshot(SupervisorState.IDLE)
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 0
+    payload = _json.loads(result.stdout)
+    assert payload["queue_dir"] == str(queue_dir.resolve())
+    assert payload["supervisor_alive"] is False
+    assert payload["pending"] == 0
+    assert payload["in_flight"] == 0
+    assert payload["snapshot"]["state"] == "idle"
+
+
+def test_status_color_categories_render(runner: CliRunner, queue_dir: Path) -> None:
+    """Visit all three color branches for state coloring: green / yellow / red.
+
+    The Rich console renders to plain text in tests; we just need the
+    state name itself to appear so the formatting code path runs."""
+    for state in [
+        SupervisorState.DISPATCHING,  # green
+        SupervisorState.SLOWING_DOWN,  # yellow
+        SupervisorState.THROTTLED_5H,  # red
+        SupervisorState.PAUSED_WEEKLY,  # red
+    ]:
+        snap = _make_snapshot(state)
+        state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+        supervisor_write_atomic(snap, state_path)
+        result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+        assert result.exit_code == 0
+        assert state.value in result.stdout
+
+
+def test_status_with_drift_message(runner: CliRunner, queue_dir: Path) -> None:
+    snap = _make_snapshot(
+        SupervisorState.ERROR_DRIFT,
+        last_drift_message="parser regex did not match",
+    )
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "parser regex did not match" in result.stdout
+
+
+def test_status_with_scheduled_wakeup(runner: CliRunner, queue_dir: Path) -> None:
+    snap = _make_snapshot(
+        SupervisorState.THROTTLED_5H,
+        scheduled_wakeup_at=datetime(2026, 5, 17, 8, 0, 0, tzinfo=UTC),
+    )
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "Next wakeup" in result.stdout
+    assert "2026-05-17" in result.stdout
+
+
+def test_status_with_alive_pid(runner: CliRunner, queue_dir: Path) -> None:
+    """PID file points at a live process — status prints 'alive'."""
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")  # our own PID, definitely alive
+    result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "alive" in result.stdout
