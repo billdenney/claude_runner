@@ -38,14 +38,22 @@ jobs:
       - name: Test (pytest, no live tests)
         env:
           CTR_RUN_LIVE_TESTS: "0"
-        # Global coverage gate: 75% line+branch. Aspirational target is 90%
-        # — see docs/cheatsheet.md "raising the coverage gate" for the
-        # backlog of CLI / daemon / orchestrator modules that need tests.
-        # New modules (supervisor.time_of_day, supervisor.pacing) are at
-        # 100% coverage; the global gap is in operator-facing CLI commands
-        # that exercise typer plumbing and the interactive-PTY capture path
-        # that requires a real claude binary.
-        run: pytest -m "not live" --cov --cov-report=xml --cov-fail-under=75
+        # Global coverage gate: 90% line+branch. Hit by 2026-05-16 after
+        # adding 227 new tests for the previously-thin operator surface
+        # (cli.supervisor_cmd, cli.usage_cmd, cli.sidecar_cmd extras,
+        # cli.queue_cmd extras, cli.install_cmd, cli.install_skills_cmd,
+        # doctor.checks, runner.orchestrator helpers, supervisor.daemon
+        # pure helpers, usage.source).
+        #
+        # Remaining gaps below the gate are deliberately exempted:
+        #   * usage.capture.py — pexpect-driven TUI capture; requires a
+        #     real ``claude`` binary, intentionally untested per the
+        #     "no external services" testing policy.
+        #   * supervisor.daemon.start_daemon — the actual event loop;
+        #     covered by the integration test in
+        #     tests/integration/test_supervisor_loop.py rather than
+        #     line-level unit coverage.
+        run: pytest -m "not live" --cov --cov-report=xml --cov-fail-under=90
 
       - name: Upload coverage
         if: matrix.python-version == '3.12'
