@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
     list_pending_tasks,
     list_state_files,
@@ -194,6 +195,12 @@ def _eligible_candidates(
     out: list[Task] = []
     in_flight_ids = set(in_flight_threads.keys())
 
+    # Cache the open-sidecar set once per call rather than scanning the
+    # sidecar directory inside every per-task branch. A task is
+    # "sidecar-open" if there's at least one request-NNN.json without a
+    # matching response-NNN.json.
+    open_sidecar_task_ids: set[str] = {tid for tid, _seq, _path in list_open_sidecars(queue_dir)}
+
     for path in list_pending_tasks(queue_dir):
         try:
             task = load_task(path)
@@ -213,7 +220,22 @@ def _eligible_candidates(
                 pass
             else:
                 if state.status not in _DISPATCHABLE_STATUSES:
-                    continue
+                    # Special case: awaiting_sidecar tasks become
+                    # dispatchable AGAIN once every sidecar request has
+                    # a matching response file. Without this, a task
+                    # that stopped to ask an operator question stays
+                    # stuck forever — the operator's response file is
+                    # written but the orchestrator never re-evaluates.
+                    # Fixed 2026-05-15 after live observation that 5
+                    # answered sidecars on the popPK queue had stayed
+                    # in awaiting_sidecar for >90 minutes despite
+                    # response-001.json files being in place.
+                    if state.status == "awaiting_sidecar" and task.id not in open_sidecar_task_ids:
+                        # All requests answered — fall through to the
+                        # depends_on check and add to out.
+                        pass
+                    else:
+                        continue
 
         unmet = [d for d in task.depends_on if d not in completed_ids]
         if unmet:
@@ -251,7 +273,9 @@ def _dispatch_one_safely(
             settings_caps=settings.task_caps,
             settings_session=settings.session,
             settings_hooks=settings.hooks,
+            settings_failure_classifier=settings.failure_classifier,
             claude_executable=claude_executable,
+            claude_config_dir=settings.claude.config_dir,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

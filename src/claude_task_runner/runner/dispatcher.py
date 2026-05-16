@@ -41,6 +41,7 @@ from pathlib import Path
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
+    FailureClassifierSettings,
     HookSettings,
     SessionSettings,
     TaskCapsSettings,
@@ -59,6 +60,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import caps as caps_mod
 from claude_task_runner.runner import heartbeat as hb_mod
 from claude_task_runner.runner import hooks as hooks_mod
+from claude_task_runner.runner import retry as retry_mod
 from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
@@ -280,7 +282,9 @@ def dispatch(
     settings_caps: TaskCapsSettings,
     settings_session: SessionSettings,
     settings_hooks: HookSettings,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
     claude_executable: str = "claude",
+    claude_config_dir: str = "",
     persist_state: bool = True,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
@@ -321,6 +325,7 @@ def dispatch(
             hook_result=hook_result,
             clock=clock,
             persist_state=persist_state,
+            settings_failure_classifier=settings_failure_classifier,
         )
 
     started_at = clock.now()
@@ -337,6 +342,20 @@ def dispatch(
     argv = build_argv(task, plan, claude_executable=claude_executable)
     logger.info("dispatching task %s (attempt %d): %s", task.id, new_state.attempts, argv[0:1])
 
+    # Build the subprocess env. When `claude_config_dir` is set (per-queue
+    # config selects a non-default Claude account, e.g. ~/.claude_personal),
+    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
+    # subprocess reads the same credentials the supervisor's /usage capture
+    # uses. Without this, the supervisor sees personal-account utilization
+    # while every dispatched task hits the default ~/.claude account --
+    # which may be at a different / depleted quota.
+    spawn_env: dict[str, str] | None = None
+    if claude_config_dir:
+        config_path = Path(claude_config_dir).expanduser()
+        if not config_path.exists():
+            raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
+        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+
     process = subprocess.Popen(  # caller-controlled
         argv,
         stdout=subprocess.PIPE,
@@ -344,6 +363,7 @@ def dispatch(
         text=True,
         bufsize=1,
         cwd=str(task.working_dir) if task.working_dir else None,
+        env=spawn_env,
     )
 
     summary, cap_violation = _dispatch_loop(
@@ -386,6 +406,7 @@ def dispatch(
         run=run_record,
         summary=summary,
         cap_violation=cap_violation,
+        settings_failure_classifier=settings_failure_classifier,
     )
 
     # Stop-and-ask override: if the agent wrote a sidecar request that has
@@ -430,6 +451,28 @@ def dispatch(
     )
 
 
+def _count_trailing_failures(runs: list[RunRecord]) -> int:
+    """Count consecutive failure RunRecords at the tail of ``runs``.
+
+    A success interleaves the failure run and resets the count. The
+    most recent run is the last element of ``runs``.
+
+    Mirrors the criteria in `_finalize_state` for "completed": empty
+    error AND a clean stop_reason. Anything else is a failure for
+    circuit-breaker accounting purposes.
+    """
+    n = 0
+    for record in reversed(runs):
+        is_success = record.error is None and record.stop_reason in (
+            "end_turn",
+            "result",
+        )
+        if is_success:
+            break
+        n += 1
+    return n
+
+
 def _finalize_state(
     *,
     prior: TaskState,
@@ -437,8 +480,20 @@ def _finalize_state(
     run: RunRecord,
     summary: StreamSummary,
     cap_violation: caps_mod.CapViolation | None,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
 ) -> TaskState:
-    """Apply a RunRecord to a TaskState, returning the post-attempt state."""
+    """Apply a RunRecord to a TaskState, returning the post-attempt state.
+
+    When ``settings_failure_classifier`` is supplied AND consecutive
+    failures (including this one) reach the configured
+    ``failure_circuit_breaker_threshold``, the status is set to
+    ``failed_circuit_breaker`` instead of plain ``failed`` -- the
+    orchestrator excludes that status from re-dispatch, breaking the
+    auto-retry loop. Without this gate, a task that fails the same
+    way every attempt (e.g. agent exits with ``stop_sequence`` and
+    no real output) gets re-dispatched indefinitely because
+    ``_DISPATCHABLE_STATUSES = {"pending", "failed"}``.
+    """
     new_runs = [*prior.runs, run]
 
     if cap_violation is not None:
@@ -447,6 +502,17 @@ def _finalize_state(
         new_status = "completed"
     else:
         new_status = "failed"
+
+    # Trip the circuit breaker on consecutive failures so we don't
+    # auto-retry forever. The threshold is queue-configured under
+    # `[failure_classifier]`; default is 3.
+    if new_status == "failed" and settings_failure_classifier is not None:
+        consecutive = _count_trailing_failures(new_runs)
+        if retry_mod.circuit_breaker_tripped(
+            consecutive_failures=consecutive,
+            settings=settings_failure_classifier,
+        ):
+            new_status = "failed_circuit_breaker"
 
     new_session_id = summary.session_id or prior.session_id
     new_resume_attempts = (
@@ -478,9 +544,19 @@ def _record_pre_dispatch_failure(
     hook_result: hooks_mod.HookResult,
     clock: Clock,
     persist_state: bool,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
 ) -> DispatchOutcome:
     """When the pre-dispatch hook fails, write a RunRecord and TaskState
-    showing the failure without ever spawning ``claude``."""
+    showing the failure without ever spawning ``claude``.
+
+    Routes through :func:`_finalize_state` so consecutive hook failures
+    are counted toward the circuit-breaker threshold. Without that,
+    a perma-deferring hook (e.g. ``DEFERRED: <paper> awaiting trim``)
+    re-attempts forever, since the orchestrator treats ``failed`` as
+    dispatchable — observed live with 71 consecutive
+    ``pre_dispatch_hook_failed`` attempts on the same task, starving
+    the rest of the queue at every tick.
+    """
     started_at = clock.now()
     finished_at = clock.now()
     run = RunRecord(
@@ -498,16 +574,24 @@ def _record_pre_dispatch_failure(
         duration_s=(finished_at - started_at).total_seconds(),
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
     )
-    new_state = state.model_copy(
+    # Bump attempts on the "prior" state we hand to _finalize_state so
+    # it ends up with the same attempts count as a normal run path
+    # would produce. (The normal dispatch flow sets `attempts =
+    # state.attempts + 1` BEFORE the run; _finalize_state preserves
+    # `prior.attempts`.)
+    prior_with_bumped_attempts = state.model_copy(
         update={
-            "status": "failed",
             "attempts": run.attempt,
             "last_started_at": started_at,
-            "last_finished_at": finished_at,
-            "stop_reason": run.stop_reason,
-            "error": run.error,
-            "runs": [*state.runs, run],
         }
+    )
+    new_state = _finalize_state(
+        prior=prior_with_bumped_attempts,
+        plan=plan,
+        run=run,
+        summary=StreamSummary(),
+        cap_violation=None,
+        settings_failure_classifier=settings_failure_classifier,
     )
     if persist_state:
         os.makedirs(state_path_for(queue_dir, task.id).parent, exist_ok=True)
