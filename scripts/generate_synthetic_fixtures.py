@@ -37,7 +37,7 @@ def _make_capture(
     """Build a synthetic raw .cap with two blocks plus surrounding noise."""
     # Welcome / shortcuts noise
     parts: list[bytes] = [
-        b"\x1b[?1049h\x1b[H\x1b[J",   # alt screen + clear
+        b"\x1b[?1049h\x1b[H\x1b[J",  # alt screen + clear
         b"   Welcome to Claude Code\r\n",
         b"\x1b[2m   shortcuts:  /help  /usage  /exit\x1b[0m\r\n",
         b"\r\n",

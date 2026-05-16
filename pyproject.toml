@@ -45,6 +45,9 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
     "types-pexpect",
+    # Run lint / format hooks locally before each commit.
+    # Mirrors the GitHub Actions CI lint steps; see .pre-commit-config.yaml.
+    "pre-commit>=3.7",
 ]
 
 [project.scripts]
@@ -113,6 +116,15 @@ filterwarnings = [
 [tool.coverage.run]
 source = ["src/claude_task_runner"]
 branch = true
+omit = [
+    # Skill helper scripts are invoked by Claude Code as standalone
+    # commands (bash / python entrypoints called from SKILL.md), not
+    # imported by the runner's library code. They're shipped under
+    # src/ purely so the editable pipx install picks them up alongside
+    # the package. Their coverage is best validated by smoke-testing
+    # them in their target environment, not via the unit-test suite.
+    "src/claude_task_runner/skills/*/[a-z]*.py",
+]
 
 [tool.coverage.report]
 exclude_lines = [

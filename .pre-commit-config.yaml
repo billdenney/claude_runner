@@ -1,0 +1,53 @@
+# pre-commit config — runs locally before each `git commit`.
+#
+# Install once per clone (after `pip install -e '.[dev]'`):
+#
+#   pre-commit install
+#
+# Then every commit auto-runs the hooks below. If any hook makes a fix,
+# the commit is aborted and the operator stages the fix:
+#
+#   git add -u && git commit
+#
+# Run against ALL files (e.g. after pulling a refactor):
+#
+#   pre-commit run --all-files
+#
+# The hooks below mirror the GitHub Actions CI lint steps so anything
+# green here is green in CI. Keep the ruff revision in sync with the
+# ``ruff>=...`` pin in pyproject.toml's [project.optional-dependencies]
+# dev extras.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        name: ruff check (lint)
+        args: [--fix]
+      - id: ruff-format
+        name: ruff format
+
+  # Generic hygiene — catch the easy stuff before it lands in CI.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Markdown can have trailing whitespace that's meaningful (two
+        # trailing spaces -> <br>). Don't strip those.
+        args: [--markdown-linebreak-ext=md]
+        # The .cap fixtures under tests/fixtures/ are byte-for-byte
+        # recordings of `claude /usage` PTY output. Stripping their
+        # whitespace would corrupt the parser-regression test inputs.
+        # Coverage XML output similarly is generator-managed.
+        exclude: '^(tests/fixtures/.*\.cap|coverage\.xml)$'
+      - id: end-of-file-fixer
+        # Same exclusion as above — .cap fixtures are exact byte
+        # replays and several legitimately lack a trailing newline.
+        exclude: '^(tests/fixtures/.*\.cap|coverage\.xml)$'
+      - id: check-yaml
+        # Allow the multi-document YAML used by some GitHub workflows.
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]

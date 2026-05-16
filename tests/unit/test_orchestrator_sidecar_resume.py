@@ -117,6 +117,69 @@ def queue_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+# --- Edge-case branches in `_eligible_candidates` -----------------------
+#
+# These tests cover branches that pre-date the awaiting_sidecar fix but
+# had no direct coverage: unparseable YAML, in-flight skip, unparseable
+# state, and unmet `depends_on`. They live in the same file because they
+# share the same _eligible_candidates fixture surface — keeping them
+# together avoids duplicate boilerplate.
+
+
+def test_unparseable_task_yaml_is_skipped(queue_dir: Path) -> None:
+    """A malformed task YAML must be skipped (logged warning), not raise."""
+    (queue_dir / "todo" / "broken.yaml").write_text(
+        "this is not: valid: yaml: at: all: [\n", encoding="utf-8"
+    )
+    in_flight: dict[str, threading.Thread] = {}
+    eligible = _eligible_candidates(queue_dir, in_flight, set())
+    # The broken YAML produces no Task; eligible list is empty (or only
+    # contains successfully-parsed tasks). Either way, no exception.
+    assert all(t.id != "broken" for t in eligible)
+
+
+def test_in_flight_task_is_skipped(queue_dir: Path) -> None:
+    """A task whose id is in ``in_flight_threads`` must not be re-dispatched."""
+    task = _make_task("t-running")
+    _write_task_yaml(queue_dir, task)
+    # No state file => normally eligible; but in-flight set masks it.
+    sentinel_thread = threading.Thread(target=lambda: None)
+    in_flight = {task.id: sentinel_thread}
+    eligible = _eligible_candidates(queue_dir, in_flight, set())
+    assert task.id not in {t.id for t in eligible}
+
+
+def test_unparseable_state_file_treated_as_undispatched(queue_dir: Path) -> None:
+    """A state file that can't parse must be ignored (treated as no-state)
+    so the next dispatch attempt overwrites it cleanly. The task should
+    therefore appear in the eligible list."""
+    task = _make_task("t-corrupt-state")
+    _write_task_yaml(queue_dir, task)
+    state_path_for(queue_dir, task.id).parent.mkdir(parents=True, exist_ok=True)
+    state_path_for(queue_dir, task.id).write_text("not yaml: ][[", encoding="utf-8")
+    in_flight: dict[str, threading.Thread] = {}
+    eligible = _eligible_candidates(queue_dir, in_flight, set())
+    assert task.id in {t.id for t in eligible}
+
+
+def test_unmet_depends_on_blocks_dispatch(queue_dir: Path) -> None:
+    """A task whose depends_on includes a non-completed id is held back."""
+    blocked = Task(
+        id="blocked",
+        title="blocked test task",
+        prompt="please do the thing",
+        depends_on=["upstream-not-done"],
+    )
+    _write_task_yaml(queue_dir, blocked)
+    in_flight: dict[str, threading.Thread] = {}
+    eligible = _eligible_candidates(queue_dir, in_flight, set())
+    assert "blocked" not in {t.id for t in eligible}
+
+    # Once the upstream completes, blocked becomes eligible.
+    eligible_after = _eligible_candidates(queue_dir, in_flight, {"upstream-not-done"})
+    assert "blocked" in {t.id for t in eligible_after}
+
+
 def test_awaiting_sidecar_with_open_request_is_not_eligible(
     queue_dir: Path,
 ) -> None:

@@ -199,9 +199,7 @@ def _eligible_candidates(
     # sidecar directory inside every per-task branch. A task is
     # "sidecar-open" if there's at least one request-NNN.json without a
     # matching response-NNN.json.
-    open_sidecar_task_ids: set[str] = {
-        tid for tid, _seq, _path in list_open_sidecars(queue_dir)
-    }
+    open_sidecar_task_ids: set[str] = {tid for tid, _seq, _path in list_open_sidecars(queue_dir)}
 
     for path in list_pending_tasks(queue_dir):
         try:
@@ -232,10 +230,7 @@ def _eligible_candidates(
                     # answered sidecars on the popPK queue had stayed
                     # in awaiting_sidecar for >90 minutes despite
                     # response-001.json files being in place.
-                    if (
-                        state.status == "awaiting_sidecar"
-                        and task.id not in open_sidecar_task_ids
-                    ):
+                    if state.status == "awaiting_sidecar" and task.id not in open_sidecar_task_ids:
                         # All requests answered — fall through to the
                         # depends_on check and add to out.
                         pass

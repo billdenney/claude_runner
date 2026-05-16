@@ -52,6 +52,39 @@ Interactive operation from inside Claude Code:
 /runner-usage
 ```
 
+## Development
+
+After cloning, install with the dev extras and enable the pre-commit hooks
+(once per clone):
+
+```sh
+pip install -e '.[dev]'
+pre-commit install
+```
+
+Each subsequent `git commit` runs the same ruff lint / ruff format / yaml /
+toml hooks that CI runs, plus a "no large binaries" guard. If a hook auto-
+fixes something it aborts the commit; re-stage and try again:
+
+```sh
+git add -u && git commit
+```
+
+Run the hooks against every file (handy after a refactor or rebase):
+
+```sh
+pre-commit run --all-files
+```
+
+The full lint / format / type / test pipeline that CI runs is:
+
+```sh
+ruff check src tests
+ruff format --check src tests
+mypy src
+pytest -m "not live" --cov --cov-fail-under=75
+```
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the component map and

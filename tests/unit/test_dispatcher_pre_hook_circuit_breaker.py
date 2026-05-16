@@ -24,8 +24,8 @@ import pytest
 from claude_task_runner.config.schema import FailureClassifierSettings
 from claude_task_runner.queue.schema import (
     RunRecord,
-    TaskState,
     Task,
+    TaskState,
     TokenUsage,
 )
 from claude_task_runner.runner.dispatcher import _record_pre_dispatch_failure
@@ -232,9 +232,12 @@ class TestPreDispatchHookCircuitBreaker:
         the visible attempts field still advances by 1, matching the
         regular-run path semantics."""
         task = _make_task("t1")
-        prior = TaskState(task_id=task.id, status="failed", attempts=4, runs=[
-            _failed_hook_run(attempt=i, when=when) for i in range(1, 5)
-        ])
+        prior = TaskState(
+            task_id=task.id,
+            status="failed",
+            attempts=4,
+            runs=[_failed_hook_run(attempt=i, when=when) for i in range(1, 5)],
+        )
         outcome = _record_pre_dispatch_failure(
             task=task,
             state=prior,

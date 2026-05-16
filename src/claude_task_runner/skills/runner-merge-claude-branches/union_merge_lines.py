@@ -36,6 +36,7 @@ If the file's structured-markdown shape differs from
 "Example models" lines, extend ``EXAMPLE_LINE_RE`` to a list of
 patterns and add per-pattern parser functions. Open to PRs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -55,9 +56,7 @@ SECTION_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 def run(args: list[str], cwd: Path) -> str:
     r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(
-            f"{' '.join(args)} failed (exit {r.returncode}): {r.stderr[:400]}"
-        )
+        raise RuntimeError(f"{' '.join(args)} failed (exit {r.returncode}): {r.stderr[:400]}")
     return r.stdout
 
 
@@ -270,16 +269,23 @@ def emit_merged(
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", type=Path, required=True,
-                    help="Repo path (contains .git and the worktree).")
-    ap.add_argument("--branch", required=True,
-                    help="The merge branch name (worktree at <repo>/.worktrees/<branch>).")
-    ap.add_argument("--base", default="origin/main",
-                    help="Base ref (default: origin/main).")
-    ap.add_argument("--pattern", default="origin/claude/*",
-                    help="Source branch refspec under refs/remotes/ (default: origin/claude/*).")
-    ap.add_argument("--file", required=True,
-                    help="Repo-relative path to the union-merge target file.")
+    ap.add_argument(
+        "--repo", type=Path, required=True, help="Repo path (contains .git and the worktree)."
+    )
+    ap.add_argument(
+        "--branch",
+        required=True,
+        help="The merge branch name (worktree at <repo>/.worktrees/<branch>).",
+    )
+    ap.add_argument("--base", default="origin/main", help="Base ref (default: origin/main).")
+    ap.add_argument(
+        "--pattern",
+        default="origin/claude/*",
+        help="Source branch refspec under refs/remotes/ (default: origin/claude/*).",
+    )
+    ap.add_argument(
+        "--file", required=True, help="Repo-relative path to the union-merge target file."
+    )
     args = ap.parse_args(argv)
 
     repo: Path = args.repo
@@ -298,8 +304,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     base_text = run(["git", "show", f"{args.base}:{args.file}"], cwd=repo)
-    branch_files = {br: run(["git", "show", f"{br}:{args.file}"], cwd=repo)
-                    for br in branches}
+    branch_files = {br: run(["git", "show", f"{br}:{args.file}"], cwd=repo) for br in branches}
 
     entries = collect_entries(
         repo=repo,
@@ -308,8 +313,9 @@ def main(argv: list[str]) -> int:
         file_rel=args.file,
     )
     sys.stderr.write(f"# (cov, sub) buckets with entries: {len(entries)}\n")
-    sys.stderr.write(f"# total filename entries:           "
-                     f"{sum(len(v) for v in entries.values())}\n")
+    sys.stderr.write(
+        f"# total filename entries:           {sum(len(v) for v in entries.values())}\n"
+    )
 
     current_text = target.read_text()
     new_text = emit_merged(
