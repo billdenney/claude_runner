@@ -132,6 +132,56 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
 
 ## Important nuances
 
+### Upstream-missing default
+
+A common `/extract-literature-model` sidecar shape: the current
+paper's PK is fixed to an upstream paper not on disk; the agent asks
+whether to skip, drop-and-re-dispatch, or queue the upstream as a
+`depends_on` task. **The recommended response is "queue upstream + add
+depends_on"** — find the upstream PDF if possible, otherwise place a
+``_needs_acquisition.flag`` so the operator can drop the PDF later.
+This pattern is general-purpose (the depends_on chain + the
+`failed`/`pending` re-dispatch flow are core runner machinery) but
+the helper that wires it up is queue-specific because the
+OA-acquisition ladder and the upstream-detection cadence are
+domain knowledge that lives in the queue.
+
+For queues that ship a queue-local helper at
+``<queue>/_scripts/handle_upstream_dependency.py`` (e.g. the
+nlmixr2lib popPK ingestion queue), the recommended response when
+answering an upstream-missing sidecar is:
+
+1. **If the upstream is identifiable** (PMID, DOI, or unambiguous
+   citation), run the queue-local helper:
+
+   ```sh
+   python3 <queue>/_scripts/handle_upstream_dependency.py \
+       --queue-dir <queue path> \
+       --current-task-id "<downstream task id>" \
+       --upstream-pmid <PMID>             # or --upstream-doi <DOI>
+       --upstream-citation '<citation>' \
+       --upstream-drug <drug>
+   ```
+
+   The helper: tries the OA-PDF ladder (queue-specific); on success
+   drops a `trim_queue` marker; on failure writes a
+   `_needs_acquisition.flag`. Either way it queues the upstream as a
+   new task in `todo/` and edits the downstream task's YAML to add
+   `depends_on`. After it completes, answer the sidecar with the
+   "queue upstream + depends_on" option (typically option A; check
+   the request for exact value).
+
+2. **If the upstream is genuinely unidentifiable** (e.g. internal
+   study, in-house simulator output, no PMID/DOI), surface the
+   sidecar's "skip / inline with Errata / defer" options to the
+   operator as written; do not invoke the helper.
+
+3. **If the queue has no `_scripts/handle_upstream_dependency.py`**
+   helper, do the same flow manually: drop the PDF (or
+   `_needs_acquisition.flag`) at the queue's expected papers/ path,
+   write a new upstream task YAML at the next free slot in `todo/`,
+   and edit the downstream task's YAML to add `depends_on`.
+
 ### v1-schema (legacy) sidecars
 
 Older worktree skill versions sometimes write sidecar requests in the
