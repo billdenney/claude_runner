@@ -71,11 +71,24 @@ def list_pattern_branches(repo: Path, pattern: str) -> list[str]:
     return sorted(b.strip() for b in out.splitlines() if b.strip())
 
 
-def branches_touching(repo: Path, base: str, pattern: str, file_rel: str) -> list[str]:
+def branches_touching(
+    repo: Path,
+    base: str,
+    pattern: str,
+    file_rel: str,
+    extra_refs: list[str] | None = None,
+) -> list[str]:
     """Filter to branches whose tip has any commit modifying ``file_rel``
-    vs the configured base."""
+    vs the configured base. ``extra_refs`` (zero or more fully-qualified
+    refs like ``origin/add-Fiedler-Kelly_2019_fremanezumab``) are
+    considered alongside the pattern matches."""
+    candidates = list(list_pattern_branches(repo, pattern))
+    if extra_refs:
+        for ref in extra_refs:
+            if ref not in candidates:
+                candidates.append(ref)
     out = []
-    for br in list_pattern_branches(repo, pattern):
+    for br in candidates:
         d = run(["git", "diff", "--name-only", f"{base}..{br}", "--", file_rel], cwd=repo)
         if d.strip():
             out.append(br)
@@ -133,6 +146,9 @@ def section_of_line(file_text: str, line_idx: int) -> tuple[str, str]:
     recent deeper header (subsection). The bucket key is the pair so
     the same subsection name under different covariates is kept
     distinct.
+
+    NOTE: this is O(N) per call and re-splits the text. For tight
+    inner loops, build a ``_section_index`` once and reuse it.
     """
     cov = ""
     sub = ""
@@ -150,6 +166,33 @@ def section_of_line(file_text: str, line_idx: int) -> tuple[str, str]:
         elif depth >= 3:
             sub = name
     return cov, sub
+
+
+def _section_index(text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Single-pass version of :func:`section_of_line`.
+
+    Returns ``(lines, idx_to_section)`` where ``idx_to_section[i]`` is
+    the ``(cov, sub)`` pair for line ``lines[i]``. Both lists are the
+    same length. Use this when the caller needs ``(cov, sub)`` for
+    many indices into the same text — folding what was an O(N^2)
+    walk per Example-line into a single O(N) pass.
+    """
+    lines = text.splitlines(keepends=False)
+    cov = ""
+    sub = ""
+    idx_to_section: list[tuple[str, str]] = []
+    for line in lines:
+        m = SECTION_RE.match(line)
+        if m:
+            depth = len(m.group(1))
+            name = m.group(2)
+            if depth == 2:
+                cov = name
+                sub = ""
+            elif depth >= 3:
+                sub = name
+        idx_to_section.append((cov, sub))
+    return lines, idx_to_section
 
 
 def collect_entries(
@@ -178,11 +221,12 @@ def collect_entries(
             continue
 
     for _label, text in versions:
-        for i, line in enumerate(text.splitlines(keepends=False)):
+        lines, idx_to_section = _section_index(text)
+        for i, line in enumerate(lines):
             m = EXAMPLE_LINE_RE.match(line)
             if not m:
                 continue
-            cov, sub = section_of_line(text, i)
+            cov, sub = idx_to_section[i]
             bucket = entries.setdefault((cov, sub), {})
             for fname, annot in parse_example_models(m.group(1)):
                 cur = bucket.get(fname)
@@ -208,15 +252,24 @@ def emit_merged(
     post-``-X-theirs`` file while still folding in every branch's
     additions.
     """
-    current_lines = current_text.splitlines(keepends=False)
+    current_lines, current_idx_to_section = _section_index(current_text)
     out_lines: list[str] = []
+
+    # Pre-build per-text indices once. Without this, the original
+    # nested-section_of_line() calls cost O(N^2) per text — for a
+    # 4K-line file with 350 Example-lines across 26 branches the
+    # walk was ~70 minutes; now it's seconds.
+    branch_index: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
+        br: _section_index(text) for br, text in branch_files.items()
+    }
+    base_lines, base_idx_to_section = _section_index(base_text)
 
     for i, line in enumerate(current_lines):
         m = EXAMPLE_LINE_RE.match(line)
         if not m:
             out_lines.append(line)
             continue
-        cov, sub = section_of_line(current_text, i)
+        cov, sub = current_idx_to_section[i]
         bucket = entries.get((cov, sub))
         if not bucket:
             out_lines.append(line)
@@ -228,24 +281,22 @@ def emit_merged(
             if fname not in ordered:
                 ordered.append(fname)
         # 2: branch order.
-        for _br, text in branch_files.items():
-            for j, bl in enumerate(text.splitlines(keepends=False)):
+        for _br, (b_lines, b_idx_to_section) in branch_index.items():
+            for j, bl in enumerate(b_lines):
                 bm = EXAMPLE_LINE_RE.match(bl)
                 if not bm:
                     continue
-                bcov, bsub = section_of_line(text, j)
-                if (bcov, bsub) != (cov, sub):
+                if b_idx_to_section[j] != (cov, sub):
                     continue
                 for fname, _ in parse_example_models(bm.group(1)):
                     if fname not in ordered:
                         ordered.append(fname)
         # 3: base order.
-        for j, bl in enumerate(base_text.splitlines(keepends=False)):
+        for j, bl in enumerate(base_lines):
             bm = EXAMPLE_LINE_RE.match(bl)
             if not bm:
                 continue
-            bcov, bsub = section_of_line(base_text, j)
-            if (bcov, bsub) != (cov, sub):
+            if base_idx_to_section[j] != (cov, sub):
                 continue
             for fname, _ in parse_example_models(bm.group(1)):
                 if fname not in ordered:
@@ -286,6 +337,17 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--file", required=True, help="Repo-relative path to the union-merge target file."
     )
+    ap.add_argument(
+        "--extra-ref",
+        action="append",
+        default=[],
+        help=(
+            "Additional fully-qualified refs to include in the union "
+            "(e.g. origin/add-Fiedler-Kelly_2019_fremanezumab). Repeat "
+            "for multiple. Useful when the bulk merge is one pattern "
+            "plus a few hand-picked feature branches."
+        ),
+    )
     args = ap.parse_args(argv)
 
     repo: Path = args.repo
@@ -295,7 +357,13 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"# target file not present on branch: {target}\n")
         return 0  # nothing to do
 
-    branches = branches_touching(repo, args.base, args.pattern, args.file)
+    branches = branches_touching(
+        repo,
+        args.base,
+        args.pattern,
+        args.file,
+        extra_refs=args.extra_ref,
+    )
     sys.stderr.write(f"# branches touching {args.file}: {len(branches)}\n")
     for b in branches:
         sys.stderr.write(f"#   - {b}\n")

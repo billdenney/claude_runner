@@ -14,6 +14,9 @@
 #   --branch <name>         Merge branch with worktree at <repo>/.worktrees/<branch>.
 #   --base <ref>            Merge base (default: origin/main).
 #   --pattern <glob>        Source branch refspec (default: origin/claude/*).
+#   --extra-ref <refname>   Additional ref to include (repeatable). Use for
+#                           hand-picked branches outside the pattern, e.g.
+#                           origin/add-Fiedler-Kelly_2019_fremanezumab.
 #   --file <path>           Repo-relative file to verify (default:
 #                           inst/references/covariate-columns.md).
 #
@@ -28,6 +31,7 @@ BRANCH=""
 BASE="origin/main"
 PATTERN="origin/claude/*"
 FILE="inst/references/covariate-columns.md"
+EXTRA_REFS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,8 +39,9 @@ while [[ $# -gt 0 ]]; do
     --branch) BRANCH="$2"; shift 2 ;;
     --base) BASE="$2"; shift 2 ;;
     --pattern) PATTERN="$2"; shift 2 ;;
+    --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
     --file) FILE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,10 +64,17 @@ fi
 
 cd "$REPO"
 
-# Iterate the pattern (origin/claude/* etc.).
+# Iterate the pattern (origin/claude/* etc.) plus any --extra-ref additions.
 mapfile -t BRANCHES < <(
   git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN" 2>/dev/null | sort -u
 )
+for er in "${EXTRA_REFS[@]:-}"; do
+  [[ -z "$er" ]] && continue
+  # Avoid duplicates if the operator passed something already in the pattern.
+  if [[ ! " ${BRANCHES[*]} " =~ " ${er} " ]]; then
+    BRANCHES+=("$er")
+  fi
+done
 
 MISSING_COUNT=0
 MISSING_DETAILS=""

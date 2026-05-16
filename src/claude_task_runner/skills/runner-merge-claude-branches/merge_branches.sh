@@ -19,6 +19,12 @@
 #   --base <ref>            Base branch to merge into (default: origin/main).
 #   --pattern <glob>        Refspec pattern for source branches
 #                           (default: origin/claude/*).
+#   --extra-ref <refname>   Additional fully-qualified ref to include
+#                           (repeatable). Use for hand-picked feature
+#                           branches that don't match --pattern, e.g.
+#                           --extra-ref origin/add-Fiedler-Kelly_2019_fremanezumab.
+#                           Flows through to union_merge_lines.py and
+#                           verify_branch_contributions.sh.
 #   --branch-name <name>    New consolidation branch name
 #                           (default: merge-all-claude-branches-<YYYY-MM-DD>).
 #   --union-file <path>     Structured markdown file requiring union merge
@@ -53,11 +59,12 @@ SKIP_CHECK=0
 SKIP_PUSH=0
 DRY_RUN=0
 ASSUME_YES=0
+EXTRA_REFS=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,32p' "$0" | sed 's/^# \?//'
+  sed -n '2,34p' "$0" | sed 's/^# \?//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --repo) REPO="$2"; shift 2 ;;
     --base) BASE="$2"; shift 2 ;;
     --pattern) PATTERN="$2"; shift 2 ;;
+    --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
     --branch-name) BRANCH_NAME="$2"; shift 2 ;;
     --union-file) UNION_FILE="$2"; shift 2 ;;
     --skip-r-regen) SKIP_R_REGEN=1; shift ;;
@@ -98,14 +106,31 @@ echo
 echo "==> Surveying $PATTERN branches with unmerged commits vs $BASE"
 echo "    base = $(git rev-parse --short "$BASE")"
 
-# Expand pattern to a concrete list of branches under refs/remotes/.
+# Expand pattern to a concrete list of branches under refs/remotes/,
+# then append any --extra-ref entries.
 mapfile -t ALL_MATCHES < <(
   git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN" 2>/dev/null | sort -u
 )
-if [[ ${#ALL_MATCHES[@]} -eq 0 ]]; then
-  echo "ERROR: no branches matched refspec '$PATTERN' under refs/remotes/" >&2
+if [[ ${#ALL_MATCHES[@]} -eq 0 && ${#EXTRA_REFS[@]} -eq 0 ]]; then
+  echo "ERROR: no branches matched refspec '$PATTERN' under refs/remotes/ and no --extra-ref supplied" >&2
   exit 3
 fi
+for er in "${EXTRA_REFS[@]:-}"; do
+  [[ -z "$er" ]] && continue
+  # Verify the ref exists.
+  if ! git rev-parse --verify "$er" >/dev/null 2>&1; then
+    echo "ERROR: --extra-ref '$er' does not exist" >&2
+    exit 3
+  fi
+  # Avoid duplicates if it's already in the pattern matches.
+  in_pattern=0
+  for m in "${ALL_MATCHES[@]:-}"; do
+    if [[ "$m" == "$er" ]]; then in_pattern=1; break; fi
+  done
+  if (( ! in_pattern )); then
+    ALL_MATCHES+=("$er")
+  fi
+done
 
 UNMERGED=()
 for br in "${ALL_MATCHES[@]}"; do
@@ -160,11 +185,27 @@ echo
 echo "==> Creating worktree $WT_REL on new branch $BRANCH_NAME off $BASE"
 git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 
-# Sequential merge.
+# Sequential cherry-pick.
+#
+# We use cherry-pick rather than `git merge -X theirs` because the
+# claude/* branches are often based on an OUTDATED main (e.g. created
+# off the merge-base of a prior consolidation PR, not the current
+# main HEAD). With `merge -X theirs` we'd silently roll back the
+# main-side updates for any file the stale branch carries unchanged
+# (binary registry blobs, NEWS.md sections, covariate-columns.md
+# entries from previously-merged work). Cherry-pick applies the
+# commit's DELTA on top of the new branch, which is exactly the
+# semantic the operator wants: "fold each branch's per-task commit
+# into one branch."
+#
+# `-X theirs` is still passed so per-commit conflicts (e.g. two
+# branches each editing the same NEWS.md line) resolve to the
+# incoming side; the covariate-columns.md union-merge step below
+# repairs structured-markdown losses.
 cd "$WT_ABS"
 echo
-echo "==> Sequential merge with -X theirs (binaries + metadata files;"
-echo "    covariate-columns.md will be union-merged after)"
+echo "==> Sequential cherry-pick with -X theirs (one commit per branch;"
+echo "    binaries regenerated and covariate-columns.md union-merged after)"
 SUCCESS=0
 FAIL=0
 FAILED_LIST=()
@@ -172,9 +213,9 @@ for br in "${UNMERGED[@]}"; do
   short=${br#origin/}
   ahead=$(git rev-list --count "$BASE..$br")
   echo "    --- $short ($ahead commit ahead) ---"
-  if git merge --no-ff --no-edit -X theirs \
-        -m "Merge branch '$short' into $BRANCH_NAME" \
-        "$br" >/dev/null 2>&1; then
+  if git cherry-pick --strategy=recursive -X theirs \
+        --keep-redundant-commits \
+        "$BASE..$br" >/dev/null 2>&1; then
     SUCCESS=$((SUCCESS+1))
   else
     FAIL=$((FAIL+1))
@@ -182,7 +223,7 @@ for br in "${UNMERGED[@]}"; do
     echo "      FAIL — conflicted files:"
     git diff --name-only --diff-filter=U | sed 's/^/        /'
     echo "      ABORTING this branch; continuing with the rest."
-    git merge --abort || true
+    git cherry-pick --abort 2>/dev/null || git merge --abort 2>/dev/null || true
   fi
 done
 
@@ -240,12 +281,17 @@ if [[ -n "$UNION_FILE" ]]; then
     echo "    union-file not present on this branch; skipping."
   else
     PYTHON3="$(command -v python3)"
-    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" \
-        --repo "$REPO" \
-        --branch "$BRANCH_NAME" \
-        --base "$BASE" \
-        --pattern "$PATTERN" \
-        --file "$UNION_FILE"
+    union_args=(
+      --repo "$REPO"
+      --branch "$BRANCH_NAME"
+      --base "$BASE"
+      --pattern "$PATTERN"
+      --file "$UNION_FILE"
+    )
+    for er in "${EXTRA_REFS[@]:-}"; do
+      [[ -n "$er" ]] && union_args+=( --extra-ref "$er" )
+    done
+    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}"
     if git diff --quiet -- "$UNION_FILE"; then
       echo "    no diff after union-merge (nothing was lost from -X theirs)."
     else
@@ -267,12 +313,17 @@ fi
 # Verify no per-branch contributions were lost.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
-"$SCRIPT_DIR/verify_branch_contributions.sh" \
-    --repo "$REPO" \
-    --branch "$BRANCH_NAME" \
-    --base "$BASE" \
-    --pattern "$PATTERN" \
-    --file "$UNION_FILE"
+verify_args=(
+  --repo "$REPO"
+  --branch "$BRANCH_NAME"
+  --base "$BASE"
+  --pattern "$PATTERN"
+  --file "$UNION_FILE"
+)
+for er in "${EXTRA_REFS[@]:-}"; do
+  [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
+done
+"$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"
 
 # devtools::check pre-push gate.
 if (( ! SKIP_CHECK )); then
