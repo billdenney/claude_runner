@@ -116,17 +116,29 @@ override per repo.
    warnings / 1 note` (the `.git`-in-worktree note is pre-existing
    and ignorable).
 
-9. **Push the branch** to origin:
+9. **Emit `post_merge_advance.sh`** in the worktree root. This is a
+   small, idempotent script the operator runs AFTER the
+   consolidation PR is merged. It force-advances each source
+   `claude/<task-id>` branch's tip to its cherry-picked commit on
+   main, so per-task tracking is preserved — GitHub then shows each
+   source branch as "merged" instead of the perpetual "1 commit
+   ahead" that cherry-pick's SHA rewrite causes. Safety: uses
+   `--force-with-lease=<branch>:<original_sha>` so a source branch
+   that's been updated since cherry-pick (e.g. the runner
+   re-dispatched the task) is not silently clobbered.
 
-   ```bash
-   git push -u origin <branch-name>
-   ```
+10. **Push the branch** to origin:
 
-10. **Print the suggested PR title + body** for the operator to open
+    ```bash
+    git push -u origin <branch-name>
+    ```
+
+11. **Print the suggested PR title + body** for the operator to open
     manually. The body lists which branches were folded in,
     categorised as new-model additions / vignette ASCII fixes /
     follow-up edits, plus a procedural note on the `-X theirs`
-    caveat for covariate-columns.md.
+    caveat for covariate-columns.md AND instructions for running
+    `post_merge_advance.sh` after the PR merges.
 
 ## Things this skill does NOT do
 
@@ -144,6 +156,38 @@ override per repo.
   inside the nlmixr2lib repo's worktree.
 
 ## Important nuances
+
+### Per-task tracking: cherry-pick + post-process
+
+The skill uses `git cherry-pick -X theirs` rather than `git merge -X
+theirs` because the latter rolls back earlier-merged branches' work
+when source branches are based on stale main (the common case for
+long-lived `claude/*` task branches). Cherry-pick applies only the
+commit delta, but each cherry-picked commit gets a NEW SHA — so
+source branches never become true ancestors of main, and GitHub
+shows them as "1 commit ahead" indefinitely after the consolidation
+PR merges.
+
+`post_merge_advance.sh` resolves this. Step 9 emits the script
+inside the worktree, recording a mapping of
+`(source_branch, cherry_picked_sha, original_source_sha)` per
+cherry-picked branch. After the consolidation PR merges into main:
+
+```bash
+cd <repo>/.worktrees/<branch-name>
+bash post_merge_advance.sh             # dry-run; shows what would happen
+bash post_merge_advance.sh --apply     # force-push each source branch
+```
+
+The `--force-with-lease=<branch>:<original_sha>` form means a source
+branch that was UPDATED since cherry-pick time (e.g. the runner
+re-dispatched the same task and pushed new commits) will be
+rejected rather than silently clobbered. Operator then triages
+those individually.
+
+If the operator forgets to run the advance script, nothing breaks —
+the source branches just stay "1 commit ahead" and can be deleted
+manually if desired. The script is optional and idempotent.
 
 ### Why `-X theirs` for binaries is safe
 
