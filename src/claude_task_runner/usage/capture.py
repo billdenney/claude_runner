@@ -98,6 +98,14 @@ def capture(
             raise UsageCaptureSpawnError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
 
+    # Pre-trust the spawn CWD and mark onboarding complete in the target
+    # .claude.json. Idempotent — a no-op once the flags are set. Done for
+    # the default CLAUDE_CONFIG_DIR too (config_path defaults to ~/.claude
+    # inside the helper) so fresh accounts don't hit the trust dialog.
+    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
+
+    _ensure_claude_init(claude_config_dir or None, Path.cwd())
+
     log_buf = io.BytesIO()
     child: pexpect.spawn[bytes] | None = None
     try:
@@ -110,44 +118,56 @@ def capture(
         )
         child.logfile_read = log_buf
 
-        # Phase 1: race trust prompt vs TUI-ready marker.
+        # Phase 1: race onboarding prompts against the TUI-ready marker.
         #
-        # Two trust-prompt shapes are known:
-        #   - Claude <= 2.1.131:   "Yes, I trust this folder"  (Enter accepts)
-        #   - Claude >= 2.1.141:   "Quick safety check: Is this a project..."
-        #                          (Enter on the highlighted default accepts;
-        #                          if that ever stops working, the operator
-        #                          can pre-trust the directory by flipping
-        #                          `hasTrustDialogAccepted=true` in
-        #                          <config_dir>/.claude.json, which makes the
-        #                          prompt vanish entirely.)
-        # Either prompt -> send Enter and then wait for the "shortcuts"
-        # TUI-ready marker.
-        try:
-            idx = child.expect(
-                [
-                    b"Yes, I trust this folder",
-                    b"Quick safety check",
-                    b"shortcuts",
-                    pexpect.TIMEOUT,
-                ],
-                timeout=settings.capture_trust_timeout_s,
-            )
-        except pexpect.EOF as exc:
-            raise UsageCaptureTimeout("claude exited before any TUI marker appeared") from exc
-
-        if idx in (0, 1):
-            child.sendline("")  # confirm trust (Enter accepts the default)
+        # Different .claude config dirs land at different first frames; we
+        # loop, dismissing whichever prompt appears, until the "shortcuts"
+        # footer marks the TUI as ready (or we hit a timeout slice without
+        # any match).
+        #
+        # Known dismissable prompts:
+        #   - "Yes, I trust this folder"  (Claude <= 2.1.131 trust prompt)
+        #   - "Quick safety check"        (Claude >= 2.1.141 trust prompt)
+        #   - "colorblind-friendly"       (first-run theme picker — appears
+        #                                  when .claude.json lacks
+        #                                  `hasCompletedOnboarding=true`;
+        #                                  the longer phrases like
+        #                                  "Choose the text style" are
+        #                                  split by ANSI cursor escapes,
+        #                                  so we anchor on a contiguous
+        #                                  hyphenated word from the option
+        #                                  list.)
+        # Each is dismissed by sending Enter (trust prompts accept the
+        # highlighted default) or "1" + Enter (theme picker selects the
+        # first option, "Auto"). Operator escape hatches: pre-set
+        # `hasTrustDialogAccepted=true` and `hasCompletedOnboarding=true`
+        # in <config_dir>/.claude.json to skip both prompts entirely.
+        ready = False
+        for _attempt in range(5):  # bound dismissals — guards a stuck loop
             try:
-                child.expect(
-                    [b"shortcuts", pexpect.TIMEOUT],
+                idx = child.expect(
+                    [
+                        b"Yes, I trust this folder",  # 0: legacy trust
+                        b"Quick safety check",  # 1: newer trust
+                        b"colorblind-friendly",  # 2: theme picker
+                        b"shortcuts",  # 3: TUI ready
+                        pexpect.TIMEOUT,  # 4
+                    ],
                     timeout=settings.capture_trust_timeout_s,
                 )
             except pexpect.EOF as exc:
-                raise UsageCaptureTimeout(
-                    "claude exited after trust confirmation, before TUI ready"
-                ) from exc
-        elif idx == 3:
+                raise UsageCaptureTimeout("claude exited before any TUI marker appeared") from exc
+            if idx in (0, 1):
+                child.sendline("")  # Enter accepts the default
+            elif idx == 2:
+                child.sendline("1")  # "1" = Auto theme
+            elif idx == 3:
+                ready = True
+                break
+            else:  # TIMEOUT — nothing matched this slice; give up
+                break
+
+        if not ready:
             raise UsageCaptureTimeout(
                 f"TUI did not become ready within {settings.capture_trust_timeout_s}s"
             )

@@ -26,6 +26,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0016 | Dynamic weekly pacing curve anchored to OAuth reset | accepted | 2026-05-13 |
 | 0017 | Cleanup after the superseded `claude_runner` audit | accepted | 2026-05-13 |
 | 0018 | Inject TERM and PATH into the generated systemd-user unit | accepted | 2026-05-14 |
+| 0019 | Pre-init `.claude.json` before every claude spawn | accepted | 2026-05-18 |
 
 ## Template
 

@@ -356,6 +356,16 @@ def dispatch(
             raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
 
+    # Pre-trust the task's working_dir (and mark onboarding complete) in the
+    # target .claude.json. Idempotent — only writes when a flag changes.
+    # ``--print`` mode doesn't paint the TUI trust prompt, but the trust
+    # state is still consulted; without this entry a fresh config_dir can
+    # bounce the dispatch on first use.
+    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
+
+    _trust_dir = task.working_dir if task.working_dir else Path.cwd()
+    _ensure_claude_init(claude_config_dir or None, _trust_dir)
+
     process = subprocess.Popen(  # caller-controlled
         argv,
         stdout=subprocess.PIPE,
