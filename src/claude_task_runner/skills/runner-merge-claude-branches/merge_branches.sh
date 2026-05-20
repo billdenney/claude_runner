@@ -322,21 +322,6 @@ union-merger script and the procedural rationale." >/dev/null
   fi
 fi
 
-# Verify no per-branch contributions were lost.
-echo
-echo "==> Verifying no per-branch model contributions are missing"
-verify_args=(
-  --repo "$REPO"
-  --branch "$BRANCH_NAME"
-  --base "$BASE"
-  --pattern "$PATTERN"
-  --file "$UNION_FILE"
-)
-for er in "${EXTRA_REFS[@]:-}"; do
-  [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
-done
-"$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"
-
 # Emit post_merge_advance.sh in the worktree. After the consolidation
 # PR lands on origin/main, the operator runs this script to advance
 # each source claude/<task-id> branch to its cherry-picked commit.
@@ -442,6 +427,28 @@ EOSTAIL
 } > "$ADVANCE_SCRIPT"
 chmod +x "$ADVANCE_SCRIPT"
 echo "    wrote $ADVANCE_SCRIPT (${#CHERRY_BRANCH[@]} branch mappings)"
+
+# Verify no per-branch contributions were lost. NB: this runs AFTER
+# post_merge_advance.sh is emitted because the verifier may legitimately
+# exit non-zero (brand-new section header lost; see SAPS_II in the
+# 2026-05-20 consolidation). With `set -e` active, a non-zero verifier
+# would abort the script before the advance script could be written —
+# but the SHA mapping doesn't depend on verifier success, and the
+# operator typically wants the advance script available even when the
+# union-file needs hand-touching first.
+echo
+echo "==> Verifying no per-branch model contributions are missing"
+verify_args=(
+  --repo "$REPO"
+  --branch "$BRANCH_NAME"
+  --base "$BASE"
+  --pattern "$PATTERN"
+  --file "$UNION_FILE"
+)
+for er in "${EXTRA_REFS[@]:-}"; do
+  [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
+done
+"$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"
 
 # devtools::check pre-push gate.
 if (( ! SKIP_CHECK )); then
