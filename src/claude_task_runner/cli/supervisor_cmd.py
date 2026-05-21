@@ -71,6 +71,20 @@ def start(
     Blocks until SIGTERM/SIGINT or until STOPPED state is reached.
     Acquires the host-wide global lock; raises if another supervisor
     is already running.
+
+    Signals (delivered with ``kill -<NAME> <pid>`` against the PID file
+    at ``<queue>/.claude_task_runner/supervisor.pid``):
+
+    * ``SIGTERM`` / ``SIGINT`` — request a clean stop; in-flight
+      dispatch threads finish their current attempt (architectural
+      invariant 2: in-flight tasks are NOT killed when the supervisor
+      exits). Use ``claude-task-runner supervisor stop`` to do this
+      from the CLI.
+    * ``SIGHUP`` — hot-reload ``claude_runner.toml`` on the next tick
+      and rescan ``<queue>/todo/`` for new task YAMLs. In-flight tasks
+      keep running with their already-built command-line; the new
+      config applies to the NEXT dispatch. Malformed TOML is logged
+      and the previous config stays active.
     """
     console = Console()
     settings = load_settings(config)
@@ -93,6 +107,7 @@ def start(
             pending_count_fn=lambda: _count_pending(queue_path),
             in_flight_count_fn=lambda: _count_in_flight(queue_path),
             max_ticks=max_ticks,
+            config_path=config,
         )
     except pidfile_mod.SupervisorAlreadyRunning as exc:
         console.print(f"[bold red]supervisor already running:[/] {exc}")

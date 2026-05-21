@@ -54,6 +54,39 @@ logger = logging.getLogger(__name__)
 
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
 
+
+def priority_sort_key(task: Task) -> tuple[int, str]:
+    """Public sort key matching the orchestrator's dispatch order.
+
+    Returns ``(priority_rank, task_id)`` where rank is 0 for ``high``,
+    1 for ``normal``, 2 for ``low``, and 99 for any unrecognized value
+    (sinks to the back). Exposed so the CLI's
+    ``queue list --order-by-dispatch`` flag can show the same ordering
+    the supervisor will actually apply.
+    """
+    return (_PRIORITY_ORDER.get(task.priority, 99), task.id)
+
+
+def planned_dispatch_order(queue_dir: Path) -> list[Task]:
+    """Return all pending tasks sorted in the order the supervisor would dispatch.
+
+    Does NOT consult ``depends_on``, in-flight state, or per-tick
+    capacity — it shows the ordering of the pending pool, which is
+    what the operator usually wants to verify. A task currently in
+    ``running`` / ``awaiting_sidecar`` / ``completed`` is still listed
+    if its YAML is in ``todo/``; consumers can cross-reference with
+    ``queue states`` if they need state-filtered output.
+    """
+    tasks: list[Task] = []
+    for path in list_pending_tasks(queue_dir):
+        try:
+            tasks.append(load_task(path))
+        except Exception as exc:
+            logger.warning("skipping unparseable task at %s: %s", path, exc)
+    tasks.sort(key=priority_sort_key)
+    return tasks
+
+
 # Task statuses that ARE eligible for (re-)dispatch.
 #
 # This is an explicit allow-list: every status defined in
@@ -120,7 +153,7 @@ def tick_dispatch(
     if not candidates:
         return
 
-    candidates.sort(key=lambda t: (_PRIORITY_ORDER.get(t.priority, 99), t.id))
+    candidates.sort(key=priority_sort_key)
 
     for task in candidates[:available]:
         thread = threading.Thread(

@@ -30,7 +30,9 @@ from datetime import datetime
 from pathlib import Path
 
 from claude_task_runner.clock import Clock, RealClock
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.config.schema import Settings
+from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -186,6 +188,22 @@ class DaemonHandle:
     pid_path: Path
 
 
+def _diff_settings(old: Settings, new: Settings) -> int:
+    """Return a coarse count of top-level setting groups whose dumped JSON differs.
+
+    Used only for the SIGHUP reload summary log line; we don't try to
+    pinpoint individual keys (the operator can compare the TOML files
+    if they want detail). Returns 0 when the merged dicts are equal,
+    so the SIGHUP path can emit "0 changes" idempotently.
+    """
+    old_d = old.model_dump(mode="json")
+    new_d = new.model_dump(mode="json")
+    if old_d == new_d:
+        return 0
+    keys = set(old_d) | set(new_d)
+    return sum(1 for k in keys if old_d.get(k) != new_d.get(k))
+
+
 def start_daemon(
     *,
     queue_dir: Path,
@@ -198,6 +216,7 @@ def start_daemon(
     event_callback: Callable[[str, dict[str, object]], None] | None = None,
     install_signal_handlers: bool = True,
     max_ticks: int | None = None,
+    config_path: Path | None = None,
 ) -> DaemonHandle:
     """Run the supervisor loop in the calling thread.
 
@@ -205,8 +224,28 @@ def start_daemon(
     persists each tick, sleeps between polls. Returns the
     :class:`DaemonHandle` once the loop exits (e.g., on SIGTERM).
 
-    ``max_ticks`` caps the loop at N ticks — used in integration tests
-    to drive a finite number of state transitions deterministically.
+    Parameters
+    ----------
+    config_path
+        Path to ``claude_runner.toml``, recorded so the SIGHUP handler
+        can re-read it. When ``None`` (the historical default), SIGHUP
+        re-reads only the package defaults — useful in tests but in
+        production callers should pass the same path they fed to
+        ``load_settings``.
+    max_ticks
+        Caps the loop at N ticks — used in integration tests to drive
+        a finite number of state transitions deterministically.
+
+    Signal handling (when ``install_signal_handlers=True``):
+
+    * ``SIGTERM`` / ``SIGINT`` — request a clean stop. In-flight
+      dispatch threads are NOT killed (architectural invariant 2);
+      the loop exits but threads finish their current attempt.
+    * ``SIGHUP`` — request a hot-reload of ``claude_runner.toml`` on
+      the next tick. Newly-added task YAMLs in ``todo/`` are picked
+      up automatically because the orchestrator rescans on every tick.
+      Malformed TOML is logged and the old config stays active.
+      In-flight tasks are unaffected.
     """
     clk = clock if clock is not None else RealClock()
 
@@ -215,14 +254,23 @@ def start_daemon(
     handle = DaemonHandle(queue_dir=queue_dir, state_path=state_path, pid_path=pid_path)
 
     stop_flag = {"stop": False}
+    reload_flag = {"pending": False}
 
     def _on_signal(signum: int, _frame: object) -> None:
         logger.info("supervisor caught signal %s; stopping", signum)
         stop_flag["stop"] = True
 
+    def _on_sighup(_signum: int, _frame: object) -> None:
+        # Defer the reload to the next tick — running reload work
+        # inside the signal handler would be unsafe (re-entrant I/O,
+        # GIL surprises). The handler only flips a flag.
+        logger.info("supervisor caught SIGHUP; reload pending on next tick")
+        reload_flag["pending"] = True
+
     if install_signal_handlers:
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGHUP, _on_sighup)
 
     # Tracks live dispatch threads keyed by task id. Threads are non-daemon
     # so the supervisor process won't terminate until in-flight tasks finish
@@ -234,11 +282,21 @@ def start_daemon(
         pidfile_mod.write_pid_file(pid_path)
         try:
             snapshot = persist_mod.load(state_path) or persist_mod.initial_snapshot(since=clk.now())
+            prior_pending = pending_count_fn()
 
             ticks = 0
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
+
+                if reload_flag["pending"]:
+                    settings, prior_pending = _apply_sighup_reload(
+                        current=settings,
+                        config_path=config_path,
+                        prior_pending=prior_pending,
+                        pending_count_fn=pending_count_fn,
+                    )
+                    reload_flag["pending"] = False
 
                 ctx = TickContext(
                     settings=settings,
@@ -253,6 +311,20 @@ def start_daemon(
                     event_callback=event_callback,
                 )
                 persist_mod.write_atomic(snapshot, state_path)
+
+                # Drain force-dispatch requests BEFORE the throttle gate so
+                # operator overrides land even when the state machine has
+                # parked the supervisor in THROTTLED_5H / PAUSED_WEEKLY.
+                try:
+                    fd_mod.tick_consume(
+                        queue_dir=queue_dir,
+                        settings=settings,
+                        clock=clk,
+                        in_flight_threads=in_flight_threads,
+                        claude_executable=settings.claude.executable,
+                    )
+                except Exception:
+                    logger.exception("force-dispatch tick_consume failed")
 
                 # Reap finished dispatch threads + spawn new ones up to the
                 # target concurrency. The orchestrator is a thin bridge; the
@@ -284,3 +356,43 @@ def start_daemon(
             pidfile_mod.clear_pid_file(pid_path)
 
     return handle
+
+
+def _apply_sighup_reload(
+    *,
+    current: Settings,
+    config_path: Path | None,
+    prior_pending: int,
+    pending_count_fn: Callable[[], int],
+) -> tuple[Settings, int]:
+    """Apply a SIGHUP-triggered reload; return ``(new_settings, new_pending)``.
+
+    On any failure (TOML parse error, schema violation, OS error) we log
+    a warning and return ``(current, prior_pending)`` — the old config
+    stays active and the operator sees the failure in the journal.
+    The orchestrator rescans ``todo/`` on every tick already, so the
+    only "rescan" work this function does is recount ``prior_pending``
+    so the summary line can report how many new tasks appeared.
+    """
+    try:
+        new_settings = load_settings(config_path)
+    except ConfigError as exc:
+        logger.warning("SIGHUP received: reload failed (%s); keeping old config", exc)
+        return current, prior_pending
+    except OSError as exc:
+        logger.warning(
+            "SIGHUP received: cannot read %s (%s); keeping old config",
+            config_path,
+            exc,
+        )
+        return current, prior_pending
+
+    changes = _diff_settings(current, new_settings)
+    new_pending = pending_count_fn()
+    delta = max(0, new_pending - prior_pending)
+    logger.info(
+        "SIGHUP received: reloaded config (%d changes); rescanned queue (%d new tasks)",
+        changes,
+        delta,
+    )
+    return new_settings, new_pending
