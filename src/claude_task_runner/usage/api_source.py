@@ -63,6 +63,26 @@ DEFAULT_PROBE_MODEL = "claude-haiku-4-5"
 """Cheapest model for the probe call. ``max_tokens=1`` keeps the
 billable cost to a single output token plus the ~3-token user prompt."""
 
+_KNOWN_OK_STATUSES: frozenset[str] = frozenset({"allowed", "allowed_warning"})
+"""``anthropic-ratelimit-unified-{5h,7d}-status`` values that mean
+"the API will accept dispatches" and require no special handling.
+
+The gist that documented the headers initially listed only
+``"allowed"``. Live traffic against the personal account on
+2026-05-21 returned ``"allowed_warning"`` when the 7d window was
+above ~70% utilization. Both values are benign for our purposes:
+the supervisor drives state transitions off the *utilization
+percentage*, not the status string, and the configured thresholds
+in ``[throttle.{five_hour,weekly}]`` already encode the operator's
+chosen slowdown / pause points. Treating ``"allowed_warning"`` as
+"slow down now" would double-count the band thresholds and
+prematurely throttle dispatch.
+
+Statuses NOT in this set are logged once per capture (not raised)
+so ops can extend the enumeration as Anthropic introduces new
+values. The log is the early-warning channel; promotion to
+state-machine signals (if any) belongs in a separate ADR."""
+
 # OAuth credential file keys, in priority order. Different Claude Code
 # versions and login flows have stored the access token under different
 # nested paths; we try each before giving up so the operator gets a
@@ -248,17 +268,21 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
             "Possible Anthropic header rename — falling back to TTY source."
         )
 
-    # Log non-"allowed" statuses without raising; the supervisor's
-    # state machine drives off the utilization percentage, so an
-    # unknown status doesn't gate dispatch. The log is the early-
-    # warning channel for ops to map out the enumeration.
+    # Log unknown statuses without raising; the supervisor's state
+    # machine drives off the utilization percentage, so an unknown
+    # status doesn't gate dispatch. ``"allowed"`` and
+    # ``"allowed_warning"`` are both treated as benign (see
+    # ``_KNOWN_OK_STATUSES``). The log is the early-warning channel
+    # for ops to map out the enumeration as new values appear.
     for window in ("5h", "7d"):
         status = lower.get(f"anthropic-ratelimit-unified-{window}-status")
-        if status is not None and status != "allowed":
+        if status is not None and status not in _KNOWN_OK_STATUSES:
             logger.warning(
-                "API usage source: %s status=%r (only 'allowed' is documented)",
+                "API usage source: %s status=%r is outside the recognised "
+                "set (%s); the supervisor still routes on utilization%%.",
                 window,
                 status,
+                sorted(_KNOWN_OK_STATUSES),
             )
 
     # After the `missing` check above, none of these are None; the
