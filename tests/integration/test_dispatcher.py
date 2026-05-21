@@ -145,6 +145,34 @@ class TestBuildArgv:
         argv = build_argv(task, plan, claude_executable="claude")
         assert "--allowedTools" not in argv
 
+    def test_settings_json_grants_bash_git_rscript(self, task: Task, fresh_plan: SpawnPlan) -> None:
+        """The autonomous dispatch must be allowed to run ``git`` and
+        ``Rscript`` from the start. Without ``permissions.allow`` for
+        those Bash patterns, ``acceptEdits`` would only auto-grant
+        Write/Edit and the agent would exit via ``end_turn`` with the
+        model on disk but never committed (observed 2026-05-21 with
+        task ``130-lowe_2009_omalizumab``). The runner always emits a
+        ``--settings`` JSON document with the additive allow list;
+        Claude Code merges it with any project-local
+        ``settings.local.json`` so per-repo configs are not clobbered.
+        """
+        import json
+
+        argv = build_argv(task, fresh_plan, claude_executable="claude")
+        assert "--settings" in argv
+        idx = argv.index("--settings")
+        settings_arg = argv[idx + 1]
+        # Settings arg is a JSON string (single-arg shell-friendly form).
+        payload = json.loads(settings_arg)
+        allow = payload["permissions"]["allow"]
+        # The four patterns are the minimum needed for Phase 4
+        # (convention check), Phase 5 (vignette render), and Phase 6
+        # (registry regen + git commit + push) of /extract-literature-model.
+        assert "Bash(git *)" in allow
+        assert "Bash(Rscript *)" in allow
+        assert "Bash(R *)" in allow
+        assert "Bash(make *)" in allow
+
     def test_no_add_dirs_omits_flag(self, task: Task, fresh_plan: SpawnPlan) -> None:
         argv = build_argv(task, fresh_plan, claude_executable="claude")
         assert "--add-dir" not in argv
