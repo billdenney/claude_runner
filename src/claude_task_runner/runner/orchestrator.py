@@ -7,20 +7,22 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the target concurrency for this tick (a simple heuristic
-   based on the supervisor state, deliberately conservative — the runner's
-   :mod:`runner.concurrency` math is reserved for a future EMA-aware
-   policy).
-3. Picks eligible pending tasks (no `running` state file, all
+2. Computes the target concurrency for this tick.
+3. Picks eligible pending tasks (no ``running`` state file, all
    ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
-4. Spawns one ``threading.Thread`` per task that calls
-   :func:`runner.dispatcher.dispatch`. Threads are non-daemon so the
-   supervisor process won't exit until in-flight tasks finish, even after
-   SIGTERM.
+4. For each candidate calls :func:`runner.account_dispatch.choose_account`
+   to pick the account to dispatch through (equal-priority across
+   accounts, least 5h util wins). Skips the task when no account has
+   capacity.
+5. Spawns one ``threading.Thread`` per dispatched task that calls
+   :func:`runner.dispatcher.dispatch` with the chosen account's
+   ``config_dir`` / ``linux_user``. Threads are non-daemon so the
+   supervisor process won't exit until in-flight tasks finish.
 
 The supervisor's snapshot is read-only here; we never emit ``DispatchTask``
 actions back to the state machine. Throttle decisions stay in the state
-machine.
+machine. The orchestrator returns the updated snapshot (with refreshed
+:class:`InFlightRecord` list) so the daemon can persist it.
 """
 
 from __future__ import annotations
@@ -40,13 +42,15 @@ from claude_task_runner.queue.store import (
     load_task,
     state_path_for,
 )
+from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.supervisor.states import SupervisorState
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
-    from claude_task_runner.config.schema import Settings
+    from claude_task_runner.config.schema import ResolvedAccount, Settings
     from claude_task_runner.supervisor.states import SupervisorSnapshot
 
 logger = logging.getLogger(__name__)
@@ -126,53 +130,129 @@ def tick_dispatch(
     settings: Settings,
     clock: Clock,
     snapshot: SupervisorSnapshot,
-    in_flight_threads: dict[str, threading.Thread],
+    in_flight_slots: dict[str, DispatchSlot],
+    accounts: list[ResolvedAccount] | None = None,
     claude_executable: str = "claude",
-) -> None:
+) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
-    Mutates ``in_flight_threads`` in place: removes finished threads,
-    inserts newly-spawned ones keyed by ``task.id``.
+    Mutates ``in_flight_slots`` in place: removes finished threads,
+    inserts newly-spawned :class:`DispatchSlot` entries (one per
+    dispatched task, with account attribution).
+
+    Returns the snapshot with refreshed
+    :attr:`SupervisorSnapshot.in_flight` (the live attributed list)
+    so the daemon can persist it without recomputing.
+
+    ``accounts`` (when ``None``) is resolved from ``settings`` on the
+    spot; pass it explicitly to share one resolution across multiple
+    callers per tick.
     """
-    _reap_finished(in_flight_threads)
+    _reap_finished(in_flight_slots)
+
+    if accounts is None:
+        # Local import to avoid a circular at module top: loader
+        # imports schema; schema is consumed by the rest of the codebase.
+        from claude_task_runner.config.loader import resolve_accounts
+
+        accounts = resolve_accounts(settings)
+    accounts_by_name = {a.name: a for a in accounts}
 
     if snapshot.state not in (
         SupervisorState.DISPATCHING,
         SupervisorState.SLOWING_DOWN,
         SupervisorState.END_OF_WEEK_PUSH,
     ):
-        return
+        return _refresh_in_flight(snapshot, in_flight_slots)
 
     target = _target_concurrency(queue_dir, settings, snapshot)
-    available = max(0, target - len(in_flight_threads))
+    available = max(0, target - len(in_flight_slots))
     if available == 0:
-        return
+        return _refresh_in_flight(snapshot, in_flight_slots)
 
     completed_ids = _completed_task_ids(queue_dir)
-    candidates = _eligible_candidates(queue_dir, in_flight_threads, completed_ids)
+    candidates = _eligible_candidates(queue_dir, in_flight_slots, completed_ids)
     if not candidates:
-        return
+        return _refresh_in_flight(snapshot, in_flight_slots)
 
     candidates.sort(key=priority_sort_key)
 
-    for task in candidates[:available]:
+    dispatched = 0
+    for task in candidates:
+        if dispatched >= available:
+            break
+        # Build the per-tick view of attributed in-flight tasks so
+        # choose_account sees each newly-dispatched slot as it lands.
+        live_in_flight = to_in_flight_records(in_flight_slots)
+        choice = account_dispatch_mod.choose_account(
+            task=task,
+            accounts=accounts_by_name,
+            account_states=dict(snapshot.accounts),
+            in_flight=live_in_flight,
+        )
+        if choice.account is None:
+            logger.info("dispatch skipped task %s: %s", task.id, choice.reason)
+            continue
+        acct = accounts_by_name[choice.account]
         thread = threading.Thread(
             target=_dispatch_one_safely,
-            args=(task, queue_dir, settings, clock, claude_executable),
+            args=(
+                task,
+                queue_dir,
+                settings,
+                clock,
+                claude_executable,
+                acct.config_dir,
+                acct.linux_user,
+                choice.account,
+            ),
             name=f"dispatch-{task.id}",
             daemon=False,
         )
         thread.start()
-        in_flight_threads[task.id] = thread
-        logger.info("dispatched task %s in thread (in_flight=%d)", task.id, len(in_flight_threads))
+        in_flight_slots[task.id] = DispatchSlot(
+            task_id=task.id,
+            account=choice.account,
+            started_at=clock.now(),
+            thread=thread,
+        )
+        dispatched += 1
+        logger.info(
+            "dispatched task %s via account=%s (in_flight=%d, %s)",
+            task.id,
+            choice.account,
+            len(in_flight_slots),
+            choice.reason,
+        )
+
+    return _refresh_in_flight(snapshot, in_flight_slots)
 
 
-def _reap_finished(in_flight_threads: dict[str, threading.Thread]) -> None:
-    finished = [tid for tid, th in in_flight_threads.items() if not th.is_alive()]
+def _refresh_in_flight(
+    snapshot: SupervisorSnapshot,
+    in_flight_slots: dict[str, DispatchSlot],
+) -> SupervisorSnapshot:
+    """Return ``snapshot`` with ``in_flight`` rebuilt from ``in_flight_slots``.
+
+    Also keeps the legacy ``in_flight_task_ids`` field in sync so v2
+    consumers still see the task-id list. The two fields are
+    redundant by design (see :class:`SupervisorSnapshot` docstring).
+    """
+    records = to_in_flight_records(in_flight_slots)
+    return snapshot.model_copy(
+        update={
+            "in_flight": records,
+            "in_flight_task_ids": [r.task_id for r in records],
+        }
+    )
+
+
+def _reap_finished(in_flight_slots: dict[str, DispatchSlot]) -> None:
+    finished = [tid for tid, slot in in_flight_slots.items() if not slot.thread.is_alive()]
     for tid in finished:
         with contextlib.suppress(Exception):
-            in_flight_threads[tid].join(timeout=0.1)
-        del in_flight_threads[tid]
+            in_flight_slots[tid].thread.join(timeout=0.1)
+        del in_flight_slots[tid]
         logger.info("reaped finished dispatch thread for task %s", tid)
 
 
@@ -222,11 +302,11 @@ def _completed_task_ids(queue_dir: Path) -> set[str]:
 
 def _eligible_candidates(
     queue_dir: Path,
-    in_flight_threads: dict[str, threading.Thread],
+    in_flight_slots: dict[str, DispatchSlot],
     completed_ids: set[str],
 ) -> list[Task]:
     out: list[Task] = []
-    in_flight_ids = set(in_flight_threads.keys())
+    in_flight_ids = set(in_flight_slots.keys())
 
     # Cache the open-sidecar set once per call rather than scanning the
     # sidecar directory inside every per-task branch. A task is
@@ -284,8 +364,18 @@ def _dispatch_one_safely(
     settings: Settings,
     clock: Clock,
     claude_executable: str,
+    claude_config_dir: str,
+    linux_user: str | None,
+    account: str,
 ) -> None:
-    """Thread entrypoint — load state, plan spawn, call dispatch, log errors."""
+    """Thread entrypoint — load state, plan spawn, call dispatch, log errors.
+
+    ``claude_config_dir`` / ``linux_user`` / ``account`` are resolved
+    per-dispatch by the orchestrator via
+    :func:`runner.account_dispatch.choose_account` and routed through to
+    :func:`runner.dispatcher.dispatch` so the spawned ``claude``
+    subprocess hits the right account's credentials (and uid).
+    """
     sp = state_path_for(queue_dir, task.id)
     if sp.exists():
         try:
@@ -309,7 +399,9 @@ def _dispatch_one_safely(
             settings_failure_classifier=settings.failure_classifier,
             settings_dispatch=settings.dispatch,
             claude_executable=claude_executable,
-            claude_config_dir=settings.claude.config_dir,
+            claude_config_dir=claude_config_dir,
+            linux_user=linux_user,
+            account=account,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

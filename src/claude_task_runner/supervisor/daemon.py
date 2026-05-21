@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import signal
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
+from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
@@ -272,16 +272,22 @@ def start_daemon(
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGHUP, _on_sighup)
 
-    # Tracks live dispatch threads keyed by task id. Threads are non-daemon
-    # so the supervisor process won't terminate until in-flight tasks finish
-    # (architectural invariant 2 — in-flight tasks are not killed by
-    # supervisor death).
-    in_flight_threads: dict[str, threading.Thread] = {}
+    # Tracks live dispatch slots (thread + account attribution) keyed by
+    # task id. Threads are non-daemon so the supervisor process won't
+    # terminate until in-flight tasks finish (architectural invariant 2 —
+    # in-flight tasks are not killed by supervisor death). The slot's
+    # ``account`` field is the source of truth for
+    # :class:`InFlightRecord` rebuilds each tick.
+    in_flight_slots: dict[str, DispatchSlot] = {}
 
     with pidfile_mod.acquire_global_lock():
         pidfile_mod.write_pid_file(pid_path)
         try:
-            snapshot = persist_mod.load(state_path) or persist_mod.initial_snapshot(since=clk.now())
+            account_names = [a.name for a in settings.accounts]
+            snapshot = persist_mod.load(state_path) or persist_mod.initial_snapshot(
+                since=clk.now(),
+                account_names=account_names,
+            )
             prior_pending = pending_count_fn()
 
             ticks = 0
@@ -320,24 +326,27 @@ def start_daemon(
                         queue_dir=queue_dir,
                         settings=settings,
                         clock=clk,
-                        in_flight_threads=in_flight_threads,
+                        in_flight_slots=in_flight_slots,
                         claude_executable=settings.claude.executable,
                     )
                 except Exception:
                     logger.exception("force-dispatch tick_consume failed")
 
                 # Reap finished dispatch threads + spawn new ones up to the
-                # target concurrency. The orchestrator is a thin bridge; the
-                # supervisor's pure step() never sees thread state.
+                # target concurrency. tick_dispatch returns the snapshot
+                # with the refreshed InFlightRecord list; persist it so
+                # ``account list`` (and a restarted supervisor) see the
+                # current attribution.
                 try:
-                    orch_mod.tick_dispatch(
+                    snapshot = orch_mod.tick_dispatch(
                         queue_dir=queue_dir,
                         settings=settings,
                         clock=clk,
                         snapshot=snapshot,
-                        in_flight_threads=in_flight_threads,
+                        in_flight_slots=in_flight_slots,
                         claude_executable=settings.claude.executable,
                     )
+                    persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
                     logger.exception("tick_dispatch failed")
 

@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_task_runner.config.loader import resolve_accounts
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -53,6 +54,7 @@ from claude_task_runner.queue.store import (
     task_path_for,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.session import plan_next_spawn
 
 if TYPE_CHECKING:
@@ -192,7 +194,7 @@ def tick_consume(
     queue_dir: Path,
     settings: Settings,
     clock: Clock,
-    in_flight_threads: dict[str, threading.Thread],
+    in_flight_slots: dict[str, DispatchSlot],
     claude_executable: str = "claude",
 ) -> int:
     """Drain the force-dispatch request queue; return tasks actually dispatched.
@@ -202,10 +204,16 @@ def tick_consume(
     no longer dispatchable (deleted, completed, in-flight elsewhere) are
     consumed and dropped. Requests that hit the concurrency cap are left
     in place for the next tick unless ``allow_over_limit`` was set.
+
+    Force-dispatched tasks honour ``task.account`` pinning when set;
+    otherwise they route to the first configured account that exists.
     """
     requests = list_requests(queue_dir)
     if not requests:
         return 0
+
+    accounts = resolve_accounts(settings)
+    accounts_by_name = {a.name: a for a in accounts}
 
     dispatched = 0
     cap = max(1, settings.concurrency.max_concurrency)
@@ -230,7 +238,7 @@ def tick_consume(
             consume_request(queue_dir, req.task_id)
             continue
 
-        if task.id in in_flight_threads:
+        if task.id in in_flight_slots:
             logger.info(
                 "force-dispatch %s: already in-flight; consuming request",
                 task.id,
@@ -249,14 +257,24 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
-        if not req.allow_over_limit and len(in_flight_threads) >= cap:
+        if not req.allow_over_limit and len(in_flight_slots) >= cap:
             logger.warning(
                 "force-dispatch %s: in-flight=%d >= max_concurrency=%d; leaving request",
                 task.id,
-                len(in_flight_threads),
+                len(in_flight_slots),
                 cap,
             )
             continue
+
+        # Pick the account: task.account pinning when present and known,
+        # else the first configured account. Force-dispatch deliberately
+        # bypasses choose_account's eligibility filter (that's the point
+        # of "force"), so a paused or throttled account still gets the
+        # task — the operator opted in.
+        if task.account and task.account in accounts_by_name:
+            picked = accounts_by_name[task.account]
+        else:
+            picked = next(iter(accounts_by_name.values()))
 
         consume_request(queue_dir, task.id)
         _spawn_dispatch_thread(
@@ -265,7 +283,10 @@ def tick_consume(
             settings=settings,
             clock=clock,
             claude_executable=claude_executable,
-            in_flight_threads=in_flight_threads,
+            in_flight_slots=in_flight_slots,
+            claude_config_dir=picked.config_dir,
+            linux_user=picked.linux_user,
+            account=picked.name,
         )
         dispatched += 1
 
@@ -279,7 +300,10 @@ def _spawn_dispatch_thread(
     settings: Settings,
     clock: Clock,
     claude_executable: str,
-    in_flight_threads: dict[str, threading.Thread],
+    in_flight_slots: dict[str, DispatchSlot],
+    claude_config_dir: str,
+    linux_user: str | None,
+    account: str,
 ) -> None:
     """Spawn the same shape of dispatch thread the orchestrator does."""
     # Local import to avoid a circular dependency at module-load time:
@@ -290,16 +314,31 @@ def _spawn_dispatch_thread(
 
     thread = threading.Thread(
         target=_dispatch_one_safely,
-        args=(task, queue_dir, settings, clock, claude_executable),
+        args=(
+            task,
+            queue_dir,
+            settings,
+            clock,
+            claude_executable,
+            claude_config_dir,
+            linux_user,
+            account,
+        ),
         name=f"force-dispatch-{task.id}",
         daemon=False,
     )
     thread.start()
-    in_flight_threads[task.id] = thread
+    in_flight_slots[task.id] = DispatchSlot(
+        task_id=task.id,
+        account=account,
+        started_at=clock.now(),
+        thread=thread,
+    )
     logger.info(
-        "force-dispatched task %s in thread (in_flight=%d)",
+        "force-dispatched task %s via account=%s (in_flight=%d)",
         task.id,
-        len(in_flight_threads),
+        account,
+        len(in_flight_slots),
     )
 
 
@@ -332,6 +371,13 @@ def dispatch_synchronously(
     if state.status not in _FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
 
+    accounts = resolve_accounts(settings)
+    accounts_by_name = {a.name: a for a in accounts}
+    if task.account and task.account in accounts_by_name:
+        picked = accounts_by_name[task.account]
+    else:
+        picked = next(iter(accounts_by_name.values()))
+
     plan = plan_next_spawn(task, state, settings=settings.session)
     outcome = dispatcher_mod.dispatch(
         task=task,
@@ -344,6 +390,8 @@ def dispatch_synchronously(
         settings_hooks=settings.hooks,
         settings_failure_classifier=settings.failure_classifier,
         claude_executable=claude_executable,
-        claude_config_dir=settings.claude.config_dir,
+        claude_config_dir=picked.config_dir,
+        linux_user=picked.linux_user,
+        account=picked.name,
     )
     return outcome.new_state

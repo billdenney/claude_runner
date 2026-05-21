@@ -27,6 +27,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
     _completed_task_ids,
     _dispatch_one_safely,
@@ -36,6 +37,39 @@ from claude_task_runner.runner.orchestrator import (
     tick_dispatch,
 )
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+
+
+def _slot(task_id: str, thread: threading.Thread, account: str = "default") -> DispatchSlot:
+    return DispatchSlot(
+        task_id=task_id,
+        account=account,
+        started_at=datetime(2026, 5, 21, tzinfo=UTC),
+        thread=thread,
+    )
+
+
+def _resolved(cap: int = 1, name: str = "default") -> list:
+    """Build a single-account ResolvedAccount list with a custom cap.
+
+    Use to override the per-account default ``max_concurrency=1`` in
+    tick_dispatch tests that want to dispatch more than one task per
+    tick under the synthesised "default" account.
+    """
+    from claude_task_runner.config.schema import (
+        AccountConcurrencyPolicy,
+        AccountPolicy,
+        ResolvedAccount,
+    )
+
+    return [
+        ResolvedAccount(
+            name=name,
+            config_dir="",
+            policy=AccountPolicy(
+                concurrency=AccountConcurrencyPolicy(max_concurrency=cap),
+            ),
+        ),
+    ]
 
 
 @pytest.fixture
@@ -63,10 +97,12 @@ def _seed_state(qd: Path, task_id: str, status: str, **kw: Any) -> TaskState:
 
 def _make_settings(*, initial: int = 1, max_c: int = 5):
     """Minimal Settings-shaped object that satisfies what the orchestrator
-    reads (only `.concurrency.max_concurrency` / `.initial_concurrency`).
-    Using a simple namespace is sufficient since the orchestrator never
-    pydantic-validates the object."""
+    reads (concurrency, accounts via resolve_accounts, plus dispatch-time
+    stubs). Using a simple namespace is sufficient since the orchestrator
+    never pydantic-validates the object."""
     from types import SimpleNamespace
+
+    from claude_task_runner.config.schema import AccountSettings
 
     return SimpleNamespace(
         concurrency=SimpleNamespace(
@@ -80,14 +116,27 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
         failure_classifier=None,
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
         claude=SimpleNamespace(config_dir=""),
+        accounts=[AccountSettings(name="default", config_dir="")],
     )
 
 
 def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
+    """Snapshot seeded with one DISPATCHING-eligible "default" account so
+    choose_account picks it. The orchestrator's tick_dispatch consults
+    snapshot.accounts; without the entry no candidate would be eligible.
+    """
+    from claude_task_runner.supervisor.states import AccountState
+
     return SupervisorSnapshot.model_validate(
         {
             "state": state,
             "since": datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
+            "accounts": {
+                "default": AccountState(
+                    state=SupervisorState.DISPATCHING,
+                    since=datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
+                ),
+            },
         }
     )
 
@@ -197,7 +246,7 @@ def test_target_concurrency_clamps_zero_or_negative_to_one(queue_dir: Path) -> N
 
 
 def test_reap_finished_empty_dict() -> None:
-    d: dict[str, threading.Thread] = {}
+    d: dict[str, DispatchSlot] = {}
     _reap_finished(d)
     assert d == {}
 
@@ -224,7 +273,7 @@ def test_reap_finished_removes_dead_threads_only() -> None:
     assert not quick.is_alive()
     assert keep.is_alive()
 
-    d = {"quick": quick, "keep": keep}
+    d = {"quick": _slot("quick", quick), "keep": _slot("keep", keep)}
     _reap_finished(d)
     assert "quick" not in d
     assert "keep" in d
@@ -242,14 +291,14 @@ def test_reap_finished_removes_dead_threads_only() -> None:
 def test_tick_dispatch_no_op_in_idle_state(queue_dir: Path) -> None:
     settings = _make_settings()
     snap = _make_snapshot(SupervisorState.IDLE)
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     # No tasks; even if there were, IDLE state means no dispatch.
     tick_dispatch(
         queue_dir=queue_dir,
         settings=settings,
         clock=RealClock(),
         snapshot=snap,
-        in_flight_threads=in_flight,
+        in_flight_slots=in_flight,
     )
     assert in_flight == {}
 
@@ -258,14 +307,14 @@ def test_tick_dispatch_no_op_in_throttled_state(queue_dir: Path) -> None:
     settings = _make_settings()
     snap = _make_snapshot(SupervisorState.THROTTLED_5H)
     _make_task(queue_dir, "t1")
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as mock_dispatch:
         tick_dispatch(
             queue_dir=queue_dir,
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
     assert in_flight == {}
     mock_dispatch.assert_not_called()
@@ -278,7 +327,7 @@ def test_tick_dispatch_dispatches_in_dispatching_state(queue_dir: Path) -> None:
     _make_task(queue_dir, "t1")
     _make_task(queue_dir, "t2")
     _make_task(queue_dir, "t3")  # third — beyond target=2; not picked
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
 
     # Make dispatcher.dispatch return immediately so threads exit fast.
     with patch(
@@ -290,13 +339,14 @@ def test_tick_dispatch_dispatches_in_dispatching_state(queue_dir: Path) -> None:
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
+            accounts=_resolved(cap=2),
         )
         # Threads were spawned; t1 and t2 were picked (alphabetical sort).
         assert set(in_flight.keys()) == {"t1", "t2"}
         # Wait for them to finish so we can clean up.
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
 
 
 def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
@@ -309,7 +359,7 @@ def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
     stop_evt = threading.Event()
     busy_thread = threading.Thread(target=lambda: stop_evt.wait(timeout=5), daemon=True)
     busy_thread.start()
-    in_flight = {"already-running": busy_thread}
+    in_flight = {"already-running": _slot("already-running", busy_thread)}
 
     with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as mock_dispatch:
         tick_dispatch(
@@ -317,7 +367,7 @@ def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
     mock_dispatch.assert_not_called()
     assert set(in_flight.keys()) == {"already-running"}
@@ -338,7 +388,7 @@ def test_tick_dispatch_reaps_before_evaluating_capacity(queue_dir: Path) -> None
     finished_thread.start()
     finished_thread.join()  # explicitly wait for it to die
     assert not finished_thread.is_alive()
-    in_flight = {"already-finished": finished_thread}
+    in_flight = {"already-finished": _slot("already-finished", finished_thread)}
 
     with patch(
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -349,27 +399,27 @@ def test_tick_dispatch_reaps_before_evaluating_capacity(queue_dir: Path) -> None
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
         # already-finished was reaped; t1 was dispatched.
         assert "already-finished" not in in_flight
         assert "t1" in in_flight
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
 
 
 def test_tick_dispatch_no_eligible_candidates(queue_dir: Path) -> None:
     """No pending tasks → no dispatches."""
     settings = _make_settings()
     snap = _make_snapshot(SupervisorState.DISPATCHING)
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as mock_dispatch:
         tick_dispatch(
             queue_dir=queue_dir,
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
     mock_dispatch.assert_not_called()
     assert in_flight == {}
@@ -381,7 +431,7 @@ def test_tick_dispatch_priority_sort(queue_dir: Path) -> None:
     snap = _make_snapshot(SupervisorState.DISPATCHING)
     _make_task(queue_dir, "low-id-but-low-priority", priority="low")
     _make_task(queue_dir, "z-high-id-but-high-priority", priority="high")
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
 
     with patch(
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -392,13 +442,13 @@ def test_tick_dispatch_priority_sort(queue_dir: Path) -> None:
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
         # High priority wins despite alphabetically-later id.
         assert "z-high-id-but-high-priority" in in_flight
         assert "low-id-but-low-priority" not in in_flight
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
 
 
 def test_tick_dispatch_one_high_two_normal_high_goes_first(queue_dir: Path) -> None:
@@ -415,7 +465,7 @@ def test_tick_dispatch_one_high_two_normal_high_goes_first(queue_dir: Path) -> N
     _make_task(queue_dir, "001-normal-alpha", priority="normal")
     _make_task(queue_dir, "002-normal-beta", priority="normal")
     _make_task(queue_dir, "999-high-zulu", priority="high")
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
 
     with patch(
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -426,13 +476,13 @@ def test_tick_dispatch_one_high_two_normal_high_goes_first(queue_dir: Path) -> N
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
         assert "999-high-zulu" in in_flight
         assert "001-normal-alpha" not in in_flight
         assert "002-normal-beta" not in in_flight
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
 
 
 def test_tick_dispatch_priority_then_id_within_band(queue_dir: Path) -> None:
@@ -445,7 +495,7 @@ def test_tick_dispatch_priority_then_id_within_band(queue_dir: Path) -> None:
     _make_task(queue_dir, "high-zzz", priority="high")
     _make_task(queue_dir, "high-aaa", priority="high")
     _make_task(queue_dir, "normal-mmm", priority="normal")
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
 
     dispatch_order: list[str] = []
     real_thread_start = threading.Thread.start
@@ -468,10 +518,11 @@ def test_tick_dispatch_priority_then_id_within_band(queue_dir: Path) -> None:
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
+            accounts=_resolved(cap=3),
         )
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
 
     assert dispatch_order == ["high-aaa", "high-zzz", "normal-mmm"]
 
@@ -495,7 +546,7 @@ def test_dispatch_one_safely_loads_existing_state(queue_dir: Path) -> None:
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
         side_effect=fake_dispatch,
     ):
-        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude")
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
 
     # Prior state was loaded and forwarded (attempts=2).
     assert captured["state"].attempts == 2
@@ -513,7 +564,7 @@ def test_dispatch_one_safely_starts_fresh_when_no_state(queue_dir: Path) -> None
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
         side_effect=fake_dispatch,
     ):
-        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude")
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
 
     # Fresh state: attempts=0.
     assert captured["state"].attempts == 0
@@ -536,7 +587,7 @@ def test_dispatch_one_safely_handles_unparseable_state(queue_dir: Path) -> None:
         "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
         side_effect=fake_dispatch,
     ):
-        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude")
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
 
     # Unparseable state ⇒ fresh fallback.
     assert captured["state"].attempts == 0
@@ -552,4 +603,4 @@ def test_dispatch_one_safely_logs_exceptions(queue_dir: Path) -> None:
         side_effect=RuntimeError("boom"),
     ):
         # Must not raise.
-        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude")
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
