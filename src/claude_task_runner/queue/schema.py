@@ -147,6 +147,17 @@ class Task(_StrictBase):
     about but do not fail dispatch. Empty list (the default) means
     "no extra dirs beyond the always-on queue dir." Backward compatible
     with v2 task YAMLs that pre-date this field."""
+    account: str | None = Field(default=None, min_length=1)
+    """Pin this task to a specific account name from ``[[accounts]]``.
+
+    When unset (the default), the supervisor's dispatch policy picks
+    the lowest-priority available account at dispatch time. Set to an
+    account ``name`` when the task must bill to a specific identity
+    (e.g. work paper → ``"work"`` account). The dispatcher fails the
+    attempt if the named account is unknown; if it exists but has no
+    capacity *and* no other slot is free, the policy logs the conflict
+    and defers. Backward compatible with v2 task YAMLs that pre-date
+    this field."""
 
 
 class TaskState(_StrictBase):

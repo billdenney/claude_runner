@@ -7,13 +7,24 @@ etc.) so a component only depends on the section it reads.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _StrictModel(BaseModel):
     """Base for all settings sections — forbid unknown keys to catch typos."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+_ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
+"""Account names must be filesystem- and CLI-safe.
+
+Used as state-file keys, supervisor log fields, and `account list/pause`
+arguments — restricting to alnum / underscore / hyphen / dot keeps
+operator workflows obvious and shell-friendly.
+"""
 
 
 class UsageSettings(_StrictModel):
@@ -204,11 +215,13 @@ class FixturesSettings(_StrictModel):
 class ClaudeSettings(_StrictModel):
     """How to invoke the ``claude`` CLI.
 
-    Most importantly, ``config_dir`` lets a single host operate against
-    multiple Claude accounts (e.g. work + personal): each account has its
-    own ``CLAUDE_CONFIG_DIR`` populated by ``claude /login`` once, and
-    each per-queue ``claude_runner.toml`` points at the appropriate dir.
-    Empty string means "use claude's default" (``~/.claude``).
+    ``config_dir`` is a *legacy* single-account alias. New configurations
+    should declare one or more ``[[accounts]]`` blocks at the top level
+    instead. When ``[[accounts]]`` is absent, the loader synthesises a
+    single account named ``"default"`` from this field for backwards
+    compatibility. When both are present, ``[[accounts]]`` wins and this
+    field is ignored. Empty string means "use claude's default"
+    (``~/.claude``).
 
     ``plan`` selects an entry from the top-level ``[plans.*]`` table so
     the loader can auto-tune ``[throttle.*]`` budgets and bands against
@@ -219,6 +232,141 @@ class ClaudeSettings(_StrictModel):
     executable: str = "claude"
     config_dir: str = ""
     plan: str = ""
+
+
+class AccountSettings(_StrictModel):
+    """Queue-side declaration of one Claude account to dispatch through.
+
+    Multi-account dispatch lets a single supervisor drain the same
+    ``todo/`` queue against multiple Claude billing identities in
+    parallel — when one account hits the weekly cap, the others keep
+    pulling. Each account has its own ``CLAUDE_CONFIG_DIR`` populated
+    by ``claude /login`` once.
+
+    The queue-side block lists *which* accounts to dispatch through;
+    per-account dispatch policy (concurrency cap, throttle bands,
+    time-of-day cutover) lives inside each account's own config dir
+    at ``<config_dir>/runner-account.toml``. The loader reads that
+    file separately and composes a :class:`ResolvedAccount`. This
+    keeps each account owner in control of their own limits — useful
+    when accounts are billed to different people / entities.
+
+    All accounts are equal priority. The dispatcher picks the least-
+    utilized account (by 5h utilization, tie-broken by weekly util
+    then name) when multiple have free capacity. There is intentionally
+    no queue-wide concurrency ceiling — operators choose per-account
+    caps such that their sum is acceptable.
+
+    ``linux_user`` (when set) opts the account into multi-user spawning:
+    the supervisor invokes ``claude`` for this account via
+    ``sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=... ...``. Useful
+    when a second account is billed to a different person / entity and
+    must run under a separate Linux uid for audit clarity. See the
+    multi-Linux-user ADR for the operator setup (passwordless sudo).
+    """
+
+    name: str
+    """Operator-visible account label; appears in supervisor logs, the
+    state YAML's RunRecord.account field, and the ``account`` CLI. Must
+    be filesystem- and shell-safe (alnum / underscore / hyphen / dot,
+    not starting with hyphen or dot, max 64 chars)."""
+
+    config_dir: str
+    """``CLAUDE_CONFIG_DIR`` for this account. Empty string targets
+    claude's default ``~/.claude``. The loader also reads per-account
+    dispatch policy from ``<config_dir>/runner-account.toml``."""
+
+    linux_user: str | None = None
+    """Optional Linux uid name to spawn claude as. When set, the
+    supervisor uses ``sudo -n -u <linux_user>`` to invoke claude for
+    this account. ``None`` (the default) spawns as the supervisor's
+    own user."""
+
+    @model_validator(mode="after")
+    def _validate_name(self) -> AccountSettings:
+        if not _ACCOUNT_NAME_RE.match(self.name):
+            raise ValueError(
+                f"account name {self.name!r} must match {_ACCOUNT_NAME_RE.pattern!r} "
+                "(alnum / underscore / hyphen / dot, max 64 chars, must not start "
+                "with hyphen or dot)"
+            )
+        if self.linux_user is not None and not self.linux_user.strip():
+            raise ValueError("linux_user must be a non-empty Linux username when set")
+        return self
+
+
+class AccountConcurrencyPolicy(_StrictModel):
+    """Per-account concurrency cap from ``<config_dir>/runner-account.toml``.
+
+    Default is intentionally low (1): the supervisor doesn't trust an
+    untested account to handle parallel sessions until the operator
+    has observed it under load and raised the cap.
+    """
+
+    max_concurrency: int = Field(default=1, ge=1)
+
+
+class AccountThrottleFiveHour(_StrictModel):
+    """Per-account 5-hour throttle bands with daytime/nighttime split.
+
+    Defaults match the multi-account ADR's documented values; the
+    operator overrides them in ``<config_dir>/runner-account.toml``
+    once they have empirical data for the account.
+    """
+
+    daytime_band_full_dispatch_max_pct: int = Field(default=40, ge=0, le=100)
+    daytime_band_slowdown_max_pct: int = Field(default=60, ge=0, le=100)
+    nighttime_band_full_dispatch_max_pct: int = Field(default=70, ge=0, le=100)
+    nighttime_band_slowdown_max_pct: int = Field(default=90, ge=0, le=100)
+
+
+class AccountTimeOfDay(_StrictModel):
+    """Per-account day/night cutover for the 5h throttle bands.
+
+    Single ``day_end`` (default 21:00) follows the operator's pattern
+    in their existing per-account file; the global
+    :class:`TimeOfDaySettings` retains the richer ``day_start`` /
+    ``ramp_minutes`` for the queue-wide throttle.
+    """
+
+    day_end: str = "21:00"
+
+
+class AccountThrottlePolicy(_StrictModel):
+    five_hour: AccountThrottleFiveHour = Field(default_factory=AccountThrottleFiveHour)
+    time_of_day: AccountTimeOfDay = Field(default_factory=AccountTimeOfDay)
+
+
+class AccountPolicy(_StrictModel):
+    """Per-account dispatch policy loaded from ``<config_dir>/runner-account.toml``.
+
+    Each account owner controls their own ``max_concurrency`` and
+    throttle bands by writing this file inside their Claude config
+    dir. The queue-side ``[[accounts]]`` block only references the
+    config_dir; the loader reads the policy here separately.
+
+    Missing file → all defaults. Present-and-partial → unspecified
+    fields fall back to defaults.
+    """
+
+    concurrency: AccountConcurrencyPolicy = Field(default_factory=AccountConcurrencyPolicy)
+    throttle: AccountThrottlePolicy = Field(default_factory=AccountThrottlePolicy)
+
+
+class ResolvedAccount(_StrictModel):
+    """Composed view of an account: queue-side declaration + per-account policy.
+
+    Built by :func:`config.loader.resolve_accounts` after the queue's
+    ``[[accounts]]`` blocks validate. Downstream code (dispatcher,
+    doctor, ``account list`` CLI) consumes this rather than
+    :class:`AccountSettings` directly, so the per-account
+    ``runner-account.toml`` is honoured uniformly.
+    """
+
+    name: str
+    config_dir: str
+    linux_user: str | None = None
+    policy: AccountPolicy = Field(default_factory=AccountPolicy)
 
 
 class DispatchSettings(_StrictModel):
@@ -279,3 +427,58 @@ class Settings(_StrictModel):
     fixtures: FixturesSettings
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     plans: dict[str, PlanSettings] = Field(default_factory=dict)
+    accounts: list[AccountSettings] = Field(default_factory=list)
+    """One or more Claude accounts the supervisor may dispatch through.
+
+    When unset / empty, the loader synthesises a single account named
+    ``"default"`` from the legacy ``[claude].config_dir`` field so
+    pre-multi-account TOMLs keep parsing unchanged. Operators with two
+    or more billing identities declare an explicit ``[[accounts]]``
+    block per account; see :class:`AccountSettings`.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _synthesize_legacy_account(cls, data: object) -> object:
+        """Backfill ``accounts`` from ``[claude].config_dir`` when omitted.
+
+        Runs *before* field validation so the synthesised list is
+        present when the post-validator counts names. A bare
+        ``[claude] config_dir = "..."`` TOML keeps working: the loader
+        sees ``accounts = []`` from the package defaults and produces
+        one ``AccountSettings(name="default", config_dir=<legacy>)``.
+
+        When the operator declares an explicit ``[[accounts]]`` list the
+        legacy field is ignored entirely; the doctor emits a WARN if
+        both are populated so the deprecation is visible.
+        """
+        if not isinstance(data, dict):
+            return data
+        existing = data.get("accounts")
+        if existing:
+            return data
+        claude_cfg = data.get("claude") or {}
+        legacy_config_dir = ""
+        if isinstance(claude_cfg, dict):
+            legacy_config_dir = str(claude_cfg.get("config_dir", "") or "")
+        new = dict(data)
+        new["accounts"] = [
+            {
+                "name": "default",
+                "config_dir": legacy_config_dir,
+            }
+        ]
+        return new
+
+    @model_validator(mode="after")
+    def _validate_account_names_unique(self) -> Settings:
+        names = [acct.name for acct in self.accounts]
+        if not names:
+            raise ValueError(
+                "at least one [[accounts]] block required (or a legacy "
+                "[claude].config_dir for single-account back-compat)"
+            )
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate account names: {dupes}")
+        return self

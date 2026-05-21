@@ -11,13 +11,20 @@ from running.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from claude_task_runner.config.loader import (
+    ConfigError,
+    load_account_policy,
+    per_account_toml_path,
+)
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.queue.store import (
@@ -81,36 +88,413 @@ def check_claude_binary(settings: Settings) -> CheckResult:
     )
 
 
-def check_claude_config_dir(settings: Settings) -> CheckResult:
-    """If ``[claude].config_dir`` is set, it must exist."""
-    if not settings.claude.config_dir:
+def check_accounts(settings: Settings) -> CheckResult:
+    """Every configured account's ``config_dir`` exists and is authenticated.
+
+    Iterates ``settings.accounts`` (which the loader always populates —
+    legacy ``[claude].config_dir`` is folded into a single
+    ``"default"`` entry). FAILs on any missing directory; WARNs on a
+    directory without ``.credentials.json``; PASSes when all accounts
+    are wired up.
+    """
+    if not settings.accounts:
+        # The model validator forbids this; defensive guard for type
+        # checkers and any future loader change.
         return CheckResult(
-            name="claude_config_dir",
-            status=CheckStatus.PASS,
-            detail="using default ~/.claude",
-        )
-    path = Path(settings.claude.config_dir).expanduser()
-    if not path.exists():
-        return CheckResult(
-            name="claude_config_dir",
+            name="accounts",
             status=CheckStatus.FAIL,
-            detail=f"configured CLAUDE_CONFIG_DIR does not exist: {path}",
-            remediation=(
-                f"Create the directory and run `CLAUDE_CONFIG_DIR={path} claude /login` once."
-            ),
+            detail="no [[accounts]] configured",
+            remediation="Add at least one [[accounts]] block to claude_runner.toml.",
         )
-    creds = path / ".credentials.json"
-    if not creds.exists():
+
+    fails: list[str] = []
+    warns: list[str] = []
+    oks: list[str] = []
+    for acct in settings.accounts:
+        if not acct.config_dir:
+            oks.append(f"{acct.name} (default ~/.claude)")
+            continue
+        path = Path(acct.config_dir).expanduser()
+        if not path.exists():
+            fails.append(
+                f"{acct.name}: CLAUDE_CONFIG_DIR does not exist: {path}\n"
+                f"      Fix: mkdir -p {path} && "
+                f"CLAUDE_CONFIG_DIR={path} claude /login"
+            )
+            continue
+        creds = path / ".credentials.json"
+        if not creds.exists():
+            warns.append(
+                f"{acct.name}: {path} exists but has no .credentials.json\n"
+                f"      Fix: CLAUDE_CONFIG_DIR={path} claude /login"
+            )
+            continue
+        oks.append(f"{acct.name} -> {path}")
+
+    if fails:
         return CheckResult(
-            name="claude_config_dir",
+            name="accounts",
+            status=CheckStatus.FAIL,
+            detail=f"{len(fails)} of {len(settings.accounts)} accounts have missing dirs",
+            remediation="\n".join(fails + warns),
+        )
+    if warns:
+        return CheckResult(
+            name="accounts",
             status=CheckStatus.WARN,
-            detail=f"{path} exists but has no .credentials.json",
-            remediation=(f"Run `CLAUDE_CONFIG_DIR={path} claude /login` to authenticate."),
+            detail=f"{len(warns)} of {len(settings.accounts)} accounts not authenticated",
+            remediation="\n".join(warns),
         )
     return CheckResult(
-        name="claude_config_dir",
+        name="accounts",
         status=CheckStatus.PASS,
-        detail=f"{path}",
+        detail=f"{len(oks)} accounts: " + ", ".join(oks),
+    )
+
+
+def check_legacy_claude_config_dir(settings: Settings) -> CheckResult:
+    """WARN when ``[claude].config_dir`` is set alongside explicit ``[[accounts]]``.
+
+    The legacy field is ignored when ``[[accounts]]`` is declared
+    explicitly. Surfacing the conflict here lets operators clean up
+    their TOMLs rather than wondering why the legacy value has no
+    effect.
+    """
+    legacy = settings.claude.config_dir
+    explicit_accounts = [a for a in settings.accounts if not _looks_like_legacy_default(a, legacy)]
+    if not legacy:
+        return CheckResult(
+            name="legacy_claude_config_dir",
+            status=CheckStatus.PASS,
+            detail="no legacy [claude].config_dir set",
+        )
+    if not explicit_accounts:
+        # Single-account back-compat: the legacy field WAS the source
+        # of the synthesised account. That's the supported path; not a
+        # warning.
+        return CheckResult(
+            name="legacy_claude_config_dir",
+            status=CheckStatus.PASS,
+            detail=f"[claude].config_dir={legacy!r} -> synthesised account 'default'",
+        )
+    return CheckResult(
+        name="legacy_claude_config_dir",
+        status=CheckStatus.WARN,
+        detail=(
+            f"[claude].config_dir={legacy!r} is ignored because explicit [[accounts]] are declared"
+        ),
+        remediation=(
+            "Remove [claude].config_dir from claude_runner.toml — the "
+            "explicit [[accounts]] list supersedes it."
+        ),
+    )
+
+
+def _looks_like_legacy_default(acct: object, legacy_config_dir: str) -> bool:
+    """Heuristic: is this account the loader's synthesised default?
+
+    Returns True for an account with name=='default' and the same
+    config_dir as the legacy field. Lets ``check_legacy_claude_config_dir``
+    distinguish "legacy was folded in" from "operator wrote both".
+    """
+    name = getattr(acct, "name", None)
+    config_dir = getattr(acct, "config_dir", None)
+    return name == "default" and config_dir == legacy_config_dir
+
+
+def _current_username() -> str:
+    """Return the supervisor's own Linux username; empty if unknown."""
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return ""
+
+
+def check_account_policies(settings: Settings) -> CheckResult:
+    """Each account's ``<config_dir>/runner-account.toml`` parses; report resolved policy.
+
+    Walks ``settings.accounts``; for each one tries to load the per-
+    account policy. A missing file is informational (defaults apply);
+    a present-but-unparseable file is FAIL. The detail string is a
+    one-line-per-account summary of resolved ``max_concurrency`` and
+    band thresholds so the operator can verify what the supervisor
+    will use.
+    """
+    if not settings.accounts:
+        return CheckResult(
+            name="account_policies",
+            status=CheckStatus.PASS,
+            detail="no [[accounts]] configured (defaults apply)",
+        )
+
+    fails: list[str] = []
+    rows: list[str] = []
+    for acct in settings.accounts:
+        path = per_account_toml_path(acct.config_dir)
+        try:
+            policy = load_account_policy(acct.config_dir)
+        except ConfigError as exc:
+            fails.append(f"{acct.name}: {exc}")
+            continue
+        source = "defaults" if path is None or not path.exists() else str(path)
+        rows.append(
+            f"{acct.name}: max_concurrency={policy.concurrency.max_concurrency}, "
+            f"daytime={policy.throttle.five_hour.daytime_band_full_dispatch_max_pct}/"
+            f"{policy.throttle.five_hour.daytime_band_slowdown_max_pct}, "
+            f"nighttime={policy.throttle.five_hour.nighttime_band_full_dispatch_max_pct}/"
+            f"{policy.throttle.five_hour.nighttime_band_slowdown_max_pct}, "
+            f"day_end={policy.throttle.time_of_day.day_end} "
+            f"({source})"
+        )
+
+    if fails:
+        return CheckResult(
+            name="account_policies",
+            status=CheckStatus.FAIL,
+            detail=f"{len(fails)} of {len(settings.accounts)} per-account policies invalid",
+            remediation="\n".join(fails),
+        )
+    return CheckResult(
+        name="account_policies",
+        status=CheckStatus.PASS,
+        detail=" | ".join(rows),
+    )
+
+
+def check_account_sudo(settings: Settings) -> CheckResult:
+    """Each account with ``linux_user`` set has passwordless sudo wired up.
+
+    Runs ``sudo -n -u <linux_user> /bin/true`` for every account whose
+    ``linux_user`` differs from the supervisor's own user. ``-n`` makes
+    the sudo call non-interactive: if a password would be prompted,
+    sudo exits non-zero immediately rather than hanging.
+
+    PASSes silently (with the count) when no account uses
+    ``linux_user``. FAILs on the first sudo failure, listing every
+    account that needs fixing.
+    """
+    targets = [a for a in settings.accounts if a.linux_user]
+    if not targets:
+        return CheckResult(
+            name="account_sudo",
+            status=CheckStatus.PASS,
+            detail="no accounts use linux_user (single-user supervisor)",
+        )
+
+    self_user = _current_username()
+    sudo_path = shutil.which("sudo")
+    if sudo_path is None:
+        return CheckResult(
+            name="account_sudo",
+            status=CheckStatus.FAIL,
+            detail="sudo binary not on PATH but accounts request linux_user",
+            remediation="Install sudo or remove linux_user from [[accounts]].",
+        )
+
+    failures: list[str] = []
+    same_user: list[str] = []
+    ok: list[str] = []
+    for acct in targets:
+        target = acct.linux_user or ""
+        if target == self_user:
+            same_user.append(f"{acct.name} (linux_user={target!r} == supervisor user)")
+            continue
+        try:
+            completed = subprocess.run(
+                [sudo_path, "-n", "-u", target, "/bin/true"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"{acct.name}: sudo invocation raised {type(exc).__name__}: {exc}")
+            continue
+        if completed.returncode == 0:
+            ok.append(f"{acct.name} -> {target}")
+        else:
+            stderr_tail = (completed.stderr or "").strip().splitlines()[-1:] or [""]
+            failures.append(
+                f"{acct.name}: sudo -n -u {target} failed (rc={completed.returncode}): "
+                f"{stderr_tail[0]}"
+            )
+
+    if failures:
+        suid = self_user or "<unknown>"
+        remediation = (
+            "Configure passwordless sudo for the supervisor user "
+            f"({suid}) to each target user. Recommended snippet in "
+            "/etc/sudoers.d/claude-task-runner:\n"
+            + "\n".join(
+                f"  {suid} ALL=({t}) NOPASSWD: ALL"
+                for t in sorted({a.linux_user for a in targets if a.linux_user})
+            )
+            + "\n\nFailures:\n  "
+            + "\n  ".join(failures)
+        )
+        return CheckResult(
+            name="account_sudo",
+            status=CheckStatus.FAIL,
+            detail=f"sudo unreachable for {len(failures)} of {len(targets)} multi-user accounts",
+            remediation=remediation,
+        )
+    detail_parts = []
+    if ok:
+        detail_parts.append(f"{len(ok)} verified: " + ", ".join(ok))
+    if same_user:
+        detail_parts.append(
+            f"{len(same_user)} no-op (same as supervisor user): " + ", ".join(same_user)
+        )
+    return CheckResult(
+        name="account_sudo",
+        status=CheckStatus.PASS,
+        detail="; ".join(detail_parts) or "all targets resolved",
+    )
+
+
+def check_queue_perms_for_linux_users(settings: Settings, queue_dir: Path) -> CheckResult:
+    """Queue dir is reachable by every configured ``linux_user``.
+
+    When at least one account has ``linux_user`` set, the queue
+    directory and key subdirectories (``todo/``,
+    ``.claude_task_runner/state/``, ``.claude_task_runner/sidecar/``)
+    must be readable+writable by every target uid. We check by
+    verifying the queue dir's group is one each linux_user belongs to,
+    and that the dir is group-writable. The setgid bit is checked so
+    new files inherit the group.
+
+    Returns PASS (skipped) when no account uses ``linux_user``. The
+    check is informational rather than authoritative — final perms
+    enforcement lives at the kernel level when files are written. The
+    suggested fix command always names absolute paths so the operator
+    can copy/paste.
+    """
+    targets = sorted({a.linux_user for a in settings.accounts if a.linux_user})
+    if not targets:
+        return CheckResult(
+            name="queue_perms_multi_user",
+            status=CheckStatus.PASS,
+            detail="no accounts use linux_user (perms check skipped)",
+        )
+
+    if not queue_dir.exists():
+        return CheckResult(
+            name="queue_perms_multi_user",
+            status=CheckStatus.FAIL,
+            detail=f"queue dir not found: {queue_dir}",
+            remediation=f"mkdir -p {queue_dir}/todo",
+        )
+
+    issues: list[str] = []
+    fix_lines: list[str] = []
+
+    try:
+        import grp
+        import pwd
+    except ImportError:  # pragma: no cover — non-POSIX platforms
+        return CheckResult(
+            name="queue_perms_multi_user",
+            status=CheckStatus.WARN,
+            detail="grp/pwd modules unavailable; cannot verify multi-user perms",
+        )
+
+    # Each linux_user's group memberships (gid set).
+    user_gids: dict[str, set[int]] = {}
+    for user in targets:
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            issues.append(f"linux_user {user!r} does not exist on this host")
+            continue
+        gids = {pw.pw_gid}
+        # Supplementary groups.
+        for g in grp.getgrall():
+            if user in g.gr_mem:
+                gids.add(g.gr_gid)
+        user_gids[user] = gids
+
+    # For each key path, verify the group is in every configured user's
+    # gid set AND the group-write bit is on.
+    paths_to_check: list[Path] = [
+        queue_dir,
+        queue_dir / "todo",
+        queue_dir / ".claude_task_runner",
+        queue_dir / ".claude_task_runner" / "state",
+        queue_dir / ".claude_task_runner" / "sidecar",
+    ]
+    target_group = None
+    for path in paths_to_check:
+        if not path.exists():
+            # The runner auto-creates state/ and sidecar/ at startup,
+            # so a missing path here is a fresh queue; defer to
+            # check_queue_layout's WARN rather than double-counting.
+            continue
+        st = path.stat()
+        if target_group is None:
+            target_group = st.st_gid
+        mode = st.st_mode
+        if not (mode & 0o060):
+            issues.append(
+                f"{path}: not group-writable (mode={oct(mode & 0o777)}). "
+                "Newly-created files will not inherit write access for other "
+                "accounts running under linux_user."
+            )
+        # Reject paths whose group differs from the queue root's group.
+        if st.st_gid != target_group:
+            try:
+                gname = grp.getgrgid(st.st_gid).gr_name
+            except KeyError:
+                gname = str(st.st_gid)
+            issues.append(
+                f"{path}: group {gname!r} differs from queue root group; "
+                "linux_user accounts may lose access on file creation."
+            )
+        if path.is_dir() and not (mode & 0o2000):
+            issues.append(
+                f"{path}: missing setgid bit; new files will not inherit the queue group."
+            )
+
+    if target_group is not None:
+        try:
+            queue_group_name = grp.getgrgid(target_group).gr_name
+        except KeyError:
+            queue_group_name = str(target_group)
+        for user, gids in user_gids.items():
+            if target_group not in gids:
+                issues.append(
+                    f"linux_user {user!r} is not a member of the queue's group {queue_group_name!r}."
+                )
+
+    if issues:
+        if target_group is not None:
+            try:
+                queue_group_name = grp.getgrgid(target_group).gr_name
+            except KeyError:
+                queue_group_name = str(target_group)
+        else:
+            queue_group_name = "<shared-group>"
+        fix_lines = [
+            f"sudo groupadd -f {queue_group_name}",
+            *[f"sudo usermod -aG {queue_group_name} {u}" for u in targets],
+            f"sudo chgrp -R {queue_group_name} {queue_dir}",
+            f"sudo chmod -R g+rwX {queue_dir}",
+            f"sudo find {queue_dir} -type d -exec chmod g+s {{}} +",
+        ]
+        return CheckResult(
+            name="queue_perms_multi_user",
+            status=CheckStatus.FAIL,
+            detail=f"{len(issues)} perms issues for multi-user dispatch",
+            remediation="Issues:\n  "
+            + "\n  ".join(issues)
+            + "\n\nSuggested fix:\n  "
+            + "\n  ".join(fix_lines),
+        )
+    return CheckResult(
+        name="queue_perms_multi_user",
+        status=CheckStatus.PASS,
+        detail=f"queue dir group + setgid OK for {len(targets)} multi-user accounts",
     )
 
 
@@ -455,7 +839,11 @@ def all_checks(
     """
     return [
         lambda: check_claude_binary(settings),
-        lambda: check_claude_config_dir(settings),
+        lambda: check_accounts(settings),
+        lambda: check_legacy_claude_config_dir(settings),
+        lambda: check_account_policies(settings),
+        lambda: check_account_sudo(settings),
+        lambda: check_queue_perms_for_linux_users(settings, queue_dir),
         lambda: check_global_lock(settings),
         lambda: check_queue_layout(settings, queue_dir),
         lambda: check_task_yamls(settings, queue_dir),
