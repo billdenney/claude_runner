@@ -5,6 +5,7 @@ from __future__ import annotations
 import typer
 
 from claude_task_runner.cli import (
+    account_cmd,
     doctor_cmd,
     install_cmd,
     install_skills_cmd,
@@ -25,6 +26,11 @@ app.add_typer(
     supervisor_cmd.app,
     name="supervisor",
     help="Start, stop, and inspect the supervisor.",
+)
+app.add_typer(
+    account_cmd.app,
+    name="account",
+    help="List configured accounts; pause/resume per-account dispatch.",
 )
 app.add_typer(queue_cmd.app, name="queue", help="List and add tasks to a queue.")
 app.add_typer(

@@ -6,6 +6,11 @@ complete file.
 
 Stored at ``<queue>/.claude_task_runner/supervisor.json`` per
 ``[supervisor].state_file``.
+
+Handles a one-way v2 → v3 migration at load time: the legacy single-
+account top-level fields are wrapped into ``accounts["default"]`` and
+un-attributed ``in_flight_task_ids`` become attributed ``InFlightRecord``
+entries.
 """
 
 from __future__ import annotations
@@ -15,12 +20,17 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 
-from claude_task_runner.queue.schema import CURRENT_SCHEMA_VERSION
 from claude_task_runner.queue.store import queue_runtime_dir
-from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+from claude_task_runner.supervisor.states import (
+    SUPERVISOR_SCHEMA_VERSION,
+    AccountState,
+    SupervisorSnapshot,
+    SupervisorState,
+)
 
 
 class SupervisorPersistenceError(ValueError):
@@ -32,12 +42,67 @@ def supervisor_state_path(queue_dir: Path, state_file: str = "supervisor.json") 
     return queue_runtime_dir(queue_dir) / state_file
 
 
+_LEGACY_FIELDS_FOR_ACCOUNT_STATE = (
+    "state",
+    "since",
+    "last_5h_util_pct",
+    "last_weekly_util_pct",
+    "last_5h_reset_at",
+    "last_weekly_reset_at",
+    "scheduled_wakeup_at",
+    "consecutive_clean_polls",
+    "last_drift_message",
+)
+
+
+def _migrate_v2_to_v3(
+    payload: dict[str, Any], default_account_name: str = "default"
+) -> dict[str, Any]:
+    """Upgrade a v2 supervisor.json payload to v3 semantics.
+
+    v2's top-level fields collapse into a single
+    ``accounts[<default_account_name>]`` entry; legacy task ids in
+    ``in_flight_task_ids`` are mapped to ``InFlightRecord`` objects
+    whose ``started_at`` defaults to the snapshot's ``since`` (no
+    per-task started_at was recorded in v2). One-way: callers must
+    persist the v3 payload before the next tick or the daemon will
+    keep re-migrating on every load.
+    """
+    migrated = dict(payload)
+    migrated["schema_version"] = SUPERVISOR_SCHEMA_VERSION
+
+    acct_payload: dict[str, Any] = {
+        key: migrated[key]
+        for key in _LEGACY_FIELDS_FOR_ACCOUNT_STATE
+        if key in migrated and migrated[key] is not None
+    }
+    if "state" not in acct_payload:
+        acct_payload["state"] = SupervisorState.IDLE.value
+    if "since" not in acct_payload:
+        acct_payload["since"] = datetime(2026, 1, 1).isoformat()
+    migrated["accounts"] = {default_account_name: acct_payload}
+
+    legacy_in_flight = migrated.get("in_flight_task_ids") or []
+    started_at = acct_payload["since"]
+    migrated["in_flight"] = [
+        {"task_id": tid, "account": default_account_name, "started_at": started_at}
+        for tid in legacy_in_flight
+    ]
+    return migrated
+
+
 def load(path: Path) -> SupervisorSnapshot | None:
     """Read a persisted snapshot, or ``None`` if the file doesn't exist.
 
     Raises :class:`SupervisorPersistenceError` if the file exists but
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
+
+    Performs a one-way v2 → v3 migration when an older file is
+    encountered: the single-account top-level fields are folded into
+    ``accounts["default"]``, and the un-attributed
+    ``in_flight_task_ids`` becomes attributed ``in_flight`` records
+    with ``account="default"``.
     """
     if not path.exists():
         return None
@@ -52,10 +117,13 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if not isinstance(payload, dict):
         raise SupervisorPersistenceError(f"{path}: top-level JSON must be an object")
 
-    sv = payload.get("schema_version", CURRENT_SCHEMA_VERSION)
-    if sv != CURRENT_SCHEMA_VERSION:
+    sv = payload.get("schema_version", SUPERVISOR_SCHEMA_VERSION)
+    if sv == 2:
+        payload = _migrate_v2_to_v3(payload)
+        sv = SUPERVISOR_SCHEMA_VERSION
+    if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
-            f"{path}: schema_version={sv} does not match supported {CURRENT_SCHEMA_VERSION}"
+            f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"
         )
 
     try:
@@ -84,13 +152,24 @@ def write_atomic(snapshot: SupervisorSnapshot, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def initial_snapshot(*, since: datetime) -> SupervisorSnapshot:
+def initial_snapshot(
+    *,
+    since: datetime,
+    account_names: list[str] | None = None,
+) -> SupervisorSnapshot:
     """Build a fresh snapshot for first-time supervisor start.
 
     Begins in ``IDLE`` so the next clean reading drives the first real
-    classification.
+    classification. ``account_names`` (when provided) seeds the
+    per-account state map with one entry per account; each account
+    starts in IDLE. ``None`` (the legacy default) produces a snapshot
+    with a single ``"default"`` entry, matching the v2 single-account
+    flow.
     """
+    names = account_names if account_names is not None else ["default"]
+    accounts = {name: AccountState(state=SupervisorState.IDLE, since=since) for name in names}
     return SupervisorSnapshot(
         state=SupervisorState.IDLE,
         since=since,
+        accounts=accounts,
     )

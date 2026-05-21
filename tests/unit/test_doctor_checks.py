@@ -17,16 +17,19 @@ from unittest.mock import patch
 import pytest
 
 from claude_task_runner.config.loader import load_settings
-from claude_task_runner.config.schema import Settings
+from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.doctor.checks import (
     CheckStatus,
     _extract_paths,
     all_checks,
+    check_account_sudo,
+    check_accounts,
     check_claude_binary,
-    check_claude_config_dir,
     check_ema,
     check_global_lock,
+    check_legacy_claude_config_dir,
     check_queue_layout,
+    check_queue_perms_for_linux_users,
     check_skills_installed,
     check_state_yamls,
     check_supervisor_state,
@@ -83,49 +86,302 @@ def test_check_claude_binary_fail(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_claude_config_dir
+# check_accounts (replaces the old check_claude_config_dir)
 # ---------------------------------------------------------------------------
 
 
-def test_check_config_dir_default_passes(settings: Settings) -> None:
-    """Empty config_dir → using default ~/.claude. PASS."""
-    assert settings.claude.config_dir == ""
-    result = check_claude_config_dir(settings)
+def _set_accounts(settings: Settings, accounts: list[AccountSettings]) -> Settings:
+    """Helper: return a Settings copy with the given [[accounts]] list."""
+    return settings.model_copy(update={"accounts": accounts})
+
+
+def test_check_accounts_default_account_no_config_dir_passes(settings: Settings) -> None:
+    """Synthesised default account with empty config_dir → PASS."""
+    # The loader's back-compat shim already populated a single
+    # 'default' account from the empty legacy field.
+    assert len(settings.accounts) == 1
+    assert settings.accounts[0].name == "default"
+    assert settings.accounts[0].config_dir == ""
+    result = check_accounts(settings)
     assert result.status == CheckStatus.PASS
     assert "default" in result.detail
 
 
-def test_check_config_dir_explicit_present_with_creds(settings: Settings, tmp_path: Path) -> None:
+def test_check_accounts_explicit_present_with_creds(settings: Settings, tmp_path: Path) -> None:
     cfg_dir = tmp_path / "claude_personal"
     cfg_dir.mkdir()
     (cfg_dir / ".credentials.json").write_text("{}", encoding="utf-8")
-    s = settings.model_copy(
-        update={"claude": settings.claude.model_copy(update={"config_dir": str(cfg_dir)})}
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="personal", config_dir=str(cfg_dir))],
     )
-    result = check_claude_config_dir(s)
+    result = check_accounts(s)
     assert result.status == CheckStatus.PASS
+    assert "personal" in result.detail
 
 
-def test_check_config_dir_explicit_missing(settings: Settings, tmp_path: Path) -> None:
+def test_check_accounts_explicit_missing_dir_fails(settings: Settings, tmp_path: Path) -> None:
     cfg_dir = tmp_path / "does_not_exist"
-    s = settings.model_copy(
-        update={"claude": settings.claude.model_copy(update={"config_dir": str(cfg_dir)})}
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="personal", config_dir=str(cfg_dir))],
     )
-    result = check_claude_config_dir(s)
+    result = check_accounts(s)
     assert result.status == CheckStatus.FAIL
-    assert "does not exist" in result.detail
+    assert "does not exist" in result.remediation
 
 
-def test_check_config_dir_present_no_credentials(settings: Settings, tmp_path: Path) -> None:
-    """Dir exists but no .credentials.json → WARN."""
+def test_check_accounts_no_credentials_warns(settings: Settings, tmp_path: Path) -> None:
     cfg_dir = tmp_path / "claude_unloggedin"
     cfg_dir.mkdir()
-    s = settings.model_copy(
-        update={"claude": settings.claude.model_copy(update={"config_dir": str(cfg_dir)})}
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="personal", config_dir=str(cfg_dir))],
     )
-    result = check_claude_config_dir(s)
+    result = check_accounts(s)
     assert result.status == CheckStatus.WARN
-    assert "no .credentials.json" in result.detail
+    assert "no .credentials.json" in result.remediation
+
+
+def test_check_accounts_multi_mixed_states(settings: Settings, tmp_path: Path) -> None:
+    """One PASS + one WARN + one FAIL → FAIL (highest severity wins)."""
+    good = tmp_path / "good"
+    good.mkdir()
+    (good / ".credentials.json").write_text("{}", encoding="utf-8")
+    nocreds = tmp_path / "nocreds"
+    nocreds.mkdir()
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(name="a1", config_dir=str(good)),
+            AccountSettings(name="a2", config_dir=str(nocreds)),
+            AccountSettings(name="a3", config_dir=str(tmp_path / "missing")),
+        ],
+    )
+    result = check_accounts(s)
+    assert result.status == CheckStatus.FAIL
+    assert "a3" in result.remediation
+
+
+# ---------------------------------------------------------------------------
+# check_legacy_claude_config_dir
+# ---------------------------------------------------------------------------
+
+
+def test_check_legacy_config_dir_unset(settings: Settings) -> None:
+    """No legacy field set → PASS."""
+    assert settings.claude.config_dir == ""
+    result = check_legacy_claude_config_dir(settings)
+    assert result.status == CheckStatus.PASS
+    assert "no legacy" in result.detail
+
+
+def test_check_legacy_config_dir_synthesised(settings: Settings) -> None:
+    """[claude].config_dir set, no explicit [[accounts]] → PASS (supported)."""
+    legacy = "/home/x/.claude_personal"
+    s = settings.model_copy(
+        update={
+            "claude": settings.claude.model_copy(update={"config_dir": legacy}),
+            "accounts": [AccountSettings(name="default", config_dir=legacy)],
+        }
+    )
+    result = check_legacy_claude_config_dir(s)
+    assert result.status == CheckStatus.PASS
+    assert "synthesised" in result.detail
+
+
+def test_check_legacy_config_dir_conflicts_with_explicit(settings: Settings) -> None:
+    """Both legacy field AND explicit [[accounts]] set → WARN."""
+    s = settings.model_copy(
+        update={
+            "claude": settings.claude.model_copy(update={"config_dir": "/legacy/path"}),
+            "accounts": [AccountSettings(name="personal", config_dir="/different/path")],
+        }
+    )
+    result = check_legacy_claude_config_dir(s)
+    assert result.status == CheckStatus.WARN
+    assert "ignored" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# check_account_policies
+# ---------------------------------------------------------------------------
+
+
+def test_check_account_policies_defaults_pass(settings: Settings) -> None:
+    """Default settings (single 'default' account, empty config_dir) → PASS.
+
+    Empty config_dir → policy defaults apply; report should show
+    max_concurrency=1 and the default bands.
+    """
+    from claude_task_runner.doctor.checks import check_account_policies
+
+    result = check_account_policies(settings)
+    assert result.status == CheckStatus.PASS
+    assert "max_concurrency=1" in result.detail
+    assert "daytime=40/60" in result.detail
+    assert "nighttime=70/90" in result.detail
+
+
+def test_check_account_policies_present_file_reported(settings: Settings, tmp_path: Path) -> None:
+    """An on-disk per-account file is parsed and reported."""
+    from claude_task_runner.doctor.checks import check_account_policies
+
+    cfg_dir = tmp_path / "personal"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text(
+        "[concurrency]\nmax_concurrency = 5\n", encoding="utf-8"
+    )
+    s = _set_accounts(settings, [AccountSettings(name="personal", config_dir=str(cfg_dir))])
+    result = check_account_policies(s)
+    assert result.status == CheckStatus.PASS
+    assert "max_concurrency=5" in result.detail
+
+
+def test_check_account_policies_invalid_file_fails(settings: Settings, tmp_path: Path) -> None:
+    from claude_task_runner.doctor.checks import check_account_policies
+
+    cfg_dir = tmp_path / "broken"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text("] not toml [", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="broken", config_dir=str(cfg_dir))])
+    result = check_account_policies(s)
+    assert result.status == CheckStatus.FAIL
+    assert "broken" in result.remediation
+
+
+# ---------------------------------------------------------------------------
+# check_account_sudo
+# ---------------------------------------------------------------------------
+
+
+def test_check_account_sudo_no_linux_user_passes(settings: Settings) -> None:
+    """Default settings have no linux_user → PASS skip."""
+    result = check_account_sudo(settings)
+    assert result.status == CheckStatus.PASS
+    assert "no accounts" in result.detail
+
+
+def test_check_account_sudo_self_user_is_noop(settings: Settings) -> None:
+    """linux_user matching the supervisor's user is treated as no-op."""
+    import getpass
+
+    self_user = getpass.getuser()
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="self", config_dir="", linux_user=self_user)],
+    )
+    # Patch the helper to avoid pwd lookup variance and force a known
+    # username — the check should return PASS without calling sudo.
+    with patch("claude_task_runner.doctor.checks._current_username", return_value=self_user):
+        result = check_account_sudo(s)
+    assert result.status == CheckStatus.PASS
+    assert "no-op" in result.detail
+
+
+def test_check_account_sudo_fail_on_nonzero(settings: Settings) -> None:
+    """sudo returns non-zero → FAIL with remediation listing the snippet."""
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(
+                name="work",
+                config_dir="",
+                linux_user="some-other-user",
+            )
+        ],
+    )
+
+    class _R:
+        returncode = 1
+        stderr = "sudo: a password is required\n"
+
+    with (
+        patch("claude_task_runner.doctor.checks._current_username", return_value="me"),
+        patch("claude_task_runner.doctor.checks.subprocess.run", return_value=_R()),
+        patch("claude_task_runner.doctor.checks.shutil.which", return_value="/usr/bin/sudo"),
+    ):
+        result = check_account_sudo(s)
+    assert result.status == CheckStatus.FAIL
+    assert "some-other-user" in result.remediation
+    assert "NOPASSWD" in result.remediation
+
+
+def test_check_account_sudo_pass_when_sudo_succeeds(settings: Settings) -> None:
+    """sudo returns 0 → PASS."""
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(
+                name="work",
+                config_dir="",
+                linux_user="bill-work",
+            )
+        ],
+    )
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    with (
+        patch("claude_task_runner.doctor.checks._current_username", return_value="bill"),
+        patch("claude_task_runner.doctor.checks.subprocess.run", return_value=_R()),
+        patch("claude_task_runner.doctor.checks.shutil.which", return_value="/usr/bin/sudo"),
+    ):
+        result = check_account_sudo(s)
+    assert result.status == CheckStatus.PASS
+    assert "work" in result.detail
+
+
+def test_check_account_sudo_missing_sudo_binary(settings: Settings) -> None:
+    """sudo not on PATH but linux_user requested → FAIL."""
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="work", config_dir="", linux_user="bill-work")],
+    )
+    with patch("claude_task_runner.doctor.checks.shutil.which", return_value=None):
+        result = check_account_sudo(s)
+    assert result.status == CheckStatus.FAIL
+    assert "sudo" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# check_queue_perms_for_linux_users
+# ---------------------------------------------------------------------------
+
+
+def test_check_queue_perms_no_linux_user_skipped(settings: Settings, queue_dir: Path) -> None:
+    result = check_queue_perms_for_linux_users(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "skipped" in result.detail
+
+
+def test_check_queue_perms_missing_queue_dir(settings: Settings, tmp_path: Path) -> None:
+    s = _set_accounts(
+        settings,
+        [AccountSettings(name="work", config_dir="", linux_user="bill-work")],
+    )
+    result = check_queue_perms_for_linux_users(s, tmp_path / "nope")
+    assert result.status == CheckStatus.FAIL
+    assert "queue dir not found" in result.detail
+
+
+def test_check_queue_perms_unknown_linux_user(settings: Settings, queue_dir: Path) -> None:
+    """Account linux_user that doesn't exist on this host → FAIL."""
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(
+                name="work",
+                config_dir="",
+                linux_user="user-that-does-not-exist-on-any-host",
+            )
+        ],
+    )
+    result = check_queue_perms_for_linux_users(s, queue_dir)
+    assert result.status == CheckStatus.FAIL
+    assert "does not exist" in result.remediation
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +768,9 @@ def test_check_watchdog_cron_present(settings: Settings, tmp_path: Path) -> None
 
 def test_all_checks_returns_runnable_callables(settings: Settings, queue_dir: Path) -> None:
     checks = list(all_checks(settings, queue_dir))
-    # 11 checks as of writing.
-    assert len(checks) >= 10
+    # 15 checks as of multi-account PR1 (added accounts, legacy,
+    # account_policies, sudo, perms).
+    assert len(checks) >= 15
     # Each is callable and produces a CheckResult.
     for fn in checks:
         result = fn()

@@ -8,10 +8,12 @@
 # ---------------------------------------------------------------------------
 [claude]
 executable = "claude"
-config_dir = ""        # CLAUDE_CONFIG_DIR override; empty = use ~/.claude.
-                       # Set to e.g. "/home/bill/.claude_personal" to target
-                       # a non-default account whose `claude /login` was run
-                       # under that dir. Lets one host run multiple accounts.
+config_dir = ""        # LEGACY single-account alias; superseded by [[accounts]]
+                       # below. Empty = ``~/.claude``. When [[accounts]] is set
+                       # explicitly, this field is ignored (the doctor command
+                       # emits a WARN). Operators with a bare [claude] block
+                       # keep working: the loader synthesises a single account
+                       # named "default" from this field.
 plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
                        # "team_standard" | "team_premium".
                        # Determines the 5h:weekly token ratio used to derive
@@ -19,6 +21,66 @@ plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
                        # override `[throttle.*]` fields explicitly below.
                        # If empty / unrecognised, the explicit `[throttle.*]`
                        # values are used as-is (no auto-tuning).
+
+# ---------------------------------------------------------------------------
+# Claude accounts (multi-account dispatch)
+#
+# One [[accounts]] block per Claude billing identity the supervisor may
+# dispatch through. When omitted entirely, the loader synthesises a single
+# account named "default" from the legacy [claude].config_dir field — bare
+# single-account configs from before multi-account dispatch keep working.
+#
+# Each block requires only `name` (filesystem- and shell-safe) and
+# `config_dir` (the CLAUDE_CONFIG_DIR populated by `claude /login`), plus
+# an optional `linux_user` for multi-user spawning. Per-account dispatch
+# policy (max_concurrency, throttle bands, time-of-day) lives INSIDE each
+# account's own config dir at:
+#
+#   <config_dir>/runner-account.toml
+#
+# That keeps each account owner in control of their own limits — useful
+# when accounts belong to different people or billing entities. A missing
+# per-account file defaults to max_concurrency=1 with the standard 40/60
+# daytime + 70/90 nighttime bands.
+#
+# Dispatch policy: all accounts equal priority. The dispatcher picks the
+# least-utilized account (by 5h utilization, tie-broken by weekly util
+# then name) when multiple have free capacity. There is no queue-wide
+# concurrency cap — operators choose per-account caps such that their
+# sum is acceptable.
+#
+# Example two-account setup (personal + work; work runs under a separate
+# Linux user for audit clarity):
+#
+#   [[accounts]]
+#   name = "personal"
+#   config_dir = "/home/bill/.claude_personal"
+#
+#   [[accounts]]
+#   name = "work"
+#   config_dir = "/home/bill-work/.claude"
+#   linux_user = "bill-work"
+#
+# Each account's own runner-account.toml then carries:
+#
+#   [concurrency]
+#   max_concurrency = 5
+#
+#   [throttle.five_hour]
+#   daytime_band_full_dispatch_max_pct   = 40
+#   daytime_band_slowdown_max_pct        = 60
+#   nighttime_band_full_dispatch_max_pct = 70
+#   nighttime_band_slowdown_max_pct      = 90
+#
+#   [throttle.time_of_day]
+#   day_end = "21:00"
+#
+# Account names appear in supervisor logs, the per-run state YAML's
+# RunRecord.account field, and the `claude-task-runner account` CLI.
+# Tasks may pin to a specific account by setting `account: <name>` in
+# their task YAML; unset means "dispatcher picks the least-utilized
+# account with free capacity".
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Usage capture & parser
