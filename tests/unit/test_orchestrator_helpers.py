@@ -400,6 +400,81 @@ def test_tick_dispatch_priority_sort(queue_dir: Path) -> None:
             th.join(timeout=2)
 
 
+def test_tick_dispatch_one_high_two_normal_high_goes_first(queue_dir: Path) -> None:
+    """One high-priority task + two normal must dispatch high first.
+
+    Regression coverage for the operator's expectation that a late
+    ``priority: high`` task jumps ahead of alphabetically-earlier
+    ``priority: normal`` tasks. The high task here has the
+    alphabetically LAST id; if the sort were id-only it would dispatch
+    third.
+    """
+    settings = _make_settings(initial=1, max_c=1)
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    _make_task(queue_dir, "001-normal-alpha", priority="normal")
+    _make_task(queue_dir, "002-normal-beta", priority="normal")
+    _make_task(queue_dir, "999-high-zulu", priority="high")
+    in_flight: dict[str, threading.Thread] = {}
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+        return_value=None,
+    ):
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=RealClock(),
+            snapshot=snap,
+            in_flight_threads=in_flight,
+        )
+        assert "999-high-zulu" in in_flight
+        assert "001-normal-alpha" not in in_flight
+        assert "002-normal-beta" not in in_flight
+        for th in list(in_flight.values()):
+            th.join(timeout=2)
+
+
+def test_tick_dispatch_priority_then_id_within_band(queue_dir: Path) -> None:
+    """Within a priority band, ties break by task id (ascending)."""
+    settings = _make_settings(initial=3, max_c=3)
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    # Two high-priority tasks: high-zzz id, high-aaa id. Among the
+    # three slots, both should be picked and high-aaa precedes high-zzz
+    # under (priority_rank, task_id).
+    _make_task(queue_dir, "high-zzz", priority="high")
+    _make_task(queue_dir, "high-aaa", priority="high")
+    _make_task(queue_dir, "normal-mmm", priority="normal")
+    in_flight: dict[str, threading.Thread] = {}
+
+    dispatch_order: list[str] = []
+    real_thread_start = threading.Thread.start
+
+    def record_then_start(self: threading.Thread) -> None:
+        # The thread name is "dispatch-<task_id>" (see orchestrator).
+        if self.name.startswith("dispatch-"):
+            dispatch_order.append(self.name.removeprefix("dispatch-"))
+        real_thread_start(self)
+
+    with (
+        patch(
+            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+            return_value=None,
+        ),
+        patch.object(threading.Thread, "start", record_then_start),
+    ):
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=RealClock(),
+            snapshot=snap,
+            in_flight_threads=in_flight,
+        )
+        for th in list(in_flight.values()):
+            th.join(timeout=2)
+
+    assert dispatch_order == ["high-aaa", "high-zzz", "normal-mmm"]
+
+
 # ---------------------------------------------------------------------------
 # _dispatch_one_safely
 # ---------------------------------------------------------------------------

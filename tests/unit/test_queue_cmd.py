@@ -88,6 +88,37 @@ class TestList:
         payload = json.loads(result.stdout)
         assert any("error" in t for t in payload["tasks"])
 
+    def test_order_by_dispatch_high_first(self, runner: CliRunner, queue_dir: Path) -> None:
+        """With --order-by-dispatch, priority high precedes normal even when
+        the high task's id sorts alphabetically last."""
+        _seed_task(queue_dir, "001-normal", priority="normal")
+        _seed_task(queue_dir, "002-normal", priority="normal")
+        _seed_task(queue_dir, "999-high", priority="high")
+        result = runner.invoke(
+            app,
+            ["list", "--queue", str(queue_dir), "--json", "--order-by-dispatch"],
+        )
+        assert result.exit_code == 0, result.stdout
+        payload = json.loads(result.stdout)
+        ids = [t["id"] for t in payload["tasks"]]
+        assert ids == ["999-high", "001-normal", "002-normal"]
+        # dispatch_rank starts at 1 and matches list order.
+        assert [t["dispatch_rank"] for t in payload["tasks"]] == [1, 2, 3]
+
+    def test_order_by_dispatch_default_filename_order(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """Without the flag, ordering remains filename-sorted (legacy behavior)."""
+        _seed_task(queue_dir, "001-normal", priority="normal")
+        _seed_task(queue_dir, "999-high", priority="high")
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        ids = [t["id"] for t in payload["tasks"]]
+        assert ids == ["001-normal", "999-high"]
+        # No dispatch_rank field when the flag is off.
+        assert all("dispatch_rank" not in t for t in payload["tasks"])
+
 
 class TestStates:
     def test_filter_by_status(self, runner: CliRunner, queue_dir: Path) -> None:
