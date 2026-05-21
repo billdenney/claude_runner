@@ -11,6 +11,29 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`--add-dir` propagation for dispatched agents.** Claude Code's
+  `--print` mode sandboxes each session to its cwd; reads/writes
+  outside that scope are silently blocked. The dispatcher now always
+  passes `--add-dir <queue_dir>` so the agent can reach sources under
+  the queue (papers/, from_people/), the sidecar protocol, and the
+  reports/ tree. New optional Task YAML field `additional_dirs:
+  list[Path]` declares per-task extras (e.g. a sibling repo, a
+  shared data tree); each entry is forwarded as another `--add-dir`.
+  A new `claude-task-runner queue add --add-dir <dir>` flag
+  (repeatable) sets the field at task-creation time. Backward
+  compatible — existing task YAMLs that omit `additional_dirs` keep
+  working and pick up the queue dir automatically.
+- New `[dispatch].auto_detect_paths_in_prompt` setting (default
+  `false`, opt-in). When enabled, the dispatcher extracts absolute
+  paths from the task prompt, walks them to the containing
+  directory, and adds the existing ones to the per-dispatch
+  `--add-dir` list. Useful for queues whose prompts inline source
+  paths; off by default to avoid false positives from prose-y prompts.
+- The supervisor's per-task dispatch log gains an `add_dirs=[...]`
+  field showing the resolved scope so operators can verify what each
+  agent was actually granted (truncated past ~300 chars).
+- New `runner/add_dirs.py` module owns the resolution logic; covered
+  at 91% by `tests/unit/test_add_dirs.py`.
 - **Time-of-day-modulated 5h throttle bands** (ADR-0015). New section
   `[throttle.time_of_day]` defines core daytime / nighttime boundaries
   and a smooth ramp. `[throttle.five_hour]` gains four optional override

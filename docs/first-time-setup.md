@@ -98,6 +98,29 @@ prompt: |
   Print "hello" and exit.
 ```
 
+### Sandbox scope (--add-dir)
+
+Claude Code sandboxes each dispatched session to its cwd; any
+`Read`/`Write`/`Bash` against a path outside that scope is blocked.
+The runner widens the scope automatically:
+
+* The queue directory is always passed via `--add-dir <queue>` so
+  the agent can reach sources under the queue (papers/, from_people/),
+  the sidecar protocol, and the reports/ tree.
+* Per-task extras can be declared via `--add-dir <dir>` on
+  `queue add` (repeatable). They persist to the task YAML's
+  `additional_dirs` list and are merged into each dispatch.
+
+```sh
+claude-task-runner queue add \
+    --id 007-foo --title "..." --prompt-file /tmp/foo.txt \
+    --add-dir /data/cohort-X --add-dir /home/bill/sibling-repo
+```
+
+Existing queues need no migration: the queue dir was always reachable
+implicitly before; this change just surfaces the same scope through
+the CLI and adds the explicit per-task knob.
+
 ## 5. Install the watchdog
 
 ```sh

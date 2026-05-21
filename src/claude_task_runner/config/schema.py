@@ -221,6 +221,27 @@ class ClaudeSettings(_StrictModel):
     plan: str = ""
 
 
+class DispatchSettings(_StrictModel):
+    """Dispatch-time scope controls for the spawned ``claude`` subprocess.
+
+    Controls how the runner builds ``--add-dir`` arguments to extend
+    the sandbox the dispatched agent sees. The queue directory is
+    *always* added (it contains the source files, sidecar/, and
+    reports/ that the agent needs to read and write); per-task
+    ``additional_dirs`` in the task YAML are always honoured. The
+    optional ``auto_detect_paths_in_prompt`` toggle additionally
+    scans the prompt text for absolute paths and adds the existing
+    ones. The auto-detect path is off by default because absolute-path
+    strings in a prompt aren't necessarily directories — false
+    positives lower the precision of the safety scope.
+    """
+
+    auto_detect_paths_in_prompt: bool = False
+    """Power-user opt-in: when True, extract absolute paths from the
+    task's prompt text and add the ones that resolve to existing
+    directories to the per-dispatch ``--add-dir`` list. Off by default."""
+
+
 class PlanSettings(_StrictModel):
     """Per-plan token-budget and throttle-band hints.
 
@@ -256,4 +277,5 @@ class Settings(_StrictModel):
     metrics: MetricsSettings
     ui: UiSettings
     fixtures: FixturesSettings
+    dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     plans: dict[str, PlanSettings] = Field(default_factory=dict)

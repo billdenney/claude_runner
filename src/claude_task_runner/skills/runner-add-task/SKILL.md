@@ -56,6 +56,14 @@ all at once.
   (`ema-cohort:foo` overrides the EMA bucket key).
 - **`--weekly-critical`** — set if the user says it must complete
   before the weekly window resets.
+- **`--add-dir <dir>`** (repeatable) — extra absolute directories the
+  dispatched `claude` subprocess should be allowed to read/write
+  outside its cwd. The queue directory is *always* added by the
+  dispatcher; only set this for additional paths (e.g. a sibling
+  repo, a shared data tree). Each entry persists to
+  `additional_dirs` in the task YAML. Missing paths are warned but
+  do not block adding the task — they may be created by the
+  pre-dispatch hook before the agent runs.
 
 ## Invocation
 
@@ -75,6 +83,25 @@ claude-task-runner queue add \
 If the runner is already up, the supervisor will pick the task up on
 the next poll. If not, suggest `claude-task-runner supervisor start`
 or rely on the watchdog.
+
+## --add-dir scope: when to set it
+
+Claude Code's `--print` subprocess sandboxes the agent to its cwd; any
+`Read`/`Write`/`Bash` call to a path outside cwd is silently blocked.
+The runner always adds the queue dir automatically, which covers the
+sidecar protocol, reports/, and any sources stored under the queue
+root (papers/, from_people/, etc).
+
+Set `--add-dir <path>` only when the task needs access to something
+that lives *outside* the queue dir:
+
+- a sibling repo the task should read but not own,
+- a shared data tree (e.g. `/data/cohort-X/`),
+- a per-team source tree the operator maintains alongside the queue.
+
+Typical setups don't need `--add-dir` at all — if the prompt
+references files under the queue, the always-on queue dir is
+sufficient.
 
 ## Things this skill doesn't do
 

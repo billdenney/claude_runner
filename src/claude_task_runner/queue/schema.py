@@ -137,6 +137,16 @@ class Task(_StrictBase):
     anything externally observable. Empty list means the gate falls
     back to "new commit on the branch" / "open sidecar" only. See
     ADR-0020."""
+    additional_dirs: list[Path] = Field(default_factory=list)
+    """Extra absolute directory paths the dispatched ``claude`` subprocess
+    should be allowed to read/write outside its cwd. Each entry is
+    forwarded as a ``--add-dir <path>`` flag. The queue directory itself
+    is always passed automatically by the dispatcher (it contains the
+    sidecar/, reports/, and per-task source files the agent needs);
+    list only *additional* locations here. Missing paths are warned
+    about but do not fail dispatch. Empty list (the default) means
+    "no extra dirs beyond the always-on queue dir." Backward compatible
+    with v2 task YAMLs that pre-date this field."""
 
 
 class TaskState(_StrictBase):

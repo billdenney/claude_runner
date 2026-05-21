@@ -307,6 +307,7 @@ def _dispatch_one_safely(
             settings_session=settings.session,
             settings_hooks=settings.hooks,
             settings_failure_classifier=settings.failure_classifier,
+            settings_dispatch=settings.dispatch,
             claude_executable=claude_executable,
             claude_config_dir=settings.claude.config_dir,
         )
