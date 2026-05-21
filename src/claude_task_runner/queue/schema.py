@@ -96,6 +96,12 @@ class RunRecord(_StrictBase):
     killed_by_cap: Literal["tokens", "duration"] | None = None
     """Set when the run was SIGTERM'd by ``runner.caps`` because a
     per-task safety cap was exceeded."""
+    account: str | None = None
+    """Which account this attempt was dispatched through. Matches the
+    ``name`` of an entry in :class:`AccountSettings`. ``None`` on
+    legacy single-account RunRecords (pre-multi-account dispatch);
+    set to the account name picked by :func:`runner.account_dispatch
+    .choose_account` on multi-account dispatches."""
 
 
 class Task(_StrictBase):

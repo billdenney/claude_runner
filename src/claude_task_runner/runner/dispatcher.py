@@ -230,6 +230,22 @@ def _read_lines(stream: Iterable[str]) -> Iterable[str]:
     yield from stream
 
 
+def _resolve_self_user() -> str:
+    """Return the supervisor's own Linux username; empty string on lookup failure.
+
+    Mirrored from :mod:`doctor.checks._current_username`. The
+    dispatcher uses it to decide whether ``linux_user`` requires a
+    sudo prefix: if the configured target equals the supervisor's
+    own user, no sudo is needed and we spawn directly.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return ""
+
+
 def _build_run_record(
     *,
     attempt: int,
@@ -240,6 +256,7 @@ def _build_run_record(
     cap_violation: caps_mod.CapViolation | None,
     process_exit_code: int,
     stderr_tail: str,
+    account: str | None = None,
 ) -> RunRecord:
     """Assemble a RunRecord from the dispatch loop's accumulated state."""
     duration_s = (finished_at - started_at).total_seconds()
@@ -281,6 +298,7 @@ def _build_run_record(
         duration_s=duration_s,
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
         killed_by_cap=killed,
+        account=account,
     )
 
 
@@ -516,6 +534,8 @@ def dispatch(
     settings_dispatch: DispatchSettings | None = None,
     claude_executable: str = "claude",
     claude_config_dir: str = "",
+    linux_user: str | None = None,
+    account: str | None = None,
     persist_state: bool = True,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
@@ -557,6 +577,7 @@ def dispatch(
             clock=clock,
             persist_state=persist_state,
             settings_failure_classifier=settings_failure_classifier,
+            account=account,
         )
 
     started_at = clock.now()
@@ -608,6 +629,34 @@ def dispatch(
         if not config_path.exists():
             raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+
+    # Multi-Linux-user dispatch: when the resolved account has a
+    # `linux_user` set and it differs from the supervisor's own user,
+    # wrap argv with `sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=...`.
+    # The doctor's check_account_sudo runs `sudo -n -u <linux_user>
+    # /bin/true` as a precondition at startup, so we don't re-check
+    # here; -n keeps a misconfigured run from hanging on a password
+    # prompt. ENV inheritance across sudo's user transition needs the
+    # explicit ``env`` wrapper because sudo defaults strip the
+    # supervisor's environment from the target's session.
+    if linux_user and _resolve_self_user() != linux_user:
+        sudo_path = shutil.which("sudo")
+        if sudo_path is None:
+            raise DispatchError(f"linux_user={linux_user!r} requested but sudo not on PATH")
+        env_pairs: list[str] = []
+        if spawn_env is not None:
+            env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
+        # Propagate explicit env via `env` so sudo's default
+        # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
+        prefix: list[str] = [sudo_path, "-n", "-u", linux_user]
+        if env_pairs:
+            prefix.extend(["env", *env_pairs])
+        argv = [*prefix, *argv]
+        # Once the subprocess transitions to <linux_user>, the
+        # supervisor's own env stops mattering — the env=... arg to
+        # Popen below would only apply to the sudo invocation itself.
+        # Clear it so we don't fight the sudo prefix.
+        spawn_env = None
 
     # Pre-trust the task's working_dir (and mark onboarding complete) in the
     # target .claude.json. Idempotent — only writes when a flag changes.
@@ -667,6 +716,7 @@ def dispatch(
         cap_violation=cap_violation,
         process_exit_code=process.returncode if process.returncode is not None else -1,
         stderr_tail=stderr_tail,
+        account=account,
     )
 
     # Detect open sidecar once and thread it through finalization. The
@@ -855,6 +905,7 @@ def _record_pre_dispatch_failure(
     clock: Clock,
     persist_state: bool,
     settings_failure_classifier: FailureClassifierSettings | None = None,
+    account: str | None = None,
 ) -> DispatchOutcome:
     """When the pre-dispatch hook fails, write a RunRecord and TaskState
     showing the failure without ever spawning ``claude``.
@@ -883,6 +934,7 @@ def _record_pre_dispatch_failure(
         cost_usd=0.0,
         duration_s=(finished_at - started_at).total_seconds(),
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
+        account=account,
     )
     # Bump attempts on the "prior" state we hand to _finalize_state so
     # it ends up with the same attempts count as a normal run path
