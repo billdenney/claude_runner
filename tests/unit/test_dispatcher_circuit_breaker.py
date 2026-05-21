@@ -111,7 +111,7 @@ class TestFinalizeStateCircuitBreaker:
     ) -> None:
         prior = TaskState(task_id="t1", status="pending", attempts=0, runs=[])
         run = _failed_run(attempt=1, when=when)
-        new = _finalize_state(
+        new, _ = _finalize_state(
             prior=prior,
             plan=fresh_plan,
             run=run,
@@ -139,7 +139,7 @@ class TestFinalizeStateCircuitBreaker:
             runs=prior_runs,
         )
         third_run = _failed_run(attempt=3, when=when)
-        new = _finalize_state(
+        new, _ = _finalize_state(
             prior=prior,
             plan=fresh_plan,
             run=third_run,
@@ -170,7 +170,7 @@ class TestFinalizeStateCircuitBreaker:
         # Now we add a 5th run that also fails. Only the 4th and 5th are
         # trailing failures -> count=2 -> below threshold of 3 -> plain failed.
         fifth_run = _failed_run(attempt=5, when=when)
-        new = _finalize_state(
+        new, _ = _finalize_state(
             prior=prior,
             plan=fresh_plan,
             run=fifth_run,
@@ -196,7 +196,7 @@ class TestFinalizeStateCircuitBreaker:
         # The 100th attempt finally succeeds. Even after 99 failures the
         # final status is completed, not circuit-broken.
         success = _successful_run(attempt=100, when=when)
-        new = _finalize_state(
+        new, _ = _finalize_state(
             prior=prior,
             plan=fresh_plan,
             run=success,
@@ -222,7 +222,7 @@ class TestFinalizeStateCircuitBreaker:
             runs=prior_runs,
         )
         sixth_run = _failed_run(attempt=6, when=when)
-        new = _finalize_state(
+        new, _ = _finalize_state(
             prior=prior,
             plan=fresh_plan,
             run=sixth_run,

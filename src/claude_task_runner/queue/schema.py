@@ -130,6 +130,13 @@ class Task(_StrictBase):
     """Per-task override of ``[task_caps].max_tokens_per_task``."""
     max_duration_s_override: float | None = Field(default=None, gt=0)
     """Per-task override of ``[task_caps].max_duration_s_per_task``."""
+    deliverable_paths: list[Path] = Field(default_factory=list)
+    """Paths (relative to ``working_dir``) the task is expected to
+    produce. Consulted by the dispatcher's output-evidence gate when
+    deciding whether a run that exited cleanly actually produced
+    anything externally observable. Empty list means the gate falls
+    back to "new commit on the branch" / "open sidecar" only. See
+    ADR-0020."""
 
 
 class TaskState(_StrictBase):
