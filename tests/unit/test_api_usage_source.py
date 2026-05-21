@@ -154,6 +154,23 @@ def test_headers_to_reading_unknown_status_warns_does_not_raise(
     assert any("status='throttled'" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize("ok_status", ["allowed", "allowed_warning"])
+def test_headers_to_reading_recognised_statuses_silent(
+    caplog: pytest.LogCaptureFixture,
+    ok_status: str,
+) -> None:
+    """``allowed`` and ``allowed_warning`` are both benign — no log warning,
+    no special handling. Observed in live traffic 2026-05-21: the 7d
+    window returns ``allowed_warning`` above ~70% utilization, which is
+    a notification not a throttle signal."""
+    h = dict(_VALID_HEADERS)
+    h["anthropic-ratelimit-unified-5h-status"] = ok_status
+    h["anthropic-ratelimit-unified-7d-status"] = ok_status
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.usage.api_source"):
+        _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert caplog.records == []
+
+
 # ---------------------------------------------------------------------------
 # _read_oauth_token — uses tmp_path to write throwaway credentials files.
 # ---------------------------------------------------------------------------
