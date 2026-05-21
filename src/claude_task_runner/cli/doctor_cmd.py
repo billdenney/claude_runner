@@ -48,6 +48,16 @@ def doctor(
             "existence sweep is unwanted."
         ),
     ),
+    check_api_usage: bool = typer.Option(
+        False,
+        "--check-api-usage/--no-check-api-usage",
+        help=(
+            "Probe the API usage source against each configured account "
+            "(one /v1/messages call per account; ~4 tokens each). Useful "
+            'before flipping `[usage].source` to "api_then_tty". Off by '
+            "default."
+        ),
+    ),
 ) -> None:
     """Run a battery of self-diagnostic checks against this queue.
 
@@ -56,7 +66,15 @@ def doctor(
     settings = load_settings(config)
     queue_path = queue_dir.resolve()
 
-    results = [factory() for factory in all_checks(settings, queue_path, check_paths=check_paths)]
+    results = [
+        factory()
+        for factory in all_checks(
+            settings,
+            queue_path,
+            check_paths=check_paths,
+            check_api_usage=check_api_usage,
+        )
+    ]
 
     if json:
         payload = {

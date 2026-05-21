@@ -84,8 +84,28 @@ plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
 
 # ---------------------------------------------------------------------------
 # Usage capture & parser
+#
+# `source` selects how the supervisor obtains usage readings:
+#   * "tty"          — spawn `claude /usage` and parse the TUI.
+#                      Slow (10-30s/capture) but reads exactly what
+#                      the operator sees. Default; preserves all
+#                      historical behaviour.
+#   * "api"          — read rate-limit headers from a minimal
+#                      /v1/messages call (~500ms, ~4 tokens). Faster
+#                      but the headers are reverse-engineered and the
+#                      OAuth bearer can expire.
+#   * "api_then_tty" — API path first; on auth-expired / missing-
+#                      header / network failure, fall through to TTY
+#                      for that one capture. The TTY fall-through
+#                      refreshes the OAuth bearer as a side effect,
+#                      so the next tick returns to the API path.
+#                      Recommended once API readings have been
+#                      validated to match TTY for the operator's plan.
 # ---------------------------------------------------------------------------
 [usage]
+source                      = "tty"     # "tty" | "api" | "api_then_tty"
+api_timeout_s               = 10        # per-request HTTP timeout for the API source
+api_probe_model             = "claude-haiku-4-5"  # cheapest model for the probe call
 capture_trust_timeout_s     = 10        # Phase 1: trust prompt vs TUI ready
 capture_usage_timeout_s     = 15        # Phase 2: await two Resets lines
 capture_eof_timeout_s       = 5
