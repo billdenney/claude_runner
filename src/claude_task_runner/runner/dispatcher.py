@@ -104,6 +104,57 @@ class DispatchOutcome:
     summary: StreamSummary
 
 
+# Bash patterns that an autonomous extraction agent must be able to
+# run end-to-end without an interactive operator. ``--permission-mode
+# acceptEdits`` only auto-grants Write/Edit; shell commands still
+# require either a per-invocation interactive grant (impossible in
+# ``--print`` mode) or an explicit allow pattern at session start.
+#
+# Without these, the Lowe 2009 omalizumab agent (observed 2026-05-21)
+# completed Phases 1-5 — read source PDFs, drafted the model + vignette,
+# wrote NEWS.md, wrote the operator-handoff report — then hit "Claude
+# requested permissions to run this command" prompts on the Phase 6
+# steps (``Rscript -e 'nlmixr2lib::buildModelDb()'``, ``git add ...``,
+# ``git commit``, ``git push``) and exited via ``end_turn`` with the
+# work uncommitted and unpushed. The operator then had to rebase,
+# regen registry artifacts, commit, and push by hand — wasteful and
+# defeats the autonomous-dispatch design.
+#
+# The list is conservative: enumerated explicit prefixes only, no
+# wildcards alone (would gate the whole tool). Add patterns here if
+# a queue regularly needs another command; this list is what every
+# dispatched agent sees by default.
+_DEFAULT_BASH_ALLOW_PATTERNS: tuple[str, ...] = (
+    # Version control. Read-only (status, log, diff, branch) and
+    # write (add, commit, push, fetch, rebase, restore) are all here.
+    "Bash(git *)",
+    # R script invocations: package building (``Rscript -e
+    # 'devtools::load_all(); buildModelDb()'``), vignette render
+    # (``Rscript -e 'rmarkdown::render(...)'``), convention check
+    # (``Rscript -e 'nlmixr2lib::checkModelConventions(...)'``), and
+    # the full check pipeline (``Rscript -e 'devtools::check()'``).
+    "Bash(Rscript *)",
+    "Bash(R *)",
+    # Build orchestration (``make check`` etc.).
+    "Bash(make *)",
+)
+
+
+def _bash_allow_settings_json() -> str:
+    """Build the ``--settings`` JSON string used to widen permissions.
+
+    Returns a JSON document (as a string) with a single
+    ``permissions.allow`` list. Claude Code merges this with any
+    project-local ``settings.local.json``, so per-repo allow lists
+    remain in effect — these are the strictly additional patterns
+    the runner injects on every dispatch.
+    """
+    import json as _json
+
+    payload = {"permissions": {"allow": list(_DEFAULT_BASH_ALLOW_PATTERNS)}}
+    return _json.dumps(payload, separators=(",", ":"))
+
+
 def build_argv(
     task: Task,
     plan: SpawnPlan,
@@ -123,12 +174,37 @@ def build_argv(
     The caller resolves the list via :mod:`runner.add_dirs` so that
     the queue dir is always present and per-task entries are
     validated.
+
+    A ``--settings`` JSON is always emitted to grant the
+    ``Bash(git *)``, ``Bash(Rscript *)``, ``Bash(R *)``, and
+    ``Bash(make *)`` permissions — without these the autonomous
+    agent can read sources and write files but cannot run the Phase 4
+    convention check, the Phase 5 vignette render, or the Phase 6
+    git commit + push, so it exits via ``end_turn`` with the work
+    on disk but uncommitted. See ``_DEFAULT_BASH_ALLOW_PATTERNS``
+    for the full list and rationale.
     """
     argv: list[str] = [
         claude_executable,
         "--print",
         "--output-format=stream-json",
         "--verbose",
+        # Autonomous dispatch can't honour interactive permission grants;
+        # the default permission policy in ``--print`` mode blocks every
+        # first-time Write/Edit/Bash-redirect with "Claude requested
+        # permissions to write to <path>, but you haven't granted it yet".
+        # ``acceptEdits`` auto-grants file edits (Write/Edit and bash
+        # redirects within the allowed-dir scope) while still gating
+        # destructive shell operations and out-of-scope paths. Without
+        # this flag the agent reads sources, drafts the model in
+        # conversation, and exits cleanly via ``end_turn_no_output``
+        # because every Write attempt was blocked (observed 2026-05-21
+        # with task ``130-lowe_2009_omalizumab``).
+        "--permission-mode",
+        "acceptEdits",
+        # See ``_DEFAULT_BASH_ALLOW_PATTERNS`` for why this is always set.
+        "--settings",
+        _bash_allow_settings_json(),
     ]
     if task.model:
         argv.extend(["--model", task.model])
