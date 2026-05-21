@@ -318,6 +318,16 @@ def add_task(
         "--weekly-critical",
         help="Dispatch first to ensure completion this week.",
     ),
+    add_dir: list[Path] = typer.Option(
+        [],
+        "--add-dir",
+        help=(
+            "Absolute directory the dispatched claude subprocess should be "
+            "allowed to read/write outside its cwd. Repeat for multiple dirs. "
+            "The queue dir is always added automatically; use this only for "
+            "extra paths (e.g. a sibling repo, a shared data tree)."
+        ),
+    ),
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Allow overwriting an existing task YAML."
     ),
@@ -367,6 +377,13 @@ def add_task(
         console.print(f"[bold red]task already exists:[/] {target}")
         raise typer.Exit(code=2)
 
+    # Validate each --add-dir: warn (don't fail) on missing entries so the
+    # operator can still queue a task whose dependencies will materialize
+    # later (e.g. a worktree the pre-dispatch hook creates).
+    for d in add_dir:
+        if not d.is_dir():
+            console.print(f"[yellow]warning:[/] --add-dir {d} is not an existing directory")
+
     task = Task(
         id=task_id,
         title=title,
@@ -377,6 +394,7 @@ def add_task(
         allowed_tools=list(allowed_tools),
         tags=list(tag),
         weekly_critical=weekly_critical,
+        additional_dirs=list(add_dir),
     )
 
     try:

@@ -385,3 +385,68 @@ class TestAdd:
         )
         assert result.exit_code != 0
         assert "either --prompt OR --prompt-file" in result.stdout
+
+    def test_add_dir_persisted(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        d1 = tmp_path / "shared"
+        d1.mkdir()
+        d2 = tmp_path / "data"
+        d2.mkdir()
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "060-ad",
+                "--title",
+                "Add dir task",
+                "--prompt",
+                "x",
+                "--add-dir",
+                str(d1),
+                "--add-dir",
+                str(d2),
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        text = task_path_for(queue_dir, "060-ad").read_text()
+        # YAML serialized list contains both paths.
+        assert str(d1) in text
+        assert str(d2) in text
+        assert "additional_dirs" in text
+
+    def test_add_dir_missing_path_warns_but_succeeds(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        absent = tmp_path / "ghost"  # never created
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "061-ghost",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+                "--add-dir",
+                str(absent),
+            ],
+        )
+        # Non-existing dir is a warning, not a failure: the
+        # pre-dispatch hook may create the dir before runtime.
+        assert result.exit_code == 0, result.stdout
+        assert "warning" in result.stdout.lower()
+        text = task_path_for(queue_dir, "061-ghost").read_text()
+        assert str(absent) in text

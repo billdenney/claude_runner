@@ -16,6 +16,7 @@ import pytest
 
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.schema import (
+    DispatchSettings,
     HookSettings,
     SessionSettings,
     TaskCapsSettings,
@@ -136,6 +137,35 @@ class TestBuildArgv:
         argv = build_argv(task, plan, claude_executable="claude")
         assert "--allowedTools" not in argv
 
+    def test_no_add_dirs_omits_flag(self, task: Task, fresh_plan: SpawnPlan) -> None:
+        argv = build_argv(task, fresh_plan, claude_executable="claude")
+        assert "--add-dir" not in argv
+
+    def test_add_dirs_emit_one_flag_per_path(self, task: Task, fresh_plan: SpawnPlan) -> None:
+        dirs = [Path("/a/queue"), Path("/b/shared"), Path("/c/data")]
+        argv = build_argv(
+            task,
+            fresh_plan,
+            claude_executable="claude",
+            add_dirs=dirs,
+        )
+        # One `--add-dir <path>` per resolved entry; appears before `--`.
+        assert argv.count("--add-dir") == 3
+        idx0 = argv.index("--add-dir")
+        # The three flags should be contiguous (--add-dir, /a/queue, --add-dir, /b/shared, ...).
+        assert argv[idx0 : idx0 + 6] == [
+            "--add-dir",
+            "/a/queue",
+            "--add-dir",
+            "/b/shared",
+            "--add-dir",
+            "/c/data",
+        ]
+        # `--` separator must still come after all flags.
+        assert "--" in argv
+        assert argv.index("--") > idx0 + 5
+        assert argv[-1] == task.prompt
+
 
 class TestDispatchSuccess:
     def test_full_success_path(
@@ -179,6 +209,51 @@ class TestDispatchSuccess:
         # Verify state was persisted atomically.
         loaded = load_state(state_path_for(queue_dir, task.id))
         assert loaded == outcome.new_state
+
+    def test_dispatch_logs_resolved_add_dirs(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The operator-facing dispatch log must surface the resolved
+        --add-dir scope so they can verify what the spawned agent saw.
+        Without this, debugging a "sandbox blocked my read" only has
+        the per-task YAML to read; the runtime resolution is hidden.
+        """
+        extra = tmp_path / "shared"
+        extra.mkdir()
+        task_with_extra = task.model_copy(update={"additional_dirs": [extra]})
+
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger="claude_task_runner.runner.dispatcher"):
+            dispatch(
+                task=task_with_extra,
+                state=TaskState(task_id=task_with_extra.id),
+                plan=fresh_plan,
+                queue_dir=queue_dir,
+                clock=RealClock(),
+                settings_caps=_caps(),
+                settings_session=_session(),
+                settings_hooks=_hooks(),
+                settings_dispatch=DispatchSettings(),
+                claude_executable=str(SHIM_PATH),
+            )
+
+        dispatch_lines = [
+            rec.getMessage() for rec in caplog.records if "[dispatch]" in rec.getMessage()
+        ]
+        assert dispatch_lines, "expected at least one [dispatch] log line"
+        line = dispatch_lines[0]
+        # Queue dir is always-on; per-task extra is included.
+        assert str(queue_dir.resolve()) in line
+        assert str(extra.resolve()) in line
+        assert f"task_id={task_with_extra.id}" in line
 
     def test_state_running_then_completed_persists(
         self,

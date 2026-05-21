@@ -78,6 +78,7 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
         session=SimpleNamespace(),
         hooks=SimpleNamespace(),
         failure_classifier=None,
+        dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
         claude=SimpleNamespace(config_dir=""),
     )
 

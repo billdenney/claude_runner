@@ -330,3 +330,22 @@ refresh_interval_ms = 1000
 # ---------------------------------------------------------------------------
 [fixtures]
 rotation_window_days = 30
+
+# ---------------------------------------------------------------------------
+# Dispatch-time sandbox scope (`--add-dir` propagation)
+#
+# Claude Code sandboxes each session to its `cwd` by default. Reading or
+# writing paths outside cwd is blocked unless `--add-dir <path>` extends
+# the allowed scope. The runner always passes `--add-dir <queue_dir>`
+# automatically so dispatched agents can reach the queue's papers/,
+# sidecar/, and reports/ subtrees. Per-task `additional_dirs` in the
+# YAML are honoured too.
+#
+# `auto_detect_paths_in_prompt` is a power-user knob: when ON, the
+# dispatcher scans the prompt text for absolute paths and adds the
+# ones that resolve to existing directories. Useful for queues whose
+# prompts inline source paths; off by default because absolute-path
+# strings in prose are not always directories (false positives).
+# ---------------------------------------------------------------------------
+[dispatch]
+auto_detect_paths_in_prompt = false

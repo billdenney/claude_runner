@@ -41,6 +41,7 @@ from pathlib import Path
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
+    DispatchSettings,
     FailureClassifierSettings,
     HookSettings,
     SessionSettings,
@@ -57,6 +58,7 @@ from claude_task_runner.queue.store import (
     state_path_for,
     write_state_atomic,
 )
+from claude_task_runner.runner import add_dirs as add_dirs_mod
 from claude_task_runner.runner import caps as caps_mod
 from claude_task_runner.runner import heartbeat as hb_mod
 from claude_task_runner.runner import hooks as hooks_mod
@@ -107,6 +109,7 @@ def build_argv(
     plan: SpawnPlan,
     *,
     claude_executable: str = "claude",
+    add_dirs: list[Path] | None = None,
 ) -> list[str]:
     """Build the argv for ``subprocess.Popen``.
 
@@ -114,6 +117,12 @@ def build_argv(
     combination that produces the NDJSON we parse). The ``--verbose``
     flag is required by the claude CLI when ``--print`` is paired with
     stream-json output.
+
+    ``add_dirs`` (when non-empty) widens the spawned agent's sandbox
+    beyond its cwd; each path is forwarded as ``--add-dir <path>``.
+    The caller resolves the list via :mod:`runner.add_dirs` so that
+    the queue dir is always present and per-task entries are
+    validated.
     """
     argv: list[str] = [
         claude_executable,
@@ -125,6 +134,8 @@ def build_argv(
         argv.extend(["--model", task.model])
     if task.allowed_tools:
         argv.extend(["--allowedTools", ",".join(task.allowed_tools)])
+    for extra_dir in add_dirs or []:
+        argv.extend(["--add-dir", str(extra_dir)])
     if plan.strategy is ResumeStrategy.RESUME and plan.session_id:
         argv.extend(["--resume", plan.session_id])
     argv.extend(plan.extra_args)
@@ -259,6 +270,27 @@ def _dispatch_loop(
             break
 
     return summary, cap_violation
+
+
+_MAX_ADD_DIRS_LOG_CHARS = 300
+
+
+def _truncate_paths_for_log(paths: list[Path]) -> str:
+    """Format a list of paths for a single log line, truncating if long.
+
+    The dispatch log is one-line-per-attempt; an operator skimming
+    ``journalctl`` for "what scope did this task get" wants the list
+    inline rather than chasing a separate trace event. A pathological
+    YAML with two dozen entries would still dominate the line, so
+    cap the rendered string at ~300 chars and indicate truncation.
+    """
+    if not paths:
+        return "[]"
+    rendered = "[" + ", ".join(str(p) for p in paths) + "]"
+    if len(rendered) <= _MAX_ADD_DIRS_LOG_CHARS:
+        return rendered
+    truncated = rendered[: _MAX_ADD_DIRS_LOG_CHARS - 4]
+    return f"{truncated}...]"
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
@@ -405,6 +437,7 @@ def dispatch(
     settings_session: SessionSettings,
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
+    settings_dispatch: DispatchSettings | None = None,
     claude_executable: str = "claude",
     claude_config_dir: str = "",
     persist_state: bool = True,
@@ -461,8 +494,30 @@ def dispatch(
     if persist_state:
         write_state_atomic(new_state, state_path_for(queue_dir, task.id))
 
-    argv = build_argv(task, plan, claude_executable=claude_executable)
-    logger.info("dispatching task %s (attempt %d): %s", task.id, new_state.attempts, argv[0:1])
+    # Resolve --add-dir scope: queue dir is always added; per-task
+    # additional_dirs are merged in; prompt auto-detect is opt-in.
+    auto_detect = (
+        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
+    )
+    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
+        task,
+        queue_dir,
+        auto_detect=auto_detect,
+    )
+    argv = build_argv(
+        task,
+        plan,
+        claude_executable=claude_executable,
+        add_dirs=resolved_add_dirs,
+    )
+    logger.info(
+        "[dispatch] task_id=%s model=%s effort=%s attempt=%d add_dirs=%s",
+        task.id,
+        task.model,
+        task.effort,
+        new_state.attempts,
+        _truncate_paths_for_log(resolved_add_dirs),
+    )
 
     # Build the subprocess env. When `claude_config_dir` is set (per-queue
     # config selects a non-default Claude account, e.g. ~/.claude_personal),
