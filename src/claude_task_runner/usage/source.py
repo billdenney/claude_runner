@@ -3,11 +3,26 @@
 The supervisor consumes ``UsageReading`` values via an abstract
 :class:`UsageSource` so that tests can drive the state machine through
 scripted readings without spawning ``claude``. See ADR-0009.
+
+Three production sources are available, selected by ``[usage].source``:
+
+* ``"tty"`` — the original :class:`ClaudeUsageSource`; spawns
+  ``claude /usage`` in a PTY and scrapes the rendered TUI. Slow
+  (10-30s/capture) but reads exactly what the operator sees.
+* ``"api"`` — :class:`ApiUsageSource` (in ``api_source.py``); reads
+  rate-limit response headers from a minimal ``/v1/messages`` call.
+  Fast (~500ms) and cheap (~4 tokens), but the headers are reverse-
+  engineered and the OAuth token can expire.
+* ``"api_then_tty"`` — :class:`ApiThenTtyUsageSource` (this module);
+  tries API first, falls through to TTY on auth-expired / missing-
+  header / network error. The TTY fall-through naturally refreshes
+  the OAuth token as a side effect of spawning ``claude``.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -16,7 +31,14 @@ from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import UsageSettings
 from claude_task_runner.usage import capture as capture_mod
 from claude_task_runner.usage import parser as parser_mod
+from claude_task_runner.usage.drift import (
+    UsageApiAuthExpired,
+    UsageApiHeaderMissing,
+    UsageApiNetworkError,
+)
 from claude_task_runner.usage.models import UsageReading
+
+logger = logging.getLogger(__name__)
 
 
 class UsageSource(Protocol):
@@ -53,6 +75,50 @@ class ClaudeUsageSource:
         )
         reading = parser_mod.parse(raw, self._clock.now(), self._clock)
         return reading.model_copy(update={"capture_path": str(cap_path)})
+
+
+class ApiThenTtyUsageSource:
+    """Composite source: try API first, fall through to TTY on documented failures.
+
+    The API path is fast (~500ms) but the OAuth bearer can expire and
+    the rate-limit header names are reverse-engineered. The TTY path
+    spawns ``claude /usage``, which both reads usage and refreshes
+    the OAuth token natively. This composite gets the best of both:
+    the fast path the vast majority of the time, with a self-healing
+    fall-through that also keeps the token fresh.
+
+    Fall-through triggers (all defined in ``usage.drift``):
+
+    * :class:`UsageApiAuthExpired` — 401/403; the TTY spawn refreshes
+      the OAuth bearer as a side effect, so the next tick goes back
+      to the API path.
+    * :class:`UsageApiHeaderMissing` — the response was OK but the
+      ``anthropic-ratelimit-unified-*`` headers we depend on are gone
+      or renamed (a possible Anthropic-side change). The TTY path is
+      independent of that surface.
+    * :class:`UsageApiNetworkError` — network/TLS/DNS failure; the
+      TTY path goes through ``claude`` which has its own retry
+      machinery.
+
+    Any other exception (including format-drift on the TTY side)
+    propagates unchanged so the supervisor's existing error routing
+    fires.
+    """
+
+    def __init__(self, api: UsageSource, tty: UsageSource) -> None:
+        self._api = api
+        self._tty = tty
+
+    def read(self) -> UsageReading:
+        try:
+            return self._api.read()
+        except (UsageApiAuthExpired, UsageApiHeaderMissing, UsageApiNetworkError) as exc:
+            logger.info(
+                "API usage source failed (%s: %s); falling through to TTY",
+                type(exc).__name__,
+                exc,
+            )
+            return self._tty.read()
 
 
 class FakeUsageSource:

@@ -27,7 +27,12 @@ from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.states import SupervisorState
-from claude_task_runner.usage.source import ClaudeUsageSource
+from claude_task_runner.usage.api_source import ApiUsageSource
+from claude_task_runner.usage.source import (
+    ApiThenTtyUsageSource,
+    ClaudeUsageSource,
+    UsageSource,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -53,6 +58,52 @@ def _count_in_flight(queue_dir: Path) -> int:
         if state.status in ("running", "awaiting_sidecar", "possibly_hung"):
             n += 1
     return n
+
+
+def _build_tty_source(settings: object, queue_path: Path) -> ClaudeUsageSource:
+    return ClaudeUsageSource(
+        settings.usage,  # type: ignore[attr-defined]
+        RealClock(),
+        captures_dir=_captures_dir(queue_path),
+        claude_executable=settings.claude.executable,  # type: ignore[attr-defined]
+        claude_config_dir=settings.claude.config_dir,  # type: ignore[attr-defined]
+    )
+
+
+def _build_api_source(settings: object) -> ApiUsageSource:
+    return ApiUsageSource(
+        RealClock(),
+        config_dir=settings.claude.config_dir,  # type: ignore[attr-defined]
+        probe_model=settings.usage.api_probe_model,  # type: ignore[attr-defined]
+        timeout_s=settings.usage.api_timeout_s,  # type: ignore[attr-defined]
+    )
+
+
+def _build_usage_source(settings: object, queue_path: Path) -> UsageSource:
+    """Pick a UsageSource based on ``settings.usage.source``.
+
+    Single-account today: the chosen source uses
+    ``settings.claude.config_dir`` for both the TTY spawn and the
+    OAuth bearer lookup. Multi-account /usage capture (one source per
+    account, round-robin scheduled by ``AccountState.last_capture_at``)
+    is the next PR's territory; once that lands, this helper grows to
+    return a ``MultiAccountUsageSource`` that dispatches per-tick to
+    the most-overdue account's per-account TtyUsageSource /
+    ApiUsageSource pair.
+    """
+    mode = settings.usage.source  # type: ignore[attr-defined]
+    if mode == "tty":
+        return _build_tty_source(settings, queue_path)
+    if mode == "api":
+        return _build_api_source(settings)
+    if mode == "api_then_tty":
+        return ApiThenTtyUsageSource(
+            api=_build_api_source(settings),
+            tty=_build_tty_source(settings, queue_path),
+        )
+    # Pydantic Literal validation makes this unreachable, but defending
+    # against a runtime mutation of the settings object.
+    raise ValueError(f"unknown [usage].source: {mode!r}")
 
 
 @app.command("start")
@@ -91,13 +142,7 @@ def start(
     queue_path = queue_dir.resolve()
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
-    source = ClaudeUsageSource(
-        settings.usage,
-        RealClock(),
-        captures_dir=_captures_dir(queue_path),
-        claude_executable=settings.claude.executable,
-        claude_config_dir=settings.claude.config_dir,
-    )
+    source = _build_usage_source(settings, queue_path)
 
     try:
         handle = start_daemon(

@@ -8,8 +8,22 @@ etc.) so a component only depends on the section it reads.
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+UsageSourceMode = Literal["tty", "api", "api_then_tty"]
+"""Which production :class:`UsageSource` the daemon should use.
+
+* ``"tty"`` (default) — spawn ``claude /usage`` and parse the TUI.
+  Slow (10-30s/capture) but reads exactly what the operator sees.
+* ``"api"`` — read rate-limit headers from a minimal
+  ``/v1/messages`` call. Fast and cheap (~4 tokens/poll) but the
+  headers are reverse-engineered and the OAuth token can expire.
+* ``"api_then_tty"`` — API path with TTY fall-through on documented
+  API failures (auth-expired / missing-header / network). The TTY
+  fall-through also refreshes the OAuth token as a side effect.
+"""
 
 
 class _StrictModel(BaseModel):
@@ -28,6 +42,15 @@ operator workflows obvious and shell-friendly.
 
 
 class UsageSettings(_StrictModel):
+    source: UsageSourceMode = "tty"
+    """Which :class:`UsageSource` implementation to use. See
+    :data:`UsageSourceMode` for the trade-offs.
+
+    The default ``"tty"`` keeps the historical behaviour. Operators
+    who want the fast path opt in by setting ``[usage].source =
+    "api_then_tty"`` (recommended over ``"api"`` because the TTY
+    fall-through also refreshes the OAuth token on expiry)."""
+
     capture_trust_timeout_s: float = Field(gt=0)
     capture_usage_timeout_s: float = Field(gt=0)
     capture_eof_timeout_s: float = Field(gt=0)
@@ -38,6 +61,16 @@ class UsageSettings(_StrictModel):
     healthcheck_interval_s: float = Field(gt=0)
     suspicious_delta_pct: int = Field(ge=0, le=100)
     drift_recovery_clean_polls: int = Field(ge=1)
+    api_timeout_s: float = Field(default=10.0, gt=0)
+    """Per-request timeout for the API usage source (seconds).
+    Generous enough to swallow ordinary network jitter, tight enough
+    that the daemon's tick loop doesn't stall on a stuck connection.
+    Ignored when ``source = "tty"``."""
+
+    api_probe_model: str = "claude-haiku-4-5"
+    """Cheapest model for the API probe call. The choice only affects
+    cost; the rate-limit headers come back the same regardless.
+    Ignored when ``source = "tty"``."""
 
 
 class TimeOfDaySettings(_StrictModel):

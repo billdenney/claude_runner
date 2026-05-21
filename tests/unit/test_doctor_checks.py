@@ -784,3 +784,31 @@ def test_all_checks_can_disable_paths_check(settings: Settings, queue_dir: Path)
     results_off = [fn() for fn in checks_off]
     task_paths_result = next(r for r in results_off if r.name == "task_paths")
     assert "skipped" in task_paths_result.detail
+
+
+def test_all_checks_api_usage_off_by_default(settings: Settings, queue_dir: Path) -> None:
+    """The API usage probe is opt-in so doctor doesn't spend tokens unprompted."""
+    checks = list(all_checks(settings, queue_dir))
+    results = [fn() for fn in checks]
+    assert not any(r.name == "api_usage_source" for r in results)
+
+
+def test_all_checks_api_usage_on_when_enabled(
+    settings: Settings,
+    queue_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """--check-api-usage adds the probe; with a missing creds file it
+    surfaces as FAIL with a remediation pointing at `claude /login`."""
+    from claude_task_runner.config.schema import AccountSettings
+
+    s = settings.model_copy(
+        update={
+            "accounts": [AccountSettings(name="probe", config_dir=str(tmp_path / "nope"))],
+        }
+    )
+    checks = list(all_checks(s, queue_dir, check_api_usage=True))
+    results = [fn() for fn in checks]
+    api_result = next(r for r in results if r.name == "api_usage_source")
+    assert api_result.status == CheckStatus.FAIL
+    assert "claude /login" in api_result.remediation

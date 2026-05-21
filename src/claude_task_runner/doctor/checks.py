@@ -790,6 +790,90 @@ def check_skills_installed(_settings: Settings) -> CheckResult:
     )
 
 
+def check_api_usage_source(settings: Settings) -> CheckResult:
+    """Probe the API usage source against each configured account.
+
+    Off by default (the doctor CLI exposes ``--check-api-usage`` to
+    opt in) because it sends one real ``/v1/messages`` call per account
+    — a few tokens each, but not free. When enabled, surfaces:
+
+    * Missing / unparseable ``<config_dir>/.credentials.json``.
+    * 401/403 from the API (token expired; operator should run
+      ``claude /login`` against that config_dir to refresh).
+    * Missing rate-limit headers (Anthropic side may have changed
+      them; the runner will fall back to TTY in ``api_then_tty`` mode
+      but ``api``-only configurations would stop working).
+
+    Reports the resolved 5h / weekly utilization per account so the
+    operator can compare against ``claude /usage`` and confirm the
+    API path is trustworthy before flipping ``[usage].source`` to
+    ``"api_then_tty"``.
+    """
+    # Local imports to keep the doctor module's top-level import graph
+    # narrow — the API source pulls in urllib, json, etc. but isn't
+    # used by most check functions.
+    from claude_task_runner.clock import RealClock
+    from claude_task_runner.usage.api_source import ApiUsageSource
+    from claude_task_runner.usage.drift import (
+        UsageApiAuthExpired,
+        UsageApiHeaderMissing,
+        UsageApiNetworkError,
+    )
+
+    if not settings.accounts:
+        return CheckResult(
+            name="api_usage_source",
+            status=CheckStatus.PASS,
+            detail="no accounts configured (skipped)",
+        )
+
+    rows: list[str] = []
+    failures: list[str] = []
+    for acct in settings.accounts:
+        src = ApiUsageSource(
+            RealClock(),
+            config_dir=acct.config_dir,
+            probe_model=settings.usage.api_probe_model,
+            timeout_s=settings.usage.api_timeout_s,
+        )
+        try:
+            reading = src.read()
+        except UsageApiAuthExpired as exc:
+            failures.append(
+                f"{acct.name}: auth expired ({exc}). "
+                f"Fix: CLAUDE_CONFIG_DIR={acct.config_dir or '~/.claude'} claude /login"
+            )
+            continue
+        except UsageApiHeaderMissing as exc:
+            failures.append(
+                f"{acct.name}: headers missing ({exc}). "
+                'API source unusable; stay on `[usage].source = "tty"`.'
+            )
+            continue
+        except UsageApiNetworkError as exc:
+            failures.append(f"{acct.name}: network ({exc})")
+            continue
+        rows.append(
+            f"{acct.name}: 5h={reading.five_hour.utilization_pct}% "
+            f"weekly={reading.seven_day.utilization_pct}% "
+            f"(5h resets {reading.five_hour.resets_at}, "
+            f"weekly resets {reading.seven_day.resets_at})"
+        )
+
+    if failures:
+        return CheckResult(
+            name="api_usage_source",
+            status=CheckStatus.FAIL,
+            detail=f"{len(failures)} of {len(settings.accounts)} accounts failed API probe",
+            remediation="\n".join(failures + rows),
+        )
+    return CheckResult(
+        name="api_usage_source",
+        status=CheckStatus.PASS,
+        detail="API readings: " + "; ".join(rows),
+    )
+
+
 def check_watchdog_installed(settings: Settings) -> CheckResult:
     """Either a systemd unit or a cron managed-block should exist."""
     systemd_present = systemd_mod.systemd_unit_path().exists()
@@ -830,14 +914,21 @@ def all_checks(
     queue_dir: Path,
     *,
     check_paths: bool = True,
+    check_api_usage: bool = False,
 ) -> Iterable[Callable[[], CheckResult]]:
     """Return zero-arg callables, in the order to run them.
 
     ``check_paths`` toggles :func:`check_task_paths`. Defaults to True;
     the doctor CLI exposes ``--no-check-paths`` to skip it on large
     queues where the existence sweep is unwanted.
+
+    ``check_api_usage`` toggles :func:`check_api_usage_source`. Defaults
+    to False because the probe sends a real (cheap) ``/v1/messages``
+    call per account; the doctor CLI exposes ``--check-api-usage`` to
+    opt in. Useful before flipping ``[usage].source`` to
+    ``"api_then_tty"``.
     """
-    return [
+    checks: list[Callable[[], CheckResult]] = [
         lambda: check_claude_binary(settings),
         lambda: check_accounts(settings),
         lambda: check_legacy_claude_config_dir(settings),
@@ -854,3 +945,6 @@ def all_checks(
         lambda: check_skills_installed(settings),
         lambda: check_watchdog_installed(settings),
     ]
+    if check_api_usage:
+        checks.append(lambda: check_api_usage_source(settings))
+    return checks
