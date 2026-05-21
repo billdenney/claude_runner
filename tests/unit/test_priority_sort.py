@@ -45,6 +45,7 @@ from claude_task_runner.queue.store import (
     todo_dir,
     write_task_atomic,
 )
+from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
     planned_dispatch_order,
     priority_sort_key,
@@ -76,6 +77,8 @@ def _make_task(qd: Path, task_id: str, **overrides: Any) -> Task:
 
 def _make_settings(*, initial: int = 1, max_c: int = 5) -> Any:
     """Minimal Settings shape used by tick_dispatch."""
+    from claude_task_runner.config.schema import AccountSettings
+
     return SimpleNamespace(
         concurrency=SimpleNamespace(
             initial_concurrency=initial,
@@ -85,29 +88,60 @@ def _make_settings(*, initial: int = 1, max_c: int = 5) -> Any:
         session=SimpleNamespace(),
         hooks=SimpleNamespace(),
         failure_classifier=None,
+        dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
         claude=SimpleNamespace(config_dir=""),
+        accounts=[AccountSettings(name="default", config_dir="")],
     )
 
 
 def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
+    from claude_task_runner.supervisor.states import AccountState
+
     return SupervisorSnapshot.model_validate(
         {
             "state": state,
             "since": datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC),
+            "accounts": {
+                "default": AccountState(
+                    state=SupervisorState.DISPATCHING,
+                    since=datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC),
+                ),
+            },
         }
     )
 
 
-def _capture_dispatch_order(*, queue_dir: Path, settings: Any) -> list[str]:
+def _resolved(cap: int) -> list:
+    """Single-account ResolvedAccount with the given concurrency cap."""
+    from claude_task_runner.config.schema import (
+        AccountConcurrencyPolicy,
+        AccountPolicy,
+        ResolvedAccount,
+    )
+
+    return [
+        ResolvedAccount(
+            name="default",
+            config_dir="",
+            policy=AccountPolicy(
+                concurrency=AccountConcurrencyPolicy(max_concurrency=cap),
+            ),
+        ),
+    ]
+
+
+def _capture_dispatch_order(*, queue_dir: Path, settings: Any, cap: int = 5) -> list[str]:
     """Drive tick_dispatch once and return ``[task_id, ...]`` in dispatch order.
 
     Wraps ``Thread.start`` so we record the order in which dispatch
     threads were SPAWNED (which is the order ``tick_dispatch`` chose),
     not the order they happened to finish. Patches the dispatcher
-    itself to a no-op so the test stays unit-scale.
+    itself to a no-op so the test stays unit-scale. ``cap`` overrides
+    the per-account ``max_concurrency`` so the tick target isn't
+    clipped to 1 (the default from an empty per-account policy file).
     """
     snap = _make_snapshot(SupervisorState.DISPATCHING)
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     dispatch_order: list[str] = []
     real_thread_start = threading.Thread.start
 
@@ -128,10 +162,11 @@ def _capture_dispatch_order(*, queue_dir: Path, settings: Any) -> list[str]:
             settings=settings,
             clock=RealClock(),
             snapshot=snap,
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
+            accounts=_resolved(cap=cap),
         )
-        for th in list(in_flight.values()):
-            th.join(timeout=2)
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
     return dispatch_order
 
 

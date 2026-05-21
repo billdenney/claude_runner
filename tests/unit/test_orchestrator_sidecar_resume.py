@@ -38,6 +38,7 @@ from claude_task_runner.queue.store import (
     state_path_for,
     write_state_atomic,
 )
+from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import _eligible_candidates
 
 
@@ -131,7 +132,7 @@ def test_unparseable_task_yaml_is_skipped(queue_dir: Path) -> None:
     (queue_dir / "todo" / "broken.yaml").write_text(
         "this is not: valid: yaml: at: all: [\n", encoding="utf-8"
     )
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     # The broken YAML produces no Task; eligible list is empty (or only
     # contains successfully-parsed tasks). Either way, no exception.
@@ -157,7 +158,7 @@ def test_unparseable_state_file_treated_as_undispatched(queue_dir: Path) -> None
     _write_task_yaml(queue_dir, task)
     state_path_for(queue_dir, task.id).parent.mkdir(parents=True, exist_ok=True)
     state_path_for(queue_dir, task.id).write_text("not yaml: ][[", encoding="utf-8")
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert task.id in {t.id for t in eligible}
 
@@ -171,7 +172,7 @@ def test_unmet_depends_on_blocks_dispatch(queue_dir: Path) -> None:
         depends_on=["upstream-not-done"],
     )
     _write_task_yaml(queue_dir, blocked)
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert "blocked" not in {t.id for t in eligible}
 
@@ -193,7 +194,7 @@ def test_awaiting_sidecar_with_open_request_is_not_eligible(
     )
     write_request(queue_dir, _make_request(task.id, 1))
 
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert eligible == []
 
@@ -214,7 +215,7 @@ def test_awaiting_sidecar_with_all_requests_answered_is_eligible(
     write_request(queue_dir, _make_request(task.id, 1))
     write_response(queue_dir, _make_response(task.id, 1))
 
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert [t.id for t in eligible] == [task.id]
 
@@ -235,7 +236,7 @@ def test_awaiting_sidecar_with_later_unanswered_request_is_not_eligible(
     write_response(queue_dir, _make_response(task.id, 1))
     write_request(queue_dir, _make_request(task.id, 2))
 
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert eligible == []
 
@@ -255,7 +256,7 @@ def test_awaiting_sidecar_with_all_multi_round_requests_answered_is_eligible(
     write_request(queue_dir, _make_request(task.id, 2))
     write_response(queue_dir, _make_response(task.id, 2))
 
-    in_flight: dict[str, threading.Thread] = {}
+    in_flight: dict[str, DispatchSlot] = {}
     eligible = _eligible_candidates(queue_dir, in_flight, set())
     assert [t.id for t in eligible] == [task.id]
 
@@ -286,7 +287,7 @@ def test_other_terminal_statuses_still_skipped(queue_dir: Path) -> None:
             attempts=1,
         )
         write_state_atomic(state, state_path_for(sub, task.id))
-        in_flight: dict[str, threading.Thread] = {}
+        in_flight: dict[str, DispatchSlot] = {}
         eligible = _eligible_candidates(sub, in_flight, set())
         if expect_eligible:
             assert [t.id for t in eligible] == [task.id], (

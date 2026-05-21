@@ -24,6 +24,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
+from claude_task_runner.runner.in_flight import DispatchSlot
 
 
 @pytest.fixture
@@ -38,12 +39,15 @@ def queue_dir(tmp_path: Path) -> Path:
 def _make_settings(*, initial: int = 1, max_c: int = 2) -> Any:
     """Minimal Settings-shaped object for the tick_consume path.
 
-    tick_consume only touches ``concurrency.max_concurrency`` and
-    ``claude.executable``; the orchestrator's ``_dispatch_one_safely``
-    is patched in every test so the rest of the settings tree is
-    irrelevant. Using SimpleNamespace keeps the test free of the full
-    pydantic Settings dependency.
+    tick_consume only touches ``concurrency.max_concurrency``,
+    ``claude.executable``, and ``accounts`` (via resolve_accounts);
+    the orchestrator's ``_dispatch_one_safely`` is patched in every
+    test so the rest of the settings tree is irrelevant. Using
+    SimpleNamespace keeps the test free of the full pydantic Settings
+    dependency.
     """
+    from claude_task_runner.config.schema import AccountSettings
+
     return SimpleNamespace(
         concurrency=SimpleNamespace(
             initial_concurrency=initial,
@@ -54,6 +58,20 @@ def _make_settings(*, initial: int = 1, max_c: int = 2) -> Any:
         hooks=SimpleNamespace(),
         failure_classifier=None,
         claude=SimpleNamespace(executable="claude", config_dir=""),
+        dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
+        accounts=[AccountSettings(name="default", config_dir="")],
+    )
+
+
+def _slot(task_id: str, thread: threading.Thread, account: str = "default") -> Any:
+    """Build a DispatchSlot for tests that need to seed a pre-existing in-flight entry."""
+    from claude_task_runner.runner.in_flight import DispatchSlot
+
+    return DispatchSlot(
+        task_id=task_id,
+        account=account,
+        started_at=datetime(2026, 5, 21, tzinfo=UTC),
+        thread=thread,
     )
 
 
@@ -133,12 +151,12 @@ class TestRequestIO:
 class TestTickConsume:
     def test_no_requests_no_op(self, queue_dir: Path) -> None:
         settings = _make_settings()
-        in_flight: dict[str, threading.Thread] = {}
+        in_flight: dict[str, DispatchSlot] = {}
         n = fd_mod.tick_consume(
             queue_dir=queue_dir,
             settings=settings,
             clock=RealClock(),
-            in_flight_threads=in_flight,
+            in_flight_slots=in_flight,
         )
         assert n == 0
         assert in_flight == {}
@@ -147,7 +165,7 @@ class TestTickConsume:
         _make_task(queue_dir, "t1")
         fd_mod.write_request(queue_dir, "t1")
         settings = _make_settings(max_c=2)
-        in_flight: dict[str, threading.Thread] = {}
+        in_flight: dict[str, DispatchSlot] = {}
 
         with patch(
             "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -157,12 +175,12 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
             assert n == 1
             assert "t1" in in_flight
-            for th in list(in_flight.values()):
-                th.join(timeout=2)
+            for slot in list(in_flight.values()):
+                slot.thread.join(timeout=2)
 
         # Request file has been consumed.
         assert not fd_mod.request_path(queue_dir, "t1").exists()
@@ -170,7 +188,7 @@ class TestTickConsume:
     def test_drops_request_when_task_missing(self, queue_dir: Path) -> None:
         fd_mod.write_request(queue_dir, "ghost")
         settings = _make_settings()
-        in_flight: dict[str, threading.Thread] = {}
+        in_flight: dict[str, DispatchSlot] = {}
         with patch(
             "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
             return_value=None,
@@ -179,7 +197,7 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
         assert n == 0
         assert not fd_mod.request_path(queue_dir, "ghost").exists()
@@ -190,7 +208,7 @@ class TestTickConsume:
         _seed_state(queue_dir, "t1", "awaiting_sidecar")
         fd_mod.write_request(queue_dir, "t1")
         settings = _make_settings()
-        in_flight: dict[str, threading.Thread] = {}
+        in_flight: dict[str, DispatchSlot] = {}
         with patch(
             "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
             return_value=None,
@@ -199,7 +217,7 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
         assert n == 0
         assert not fd_mod.request_path(queue_dir, "t1").exists()
@@ -213,7 +231,7 @@ class TestTickConsume:
         stop = threading.Event()
         ghost = threading.Thread(target=lambda: stop.wait(timeout=5), daemon=True)
         ghost.start()
-        in_flight = {"t1": ghost}
+        in_flight = {"t1": _slot("t1", ghost)}
 
         settings = _make_settings()
         with patch(
@@ -224,7 +242,7 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
         assert n == 0
         mock_dispatch.assert_not_called()
@@ -240,7 +258,7 @@ class TestTickConsume:
         stop = threading.Event()
         busy = threading.Thread(target=lambda: stop.wait(timeout=5), daemon=True)
         busy.start()
-        in_flight = {"already-busy": busy}
+        in_flight = {"already-busy": _slot("already-busy", busy)}
 
         with patch(
             "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -250,7 +268,7 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
         assert n == 0
         mock_dispatch.assert_not_called()
@@ -268,7 +286,7 @@ class TestTickConsume:
         stop = threading.Event()
         busy = threading.Thread(target=lambda: stop.wait(timeout=5), daemon=True)
         busy.start()
-        in_flight = {"already-busy": busy}
+        in_flight = {"already-busy": _slot("already-busy", busy)}
 
         with patch(
             "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
@@ -278,12 +296,12 @@ class TestTickConsume:
                 queue_dir=queue_dir,
                 settings=settings,
                 clock=RealClock(),
-                in_flight_threads=in_flight,
+                in_flight_slots=in_flight,
             )
             assert n == 1
             assert "t1" in in_flight
             for tid in ["t1"]:
-                in_flight[tid].join(timeout=2)
+                in_flight[tid].thread.join(timeout=2)
 
         stop.set()
         busy.join(timeout=2)
