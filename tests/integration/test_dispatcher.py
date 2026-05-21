@@ -110,6 +110,14 @@ class TestBuildArgv:
         assert "--verbose" in argv
         assert "--model" in argv
         assert "--allowedTools" in argv
+        # Autonomous dispatch must accept edits up-front; the default
+        # permission policy blocks Write/Edit/Bash-redirect with
+        # "permissions not yet granted" prompts that ``--print`` cannot
+        # honour. See the comment in build_argv() for the observed
+        # symptom (task 130-lowe_2009_omalizumab on 2026-05-21).
+        assert "--permission-mode" in argv
+        idx = argv.index("--permission-mode")
+        assert argv[idx + 1] == "acceptEdits"
         assert argv[-1] == task.prompt
         assert "--resume" not in argv
 

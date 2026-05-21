@@ -129,6 +129,19 @@ def build_argv(
         "--print",
         "--output-format=stream-json",
         "--verbose",
+        # Autonomous dispatch can't honour interactive permission grants;
+        # the default permission policy in ``--print`` mode blocks every
+        # first-time Write/Edit/Bash-redirect with "Claude requested
+        # permissions to write to <path>, but you haven't granted it yet".
+        # ``acceptEdits`` auto-grants file edits (Write/Edit and bash
+        # redirects within the allowed-dir scope) while still gating
+        # destructive shell operations and out-of-scope paths. Without
+        # this flag the agent reads sources, drafts the model in
+        # conversation, and exits cleanly via ``end_turn_no_output``
+        # because every Write attempt was blocked (observed 2026-05-21
+        # with task ``130-lowe_2009_omalizumab``).
+        "--permission-mode",
+        "acceptEdits",
     ]
     if task.model:
         argv.extend(["--model", task.model])
