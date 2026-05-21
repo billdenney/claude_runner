@@ -272,6 +272,128 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         pass
 
 
+def _snapshot_pre_dispatch_sha(working_dir: Path | None) -> str | None:
+    """Return the current ``HEAD`` SHA inside ``working_dir``, or ``None``.
+
+    Used by the output-evidence gate (ADR-0020) to compare commits
+    before vs. after dispatch. Failures (cwd not a git repo, ``git``
+    missing, subprocess error) are swallowed with a warning — the gate
+    falls back to skipping the commit check rather than blocking
+    dispatch.
+    """
+    if working_dir is None:
+        return None
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("pre-dispatch SHA snapshot failed for %s: %s", working_dir, exc)
+        return None
+    if completed.returncode != 0:
+        logger.warning(
+            "pre-dispatch SHA snapshot non-zero exit for %s (rc=%d): %s",
+            working_dir,
+            completed.returncode,
+            completed.stderr.strip(),
+        )
+        return None
+    sha = completed.stdout.strip()
+    return sha or None
+
+
+def _new_commit_since(working_dir: Path, pre_sha: str) -> bool:
+    """True iff ``HEAD`` has moved past ``pre_sha`` since dispatch start."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-list", "--count", f"{pre_sha}..HEAD"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("post-dispatch commit check failed for %s: %s", working_dir, exc)
+        return False
+    if completed.returncode != 0:
+        return False
+    try:
+        return int(completed.stdout.strip() or "0") > 0
+    except ValueError:
+        return False
+
+
+@dataclass(frozen=True)
+class OutputEvidence:
+    """Why a clean-exit run is (or isn't) judged to have produced output.
+
+    Set by :func:`_verify_output_evidence` and consumed in
+    :func:`_finalize_state` to either pass the ``completed`` gate or
+    flip the status to ``failed`` with stop_reason
+    ``end_turn_no_output``.
+    """
+
+    has_commit: bool
+    has_sidecar: bool
+    has_deliverable: bool
+
+    @property
+    def any(self) -> bool:
+        return self.has_commit or self.has_sidecar or self.has_deliverable
+
+    def missed_gates(self) -> str:
+        misses: list[str] = []
+        if not self.has_commit:
+            misses.append("no new commit on branch")
+        if not self.has_sidecar:
+            misses.append("no open sidecar")
+        if not self.has_deliverable:
+            misses.append("no declared deliverable on disk")
+        return "; ".join(misses)
+
+
+def _verify_output_evidence(
+    *,
+    task: Task,
+    pre_sha: str | None,
+    has_open_sidecar: bool,
+) -> OutputEvidence:
+    """Check whether a clean-exit run left an observable artifact behind.
+
+    See ADR-0020. Returns an ``OutputEvidence`` describing which gates
+    matched. The caller decides the consequence: at least one True ⇒
+    ``completed``; all False ⇒ ``failed`` with stop_reason
+    ``end_turn_no_output``.
+
+    When ``task.working_dir is None`` the dispatcher caller skips
+    calling this function entirely (existing non-worktree-task
+    behavior is preserved).
+    """
+    working_dir = task.working_dir
+    assert working_dir is not None  # caller ensures
+
+    has_commit = pre_sha is not None and _new_commit_since(working_dir, pre_sha)
+
+    has_deliverable = False
+    for rel in task.deliverable_paths:
+        candidate = rel if rel.is_absolute() else working_dir / rel
+        if candidate.exists():
+            has_deliverable = True
+            break
+
+    return OutputEvidence(
+        has_commit=has_commit,
+        has_sidecar=has_open_sidecar,
+        has_deliverable=has_deliverable,
+    )
+
+
 def dispatch(
     *,
     task: Task,
@@ -366,6 +488,12 @@ def dispatch(
     _trust_dir = task.working_dir if task.working_dir else Path.cwd()
     _ensure_claude_init(claude_config_dir or None, _trust_dir)
 
+    # Snapshot HEAD before spawning so the post-run output-evidence
+    # gate (ADR-0020) can detect a new commit. Failure here is a
+    # warning, not an error — the gate degrades gracefully to checking
+    # only sidecar/deliverable evidence.
+    pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
+
     process = subprocess.Popen(  # caller-controlled
         argv,
         stdout=subprocess.PIPE,
@@ -410,13 +538,22 @@ def dispatch(
         stderr_tail=stderr_tail,
     )
 
-    final_state = _finalize_state(
+    # Detect open sidecar once and thread it through finalization. The
+    # output-evidence gate (ADR-0020) consults it when deciding whether
+    # a clean exit really produced anything; the awaiting_sidecar
+    # override below uses the same answer.
+    has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
+
+    final_state, run_record = _finalize_state(
         prior=new_state,
         plan=plan,
+        task=task,
         run=run_record,
         summary=summary,
         cap_violation=cap_violation,
         settings_failure_classifier=settings_failure_classifier,
+        pre_sha=pre_sha,
+        has_open_sidecar=has_open_sidecar,
     )
 
     # Stop-and-ask override: if the agent wrote a sidecar request that has
@@ -425,7 +562,6 @@ def dispatch(
     # exited — clean exit, error, or cap. The orchestrator's eligibility
     # check skips awaiting_sidecar tasks, so the slot frees for the next
     # pending task while this one waits for the operator.
-    has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
     if has_open_sidecar:
         final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
 
@@ -491,8 +627,12 @@ def _finalize_state(
     summary: StreamSummary,
     cap_violation: caps_mod.CapViolation | None,
     settings_failure_classifier: FailureClassifierSettings | None = None,
-) -> TaskState:
-    """Apply a RunRecord to a TaskState, returning the post-attempt state.
+    task: Task | None = None,
+    pre_sha: str | None = None,
+    has_open_sidecar: bool = False,
+) -> tuple[TaskState, RunRecord]:
+    """Apply a RunRecord to a TaskState, returning the post-attempt state
+    and the (possibly amended) RunRecord.
 
     When ``settings_failure_classifier`` is supplied AND consecutive
     failures (including this one) reach the configured
@@ -503,15 +643,43 @@ def _finalize_state(
     way every attempt (e.g. agent exits with ``stop_sequence`` and
     no real output) gets re-dispatched indefinitely because
     ``_DISPATCHABLE_STATUSES = {"pending", "failed"}``.
-    """
-    new_runs = [*prior.runs, run]
 
+    A second gate (ADR-0020) flips a would-be ``completed`` status to
+    ``failed`` with stop_reason ``end_turn_no_output`` when the run
+    produced no observable artifact (no new commit on the worktree
+    branch, no open sidecar, no declared deliverable on disk). The
+    gate is opt-in: it only runs when ``task`` is supplied AND
+    ``task.working_dir is not None``. The original-attempt RunRecord
+    is amended so its ``stop_reason`` and ``error`` reflect the gate
+    miss; the returned RunRecord is what callers should persist.
+    """
     if cap_violation is not None:
         new_status = "failed"
     elif run.error is None and run.stop_reason in ("end_turn", "result"):
         new_status = "completed"
     else:
         new_status = "failed"
+
+    # ADR-0020: gate "completed" on at least one observable output
+    # artifact. Skip when the task has no working_dir (research/analysis
+    # tasks intentionally run without a worktree; existing behavior is
+    # preserved in that case).
+    if new_status == "completed" and task is not None and task.working_dir is not None:
+        evidence = _verify_output_evidence(
+            task=task,
+            pre_sha=pre_sha,
+            has_open_sidecar=has_open_sidecar,
+        )
+        if not evidence.any:
+            new_status = "failed"
+            run = run.model_copy(
+                update={
+                    "stop_reason": "end_turn_no_output",
+                    "error": (f"no observable output produced ({evidence.missed_gates()})"),
+                }
+            )
+
+    new_runs = [*prior.runs, run]
 
     # Trip the circuit breaker on consecutive failures so we don't
     # auto-retry forever. The threshold is queue-configured under
@@ -531,7 +699,7 @@ def _finalize_state(
         else prior.resume_attempts
     )
 
-    return prior.model_copy(
+    new_state = prior.model_copy(
         update={
             "status": new_status,
             "session_id": new_session_id,
@@ -543,6 +711,7 @@ def _finalize_state(
             "runs": new_runs,
         }
     )
+    return new_state, run
 
 
 def _record_pre_dispatch_failure(
@@ -595,7 +764,7 @@ def _record_pre_dispatch_failure(
             "last_started_at": started_at,
         }
     )
-    new_state = _finalize_state(
+    new_state, run = _finalize_state(
         prior=prior_with_bumped_attempts,
         plan=plan,
         run=run,

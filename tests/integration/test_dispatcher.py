@@ -9,6 +9,7 @@ itself.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -313,3 +314,95 @@ class TestPostDispatchHook:
             claude_executable=str(SHIM_PATH),
         )
         assert outcome.new_state.status == "completed"
+
+
+class TestOutputEvidenceGate:
+    """End-to-end checks for the ADR-0020 output-evidence gate when
+    ``dispatch()`` runs with a real ``working_dir`` against the shim."""
+
+    @staticmethod
+    def _git(cwd: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+    def _init_repo(self, repo: Path) -> None:
+        repo.mkdir()
+        self._git(repo, "init", "-q", "-b", "main")
+        self._git(repo, "config", "user.email", "test@example.invalid")
+        self._git(repo, "config", "user.name", "Test")
+        (repo / "README.md").write_text("seed\n")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-q", "-m", "seed")
+
+    def test_clean_exit_no_artifact_flips_to_failed(
+        self,
+        queue_dir: Path,
+        tmp_path: Path,
+        reset_shim_env: None,
+    ) -> None:
+        repo = tmp_path / "wt"
+        self._init_repo(repo)
+        worktree_task = Task(
+            id="999-no-output",
+            title="No output",
+            prompt="Do nothing",
+            working_dir=repo,
+        )
+        plan = SpawnPlan(
+            strategy=ResumeStrategy.FRESH,
+            session_id=None,
+            prompt=worktree_task.prompt,
+            extra_args=[],
+        )
+        outcome = dispatch(
+            task=worktree_task,
+            state=TaskState(task_id=worktree_task.id),
+            plan=plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_session=_session(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+        )
+        assert outcome.new_state.status == "failed"
+        assert outcome.run_record.stop_reason == "end_turn_no_output"
+        assert outcome.run_record.error is not None
+        assert "no new commit" in outcome.run_record.error
+
+    def test_declared_deliverable_satisfies_gate(
+        self,
+        queue_dir: Path,
+        tmp_path: Path,
+        reset_shim_env: None,
+    ) -> None:
+        repo = tmp_path / "wt"
+        self._init_repo(repo)
+        # Pre-existing deliverable. The shim produces no commit but the
+        # declared path exists ⇒ gate passes.
+        (repo / "out.R").write_text("# stub\n")
+        worktree_task = Task(
+            id="998-has-deliverable",
+            title="Has deliverable",
+            prompt="Do nothing",
+            working_dir=repo,
+            deliverable_paths=[Path("out.R")],
+        )
+        plan = SpawnPlan(
+            strategy=ResumeStrategy.FRESH,
+            session_id=None,
+            prompt=worktree_task.prompt,
+            extra_args=[],
+        )
+        outcome = dispatch(
+            task=worktree_task,
+            state=TaskState(task_id=worktree_task.id),
+            plan=plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_session=_session(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+        )
+        assert outcome.new_state.status == "completed"
+        assert outcome.run_record.stop_reason == "end_turn"
