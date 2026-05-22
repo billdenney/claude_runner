@@ -414,6 +414,25 @@ refresh_interval_ms = 1000
 rotation_window_days = 30
 
 # ---------------------------------------------------------------------------
+# Logging
+#
+# The supervisor's log records flow through structlog processors and are
+# emitted to stderr — systemd's user service captures stderr into the
+# journal automatically, so `journalctl --user -u claude-task-runner -f`
+# shows live supervisor activity (dispatch decisions, throttle
+# transitions, /usage capture timings).
+#
+#   level   stdlib level name: DEBUG / INFO / WARNING / ERROR.
+#           INFO is the operator default; bump to DEBUG to track a
+#           specific dispatch's lifecycle.
+#   format  "text" = timestamped key=value lines (journalctl-friendly).
+#           "json" = one JSON object per record (log-shipper friendly).
+# ---------------------------------------------------------------------------
+[logging]
+level  = "INFO"
+format = "text"
+
+# ---------------------------------------------------------------------------
 # Dispatch-time sandbox scope (`--add-dir` propagation)
 #
 # Claude Code sandboxes each session to its `cwd` by default. Reading or

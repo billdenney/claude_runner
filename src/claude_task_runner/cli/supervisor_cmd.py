@@ -18,6 +18,7 @@ from rich.console import Console
 
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
+from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.store import (
     list_pending_tasks,
     list_state_files,
@@ -212,6 +213,14 @@ def start(
     """
     console = Console()
     settings = load_settings(config)
+    # Re-apply logging settings now that the queue's [logging] block has
+    # been read. The CLI entry point's early configure runs before Typer
+    # parses arguments (so it can use env-var overrides) with safe
+    # defaults; this call upgrades to the operator-configured level /
+    # format. No-op when the settings happen to match the env-var
+    # defaults.
+    configure_logging(level=settings.logging.level, fmt=settings.logging.format)
+
     queue_path = queue_dir.resolve()
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
