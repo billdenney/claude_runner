@@ -93,6 +93,21 @@ def systemd_unit_path() -> Path:
     return systemd_unit_dir() / f"{UNIT_NAME}.service"
 
 
+def _drain_command_from(supervisor_command: str) -> str:
+    """Derive the ``supervisor drain`` invocation from the ``supervisor start`` one.
+
+    Reuses the same binary path, ``--queue``, and ``--config`` so the
+    unit's stop command can be generated without the caller having to
+    pass it explicitly. Appends ``--no-wait`` so the ExecStop process
+    returns immediately after signalling SIGUSR1; systemd's own
+    main-PID wait (capped by ``TimeoutStopSec``) governs the drain
+    duration. Falls back to a substring substitution that does nothing
+    if ``supervisor_command`` doesn't include ``supervisor start`` —
+    the operator can still hand-edit the unit.
+    """
+    return supervisor_command.replace(" supervisor start", " supervisor drain") + " --no-wait"
+
+
 def build_unit_text(
     *,
     supervisor_command: str,
@@ -101,6 +116,7 @@ def build_unit_text(
     restart_sec_s: int = 30,
     start_limit_burst: int = 5,
     start_limit_interval_s: int = 600,
+    timeout_stop_sec: int = 14400,
 ) -> str:
     """Build the ``[Unit]/[Service]/[Install]`` text.
 
@@ -109,7 +125,28 @@ def build_unit_text(
     /home/bill/queue``). systemd's restart policy gives us crash-loop
     protection for free; we additionally cap with ``StartLimitBurst``
     so a hopelessly broken supervisor doesn't churn forever.
+
+    Graceful-drain wiring (PR 11):
+      * ``ExecStop`` calls ``supervisor drain --no-wait`` so
+        ``systemctl stop`` / ``restart`` signals SIGUSR1 and lets
+        systemd's own main-PID wait take over. The daemon's drain
+        loop finishes in-flight tasks before exiting cleanly.
+      * ``KillMode=process`` keeps systemd from killing dispatched
+        ``claude`` subprocesses if it ever has to escalate to
+        SIGKILL on the main PID after ``TimeoutStopSec``. Children
+        stay in the unit's cgroup but aren't signalled.
+      * ``TimeoutStopSec`` is generous (default 14400s = 4h, matching
+        ``[task_caps].max_duration_s_per_task``) so a legitimately
+        long in-flight task isn't SIGKILL'd before drain completes.
+        Operators with shorter caps override with ``timeout_stop_sec``.
+
+    For ``systemctl restart``, systemd runs ExecStop, waits for the
+    main PID to exit, and then starts the unit again. For
+    ``systemctl stop``, it runs ExecStop, waits for exit, and stays
+    stopped. ``Restart=on-failure`` covers crashes only — it never
+    fires for an operator-driven stop/restart.
     """
+    drain_command = _drain_command_from(supervisor_command)
     return (
         "[Unit]\n"
         f"Description={description}\n"
@@ -132,10 +169,15 @@ def build_unit_text(
         "Environment=PATH=%h/.local/bin:/usr/local/sbin:"
         "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
         f"ExecStart={supervisor_command}\n"
+        f"ExecStop={drain_command}\n"
         f"WorkingDirectory={queue_dir}\n"
+        # PR 11: graceful-drain wiring (see docstring).
+        "KillMode=process\n"
+        f"TimeoutStopSec={timeout_stop_sec}\n"
         "Restart=on-failure\n"
         f"RestartSec={restart_sec_s}\n"
-        # Don't restart when supervisor exits cleanly (e.g., STOPPED state).
+        # Don't restart when supervisor exits cleanly (e.g., STOPPED state
+        # or successful drain).
         "RestartPreventExitStatus=0\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"

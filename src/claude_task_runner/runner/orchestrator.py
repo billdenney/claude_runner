@@ -133,6 +133,7 @@ def tick_dispatch(
     in_flight_slots: dict[str, DispatchSlot],
     accounts: list[ResolvedAccount] | None = None,
     claude_executable: str = "claude",
+    draining: bool = False,
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
@@ -148,6 +149,12 @@ def tick_dispatch(
     spot; pass it explicitly to share one resolution across multiple
     callers per tick.
 
+    ``draining`` (PR 11): when ``True``, the function reaps finished
+    threads and refreshes the in_flight snapshot — but does not
+    enumerate candidates or dispatch new work. Used by the daemon's
+    graceful-restart path so the supervisor can ride out its
+    in-flight tasks before exiting.
+
     Dispatch gating (PR 9): a tick proceeds to candidate enumeration
     if AT LEAST ONE configured account is dispatchable (see
     :func:`_any_account_dispatchable`). The historical top-level
@@ -158,6 +165,14 @@ def tick_dispatch(
     another was fine, halving effective dispatch throughput.
     """
     _reap_finished(in_flight_slots)
+
+    if draining:
+        # Drain mode: skip both the candidate enumeration and
+        # choose_account routing. The reap above handled any threads
+        # that finished since the last tick; the refresh below
+        # surfaces the still-running set into the snapshot so the
+        # daemon's persist step records accurate in_flight attribution.
+        return _refresh_in_flight(snapshot, in_flight_slots)
 
     if accounts is None:
         # Local import to avoid a circular at module top: loader
