@@ -280,6 +280,96 @@ def stop(
     console.print(f"[green]SIGTERM sent to PID {pid}.[/]")
 
 
+@app.command("drain")
+def drain(
+    *,
+    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    wait: bool = typer.Option(
+        True,
+        "--wait/--no-wait",
+        help="Block until the supervisor exits (or --timeout elapses).",
+    ),
+    timeout: float = typer.Option(
+        3600.0,
+        "--timeout",
+        help=(
+            "When --wait, give up after N seconds. Default 1h — longer "
+            "than the longest plausible task. Exit code 4 if the timeout "
+            "fires; the supervisor will keep draining."
+        ),
+    ),
+    poll_s: float = typer.Option(
+        2.0,
+        "--poll",
+        help="When --wait, seconds between PID-liveness checks.",
+    ),
+) -> None:
+    """Graceful drain: stop dispatching NEW work; exit when in_flight=0.
+
+    Sends SIGUSR1 to the running supervisor. The supervisor stops
+    picking up new tasks immediately but keeps ticking so its reaper
+    sees in-flight completions; once every dispatched thread has
+    finished, the supervisor exits cleanly. The persisted snapshot
+    contains terminal state for every task that ran on it — a fresh
+    supervisor started afterwards re-reads ``supervisor.json`` and
+    picks up the queue without double-dispatching anything.
+
+    Combined with the systemd unit's ``ExecStop=... drain`` directive
+    and ``Restart=on-success``, this gives near-zero-downtime
+    supervisor restarts with zero lost work. The drain window is
+    bounded by the longest in-flight task (typically minutes for
+    extraction work; up to ``[task_caps].max_duration_s_per_task``
+    for the hard cap).
+
+    Exit codes:
+      0  supervisor exited cleanly (or --no-wait and signal delivered)
+      1  no PID file / stale PID file
+      2  signal delivery rejected (permission)
+      4  --wait timed out (supervisor still draining — re-run drain or stop)
+    """
+    console = Console()
+    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    pid = pidfile_mod.read_existing_pid(pid_path)
+    if pid is None:
+        console.print(f"[yellow]No PID file at {pid_path}[/]")
+        raise typer.Exit(code=1)
+    if not pidfile_mod.is_pid_alive(pid):
+        console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
+        raise typer.Exit(code=1)
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        console.print(f"[yellow]PID {pid} disappeared before SIGUSR1[/]")
+        raise typer.Exit(code=1) from None
+    except PermissionError as exc:
+        console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+    console.print(f"[green]SIGUSR1 (drain) sent to PID {pid}.[/]")
+
+    if not wait:
+        return
+
+    import time
+
+    console.print(
+        f"[dim]Waiting up to {timeout:.0f}s for PID {pid} to exit "
+        f"(polling every {poll_s:.0f}s)...[/]"
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not pidfile_mod.is_pid_alive(pid):
+            console.print(f"[green]PID {pid} exited; drain complete.[/]")
+            return
+        time.sleep(poll_s)
+    console.print(
+        f"[bold yellow]Drain still in progress after {timeout:.0f}s.[/] "
+        "The supervisor will keep draining. Re-run `supervisor drain` "
+        "to wait further, or `supervisor stop` to force-exit (in-flight "
+        "tasks will be killed by systemd's KillMode)."
+    )
+    raise typer.Exit(code=4)
+
+
 @app.command("status")
 def status(
     *,

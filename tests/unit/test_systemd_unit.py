@@ -55,6 +55,54 @@ class TestBuildUnitText:
         )
         assert "StartLimitBurst=10" in text
 
+    def test_includes_drain_execstop(self) -> None:
+        """ExecStop runs ``supervisor drain --no-wait`` so systemctl
+        stop/restart goes through the graceful-drain path."""
+        text = build_unit_text(
+            supervisor_command="/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml",
+            queue_dir=Path("/q"),
+        )
+        assert "ExecStop=" in text
+        assert "supervisor drain" in text
+        assert "--no-wait" in text
+        # Same binary path as ExecStart so the operator's pipx install
+        # is honoured.
+        assert "ExecStop=/usr/local/bin/claude-task-runner supervisor drain" in text
+        # Same --queue / --config so drain targets the right state file.
+        assert "--queue /q" in text
+        assert "--config /q/claude_runner.toml" in text
+
+    def test_kill_mode_process(self) -> None:
+        """KillMode=process so dispatched claude subprocesses survive
+        systemd's SIGKILL escalation on the main PID."""
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        assert "KillMode=process" in text
+
+    def test_timeout_stop_sec_default_matches_max_task_duration(self) -> None:
+        """Default TimeoutStopSec=14400 (4h) matches the default
+        [task_caps].max_duration_s_per_task so drain has time to finish
+        the longest plausibly-allowed task."""
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        assert "TimeoutStopSec=14400" in text
+
+    def test_timeout_stop_sec_customizable(self) -> None:
+        text = build_unit_text(
+            supervisor_command="x",
+            queue_dir=Path("/q"),
+            timeout_stop_sec=1800,
+        )
+        assert "TimeoutStopSec=1800" in text
+
+    def test_clean_drain_exit_does_not_restart(self) -> None:
+        """RestartPreventExitStatus=0 — a clean drain-exit means the
+        operator asked for stop/restart, NOT a crash. systemd's stop
+        sequence handles the eventual fresh-start when needed
+        (``systemctl restart`` runs stop then start; ``stop`` alone
+        leaves it stopped). Restart=on-failure only fires for crashes."""
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        assert "Restart=on-failure" in text
+        assert "RestartPreventExitStatus=0" in text
+
 
 class TestBuildInstallPlan:
     def test_default_path(self, tmp_path: Path) -> None:

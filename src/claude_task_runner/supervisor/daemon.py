@@ -355,6 +355,7 @@ def start_daemon(
 
     stop_flag = {"stop": False}
     reload_flag = {"pending": False}
+    drain_flag = {"draining": False}
 
     def _on_signal(signum: int, _frame: object) -> None:
         logger.info("supervisor caught signal %s; stopping", signum)
@@ -367,10 +368,26 @@ def start_daemon(
         logger.info("supervisor caught SIGHUP; reload pending on next tick")
         reload_flag["pending"] = True
 
+    def _on_sigusr1(_signum: int, _frame: object) -> None:
+        # Graceful drain (PR 11). Operator (or systemd's ExecStop)
+        # delivers SIGUSR1 when they want to restart without losing
+        # in-flight work. The handler flips the drain flag; the main
+        # loop stops dispatching new tasks but keeps ticking so the
+        # reaper sees in-flight completions. Once in_flight_slots is
+        # empty, the loop exits cleanly. Idempotent — a second
+        # SIGUSR1 doesn't do anything new.
+        if not drain_flag["draining"]:
+            logger.info(
+                "supervisor caught SIGUSR1; entering drain mode "
+                "(no new dispatches; exit when in_flight=0)"
+            )
+        drain_flag["draining"] = True
+
     if install_signal_handlers:
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGHUP, _on_sighup)
+        signal.signal(signal.SIGUSR1, _on_sigusr1)
 
     # Tracks live dispatch slots (thread + account attribution) keyed by
     # task id. Threads are non-daemon so the supervisor process won't
@@ -440,22 +457,29 @@ def start_daemon(
                 # Drain force-dispatch requests BEFORE the throttle gate so
                 # operator overrides land even when the state machine has
                 # parked the supervisor in THROTTLED_5H / PAUSED_WEEKLY.
-                try:
-                    fd_mod.tick_consume(
-                        queue_dir=queue_dir,
-                        settings=settings,
-                        clock=clk,
-                        in_flight_slots=in_flight_slots,
-                        claude_executable=settings.claude.executable,
-                    )
-                except Exception:
-                    logger.exception("force-dispatch tick_consume failed")
+                #
+                # Skipped entirely in drain mode: force-dispatch is by
+                # definition new work, and the operator's intent during
+                # drain is "finish what's running and exit." The next
+                # supervisor picks up the request file.
+                if not drain_flag["draining"]:
+                    try:
+                        fd_mod.tick_consume(
+                            queue_dir=queue_dir,
+                            settings=settings,
+                            clock=clk,
+                            in_flight_slots=in_flight_slots,
+                            claude_executable=settings.claude.executable,
+                        )
+                    except Exception:
+                        logger.exception("force-dispatch tick_consume failed")
 
                 # Reap finished dispatch threads + spawn new ones up to the
                 # target concurrency. tick_dispatch returns the snapshot
                 # with the refreshed InFlightRecord list; persist it so
                 # ``account list`` (and a restarted supervisor) see the
-                # current attribution.
+                # current attribution. In drain mode tick_dispatch skips
+                # the dispatch step but still reaps + refreshes.
                 try:
                     snapshot = orch_mod.tick_dispatch(
                         queue_dir=queue_dir,
@@ -464,10 +488,22 @@ def start_daemon(
                         snapshot=snapshot,
                         in_flight_slots=in_flight_slots,
                         claude_executable=settings.claude.executable,
+                        draining=drain_flag["draining"],
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
                     logger.exception("tick_dispatch failed")
+
+                # Drain-complete check: once every dispatch thread has
+                # finished, exit cleanly. Done AFTER tick_dispatch so the
+                # reap step inside it gets a final pass at picking up
+                # threads that completed during this tick.
+                if drain_flag["draining"] and not in_flight_slots:
+                    logger.info(
+                        "drain complete: in_flight=0; exiting cleanly so a "
+                        "fresh supervisor can pick up the queue"
+                    )
+                    break
 
                 if snapshot.state is SupervisorState.STOPPED:
                     logger.info("supervisor in STOPPED state; exiting loop")
