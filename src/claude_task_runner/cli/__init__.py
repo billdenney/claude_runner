@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import typer
 
 from claude_task_runner.cli import (
@@ -15,6 +17,32 @@ from claude_task_runner.cli import (
     usage_cmd,
     watchdog_cmd,
 )
+from claude_task_runner.observability import LogFormat, configure_logging
+
+
+def _early_configure_logging() -> None:
+    """Configure logging before Typer parses args.
+
+    Reads env-var overrides so operator-driven runs (one-off
+    ``claude-task-runner doctor --check-api-usage``) can crank to
+    DEBUG without editing the queue TOML. The defaults match the
+    ``[logging]`` defaults in settings.toml so production behaviour
+    is unchanged.
+
+    Settings-driven configuration (per-queue ``[logging]`` block) is
+    applied in commands that load settings — see e.g.
+    :mod:`cli.supervisor_cmd`. The ``configure_logging`` call is
+    idempotent so the later, fully-resolved call is a no-op when the
+    env-var path already configured the same.
+    """
+    level = os.environ.get("CLAUDE_TASK_RUNNER_LOG_LEVEL", "INFO")
+    fmt_raw = os.environ.get("CLAUDE_TASK_RUNNER_LOG_FORMAT", "text")
+    fmt: LogFormat = fmt_raw if fmt_raw in ("text", "json") else "text"  # type: ignore[assignment]
+    configure_logging(level=level, fmt=fmt)
+
+
+_early_configure_logging()
+
 
 app = typer.Typer(
     name="claude-task-runner",

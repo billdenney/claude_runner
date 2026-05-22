@@ -245,6 +245,28 @@ class FixturesSettings(_StrictModel):
     rotation_window_days: int = Field(ge=0)
 
 
+class LoggingSettings(_StrictModel):
+    """Process-wide logging knobs honoured by :mod:`observability`.
+
+    The supervisor's log lines flow through ``structlog`` processors
+    and out to stderr (where systemd's user service captures them
+    into the journal). The defaults are picked for ``journalctl
+    --user -u claude-task-runner`` readability.
+    """
+
+    level: str = "INFO"
+    """Stdlib log-level name (``"DEBUG"``, ``"INFO"``, ``"WARNING"``,
+    ``"ERROR"``). The root logger is set to this level; anything
+    below is dropped at the handler. INFO is the operator-facing
+    default; DEBUG is useful when tracking a specific dispatch."""
+
+    format: Literal["text", "json"] = "text"
+    """Output format. ``"text"`` (default) renders as
+    ``timestamp [level] logger key=value …`` — readable in
+    ``journalctl``. ``"json"`` renders as one JSON object per line,
+    suitable for shipping to Loki / Vector / etc."""
+
+
 class ClaudeSettings(_StrictModel):
     """How to invoke the ``claude`` CLI.
 
@@ -458,6 +480,10 @@ class Settings(_StrictModel):
     metrics: MetricsSettings
     ui: UiSettings
     fixtures: FixturesSettings
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    """Process-wide logging knobs. See :class:`LoggingSettings`. Has a
+    default so existing TOMLs that pre-date this block keep parsing
+    unchanged."""
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     plans: dict[str, PlanSettings] = Field(default_factory=dict)
     accounts: list[AccountSettings] = Field(default_factory=list)
