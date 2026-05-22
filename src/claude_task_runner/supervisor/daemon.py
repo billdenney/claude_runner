@@ -36,6 +36,7 @@ from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
+from claude_task_runner.supervisor import reconcile as reconcile_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
 from claude_task_runner.supervisor.actions import (
     Action,
@@ -405,6 +406,27 @@ def start_daemon(
                 since=clk.now(),
                 account_names=account_names,
             )
+
+            # Orphan reconciliation (PR 12): if the previous supervisor
+            # exited ungracefully (crash, SIGKILL after TimeoutStopSec, or
+            # the bootstrap case of a pre-drain-handler supervisor being
+            # forcibly restarted), TaskState YAMLs are stuck at
+            # status="running" with their session_id recorded. Demote
+            # those orphans to "failed" so the orchestrator picks them up
+            # via the normal session-resume path
+            # (runner.session.plan_next_spawn → claude --resume <id>).
+            # Clear the stale snapshot.in_flight records the dead
+            # supervisor wrote — this supervisor owns the in-memory slot
+            # map from here on.
+            snapshot, orphan_ids = reconcile_mod.reconcile_orphans(queue_dir, snapshot)
+            if orphan_ids:
+                logger.info(
+                    "reconciled %d orphan task(s) for session resume: %s",
+                    len(orphan_ids),
+                    orphan_ids,
+                )
+            persist_mod.write_atomic(snapshot, state_path)
+
             prior_pending = pending_count_fn()
 
             # If the caller passed a source_builder, instantiate the
