@@ -73,3 +73,12 @@ class UsageReading(BaseModel):
 
     capture_path: str | None = None
     """Filesystem path of the raw .cap forensics file, if persisted."""
+
+    account: str | None = None
+    """Which configured account this reading belongs to. ``None`` for
+    legacy single-account flows (the daemon applies the reading to
+    the top-level snapshot fields). Multi-account sources set this so
+    the daemon knows which ``AccountState`` to update.
+
+    Added in PR 8 (per-account ``/usage`` capture). Backward compatible
+    with PR 1-7 readings which omit the field."""
