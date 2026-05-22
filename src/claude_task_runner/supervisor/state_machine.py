@@ -302,13 +302,20 @@ def _classify_active(
     reading: UsageReading,
     bands: _EffectiveBands,
 ) -> SupervisorState:
-    """Pick between DISPATCHING / SLOWING_DOWN / THROTTLED_5H / PAUSED_WEEKLY
+    """Pick between DISPATCHING / SLOWING_DOWN / THROTTLED_5H / THROTTLED_WEEKLY / PAUSED_WEEKLY
     given a clean reading and the effective per-tick bands.
 
-    PAUSED_WEEKLY beats THROTTLED_5H beats SLOWING_DOWN beats DISPATCHING
-    because weekly-cap is the strictest brake. The hard ``pause_at_pct``
-    floor is read directly from settings — pacing-curve modulation never
-    touches it (safety floor).
+    Precedence (strictest wins):
+      1. PAUSED_WEEKLY    — weekly >= pause_at_pct (hard floor; pacing never touches).
+      2. THROTTLED_5H     — 5h util >= 5h slowdown band.
+      3. THROTTLED_WEEKLY — weekly util >= weekly slowdown band but < pause_at.
+      4. SLOWING_DOWN     — either window is between its full and slow bands.
+      5. DISPATCHING      — neither window is over its full band.
+
+    Splitting THROTTLED_5H from THROTTLED_WEEKLY lets the operator (and
+    the dispatch-time messages emitted below) name which window is the
+    cause. Before this split, weekly-driven throttle was labelled
+    THROTTLED_5H, which was misleading when 5h util was low.
     """
     weekly_pct = reading.seven_day.utilization_pct
     if weekly_pct >= bands.weekly_pause_at_pct:
@@ -318,16 +325,54 @@ def _classify_active(
     if five_pct >= bands.five_hour_slow:
         return SupervisorState.THROTTLED_5H
 
+    weekly_in_stop = weekly_pct >= bands.weekly_slow
+    if weekly_in_stop:
+        return SupervisorState.THROTTLED_WEEKLY
+
     five_in_slow = bands.five_hour_full <= five_pct < bands.five_hour_slow
     weekly_in_slow = bands.weekly_full <= weekly_pct < bands.weekly_slow
-    weekly_in_stop = weekly_pct >= bands.weekly_slow
-
-    if weekly_in_stop:
-        # Weekly stopped band but not yet pause_at — treat as throttled.
-        return SupervisorState.THROTTLED_5H
     if five_in_slow or weekly_in_slow:
         return SupervisorState.SLOWING_DOWN
     return SupervisorState.DISPATCHING
+
+
+def _throttle_cause_message(
+    state: SupervisorState,
+    reading: UsageReading,
+    bands: _EffectiveBands,
+) -> str:
+    """Human-readable explanation of WHY ``state`` was entered.
+
+    Used for the ``Notify`` action's ``message`` so operators see
+    e.g. ``"throttled: weekly at 78% (band 44%, pause_at 90%)"``
+    instead of just ``"throttled_5h_entry"``. Returns the empty string
+    for non-throttle states (caller can use it unconditionally).
+    """
+    five_pct = reading.five_hour.utilization_pct
+    weekly_pct = reading.seven_day.utilization_pct
+    if state is SupervisorState.THROTTLED_5H:
+        return (
+            f"5h utilization {five_pct}% >= slowdown band "
+            f"{bands.five_hour_slow}%; pausing dispatch until next 5h reset"
+        )
+    if state is SupervisorState.THROTTLED_WEEKLY:
+        return (
+            f"weekly utilization {weekly_pct}% >= effective slowdown band "
+            f"{bands.weekly_slow}% (pause_at {bands.weekly_pause_at_pct}%); "
+            "pausing dispatch — pacing-curve-driven if enabled"
+        )
+    if state is SupervisorState.PAUSED_WEEKLY:
+        return (
+            f"weekly utilization {weekly_pct}% >= pause_at "
+            f"{bands.weekly_pause_at_pct}%; hard pause until weekly reset or EOW push"
+        )
+    if state is SupervisorState.SLOWING_DOWN:
+        return (
+            f"slowing dispatch: 5h={five_pct}% (full {bands.five_hour_full}%, "
+            f"slow {bands.five_hour_slow}%), weekly={weekly_pct}% "
+            f"(full {bands.weekly_full}%, slow {bands.weekly_slow}%)"
+        )
+    return ""
 
 
 def _wakeup_for_throttle(
@@ -513,8 +558,16 @@ def step(
 
     # Schedule wakeups proactively for blocked / throttled states so the
     # supervisor (or its watchdog) can sleep until the next reset.
+    # THROTTLED_WEEKLY waits for the next 5h reset (same as THROTTLED_5H)
+    # rather than the weekly reset — the pacing-curve-adjusted weekly
+    # band can shift between 5h windows as observed utilization changes,
+    # so we re-check often.
     wakeup: object = ...
-    if target_state in (SupervisorState.THROTTLED_5H, SupervisorState.SLOWING_DOWN):
+    if target_state in (
+        SupervisorState.THROTTLED_5H,
+        SupervisorState.THROTTLED_WEEKLY,
+        SupervisorState.SLOWING_DOWN,
+    ):
         wakeup = _wakeup_for_throttle(
             reading=reading,
             clock=clock,
@@ -544,17 +597,23 @@ def step(
         scheduled_wakeup_at=wakeup,
     )
 
-    # Side actions for state-specific transitions.
+    # Side actions for state-specific transitions. The messages identify
+    # which window (5h or weekly) drove the throttle/pause so the
+    # operator can act on the right axis.
+    cause_msg = _throttle_cause_message(target_state, reading, effective_bands)
+
     if (
         target_state is SupervisorState.PAUSED_WEEKLY
         and snapshot.state is not SupervisorState.PAUSED_WEEKLY
     ):
+        actions.append(Notify(level="warn", message=cause_msg))
         actions.append(
-            Notify(
-                level="warn",
-                message=(
-                    f"weekly utilization {reading.seven_day.utilization_pct}% — pausing dispatch"
-                ),
+            EmitEvent(
+                event_type="paused_weekly_entry",
+                payload={
+                    "weekly_util_pct": reading.seven_day.utilization_pct,
+                    "pause_at_pct": effective_bands.weekly_pause_at_pct,
+                },
             )
         )
 
@@ -562,10 +621,30 @@ def step(
         target_state is SupervisorState.THROTTLED_5H
         and snapshot.state is not SupervisorState.THROTTLED_5H
     ):
+        actions.append(Notify(level="info", message=cause_msg))
         actions.append(
             EmitEvent(
                 event_type="throttled_5h_entry",
-                payload={"util_pct": reading.five_hour.utilization_pct},
+                payload={
+                    "five_hour_util_pct": reading.five_hour.utilization_pct,
+                    "five_hour_slow_band_pct": effective_bands.five_hour_slow,
+                },
+            )
+        )
+
+    if (
+        target_state is SupervisorState.THROTTLED_WEEKLY
+        and snapshot.state is not SupervisorState.THROTTLED_WEEKLY
+    ):
+        actions.append(Notify(level="info", message=cause_msg))
+        actions.append(
+            EmitEvent(
+                event_type="throttled_weekly_entry",
+                payload={
+                    "weekly_util_pct": reading.seven_day.utilization_pct,
+                    "weekly_slow_band_pct": effective_bands.weekly_slow,
+                    "weekly_pause_at_pct": effective_bands.weekly_pause_at_pct,
+                },
             )
         )
 
@@ -574,6 +653,7 @@ def step(
 
     if target_state in (
         SupervisorState.THROTTLED_5H,
+        SupervisorState.THROTTLED_WEEKLY,
         SupervisorState.PAUSED_WEEKLY,
     ):
         actions.append(StopDispatch())
