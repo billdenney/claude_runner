@@ -10,6 +10,7 @@ from __future__ import annotations
 import json as _json
 import os
 import signal
+from collections.abc import Callable
 from pathlib import Path
 
 import typer
@@ -26,7 +27,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor.daemon import start_daemon
-from claude_task_runner.supervisor.states import SupervisorState
+from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 from claude_task_runner.usage.api_source import ApiUsageSource
 from claude_task_runner.usage.source import (
     ApiThenTtyUsageSource,
@@ -60,50 +61,122 @@ def _count_in_flight(queue_dir: Path) -> int:
     return n
 
 
-def _build_tty_source(settings: object, queue_path: Path) -> ClaudeUsageSource:
+def _build_tty_source(
+    settings: object,
+    queue_path: Path,
+    *,
+    config_dir: str | None = None,
+) -> ClaudeUsageSource:
+    """Build a TTY usage source against ``config_dir``.
+
+    Defaults to ``settings.claude.config_dir`` (legacy single-account
+    path) when ``config_dir`` is None. Multi-account callers pass each
+    account's ``config_dir`` explicitly.
+    """
+    effective = (
+        config_dir if config_dir is not None else settings.claude.config_dir  # type: ignore[attr-defined]
+    )
     return ClaudeUsageSource(
         settings.usage,  # type: ignore[attr-defined]
         RealClock(),
         captures_dir=_captures_dir(queue_path),
         claude_executable=settings.claude.executable,  # type: ignore[attr-defined]
-        claude_config_dir=settings.claude.config_dir,  # type: ignore[attr-defined]
+        claude_config_dir=effective,
     )
 
 
-def _build_api_source(settings: object) -> ApiUsageSource:
+def _build_api_source(
+    settings: object,
+    *,
+    config_dir: str | None = None,
+) -> ApiUsageSource:
+    """Build an API usage source against ``config_dir``.
+
+    Same default rule as :func:`_build_tty_source`.
+    """
+    effective = (
+        config_dir if config_dir is not None else settings.claude.config_dir  # type: ignore[attr-defined]
+    )
     return ApiUsageSource(
         RealClock(),
-        config_dir=settings.claude.config_dir,  # type: ignore[attr-defined]
+        config_dir=effective,
         probe_model=settings.usage.api_probe_model,  # type: ignore[attr-defined]
         timeout_s=settings.usage.api_timeout_s,  # type: ignore[attr-defined]
     )
 
 
-def _build_usage_source(settings: object, queue_path: Path) -> UsageSource:
-    """Pick a UsageSource based on ``settings.usage.source``.
+def _build_per_account_source(
+    settings: object,
+    queue_path: Path,
+    config_dir: str,
+) -> UsageSource:
+    """Build one inner source for one account, honouring ``[usage].source``.
 
-    Single-account today: the chosen source uses
-    ``settings.claude.config_dir`` for both the TTY spawn and the
-    OAuth bearer lookup. Multi-account /usage capture (one source per
-    account, round-robin scheduled by ``AccountState.last_capture_at``)
-    is the next PR's territory; once that lands, this helper grows to
-    return a ``MultiAccountUsageSource`` that dispatches per-tick to
-    the most-overdue account's per-account TtyUsageSource /
-    ApiUsageSource pair.
+    Same mode dispatch as :func:`_build_usage_source` but pinned to
+    a specific ``config_dir`` so the multi-account wrapper can map
+    one source per configured account.
     """
     mode = settings.usage.source  # type: ignore[attr-defined]
     if mode == "tty":
-        return _build_tty_source(settings, queue_path)
+        return _build_tty_source(settings, queue_path, config_dir=config_dir)
     if mode == "api":
-        return _build_api_source(settings)
+        return _build_api_source(settings, config_dir=config_dir)
     if mode == "api_then_tty":
         return ApiThenTtyUsageSource(
-            api=_build_api_source(settings),
-            tty=_build_tty_source(settings, queue_path),
+            api=_build_api_source(settings, config_dir=config_dir),
+            tty=_build_tty_source(settings, queue_path, config_dir=config_dir),
         )
-    # Pydantic Literal validation makes this unreachable, but defending
-    # against a runtime mutation of the settings object.
     raise ValueError(f"unknown [usage].source: {mode!r}")
+
+
+def _build_usage_source(
+    settings: object,
+    queue_path: Path,
+    snapshot_getter: Callable[[], object],
+) -> UsageSource:
+    """Pick a UsageSource based on ``settings.usage.source`` and account count.
+
+    Single-account (``len(settings.accounts) <= 1``): direct
+    ClaudeUsageSource / ApiUsageSource / composite, same as PR 6.
+
+    Multi-account (``len(settings.accounts) > 1``): wrap one
+    per-account source per ``[[accounts]]`` block in a
+    :class:`MultiAccountUsageSource` that round-robins captures by
+    ``AccountState.last_capture_at``. The reading is tagged with the
+    captured account and the daemon attributes it to
+    ``snapshot.accounts[<name>]``.
+
+    ``snapshot_getter`` is a zero-arg callable that returns the
+    current :class:`SupervisorSnapshot`. The multi-account wrapper
+    needs the FRESHEST snapshot per call to consult the
+    ``last_capture_at`` fields the daemon just persisted.
+    """
+    accounts = settings.accounts  # type: ignore[attr-defined]
+    if len(accounts) <= 1:
+        mode = settings.usage.source  # type: ignore[attr-defined]
+        if mode == "tty":
+            return _build_tty_source(settings, queue_path)
+        if mode == "api":
+            return _build_api_source(settings)
+        if mode == "api_then_tty":
+            return ApiThenTtyUsageSource(
+                api=_build_api_source(settings),
+                tty=_build_tty_source(settings, queue_path),
+            )
+        raise ValueError(f"unknown [usage].source: {mode!r}")
+
+    # Multi-account: one inner source per account.
+    per_account: dict[str, UsageSource] = {
+        acct.name: _build_per_account_source(settings, queue_path, acct.config_dir)
+        for acct in accounts
+    }
+    # Local import to keep the CLI module's import graph slim.
+    from claude_task_runner.usage.multi_account_source import MultiAccountUsageSource
+
+    return MultiAccountUsageSource(
+        per_account_sources=per_account,
+        snapshot_getter=snapshot_getter,  # type: ignore[arg-type]
+    )
 
 
 @app.command("start")
@@ -142,13 +215,17 @@ def start(
     queue_path = queue_dir.resolve()
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
-    source = _build_usage_source(settings, queue_path)
+    # Use source_builder so the multi-account wrapper can be wired to
+    # the daemon's live snapshot accessor — the round-robin picker
+    # needs the freshest accounts[*].last_capture_at every read.
+    def _source_builder(snapshot_getter: Callable[[], SupervisorSnapshot]) -> UsageSource:
+        return _build_usage_source(settings, queue_path, snapshot_getter)
 
     try:
         handle = start_daemon(
             queue_dir=queue_path,
             settings=settings,
-            source=source,
+            source_builder=_source_builder,
             pending_count_fn=lambda: _count_pending(queue_path),
             in_flight_count_fn=lambda: _count_in_flight(queue_path),
             max_ticks=max_ticks,

@@ -314,6 +314,54 @@ def whoami(
         )
 
 
+@app.command("refresh")
+def refresh(ctx: typer.Context) -> None:
+    """Refresh OAuth tokens for every configured account (non-interactive).
+
+    Each refresh spawns ``claude /usage`` in a PTY against the account's
+    ``config_dir``. The TUI's OAuth-backed call rewrites the credentials
+    file with a fresh access token as a side effect — no operator
+    interaction required, no direct OAuth endpoint dependency.
+
+    Useful as a preflight before flipping ``[usage].source`` to
+    ``"api_then_tty"``: every account's bearer is known-fresh, so the
+    first hour of API-mode polls don't all fall through to TTY.
+
+    Exit code 0 on full success; non-zero if any account failed. Each
+    account's status is printed regardless of success/failure of the
+    others — failures don't abort the whole run.
+    """
+    settings = ctx.obj["settings"]
+    captures_dir: Path = ctx.obj["captures_dir"]
+    console = Console()
+    clock = RealClock()
+
+    if not settings.accounts:
+        console.print("[dim]no [[accounts]] configured — nothing to refresh[/]")
+        return
+
+    # Local import keeps the CLI module's import graph slim — the
+    # refresh helper transitively pulls in pexpect via capture.py.
+    from claude_task_runner.usage.oauth_refresh import refresh_all_accounts
+
+    results = refresh_all_accounts(
+        accounts=settings.accounts,
+        settings=settings.usage,
+        captures_dir=captures_dir,
+        clock=clock,
+        claude_executable=settings.claude.executable,
+    )
+
+    ok = sum(1 for r in results if r.success)
+    fail = len(results) - ok
+    for r in results:
+        marker = "[bold green]PASS[/]" if r.success else "[bold red]FAIL[/]"
+        console.print(f"  {marker} {r.account} ({r.config_dir or '~/.claude'}): {r.detail}")
+    console.print(f"\n[bold]Summary:[/] {ok} refreshed, {fail} failed of {len(results)} accounts.")
+    if fail:
+        raise typer.Exit(code=EXIT_CAPTURE_TIMEOUT)
+
+
 @app.command("parse-file")
 def parse_file(
     path: Path = typer.Argument(..., exists=True, readable=True),

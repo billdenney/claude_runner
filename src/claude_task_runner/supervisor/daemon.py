@@ -101,9 +101,23 @@ def run_one_tick(
     daemon's responsibility (:func:`execute_actions`). Tests can call
     this with hand-built :class:`TickContext` and skip the whole
     side-effects layer.
+
+    Multi-account attribution:
+        When ``ctx.poll_result`` is a :class:`UsageReading` with
+        ``.account`` set (produced by
+        :class:`MultiAccountUsageSource`), the daemon focuses the
+        state machine on that account's per-account state before
+        ``step()`` runs and copies the resulting top-level changes
+        back into ``snapshot.accounts[<account>]`` afterwards. This
+        lets the existing single-account state machine logic operate
+        per-account without an invasive rewrite. The top-level
+        fields end the tick mirroring the most-recently-captured
+        account.
     """
+    account_name = _reading_account(ctx.poll_result)
+    focused = _focus_on_account(snapshot, account_name)
     inp = sm_mod.StepInput(
-        snapshot=snapshot,
+        snapshot=focused,
         reading=ctx.poll_result,
         settings_throttle=ctx.settings.throttle,
         settings_supervisor=ctx.settings.supervisor,
@@ -111,7 +125,92 @@ def run_one_tick(
         pending_count=ctx.pending_count,
         in_flight_count=ctx.in_flight_count,
     )
-    return sm_mod.step(inp, clock)
+    new_focused, actions = sm_mod.step(inp, clock)
+    new_snapshot = _propagate_to_account(new_focused, account_name, clock)
+    return new_snapshot, actions
+
+
+def _reading_account(poll_result: object) -> str | None:
+    """Extract the account name from a ``UsageReading`` or attributed exception.
+
+    Returns ``None`` for legacy single-account flows (reading has no
+    account, or the poll yielded an exception with no ``.account``
+    attribute) so callers fall back to the un-attributed code path.
+    """
+    name = getattr(poll_result, "account", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _focus_on_account(
+    snapshot: SupervisorSnapshot,
+    account_name: str | None,
+) -> SupervisorSnapshot:
+    """Return a snapshot whose top-level fields mirror ``accounts[name]``.
+
+    No-op when ``account_name`` is None (single-account flow) or the
+    name is not in ``snapshot.accounts`` (defensive — covers a race
+    where the supervisor's accounts list was reduced mid-tick).
+
+    The state machine reads the top-level fields; mirroring lets it
+    operate on the focused account's prior state without changes.
+    """
+    if account_name is None:
+        return snapshot
+    acct = snapshot.accounts.get(account_name)
+    if acct is None:
+        return snapshot
+    return snapshot.model_copy(
+        update={
+            "state": acct.state,
+            "since": acct.since,
+            "last_5h_util_pct": acct.last_5h_util_pct,
+            "last_weekly_util_pct": acct.last_weekly_util_pct,
+            "last_5h_reset_at": acct.last_5h_reset_at,
+            "last_weekly_reset_at": acct.last_weekly_reset_at,
+            "scheduled_wakeup_at": acct.scheduled_wakeup_at,
+            "consecutive_clean_polls": acct.consecutive_clean_polls,
+            "last_drift_message": acct.last_drift_message,
+        }
+    )
+
+
+def _propagate_to_account(
+    snapshot: SupervisorSnapshot,
+    account_name: str | None,
+    clock: Clock,
+) -> SupervisorSnapshot:
+    """Copy ``snapshot``'s top-level fields back into ``accounts[name]``.
+
+    Inverse of :func:`_focus_on_account`. Also bumps
+    ``accounts[name].last_capture_at`` to the current clock so the
+    :class:`MultiAccountUsageSource` round-robin picker advances past
+    this account on the next tick.
+
+    No-op when ``account_name`` is None — keeps single-account flow
+    bit-for-bit identical.
+    """
+    if account_name is None:
+        return snapshot
+    acct = snapshot.accounts.get(account_name)
+    if acct is None:
+        return snapshot
+    updated_acct = acct.model_copy(
+        update={
+            "state": snapshot.state,
+            "since": snapshot.since,
+            "last_5h_util_pct": snapshot.last_5h_util_pct,
+            "last_weekly_util_pct": snapshot.last_weekly_util_pct,
+            "last_5h_reset_at": snapshot.last_5h_reset_at,
+            "last_weekly_reset_at": snapshot.last_weekly_reset_at,
+            "scheduled_wakeup_at": snapshot.scheduled_wakeup_at,
+            "consecutive_clean_polls": snapshot.consecutive_clean_polls,
+            "last_drift_message": snapshot.last_drift_message,
+            "last_capture_at": clock.now(),
+        }
+    )
+    new_accounts = dict(snapshot.accounts)
+    new_accounts[account_name] = updated_acct
+    return snapshot.model_copy(update={"accounts": new_accounts})
 
 
 def execute_actions(
@@ -208,7 +307,8 @@ def start_daemon(
     *,
     queue_dir: Path,
     settings: Settings,
-    source: UsageSource,
+    source: UsageSource | None = None,
+    source_builder: Callable[[Callable[[], SupervisorSnapshot]], UsageSource] | None = None,
     pending_count_fn: Callable[[], int],
     in_flight_count_fn: Callable[[], int],
     clock: Clock | None = None,
@@ -290,6 +390,25 @@ def start_daemon(
             )
             prior_pending = pending_count_fn()
 
+            # If the caller passed a source_builder, instantiate the
+            # source now that we have the loaded snapshot. The builder
+            # gets a snapshot accessor so a multi-account wrapper can
+            # consult the freshest ``accounts[*].last_capture_at``
+            # between ticks. ``source`` (the plain pre-built source)
+            # remains supported for single-account / test paths.
+            if source_builder is not None and source is None:
+
+                def _get_snapshot() -> SupervisorSnapshot:
+                    return snapshot
+
+                effective_source: UsageSource = source_builder(_get_snapshot)
+            elif source is not None:
+                effective_source = source
+            else:
+                raise ValueError(
+                    "start_daemon requires either source or source_builder; got neither"
+                )
+
             ticks = 0
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
@@ -306,7 +425,7 @@ def start_daemon(
 
                 ctx = TickContext(
                     settings=settings,
-                    poll_result=safe_poll(source),
+                    poll_result=safe_poll(effective_source),
                     pending_count=pending_count_fn(),
                     in_flight_count=in_flight_count_fn(),
                 )
