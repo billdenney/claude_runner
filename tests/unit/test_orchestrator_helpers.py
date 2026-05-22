@@ -121,10 +121,12 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
 
 
 def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
-    """Snapshot seeded with one DISPATCHING-eligible "default" account so
-    choose_account picks it. The orchestrator's tick_dispatch consults
-    snapshot.accounts; without the entry no candidate would be eligible.
-    """
+    """Snapshot seeded with one "default" account mirroring the top-level state.
+
+    PR 9 introduced per-account gating in tick_dispatch; mirroring the
+    requested state to ``accounts.default.state`` makes the fixture
+    behave like a real daemon write (which copies top-level <->
+    accounts[X] for the most-recently-captured account)."""
     from claude_task_runner.supervisor.states import AccountState
 
     return SupervisorSnapshot.model_validate(
@@ -133,7 +135,7 @@ def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
             "since": datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
             "accounts": {
                 "default": AccountState(
-                    state=SupervisorState.DISPATCHING,
+                    state=state,
                     since=datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
                 ),
             },

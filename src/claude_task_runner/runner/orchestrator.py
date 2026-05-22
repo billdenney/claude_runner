@@ -147,6 +147,15 @@ def tick_dispatch(
     ``accounts`` (when ``None``) is resolved from ``settings`` on the
     spot; pass it explicitly to share one resolution across multiple
     callers per tick.
+
+    Dispatch gating (PR 9): a tick proceeds to candidate enumeration
+    if AT LEAST ONE configured account is dispatchable (see
+    :func:`_any_account_dispatchable`). The historical top-level
+    ``snapshot.state`` gate was retired because, after PR 8's per-
+    account capture, ``snapshot.state`` mirrors only the most-recently
+    captured account — so a strict top-level gate alternated between
+    "open" and "closed" each tick when one account was throttled and
+    another was fine, halving effective dispatch throughput.
     """
     _reap_finished(in_flight_slots)
 
@@ -158,11 +167,17 @@ def tick_dispatch(
         accounts = resolve_accounts(settings)
     accounts_by_name = {a.name: a for a in accounts}
 
-    if snapshot.state not in (
-        SupervisorState.DISPATCHING,
-        SupervisorState.SLOWING_DOWN,
-        SupervisorState.END_OF_WEEK_PUSH,
-    ):
+    # Per-account dispatch gate (replaces PR 5's top-level snapshot.state
+    # gate). After PR 8's per-account capture, the top-level snapshot.state
+    # mirrors whichever account was most recently captured — so a gate
+    # that reads it alone alternates between "open" and "closed" each
+    # tick, halving effective dispatch throughput in multi-account setups
+    # where one account is throttled (e.g. high weekly util) while the
+    # other is fine. Instead, gate per-account: if AT LEAST ONE configured
+    # account is dispatchable (its AccountState is in _DISPATCHABLE_STATES
+    # and it's not operator-paused), let choose_account do the actual
+    # per-task routing.
+    if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
     target = _target_concurrency(queue_dir, settings, snapshot)
@@ -245,6 +260,48 @@ def _refresh_in_flight(
             "in_flight_task_ids": [r.task_id for r in records],
         }
     )
+
+
+def _any_account_dispatchable(
+    snapshot: SupervisorSnapshot,
+    accounts_by_name: dict[str, ResolvedAccount],
+) -> bool:
+    """Return True iff at least one configured account would let a task land.
+
+    "Would let a task land" means the account's :class:`AccountState`:
+      * exists in ``snapshot.accounts`` (so the daemon has captured it),
+      * is in :data:`account_dispatch._DISPATCHABLE_STATES`
+        (DISPATCHING / SLOWING_DOWN / END_OF_WEEK_PUSH / IDLE), AND
+      * is not operator-paused via ``account pause``.
+
+    Cold start: when no account has been captured yet, every entry's
+    state is the seeded IDLE — which is in the dispatchable set — so
+    this function returns True and ``choose_account`` does the actual
+    routing.
+
+    Note: this gate intentionally does NOT check per-account capacity
+    (max_concurrency); that's :func:`account_dispatch.choose_account`'s
+    job and applies per-task. The gate's job is to short-circuit when
+    NOTHING can dispatch this tick so we don't pay the candidate
+    enumeration cost.
+    """
+    if not snapshot.accounts:
+        return False
+    for name in accounts_by_name:
+        state = snapshot.accounts.get(name)
+        if state is None:
+            continue
+        if state.paused:
+            continue
+        if state.state in _account_dispatch_mod_states():
+            return True
+    return False
+
+
+def _account_dispatch_mod_states() -> frozenset[SupervisorState]:
+    """Lazy import of ``account_dispatch._DISPATCHABLE_STATES`` to avoid
+    a module-load circular and keep the source of truth in one place."""
+    return account_dispatch_mod._DISPATCHABLE_STATES
 
 
 def _reap_finished(in_flight_slots: dict[str, DispatchSlot]) -> None:

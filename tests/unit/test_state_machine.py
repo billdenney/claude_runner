@@ -477,8 +477,17 @@ class TestPacingCurveModulation:
             weekly_resets=weekly_reset,
         )
         new, _ = step(_input(snap, reading, cfg, pending=2), clock)
-        # weekly slot in slowdown or stop band due to tightening
-        assert new.state in {SupervisorState.SLOWING_DOWN, SupervisorState.THROTTLED_5H}
+        # Weekly slot in slowdown or stop band due to tightening. PR 9
+        # split the weekly-in-stop band from THROTTLED_5H into the new
+        # THROTTLED_WEEKLY state so the operator can tell which window
+        # caused the throttle. Both throttle states (5h, weekly) and the
+        # SLOWING_DOWN band are acceptable here — the precise effective
+        # band depends on pacing math, which other tests pin tightly.
+        assert new.state in {
+            SupervisorState.SLOWING_DOWN,
+            SupervisorState.THROTTLED_5H,
+            SupervisorState.THROTTLED_WEEKLY,
+        }
 
     def test_behind_target_keeps_dispatching(self, settings: Settings) -> None:
         """Observed well behind target → bands loosen → DISPATCHING.

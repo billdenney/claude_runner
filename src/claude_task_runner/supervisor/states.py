@@ -48,10 +48,26 @@ class SupervisorState(StrEnum):
     """In the slowdown band; target concurrency reduced linearly."""
 
     THROTTLED_5H = "throttled_5h"
-    """5-hour utilization >= no-dispatch threshold."""
+    """5-hour utilization >= the configured no-dispatch threshold.
+
+    Recovery wakeup is scheduled just past the next 5h reset; the
+    next clean reading reclassifies."""
+
+    THROTTLED_WEEKLY = "throttled_weekly"
+    """Weekly utilization >= the (possibly pacing-curve-adjusted)
+    no-dispatch threshold but still below ``pause_at_pct``.
+
+    Distinct from :attr:`THROTTLED_5H` so the operator can tell at a
+    glance which window is driving the throttle. Before this state
+    existed, ``_classify_active`` returned ``THROTTLED_5H`` for the
+    weekly-in-stop band too — misleading when 5h util was low. Wakeup
+    is scheduled just past the next 5h reset (giving the operator a
+    chance to observe the weekly trend without burning the whole
+    budget) and the next clean reading reclassifies."""
 
     PAUSED_WEEKLY = "paused_weekly"
-    """Weekly utilization >= pause threshold."""
+    """Weekly utilization >= ``pause_at_pct``. Hard pause until either
+    the weekly window resets or end-of-week push fires."""
 
     END_OF_WEEK_PUSH = "end_of_week_push"
     """Weekly cap hit AND reset is imminent; dispatch only short tasks."""
