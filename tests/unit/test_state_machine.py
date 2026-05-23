@@ -264,6 +264,64 @@ class TestCaptureErrors:
         assert new.state is SupervisorState.DISPATCHING
 
 
+class TestAuthExpired:
+    """PR 14: ``UsageApiAuthExpired`` enters ERROR_DRIFT immediately.
+
+    Before PR 14, a 401 from ``/v1/messages`` propagated as a generic
+    ``UsageCaptureSpawnError`` (its parent class) and got rolled in
+    with transient capture failures: state unchanged, util frozen.
+    The work account spent 15 hours stuck in ``throttled_5h`` after
+    its OAuth bearer expired because of exactly that path.
+
+    After PR 14, auth-expired is treated as an operator-attention
+    signal: enter ERROR_DRIFT, halt dispatch, surface the message in
+    ``last_drift_message``, and fire a ``Notify`` so the operator
+    sees the cause in ``runner-status``.
+    """
+
+    def test_auth_expired_enters_error_drift(self, settings: Settings, clock: FakeClock) -> None:
+        from claude_task_runner.supervisor.actions import Notify, StopDispatch
+        from claude_task_runner.usage.drift import UsageApiAuthExpired
+
+        snap = _initial(SupervisorState.DISPATCHING)
+        new, actions = step(
+            _input(snap, UsageApiAuthExpired("HTTP 401"), settings, pending=2),
+            clock,
+        )
+        assert new.state is SupervisorState.ERROR_DRIFT
+        assert "HTTP 401" in new.last_drift_message
+        action_types = {type(a) for a in actions}
+        assert Notify in action_types
+        assert StopDispatch in action_types
+        assert any(
+            isinstance(a, EmitEvent) and a.event_type == "oauth_auth_expired" for a in actions
+        )
+
+    def test_auth_expired_during_drift_updates_message(
+        self, settings: Settings, clock: FakeClock
+    ) -> None:
+        """A second auth-expired tick refreshes ``last_drift_message`` but
+        does NOT re-fire ``Notify`` (one alert per entry, not per tick)."""
+        from claude_task_runner.supervisor.actions import Notify
+        from claude_task_runner.usage.drift import UsageApiAuthExpired
+
+        snap = _initial(SupervisorState.ERROR_DRIFT)
+        snap = snap.model_copy(
+            update={
+                "last_drift_message": "HTTP 401",
+                "consecutive_clean_polls": 2,
+            }
+        )
+        new, actions = step(
+            _input(snap, UsageApiAuthExpired("HTTP 401 again"), settings, pending=2),
+            clock,
+        )
+        assert new.state is SupervisorState.ERROR_DRIFT
+        assert "HTTP 401 again" in new.last_drift_message
+        assert new.consecutive_clean_polls == 0
+        assert not any(isinstance(a, Notify) for a in actions)
+
+
 class TestStopAndResume:
     def test_stop_is_sticky(self, settings: Settings, clock: FakeClock) -> None:
         snap = request_stop(_initial(), clock=clock)

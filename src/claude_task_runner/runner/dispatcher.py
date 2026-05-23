@@ -623,12 +623,29 @@ def dispatch(
     # uses. Without this, the supervisor sees personal-account utilization
     # while every dispatched task hits the default ~/.claude account --
     # which may be at a different / depleted quota.
+    #
+    # PR 14: when the account is on a long-lived OAuth token (file at
+    # `<config_dir>/oauth-token`, produced by `claude setup-token`),
+    # also export `CLAUDE_CODE_OAUTH_TOKEN` so the CLI bypasses
+    # `.credentials.json` and uses the long-lived bearer instead. This
+    # is the same env-var contract documented for GitHub Actions; the
+    # CLI honours it as the auth source when present. The file lookup
+    # is shared with `ApiUsageSource` (PR 14) so the supervisor's
+    # usage capture and the dispatched subprocess always agree on which
+    # token is in use for an account.
     spawn_env: dict[str, str] | None = None
     if claude_config_dir:
         config_path = Path(claude_config_dir).expanduser()
         if not config_path.exists():
             raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+        # Local import — keeps `oauth_token_file` out of the dispatcher's
+        # cold-start path for single-account / pre-PR-14 deployments.
+        from claude_task_runner.usage.oauth_token_file import read_long_lived_token
+
+        long_lived = read_long_lived_token(claude_config_dir)
+        if long_lived is not None:
+            spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
 
     # Multi-Linux-user dispatch: when the resolved account has a
     # `linux_user` set and it differs from the supervisor's own user,
@@ -646,6 +663,13 @@ def dispatch(
         env_pairs: list[str] = []
         if spawn_env is not None:
             env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
+            # PR 14: propagate the long-lived OAuth token across the
+            # sudo boundary too — sudo's default env_reset would strip
+            # CLAUDE_CODE_OAUTH_TOKEN. Without this the per-account
+            # token would only affect the supervisor's own dispatches,
+            # not the multi-Linux-user spawn (PR 3) target shells.
+            if "CLAUDE_CODE_OAUTH_TOKEN" in spawn_env:
+                env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
         # Propagate explicit env via `env` so sudo's default
         # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
         prefix: list[str] = [sudo_path, "-n", "-u", linux_user]

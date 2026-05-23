@@ -223,6 +223,49 @@ def test_read_oauth_token_no_matching_key_raises(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR 14: long-lived token file takes precedence over .credentials.json.
+# ---------------------------------------------------------------------------
+
+
+def test_long_lived_token_file_takes_precedence(tmp_path: Path) -> None:
+    """When `<config_dir>/oauth-token` exists, ignore .credentials.json
+    entirely — a stale short-lived accessToken must NOT poison the lookup
+    when the operator has provided a fresh long-lived token."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "stale-short-lived"}}),
+        encoding="utf-8",
+    )
+    (config_dir / "oauth-token").write_text("sk-ant-oat01-LONG\n", encoding="utf-8")
+    assert _read_oauth_token(str(config_dir)) == "sk-ant-oat01-LONG"
+
+
+def test_long_lived_token_file_only_no_credentials_json(tmp_path: Path) -> None:
+    """A queue can drop credentials.json entirely and rely on
+    setup-token alone — the lookup still succeeds."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / "oauth-token").write_text("sk-ant-oat01-LONG\n", encoding="utf-8")
+    assert _read_oauth_token(str(config_dir)) == "sk-ant-oat01-LONG"
+
+
+def test_empty_long_lived_file_falls_through_to_credentials_json(
+    tmp_path: Path,
+) -> None:
+    """A half-written oauth-token file (empty / whitespace-only) must
+    not poison the lookup — the short-lived path still serves."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / "oauth-token").write_text("   \n", encoding="utf-8")
+    (config_dir / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok-A"}}),
+        encoding="utf-8",
+    )
+    assert _read_oauth_token(str(config_dir)) == "tok-A"
+
+
+# ---------------------------------------------------------------------------
 # ApiUsageSource.read — mock urllib so the test is hermetic.
 # ---------------------------------------------------------------------------
 

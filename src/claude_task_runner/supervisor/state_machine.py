@@ -51,6 +51,7 @@ from claude_task_runner.supervisor.states import (
     SupervisorState,
 )
 from claude_task_runner.usage.drift import (
+    UsageApiAuthExpired,
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
     UsageFormatDrift,
@@ -435,6 +436,51 @@ def step(
     # outside this pure step) clears it.
     if snapshot.state is SupervisorState.STOPPED:
         return snapshot, [MonitorInFlight()]
+
+    # Auth-expired (PR 14) routes to ERROR_DRIFT — the bearer is dead
+    # and no amount of retry will fix it without operator intervention
+    # (either `claude setup-token` to refresh the long-lived token or
+    # `claude /login` for the short-lived path). ERROR_DRIFT halts
+    # dispatch and surfaces the message in `supervisor.json`, so the
+    # operator sees the cause in `runner-status` rather than seeing
+    # the account stuck at the last-good utilization indefinitely.
+    #
+    # NOTE: this isinstance check must come BEFORE the
+    # UsageCaptureSpawnError branch — UsageApiAuthExpired is a subclass
+    # of UsageCaptureSpawnError, and the broader branch would otherwise
+    # swallow it as a transient spawn error and skip the tick.
+    if isinstance(inp.reading, UsageApiAuthExpired):
+        if snapshot.state is SupervisorState.ERROR_DRIFT:
+            new_snap = snapshot.model_copy(
+                update={
+                    "consecutive_clean_polls": 0,
+                    "last_drift_message": str(inp.reading),
+                }
+            )
+        else:
+            new_snap = _entry(
+                SupervisorState.ERROR_DRIFT,
+                snapshot=snapshot,
+                clock=clock,
+                reading=None,
+                consecutive_clean_polls=0,
+                last_drift_message=str(inp.reading),
+            )
+            actions.append(
+                Notify(
+                    level="error",
+                    message=f"OAuth bearer rejected: {inp.reading}",
+                )
+            )
+        actions.append(StopDispatch())
+        actions.append(MonitorInFlight())
+        actions.append(
+            EmitEvent(
+                event_type="oauth_auth_expired",
+                payload={"message": str(inp.reading)},
+            )
+        )
+        return new_snap, actions
 
     # Capture-level errors don't trigger ERROR_DRIFT (which is parser
     # format drift). They simply skip this tick — utilization unchanged,

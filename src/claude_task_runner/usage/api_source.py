@@ -13,14 +13,29 @@ Anthropic docs, so the source treats absent / renamed headers as
 :class:`UsageApiHeaderMissing` — a format-drift signal the supervisor
 can route on without confusing it for a network timeout.
 
-Authentication: reads the OAuth bearer token from
-``<config_dir>/.credentials.json`` (the same file ``claude /login``
-writes). The Claude Code CLI refreshes this token internally; third-
-party use of the bearer can see 401 responses on expiry, which this
-source raises as :class:`UsageApiAuthExpired`. The
-``api_then_tty`` composite source falls through to the TTY source on
-that exception (the TTY path spawns ``claude``, which refreshes the
-token as a side effect).
+Authentication: two-stage lookup per account.
+
+1. **Long-lived token (PR 14)** — if ``<config_dir>/oauth-token``
+   exists and contains a non-empty string, use it as the bearer.
+   The file is produced by ``claude setup-token`` and lasts ~1 year;
+   the runner never tries to refresh it (it's not refreshable by
+   design, and the long lifetime makes refresh cycles irrelevant).
+2. **Short-lived token (PR 6, legacy)** — fall back to the
+   ``accessToken`` field in ``<config_dir>/.credentials.json`` (the
+   same file ``claude /login`` writes). The Claude Code CLI
+   refreshes this token internally on every successful CLI call;
+   when the runner reads it directly and the access token has
+   expired (and the refresh token can't roll it forward), this
+   source raises :class:`UsageApiAuthExpired`.
+
+The ``api_then_tty`` composite source falls through to the TTY
+source on :class:`UsageApiAuthExpired` (the TTY path spawns
+``claude``, which refreshes the short-lived token as a side
+effect). For accounts on long-lived tokens, the supervisor's per-
+account source selection (see ``supervisor_cmd._build_source``)
+skips the TTY composite — TTY can't recover a revoked long-lived
+token either, so the right response is to escalate to ERROR_DRIFT
+and notify the operator.
 
 No new third-party deps: uses stdlib ``urllib.request`` so the runner
 install footprint is unchanged.
@@ -48,6 +63,7 @@ from claude_task_runner.usage.drift import (
     UsageApiNetworkError,
 )
 from claude_task_runner.usage.models import UsageReading, WindowReading
+from claude_task_runner.usage.oauth_token_file import read_long_lived_token
 
 logger = logging.getLogger(__name__)
 
@@ -197,13 +213,27 @@ class ApiUsageSource:
 
 
 def _read_oauth_token(config_dir: str) -> str:
-    """Extract the OAuth access token from ``<config_dir>/.credentials.json``.
+    """Extract the OAuth bearer for ``config_dir``.
 
-    Tries each path in ``_CREDENTIAL_KEY_PATHS`` until one resolves to
-    a non-empty string. Raises :class:`CredentialsNotFound` with a
-    helpful listing if none match — the operator can then point the
-    code at whatever shape their version of Claude Code wrote.
+    Priority (PR 14):
+
+    1. ``<config_dir>/oauth-token`` — long-lived token from
+       ``claude setup-token``. Wins outright if present and non-empty.
+       Bypasses ``.credentials.json`` entirely so a stale / dead
+       short-lived ``accessToken`` does not poison the lookup.
+    2. ``<config_dir>/.credentials.json`` — short-lived OAuth bearer
+       written by ``claude /login``. Tries each path in
+       :data:`_CREDENTIAL_KEY_PATHS` until one resolves to a non-empty
+       string.
+
+    Raises :class:`CredentialsNotFound` only when BOTH stages produce
+    nothing — the operator can then either run ``claude setup-token``
+    (recommended) or ``claude /login`` to populate one of the two.
     """
+    long_lived = read_long_lived_token(config_dir)
+    if long_lived is not None:
+        return long_lived
+
     creds_path = (
         Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
     ) / ".credentials.json"
