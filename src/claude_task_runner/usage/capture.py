@@ -37,6 +37,46 @@ def _format_filename(when: datetime) -> str:
     return when.strftime("%Y%m%dT%H%M%SZ.cap")
 
 
+def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
+    """Build the env dict passed to ``pexpect.spawn`` for a usage capture.
+
+    Returns ``None`` when ``claude_config_dir`` is empty — meaning the
+    pexpect spawn inherits the supervisor's process environment
+    unchanged (the original PR 6 single-account behaviour).
+
+    When ``claude_config_dir`` is set:
+
+    * ``CLAUDE_CONFIG_DIR`` is exported so the spawned ``claude /usage``
+      reads the right account's ``.credentials.json``.
+    * If the account has a long-lived OAuth token at
+      ``<config_dir>/oauth-token`` (PR 14), ``CLAUDE_CODE_OAUTH_TOKEN``
+      is also exported so the CLI uses the long-lived bearer instead
+      of ``.credentials.json``'s short-lived ``accessToken``. This
+      closes the gap that PR 14 left in pure-tty ``[usage].source``
+      deployments — without it, `setup-token` long-lived tokens never
+      reach the TTY capture path.
+
+    Raises :class:`UsageCaptureSpawnError` when ``claude_config_dir``
+    points at a path that does not exist on disk (caller pre-condition,
+    surfaced here so the spawn site has one consistent error type).
+    """
+    if not claude_config_dir:
+        return None
+    config_path = Path(claude_config_dir).expanduser()
+    if not config_path.exists():
+        raise UsageCaptureSpawnError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
+    env: dict[str, str] = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+    # Local import to keep `oauth_token_file` out of the import graph
+    # for callers that never construct a capture env (e.g. CLI tools
+    # that import this module just for ``_format_filename``).
+    from claude_task_runner.usage.oauth_token_file import read_long_lived_token
+
+    long_lived = read_long_lived_token(claude_config_dir)
+    if long_lived is not None:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
+    return env
+
+
 def _rotate_captures(captures_dir: Path, keep: int) -> None:
     """Drop the oldest .cap files so at most ``keep`` remain."""
     if keep <= 0:
@@ -91,12 +131,7 @@ def capture(
     captures_dir.mkdir(parents=True, exist_ok=True)
     capture_path = captures_dir / _format_filename(clock.now())
 
-    spawn_env: dict[str, str] | None = None
-    if claude_config_dir:
-        config_path = Path(claude_config_dir).expanduser()
-        if not config_path.exists():
-            raise UsageCaptureSpawnError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
-        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+    spawn_env = _build_spawn_env(claude_config_dir)
 
     # Pre-trust the spawn CWD and mark onboarding complete in the target
     # .claude.json. Idempotent — a no-op once the flags are set. Done for
