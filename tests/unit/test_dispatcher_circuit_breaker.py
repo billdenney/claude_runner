@@ -55,8 +55,14 @@ def fresh_plan() -> SpawnPlan:
 
 
 def _failed_run(
-    *, attempt: int, when: datetime, stop_reason: str = "stop_sequence", error: str | None = None
+    *, attempt: int, when: datetime, stop_reason: str = "max_tokens", error: str | None = None
 ) -> RunRecord:
+    # PR 16: default failure stop_reason changed from "stop_sequence" to
+    # "max_tokens". stop_sequence is now treated as a clean API-level
+    # completion (alongside end_turn / result), so the prior default
+    # would silently classify these "failed_run" fixtures as successes.
+    # max_tokens is a stable cap-violation stop_reason that's never been
+    # in the success set.
     return RunRecord(
         attempt=attempt,
         started_at=when,
@@ -96,9 +102,30 @@ class TestCountTrailingFailures:
         # Only the last failure counts; the success before it broke the streak.
         assert _count_trailing_failures(runs) == 1
 
-    def test_stop_sequence_counts_as_failure(self, when: datetime) -> None:
-        # The live bug: stop_sequence with empty error is classified failed.
+    def test_stop_sequence_counts_as_success(self, when: datetime) -> None:
+        """PR 16: ``stop_sequence`` is recognised as a clean API-level
+        completion (alongside ``end_turn`` / ``result``). Before PR 16
+        this counted as a failure, which produced the chen_2016 /
+        garonzik_2016 / li_2015 false-positive failed-classifications
+        observed live on 2026-05-22/23 — each task had pushed its
+        commit, written its report, and exited cleanly via
+        stop_sequence."""
         runs = [_failed_run(attempt=1, when=when, stop_reason="stop_sequence")]
+        # No trailing failures: stop_sequence breaks the failure streak
+        # the same way end_turn does.
+        assert _count_trailing_failures(runs) == 0
+
+    def test_max_tokens_still_counts_as_failure(self, when: datetime) -> None:
+        """``max_tokens`` (cap hit mid-output) remains a failure — only
+        the clean API-level "I'm done" stop reasons are successes."""
+        runs = [_failed_run(attempt=1, when=when, stop_reason="max_tokens")]
+        assert _count_trailing_failures(runs) == 1
+
+    def test_tool_use_still_counts_as_failure(self, when: datetime) -> None:
+        """``tool_use`` means the model handed control back to the
+        caller mid-conversation without resolving — not a completion,
+        so should not break the failure streak."""
+        runs = [_failed_run(attempt=1, when=when, stop_reason="tool_use")]
         assert _count_trailing_failures(runs) == 1
 
 
