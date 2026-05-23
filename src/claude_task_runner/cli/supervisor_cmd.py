@@ -116,13 +116,33 @@ def _build_per_account_source(
     Same mode dispatch as :func:`_build_usage_source` but pinned to
     a specific ``config_dir`` so the multi-account wrapper can map
     one source per configured account.
+
+    PR 14 long-lived token override: when ``<config_dir>/oauth-token``
+    exists the account is on a ``claude setup-token`` long-lived
+    bearer; the TTY fall-through in ``api_then_tty`` cannot recover
+    a revoked long-lived token (the CLI uses the same bearer and will
+    also 401), so the right behaviour is to drop the composite and
+    use the API source alone. A 401 then surfaces as
+    :class:`UsageApiAuthExpired` → ``ERROR_DRIFT`` rather than being
+    swallowed by a TTY timeout the supervisor can't act on.
     """
     mode = settings.usage.source  # type: ignore[attr-defined]
+    # Local import to avoid pulling oauth_token_file into modules that
+    # don't need it (keeps the CLI startup graph slim).
+    from claude_task_runner.usage.oauth_token_file import oauth_token_path
+
+    long_lived = oauth_token_path(config_dir).exists()
+
     if mode == "tty":
+        # Long-lived bearer + tty-only source: still build the TTY
+        # source; the CLI will pick up CLAUDE_CODE_OAUTH_TOKEN at
+        # spawn time (PR 14 dispatcher change). No composite to undo.
         return _build_tty_source(settings, queue_path, config_dir=config_dir)
     if mode == "api":
         return _build_api_source(settings, config_dir=config_dir)
     if mode == "api_then_tty":
+        if long_lived:
+            return _build_api_source(settings, config_dir=config_dir)
         return ApiThenTtyUsageSource(
             api=_build_api_source(settings, config_dir=config_dir),
             tty=_build_tty_source(settings, queue_path, config_dir=config_dir),

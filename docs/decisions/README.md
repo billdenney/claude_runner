@@ -27,6 +27,8 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0017 | Cleanup after the superseded `claude_runner` audit | accepted | 2026-05-13 |
 | 0018 | Inject TERM and PATH into the generated systemd-user unit | accepted | 2026-05-14 |
 | 0019 | Pre-init `.claude.json` before every claude spawn | accepted | 2026-05-18 |
+| 0020 | Gate `completed` status on at least one observable output artifact | proposed | 2026-05-21 |
+| 0021 | Per-account long-lived OAuth token via `claude setup-token` | proposed | 2026-05-23 |
 
 ## Template
 
