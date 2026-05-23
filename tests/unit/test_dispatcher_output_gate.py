@@ -439,14 +439,21 @@ class TestFinalizeStateOutputGate:
         # If the run came back with an error or a non-completing
         # stop_reason, the status is already ``failed`` and the gate
         # must not touch the RunRecord. (Regression guard: an earlier
-        # draft re-classified ``stop_sequence`` as
-        # ``end_turn_no_output`` because the gate ran unconditionally.)
+        # draft re-classified failing runs as ``end_turn_no_output``
+        # because the gate ran unconditionally.)
+        #
+        # PR 16: ``stop_sequence`` is no longer a failing stop_reason
+        # (it's a clean API-level completion alongside ``end_turn`` /
+        # ``result``), so this test uses ``max_tokens`` instead — a
+        # stable failure stop_reason that's never been in the success
+        # set. The PR 16-specific success case for ``stop_sequence``
+        # is covered by ``TestStopSequenceSuccess`` below.
         prior = TaskState(task_id="t1")
         failing_run = RunRecord(
             attempt=1,
             started_at=WHEN,
             finished_at=WHEN,
-            stop_reason="stop_sequence",
+            stop_reason="max_tokens",
             error=None,
             usage=TokenUsage(),
             duration_s=1.0,
@@ -462,4 +469,79 @@ class TestFinalizeStateOutputGate:
             has_open_sidecar=False,
         )
         assert new_state.status == "failed"
+        assert new_run.stop_reason == "max_tokens"
+
+
+class TestStopSequenceSuccess:
+    """PR 16: ``stop_sequence`` is a clean API-level completion.
+
+    The live chen_2016 / garonzik_2016 / li_2015 false-positive
+    failed-classifications observed on 2026-05-22/23 happened because
+    ``stop_sequence`` (a normal Anthropic stop_reason for "model emitted
+    a configured stop sequence") was not in the success set. Each task
+    had pushed a real commit, written its report, and exited cleanly,
+    but got re-dispatched because the status was ``failed``.
+    """
+
+    def test_stop_sequence_with_evidence_is_completed(
+        self, git_worktree: Path, fresh_plan: SpawnPlan
+    ) -> None:
+        """The chen_2016 case: stop_sequence + new commit on the worktree
+        branch + no error → completed (and the evidence gate does not
+        flip it back to failed)."""
+        prior = TaskState(task_id="t1")
+        # Snapshot HEAD as pre_sha, add a commit that mimics the
+        # dispatched agent's output, then call finalize. The evidence
+        # gate should see the new commit and keep the status as
+        # completed.
+        pre_sha = _git(git_worktree, "rev-parse", "HEAD")
+        (git_worktree / "out.txt").write_text("agent output\n")
+        _git(git_worktree, "add", ".")
+        _git(git_worktree, "commit", "-q", "-m", "agent commit")
+        run = RunRecord(
+            attempt=1,
+            started_at=WHEN,
+            finished_at=WHEN,
+            stop_reason="stop_sequence",
+            error=None,
+            usage=TokenUsage(),
+            duration_s=1.0,
+        )
+        new_state, new_run = _finalize_state(
+            prior=prior,
+            plan=fresh_plan,
+            run=run,
+            summary=StreamSummary(),
+            cap_violation=None,
+            task=_task(working_dir=git_worktree),
+            pre_sha=pre_sha,
+            has_open_sidecar=False,
+        )
+        assert new_state.status == "completed"
         assert new_run.stop_reason == "stop_sequence"
+
+    def test_stop_sequence_without_working_dir_is_completed(self, fresh_plan: SpawnPlan) -> None:
+        """No working_dir means the ADR-0020 evidence gate is skipped
+        entirely; stop_sequence + error=None classifies as completed
+        without any evidence check."""
+        prior = TaskState(task_id="t1")
+        run = RunRecord(
+            attempt=1,
+            started_at=WHEN,
+            finished_at=WHEN,
+            stop_reason="stop_sequence",
+            error=None,
+            usage=TokenUsage(),
+            duration_s=1.0,
+        )
+        new_state, _ = _finalize_state(
+            prior=prior,
+            plan=fresh_plan,
+            run=run,
+            summary=StreamSummary(),
+            cap_violation=None,
+            task=_task(working_dir=None),
+            pre_sha=None,
+            has_open_sidecar=False,
+        )
+        assert new_state.status == "completed"

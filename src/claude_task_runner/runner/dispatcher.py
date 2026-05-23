@@ -802,22 +802,53 @@ def dispatch(
     )
 
 
+_SUCCESS_STOP_REASONS: frozenset[str] = frozenset(
+    {
+        # Model finished its turn naturally with no caller-imposed cap.
+        "end_turn",
+        # claude-code wrapper synthesises this for the top-level result
+        # event when no specific stop_reason was provided by the API.
+        "result",
+        # Model emitted a configured stop sequence — this is a clean,
+        # API-level "I'm done" signal, semantically equivalent to
+        # end_turn from the runner's perspective (the dispatched agent
+        # has finished its work and produced its output). Treating
+        # stop_sequence as a failure caused the chen_2016 / garonzik_2016
+        # / li_2015 false-positive failed-classifications observed live
+        # on 2026-05-22/23 — each task had pushed a real commit, written
+        # its report, and exited cleanly, but got re-dispatched because
+        # the status was "failed".
+        "stop_sequence",
+    }
+)
+"""Stop reasons that indicate the dispatched agent finished its work
+intentionally. Used by :func:`_finalize_state` and
+:func:`_count_trailing_failures` so success classification and
+circuit-breaker accounting stay in sync.
+
+Failure-class stop_reasons (not in this set) include:
+``max_tokens`` (cap exceeded mid-output), ``tool_use`` (turn handed
+back to caller without resolution — should be picked up next tick
+via session resume, not classified completed yet), and the runner-
+synthesised ``killed_by_cap`` / ``process_exit_nonzero`` /
+``no_result`` / ``pre_dispatch_hook_failed`` / ``end_turn_no_output``
+(ADR-0020 evidence gate)."""
+
+
 def _count_trailing_failures(runs: list[RunRecord]) -> int:
     """Count consecutive failure RunRecords at the tail of ``runs``.
 
     A success interleaves the failure run and resets the count. The
     most recent run is the last element of ``runs``.
 
-    Mirrors the criteria in `_finalize_state` for "completed": empty
-    error AND a clean stop_reason. Anything else is a failure for
-    circuit-breaker accounting purposes.
+    Mirrors the criteria in `_finalize_state` for "completed" via the
+    shared :data:`_SUCCESS_STOP_REASONS` set: empty error AND a clean
+    stop_reason. Anything else is a failure for circuit-breaker
+    accounting purposes.
     """
     n = 0
     for record in reversed(runs):
-        is_success = record.error is None and record.stop_reason in (
-            "end_turn",
-            "result",
-        )
+        is_success = record.error is None and record.stop_reason in _SUCCESS_STOP_REASONS
         if is_success:
             break
         n += 1
@@ -860,7 +891,7 @@ def _finalize_state(
     """
     if cap_violation is not None:
         new_status = "failed"
-    elif run.error is None and run.stop_reason in ("end_turn", "result"):
+    elif run.error is None and run.stop_reason in _SUCCESS_STOP_REASONS:
         new_status = "completed"
     else:
         new_status = "failed"
