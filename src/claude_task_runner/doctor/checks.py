@@ -239,13 +239,26 @@ def check_account_policies(settings: Settings) -> CheckResult:
             fails.append(f"{acct.name}: {exc}")
             continue
         source = "defaults" if path is None or not path.exists() else str(path)
+
+        def _fmt(v: object) -> str:
+            """Render a per-account override field, treating None as 'inherit'.
+
+            After PR 13 every per-account throttle field defaults to None,
+            meaning "inherit the queue-wide value." Showing 'inherit' in the
+            doctor report makes the per-account file's overrides obvious."""
+            return "inherit" if v is None else str(v)
+
+        f = policy.throttle.five_hour
+        w = policy.throttle.weekly
         rows.append(
             f"{acct.name}: max_concurrency={policy.concurrency.max_concurrency}, "
-            f"daytime={policy.throttle.five_hour.daytime_band_full_dispatch_max_pct}/"
-            f"{policy.throttle.five_hour.daytime_band_slowdown_max_pct}, "
-            f"nighttime={policy.throttle.five_hour.nighttime_band_full_dispatch_max_pct}/"
-            f"{policy.throttle.five_hour.nighttime_band_slowdown_max_pct}, "
-            f"day_end={policy.throttle.time_of_day.day_end} "
+            f"daytime={_fmt(f.daytime_band_full_dispatch_max_pct)}/"
+            f"{_fmt(f.daytime_band_slowdown_max_pct)}, "
+            f"nighttime={_fmt(f.nighttime_band_full_dispatch_max_pct)}/"
+            f"{_fmt(f.nighttime_band_slowdown_max_pct)}, "
+            f"weekly={_fmt(w.band_slowdown_max_pct)}/"
+            f"{_fmt(w.pause_at_pct)}, "
+            f"day_end={_fmt(policy.throttle.time_of_day.day_end)} "
             f"({source})"
         )
 

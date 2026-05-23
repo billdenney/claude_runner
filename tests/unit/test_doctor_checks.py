@@ -211,16 +211,20 @@ def test_check_legacy_config_dir_conflicts_with_explicit(settings: Settings) -> 
 def test_check_account_policies_defaults_pass(settings: Settings) -> None:
     """Default settings (single 'default' account, empty config_dir) → PASS.
 
-    Empty config_dir → policy defaults apply; report should show
-    max_concurrency=1 and the default bands.
+    Empty config_dir → policy defaults apply. After PR 13 the per-account
+    throttle fields default to None ('inherit queue-wide'), so the doctor
+    report shows them as 'inherit' rather than the hardcoded numbers it
+    used to print.
     """
     from claude_task_runner.doctor.checks import check_account_policies
 
     result = check_account_policies(settings)
     assert result.status == CheckStatus.PASS
     assert "max_concurrency=1" in result.detail
-    assert "daytime=40/60" in result.detail
-    assert "nighttime=70/90" in result.detail
+    # PR 13 — None per-account fields render as 'inherit', not numeric bands.
+    assert "daytime=inherit/inherit" in result.detail
+    assert "nighttime=inherit/inherit" in result.detail
+    assert "weekly=inherit/inherit" in result.detail
 
 
 def test_check_account_policies_present_file_reported(settings: Settings, tmp_path: Path) -> None:

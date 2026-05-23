@@ -362,33 +362,75 @@ class AccountConcurrencyPolicy(_StrictModel):
 
 
 class AccountThrottleFiveHour(_StrictModel):
-    """Per-account 5-hour throttle bands with daytime/nighttime split.
+    """Per-account 5-hour throttle band overrides.
 
-    Defaults match the multi-account ADR's documented values; the
-    operator overrides them in ``<config_dir>/runner-account.toml``
-    once they have empirical data for the account.
+    Every field is ``int | None``: ``None`` (the default) means
+    *inherit* the queue-wide ``[throttle.five_hour]`` value for that
+    field. Set a field to override the queue-wide value for this
+    account only — useful when a fresh / untested account needs
+    tighter bands than the established one, or vice versa.
+
+    Changed in PR 13: pre-PR-13 these had hardcoded defaults
+    (40/60/70/90) which were the *same* numbers the queue uses by
+    default — so the visible behaviour didn't change. After PR 13
+    these are None-by-default and a missing field falls through to
+    the queue-wide value, which gives operators a single source of
+    truth (the queue toml) and lets per-account files override
+    surgically.
     """
 
-    daytime_band_full_dispatch_max_pct: int = Field(default=40, ge=0, le=100)
-    daytime_band_slowdown_max_pct: int = Field(default=60, ge=0, le=100)
-    nighttime_band_full_dispatch_max_pct: int = Field(default=70, ge=0, le=100)
-    nighttime_band_slowdown_max_pct: int = Field(default=90, ge=0, le=100)
+    daytime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
+    daytime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+    nighttime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
+    nighttime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+
+
+class AccountThrottleWeekly(_StrictModel):
+    """Per-account weekly throttle + pacing-curve overrides.
+
+    Every field is ``T | None`` with ``None`` meaning "inherit the
+    queue-wide ``[throttle.weekly]`` value for that field." Set a
+    field to override.
+
+    Use cases:
+      * One account is the operator's primary; the other is a
+        secondary that's allowed to push closer to its weekly cap
+        (``pause_at_pct`` higher, ``pacing_slack_pp`` wider).
+      * ``eow_push_nighttime_only`` is true queue-wide (default) so
+        daytime windows stay free for interactive use, but is false
+        on a fully-autonomous account that can push 24/7.
+
+    Added in PR 13. The hard pause floor (``pause_at_pct``) is still
+    a SAFETY floor even when overridden — the pacing curve never
+    tightens past it.
+    """
+
+    band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
+    band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+    pause_at_pct: int | None = Field(default=None, ge=0, le=100)
+    eow_push_enter_at_pct: int | None = Field(default=None, ge=0, le=100)
+    eow_target_pct: int | None = Field(default=None, ge=0, le=100)
+    eow_window_s: float | None = Field(default=None, ge=0)
+    eow_runtime_safety_factor: float | None = Field(default=None, gt=0, le=1.0)
+    pacing_curve_enabled: bool | None = None
+    pre_eow_target_pct: int | None = Field(default=None, ge=0, le=100)
+    pacing_slack_pp: float | None = Field(default=None, ge=0, le=100)
+    eow_push_nighttime_only: bool | None = None
 
 
 class AccountTimeOfDay(_StrictModel):
-    """Per-account day/night cutover for the 5h throttle bands.
+    """Per-account day/night cutover override.
 
-    Single ``day_end`` (default 21:00) follows the operator's pattern
-    in their existing per-account file; the global
-    :class:`TimeOfDaySettings` retains the richer ``day_start`` /
-    ``ramp_minutes`` for the queue-wide throttle.
+    ``day_end`` was hardcoded to "21:00" pre-PR-13; now defaults to
+    None (inherit queue-wide ``[throttle.time_of_day].day_end``).
     """
 
-    day_end: str = "21:00"
+    day_end: str | None = None
 
 
 class AccountThrottlePolicy(_StrictModel):
     five_hour: AccountThrottleFiveHour = Field(default_factory=AccountThrottleFiveHour)
+    weekly: AccountThrottleWeekly = Field(default_factory=AccountThrottleWeekly)
     time_of_day: AccountTimeOfDay = Field(default_factory=AccountTimeOfDay)
 
 
