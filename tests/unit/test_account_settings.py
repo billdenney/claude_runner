@@ -165,16 +165,24 @@ class TestSettingsLegacySynthesis:
 
 
 class TestAccountPolicyDefaults:
-    def test_default_policy_uses_documented_values(self) -> None:
-        """Empty policy → max_concurrency=1, 40/60 daytime, 70/90 nighttime."""
+    def test_default_policy_inherits_queue_wide(self) -> None:
+        """Empty policy → max_concurrency=1 (still the per-account fallback)
+        but every throttle field is None (= inherit queue-wide) after PR 13.
+        The merge helper in supervisor.throttle_merge fills the queue-wide
+        value at use time."""
         policy = AccountPolicy()
         assert policy.concurrency.max_concurrency == 1
         f = policy.throttle.five_hour
-        assert f.daytime_band_full_dispatch_max_pct == 40
-        assert f.daytime_band_slowdown_max_pct == 60
-        assert f.nighttime_band_full_dispatch_max_pct == 70
-        assert f.nighttime_band_slowdown_max_pct == 90
-        assert policy.throttle.time_of_day.day_end == "21:00"
+        assert f.daytime_band_full_dispatch_max_pct is None
+        assert f.daytime_band_slowdown_max_pct is None
+        assert f.nighttime_band_full_dispatch_max_pct is None
+        assert f.nighttime_band_slowdown_max_pct is None
+        assert policy.throttle.time_of_day.day_end is None
+        # PR 13: weekly overrides also default to None.
+        w = policy.throttle.weekly
+        assert w.band_slowdown_max_pct is None
+        assert w.pause_at_pct is None
+        assert w.eow_push_nighttime_only is None
 
 
 class TestPerAccountTomlPath:
@@ -219,16 +227,18 @@ class TestLoadAccountPolicy:
         assert policy.throttle.five_hour.nighttime_band_slowdown_max_pct == 85
         assert policy.throttle.time_of_day.day_end == "22:00"
 
-    def test_partial_policy_fills_defaults(self, tmp_path: Path) -> None:
-        """Setting only max_concurrency leaves throttle defaults intact."""
+    def test_partial_policy_inherits_for_missing_fields(self, tmp_path: Path) -> None:
+        """Setting only max_concurrency leaves throttle fields at None
+        (= inherit queue-wide). PR 13 changed AccountThrottle*'s
+        defaults from hardcoded numbers to None-means-inherit."""
         (tmp_path / "runner-account.toml").write_text(
             "[concurrency]\nmax_concurrency = 3\n", encoding="utf-8"
         )
         policy = load_account_policy(str(tmp_path))
         assert policy.concurrency.max_concurrency == 3
-        # Defaults preserved.
-        assert policy.throttle.five_hour.daytime_band_full_dispatch_max_pct == 40
-        assert policy.throttle.time_of_day.day_end == "21:00"
+        # Inherited (None means "use queue-wide").
+        assert policy.throttle.five_hour.daytime_band_full_dispatch_max_pct is None
+        assert policy.throttle.time_of_day.day_end is None
 
     def test_invalid_toml_raises_config_error(self, tmp_path: Path) -> None:
         (tmp_path / "runner-account.toml").write_text("not = valid = toml", encoding="utf-8")

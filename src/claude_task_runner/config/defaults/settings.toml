@@ -196,7 +196,12 @@ band_slowdown_max_pct       = 90
 pause_at_pct                = 90
 eow_push_enter_at_pct       = 90
 eow_target_pct              = 95           # was 98 — leave safety margin
-eow_window_s                = 86400        # 24h — was 43200 (12h)
+eow_window_s                = 144000       # 40h — covers ~2 nights of the
+                                           # `eow_push_nighttime_only` gate (was
+                                           # 86400 / 24h in PR 1-12, which left a
+                                           # single-night window prone to skipping
+                                           # an EOW push if that one night was
+                                           # truncated by operator activity).
 eow_runtime_safety_factor   = 0.5
 # Dynamic pacing curve. ADR-0016.
 pacing_curve_enabled        = true

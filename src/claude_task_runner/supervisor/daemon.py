@@ -24,13 +24,13 @@ import logging
 import signal
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from claude_task_runner.clock import Clock, RealClock
 from claude_task_runner.config.loader import ConfigError, load_settings
-from claude_task_runner.config.schema import Settings
+from claude_task_runner.config.schema import AccountPolicy, Settings
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
@@ -38,6 +38,7 @@ from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import reconcile as reconcile_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
+from claude_task_runner.supervisor import throttle_merge as merge_throttle_mod
 from claude_task_runner.supervisor.actions import (
     Action,
     EmitEvent,
@@ -83,12 +84,20 @@ class TickContext:
     Surveys the queue (pending + in-flight counts), polls usage, and
     bundles them with the loaded settings. Tests construct one
     explicitly to drive :func:`run_one_tick` deterministically.
+
+    ``account_policies`` (PR 13) maps account name → resolved
+    :class:`AccountPolicy`. Used by :func:`run_one_tick` to layer
+    per-account throttle overrides on top of the queue-wide
+    ``settings.throttle`` when the poll result is attributed to a
+    specific account. Empty dict (the default) reproduces the
+    pre-PR-13 single-throttle behaviour.
     """
 
     settings: Settings
     poll_result: PollResult
     pending_count: int
     in_flight_count: int
+    account_policies: dict[str, AccountPolicy] = field(default_factory=dict)
 
 
 def run_one_tick(
@@ -103,24 +112,48 @@ def run_one_tick(
     this with hand-built :class:`TickContext` and skip the whole
     side-effects layer.
 
-    Multi-account attribution:
+    Multi-account attribution + per-account throttle (PR 8 + PR 13):
         When ``ctx.poll_result`` is a :class:`UsageReading` with
         ``.account`` set (produced by
-        :class:`MultiAccountUsageSource`), the daemon focuses the
-        state machine on that account's per-account state before
-        ``step()`` runs and copies the resulting top-level changes
-        back into ``snapshot.accounts[<account>]`` afterwards. This
-        lets the existing single-account state machine logic operate
-        per-account without an invasive rewrite. The top-level
-        fields end the tick mirroring the most-recently-captured
-        account.
+        :class:`MultiAccountUsageSource`), the daemon:
+
+        1. Focuses the snapshot on that account's per-account state
+           (mirror to top-level so the state machine sees the right
+           prior state).
+        2. Merges the per-account throttle policy from
+           ``ctx.account_policies[<account>]`` on top of the queue-
+           wide ``ctx.settings.throttle`` via
+           :func:`throttle_merge.merge_throttle_with_account`. Any
+           ``None`` field in the per-account policy inherits queue-
+           wide; explicit values override. Passes the merged
+           ``ThrottleSettings`` into ``StepInput`` so
+           ``_classify_active`` operates with the right bands.
+        3. Runs ``step()``.
+        4. Copies the resulting top-level state back into
+           ``snapshot.accounts[<account>]``.
+
+        Without per-account attribution (single-account / cold
+        start), the queue-wide throttle is used as before.
     """
     account_name = _reading_account(ctx.poll_result)
     focused = _focus_on_account(snapshot, account_name)
+
+    # Per-account throttle merge (PR 13). When attributed, pull the
+    # account's policy and overlay onto queue-wide throttle. The
+    # merge helper is a pure function and a no-op if every per-
+    # account override field is None (i.e. inherit everything).
+    effective_throttle = ctx.settings.throttle
+    if account_name is not None:
+        policy = ctx.account_policies.get(account_name)
+        if policy is not None:
+            effective_throttle = merge_throttle_mod.merge_throttle_with_account(
+                ctx.settings.throttle, policy
+            )
+
     inp = sm_mod.StepInput(
         snapshot=focused,
         reading=ctx.poll_result,
-        settings_throttle=ctx.settings.throttle,
+        settings_throttle=effective_throttle,
         settings_supervisor=ctx.settings.supervisor,
         settings_usage=ctx.settings.usage,
         pending_count=ctx.pending_count,
@@ -462,11 +495,24 @@ def start_daemon(
                     )
                     reload_flag["pending"] = False
 
+                # Resolve account policies each tick so per-account
+                # runner-account.toml edits are picked up live (matches
+                # the live-config posture of `resolve_accounts` already
+                # called per-tick from tick_dispatch). Local import to
+                # avoid a circular at module top (config.loader imports
+                # config.schema which the supervisor package depends on
+                # via its own state types).
+                from claude_task_runner.config.loader import resolve_accounts
+
+                resolved = resolve_accounts(settings)
+                account_policies = {a.name: a.policy for a in resolved}
+
                 ctx = TickContext(
                     settings=settings,
                     poll_result=safe_poll(effective_source),
                     pending_count=pending_count_fn(),
                     in_flight_count=in_flight_count_fn(),
+                    account_policies=account_policies,
                 )
                 snapshot, actions = run_one_tick(snapshot, ctx, clk)
                 execute_actions(
