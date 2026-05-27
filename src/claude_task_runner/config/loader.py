@@ -38,6 +38,28 @@ PER_ACCOUNT_TOML_NAME = "runner-account.toml"
 the per-account dispatch policy."""
 
 
+_LEGACY_THROTTLE_MIGRATION_MSG = (
+    "[throttle.*] is gone in ADR-0022; rename to [dispatch_pct.*]. "
+    "Mapping: day = {fivehr_slowdown_pct, fivehr_stop_pct}, "
+    "night = {fivehr_slowdown_pct, fivehr_stop_pct, time_start, time_end}, "
+    "week = {early_pct, eow_pct, eow_time_switch}. "
+    "See docs/cheatsheet.md#migration-from-throttle and "
+    "docs/decisions/0022-dispatch-pct-trace-following.md."
+)
+
+
+def _reject_legacy_throttle(payload: dict[str, Any], source: str) -> None:
+    """Raise :class:`ConfigError` if ``payload`` contains a top-level ``throttle`` key.
+
+    Called on every operator-provided TOML (queue and per-account)
+    *before* merging defaults so an operator who hasn't migrated their
+    config sees the rename hint at startup — silent fall-through would
+    drop safety-floor settings without warning.
+    """
+    if "throttle" in payload:
+        raise ConfigError(f"{source}: {_LEGACY_THROTTLE_MIGRATION_MSG}")
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: nested dicts merge, scalars and lists overwrite."""
     out = dict(base)
@@ -80,6 +102,7 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
                 override = tomllib.load(fh)
         except tomllib.TOMLDecodeError as exc:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
+        _reject_legacy_throttle(override, str(per_queue_toml))
         merged = _deep_merge(merged, override)
 
     try:
@@ -118,6 +141,7 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
             payload = tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
+    _reject_legacy_throttle(payload, str(path))
     try:
         return AccountPolicy.model_validate(payload)
     except Exception as exc:

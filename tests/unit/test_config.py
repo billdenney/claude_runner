@@ -38,29 +38,34 @@ class TestLoadDefaults:
     def test_loads_without_error(self) -> None:
         defaults = load_defaults()
         assert "usage" in defaults
-        assert "throttle" in defaults
-        assert defaults["throttle"]["five_hour"]["band_full_dispatch_max_pct"] == 40
+        assert "dispatch_pct" in defaults
+        assert defaults["dispatch_pct"]["day"]["fivehr_slowdown_pct"] == 40
 
 
 class TestLoadSettings:
     def test_no_override(self) -> None:
         s = load_settings(None)
-        assert s.throttle.five_hour.band_full_dispatch_max_pct == 40
-        assert s.throttle.five_hour.band_slowdown_max_pct == 60
+        assert s.dispatch_pct.day.fivehr_slowdown_pct == 40
+        assert s.dispatch_pct.day.fivehr_stop_pct == 60
         assert s.usage.poll_interval_s == 60.0
         assert s.session.max_resume_attempts == 3
 
-    def test_override_replaces_value(self, tmp_path: Path) -> None:
+    def test_legacy_throttle_block_rejected(self, tmp_path: Path) -> None:
+        """ADR-0022 retired ``[throttle.*]``; the loader raises with a
+        migration hint so operators don't silently lose safety floors."""
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(
-            "[throttle.five_hour]\n"
-            "band_full_dispatch_max_pct = 75\n"
-            "band_slowdown_max_pct = 85\n"
-            "budget_tokens = 50_000_000\n"
+            "[throttle.five_hour]\nband_full_dispatch_max_pct = 75\nband_slowdown_max_pct = 85\n"
         )
+        with pytest.raises(ConfigError, match=r"\[throttle\.\*\]"):
+            load_settings(toml)
+
+    def test_override_replaces_value(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[dispatch_pct.day]\nfivehr_slowdown_pct = 75\nfivehr_stop_pct     = 85\n")
         s = load_settings(toml)
-        assert s.throttle.five_hour.band_full_dispatch_max_pct == 75
-        assert s.throttle.five_hour.band_slowdown_max_pct == 85
+        assert s.dispatch_pct.day.fivehr_slowdown_pct == 75
+        assert s.dispatch_pct.day.fivehr_stop_pct == 85
         # Untouched section keeps default
         assert s.session.max_resume_attempts == 3
 
@@ -83,7 +88,7 @@ class TestLoadSettings:
     def test_out_of_range_value_rejected(self, tmp_path: Path) -> None:
         toml = tmp_path / "bad_range.toml"
         toml.write_text(
-            "[throttle.five_hour]\nband_full_dispatch_max_pct = 250\n"  # > 100
+            "[dispatch_pct.day]\nfivehr_slowdown_pct = 250\n"  # > 100
         )
         with pytest.raises(ConfigError, match="validation failed"):
             load_settings(toml)

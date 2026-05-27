@@ -243,22 +243,22 @@ def check_account_policies(settings: Settings) -> CheckResult:
         def _fmt(v: object) -> str:
             """Render a per-account override field, treating None as 'inherit'.
 
-            After PR 13 every per-account throttle field defaults to None,
-            meaning "inherit the queue-wide value." Showing 'inherit' in the
-            doctor report makes the per-account file's overrides obvious."""
+            Every per-account ``[dispatch_pct.*]`` field defaults to None,
+            meaning "inherit the queue-wide value." Showing 'inherit' in
+            the doctor report makes the per-account file's overrides
+            obvious."""
             return "inherit" if v is None else str(v)
 
-        f = policy.throttle.five_hour
-        w = policy.throttle.weekly
+        dp = policy.dispatch_pct
         rows.append(
             f"{acct.name}: max_concurrency={policy.concurrency.max_concurrency}, "
-            f"daytime={_fmt(f.daytime_band_full_dispatch_max_pct)}/"
-            f"{_fmt(f.daytime_band_slowdown_max_pct)}, "
-            f"nighttime={_fmt(f.nighttime_band_full_dispatch_max_pct)}/"
-            f"{_fmt(f.nighttime_band_slowdown_max_pct)}, "
-            f"weekly={_fmt(w.band_slowdown_max_pct)}/"
-            f"{_fmt(w.pause_at_pct)}, "
-            f"day_end={_fmt(policy.throttle.time_of_day.day_end)} "
+            f"day={_fmt(dp.day.fivehr_slowdown_pct)}/"
+            f"{_fmt(dp.day.fivehr_stop_pct)}, "
+            f"night={_fmt(dp.night.fivehr_slowdown_pct)}/"
+            f"{_fmt(dp.night.fivehr_stop_pct)}"
+            f"@[{_fmt(dp.night.time_start)}-{_fmt(dp.night.time_end)}], "
+            f"week early={_fmt(dp.week.early_pct)}/"
+            f"eow={_fmt(dp.week.eow_pct)}@{_fmt(dp.week.eow_time_switch)} "
             f"({source})"
         )
 
@@ -273,6 +273,60 @@ def check_account_policies(settings: Settings) -> CheckResult:
         name="account_policies",
         status=CheckStatus.PASS,
         detail=" | ".join(rows),
+    )
+
+
+def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResult:
+    """Operator-visible migration check: flag lingering ``[throttle.*]`` blocks.
+
+    ADR-0022 renamed ``[throttle.*]`` to ``[dispatch_pct.*]``. The loader
+    raises on the legacy block, but operators running ``doctor`` on a
+    queue that hasn't been migrated yet see this check first — it
+    points to the exact files that need editing.
+
+    Scans the queue's ``claude_runner.toml`` and every resolved
+    account's ``<config_dir>/runner-account.toml`` for a top-level
+    ``[throttle]`` table.
+    """
+    import tomllib
+
+    candidates: list[Path] = []
+    queue_toml = queue_dir / "claude_runner.toml"
+    if queue_toml.exists():
+        candidates.append(queue_toml)
+    for acct in settings.accounts:
+        path = per_account_toml_path(acct.config_dir)
+        if path is not None and path.exists():
+            candidates.append(path)
+
+    offenders: list[str] = []
+    for path in candidates:
+        try:
+            with path.open("rb") as fh:
+                payload = tomllib.load(fh)
+        except tomllib.TOMLDecodeError:
+            # The check_account_policies / loader path surfaces parse
+            # errors; we only care about the legacy throttle key here.
+            continue
+        if "throttle" in payload:
+            offenders.append(str(path))
+
+    if offenders:
+        return CheckResult(
+            name="dispatch_pct_legacy",
+            status=CheckStatus.FAIL,
+            detail=(f"{len(offenders)} TOML file(s) still carry a legacy [throttle.*] block."),
+            remediation=(
+                "Rename [throttle.*] to [dispatch_pct.*] in:\n  "
+                + "\n  ".join(offenders)
+                + "\nSee docs/decisions/0022-dispatch-pct-trace-following.md "
+                "and docs/cheatsheet.md#migration-from-throttle."
+            ),
+        )
+    return CheckResult(
+        name="dispatch_pct_legacy",
+        status=CheckStatus.PASS,
+        detail=f"no legacy [throttle.*] blocks across {len(candidates)} TOML(s)",
     )
 
 
@@ -946,6 +1000,7 @@ def all_checks(
         lambda: check_accounts(settings),
         lambda: check_legacy_claude_config_dir(settings),
         lambda: check_account_policies(settings),
+        lambda: check_dispatch_pct_legacy(settings, queue_dir),
         lambda: check_account_sudo(settings),
         lambda: check_queue_perms_for_linux_users(settings, queue_dir),
         lambda: check_global_lock(settings),

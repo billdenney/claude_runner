@@ -30,7 +30,11 @@ from pathlib import Path
 
 from claude_task_runner.clock import Clock, RealClock
 from claude_task_runner.config.loader import ConfigError, load_settings
-from claude_task_runner.config.schema import AccountPolicy, Settings
+from claude_task_runner.config.schema import (
+    AccountConcurrencyPolicy,
+    AccountPolicy,
+    Settings,
+)
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
@@ -38,7 +42,6 @@ from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import reconcile as reconcile_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
-from claude_task_runner.supervisor import throttle_merge as merge_throttle_mod
 from claude_task_runner.supervisor.actions import (
     Action,
     EmitEvent,
@@ -46,6 +49,7 @@ from claude_task_runner.supervisor.actions import (
     ScheduleWakeupAt,
 )
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+from claude_task_runner.throttle import policy as throttle_policy
 from claude_task_runner.usage.drift import (
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
@@ -112,7 +116,7 @@ def run_one_tick(
     this with hand-built :class:`TickContext` and skip the whole
     side-effects layer.
 
-    Multi-account attribution + per-account throttle (PR 8 + PR 13):
+    Multi-account attribution + per-account dispatch_pct (PR 8 + ADR-0022):
         When ``ctx.poll_result`` is a :class:`UsageReading` with
         ``.account`` set (produced by
         :class:`MultiAccountUsageSource`), the daemon:
@@ -120,40 +124,33 @@ def run_one_tick(
         1. Focuses the snapshot on that account's per-account state
            (mirror to top-level so the state machine sees the right
            prior state).
-        2. Merges the per-account throttle policy from
-           ``ctx.account_policies[<account>]`` on top of the queue-
-           wide ``ctx.settings.throttle`` via
-           :func:`throttle_merge.merge_throttle_with_account`. Any
-           ``None`` field in the per-account policy inherits queue-
-           wide; explicit values override. Passes the merged
-           ``ThrottleSettings`` into ``StepInput`` so
-           ``_classify_active`` operates with the right bands.
+        2. Resolves the per-account ``[dispatch_pct.*]`` policy
+           against the queue-wide settings via
+           :func:`throttle.policy.resolve`. Per-account ``None``
+           fields inherit queue-wide; explicit values override.
+           Passes the resulting :class:`ResolvedPolicy` into
+           ``StepInput``.
         3. Runs ``step()``.
         4. Copies the resulting top-level state back into
            ``snapshot.accounts[<account>]``.
 
         Without per-account attribution (single-account / cold
-        start), the queue-wide throttle is used as before.
+        start), the queue-wide concurrency cap is used.
     """
     account_name = _reading_account(ctx.poll_result)
     focused = _focus_on_account(snapshot, account_name)
 
-    # Per-account throttle merge (PR 13). When attributed, pull the
-    # account's policy and overlay onto queue-wide throttle. The
-    # merge helper is a pure function and a no-op if every per-
-    # account override field is None (i.e. inherit everything).
-    effective_throttle = ctx.settings.throttle
-    if account_name is not None:
-        policy = ctx.account_policies.get(account_name)
-        if policy is not None:
-            effective_throttle = merge_throttle_mod.merge_throttle_with_account(
-                ctx.settings.throttle, policy
-            )
+    account_policy = _resolve_account_policy(ctx, account_name)
+    resolved_policy = throttle_policy.resolve(
+        ctx.settings,
+        account_policy,
+        account_name=account_name or "default",
+    )
 
     inp = sm_mod.StepInput(
         snapshot=focused,
         reading=ctx.poll_result,
-        settings_throttle=effective_throttle,
+        policy=resolved_policy,
         settings_supervisor=ctx.settings.supervisor,
         settings_usage=ctx.settings.usage,
         pending_count=ctx.pending_count,
@@ -162,6 +159,27 @@ def run_one_tick(
     new_focused, actions = sm_mod.step(inp, clock)
     new_snapshot = _propagate_to_account(new_focused, account_name, clock)
     return new_snapshot, actions
+
+
+def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> AccountPolicy:
+    """Pick the :class:`AccountPolicy` to compose into the ResolvedPolicy.
+
+    When the reading is attributed and the operator declared a policy
+    for that account, return it verbatim. Otherwise synthesise a
+    policy that carries the queue-wide ``[concurrency].max_concurrency``
+    so ``ResolvedPolicy.max_concurrency`` reflects the operator's
+    setting rather than the per-account default of 1. ADR-0022 requires
+    ``max_concurrency`` never to be implicit.
+    """
+    if account_name is not None:
+        explicit = ctx.account_policies.get(account_name)
+        if explicit is not None:
+            return explicit
+    return AccountPolicy(
+        concurrency=AccountConcurrencyPolicy(
+            max_concurrency=ctx.settings.concurrency.max_concurrency
+        ),
+    )
 
 
 def _reading_account(poll_result: object) -> str | None:
@@ -524,7 +542,7 @@ def start_daemon(
 
                 # Drain force-dispatch requests BEFORE the throttle gate so
                 # operator overrides land even when the state machine has
-                # parked the supervisor in THROTTLED_5H / PAUSED_WEEKLY.
+                # parked the supervisor in THROTTLED_5H / THROTTLED_WEEKLY.
                 #
                 # Skipped entirely in drain mode: force-dispatch is by
                 # definition new work, and the operator's intent during

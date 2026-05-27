@@ -89,9 +89,9 @@ The gist that documented the headers initially listed only
 above ~70% utilization. Both values are benign for our purposes:
 the supervisor drives state transitions off the *utilization
 percentage*, not the status string, and the configured thresholds
-in ``[throttle.{five_hour,weekly}]`` already encode the operator's
-chosen slowdown / pause points. Treating ``"allowed_warning"`` as
-"slow down now" would double-count the band thresholds and
+in ``[dispatch_pct.*]`` already encode the operator's chosen
+slowdown / stop points. Treating ``"allowed_warning"`` as
+"slow down now" would double-count those thresholds and
 prematurely throttle dispatch.
 
 Statuses NOT in this set are logged once per capture (not raised)

@@ -1,11 +1,8 @@
 """Predictions over the EMA: p90 estimates and EOW-push fitness checks.
 
 Thin wrapper over :mod:`runner.ema` that lifts EMA point estimates into
-percentile-style predictions used by:
-
-* :mod:`runner.concurrency` for in-flight cost reservations.
-* The ``EndOfWeekPush`` supervisor state for "will this task fit before
-  the weekly window resets?".
+percentile-style predictions, used by callers that need a "will this
+task fit before the next window reset?" estimate.
 
 Until enough real samples accumulate, p90 is approximated as
 ``ema * runtime_p90_multiplier`` (default 1.5). After

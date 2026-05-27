@@ -1,7 +1,7 @@
 # ADR-0015: Time-of-day band modulation for 5h throttle + nighttime-biased EOW push
 
 - **Date:** 2026-05-13
-- **Status:** accepted
+- **Status:** superseded by ADR-0022
 
 ## Context
 

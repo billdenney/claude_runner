@@ -167,22 +167,24 @@ class TestSettingsLegacySynthesis:
 class TestAccountPolicyDefaults:
     def test_default_policy_inherits_queue_wide(self) -> None:
         """Empty policy → max_concurrency=1 (still the per-account fallback)
-        but every throttle field is None (= inherit queue-wide) after PR 13.
-        The merge helper in supervisor.throttle_merge fills the queue-wide
-        value at use time."""
+        but every dispatch_pct field is None (= inherit queue-wide) after
+        ADR-0022. ``throttle.policy.resolve`` fills the queue-wide value
+        at use time."""
         policy = AccountPolicy()
         assert policy.concurrency.max_concurrency == 1
-        f = policy.throttle.five_hour
-        assert f.daytime_band_full_dispatch_max_pct is None
-        assert f.daytime_band_slowdown_max_pct is None
-        assert f.nighttime_band_full_dispatch_max_pct is None
-        assert f.nighttime_band_slowdown_max_pct is None
-        assert policy.throttle.time_of_day.day_end is None
-        # PR 13: weekly overrides also default to None.
-        w = policy.throttle.weekly
-        assert w.band_slowdown_max_pct is None
-        assert w.pause_at_pct is None
-        assert w.eow_push_nighttime_only is None
+        d = policy.dispatch_pct.day
+        assert d.fivehr_slowdown_pct is None
+        assert d.fivehr_stop_pct is None
+        n = policy.dispatch_pct.night
+        assert n.fivehr_slowdown_pct is None
+        assert n.fivehr_stop_pct is None
+        assert n.time_start is None
+        assert n.time_end is None
+        # Weekly trace overrides also default to None.
+        w = policy.dispatch_pct.week
+        assert w.early_pct is None
+        assert w.eow_pct is None
+        assert w.eow_time_switch is None
 
 
 class TestPerAccountTomlPath:
@@ -208,14 +210,15 @@ class TestLoadAccountPolicy:
                     "[concurrency]",
                     "max_concurrency = 5",
                     "",
-                    "[throttle.five_hour]",
-                    "daytime_band_full_dispatch_max_pct   = 30",
-                    "daytime_band_slowdown_max_pct        = 50",
-                    "nighttime_band_full_dispatch_max_pct = 65",
-                    "nighttime_band_slowdown_max_pct      = 85",
+                    "[dispatch_pct.day]",
+                    "fivehr_slowdown_pct = 30",
+                    "fivehr_stop_pct     = 50",
                     "",
-                    "[throttle.time_of_day]",
-                    'day_end = "22:00"',
+                    "[dispatch_pct.night]",
+                    "fivehr_slowdown_pct = 65",
+                    "fivehr_stop_pct     = 85",
+                    'time_start          = "22:00"',
+                    'time_end            = "06:00"',
                     "",
                 ]
             ),
@@ -223,22 +226,22 @@ class TestLoadAccountPolicy:
         )
         policy = load_account_policy(str(tmp_path))
         assert policy.concurrency.max_concurrency == 5
-        assert policy.throttle.five_hour.daytime_band_full_dispatch_max_pct == 30
-        assert policy.throttle.five_hour.nighttime_band_slowdown_max_pct == 85
-        assert policy.throttle.time_of_day.day_end == "22:00"
+        assert policy.dispatch_pct.day.fivehr_slowdown_pct == 30
+        assert policy.dispatch_pct.night.fivehr_stop_pct == 85
+        assert policy.dispatch_pct.night.time_start == "22:00"
 
     def test_partial_policy_inherits_for_missing_fields(self, tmp_path: Path) -> None:
-        """Setting only max_concurrency leaves throttle fields at None
-        (= inherit queue-wide). PR 13 changed AccountThrottle*'s
-        defaults from hardcoded numbers to None-means-inherit."""
+        """Setting only max_concurrency leaves dispatch_pct fields at None
+        (= inherit queue-wide). ADR-0022 changed per-account dispatch_pct
+        defaults to None-means-inherit."""
         (tmp_path / "runner-account.toml").write_text(
             "[concurrency]\nmax_concurrency = 3\n", encoding="utf-8"
         )
         policy = load_account_policy(str(tmp_path))
         assert policy.concurrency.max_concurrency == 3
         # Inherited (None means "use queue-wide").
-        assert policy.throttle.five_hour.daytime_band_full_dispatch_max_pct is None
-        assert policy.throttle.time_of_day.day_end is None
+        assert policy.dispatch_pct.day.fivehr_slowdown_pct is None
+        assert policy.dispatch_pct.night.time_start is None
 
     def test_invalid_toml_raises_config_error(self, tmp_path: Path) -> None:
         (tmp_path / "runner-account.toml").write_text("not = valid = toml", encoding="utf-8")

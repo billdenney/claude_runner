@@ -434,12 +434,7 @@ def status(
         state_color = (
             "green"
             if snapshot.state in (SupervisorState.IDLE, SupervisorState.DISPATCHING)
-            else (
-                "yellow"
-                if snapshot.state
-                in (SupervisorState.SLOWING_DOWN, SupervisorState.END_OF_WEEK_PUSH)
-                else "red"
-            )
+            else ("yellow" if snapshot.state is SupervisorState.SLOWING_DOWN else "red")
         )
         console.print(
             f"[bold]State:[/]            "

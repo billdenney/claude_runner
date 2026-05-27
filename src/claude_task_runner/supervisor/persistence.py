@@ -7,10 +7,16 @@ complete file.
 Stored at ``<queue>/.claude_task_runner/supervisor.json`` per
 ``[supervisor].state_file``.
 
-Handles a one-way v2 → v3 migration at load time: the legacy single-
-account top-level fields are wrapped into ``accounts["default"]`` and
-un-attributed ``in_flight_task_ids`` become attributed ``InFlightRecord``
-entries.
+Handles two one-way migrations at load time:
+
+* v2 → v3: the legacy single-account top-level fields wrap into
+  ``accounts["default"]`` and un-attributed ``in_flight_task_ids``
+  become attributed ``InFlightRecord`` entries.
+* v3 → v4 (ADR-0022): any persisted ``state="paused_weekly"`` or
+  ``state="end_of_week_push"`` rewrites to ``"idle"`` (both top-level
+  and inside every ``accounts[*]``) and ``scheduled_wakeup_at``
+  clears so the next tick recomputes wakeups against the new
+  trace-following curve. In-flight tasks survive verbatim.
 """
 
 from __future__ import annotations
@@ -64,12 +70,10 @@ def _migrate_v2_to_v3(
     ``accounts[<default_account_name>]`` entry; legacy task ids in
     ``in_flight_task_ids`` are mapped to ``InFlightRecord`` objects
     whose ``started_at`` defaults to the snapshot's ``since`` (no
-    per-task started_at was recorded in v2). One-way: callers must
-    persist the v3 payload before the next tick or the daemon will
-    keep re-migrating on every load.
+    per-task started_at was recorded in v2). One-way migration.
     """
     migrated = dict(payload)
-    migrated["schema_version"] = SUPERVISOR_SCHEMA_VERSION
+    migrated["schema_version"] = 3
 
     acct_payload: dict[str, Any] = {
         key: migrated[key]
@@ -88,6 +92,47 @@ def _migrate_v2_to_v3(
         {"task_id": tid, "account": default_account_name, "started_at": started_at}
         for tid in legacy_in_flight
     ]
+    return migrated
+
+
+_DROPPED_STATES_V4 = frozenset({"paused_weekly", "end_of_week_push"})
+"""States removed by ADR-0022. Any persisted snapshot carrying one
+is rewritten to ``idle`` so the next tick reclassifies under the new
+trace-following rule."""
+
+
+def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v3 supervisor.json payload to v4 semantics (ADR-0022).
+
+    Rewrites any ``state == "paused_weekly" | "end_of_week_push"`` to
+    ``"idle"`` — both at the top level and inside every
+    ``accounts[*]`` entry — and clears ``scheduled_wakeup_at`` (both
+    top-level and per-account) so the next tick recomputes wakeups
+    against the new curve. In-flight task records are preserved
+    verbatim: state migrations never kill running tasks.
+    """
+    migrated = dict(payload)
+    migrated["schema_version"] = 4
+
+    top_state = migrated.get("state")
+    if isinstance(top_state, str) and top_state in _DROPPED_STATES_V4:
+        migrated["state"] = SupervisorState.IDLE.value
+    migrated["scheduled_wakeup_at"] = None
+
+    accounts = migrated.get("accounts")
+    if isinstance(accounts, dict):
+        new_accounts: dict[str, Any] = {}
+        for name, acct in accounts.items():
+            if not isinstance(acct, dict):
+                new_accounts[name] = acct
+                continue
+            acct_copy = dict(acct)
+            acct_state = acct_copy.get("state")
+            if isinstance(acct_state, str) and acct_state in _DROPPED_STATES_V4:
+                acct_copy["state"] = SupervisorState.IDLE.value
+            acct_copy["scheduled_wakeup_at"] = None
+            new_accounts[name] = acct_copy
+        migrated["accounts"] = new_accounts
     return migrated
 
 
@@ -120,7 +165,10 @@ def load(path: Path) -> SupervisorSnapshot | None:
     sv = payload.get("schema_version", SUPERVISOR_SCHEMA_VERSION)
     if sv == 2:
         payload = _migrate_v2_to_v3(payload)
-        sv = SUPERVISOR_SCHEMA_VERSION
+        sv = 3
+    if sv == 3:
+        payload = _migrate_v3_to_v4(payload)
+        sv = 4
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"

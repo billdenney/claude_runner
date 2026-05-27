@@ -58,20 +58,24 @@ N hours old. EMA suggests it should have completed by now.
 4. If hangs are common, reduce `task_caps.heartbeat_silence_kill_s` from
    default 0 (off) to e.g. 600 to auto-kill silent tasks.
 
-## Weekly cap hit, no end-of-week push
+## Weekly throttled, no dispatch resuming
 
-**Symptom:** Supervisor in `PausedWeekly`, weekly utilization < 98%, but
-no dispatches happening close to reset.
+**Symptom:** Supervisor in `ThrottledWeekly`, observed weekly
+utilization above the trace target for the current elapsed fraction.
 
-**Steps:**
-1. Check `time_until_weekly_reset` against `[throttle.weekly].eow_window_s`
-   (default 12h). EOW push only kicks in within the last N hours.
-2. Check that pending tasks have EMA samples. Tasks with no samples
-   (cold-start) are refused in EOW push unless they have
-   `force_dispatch_in_eow: true`.
-3. Either wait for the EOW window, or mark short tasks as
-   `force_dispatch_in_eow`, or reduce `eow_runtime_safety_factor` if
-   you're sure tasks will fit.
+**Steps (ADR-0022 — variant-C trace-following):**
+1. Compute the current curve target: at elapsed fraction `t`, the
+   target is `(t / (1 - eow_frac)) * early_pct` (pre-EOW) or
+   `early_pct + ((t - (1 - eow_frac)) / eow_frac) * (eow_pct - early_pct)`
+   (EOW segment). With defaults `early_pct=60`, `eow_pct=95`,
+   `eow_time_switch="40h"`, the EOW elbow is at `t ≈ 0.76`.
+2. The supervisor's `scheduled_wakeup_at` should already point to
+   the analytical catch-up time (when the curve rises to meet
+   observed); confirm via `claude-task-runner status`.
+3. If catch-up is far in the future and you have urgent work, either
+   raise `[dispatch_pct.week].early_pct` for the queue, or use
+   `claude-task-runner queue force-dispatch <task_id>` to bypass
+   the throttle for that one task.
 
 ## Sidecars piling up
 

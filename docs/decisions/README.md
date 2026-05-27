@@ -22,13 +22,14 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0012 | Extensible failure classifier via TOML patterns | accepted | 2026-05-03 |
 | 0013 | Pre/post-dispatch shell hooks (replaces built-in worktree mgmt) | accepted | 2026-05-03 |
 | 0014 | Every cutoff is a TOML setting | accepted | 2026-05-03 |
-| 0015 | Time-of-day band modulation + nighttime-biased EOW push | accepted | 2026-05-13 |
-| 0016 | Dynamic weekly pacing curve anchored to OAuth reset | accepted | 2026-05-13 |
+| 0015 | Time-of-day band modulation + nighttime-biased EOW push | superseded by ADR-0022 | 2026-05-13 |
+| 0016 | Dynamic weekly pacing curve anchored to OAuth reset | superseded by ADR-0022 | 2026-05-13 |
 | 0017 | Cleanup after the superseded `claude_runner` audit | accepted | 2026-05-13 |
 | 0018 | Inject TERM and PATH into the generated systemd-user unit | accepted | 2026-05-14 |
 | 0019 | Pre-init `.claude.json` before every claude spawn | accepted | 2026-05-18 |
 | 0020 | Gate `completed` status on at least one observable output artifact | proposed | 2026-05-21 |
 | 0021 | Per-account long-lived OAuth token via `claude setup-token` | proposed | 2026-05-23 |
+| 0022 | `[dispatch_pct.*]` variant-C trace-following, replacing `[throttle.*]` | accepted | 2026-05-27 |
 
 ## Template
 

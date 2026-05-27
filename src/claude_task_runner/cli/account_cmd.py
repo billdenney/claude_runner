@@ -58,19 +58,29 @@ def _account_row(
         state = snapshot.accounts.get(acct.name)
         in_flight_count = account_in_flight_count(acct.name, snapshot.in_flight)
     policy = acct.policy
+    dp = policy.dispatch_pct
     return {
         "name": acct.name,
         "config_dir": acct.config_dir,
         "linux_user": acct.linux_user,
         "max_concurrency": policy.concurrency.max_concurrency,
-        "throttle": {
-            "five_hour": {
-                "daytime_full": policy.throttle.five_hour.daytime_band_full_dispatch_max_pct,
-                "daytime_slow": policy.throttle.five_hour.daytime_band_slowdown_max_pct,
-                "nighttime_full": policy.throttle.five_hour.nighttime_band_full_dispatch_max_pct,
-                "nighttime_slow": policy.throttle.five_hour.nighttime_band_slowdown_max_pct,
+        "dispatch_pct": {
+            "day": {
+                "fivehr_slowdown_pct": dp.day.fivehr_slowdown_pct,
+                "fivehr_stop_pct": dp.day.fivehr_stop_pct,
             },
-            "day_end": policy.throttle.time_of_day.day_end,
+            "night": {
+                "fivehr_slowdown_pct": dp.night.fivehr_slowdown_pct,
+                "fivehr_stop_pct": dp.night.fivehr_stop_pct,
+                "time_start": dp.night.time_start,
+                "time_end": dp.night.time_end,
+            },
+            "week": {
+                "early_pct": dp.week.early_pct,
+                "eow_pct": dp.week.eow_pct,
+                "eow_time_switch": dp.week.eow_time_switch,
+            },
+            "timezone": dp.timezone,
         },
         "state": state.state.value if state is not None else None,
         "paused": state.paused if state is not None else False,
@@ -123,13 +133,17 @@ def list_accounts(
         if acct.linux_user:
             console.print(f"  linux_user:      {acct.linux_user}")
         console.print(f"  max_concurrency: {acct.policy.concurrency.max_concurrency}")
-        f = acct.policy.throttle.five_hour
-        console.print(
-            f"  bands:           "
-            f"daytime {f.daytime_band_full_dispatch_max_pct}/{f.daytime_band_slowdown_max_pct}, "
-            f"nighttime {f.nighttime_band_full_dispatch_max_pct}/{f.nighttime_band_slowdown_max_pct}, "
-            f"day_end={acct.policy.throttle.time_of_day.day_end}"
+        dp = acct.policy.dispatch_pct
+        day_s = f"day {dp.day.fivehr_slowdown_pct or '~'}/{dp.day.fivehr_stop_pct or '~'}"
+        night_s = (
+            f"night {dp.night.fivehr_slowdown_pct or '~'}/{dp.night.fivehr_stop_pct or '~'}"
+            f" [{dp.night.time_start or '~'}-{dp.night.time_end or '~'}]"
         )
+        week_s = (
+            f"week early={dp.week.early_pct or '~'}/eow={dp.week.eow_pct or '~'}"
+            f"@{dp.week.eow_time_switch or '~'}"
+        )
+        console.print(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}")
         console.print(
             f"  state:           {state_str}   "
             f"5h={util_5h_s}   weekly={util_w_s}   in_flight={row['in_flight_count']}"

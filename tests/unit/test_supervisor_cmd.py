@@ -250,12 +250,19 @@ def test_status_color_categories_render(runner: CliRunner, queue_dir: Path) -> N
     """Visit all three color branches for state coloring: green / yellow / red.
 
     The Rich console renders to plain text in tests; we just need the
-    state name itself to appear so the formatting code path runs."""
+    state name itself to appear so the formatting code path runs.
+
+    ADR-0022 dropped ``PAUSED_WEEKLY`` / ``END_OF_WEEK_PUSH``; only the
+    surviving states are exercised below. ``IDLE`` / ``DISPATCHING`` are
+    green; ``SLOWING_DOWN`` is yellow; the rest are red."""
     for state in [
+        SupervisorState.IDLE,  # green
         SupervisorState.DISPATCHING,  # green
         SupervisorState.SLOWING_DOWN,  # yellow
         SupervisorState.THROTTLED_5H,  # red
-        SupervisorState.PAUSED_WEEKLY,  # red
+        SupervisorState.THROTTLED_WEEKLY,  # red
+        SupervisorState.STOPPED,  # red
+        SupervisorState.ERROR_DRIFT,  # red
     ]:
         snap = _make_snapshot(state)
         state_path = queue_dir / ".claude_task_runner" / "supervisor.json"

@@ -57,10 +57,11 @@ or recent failures), follow the prioritized triage flow below.
       `claude-task-runner usage healthcheck` or invoke `/runner-usage`
       to investigate. Stop here unless the user wants more.
 
-   2. **Weekly cap** — if `snapshot.last_weekly_util_pct >= 90`:
-      print "Weekly utilization NN% (paused)" in yellow. Mention
-      whether end-of-week-push state is active
-      (`snapshot.state == "end_of_week_push"`).
+   2. **Weekly cap** — if `snapshot.state == "throttled_weekly"`:
+      print "Weekly utilization NN% > target (throttled)" in yellow.
+      The trace-following rule (ADR-0022) means the supervisor will
+      auto-resume when the curve catches up; surface
+      `snapshot.scheduled_wakeup_at` if present.
 
    3. **5h throttle** — if `snapshot.state in ("throttled_5h",
       "slowing_down")`: print 5h utilization + state.
