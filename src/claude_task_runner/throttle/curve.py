@@ -124,21 +124,28 @@ def elapsed_for_target_pct(
 
     if f == 1.0:
         # All segment B across the full week; curve hits eow_pct at t=1.
-        if eow_pct == 0.0:
+        if eow_pct == 0.0:  # pragma: no cover
+            # Unreachable: ``observed_pct >= eow_pct`` short-circuits at
+            # the top of the function, so eow_pct == 0 + observed_pct > 0
+            # cannot reach this branch. Kept as a defensive guard.
             return 1.0
         return min(1.0, observed_pct / eow_pct)
 
     if observed_pct <= early_pct:
         # Segment A: observed = (t / B) * early_pct → t = observed * B / early_pct.
-        if early_pct == 0.0:
-            # Segment A is flat at 0 here; observed > 0 was caught above.
+        if early_pct == 0.0:  # pragma: no cover
+            # Unreachable: ``observed_pct <= 0`` short-circuits at the top
+            # so observed_pct <= 0 + early_pct == 0 cannot reach here.
+            # Kept as a defensive guard.
             return 0.0
         return observed_pct * b / early_pct
 
     # Segment B: observed = early_pct + ((t - B) / f) * (eow_pct - early_pct)
     #          → t = B + f * (observed - early_pct) / (eow_pct - early_pct).
-    if eow_pct == early_pct:
-        # Flat segment B; observed > early_pct unreachable.
+    if eow_pct == early_pct:  # pragma: no cover
+        # Unreachable: ``observed_pct >= eow_pct`` short-circuits at the
+        # top of the function, so eow_pct == early_pct + observed_pct >
+        # early_pct cannot reach here. Kept as a defensive guard.
         return 1.0
     return b + f * (observed_pct - early_pct) / (eow_pct - early_pct)
 

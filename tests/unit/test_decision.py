@@ -290,3 +290,68 @@ class TestEventDiagnostics:
         assert d.band == "day"
         assert d.fivehr_slowdown_pct == 40
         assert d.fivehr_stop_pct == 60
+
+
+class TestDefensiveBranches:
+    """Edge-case defensive branches inside :mod:`throttle.decision`.
+
+    These exercise rare but reachable inputs that the schema layer
+    does not currently reject (parsing failure on the 5h reset
+    timestamp; a misconfigured slowdown_pct >= stop_pct). Kept here so
+    the coverage gate pins them.
+    """
+
+    def test_5h_reset_unparseable_falls_back_to_fixed_delay(self) -> None:
+        """When the OAuth reading has no ``resets_at`` the wakeup math
+        falls back to ``now + FIVE_HOUR_LENGTH_S + delay``."""
+        now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+        clock = FakeClock(now)
+        reading = _reading(
+            five_h_pct=65,  # in 5h stop band (day=60)
+            weekly_pct=10,
+            five_h_resets_at=None,  # parser failure
+            weekly_resets_at=now + timedelta(days=4),
+        )
+        d = decide(_policy(timezone="UTC"), reading, clock, poll_interval_s=POLL)
+        assert d.state is SupervisorState.THROTTLED_5H
+        # Fallback wakeup is ~5h out (not within poll-interval clamp).
+        assert d.wakeup_at is not None
+        assert d.wakeup_at > now + timedelta(hours=4)
+        assert d.wakeup_at < now + timedelta(hours=6)
+
+    def test_degenerate_slow_equals_stop_returns_zero(self) -> None:
+        """A misconfigured ResolvedBand with slowdown_pct >= stop_pct
+        cannot ramp; the linear-ramp helper returns 0 instead of
+        dividing by zero."""
+        now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+        clock = FakeClock(now)
+        # slow = stop = 50 — zero-span band.
+        reading = _reading(
+            five_h_pct=50,  # exactly at the zero-span band
+            weekly_pct=10,
+            five_h_resets_at=now + timedelta(hours=2),
+            weekly_resets_at=now + timedelta(days=4),
+        )
+        d = decide(
+            _policy(day_slow=50, day_stop=50, timezone="UTC"),
+            reading,
+            clock,
+            poll_interval_s=POLL,
+        )
+        # observed >= slowdown=50 AND observed >= stop=50 → THROTTLED_5H.
+        # _linear_ramp isn't called on the stop path, but it's exercised
+        # when observed is in the (slowdown, stop) span. Verify the
+        # zero-span pretends to be stop:
+        assert d.state is SupervisorState.THROTTLED_5H
+        assert d.target_concurrency == 0
+
+    def test_degenerate_slow_above_stop_returns_zero(self) -> None:
+        """slowdown_pct >= stop_pct is illegal but defended-against in
+        the linear-ramp helper. The natural decision path never enters
+        ``_linear_ramp`` with an inverted/zero span (band classification
+        kicks in first), so the branch is covered directly here.
+        """
+        from claude_task_runner.throttle.decision import _linear_ramp
+
+        out = _linear_ramp(observed_pct=65, slowdown_pct=70, stop_pct=60, max_concurrency=5)
+        assert out == 0

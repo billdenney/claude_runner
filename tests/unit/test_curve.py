@@ -180,3 +180,19 @@ class TestElapsedForTargetPct:
                             f"round-trip failed: early={early}, eow={eow}, ews={ews}, "
                             f"o={o_pct} → t={t} → target={back}"
                         )
+
+
+class TestElapsedForTargetDegenerate:
+    """Defensive branches of :func:`elapsed_for_target_pct` for degenerate inputs.
+
+    These are unreachable from validated TOML (the schema enforces positive
+    pcts) but the function is a pure helper and the branches exist for
+    safety. Pinned here so the coverage gate doesn't regress quietly.
+    """
+
+    def test_eow_fraction_zero_and_early_pct_zero(self) -> None:
+        # Pure segment A with a flat (always-0) target: any observed > 0
+        # is already above the cap, so caller should wake at week reset.
+        assert (
+            elapsed_for_target_pct(5.0, early_pct=0.0, eow_pct=95.0, eow_window_fraction=0.0) == 1.0
+        )

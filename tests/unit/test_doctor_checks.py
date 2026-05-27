@@ -316,6 +316,24 @@ def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
     assert result.status == CheckStatus.PASS
 
 
+def test_check_dispatch_pct_legacy_skips_unparseable_toml(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """An unparseable per-account TOML is skipped (the loader / other
+    checks surface the parse error). Verifies the defensive
+    ``except TOMLDecodeError`` branch in :func:`check_dispatch_pct_legacy`.
+    """
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "broken"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text("this is not = valid toml [[\n", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="broken", config_dir=str(cfg_dir))])
+    result = check_dispatch_pct_legacy(s, queue_dir)
+    # Unparseable file is skipped; with no other offenders the check passes.
+    assert result.status == CheckStatus.PASS
+
+
 # ---------------------------------------------------------------------------
 # check_account_sudo
 # ---------------------------------------------------------------------------
