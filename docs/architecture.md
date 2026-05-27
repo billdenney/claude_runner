@@ -71,35 +71,39 @@ introduces a new on-disk file MUST update this document in the same PR.
 States in `supervisor/states.py`:
 
 - `Idle` — no pending tasks; polling only.
-- `Dispatching` — predicted_pct < `band_full_dispatch_max_pct`.
-- `SlowingDown` — predicted_pct in slowdown band; target concurrency reduced linearly.
-- `Throttled5h` — 5h utilization ≥ no-dispatch threshold.
-- `PausedWeekly` — weekly utilization ≥ pause threshold.
-- `EndOfWeekPush` — weekly is paused but reset is imminent; dispatches only short tasks.
+- `Dispatching` — predicted 5h pct < `dispatch_pct.<band>.fivehr_slowdown_pct`.
+- `SlowingDown` — predicted 5h pct in [slowdown, stop); target concurrency reduced linearly.
+- `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
+- `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
 - `Stopped` — operator-issued stop.
 
-The state machine itself (`supervisor/state_machine.py`) is a pure function:
-`step(state, reading, clock) → (new_state, actions)`. All I/O happens in
-`supervisor/daemon.py` based on the action list.
+The state machine itself (`supervisor/state_machine.py`) is a thin
+wrapper that translates the result of `throttle.decision.decide()`
+into `(snapshot, actions)`. Both `decide()` and `step()` are pure;
+all I/O happens in `supervisor/daemon.py` based on the action list.
 
-### Per-tick band modulation
+### Per-tick decision (ADR-0022, variant-C)
 
-`step()` consults two pure helpers before classifying the active state:
+`decide()` walks the inputs in a fixed order:
 
-- `supervisor/time_of_day.py` (ADR-0015) — converts `clock.now()` to local
-  time per `[throttle.time_of_day].timezone`, then linearly interpolates
-  between daytime / nighttime band thresholds across a ramp centered on
-  each `day_start` / `day_end` boundary. `is_nighttime` (conservative —
-  ramp regions count as not-nighttime) gates the EOW push state.
-- `supervisor/pacing.py` (ADR-0016) — anchors the elapsed-in-week fraction
-  to `reading.seven_day.resets_at` (NOT a fixed weekday), computes a
-  piecewise-linear target curve, and shifts the static weekly bands by
-  the observed-vs-target deviation outside `pacing_slack_pp`. The hard
-  `pause_at_pct` floor is read directly and is never modulated.
+1. **Weekly first.** `throttle.curve.target_pct(elapsed_now, …)`
+   evaluates the piecewise-linear curve anchored to
+   `reading.seven_day.resets_at`. If `observed > target`,
+   `ThrottledWeekly` with `target_concurrency=0` and an analytical
+   wakeup (`elapsed_for_target_pct(observed)` mapped back to a
+   datetime, clamped to the next 5h reset and `now + poll_interval_s`).
+2. **Then 5h.** `throttle.time_of_day.which_band(now_local, …)`
+   picks `day` or `night` (wrap-aware hard step). Compare observed
+   5h utilization to that band's `fivehr_slowdown_pct` /
+   `fivehr_stop_pct`; classify into `Dispatching`, `SlowingDown`,
+   or `Throttled5h`. The linear concurrency ramp shape is unchanged
+   from ADR-0004.
 
-Both helpers are pure functions of their inputs (clock + settings + reading)
-and at 100% test coverage.
+The math is centralised in the `throttle/` package (`curve.py`,
+`time_of_day.py`, `policy.py`, `decision.py`). All pure functions;
+all 100% test coverage in `tests/unit/test_curve.py`,
+`test_dispatch_time_of_day.py`, `test_policy.py`, `test_decision.py`.
 
 ## On-disk layout (per queue)
 

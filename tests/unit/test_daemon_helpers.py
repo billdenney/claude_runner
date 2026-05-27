@@ -56,7 +56,12 @@ def _make_reading() -> UsageReading:
             resets_at=datetime(2026, 5, 16, 17, 0, 0, tzinfo=UTC),
         ),
         seven_day=WindowReading(
-            utilization_pct=40,
+            # Low weekly so the trace-following rule (ADR-0022) leaves
+            # the supervisor in an active state — the throttle decision
+            # is driven by observed-vs-target on the weekly curve, not
+            # by a fixed slowdown threshold like the old [throttle.weekly]
+            # block.
+            utilization_pct=10,
             resets_at_raw="some time",
             resets_at=datetime(2026, 5, 20, 11, 0, 0, tzinfo=UTC),
         ),

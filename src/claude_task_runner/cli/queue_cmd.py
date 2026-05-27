@@ -443,7 +443,7 @@ def force_dispatch(
     """Bypass throttle and priority; dispatch ``task_id`` next.
 
     Use when an operator needs a single high-priority task to run NOW
-    even though the supervisor is in ``throttled_5h`` or ``paused_weekly``.
+    even though the supervisor is in ``throttled_5h`` or ``throttled_weekly``.
 
     Behavior depends on whether the supervisor is running:
 

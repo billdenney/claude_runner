@@ -59,8 +59,8 @@ class EmitEvent(_ActionBase):
 @dataclass(frozen=True)
 class StopDispatch(_ActionBase):
     """Refuse to start any new dispatches this tick. Diagnostic-only —
-    the actual dispatch decisions are gated by ``target_concurrency`` in
-    :mod:`runner.concurrency`. Useful for telemetry."""
+    the actual dispatch decisions are gated by ``target_concurrency`` on
+    the :class:`throttle.decision.Decision`. Useful for telemetry."""
 
 
 # Public union for type-narrowed iteration.

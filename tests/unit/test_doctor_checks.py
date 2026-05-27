@@ -211,20 +211,20 @@ def test_check_legacy_config_dir_conflicts_with_explicit(settings: Settings) -> 
 def test_check_account_policies_defaults_pass(settings: Settings) -> None:
     """Default settings (single 'default' account, empty config_dir) → PASS.
 
-    Empty config_dir → policy defaults apply. After PR 13 the per-account
-    throttle fields default to None ('inherit queue-wide'), so the doctor
-    report shows them as 'inherit' rather than the hardcoded numbers it
-    used to print.
+    Empty config_dir → policy defaults apply. Per-account dispatch_pct
+    fields default to None ('inherit queue-wide') under ADR-0022, so the
+    doctor report shows them as 'inherit' rather than numeric bands.
     """
     from claude_task_runner.doctor.checks import check_account_policies
 
     result = check_account_policies(settings)
     assert result.status == CheckStatus.PASS
     assert "max_concurrency=1" in result.detail
-    # PR 13 — None per-account fields render as 'inherit', not numeric bands.
-    assert "daytime=inherit/inherit" in result.detail
-    assert "nighttime=inherit/inherit" in result.detail
-    assert "weekly=inherit/inherit" in result.detail
+    # ADR-0022 — None per-account fields render as 'inherit' for every
+    # dispatch_pct field (day, night, week).
+    assert "day=inherit/inherit" in result.detail
+    assert "night=inherit/inherit" in result.detail
+    assert "week early=inherit/eow=inherit" in result.detail
 
 
 def test_check_account_policies_present_file_reported(settings: Settings, tmp_path: Path) -> None:
@@ -252,6 +252,86 @@ def test_check_account_policies_invalid_file_fails(settings: Settings, tmp_path:
     result = check_account_policies(s)
     assert result.status == CheckStatus.FAIL
     assert "broken" in result.remediation
+
+
+# ---------------------------------------------------------------------------
+# check_dispatch_pct_legacy (ADR-0022 migration check)
+# ---------------------------------------------------------------------------
+
+
+def test_check_dispatch_pct_legacy_clean_queue_passes(settings: Settings, queue_dir: Path) -> None:
+    """No claude_runner.toml, no per-account TOMLs → PASS."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    result = check_dispatch_pct_legacy(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "no legacy" in result.detail
+
+
+def test_check_dispatch_pct_legacy_queue_toml_with_throttle_fails(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """A queue-side claude_runner.toml with a [throttle.*] block → FAIL."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    (queue_dir / "claude_runner.toml").write_text(
+        "[throttle.five_hour]\nband_full_dispatch_max_pct = 40\n",
+        encoding="utf-8",
+    )
+    result = check_dispatch_pct_legacy(settings, queue_dir)
+    assert result.status == CheckStatus.FAIL
+    assert "legacy" in result.detail.lower() or "throttle" in result.detail.lower()
+    assert "dispatch_pct" in result.remediation
+
+
+def test_check_dispatch_pct_legacy_per_account_with_throttle_fails(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """A per-account runner-account.toml with [throttle.*] → FAIL."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "personal"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text(
+        "[throttle.five_hour]\ndaytime_band_full_dispatch_max_pct = 30\n",
+        encoding="utf-8",
+    )
+    s = _set_accounts(settings, [AccountSettings(name="personal", config_dir=str(cfg_dir))])
+    result = check_dispatch_pct_legacy(s, queue_dir)
+    assert result.status == CheckStatus.FAIL
+    assert str(cfg_dir / "runner-account.toml") in result.remediation
+
+
+def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """A queue TOML carrying [dispatch_pct.*] (new schema) → PASS."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    (queue_dir / "claude_runner.toml").write_text(
+        "[dispatch_pct.day]\nfivehr_slowdown_pct = 40\nfivehr_stop_pct = 60\n",
+        encoding="utf-8",
+    )
+    result = check_dispatch_pct_legacy(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+
+
+def test_check_dispatch_pct_legacy_skips_unparseable_toml(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """An unparseable per-account TOML is skipped (the loader / other
+    checks surface the parse error). Verifies the defensive
+    ``except TOMLDecodeError`` branch in :func:`check_dispatch_pct_legacy`.
+    """
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "broken"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text("this is not = valid toml [[\n", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="broken", config_dir=str(cfg_dir))])
+    result = check_dispatch_pct_legacy(s, queue_dir)
+    # Unparseable file is skipped; with no other offenders the check passes.
+    assert result.status == CheckStatus.PASS
 
 
 # ---------------------------------------------------------------------------

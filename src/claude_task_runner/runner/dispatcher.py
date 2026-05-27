@@ -547,7 +547,7 @@ def dispatch(
       ``status``, and refreshed ``session_id``.
 
     The supervisor wraps this call with the throttling / concurrency
-    decisions from :mod:`runner.concurrency`.
+    decisions from :mod:`claude_task_runner.throttle.decision`.
     """
     if shutil.which(claude_executable) is None:
         raise DispatchError(f"claude binary not found: {claude_executable}")

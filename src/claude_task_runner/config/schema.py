@@ -1,7 +1,7 @@
 """Pydantic settings model.
 
 The full settings tree is built up incrementally as components land. Slices
-are accessed via attribute (`settings.usage`, `settings.throttle.five_hour`,
+are accessed via attribute (`settings.usage`, `settings.dispatch_pct.day`,
 etc.) so a component only depends on the section it reads.
 """
 
@@ -10,7 +10,9 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from claude_task_runner.config.duration import DurationParseError, parse_duration
 
 UsageSourceMode = Literal["tty", "api", "api_then_tty"]
 """Which production :class:`UsageSource` the daemon should use.
@@ -71,95 +73,6 @@ class UsageSettings(_StrictModel):
     """Cheapest model for the API probe call. The choice only affects
     cost; the rate-limit headers come back the same regardless.
     Ignored when ``source = "tty"``."""
-
-
-class TimeOfDaySettings(_StrictModel):
-    """Global day/night boundaries used by per-band time-of-day overrides.
-
-    The operator is interactive during the day (e.g. 06:00-22:00 local), so
-    dispatch should be tighter then to leave token headroom; at night the
-    runner can use the budget more aggressively. The transition is linearly
-    interpolated over a ``ramp_minutes`` window around each boundary so
-    dispatch doesn't whipsaw at the clock edge.
-
-    See ADR-0015 for the rationale and the math.
-    """
-
-    timezone: str = ""
-    """IANA timezone name (e.g. ``"America/New_York"``). Empty string means
-    "use system local time" (``datetime.astimezone(None)``)."""
-
-    day_start: str = "06:00"
-    """Inclusive start of core daytime, ``HH:MM`` 24-hour."""
-
-    day_end: str = "22:00"
-    """Exclusive end of core daytime (i.e. start of evening ramp toward night)."""
-
-    ramp_minutes: int = Field(default=30, ge=0, le=180)
-    """Width of the linear day/night interpolation ramp around each boundary."""
-
-
-class ThrottleBandSettings(_StrictModel):
-    """Static band thresholds — always available as a fallback."""
-
-    budget_tokens: int = Field(gt=0)
-    band_full_dispatch_max_pct: int = Field(ge=0, le=100)
-    band_slowdown_max_pct: int = Field(ge=0, le=100)
-
-
-class ThrottleFiveHourSettings(ThrottleBandSettings):
-    """5-hour bands with optional daytime/nighttime overrides.
-
-    When any of the four override fields is non-None, the supervisor uses
-    it in place of the corresponding ``band_*`` value per the time-of-day
-    schedule defined in ``[throttle.time_of_day]``. Leaving them at ``None``
-    falls back to the static bands (full backward compatibility).
-    """
-
-    daytime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
-    daytime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
-    nighttime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
-    nighttime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
-
-
-class ThrottleWeeklySettings(ThrottleBandSettings):
-    """Weekly bands plus EOW push and dynamic pacing curve.
-
-    The pacing curve (when ``pacing_curve_enabled``) shifts the effective
-    ``band_*`` thresholds up or down based on how far the observed weekly
-    utilization is from the target curve at the current point in the
-    weekly window. See ADR-0016.
-    """
-
-    pause_at_pct: int = Field(ge=0, le=100)
-    eow_push_enter_at_pct: int = Field(ge=0, le=100)
-    eow_target_pct: int = Field(ge=0, le=100)
-    eow_window_s: float = Field(ge=0)
-    eow_runtime_safety_factor: float = Field(gt=0, le=1.0)
-
-    pacing_curve_enabled: bool = False
-    """Master switch for the dynamic weekly pacing curve."""
-
-    pre_eow_target_pct: int = Field(default=80, ge=0, le=100)
-    """Target utilization at the start of the EOW push window — the curve
-    ramps from 0 to here over (1 - eow_window_fraction) of the week, then
-    from here to ``eow_target_pct`` over the EOW window."""
-
-    pacing_slack_pp: float = Field(default=10.0, ge=0, le=100)
-    """Dead-band (percentage points) around the target curve. The bands
-    only shift when observed deviates by more than ``slack`` from target."""
-
-    eow_push_nighttime_only: bool = True
-    """When ``True`` (the default), the PAUSED_WEEKLY → END_OF_WEEK_PUSH
-    transition fires only during core nighttime per ``[throttle.time_of_day]``.
-    This keeps daytime 5h windows available for interactive use while the
-    end-of-week burn-down runs overnight. See ADR-0015."""
-
-
-class ThrottleSettings(_StrictModel):
-    five_hour: ThrottleFiveHourSettings
-    weekly: ThrottleWeeklySettings
-    time_of_day: TimeOfDaySettings = Field(default_factory=TimeOfDaySettings)
 
 
 class ConcurrencySettings(_StrictModel):
@@ -279,9 +192,8 @@ class ClaudeSettings(_StrictModel):
     (``~/.claude``).
 
     ``plan`` selects an entry from the top-level ``[plans.*]`` table so
-    the loader can auto-tune ``[throttle.*]`` budgets and bands against
-    the plan's 5h:weekly token ratio. Empty string means "no auto-tune;
-    use the explicit [throttle.*] values as-is."
+    the loader can pull the 5h and weekly token caps for that plan.
+    Empty string means "no auto-tune; use the explicit budgets."
     """
 
     executable: str = "claude"
@@ -361,77 +273,171 @@ class AccountConcurrencyPolicy(_StrictModel):
     max_concurrency: int = Field(default=1, ge=1)
 
 
-class AccountThrottleFiveHour(_StrictModel):
-    """Per-account 5-hour throttle band overrides.
+# ---------------------------------------------------------------------------
+# ADR-0022 — [dispatch_pct.*] variant-C trace-following.
+# ---------------------------------------------------------------------------
 
-    Every field is ``int | None``: ``None`` (the default) means
-    *inherit* the queue-wide ``[throttle.five_hour]`` value for that
-    field. Set a field to override the queue-wide value for this
-    account only — useful when a fresh / untested account needs
-    tighter bands than the established one, or vice versa.
+_HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+"""``HH:MM`` 24-hour validator used by ``DispatchPctNight.time_*``."""
 
-    Changed in PR 13: pre-PR-13 these had hardcoded defaults
-    (40/60/70/90) which were the *same* numbers the queue uses by
-    default — so the visible behaviour didn't change. After PR 13
-    these are None-by-default and a missing field falls through to
-    the queue-wide value, which gives operators a single source of
-    truth (the queue toml) and lets per-account files override
-    surgically.
+
+def _validate_hhmm(value: str) -> str:
+    if not _HHMM_RE.match(value):
+        raise ValueError(f"expected 'HH:MM' 24-hour time, got {value!r}")
+    return value
+
+
+def _validate_duration(value: str) -> str:
+    try:
+        parse_duration(value)
+    except DurationParseError as exc:
+        raise ValueError(str(exc)) from exc
+    return value
+
+
+class DispatchPctBand(_StrictModel):
+    """5h-utilization thresholds for a single named band (day or night).
+
+    The supervisor compares observed 5h utilization to these thresholds
+    to pick between ``DISPATCHING`` (below ``fivehr_slowdown_pct``),
+    ``SLOWING_DOWN`` (between slowdown and stop — linear concurrency
+    ramp), and ``THROTTLED_5H`` (at or above ``fivehr_stop_pct``).
+    See ADR-0022.
     """
 
-    daytime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
-    daytime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
-    nighttime_band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
-    nighttime_band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
+    fivehr_slowdown_pct: int = Field(ge=0, le=100)
+    """5h utilization at which the linear concurrency ramp begins."""
+
+    fivehr_stop_pct: int = Field(ge=0, le=100)
+    """5h utilization at which dispatch halts."""
+
+    @model_validator(mode="after")
+    def _validate_order(self) -> DispatchPctBand:
+        if self.fivehr_slowdown_pct >= self.fivehr_stop_pct:
+            raise ValueError(
+                f"fivehr_slowdown_pct ({self.fivehr_slowdown_pct}) must be < "
+                f"fivehr_stop_pct ({self.fivehr_stop_pct})"
+            )
+        return self
 
 
-class AccountThrottleWeekly(_StrictModel):
-    """Per-account weekly throttle + pacing-curve overrides.
+class DispatchPctNight(DispatchPctBand):
+    """The night band. Adds ``time_start`` and ``time_end`` boundaries.
 
-    Every field is ``T | None`` with ``None`` meaning "inherit the
-    queue-wide ``[throttle.weekly]`` value for that field." Set a
-    field to override.
-
-    Use cases:
-      * One account is the operator's primary; the other is a
-        secondary that's allowed to push closer to its weekly cap
-        (``pause_at_pct`` higher, ``pacing_slack_pp`` wider).
-      * ``eow_push_nighttime_only`` is true queue-wide (default) so
-        daytime windows stay free for interactive use, but is false
-        on a fully-autonomous account that can push 24/7.
-
-    Added in PR 13. The hard pause floor (``pause_at_pct``) is still
-    a SAFETY floor even when overridden — the pacing curve never
-    tightens past it.
+    The day band is the implicit complement: any local time outside
+    ``[time_start, time_end)`` is daytime. ``time_start > time_end``
+    means night wraps midnight (e.g. ``21:00`` → ``06:00``).
     """
 
-    band_full_dispatch_max_pct: int | None = Field(default=None, ge=0, le=100)
-    band_slowdown_max_pct: int | None = Field(default=None, ge=0, le=100)
-    pause_at_pct: int | None = Field(default=None, ge=0, le=100)
-    eow_push_enter_at_pct: int | None = Field(default=None, ge=0, le=100)
-    eow_target_pct: int | None = Field(default=None, ge=0, le=100)
-    eow_window_s: float | None = Field(default=None, ge=0)
-    eow_runtime_safety_factor: float | None = Field(default=None, gt=0, le=1.0)
-    pacing_curve_enabled: bool | None = None
-    pre_eow_target_pct: int | None = Field(default=None, ge=0, le=100)
-    pacing_slack_pp: float | None = Field(default=None, ge=0, le=100)
-    eow_push_nighttime_only: bool | None = None
+    time_start: str
+    """Local time-of-day (``HH:MM``) at which the night band takes over."""
+
+    time_end: str
+    """Local time-of-day (``HH:MM``) at which the night band ends and
+    the day band resumes."""
+
+    @field_validator("time_start", "time_end")
+    @classmethod
+    def _check_hhmm(cls, value: str) -> str:
+        return _validate_hhmm(value)
 
 
-class AccountTimeOfDay(_StrictModel):
-    """Per-account day/night cutover override.
+class DispatchPctWeek(_StrictModel):
+    """Weekly trace targets.
 
-    ``day_end`` was hardcoded to "21:00" pre-PR-13; now defaults to
-    None (inherit queue-wide ``[throttle.time_of_day].day_end``).
+    The curve runs from ``0`` at week start to ``early_pct`` at the
+    EOW breakpoint (located ``eow_time_switch`` before week reset),
+    then from ``early_pct`` to ``eow_pct`` at week reset. The
+    supervisor reads observed weekly utilization and stops dispatch
+    when ``observed > target(elapsed_now)``. See ADR-0022.
     """
 
-    day_end: str | None = None
+    early_pct: int = Field(ge=0, le=100)
+    """Target utilization (%) at the start of the EOW segment."""
+
+    eow_pct: int = Field(ge=0, le=100)
+    """Target utilization (%) at week reset (end of EOW segment)."""
+
+    eow_time_switch: str
+    """Duration string (``"40h"``, ``"1d 16h"``) — the EOW segment's
+    length. Anchored to the OAuth-reported weekly reset timestamp."""
+
+    @model_validator(mode="after")
+    def _validate_order(self) -> DispatchPctWeek:
+        if self.early_pct >= self.eow_pct:
+            raise ValueError(f"early_pct ({self.early_pct}) must be < eow_pct ({self.eow_pct})")
+        return self
+
+    @field_validator("eow_time_switch")
+    @classmethod
+    def _check_duration(cls, value: str) -> str:
+        return _validate_duration(value)
 
 
-class AccountThrottlePolicy(_StrictModel):
-    five_hour: AccountThrottleFiveHour = Field(default_factory=AccountThrottleFiveHour)
-    weekly: AccountThrottleWeekly = Field(default_factory=AccountThrottleWeekly)
-    time_of_day: AccountTimeOfDay = Field(default_factory=AccountTimeOfDay)
+class DispatchPctSettings(_StrictModel):
+    """Composite root for the ADR-0022 dispatch-percentage policy."""
+
+    timezone: str = ""
+    """IANA timezone (e.g. ``"America/New_York"``). Empty = system local."""
+
+    day: DispatchPctBand
+    """Daytime 5h thresholds."""
+
+    night: DispatchPctNight
+    """Nighttime 5h thresholds and the local-time window that selects them."""
+
+    week: DispatchPctWeek
+    """Weekly trace target curve."""
+
+
+class AccountDispatchPctBand(_StrictModel):
+    """Per-account overrides for one named 5h band.
+
+    Every field is ``T | None``: ``None`` inherits the queue-wide
+    ``[dispatch_pct.<band>]`` value for that field. The composed
+    :class:`throttle.policy.ResolvedPolicy` carries the merged values.
+    """
+
+    fivehr_slowdown_pct: int | None = Field(default=None, ge=0, le=100)
+    fivehr_stop_pct: int | None = Field(default=None, ge=0, le=100)
+
+
+class AccountDispatchPctNight(AccountDispatchPctBand):
+    """Per-account overrides for the night band, including time window."""
+
+    time_start: str | None = None
+    time_end: str | None = None
+
+    @field_validator("time_start", "time_end")
+    @classmethod
+    def _check_hhmm(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_hhmm(value)
+
+
+class AccountDispatchPctWeek(_StrictModel):
+    """Per-account overrides for the weekly trace curve."""
+
+    early_pct: int | None = Field(default=None, ge=0, le=100)
+    eow_pct: int | None = Field(default=None, ge=0, le=100)
+    eow_time_switch: str | None = None
+
+    @field_validator("eow_time_switch")
+    @classmethod
+    def _check_duration(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_duration(value)
+
+
+class AccountDispatchPolicy(_StrictModel):
+    """Per-account dispatch_pct overrides composed onto queue-wide settings."""
+
+    timezone: str | None = None
+    day: AccountDispatchPctBand = Field(default_factory=AccountDispatchPctBand)
+    night: AccountDispatchPctNight = Field(default_factory=AccountDispatchPctNight)
+    week: AccountDispatchPctWeek = Field(default_factory=AccountDispatchPctWeek)
 
 
 class AccountPolicy(_StrictModel):
@@ -447,7 +453,7 @@ class AccountPolicy(_StrictModel):
     """
 
     concurrency: AccountConcurrencyPolicy = Field(default_factory=AccountConcurrencyPolicy)
-    throttle: AccountThrottlePolicy = Field(default_factory=AccountThrottlePolicy)
+    dispatch_pct: AccountDispatchPolicy = Field(default_factory=AccountDispatchPolicy)
 
 
 class ResolvedAccount(_StrictModel):
@@ -488,18 +494,14 @@ class DispatchSettings(_StrictModel):
 
 
 class PlanSettings(_StrictModel):
-    """Per-plan token-budget and throttle-band hints.
+    """Per-plan token budgets.
 
-    The loader uses these to derive ``[throttle.*]`` budgets and bands
-    when ``[claude].plan`` is set. Operator overrides in
-    ``claude_runner.toml`` still win on a per-field basis (the merged
-    explicit fields take precedence over plan-derived defaults).
+    ADR-0022 simplified this block to token caps only; dispatch shape
+    lives in ``[dispatch_pct.*]`` which the operator sets directly.
     """
 
     five_hour_tokens: int = Field(gt=0)
     weekly_tokens: int = Field(gt=0)
-    band_full_dispatch_max_pct: int = Field(ge=0, le=100)
-    band_slowdown_max_pct: int = Field(ge=0, le=100)
 
 
 class Settings(_StrictModel):
@@ -507,7 +509,9 @@ class Settings(_StrictModel):
 
     claude: ClaudeSettings
     usage: UsageSettings
-    throttle: ThrottleSettings
+    dispatch_pct: DispatchPctSettings
+    """ADR-0022 ``[dispatch_pct.*]`` tree. Variant-C trace-following
+    dispatch policy."""
     concurrency: ConcurrencySettings
     ema: EMASettings
     effort_levels: dict[str, list[str]]

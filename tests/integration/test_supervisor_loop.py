@@ -1,11 +1,24 @@
 """Integration test: drive the supervisor through a scripted day.
 
-Uses :class:`FakeUsageSource` to script a sequence of readings (5h
-climb → throttle → reset → weekly climb → pause → EOW push → drift →
-recover) and asserts the supervisor's state machine arrives at each
-expected vertex.
+Scripts a sequence of readings (5h climb → throttle → reset →
+recover → weekly throttle → drift → recovery) and asserts the
+supervisor's state machine arrives at each expected vertex under the
+ADR-0022 trace-following decision rule.
 
 No real ``claude`` subprocess; this test runs in milliseconds.
+
+Differences from the pre-ADR-0022 fixture:
+
+* The queue-wide ``dispatch_pct.timezone`` is pinned to ``"UTC"`` so
+  the day/night band selection is deterministic across hosts.
+* The "weekly hits 92%" path no longer triggers a hard ``PAUSED_WEEKLY``
+  state at a static floor — under ADR-0022 the weekly side is binary
+  on the trace curve. Scenarios pick a ``(now, weekly_resets,
+  weekly_pct)`` triple where observed > target_pct(elapsed) so the
+  state machine routes to ``THROTTLED_WEEKLY``.
+* The dropped ``END_OF_WEEK_PUSH`` lifecycle test is gone; the EOW
+  segment is now a natural rise in the curve from ``early_pct`` to
+  ``eow_pct`` rather than a distinct state.
 """
 
 from __future__ import annotations
@@ -48,32 +61,23 @@ def _r(
 
 @pytest.fixture
 def settings() -> Settings:
-    """Default test settings — time-of-day and pacing modulation disabled.
+    """Queue settings pinned to UTC so day/night band selection is
+    deterministic.
 
-    These integration scenarios script utilization values designed against
-    the static band thresholds (70/90 for both 5h and weekly). Modulation
-    layers on top is covered by unit tests in tests/unit/test_state_machine.py.
+    The default ``dispatch_pct.timezone = ""`` defers to system local;
+    inside CI / on developer hosts that produces non-deterministic 5h
+    band selection. We override only the timezone — every other
+    ``dispatch_pct`` field keeps its default value from the package
+    TOML.
     """
     base = load_settings(None)
-    five_static = base.throttle.five_hour.model_copy(
-        update={
-            "daytime_band_full_dispatch_max_pct": None,
-            "daytime_band_slowdown_max_pct": None,
-            "nighttime_band_full_dispatch_max_pct": None,
-            "nighttime_band_slowdown_max_pct": None,
-        }
-    )
-    weekly_static = base.throttle.weekly.model_copy(
-        update={"pacing_curve_enabled": False, "eow_push_nighttime_only": False}
-    )
-    throttle_static = base.throttle.model_copy(
-        update={"five_hour": five_static, "weekly": weekly_static}
-    )
-    return base.model_copy(update={"throttle": throttle_static})
+    dp = base.dispatch_pct.model_copy(update={"timezone": "UTC"})
+    return base.model_copy(update={"dispatch_pct": dp})
 
 
 @pytest.fixture
 def clock() -> FakeClock:
+    # 08:00 UTC is squarely inside the default day band (06:00-21:00).
     return FakeClock(datetime(2026, 5, 4, 8, 0, tzinfo=UTC))
 
 
@@ -108,11 +112,17 @@ def _run_until(
 
 class TestScriptedDay:
     def test_full_lifecycle(self, settings: Settings, clock: FakeClock) -> None:
+        """Climb, hit 5h stop, reset, then weekly trace catches up."""
         five_reset_initial = datetime(2026, 5, 4, 13, 0, tzinfo=UTC)
         five_reset_after = datetime(2026, 5, 4, 18, 0, tzinfo=UTC)
+        # Weekly window: at clock.now()=2026-05-04 08:00 UTC, resets in
+        # 2 d 4 h. Elapsed = 1 - (2.1667/7) ≈ 0.690. Breakpoint =
+        # 1 - 40/168 ≈ 0.762, so elapsed < breakpoint; pre-EOW target =
+        # (0.690 / 0.762) * 60 ≈ 54.4%. We use weekly_pct values below
+        # and above this target to drive the weekly side.
         weekly_reset = datetime(2026, 5, 6, 12, 0, tzinfo=UTC)
-
         captured = clock.now()
+
         results = [
             # 1. Cold start: low utilization → DISPATCHING
             _r(
@@ -122,7 +132,7 @@ class TestScriptedDay:
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 2. Climbing: 50% (slowdown band 40-60 with static bands) → SLOWING_DOWN
+            # 2. 5h climbs to 50 (day band slowdown=40/stop=60) → SLOWING_DOWN
             _r(
                 five=50,
                 weekly=10,
@@ -130,15 +140,15 @@ class TestScriptedDay:
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 3. Hits 92% → THROTTLED_5H
+            # 3. Hits stop: 5h=65 → THROTTLED_5H
             _r(
-                five=92,
+                five=65,
                 weekly=15,
                 five_resets=five_reset_initial,
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 4. 5h reset crossed; back down to 5% with new reset target
+            # 4. 5h reset crossed; back down to 5% with new reset target.
             _r(
                 five=5,
                 weekly=20,
@@ -146,10 +156,11 @@ class TestScriptedDay:
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # 5. Weekly climbs to 92% → PAUSED_WEEKLY
+            # 5. Weekly climbs to 70 — well above the ~54% trace target
+            # at elapsed ≈ 0.69, so → THROTTLED_WEEKLY.
             _r(
                 five=10,
-                weekly=92,
+                weekly=70,
                 five_resets=five_reset_after,
                 weekly_resets=weekly_reset,
                 captured_at=captured,
@@ -163,35 +174,38 @@ class TestScriptedDay:
         assert SupervisorState.DISPATCHING in visited
         assert SupervisorState.SLOWING_DOWN in visited
         assert SupervisorState.THROTTLED_5H in visited
-        # After 5h reset, we should be back to dispatching territory
+        # After the 5h reset reading, we should have crossed back into
+        # dispatching territory.
         assert SupervisorState.DISPATCHING in visited[3:]
-        assert SupervisorState.PAUSED_WEEKLY in visited
-        assert final.state is SupervisorState.PAUSED_WEEKLY
+        assert SupervisorState.THROTTLED_WEEKLY in visited
+        assert final.state is SupervisorState.THROTTLED_WEEKLY
 
 
-class TestEowPushTrajectory:
-    def test_paused_to_eow_to_pause_again(self, settings: Settings, clock: FakeClock) -> None:
-        # Place clock 6h before weekly reset → inside default 12h EOW window.
-        clock.set_to(datetime(2026, 5, 6, 6, 0, tzinfo=UTC))
+class TestWeeklyRelease:
+    def test_throttled_then_drops_back(self, settings: Settings, clock: FakeClock) -> None:
+        """Once observed weekly drops below the curve target, the
+        supervisor returns to DISPATCHING (no separate END_OF_WEEK_PUSH
+        state — the curve naturally rises from ``early_pct`` to
+        ``eow_pct`` over the EOW segment)."""
         weekly_reset = datetime(2026, 5, 6, 12, 0, tzinfo=UTC)
-        five_reset = datetime(2026, 5, 6, 11, 0, tzinfo=UTC)
+        five_reset = datetime(2026, 5, 4, 13, 0, tzinfo=UTC)
         captured = clock.now()
 
-        snap = SupervisorSnapshot(state=SupervisorState.PAUSED_WEEKLY, since=clock.now())
+        snap = SupervisorSnapshot(state=SupervisorState.IDLE, since=clock.now())
 
-        # Reading 1: weekly at 92% (below 98 target, EOW window open)
         results = [
+            # 1. weekly=70 above ~54% target → THROTTLED_WEEKLY
             _r(
                 five=10,
-                weekly=92,
+                weekly=70,
                 five_resets=five_reset,
                 weekly_resets=weekly_reset,
                 captured_at=captured,
             ),
-            # Reading 2: weekly hits 98% target → back to PAUSED_WEEKLY
+            # 2. weekly=10 well below target → DISPATCHING
             _r(
                 five=10,
-                weekly=98,
+                weekly=10,
                 five_resets=five_reset,
                 weekly_resets=weekly_reset,
                 captured_at=captured,
@@ -199,10 +213,9 @@ class TestEowPushTrajectory:
         ]
 
         final, visited = _run_until(snap, results, settings, clock, pending=3)
-        assert SupervisorState.END_OF_WEEK_PUSH in visited
-        # After hitting 98% target, EOW push exits back to paused.
-        assert visited[-1] is SupervisorState.PAUSED_WEEKLY
-        assert final.state is SupervisorState.PAUSED_WEEKLY
+        assert SupervisorState.THROTTLED_WEEKLY in visited
+        assert visited[-1] is SupervisorState.DISPATCHING
+        assert final.state is SupervisorState.DISPATCHING
 
 
 class TestDriftRecovery:
@@ -213,7 +226,7 @@ class TestDriftRecovery:
 
         snap = SupervisorSnapshot(state=SupervisorState.IDLE, since=clock.now())
         results = [
-            # 1. Initial dispatch
+            # 1. Initial dispatch (low utilization, below curve target).
             _r(
                 five=10,
                 weekly=5,
@@ -249,7 +262,8 @@ class TestDriftRecovery:
 
         final, visited = _run_until(snap, results, settings, clock, pending=3)
         assert SupervisorState.ERROR_DRIFT in visited
-        # After 3 clean polls (default), should recover.
+        # After 3 clean polls (default ``drift_recovery_clean_polls``),
+        # the supervisor recovers.
         assert final.state is SupervisorState.DISPATCHING
 
 
@@ -288,7 +302,7 @@ class TestDaemonPersistence:
         assert loaded == new_snap
 
     def test_next_wakeup_picks_latest(self, settings: Settings, clock: FakeClock) -> None:
-        # Empty actions → no wakeup
+        # Empty actions → no wakeup.
         assert next_wakeup([]) is None
 
         from claude_task_runner.supervisor.actions import ScheduleWakeupAt

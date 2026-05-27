@@ -1,7 +1,7 @@
 # ADR-0016: Dynamic weekly pacing curve anchored to OAuth reset
 
 - **Date:** 2026-05-13
-- **Status:** accepted
+- **Status:** superseded by ADR-0022
 
 ## Context
 

@@ -220,7 +220,7 @@ class TestUnpinnedPolicy:
                 "work": _account("work"),
             },
             account_states={
-                "personal": _state(state=SupervisorState.PAUSED_WEEKLY),
+                "personal": _state(state=SupervisorState.THROTTLED_WEEKLY),
                 "work": _state(),
             },
             in_flight=[],
@@ -250,7 +250,7 @@ class TestUnpinnedPolicy:
                 "work": _account("work"),
             },
             account_states={
-                "personal": _state(state=SupervisorState.PAUSED_WEEKLY),
+                "personal": _state(state=SupervisorState.THROTTLED_WEEKLY),
                 "work": _state(paused=True),
             },
             in_flight=[],

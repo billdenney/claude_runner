@@ -183,9 +183,9 @@ def test_dispatch_skipped_when_no_account_dispatchable(queue_dir: Path) -> None:
     snap = _snapshot(
         {
             "personal": _acct(SupervisorState.THROTTLED_5H),
-            "work": _acct(SupervisorState.PAUSED_WEEKLY),
+            "work": _acct(SupervisorState.THROTTLED_WEEKLY),
         },
-        top_state=SupervisorState.PAUSED_WEEKLY,
+        top_state=SupervisorState.THROTTLED_WEEKLY,
     )
 
     with patch(

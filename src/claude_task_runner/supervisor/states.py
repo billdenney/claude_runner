@@ -10,9 +10,9 @@ Schema versions
 ``SupervisorSnapshot.schema_version`` is independent of the queue's
 ``schema_version`` (Task / TaskState / RunRecord). v2 was the single-
 account snapshot; v3 adds per-account state alongside the legacy
-single-account fields. The legacy fields remain populated (mirrored
-from ``accounts[<active>]`` after each tick) so existing state-
-machine code keeps working while multi-account dispatch is wired in.
+single-account fields; v4 (ADR-0022) drops the ``paused_weekly`` and
+``end_of_week_push`` states. The legacy top-level fields remain
+populated (mirrored from ``accounts[<active>]`` after each tick).
 """
 
 from __future__ import annotations
@@ -22,20 +22,22 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SUPERVISOR_SCHEMA_VERSION = 3
+SUPERVISOR_SCHEMA_VERSION = 4
 """Supervisor.json schema version.
 
-Bumped from 2 to 3 when per-account state was added. The persistence
-layer migrates a v2 file in-place at load time (single account
-recorded under name ``"default"``)."""
+Bumped from 3 to 4 (ADR-0022) when ``paused_weekly`` and
+``end_of_week_push`` were dropped from :class:`SupervisorState`.
+The persistence layer rewrites those values to ``idle`` and clears
+``scheduled_wakeup_at`` so the next tick reclassifies under the new
+trace-following rule."""
 
 
 class SupervisorState(StrEnum):
     """The high-level state machine vertices.
 
-    Continuous spectrum (FULL/SLOW/STOPPED) of the throttle bands maps
-    onto separate states only for telemetry clarity — see ADR-0004 and
-    :mod:`runner.concurrency`.
+    Continuous spectrum (FULL/SLOW/STOPPED) of the 5h dispatch_pct
+    bands maps onto separate states only for telemetry clarity —
+    see ADR-0022 and :mod:`claude_task_runner.throttle.decision`.
     """
 
     IDLE = "idle"
@@ -54,23 +56,15 @@ class SupervisorState(StrEnum):
     next clean reading reclassifies."""
 
     THROTTLED_WEEKLY = "throttled_weekly"
-    """Weekly utilization >= the (possibly pacing-curve-adjusted)
-    no-dispatch threshold but still below ``pause_at_pct``.
+    """Observed weekly utilization is above the trace target at the
+    current elapsed fraction of the week. Wakeup is the analytical
+    catch-up time (when the curve rises to meet observed),
+    clamped to the next 5h reset so the horizon stays readable.
 
     Distinct from :attr:`THROTTLED_5H` so the operator can tell at a
-    glance which window is driving the throttle. Before this state
-    existed, ``_classify_active`` returned ``THROTTLED_5H`` for the
-    weekly-in-stop band too — misleading when 5h util was low. Wakeup
-    is scheduled just past the next 5h reset (giving the operator a
-    chance to observe the weekly trend without burning the whole
-    budget) and the next clean reading reclassifies."""
-
-    PAUSED_WEEKLY = "paused_weekly"
-    """Weekly utilization >= ``pause_at_pct``. Hard pause until either
-    the weekly window resets or end-of-week push fires."""
-
-    END_OF_WEEK_PUSH = "end_of_week_push"
-    """Weekly cap hit AND reset is imminent; dispatch only short tasks."""
+    glance which window is driving the throttle. Replaces the
+    superseded ``PAUSED_WEEKLY`` / ``END_OF_WEEK_PUSH`` pair from
+    ADR-0006/0016 — see ADR-0022."""
 
     ERROR_DRIFT = "error_drift"
     """Last poll raised UsageFormatDrift; require N clean polls to recover."""

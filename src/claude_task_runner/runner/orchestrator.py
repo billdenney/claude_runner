@@ -1,7 +1,7 @@
 """Bridge between the supervisor's state machine and the runner's dispatcher.
 
 The supervisor's :func:`run_one_tick` decides whether the queue is in a
-dispatching state (``DISPATCHING`` / ``SLOWING_DOWN`` / ``END_OF_WEEK_PUSH``)
+dispatching state (``DISPATCHING`` / ``SLOWING_DOWN`` / ``IDLE``)
 but the original codebase does not wire the supervisor to
 :func:`runner.dispatcher.dispatch`. This module fills that gap: each tick
 the daemon calls :func:`tick_dispatch`, which:
@@ -286,7 +286,7 @@ def _any_account_dispatchable(
     "Would let a task land" means the account's :class:`AccountState`:
       * exists in ``snapshot.accounts`` (so the daemon has captured it),
       * is in :data:`account_dispatch._DISPATCHABLE_STATES`
-        (DISPATCHING / SLOWING_DOWN / END_OF_WEEK_PUSH / IDLE), AND
+        (DISPATCHING / SLOWING_DOWN / IDLE), AND
       * is not operator-paused via ``account pause``.
 
     Cold start: when no account has been captured yet, every entry's

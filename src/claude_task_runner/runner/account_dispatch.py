@@ -16,8 +16,8 @@ Selection rule
    available; otherwise reject (the orchestrator surfaces the conflict
    in the dispatch log).
 2. Otherwise: filter to accounts that are dispatching-eligible
-   (state in DISPATCHING / SLOWING_DOWN / END_OF_WEEK_PUSH / IDLE,
-   not paused, has capacity).
+   (state in DISPATCHING / SLOWING_DOWN / IDLE, not paused, has
+   capacity).
 3. All accounts are equal priority. Pick the one with the lowest
    ``last_5h_util_pct``. Tie-break by ``last_weekly_util_pct``, then
    account name (lexicographic, deterministic).
@@ -44,7 +44,6 @@ _DISPATCHABLE_STATES: frozenset[SupervisorState] = frozenset(
     {
         SupervisorState.DISPATCHING,
         SupervisorState.SLOWING_DOWN,
-        SupervisorState.END_OF_WEEK_PUSH,
         SupervisorState.IDLE,
     }
 )

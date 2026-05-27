@@ -118,150 +118,72 @@ suspicious_delta_pct        = 50        # flag if util jumps > N points between 
 drift_recovery_clean_polls  = 3         # consecutive clean polls to leave ErrorDrift
 
 # ---------------------------------------------------------------------------
-# Throttle: global time-of-day boundaries
+# Dispatch percentages (ADR-0022 — variant-C trace-following)
 #
-# Operator-active hours (06:00-22:00 local) get tighter dispatch caps so
-# interactive work has token headroom; the runner pushes harder at night.
-# The 30-minute ramp at each boundary avoids whipsawing dispatch at the
-# clock edge. See ADR-0015 for the math.
+# Two pictures the operator can hold in mind:
 #
-# Set `timezone = ""` to use the system local timezone.
+# 1. 5h side — day/night step function. At any local time, dispatch is
+#    in DISPATCHING below `fivehr_slowdown_pct`, in SLOWING_DOWN with a
+#    linear concurrency ramp between slowdown and stop, and in
+#    THROTTLED_5H at or above `fivehr_stop_pct`. Day vs. night is a
+#    hard step at the boundaries (`night.time_start` / `night.time_end`).
+#    Night may wrap midnight (start > end) or not (start < end).
+#
+# 2. Weekly side — single sloped target line. From 0 at week start
+#    rising to `early_pct` at the EOW elbow (`eow_time_switch` before
+#    week reset), then steeper to `eow_pct` at reset. Observed > target
+#    ⇒ THROTTLED_WEEKLY; else weekly allows dispatch.
 # ---------------------------------------------------------------------------
-[throttle.time_of_day]
-timezone     = ""        # IANA name (e.g. "America/New_York"); "" = system local
-day_start    = "06:00"   # HH:MM 24h — inclusive start of core daytime
-day_end      = "22:00"   # HH:MM 24h — exclusive end of core daytime
-ramp_minutes = 30        # linear interpolation width at each boundary
+[dispatch_pct]
+timezone = ""             # IANA name (e.g. "America/New_York"); "" = system local
+
+[dispatch_pct.day]
+fivehr_slowdown_pct = 40  # < 40% : full dispatch
+fivehr_stop_pct     = 60  # 40-60% : linear slowdown; >= 60% : no new dispatch
+
+[dispatch_pct.night]
+fivehr_slowdown_pct = 70  # looser at night while operator is AFK
+fivehr_stop_pct     = 90
+time_start          = "21:00"   # night begins at 21:00 local
+time_end            = "06:00"   # night ends at 06:00 local (wraps midnight)
+
+[dispatch_pct.week]
+early_pct       = 60          # target % at start of EOW segment
+eow_pct         = 95          # target % at week reset
+eow_time_switch = "40h"       # length of EOW segment (~2 nights)
 
 # ---------------------------------------------------------------------------
-# Throttle: 5-hour window
+# Plan-specific token budgets
 #
-# Two layers of band thresholds operate together:
+# When `[claude].plan` is one of the keys below, the loader uses the
+# plan's `five_hour_tokens` and `weekly_tokens` as the source of truth
+# for the supervisor's window budgets. Dispatch shape lives entirely in
+# `[dispatch_pct.*]` (ADR-0022); plans no longer carry band hints.
 #
-# 1. Static `band_*` — pacing-agnostic safety floor. Tightened 2026-05-11
-#    from 70/90 to 40/60 so that, even with time-of-day modulation off,
-#    no single 5h session exceeds 60% of cap. On Max plans the 5h budget
-#    is ~1/8 of the weekly budget, so 8 back-to-back 100%-utilised 5h
-#    sessions would exhaust weekly in ~40h of the 168h window — capping
-#    at 60% spreads autonomous runtime across the full week.
-# 2. Daytime / nighttime overrides — when set, the supervisor uses
-#    `daytime_band_*` during 06:00-22:00 (operator-active hours) and
-#    `nighttime_band_*` overnight, linearly interpolating across the
-#    `ramp_minutes` boundary. ADR-0015. With overrides unset the static
-#    bands apply unchanged.
-#
-# Plan-specific tuning: future versions will derive `budget_tokens` and
-# the static `band_*` values from `[claude].plan` against the
-# `[plans.*]` table; for now the defaults below are tuned for Max20x and
-# inherited unchanged by other plans. Per-queue overrides always win.
-# ---------------------------------------------------------------------------
-[throttle.five_hour]
-budget_tokens               = 99_000_000   # Max20x 5h ceiling
-band_full_dispatch_max_pct  = 40           # < 40% : full target concurrency
-band_slowdown_max_pct       = 60           # 40-60% : linear slowdown
-                                           # >= 60% : no new dispatch (Throttled5h)
-# Time-of-day overrides: tighter during day, looser at night.
-# Target ~22% average 5h utilization across 168h => ~95% weekly cap by reset.
-daytime_band_full_dispatch_max_pct   = 15  # tight daytime: leave 85% headroom for interactive
-daytime_band_slowdown_max_pct        = 30
-nighttime_band_full_dispatch_max_pct = 50  # push at night while operator is AFK
-nighttime_band_slowdown_max_pct      = 75
-
-# ---------------------------------------------------------------------------
-# Throttle: weekly window
-#
-# Weekly thresholds are looser than the 5h bands because the weekly cap
-# is the hard ceiling rather than the per-session pacer — the 5h
-# throttle is what spreads consumption across the week. Two layers
-# operate on weekly utilization on top of the static thresholds:
-#
-# 1. Static bands (`band_*`, `pause_at_pct`) — hard safety floor.
-# 2. Dynamic pacing curve (`pacing_curve_enabled`) — when ON, the supervisor
-#    computes a target utilization curve from the weekly elapsed fraction
-#    (anchored to the OAuth-reported `resets_at`, NOT a fixed weekday) and
-#    shifts the effective bands by how far observed deviates from target,
-#    outside a `pacing_slack_pp` dead-band. Ahead of target → tighter
-#    bands; behind target → looser bands. ADR-0016.
-#
-# `eow_target_pct` lowered 98 → 95: leaves a 5pp safety margin so a sudden
-# burst near reset doesn't trip the hard pause.
-# `eow_window_s` widened 43_200 (12h) → 86_400 (24h): more opportunities
-# for nighttime EOW push (which is gated to nighttime in the state machine
-# so daytime 5h windows stay free for interactive use).
-# ---------------------------------------------------------------------------
-[throttle.weekly]
-budget_tokens               = 798_841_951  # Max20x weekly ceiling
-band_full_dispatch_max_pct  = 70
-band_slowdown_max_pct       = 90
-pause_at_pct                = 90
-eow_push_enter_at_pct       = 90
-eow_target_pct              = 95           # was 98 — leave safety margin
-eow_window_s                = 144000       # 40h — covers ~2 nights of the
-                                           # `eow_push_nighttime_only` gate (was
-                                           # 86400 / 24h in PR 1-12, which left a
-                                           # single-night window prone to skipping
-                                           # an EOW push if that one night was
-                                           # truncated by operator activity).
-eow_runtime_safety_factor   = 0.5
-# Dynamic pacing curve. ADR-0016.
-pacing_curve_enabled        = true
-pre_eow_target_pct          = 80           # target % at start of EOW window
-pacing_slack_pp             = 10.0         # dead-band ±N pp around target curve
-# Nighttime-bias for EOW push: when true (default), the PAUSED_WEEKLY →
-# END_OF_WEEK_PUSH transition only fires during core nighttime. ADR-0015.
-eow_push_nighttime_only     = true
-
-# ---------------------------------------------------------------------------
-# Plan-specific budget table
-#
-# Reserved for forthcoming auto-tuning: when `[claude].plan` is one
-# of the keys below, the loader replaces `[throttle.five_hour].budget_tokens`
-# and `[throttle.weekly].budget_tokens` with the plan's values, and
-# (if the operator hasn't overridden them) replaces the band_*_max_pct
-# fields with values derived from the plan's 5h:weekly ratio.
-#
-# Current rows are approximate ceilings observed on each plan; verify
-# against `claude /usage` for the target account before relying on them.
-# The schema validator does not enforce these — they're informational
-# until the loader implements the auto-tuning.
+# Rows are approximate ceilings observed on each plan; verify against
+# `claude /usage` for the target account before relying on them.
 # ---------------------------------------------------------------------------
 [plans.max20x]
 five_hour_tokens = 99_000_000
 weekly_tokens    = 798_841_951
-# Eight 5h windows per week of budget; 168h / (8 windows × 5h) = 4.2x
-# spare capacity, so cap 5h at ~60% to spread across the week.
-band_full_dispatch_max_pct = 40
-band_slowdown_max_pct      = 60
 
 [plans.max5x]
 five_hour_tokens = 24_750_000     # ~1/4 of Max20x
 weekly_tokens    = 199_710_488
-band_full_dispatch_max_pct = 40
-band_slowdown_max_pct      = 60
 
 [plans.pro]
 five_hour_tokens = 4_950_000      # ~1/20 of Max20x
 weekly_tokens    = 39_942_098
-band_full_dispatch_max_pct = 40
-band_slowdown_max_pct      = 60
 
 [plans.team_standard]
 # Team Standard: operator-noted ratio 1.25 x Pro.
-# 5h:  4_950_000 * 1.25 =  6_187_500
-# wk: 39_942_098 * 1.25 = 49_927_622
 five_hour_tokens = 6_187_500
 weekly_tokens    = 49_927_622
-band_full_dispatch_max_pct = 40
-band_slowdown_max_pct      = 60
 
 [plans.team_premium]
 # Team Premium: operator-noted ratio 6.25 x Pro.
-# 5h:  4_950_000 * 6.25 =  30_937_500
-# wk: 39_942_098 * 6.25 = 249_638_112
 five_hour_tokens = 30_937_500
 weekly_tokens    = 249_638_112
-band_full_dispatch_max_pct = 40
-band_slowdown_max_pct      = 60
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA

@@ -311,3 +311,109 @@ class TestAccountPauseResume:
         out = json.loads(result.stdout)
         assert out["changed"] is False
         assert "already paused" in out["message"]
+
+
+class TestAccountListHumanReadable:
+    """Cover the non-JSON render loop in ``account list``."""
+
+    def test_no_snapshot_renders_defaults(self, runner: CliRunner, tmp_path: Path) -> None:
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
+        result = runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "personal" in result.stdout
+        assert "max_concurrency:" in result.stdout
+        assert "dispatch_pct:" in result.stdout
+        # No snapshot ⇒ state should render as "—".
+        assert "—" in result.stdout
+
+    def test_with_snapshot_renders_state_and_paused_marker(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(
+            tmp_path,
+            accounts=[("personal", str(cfg_dir), None), ("work", "", "bw")],
+        )
+        accounts = {
+            "personal": AccountState(
+                state=SupervisorState.DISPATCHING,
+                since=datetime(2026, 5, 21, tzinfo=UTC),
+                last_5h_util_pct=42,
+                last_weekly_util_pct=18,
+                paused=False,
+            ),
+            "work": AccountState(
+                state=SupervisorState.IDLE,
+                since=datetime(2026, 5, 21, tzinfo=UTC),
+                paused=True,
+            ),
+        }
+        _seed_snapshot(queue_dir, accounts=accounts, in_flight=[])
+        result = runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "personal" in result.stdout
+        assert "dispatching" in result.stdout
+        assert "42%" in result.stdout
+        assert "work" in result.stdout
+        # Paused marker on the work account.
+        assert "(paused)" in result.stdout
+        # linux_user line printed for the work account.
+        assert "bw" in result.stdout
+
+
+class TestAccountPauseResumeHumanReadable:
+    """Cover the non-JSON output paths of ``account pause`` / ``account resume``."""
+
+    def test_pause_seeds_snapshot_and_prints_changed(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
+        # No snapshot yet — _update_paused seeds one with an IDLE row.
+        result = runner.invoke(
+            app,
+            ["account", "pause", "personal", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "paused=True" in result.stdout
+
+    def test_resume_already_resumed_is_idempotent_dim(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                "personal": AccountState(
+                    state=SupervisorState.IDLE,
+                    since=datetime(2026, 5, 21, tzinfo=UTC),
+                    paused=False,
+                ),
+            },
+        )
+        result = runner.invoke(
+            app,
+            ["account", "resume", "personal", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "already paused=False" in result.stdout

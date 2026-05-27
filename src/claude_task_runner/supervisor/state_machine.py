@@ -2,42 +2,35 @@
 
 The daemon calls :func:`step` once per poll tick:
 
-    new_snapshot, actions = step(snapshot, reading_or_error, settings, clock,
-                                 pending_count=N, in_flight_count=M)
+    new_snapshot, actions = step(StepInput(...), clock)
 
-Properties (also enforced by tests in
-``tests/property/test_state_machine_hypothesis.py``):
+Properties (also enforced by property tests):
 
-* No I/O, no global state — the step function is a pure function of
-  its inputs. Pass a :class:`FakeClock` and ``FakeUsageSource`` and
-  the entire dynamics are reproducible.
+* No I/O, no global state — pure function of its inputs.
 * Recovery from :class:`states.SupervisorState.ERROR_DRIFT` requires
   ``[usage].drift_recovery_clean_polls`` consecutive clean readings.
-  This is the anti-flap guarantee the Plan agent flagged.
-* :class:`states.SupervisorState.STOPPED` is sticky — only an explicit
-  resume action moves out of it.
-* In-flight tasks are NEVER killed by state transitions; the throttle
-  bands only gate NEW dispatches.
+* :class:`states.SupervisorState.STOPPED` is sticky — only
+  :func:`request_resume` moves out of it.
+* In-flight tasks are NEVER killed by state transitions; the dispatch
+  decision only gates NEW dispatches.
+
+The dispatch math lives in :mod:`claude_task_runner.throttle`. This
+module is a thin translator from the throttle package's
+:class:`Decision` into a ``(snapshot, actions)`` tuple plus the
+non-decision concerns (STOPPED stickiness, IDLE classification,
+ERROR_DRIFT routing).
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
     SupervisorSettings,
-    ThrottleFiveHourSettings,
-    ThrottleSettings,
-    ThrottleWeeklySettings,
-    TimeOfDaySettings,
     UsageSettings,
 )
-from claude_task_runner.supervisor import pacing as pacing_mod
-from claude_task_runner.supervisor import time_of_day as tod_mod
-from claude_task_runner.supervisor import window as window_mod
 from claude_task_runner.supervisor.actions import (
     Action,
     EmitEvent,
@@ -50,6 +43,8 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
+from claude_task_runner.throttle.decision import Decision, decide
+from claude_task_runner.throttle.policy import ResolvedPolicy
 from claude_task_runner.usage.drift import (
     UsageApiAuthExpired,
     UsageCaptureSpawnError,
@@ -63,13 +58,15 @@ from claude_task_runner.usage.models import UsageReading
 class StepInput:
     """Bundle of inputs to :func:`step`.
 
-    Using a dataclass keeps signatures stable as we add more inputs;
-    callers construct it once per tick.
+    The dispatch policy is pre-resolved by the daemon
+    (``throttle.policy.resolve(queue_settings, account_policy,
+    account_name)``); ``step`` consumes the merged
+    :class:`ResolvedPolicy` directly.
     """
 
     snapshot: SupervisorSnapshot
     reading: UsageReading | UsageFormatDrift | UsageCaptureTimeout | UsageCaptureSpawnError
-    settings_throttle: ThrottleSettings
+    policy: ResolvedPolicy
     settings_supervisor: SupervisorSettings
     settings_usage: UsageSettings
     pending_count: int
@@ -86,13 +83,7 @@ def _entry(
     last_drift_message: str | None = None,
     scheduled_wakeup_at: object = ...,  # sentinel: unset means keep
 ) -> SupervisorSnapshot:
-    """Build a new snapshot with ``state`` and ``since=clock.now()``.
-
-    Updates utilization / reset fields from ``reading`` when provided;
-    otherwise keeps the previous values. ``scheduled_wakeup_at`` is a
-    sentinel-based optional override — pass ``None`` to clear, pass
-    ``...`` (default) to keep the previous value.
-    """
+    """Build a new snapshot with ``state`` and ``since=clock.now()``."""
     update: dict[str, object] = {"state": state, "since": clock.now()}
     if reading is not None:
         update["last_5h_util_pct"] = reading.five_hour.utilization_pct
@@ -110,313 +101,43 @@ def _entry(
     return snapshot.model_copy(update=update)
 
 
-@dataclass(frozen=True)
-class _EffectiveBands:
-    """Per-tick view of throttle thresholds after time-of-day and pacing modulation.
-
-    ``static_*`` fields (e.g. ``weekly_pause_at_pct``) bypass modulation
-    intentionally — they're hard safety floors that the dynamic logic
-    must never override.
-    """
-
-    five_hour_full: float
-    five_hour_slow: float
-    weekly_full: float
-    weekly_slow: float
-    weekly_pause_at_pct: int
-
-
-def _effective_five_hour_thresholds(
+def _emit_state_specific_events(
+    decision: Decision,
     *,
-    five_hour: ThrottleFiveHourSettings,
-    time_of_day: TimeOfDaySettings,
-    clock: Clock,
-) -> tuple[float, float]:
-    """Time-of-day-modulated 5-hour thresholds.
+    previous_state: SupervisorState,
+    actions: list[Action],
+) -> None:
+    """Append per-transition Notify / EmitEvent actions for the new state."""
+    new_state = decision.state
 
-    Falls back to the static ``band_*`` values when any of the daytime /
-    nighttime override fields is ``None``. A field that's set as a
-    daytime override but not as a nighttime override (or vice versa)
-    fills in with the static band value, so an operator who only wants
-    to tighten daytime doesn't need to repeat the static value for night.
-    """
-    static_full = float(five_hour.band_full_dispatch_max_pct)
-    static_slow = float(five_hour.band_slowdown_max_pct)
-
-    daytime_full = (
-        float(five_hour.daytime_band_full_dispatch_max_pct)
-        if five_hour.daytime_band_full_dispatch_max_pct is not None
-        else static_full
-    )
-    nighttime_full = (
-        float(five_hour.nighttime_band_full_dispatch_max_pct)
-        if five_hour.nighttime_band_full_dispatch_max_pct is not None
-        else static_full
-    )
-    daytime_slow = (
-        float(five_hour.daytime_band_slowdown_max_pct)
-        if five_hour.daytime_band_slowdown_max_pct is not None
-        else static_slow
-    )
-    nighttime_slow = (
-        float(five_hour.nighttime_band_slowdown_max_pct)
-        if five_hour.nighttime_band_slowdown_max_pct is not None
-        else static_slow
-    )
-
-    # Cheap shortcut: if both override pairs collapse to the static values,
-    # skip the tz / hh:mm work.
-    if daytime_full == nighttime_full == static_full and (
-        daytime_slow == nighttime_slow == static_slow
-    ):
-        return static_full, static_slow
-
-    now_local = tod_mod.to_local(clock.now(), time_of_day.timezone)
-    day_start = tod_mod.parse_hhmm(time_of_day.day_start)
-    day_end = tod_mod.parse_hhmm(time_of_day.day_end)
-    ramp = time_of_day.ramp_minutes
-
-    full = tod_mod.effective_threshold(
-        tod_mod.DayNightBand(daytime_pct=daytime_full, nighttime_pct=nighttime_full),
-        now_local=now_local,
-        day_start=day_start,
-        day_end=day_end,
-        ramp_minutes=ramp,
-    )
-    slow = tod_mod.effective_threshold(
-        tod_mod.DayNightBand(daytime_pct=daytime_slow, nighttime_pct=nighttime_slow),
-        now_local=now_local,
-        day_start=day_start,
-        day_end=day_end,
-        ramp_minutes=ramp,
-    )
-    return full, slow
-
-
-def _effective_weekly_thresholds(
-    *,
-    weekly: ThrottleWeeklySettings,
-    reading: UsageReading,
-    clock: Clock,
-) -> tuple[float, float]:
-    """Pacing-curve-modulated weekly thresholds.
-
-    Returns the static bands when ``pacing_curve_enabled`` is False or
-    when the OAuth ``resets_at`` couldn't be parsed (curve has nothing
-    to anchor to). The hard ``pause_at_pct`` floor is never touched.
-    """
-    static_full = float(weekly.band_full_dispatch_max_pct)
-    static_slow = float(weekly.band_slowdown_max_pct)
-
-    if not weekly.pacing_curve_enabled or reading.seven_day.resets_at is None:
-        return static_full, static_slow
-
-    elapsed = pacing_mod.elapsed_fraction(
-        resets_at=reading.seven_day.resets_at,
-        now=clock.now(),
-    )
-    eow_window_fraction = (
-        weekly.eow_window_s / pacing_mod.SEVEN_DAYS_S if weekly.eow_window_s > 0 else 0.0
-    )
-    target = pacing_mod.target_weekly_pct(
-        elapsed,
-        eow_target_pct=float(weekly.eow_target_pct),
-        eow_window_fraction=eow_window_fraction,
-        pre_eow_target_pct=float(weekly.pre_eow_target_pct),
-    )
-    observed = float(reading.seven_day.utilization_pct)
-    full = float(
-        pacing_mod.adjusted_weekly_band(
-            observed_pct=observed,
-            target_now=target,
-            base_pct=weekly.band_full_dispatch_max_pct,
-            slack_pp=weekly.pacing_slack_pp,
-            max_pct=weekly.pause_at_pct,
+    if new_state is SupervisorState.THROTTLED_WEEKLY and previous_state is not new_state:
+        actions.append(Notify(level="warn", message=decision.message))
+        actions.append(
+            EmitEvent(
+                event_type="throttled_weekly_entry",
+                payload={
+                    "observed_pct": decision.observed_weekly_pct,
+                    "target_pct": decision.target_pct,
+                },
+            )
         )
-    )
-    slow = float(
-        pacing_mod.adjusted_weekly_band(
-            observed_pct=observed,
-            target_now=target,
-            base_pct=weekly.band_slowdown_max_pct,
-            slack_pp=weekly.pacing_slack_pp,
-            max_pct=weekly.pause_at_pct,
+
+    if new_state is SupervisorState.THROTTLED_5H and previous_state is not new_state:
+        actions.append(Notify(level="info", message=decision.message))
+        actions.append(
+            EmitEvent(
+                event_type="throttled_5h_entry",
+                payload={
+                    "five_hour_util_pct": decision.observed_5h_pct,
+                    "fivehr_slowdown_pct": decision.fivehr_slowdown_pct,
+                    "fivehr_stop_pct": decision.fivehr_stop_pct,
+                    "band": decision.band,
+                },
+            )
         )
-    )
-    return full, slow
 
-
-def _eow_push_nighttime_gate_ok(
-    *,
-    throttle: ThrottleSettings,
-    clock: Clock,
-) -> bool:
-    """``True`` if the EOW-push transition is allowed right now.
-
-    When ``eow_push_nighttime_only`` is ``False`` the gate is always open
-    (preserves the pre-modulation behavior). When ``True``, the gate
-    requires core nighttime per ``[throttle.time_of_day]`` — within the
-    daytime / nighttime ramps the gate stays closed so a push doesn't
-    fire just as we're sliding into daytime.
-    """
-    if not throttle.weekly.eow_push_nighttime_only:
-        return True
-    now_local = tod_mod.to_local(clock.now(), throttle.time_of_day.timezone)
-    day_start = tod_mod.parse_hhmm(throttle.time_of_day.day_start)
-    day_end = tod_mod.parse_hhmm(throttle.time_of_day.day_end)
-    return tod_mod.is_nighttime(
-        now_local,
-        day_start=day_start,
-        day_end=day_end,
-        ramp_minutes=throttle.time_of_day.ramp_minutes,
-    )
-
-
-def _compute_effective_bands(
-    *,
-    reading: UsageReading,
-    throttle: ThrottleSettings,
-    clock: Clock,
-) -> _EffectiveBands:
-    """Compose the per-tick effective bands from the 5h and weekly helpers."""
-    five_full, five_slow = _effective_five_hour_thresholds(
-        five_hour=throttle.five_hour,
-        time_of_day=throttle.time_of_day,
-        clock=clock,
-    )
-    weekly_full, weekly_slow = _effective_weekly_thresholds(
-        weekly=throttle.weekly,
-        reading=reading,
-        clock=clock,
-    )
-    return _EffectiveBands(
-        five_hour_full=five_full,
-        five_hour_slow=five_slow,
-        weekly_full=weekly_full,
-        weekly_slow=weekly_slow,
-        weekly_pause_at_pct=throttle.weekly.pause_at_pct,
-    )
-
-
-def _classify_active(
-    *,
-    reading: UsageReading,
-    bands: _EffectiveBands,
-) -> SupervisorState:
-    """Pick between DISPATCHING / SLOWING_DOWN / THROTTLED_5H / THROTTLED_WEEKLY / PAUSED_WEEKLY
-    given a clean reading and the effective per-tick bands.
-
-    Precedence (strictest wins):
-      1. PAUSED_WEEKLY    — weekly >= pause_at_pct (hard floor; pacing never touches).
-      2. THROTTLED_5H     — 5h util >= 5h slowdown band.
-      3. THROTTLED_WEEKLY — weekly util >= weekly slowdown band but < pause_at.
-      4. SLOWING_DOWN     — either window is between its full and slow bands.
-      5. DISPATCHING      — neither window is over its full band.
-
-    Splitting THROTTLED_5H from THROTTLED_WEEKLY lets the operator (and
-    the dispatch-time messages emitted below) name which window is the
-    cause. Before this split, weekly-driven throttle was labelled
-    THROTTLED_5H, which was misleading when 5h util was low.
-    """
-    weekly_pct = reading.seven_day.utilization_pct
-    if weekly_pct >= bands.weekly_pause_at_pct:
-        return SupervisorState.PAUSED_WEEKLY
-
-    five_pct = reading.five_hour.utilization_pct
-    if five_pct >= bands.five_hour_slow:
-        return SupervisorState.THROTTLED_5H
-
-    weekly_in_stop = weekly_pct >= bands.weekly_slow
-    if weekly_in_stop:
-        return SupervisorState.THROTTLED_WEEKLY
-
-    five_in_slow = bands.five_hour_full <= five_pct < bands.five_hour_slow
-    weekly_in_slow = bands.weekly_full <= weekly_pct < bands.weekly_slow
-    if five_in_slow or weekly_in_slow:
-        return SupervisorState.SLOWING_DOWN
-    return SupervisorState.DISPATCHING
-
-
-def _throttle_cause_message(
-    state: SupervisorState,
-    reading: UsageReading,
-    bands: _EffectiveBands,
-) -> str:
-    """Human-readable explanation of WHY ``state`` was entered.
-
-    Used for the ``Notify`` action's ``message`` so operators see
-    e.g. ``"throttled: weekly at 78% (band 44%, pause_at 90%)"``
-    instead of just ``"throttled_5h_entry"``. Returns the empty string
-    for non-throttle states (caller can use it unconditionally).
-    """
-    five_pct = reading.five_hour.utilization_pct
-    weekly_pct = reading.seven_day.utilization_pct
-    if state is SupervisorState.THROTTLED_5H:
-        return (
-            f"5h utilization {five_pct}% >= slowdown band "
-            f"{bands.five_hour_slow}%; pausing dispatch until next 5h reset"
-        )
-    if state is SupervisorState.THROTTLED_WEEKLY:
-        return (
-            f"weekly utilization {weekly_pct}% >= effective slowdown band "
-            f"{bands.weekly_slow}% (pause_at {bands.weekly_pause_at_pct}%); "
-            "pausing dispatch — pacing-curve-driven if enabled"
-        )
-    if state is SupervisorState.PAUSED_WEEKLY:
-        return (
-            f"weekly utilization {weekly_pct}% >= pause_at "
-            f"{bands.weekly_pause_at_pct}%; hard pause until weekly reset or EOW push"
-        )
-    if state is SupervisorState.SLOWING_DOWN:
-        return (
-            f"slowing dispatch: 5h={five_pct}% (full {bands.five_hour_full}%, "
-            f"slow {bands.five_hour_slow}%), weekly={weekly_pct}% "
-            f"(full {bands.weekly_full}%, slow {bands.weekly_slow}%)"
-        )
-    return ""
-
-
-def _wakeup_for_throttle(
-    *,
-    reading: UsageReading,
-    clock: Clock,
-    settings_supervisor: SupervisorSettings,
-) -> object:
-    """Compute a scheduled wakeup just past the next 5-hour reset.
-
-    Returns a datetime when the 5-hour reset time is parseable, else
-    keeps the previous schedule by returning the sentinel (caller must
-    handle).
-    """
-    if reading.five_hour.resets_at is None:
-        return ...  # keep previous
-    return window_mod.schedule_window_start_wakeup(
-        window=reading.five_hour,
-        clock=clock,
-        delay_s=settings_supervisor.window_start_delay_s,
-        fallback_window_length_s=window_mod.FIVE_HOUR_LENGTH_S,
-    )
-
-
-def _wakeup_for_weekly_pause(
-    *,
-    reading: UsageReading,
-    clock: Clock,
-    settings_supervisor: SupervisorSettings,
-    settings_throttle: ThrottleSettings,
-) -> object:
-    """When weekly is paused, schedule wakeup either at:
-
-    * The EOW window opening (so we re-enter to push toward 98%), or
-    * The weekly reset itself (if EOW is disabled / config edge case).
-    """
-    if reading.seven_day.resets_at is None:
-        return ...
-    eow_window = settings_throttle.weekly.eow_window_s
-    if eow_window > 0:
-        # Wake when EOW window opens (resets_at - eow_window_s).
-        return reading.seven_day.resets_at - timedelta(seconds=eow_window)
-    return reading.seven_day.resets_at + timedelta(seconds=settings_supervisor.window_start_delay_s)
+    if new_state is SupervisorState.SLOWING_DOWN and previous_state is not new_state:
+        actions.append(Notify(level="info", message=decision.message))
 
 
 def step(
@@ -432,22 +153,15 @@ def step(
     snapshot = inp.snapshot
     actions: list[Action] = []
 
-    # STOPPED is sticky — only an explicit operator command (handled
-    # outside this pure step) clears it.
+    # STOPPED is sticky — only :func:`request_resume` clears it.
     if snapshot.state is SupervisorState.STOPPED:
         return snapshot, [MonitorInFlight()]
 
-    # Auth-expired (PR 14) routes to ERROR_DRIFT — the bearer is dead
-    # and no amount of retry will fix it without operator intervention
-    # (either `claude setup-token` to refresh the long-lived token or
-    # `claude /login` for the short-lived path). ERROR_DRIFT halts
-    # dispatch and surfaces the message in `supervisor.json`, so the
-    # operator sees the cause in `runner-status` rather than seeing
-    # the account stuck at the last-good utilization indefinitely.
+    # PR 14: auth-expired routes to ERROR_DRIFT.
     #
-    # NOTE: this isinstance check must come BEFORE the
-    # UsageCaptureSpawnError branch — UsageApiAuthExpired is a subclass
-    # of UsageCaptureSpawnError, and the broader branch would otherwise
+    # This isinstance check must come BEFORE the UsageCaptureSpawnError
+    # branch — UsageApiAuthExpired is a subclass of
+    # UsageCaptureSpawnError, and the broader branch would otherwise
     # swallow it as a transient spawn error and skip the tick.
     if isinstance(inp.reading, UsageApiAuthExpired):
         if snapshot.state is SupervisorState.ERROR_DRIFT:
@@ -482,8 +196,7 @@ def step(
         )
         return new_snap, actions
 
-    # Capture-level errors don't trigger ERROR_DRIFT (which is parser
-    # format drift). They simply skip this tick — utilization unchanged,
+    # Capture-level errors: skip this tick — utilization unchanged,
     # state unchanged, monitor in-flight only.
     if isinstance(inp.reading, (UsageCaptureSpawnError, UsageCaptureTimeout)):
         actions.append(
@@ -498,8 +211,6 @@ def step(
     # Parser drift → enter ERROR_DRIFT.
     if isinstance(inp.reading, UsageFormatDrift):
         if snapshot.state is SupervisorState.ERROR_DRIFT:
-            # Already in drift; reset the clean-poll counter and
-            # update the message (the underlying drift may have changed).
             new_snap = snapshot.model_copy(
                 update={
                     "consecutive_clean_polls": 0,
@@ -531,7 +242,7 @@ def step(
         )
         return new_snap, actions
 
-    # From here on, ``reading`` is a clean :class:`UsageReading`.
+    # From here on, reading is a clean UsageReading.
     reading: UsageReading = inp.reading
 
     # Recovery from ERROR_DRIFT: require N clean polls in a row.
@@ -559,10 +270,9 @@ def step(
                 )
             )
             return new_snap, actions
-        # Clean threshold met — fall through to normal classification,
-        # clearing the drift bookkeeping.
+        # Clean threshold met — fall through to normal classification.
 
-    # Idle when no work pending and nothing in flight.
+    # IDLE when no work pending and nothing in flight.
     if inp.pending_count == 0 and inp.in_flight_count == 0:
         new_snap = _entry(
             SupervisorState.IDLE,
@@ -575,144 +285,46 @@ def step(
         actions.append(MonitorInFlight())
         return new_snap, actions
 
-    # Active classification: throttle bands (with time-of-day and pacing modulation).
-    effective_bands = _compute_effective_bands(
-        reading=reading,
-        throttle=inp.settings_throttle,
-        clock=clock,
+    # Trace-following dispatch decision (ADR-0022).
+    decision = decide(
+        inp.policy,
+        reading,
+        clock,
+        poll_interval_s=inp.settings_usage.poll_interval_s,
+        window_start_delay_s=inp.settings_supervisor.window_start_delay_s,
     )
-    target_state = _classify_active(reading=reading, bands=effective_bands)
-
-    # End-of-week push: only entered FROM PausedWeekly when the EOW
-    # window has opened. (PausedWeekly persists otherwise.)
-    # ``eow_push_nighttime_only`` gates entry to core nighttime so the
-    # daytime 5h windows stay free for interactive use.
-    if (
-        target_state is SupervisorState.PAUSED_WEEKLY
-        and window_mod.in_eow_push_window(
-            weekly=reading.seven_day,
-            clock=clock,
-            eow_window_s=inp.settings_throttle.weekly.eow_window_s,
-        )
-        and reading.seven_day.utilization_pct < inp.settings_throttle.weekly.eow_target_pct
-        and _eow_push_nighttime_gate_ok(
-            throttle=inp.settings_throttle,
-            clock=clock,
-        )
-    ):
-        target_state = SupervisorState.END_OF_WEEK_PUSH
-
-    # Schedule wakeups proactively for blocked / throttled states so the
-    # supervisor (or its watchdog) can sleep until the next reset.
-    # THROTTLED_WEEKLY waits for the next 5h reset (same as THROTTLED_5H)
-    # rather than the weekly reset — the pacing-curve-adjusted weekly
-    # band can shift between 5h windows as observed utilization changes,
-    # so we re-check often.
-    wakeup: object = ...
-    if target_state in (
-        SupervisorState.THROTTLED_5H,
-        SupervisorState.THROTTLED_WEEKLY,
-        SupervisorState.SLOWING_DOWN,
-    ):
-        wakeup = _wakeup_for_throttle(
-            reading=reading,
-            clock=clock,
-            settings_supervisor=inp.settings_supervisor,
-        )
-    elif target_state is SupervisorState.PAUSED_WEEKLY:
-        wakeup = _wakeup_for_weekly_pause(
-            reading=reading,
-            clock=clock,
-            settings_supervisor=inp.settings_supervisor,
-            settings_throttle=inp.settings_throttle,
-        )
-    elif target_state in (
-        SupervisorState.DISPATCHING,
-        SupervisorState.END_OF_WEEK_PUSH,
-    ):
-        # Active states: no scheduled wakeup needed (regular polling).
-        wakeup = None
 
     new_snap = _entry(
-        target_state,
+        decision.state,
         snapshot=snapshot,
         clock=clock,
         reading=reading,
         consecutive_clean_polls=0,
         last_drift_message="",
-        scheduled_wakeup_at=wakeup,
+        scheduled_wakeup_at=decision.wakeup_at,
     )
 
-    # Side actions for state-specific transitions. The messages identify
-    # which window (5h or weekly) drove the throttle/pause so the
-    # operator can act on the right axis.
-    cause_msg = _throttle_cause_message(target_state, reading, effective_bands)
+    _emit_state_specific_events(
+        decision,
+        previous_state=snapshot.state,
+        actions=actions,
+    )
 
-    if (
-        target_state is SupervisorState.PAUSED_WEEKLY
-        and snapshot.state is not SupervisorState.PAUSED_WEEKLY
-    ):
-        actions.append(Notify(level="warn", message=cause_msg))
-        actions.append(
-            EmitEvent(
-                event_type="paused_weekly_entry",
-                payload={
-                    "weekly_util_pct": reading.seven_day.utilization_pct,
-                    "pause_at_pct": effective_bands.weekly_pause_at_pct,
-                },
-            )
-        )
+    if decision.wakeup_at is not None:
+        actions.append(ScheduleWakeupAt(when=decision.wakeup_at))
 
-    if (
-        target_state is SupervisorState.THROTTLED_5H
-        and snapshot.state is not SupervisorState.THROTTLED_5H
-    ):
-        actions.append(Notify(level="info", message=cause_msg))
-        actions.append(
-            EmitEvent(
-                event_type="throttled_5h_entry",
-                payload={
-                    "five_hour_util_pct": reading.five_hour.utilization_pct,
-                    "five_hour_slow_band_pct": effective_bands.five_hour_slow,
-                },
-            )
-        )
-
-    if (
-        target_state is SupervisorState.THROTTLED_WEEKLY
-        and snapshot.state is not SupervisorState.THROTTLED_WEEKLY
-    ):
-        actions.append(Notify(level="info", message=cause_msg))
-        actions.append(
-            EmitEvent(
-                event_type="throttled_weekly_entry",
-                payload={
-                    "weekly_util_pct": reading.seven_day.utilization_pct,
-                    "weekly_slow_band_pct": effective_bands.weekly_slow,
-                    "weekly_pause_at_pct": effective_bands.weekly_pause_at_pct,
-                },
-            )
-        )
-
-    if isinstance(wakeup, object) and wakeup not in (..., None):
-        actions.append(ScheduleWakeupAt(when=wakeup))  # type: ignore[arg-type]
-
-    if target_state in (
-        SupervisorState.THROTTLED_5H,
-        SupervisorState.THROTTLED_WEEKLY,
-        SupervisorState.PAUSED_WEEKLY,
-    ):
+    if decision.state in (SupervisorState.THROTTLED_5H, SupervisorState.THROTTLED_WEEKLY):
         actions.append(StopDispatch())
 
     actions.append(MonitorInFlight())
 
-    if snapshot.state is not target_state:
+    if snapshot.state is not decision.state:
         actions.append(
             EmitEvent(
                 event_type="state_transition",
                 payload={
                     "from": snapshot.state.value,
-                    "to": target_state.value,
+                    "to": decision.state.value,
                     "five_hour_util": reading.five_hour.utilization_pct,
                     "weekly_util": reading.seven_day.utilization_pct,
                 },
@@ -723,10 +335,7 @@ def step(
 
 
 def request_stop(snapshot: SupervisorSnapshot, *, clock: Clock) -> SupervisorSnapshot:
-    """Operator-issued stop: transition to STOPPED.
-
-    Sticky — only :func:`request_resume` moves out.
-    """
+    """Operator-issued stop: transition to STOPPED. Sticky."""
     return _entry(
         SupervisorState.STOPPED,
         snapshot=snapshot,
@@ -737,10 +346,7 @@ def request_stop(snapshot: SupervisorSnapshot, *, clock: Clock) -> SupervisorSna
 
 
 def request_resume(snapshot: SupervisorSnapshot, *, clock: Clock) -> SupervisorSnapshot:
-    """Operator-issued resume: leave STOPPED, return to IDLE.
-
-    The next :func:`step` call reclassifies based on the next reading.
-    """
+    """Operator-issued resume: leave STOPPED, return to IDLE."""
     if snapshot.state is not SupervisorState.STOPPED:
         return snapshot
     return _entry(
