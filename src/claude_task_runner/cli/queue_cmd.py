@@ -6,11 +6,14 @@ keeps the skill's Markdown brief and the boundary stable.
 
 Subcommands:
 
-* ``queue list``           — list pending tasks (``todo/`` YAMLs).
-* ``queue states``         — list TaskState YAMLs, optionally filtered by status.
-* ``queue show ID``        — show one task's input + state + runs.
-* ``queue add``            — write a new Task YAML from CLI args.
-* ``queue force-dispatch`` — bypass throttle gates and dispatch one task now.
+* ``queue list``                  — list pending tasks (``todo/`` YAMLs).
+* ``queue states``                — list TaskState YAMLs, optionally filtered by status.
+* ``queue show ID``               — show one task's input + state + runs.
+* ``queue add``                   — write a new Task YAML from CLI args.
+* ``queue backfill-working-dir``  — populate ``working_dir`` on existing
+                                    null-valued YAMLs from the per-queue
+                                    template (ADR-0023).
+* ``queue force-dispatch``        — bypass throttle gates and dispatch one task now.
 """
 
 from __future__ import annotations
@@ -53,6 +56,43 @@ app = typer.Typer(no_args_is_help=True)
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 """Allowed task-ID characters. Restrictive so the id can be safely used
 as a filename without shell-escaping concerns."""
+
+
+class WorkingDirTemplateError(ValueError):
+    """A ``[queue].working_dir_template`` substitution failed.
+
+    Raised when the template references a placeholder other than
+    ``{task_id}`` — e.g. a typo like ``{taskid}``, or a stray
+    ``{queue_dir}`` left over from a future extension. Surfacing the
+    error at template-application time (not at config load) keeps the
+    schema permissive while still failing fast when an operator runs
+    ``queue add``.
+    """
+
+
+def _apply_working_dir_template(template: str, task_id: str) -> Path | None:
+    """Substitute ``{task_id}`` in ``template`` and return a :class:`Path`.
+
+    Empty / whitespace-only template → ``None`` (caller should treat as
+    "no template configured" and leave ``working_dir`` null). Unknown
+    placeholders raise :class:`WorkingDirTemplateError`.
+    """
+    stripped = template.strip()
+    if not stripped:
+        return None
+    try:
+        rendered = stripped.format(task_id=task_id)
+    except KeyError as exc:
+        # str.format raises KeyError on the missing placeholder name.
+        raise WorkingDirTemplateError(
+            f"[queue].working_dir_template={template!r} references unknown "
+            f"placeholder {exc.args[0]!r}; only {{task_id}} is supported"
+        ) from exc
+    except (IndexError, ValueError) as exc:
+        raise WorkingDirTemplateError(
+            f"[queue].working_dir_template={template!r} is not a valid format string: {exc}"
+        ) from exc
+    return Path(rendered)
 
 
 def _emit(payload: object, *, json: bool, console: Console) -> None:
@@ -328,6 +368,26 @@ def add_task(
             "extra paths (e.g. a sibling repo, a shared data tree)."
         ),
     ),
+    working_dir: Path | None = typer.Option(
+        None,
+        "--working-dir",
+        help=(
+            "Explicit cwd the dispatched task runs in (and the value the "
+            "pre-dispatch hook receives as $TASK_WORKING_DIR). Overrides "
+            "any [queue].working_dir_template in the per-queue config. "
+            "Use --no-working-dir to force null when a template is set "
+            "but this particular task shouldn't have a working_dir."
+        ),
+    ),
+    no_working_dir: bool = typer.Option(
+        False,
+        "--no-working-dir",
+        help=(
+            "Force working_dir to null even when [queue].working_dir_template "
+            "is configured. Useful for tasks that legitimately don't need "
+            "a worktree (e.g. queue-wide categorization shards)."
+        ),
+    ),
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Allow overwriting an existing task YAML."
     ),
@@ -384,10 +444,39 @@ def add_task(
         if not d.is_dir():
             console.print(f"[yellow]warning:[/] --add-dir {d} is not an existing directory")
 
+    # Resolve the task's working_dir.
+    #
+    # Precedence (highest first):
+    #   1. --no-working-dir       — force null even when a template is set.
+    #   2. --working-dir <path>   — explicit value wins over the template.
+    #   3. [queue].working_dir_template — substitute {task_id} and use.
+    #   4. None                   — preserve historical behavior.
+    #
+    # Operators with a pre-dispatch hook that depends on working_dir (e.g.
+    # the nlmixr2lib popPK ingestion worktree hook) configure the template
+    # so each new task gets a sensible default without per-call typing.
+    if no_working_dir and working_dir is not None:
+        console.print("[bold red]give either --working-dir OR --no-working-dir, not both[/]")
+        raise typer.Exit(code=2)
+
+    if no_working_dir:
+        resolved_working_dir: Path | None = None
+    elif working_dir is not None:
+        resolved_working_dir = working_dir
+    else:
+        try:
+            resolved_working_dir = _apply_working_dir_template(
+                settings.queue.working_dir_template, task_id
+            )
+        except WorkingDirTemplateError as exc:
+            console.print(f"[bold red]{exc}[/]")
+            raise typer.Exit(code=2) from exc
+
     task = Task(
         id=task_id,
         title=title,
         prompt=prompt_text or "",
+        working_dir=resolved_working_dir,
         model=model,
         effort=effort,
         priority=priority,
@@ -405,6 +494,116 @@ def add_task(
 
     console.print(f"[green]wrote {target}[/]")
     sys.stdout.flush()
+
+
+@app.command("backfill-working-dir")
+def backfill_working_dir(
+    *,
+    config: Path | None = typer.Option(
+        None, "--config", "-c", help="Per-queue claude_runner.toml."
+    ),
+    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report what would change without writing.",
+    ),
+    json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Populate ``working_dir`` on tasks in ``todo/`` whose value is null.
+
+    Idempotent: skips any task whose ``working_dir`` is already set
+    (regardless of whether the current value matches the template).
+    Reads the per-queue ``[queue].working_dir_template`` and substitutes
+    ``{task_id}`` per task; refuses to run when the template is unset
+    (there is nothing to apply).
+
+    Authoring history: this command exists because operators repeatedly
+    forgot to set ``working_dir`` on hand-edited tasks (or queued tasks
+    before the template was configured) and the pre-dispatch hook then
+    short-circuited at runtime, costing dispatch attempts. Backfilling
+    upfront catches the omission once. See ADR-0023.
+    """
+    console = Console()
+    qd = queue_dir.resolve()
+    settings = load_settings(config)
+
+    template = settings.queue.working_dir_template
+    if not template.strip():
+        msg = (
+            "[queue].working_dir_template is not set; nothing to backfill. "
+            "Configure it in the per-queue claude_runner.toml before running this command."
+        )
+        if json:
+            print(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2)
+
+    updated: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    errors: list[dict[str, str]] = []
+
+    for path in list_pending_tasks(qd):
+        try:
+            task = load_task(path)
+        except (QueueIOError, QueueSchemaError) as exc:
+            errors.append({"id": path.stem, "path": str(path), "error": str(exc)})
+            continue
+        if task.working_dir is not None:
+            skipped.append(
+                {
+                    "id": task.id,
+                    "path": str(path),
+                    "reason": "working_dir already set",
+                    "working_dir": str(task.working_dir),
+                }
+            )
+            continue
+        try:
+            new_dir = _apply_working_dir_template(template, task.id)
+        except WorkingDirTemplateError as exc:
+            errors.append({"id": task.id, "path": str(path), "error": str(exc)})
+            continue
+        if new_dir is None:
+            # Template stripped to empty after substitution — treat as
+            # "no value." We only get here if the template was non-empty
+            # whitespace, which the outer guard already rejected, but
+            # keep the branch defensive.
+            skipped.append({"id": task.id, "path": str(path), "reason": "template rendered empty"})
+            continue
+        if dry_run:
+            updated.append({"id": task.id, "path": str(path), "working_dir": str(new_dir)})
+            continue
+        new_task = task.model_copy(update={"working_dir": new_dir})
+        try:
+            write_task_atomic(new_task, path)
+        except QueueIOError as exc:
+            errors.append({"id": task.id, "path": str(path), "error": str(exc)})
+            continue
+        updated.append({"id": task.id, "path": str(path), "working_dir": str(new_dir)})
+
+    payload = {
+        "ok": not errors,
+        "dry_run": dry_run,
+        "template": template,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+    }
+    if json:
+        print(_json.dumps(payload, indent=2))
+    else:
+        verb = "would update" if dry_run else "updated"
+        console.print(f"[green]{verb} {len(updated)} task(s)[/]; skipped {len(skipped)}")
+        for u in updated:
+            console.print(f"  [bold]{u['id']}[/]  -> {u['working_dir']}")
+        if errors:
+            console.print(f"[bold red]{len(errors)} error(s):[/]")
+            for e in errors:
+                console.print(f"  [red]{e['id']}[/]: {e['error']}")
+    if errors:
+        raise typer.Exit(code=1)
 
 
 def _supervisor_is_alive(queue_dir: Path) -> bool:

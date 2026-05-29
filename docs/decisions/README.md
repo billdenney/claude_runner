@@ -30,6 +30,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0020 | Gate `completed` status on at least one observable output artifact | proposed | 2026-05-21 |
 | 0021 | Per-account long-lived OAuth token via `claude setup-token` | proposed | 2026-05-23 |
 | 0022 | `[dispatch_pct.*]` variant-C trace-following, replacing `[throttle.*]` | accepted | 2026-05-27 |
+| 0023 | `[queue].working_dir_template` for `queue add` | proposed | 2026-05-29 |
 
 ## Template
 

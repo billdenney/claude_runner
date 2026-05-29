@@ -360,6 +360,37 @@ level  = "INFO"
 format = "text"
 
 # ---------------------------------------------------------------------------
+# Queue authoring (`claude-task-runner queue add`)
+#
+# Per-queue knobs the `queue add` command consults when writing a new task
+# YAML. Operators with a pre-dispatch hook that consumes `working_dir`
+# (e.g. the nlmixr2lib popPK ingestion hook that creates a per-task git
+# worktree) set `working_dir_template` so the convention is encoded once
+# in `claude_runner.toml` rather than re-typed (or forgotten) at every
+# `queue add` invocation. See ADR-0023.
+#
+#   working_dir_template
+#       Template for new tasks' `working_dir` field. Supports a single
+#       `{task_id}` substitution. Empty (the default) preserves the
+#       historical behavior: `queue add` writes `working_dir: null`,
+#       leaving the field to be populated by hand. Example:
+#
+#         working_dir_template = "/path/to/repo/.claude/worktrees/{task_id}"
+#
+#       The operator can still override per task:
+#       * `--working-dir <path>`     — use this path explicitly
+#       * `--no-working-dir`         — force null (some tasks legitimately
+#                                      don't want a worktree, e.g. queue
+#                                      categorization shards)
+#
+#       Tasks already in `todo/` aren't retroactively updated; use
+#       `claude-task-runner queue backfill-working-dir --queue <dir>`
+#       to fill `working_dir: null` entries idempotently.
+# ---------------------------------------------------------------------------
+[queue]
+working_dir_template = ""
+
+# ---------------------------------------------------------------------------
 # Dispatch-time sandbox scope (`--add-dir` propagation)
 #
 # Claude Code sandboxes each session to its `cwd` by default. Reading or
