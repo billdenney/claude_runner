@@ -450,3 +450,302 @@ class TestAdd:
         assert "warning" in result.stdout.lower()
         text = task_path_for(queue_dir, "061-ghost").read_text()
         assert str(absent) in text
+
+
+# ---------------------------------------------------------------------------
+# ADR-0023: [queue].working_dir_template — `queue add` writes a per-task
+# working_dir derived from the template (when set) so a pre-dispatch hook
+# that depends on it (e.g. a per-task git-worktree setup script) doesn't
+# silently short-circuit at runtime.
+# ---------------------------------------------------------------------------
+
+
+def _write_config(tmp_path: Path, template: str) -> Path:
+    """Write a minimal per-queue claude_runner.toml carrying the template.
+
+    Other sections inherit the package defaults via load_settings's
+    deep-merge, so the test config stays small.
+    """
+    cfg = tmp_path / "claude_runner.toml"
+    cfg.write_text(f'[queue]\nworking_dir_template = "{template}"\n')
+    return cfg
+
+
+class TestAddWorkingDir:
+    def test_template_substitutes_task_id(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/repos/foo/.wt/{task_id}")
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "070-templated",
+                "--title",
+                "templated",
+                "--prompt",
+                "x",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        text = task_path_for(queue_dir, "070-templated").read_text()
+        assert "working_dir: /repos/foo/.wt/070-templated" in text
+
+    def test_empty_template_leaves_null(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+    ) -> None:
+        """No --config (and thus no template) preserves the historical
+        behavior: working_dir serialises as null."""
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "071-null",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        text = task_path_for(queue_dir, "071-null").read_text()
+        assert "working_dir: null" in text
+
+    def test_explicit_flag_overrides_template(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/repos/foo/.wt/{task_id}")
+        explicit = "/repos/bar/something-else"
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "072-explicit",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+                "--working-dir",
+                explicit,
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        text = task_path_for(queue_dir, "072-explicit").read_text()
+        assert f"working_dir: {explicit}" in text
+        # The templated value MUST NOT have leaked through.
+        assert "/repos/foo/.wt/072-explicit" not in text
+
+    def test_no_working_dir_flag_forces_null(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/repos/foo/.wt/{task_id}")
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "073-suppressed",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+                "--no-working-dir",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        text = task_path_for(queue_dir, "073-suppressed").read_text()
+        assert "working_dir: null" in text
+
+    def test_working_dir_and_no_working_dir_conflict(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+    ) -> None:
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "074-conflict",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+                "--working-dir",
+                "/tmp/anything",
+                "--no-working-dir",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "either --working-dir OR --no-working-dir" in result.stdout
+
+    def test_template_with_bad_placeholder_fails_clearly(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/repos/{taskid}")  # typo: missing underscore
+        result = runner.invoke(
+            app,
+            [
+                "add",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--id",
+                "075-typo",
+                "--title",
+                "x",
+                "--prompt",
+                "x",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "unknown placeholder" in result.stdout
+        assert "taskid" in result.stdout
+
+
+class TestBackfillWorkingDir:
+    def test_refuses_when_template_unset(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+    ) -> None:
+        _seed_task(queue_dir, "100-pending")
+        result = runner.invoke(
+            app,
+            ["backfill-working-dir", "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 2
+        assert "not set" in result.stdout
+
+    def test_fills_null_working_dir(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/wts/{task_id}")
+        _seed_task(queue_dir, "101-null")
+        _seed_task(queue_dir, "102-preset", working_dir="/already/set")
+        result = runner.invoke(
+            app,
+            [
+                "backfill-working-dir",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        ids_updated = {u["id"] for u in payload["updated"]}
+        assert ids_updated == {"101-null"}
+        # 102-preset stays unchanged.
+        text = task_path_for(queue_dir, "102-preset").read_text()
+        assert "working_dir: /already/set" in text
+        # 101-null now carries the templated value.
+        text = task_path_for(queue_dir, "101-null").read_text()
+        assert "working_dir: /wts/101-null" in text
+
+    def test_is_idempotent(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A second run after the first does nothing — all working_dirs
+        are already set, so updated=0 and skipped=N."""
+        cfg = _write_config(tmp_path, "/wts/{task_id}")
+        _seed_task(queue_dir, "110-a")
+        _seed_task(queue_dir, "111-b")
+        first = runner.invoke(
+            app,
+            [
+                "backfill-working-dir",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert first.exit_code == 0
+        second = runner.invoke(
+            app,
+            [
+                "backfill-working-dir",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert second.exit_code == 0
+        payload = json.loads(second.stdout)
+        assert payload["updated"] == []
+        assert len(payload["skipped"]) == 2
+
+    def test_dry_run_does_not_write(
+        self,
+        runner: CliRunner,
+        queue_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        cfg = _write_config(tmp_path, "/wts/{task_id}")
+        _seed_task(queue_dir, "120-dry")
+        result = runner.invoke(
+            app,
+            [
+                "backfill-working-dir",
+                "--config",
+                str(cfg),
+                "--queue",
+                str(queue_dir),
+                "--dry-run",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["dry_run"] is True
+        assert len(payload["updated"]) == 1
+        # File on disk untouched.
+        text = task_path_for(queue_dir, "120-dry").read_text()
+        assert "working_dir: null" in text

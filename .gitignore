@@ -22,6 +22,11 @@ coverage.xml
 venv/
 env/
 
+# uv — lockfile is not tracked yet; the project pins via pyproject.toml
+# instead. Remove this entry when/if the maintainers decide to commit the
+# lockfile (which would freeze the full transitive dependency graph).
+uv.lock
+
 # Editor / IDE
 .vscode/
 .idea/

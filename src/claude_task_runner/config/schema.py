@@ -158,6 +158,28 @@ class FixturesSettings(_StrictModel):
     rotation_window_days: int = Field(ge=0)
 
 
+class QueueSettings(_StrictModel):
+    """Queue-authoring knobs consumed by ``claude-task-runner queue add``.
+
+    The defaults live in this Pydantic model, NOT the package TOML, so a
+    queue config that pre-dates this section keeps parsing unchanged
+    (extra="forbid" only rejects unknown keys, missing ones default).
+    Operators opt in by adding a ``[queue]`` block to their per-queue
+    ``claude_runner.toml``.
+    """
+
+    working_dir_template: str = ""
+    """Template applied to a new task's ``working_dir`` when the operator
+    runs ``queue add`` without ``--working-dir`` / ``--no-working-dir``.
+
+    Supports a single ``{task_id}`` substitution (Pythonic
+    ``str.format(task_id=...)``); other ``{...}`` placeholders raise a
+    ``ConfigError`` at template-application time so typos surface fast.
+    Empty string (the default) keeps the historical behavior: ``queue
+    add`` writes ``working_dir: null`` and operators populate the field
+    manually. See ADR-0023."""
+
+
 class LoggingSettings(_StrictModel):
     """Process-wide logging knobs honoured by :mod:`observability`.
 
@@ -531,6 +553,10 @@ class Settings(_StrictModel):
     default so existing TOMLs that pre-date this block keep parsing
     unchanged."""
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
+    queue: QueueSettings = Field(default_factory=QueueSettings)
+    """``[queue]`` block — task-authoring knobs consumed by ``queue add``.
+    Has a default so existing TOMLs that pre-date this block keep
+    parsing unchanged. See :class:`QueueSettings` and ADR-0023."""
     plans: dict[str, PlanSettings] = Field(default_factory=dict)
     accounts: list[AccountSettings] = Field(default_factory=list)
     """One or more Claude accounts the supervisor may dispatch through.

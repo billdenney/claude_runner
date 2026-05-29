@@ -64,6 +64,50 @@ all at once.
   `additional_dirs` in the task YAML. Missing paths are warned but
   do not block adding the task — they may be created by the
   pre-dispatch hook before the agent runs.
+- **`--working-dir <path>` / `--no-working-dir`** — the directory the
+  dispatched agent runs in (and the value the pre-dispatch hook
+  receives as `$TASK_WORKING_DIR`). See the next section for when
+  these flags matter; the short version is that you usually do NOT
+  need to ask the operator about working_dir.
+
+## working_dir: when (and when not) to ask
+
+ADR-0023: per-queue `[queue].working_dir_template` (in
+`claude_runner.toml`) is the canonical way to set `working_dir`. When
+it's configured, `queue add` substitutes `{task_id}` into the template
+and writes the result into the new YAML automatically — DON'T ask the
+operator about working_dir in this case.
+
+To check, read the per-queue config:
+
+```
+python3 -c 'import tomllib, sys
+cfg = tomllib.load(open(sys.argv[1], "rb"))
+print((cfg.get("queue") or {}).get("working_dir_template", ""))' \
+  <CWD>/claude_runner.toml
+```
+
+(empty output = no template set).
+
+Decision tree:
+
+1. **Template is set AND the new task fits the convention** → don't
+   ask; let the template apply. This is the common case.
+2. **Template is set BUT this task legitimately doesn't need a
+   working_dir** (e.g. a queue-wide categorization shard that doesn't
+   operate on a single per-task checkout) → pass `--no-working-dir`.
+   Ask the operator only if you're unsure.
+3. **Template is set but THIS task needs a different path** → pass
+   `--working-dir <explicit-path>`. Ask the operator for the path.
+4. **No template configured AND the queue has a pre-dispatch hook
+   that depends on `working_dir`** (read
+   `[hooks].pre_dispatch_command` from the same TOML — non-empty
+   means a hook is configured) → ask the operator whether this task
+   needs a `working_dir`, and if yes for the path. Encourage them to
+   add the template to `claude_runner.toml` and run
+   `claude-task-runner queue backfill-working-dir` once so future
+   `queue add` invocations don't need this question.
+5. **No template, no hook** → don't ask; let `working_dir` stay null.
 
 ## Invocation
 

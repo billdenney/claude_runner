@@ -896,3 +896,111 @@ def test_all_checks_api_usage_on_when_enabled(
     api_result = next(r for r in results if r.name == "api_usage_source")
     assert api_result.status == CheckStatus.FAIL
     assert "claude /login" in api_result.remediation
+
+
+# ---------------------------------------------------------------------------
+# check_working_dir_template — ADR-0023.
+# ---------------------------------------------------------------------------
+
+
+def _with_hook_and_template(settings: Settings, *, hook: str, template: str) -> Settings:
+    """Helper: set [hooks].pre_dispatch_command and [queue].working_dir_template
+    on a copied Settings without disturbing other sections."""
+    return settings.model_copy(
+        update={
+            "hooks": settings.hooks.model_copy(update={"pre_dispatch_command": hook}),
+            "queue": settings.queue.model_copy(update={"working_dir_template": template}),
+        }
+    )
+
+
+def test_check_working_dir_template_no_hook_passes(settings: Settings, queue_dir: Path) -> None:
+    """No pre-dispatch hook → check is irrelevant → PASS."""
+    from claude_task_runner.doctor.checks import check_working_dir_template
+
+    # Default settings have no hook configured.
+    assert settings.hooks.pre_dispatch_command == ""
+    result = check_working_dir_template(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "no pre-dispatch hook" in result.detail
+
+
+def test_check_working_dir_template_set_passes(settings: Settings, queue_dir: Path) -> None:
+    """Hook present AND template set → operator has wired it up → PASS."""
+    from claude_task_runner.doctor.checks import check_working_dir_template
+
+    s = _with_hook_and_template(
+        settings,
+        hook="/tmp/hook.sh",
+        template="/repo/.wt/{task_id}",
+    )
+    result = check_working_dir_template(s, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "template set" in result.detail
+
+
+def test_check_working_dir_template_warns_on_null_with_hook(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """Hook present, no template, and a task in todo/ has working_dir: null
+    → WARN, naming the offending task IDs and pointing at backfill."""
+    from claude_task_runner.doctor.checks import check_working_dir_template
+
+    # Seed two null-valued tasks and one with working_dir already set.
+    write_task_atomic(
+        Task.model_validate({"id": "210-null-a", "title": "a", "prompt": "x"}),
+        task_path_for(queue_dir, "210-null-a"),
+    )
+    write_task_atomic(
+        Task.model_validate({"id": "211-null-b", "title": "b", "prompt": "x"}),
+        task_path_for(queue_dir, "211-null-b"),
+    )
+    write_task_atomic(
+        Task.model_validate(
+            {
+                "id": "212-set",
+                "title": "c",
+                "prompt": "x",
+                "working_dir": "/already/set",
+            }
+        ),
+        task_path_for(queue_dir, "212-set"),
+    )
+
+    s = _with_hook_and_template(
+        settings,
+        hook="/tmp/hook.sh",
+        template="",  # no template configured
+    )
+    result = check_working_dir_template(s, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert "2 pending task" in result.detail
+    assert "210-null-a" in result.detail
+    assert "211-null-b" in result.detail
+    # The presets one MUST NOT be in the warning.
+    assert "212-set" not in result.detail
+    assert "queue backfill-working-dir" in result.remediation
+
+
+def test_check_working_dir_template_no_null_tasks_passes(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """Hook present, no template, but every pending task already has a
+    working_dir → nothing to warn about → PASS."""
+    from claude_task_runner.doctor.checks import check_working_dir_template
+
+    write_task_atomic(
+        Task.model_validate(
+            {
+                "id": "220-set",
+                "title": "x",
+                "prompt": "y",
+                "working_dir": "/repo/.wt/220-set",
+            }
+        ),
+        task_path_for(queue_dir, "220-set"),
+    )
+    s = _with_hook_and_template(settings, hook="/tmp/hook.sh", template="")
+    result = check_working_dir_template(s, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "no pending tasks with working_dir: null" in result.detail

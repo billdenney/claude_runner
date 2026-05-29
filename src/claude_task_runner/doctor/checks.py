@@ -756,6 +756,74 @@ def check_task_paths(
     )
 
 
+def check_working_dir_template(settings: Settings, queue_dir: Path) -> CheckResult:
+    """WARN when ``working_dir`` is null on pending tasks AND a pre-dispatch hook runs.
+
+    The combination is a near-certain dispatch failure on queues whose
+    hook depends on ``working_dir`` (e.g. setting up a per-task git
+    worktree before the agent runs): the hook receives an empty
+    ``$TASK_WORKING_DIR``, short-circuits, the agent runs in the queue
+    dir, and the run fails for reasons unrelated to the task itself.
+    See ADR-0023 — the operator-facing fix is to set
+    ``[queue].working_dir_template`` and run ``queue
+    backfill-working-dir`` once.
+
+    PASS when no pre-dispatch hook is configured, or when the template
+    is configured, or when every pending task already has
+    ``working_dir`` set. Otherwise the check tallies the null-valued
+    tasks and points at the backfill subcommand.
+    """
+    if not settings.hooks.pre_dispatch_command.strip():
+        return CheckResult(
+            name="working_dir_template",
+            status=CheckStatus.PASS,
+            detail="no pre-dispatch hook configured (working_dir gate not in play)",
+        )
+    if settings.queue.working_dir_template.strip():
+        return CheckResult(
+            name="working_dir_template",
+            status=CheckStatus.PASS,
+            detail=f"template set: {settings.queue.working_dir_template!r}",
+        )
+
+    null_ids: list[str] = []
+    for path in list_pending_tasks(queue_dir):
+        try:
+            task = load_task(path)
+        except (QueueIOError, QueueSchemaError):
+            # check_task_yamls reports parse errors; don't double-count.
+            continue
+        if task.working_dir is None:
+            null_ids.append(task.id)
+
+    if not null_ids:
+        return CheckResult(
+            name="working_dir_template",
+            status=CheckStatus.PASS,
+            detail="no pending tasks with working_dir: null",
+        )
+
+    sample = ", ".join(null_ids[:5])
+    if len(null_ids) > 5:
+        sample += f", ... +{len(null_ids) - 5} more"
+    return CheckResult(
+        name="working_dir_template",
+        status=CheckStatus.WARN,
+        detail=(
+            f"{len(null_ids)} pending task(s) have working_dir: null and a "
+            f"pre-dispatch hook is configured: {sample}"
+        ),
+        remediation=(
+            "Set [queue].working_dir_template in claude_runner.toml "
+            "(supports {task_id}), then:\n"
+            "  claude-task-runner queue backfill-working-dir --queue "
+            f"{queue_dir}\n"
+            "Tasks that legitimately need no working_dir can stay null; "
+            "this check only WARNs when the combination is likely a bug."
+        ),
+    )
+
+
 def check_state_yamls(_settings: Settings, queue_dir: Path) -> CheckResult:
     """Every YAML in ``state/`` validates."""
     bad: list[str] = []
@@ -1007,6 +1075,7 @@ def all_checks(
         lambda: check_queue_layout(settings, queue_dir),
         lambda: check_task_yamls(settings, queue_dir),
         lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
+        lambda: check_working_dir_template(settings, queue_dir),
         lambda: check_state_yamls(settings, queue_dir),
         lambda: check_supervisor_state(settings, queue_dir),
         lambda: check_ema(settings, queue_dir),

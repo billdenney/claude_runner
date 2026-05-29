@@ -2,6 +2,7 @@
 
 - **Date:** 2026-05-03
 - **Status:** accepted
+- **Refined by:** ADR-0023 (working_dir contract clarification)
 
 ## Context
 
@@ -26,6 +27,17 @@ Environment variables exposed: `$TASK_ID`, `$TASK_WORKING_DIR`,
 `$TASK_MODEL`, `$ATTEMPT`, `$SESSION_ID`. Pre-dispatch hook failure
 (non-zero exit) aborts dispatch for that task. Post-dispatch hook
 failure logs a warning but doesn't fail the task.
+
+Hooks should treat `$TASK_WORKING_DIR=""` (the task has
+`working_dir: null` in its YAML) as "no per-task working dir needed"
+and exit 0 without erroring — some tasks legitimately don't have a
+working_dir (e.g. categorization shards that don't operate on a single
+per-task checkout). The nlmixr2lib popPK ingestion hook
+(`_scripts/hooks/setup_worktree.sh`) is the reference implementation
+of this contract. Operators whose hook REQUIRES `working_dir` should
+configure `[queue].working_dir_template` (ADR-0023) so `queue add`
+populates the field automatically rather than relying on operators to
+remember the flag.
 
 ## Alternatives considered
 

@@ -92,3 +92,22 @@ class TestLoadSettings:
         )
         with pytest.raises(ConfigError, match="validation failed"):
             load_settings(toml)
+
+    def test_queue_section_defaults_to_empty_template(self) -> None:
+        """ADR-0023: ``[queue].working_dir_template`` is empty by default
+        so existing queues whose claude_runner.toml predates the section
+        keep writing ``working_dir: null`` from ``queue add``."""
+        s = load_settings(None)
+        assert s.queue.working_dir_template == ""
+
+    def test_queue_section_override(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text('[queue]\nworking_dir_template = "/repo/.worktrees/{task_id}"\n')
+        s = load_settings(toml)
+        assert s.queue.working_dir_template == "/repo/.worktrees/{task_id}"
+
+    def test_queue_unknown_key_rejected(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[queue]\nbogus_key = 1\n")
+        with pytest.raises(ConfigError, match="validation failed"):
+            load_settings(toml)
