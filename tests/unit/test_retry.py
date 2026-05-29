@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_task_runner.config.schema import FailureClassifierSettings
+from claude_task_runner.config.schema import FailureClassifierSettings, Settings
 from claude_task_runner.runner.retry import (
     circuit_breaker_tripped,
     classify,
@@ -82,3 +82,22 @@ class TestCircuitBreaker:
 
     def test_above_threshold(self, settings: FailureClassifierSettings) -> None:
         assert circuit_breaker_tripped(10, settings) is True
+
+
+class TestDefaultEnvironmentalPatterns:
+    """The package-default ``environmental_patterns`` allowlist must include
+    the cross-account resume error (ADR-0024). This forward-compatibility
+    guarantee means old state YAMLs without ``session_account`` that hit
+    the bug get auto-resumed on the next tick (where the post-fix
+    orchestrator picks the affined account).
+    """
+
+    def test_no_conversation_found_is_environmental(self, default_settings: Settings) -> None:
+        err = "Error: No conversation found with session ID: 79e06baa-4004-4d73-9400-96b63dfc382d"
+        klass = classify(err, default_settings.failure_classifier)
+        assert klass == "environmental"
+        assert should_auto_resume(klass) is True
+
+    def test_no_conversation_found_case_insensitive(self, default_settings: Settings) -> None:
+        err = "NO CONVERSATION FOUND WITH SESSION ID: abc"
+        assert classify(err, default_settings.failure_classifier) == "environmental"

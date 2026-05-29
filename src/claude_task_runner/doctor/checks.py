@@ -848,6 +848,58 @@ def check_state_yamls(_settings: Settings, queue_dir: Path) -> CheckResult:
     )
 
 
+def check_orphaned_sessions(settings: Settings, queue_dir: Path) -> CheckResult:
+    """Warn when a task's session is affined to an account no longer configured.
+
+    Walks ``state/*.yaml``; for each task with ``session_id != null``,
+    resolve the host account via :meth:`TaskState.session_host_account`
+    and confirm it's still listed in ``[[accounts]]``. An orphan
+    happens when an operator removes an ``[[accounts]]`` block while
+    a task that had run on it carries an unfinished session — the
+    orchestrator's affinity check (ADR-0024) refuses to dispatch
+    against an unknown account, so the task is stuck.
+
+    WARNs (not FAILs) because the task isn't broken — it just can't
+    move forward until the operator either restores the missing
+    account or runs ``queue restart-fresh <task_id>`` to clear the
+    session and dispatch fresh.
+    """
+    known = {a.name for a in settings.accounts}
+    orphans: list[tuple[str, str]] = []
+    inspected = 0
+    for path in list_state_files(queue_dir):
+        try:
+            state = load_state(path)
+        except (QueueIOError, QueueSchemaError):
+            # check_state_yamls already flags this as FAIL.
+            continue
+        if state.session_id is None:
+            continue
+        inspected += 1
+        host = state.session_host_account()
+        if host is None:
+            continue
+        if host not in known:
+            orphans.append((state.task_id, host))
+    if not orphans:
+        return CheckResult(
+            name="orphaned_sessions",
+            status=CheckStatus.PASS,
+            detail=f"{inspected} sessioned task(s) all map to a configured account",
+        )
+    lines = [f"  {tid}: session host {host!r} not in [[accounts]]" for tid, host in orphans]
+    return CheckResult(
+        name="orphaned_sessions",
+        status=CheckStatus.WARN,
+        detail=f"{len(orphans)} orphaned session(s) of {inspected} sessioned task(s)",
+        remediation=(
+            "Either restore the missing [[accounts]] block, or for each "
+            "task run `claude-task-runner queue restart-fresh <task_id>` "
+            "to clear the session and dispatch fresh:\n" + "\n".join(lines)
+        ),
+    )
+
+
 def check_supervisor_state(settings: Settings, queue_dir: Path) -> CheckResult:
     """The supervisor's ``supervisor.json`` (if present) parses cleanly."""
     path = persist_mod.supervisor_state_path(queue_dir, settings.supervisor.state_file)
@@ -1077,6 +1129,7 @@ def all_checks(
         lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
         lambda: check_working_dir_template(settings, queue_dir),
         lambda: check_state_yamls(settings, queue_dir),
+        lambda: check_orphaned_sessions(settings, queue_dir),
         lambda: check_supervisor_state(settings, queue_dir),
         lambda: check_ema(settings, queue_dir),
         lambda: check_skills_installed(settings),

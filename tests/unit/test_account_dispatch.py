@@ -290,3 +290,156 @@ class TestInFlightCount:
     def test_count_by_account(self, account: str, expected: int) -> None:
         in_flight = _in_flight("personal", 3) + _in_flight("work", 2)
         assert account_in_flight_count(account, in_flight) == expected
+
+
+class TestSessionAffinity:
+    """ADR-0024 session affinity branches in ``choose_account``.
+
+    Claude Code sessions are namespaced by ``CLAUDE_CONFIG_DIR``. A
+    task with an active ``session_id`` must resume on the account
+    that created it; resuming under a different config dir fails
+    with ``No conversation found with session ID``. ``affined_account``
+    is therefore a correctness gate ahead of ``task.account`` pinning
+    and the equal-priority "least-utilized" rule.
+    """
+
+    def test_affined_account_picked_when_free(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={
+                "personal": _account("personal"),
+                "work": _account("work"),
+            },
+            account_states={
+                "personal": _state(util_5h=0),
+                "work": _state(util_5h=50),
+            },
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account == "work"
+        assert "affined" in choice.reason
+
+    def test_affined_account_picked_even_when_other_has_more_headroom(self) -> None:
+        """Reproduces the live 131-laffont bug: equal-priority would have
+        picked `personal` (much more 5h headroom), but affinity wins."""
+        choice = choose_account(
+            task=_task(),
+            accounts={
+                "personal": _account("personal"),
+                "work": _account("work"),
+            },
+            account_states={
+                "personal": _state(util_5h=29, state=SupervisorState.DISPATCHING),
+                "work": _state(util_5h=89, state=SupervisorState.SLOWING_DOWN),
+            },
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account == "work"
+
+    def test_affined_account_unavailable_returns_none(self) -> None:
+        """When the host account is throttled, skip this tick rather than
+        cross-account dispatching to a working account."""
+        choice = choose_account(
+            task=_task(),
+            accounts={
+                "personal": _account("personal"),
+                "work": _account("work"),
+            },
+            account_states={
+                "personal": _state(state=SupervisorState.DISPATCHING),
+                "work": _state(state=SupervisorState.THROTTLED_WEEKLY),
+            },
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account is None
+        assert "session affinity blocks dispatch" in choice.reason
+        assert "throttled_weekly" in choice.reason
+
+    def test_affined_account_paused_returns_none(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"work": _account("work")},
+            account_states={"work": _state(paused=True)},
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account is None
+        assert "session affinity blocks dispatch" in choice.reason
+        assert "paused" in choice.reason
+
+    def test_affined_account_at_capacity_returns_none(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"work": _account("work", cap=1)},
+            account_states={"work": _state()},
+            in_flight=_in_flight("work", 1),
+            affined_account="work",
+        )
+        assert choice.account is None
+        assert "capacity" in choice.reason
+
+    def test_affined_to_orphaned_account_returns_none(self) -> None:
+        """The affined account was removed from [[accounts]] entirely."""
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal")},
+            account_states={"personal": _state()},
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account is None
+        assert "not in [[accounts]]" in choice.reason
+        assert "queue restart-fresh" in choice.reason
+
+    def test_affined_to_account_without_state_returns_none(self) -> None:
+        """Cold start before the host account's first /usage capture."""
+        choice = choose_account(
+            task=_task(),
+            accounts={"work": _account("work")},
+            account_states={},
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account is None
+        assert "no state" in choice.reason
+
+    def test_affinity_overrides_pinning(self) -> None:
+        """A pinned task whose session is on a different account routes to
+        the session host, not the pin. Pinning happened at task-author
+        time; the session-host is the post-hoc binding constraint."""
+        choice = choose_account(
+            task=_task(account="personal"),
+            accounts={
+                "personal": _account("personal"),
+                "work": _account("work"),
+            },
+            account_states={
+                "personal": _state(),
+                "work": _state(),
+            },
+            in_flight=[],
+            affined_account="work",
+        )
+        assert choice.account == "work"
+        assert "affined" in choice.reason
+
+    def test_no_affinity_param_preserves_legacy_behavior(self) -> None:
+        """Without `affined_account`, choose_account picks by 5h util as
+        before. Locks in the backwards-compat guarantee for single-
+        account queues and first-attempt fresh dispatches."""
+        choice = choose_account(
+            task=_task(),
+            accounts={
+                "personal": _account("personal"),
+                "work": _account("work"),
+            },
+            account_states={
+                "personal": _state(util_5h=10),
+                "work": _state(util_5h=50),
+            },
+            in_flight=[],
+        )
+        assert choice.account == "personal"

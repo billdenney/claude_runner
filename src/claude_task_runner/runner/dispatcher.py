@@ -934,11 +934,29 @@ def _finalize_state(
         if plan.strategy is ResumeStrategy.RESUME
         else prior.resume_attempts
     )
+    # Persist which account hosts the current session so the dispatcher
+    # can honour session affinity on the next attempt (ADR-0024). Two
+    # cases:
+    #   * FRESH that produced a new session id → host account = the
+    #     account this run executed on (run.account).
+    #   * RESUME that succeeded → session id is unchanged from prior;
+    #     the host account also stays unchanged (a successful resume
+    #     proves the prior account still hosts it).
+    # When this run produced no session id and the prior had none
+    # (cold start that failed before SystemInitEvent), session_account
+    # stays None — there's no session to be affined to.
+    if new_session_id is None:
+        new_session_account: str | None = None
+    elif summary.session_id and summary.session_id != prior.session_id:
+        new_session_account = run.account
+    else:
+        new_session_account = prior.session_account or run.account
 
     new_state = prior.model_copy(
         update={
             "status": new_status,
             "session_id": new_session_id,
+            "session_account": new_session_account,
             "resume_attempts": new_resume_attempts,
             "last_finished_at": run.finished_at,
             "last_heartbeat_at": run.finished_at,

@@ -258,6 +258,14 @@ environmental_patterns = [
     "ECONNRESET",
     "connection reset",
     "connection refused",
+    # ADR-0024: cross-account session resume. The orchestrator avoids
+    # this case proactively via session affinity, but a state YAML
+    # written before that fix (or any other transient reason the
+    # session isn't on the resuming account) can still surface here.
+    # The fix is to clear session_id (queue restart-fresh) and dispatch
+    # fresh; auto-retry buys the next tick where the orchestrator
+    # picks the affined account or the operator's restart-fresh lands.
+    "No conversation found with session ID",
 ]
 operator_patterns = [
     "Operator: defer",

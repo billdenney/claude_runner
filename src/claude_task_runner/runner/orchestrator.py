@@ -211,6 +211,15 @@ def tick_dispatch(
     for task in candidates:
         if dispatched >= available:
             break
+        # Resolve the affined account from the task's state YAML so
+        # choose_account can honour session affinity (ADR-0024):
+        # multi-account queues must resume a Claude session on the
+        # account that created it — sessions are namespaced by
+        # CLAUDE_CONFIG_DIR. ``session_host_account`` returns None
+        # when the task has no session yet (first attempt) or when
+        # state load fails (which falls back to a fresh dispatch on
+        # whichever account choose_account picks).
+        affined = _affined_account_for_task(queue_dir, task.id)
         # Build the per-tick view of attributed in-flight tasks so
         # choose_account sees each newly-dispatched slot as it lands.
         live_in_flight = to_in_flight_records(in_flight_slots)
@@ -219,6 +228,7 @@ def tick_dispatch(
             accounts=accounts_by_name,
             account_states=dict(snapshot.accounts),
             in_flight=live_in_flight,
+            affined_account=affined,
         )
         if choice.account is None:
             logger.info("dispatch skipped task %s: %s", task.id, choice.reason)
@@ -370,6 +380,25 @@ def _completed_task_ids(queue_dir: Path) -> set[str]:
         if state.status == "completed":
             ids.add(state.task_id)
     return ids
+
+
+def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
+    """Resolve the host account for ``task_id``'s current session.
+
+    Returns ``None`` when there is no state file, the state cannot be
+    parsed, the task has no ``session_id``, or no account can be
+    derived (legacy state with empty ``runs``). The dispatcher treats
+    ``None`` as "no affinity constraint" — the next attempt starts
+    fresh on whichever account ``choose_account`` picks.
+    """
+    sp = state_path_for(queue_dir, task_id)
+    if not sp.exists():
+        return None
+    try:
+        state = load_state(sp)
+    except Exception:
+        return None
+    return state.session_host_account()
 
 
 def _eligible_candidates(
