@@ -4,7 +4,9 @@ The policy is a function of the resolved accounts (queue-side
 declaration + per-account dispatch policy from
 ``<config_dir>/runner-account.toml``), each account's most recent
 state (capacity + throttle band), the in-flight task set (per-account
-utilisation), and the task itself (which may pin a specific account).
+utilisation), the task itself (which may pin a specific account), and
+the **affined account** (which hosts the task's current claude session,
+if any — see ADR-0024).
 
 Kept side-effect-free so the supervisor's tick loop can call it
 without touching the disk and the unit tests can drive it with
@@ -12,13 +14,22 @@ hand-built inputs.
 
 Selection rule
 --------------
-1. If ``task.account`` is set, route to that account when capacity is
-   available; otherwise reject (the orchestrator surfaces the conflict
-   in the dispatch log).
-2. Otherwise: filter to accounts that are dispatching-eligible
+1. If ``affined_account`` is set, route to that account when it exists
+   and has capacity; otherwise reject. Affinity is a correctness gate,
+   not a policy choice — a Claude session created on one account is
+   invisible to ``claude`` running with a different ``CLAUDE_CONFIG_DIR``,
+   so resuming elsewhere yields ``No conversation found with session ID``.
+   When affinity is set, ``task.account`` pinning is ignored (the
+   pinning happened at task-author time, before the session existed;
+   the session's host is the binding constraint until an operator runs
+   ``queue restart-fresh`` to clear it).
+2. Else if ``task.account`` is set, route to that account when capacity
+   is available; otherwise reject (the orchestrator surfaces the
+   conflict in the dispatch log).
+3. Otherwise: filter to accounts that are dispatching-eligible
    (state in DISPATCHING / SLOWING_DOWN / IDLE, not paused, has
    capacity).
-3. All accounts are equal priority. Pick the one with the lowest
+4. All accounts are equal priority. Pick the one with the lowest
    ``last_5h_util_pct``. Tie-break by ``last_weekly_util_pct``, then
    account name (lexicographic, deterministic).
 
@@ -74,6 +85,7 @@ def choose_account(
     accounts: dict[str, ResolvedAccount],
     account_states: dict[str, AccountState],
     in_flight: list[InFlightRecord],
+    affined_account: str | None = None,
 ) -> DispatchChoice:
     """Pick the account ``task`` should be dispatched through.
 
@@ -83,7 +95,7 @@ def choose_account(
     ----------
     task
         The task being dispatched. ``task.account`` (when set) pins it
-        to a specific account.
+        to a specific account (ignored when ``affined_account`` is set).
     accounts
         Resolved accounts keyed by name (from
         ``loader.resolve_accounts(settings)``). Each carries the queue-
@@ -95,6 +107,14 @@ def choose_account(
     in_flight
         Attributed in-flight tasks (from
         ``SupervisorSnapshot.in_flight``).
+    affined_account
+        Name of the account that hosts the task's current Claude
+        session (from ``TaskState.session_host_account()``), or
+        ``None`` when there's no session yet. Multi-account queues
+        must resume sessions on the account that created them
+        (sessions are namespaced by ``CLAUDE_CONFIG_DIR``); affinity
+        is enforced as a correctness gate ahead of ``task.account``
+        pinning. See ADR-0024.
 
     Returns
     -------
@@ -102,6 +122,54 @@ def choose_account(
         ``account`` names the picked account, or ``None`` when no
         account has capacity. ``reason`` is a short audit string.
     """
+    if affined_account is not None:
+        if affined_account not in accounts:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account "
+                    f"{affined_account!r} not in [[accounts]] (run "
+                    "`queue restart-fresh` to start a fresh session)"
+                ),
+            )
+        if affined_account not in account_states:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity: host account {affined_account!r} "
+                    "has no state yet (cold start)"
+                ),
+            )
+        state = account_states[affined_account]
+        acct = accounts[affined_account]
+        if state.paused:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account {affined_account!r} is paused"
+                ),
+            )
+        if state.state not in _DISPATCHABLE_STATES:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account "
+                    f"{affined_account!r} is {state.state.value}"
+                ),
+            )
+        if not _has_capacity(affined_account, acct, in_flight):
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account "
+                    f"{affined_account!r} at capacity"
+                ),
+            )
+        return DispatchChoice(
+            account=affined_account,
+            reason=f"session affined to {affined_account!r}",
+        )
+
     pinned = task.account
     if pinned is not None:
         if pinned not in accounts:

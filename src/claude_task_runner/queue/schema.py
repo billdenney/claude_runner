@@ -179,6 +179,24 @@ class TaskState(_StrictBase):
     session_id: str | None = None
     """Most recent claude session id this task has run under. Used by
     ``runner.session.resume_or_fresh``."""
+    session_account: str | None = None
+    """Account name (matches an entry in :class:`AccountSettings`) under
+    which the current ``session_id`` was created. The dispatcher must
+    resume the session on this same account — Claude Code sessions are
+    namespaced by ``CLAUDE_CONFIG_DIR``, so a session opened under
+    ``personal`` is invisible to ``claude`` invoked with the ``work``
+    config dir and vice versa.
+
+    Written alongside ``session_id`` on every dispatch that produced a
+    session (see ``runner.dispatcher._finalize_state``). ``None`` on
+    legacy state YAMLs that pre-date this field; the dispatch policy
+    falls back to scanning ``runs[]`` for the most recent attempt's
+    ``account`` value when this is unset. New writes always populate
+    the explicit field.
+
+    Cleared together with ``session_id`` when an operator runs
+    ``queue restart-fresh <task_id>`` to abandon a session whose
+    affined account is stuck (throttled / paused / removed)."""
     attempts: int = Field(ge=0, default=0)
     resume_attempts: int = Field(ge=0, default=0)
     """Counter capped by ``[session].max_resume_attempts``; beyond cap,
@@ -192,6 +210,31 @@ class TaskState(_StrictBase):
     stop_reason: str | None = None
     error: str | None = None
     runs: list[RunRecord] = Field(default_factory=list)
+
+    def session_host_account(self) -> str | None:
+        """Resolve which account currently hosts the task's session.
+
+        Returns ``None`` when the task has no ``session_id`` — there is
+        no session to be affined to.
+
+        When the explicit ``session_account`` field is set (new writes),
+        that wins. Otherwise — for state YAMLs that pre-date the field —
+        scan ``runs`` newest-first and return the most recent attempt's
+        ``account``. Returns ``None`` only when the run list is empty
+        or no attempt carried an account (cold start / pre-multi-account).
+
+        The dispatch policy uses this to honor session affinity: a task
+        with a session must resume on the host account, even when
+        another account has more headroom (see ADR-0024).
+        """
+        if self.session_id is None:
+            return None
+        if self.session_account is not None:
+            return self.session_account
+        for run in reversed(self.runs):
+            if run.account is not None:
+                return run.account
+        return None
 
 
 class SidecarOption(_StrictBase):

@@ -28,6 +28,7 @@ from claude_task_runner.doctor.checks import (
     check_ema,
     check_global_lock,
     check_legacy_claude_config_dir,
+    check_orphaned_sessions,
     check_queue_layout,
     check_queue_perms_for_linux_users,
     check_skills_installed,
@@ -37,10 +38,12 @@ from claude_task_runner.doctor.checks import (
     check_task_yamls,
     check_watchdog_installed,
 )
-from claude_task_runner.queue.schema import Task
+from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
+    state_path_for,
     task_path_for,
     todo_dir,
+    write_state_atomic,
     write_task_atomic,
 )
 from claude_task_runner.supervisor.persistence import (
@@ -692,6 +695,94 @@ def test_check_state_yamls_invalid_file(settings: Settings, queue_dir: Path) -> 
     (state_dir / "bad.yaml").write_text("not yaml: ][", encoding="utf-8")
     result = check_state_yamls(settings, queue_dir)
     assert result.status == CheckStatus.FAIL
+
+
+# ---------------------------------------------------------------------------
+# check_orphaned_sessions (ADR-0024)
+# ---------------------------------------------------------------------------
+
+
+def test_check_orphaned_sessions_empty_queue_passes(settings: Settings, queue_dir: Path) -> None:
+    result = check_orphaned_sessions(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+
+
+def test_check_orphaned_sessions_no_sessions_passes(settings: Settings, queue_dir: Path) -> None:
+    """State YAMLs exist but none carry a session_id — nothing to orphan."""
+    write_state_atomic(TaskState(task_id="t1", status="pending"), state_path_for(queue_dir, "t1"))
+    result = check_orphaned_sessions(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+
+
+def test_check_orphaned_sessions_all_match_passes(settings: Settings, queue_dir: Path) -> None:
+    settings = _set_accounts(
+        settings,
+        [
+            AccountSettings(name="personal", config_dir=""),
+            AccountSettings(name="work", config_dir=""),
+        ],
+    )
+    write_state_atomic(
+        TaskState(
+            task_id="t1",
+            status="failed",
+            session_id="abc",
+            session_account="work",
+        ),
+        state_path_for(queue_dir, "t1"),
+    )
+    result = check_orphaned_sessions(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+
+
+def test_check_orphaned_sessions_warns_on_unknown_account(
+    settings: Settings, queue_dir: Path
+) -> None:
+    settings = _set_accounts(settings, [AccountSettings(name="personal", config_dir="")])
+    write_state_atomic(
+        TaskState(
+            task_id="t1",
+            status="failed",
+            session_id="abc",
+            session_account="work",
+        ),
+        state_path_for(queue_dir, "t1"),
+    )
+    result = check_orphaned_sessions(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert "t1" in result.remediation
+    assert "work" in result.remediation
+    assert "restart-fresh" in result.remediation
+
+
+def test_check_orphaned_sessions_uses_runs_fallback(settings: Settings, queue_dir: Path) -> None:
+    """Legacy state YAML without ``session_account`` field still resolves
+    its host via the runs[] fallback."""
+    settings = _set_accounts(settings, [AccountSettings(name="personal", config_dir="")])
+    from claude_task_runner.queue.schema import RunRecord
+
+    t = datetime(2026, 5, 21, tzinfo=UTC)
+    legacy = TaskState(
+        task_id="legacy",
+        status="failed",
+        session_id="abc",
+        # session_account intentionally None — pre-ADR-0024 YAML.
+        runs=[
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account="work",
+            ),
+        ],
+    )
+    write_state_atomic(legacy, state_path_for(queue_dir, "legacy"))
+    result = check_orphaned_sessions(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert "legacy" in result.remediation
+    assert "work" in result.remediation
 
 
 # ---------------------------------------------------------------------------

@@ -163,6 +163,87 @@ class TestTaskState:
         assert len(s.runs) == 1
         assert s.runs[0].stop_reason == "end_turn"
 
+    def test_session_account_field_optional(self) -> None:
+        s = TaskState(task_id="x")
+        assert s.session_account is None
+
+    def test_session_host_account_no_session_returns_none(self) -> None:
+        s = TaskState(task_id="x", session_account="work")
+        assert s.session_host_account() is None
+
+    def test_session_host_account_explicit_field_wins(self) -> None:
+        s = TaskState(task_id="x", session_id="sess1", session_account="work")
+        assert s.session_host_account() == "work"
+
+    def test_session_host_account_falls_back_to_last_run(self) -> None:
+        """Legacy state YAML without session_account field — derive from the
+        most recent attempt's account. This is the backwards-compatibility
+        path for state YAMLs written before ADR-0024."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        runs = [
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account="personal",
+            ),
+            RunRecord(
+                attempt=2,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account="work",
+            ),
+        ]
+        s = TaskState(task_id="x", session_id="sess1", runs=runs)
+        assert s.session_host_account() == "work"
+
+    def test_session_host_account_skips_runs_without_account(self) -> None:
+        """A legacy single-account run (account=None) is skipped to find the
+        most recent run that did record an account."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        runs = [
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account="personal",
+            ),
+            RunRecord(
+                attempt=2,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account=None,
+            ),
+        ]
+        s = TaskState(task_id="x", session_id="sess1", runs=runs)
+        assert s.session_host_account() == "personal"
+
+    def test_session_host_account_session_but_no_account_anywhere(self) -> None:
+        """A session_id with no derivable host returns None — the dispatch
+        policy treats this as "no affinity constraint" (legacy single-
+        account queues; safe to dispatch on any account)."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        runs = [
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                account=None,
+            ),
+        ]
+        s = TaskState(task_id="x", session_id="sess1", runs=runs)
+        assert s.session_host_account() is None
+
 
 class TestSidecar:
     def _question(self) -> SidecarQuestion:

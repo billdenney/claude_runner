@@ -338,6 +338,148 @@ class TestDispatchSynchronously:
 
 
 # ---------------------------------------------------------------------------
+# ADR-0024 — session affinity in force-dispatch
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_account_settings(*, max_c: int = 2) -> Any:
+    """Two-account settings shape for affinity tests."""
+    from claude_task_runner.config.schema import AccountSettings
+
+    return SimpleNamespace(
+        concurrency=SimpleNamespace(initial_concurrency=1, max_concurrency=max_c),
+        task_caps=SimpleNamespace(),
+        session=SimpleNamespace(),
+        hooks=SimpleNamespace(),
+        failure_classifier=None,
+        claude=SimpleNamespace(executable="claude", config_dir=""),
+        dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
+        accounts=[
+            AccountSettings(name="personal", config_dir="/tmp/.claude_personal"),
+            AccountSettings(name="work", config_dir="/tmp/.claude_work"),
+        ],
+    )
+
+
+def _seed_sessioned_state(
+    queue_dir: Path,
+    task_id: str,
+    *,
+    session_id: str,
+    session_account: str | None,
+    status: str = "failed",
+) -> TaskState:
+    """State YAML with an active session affined to a specific account."""
+    state = TaskState(
+        task_id=task_id,
+        status=status,
+        session_id=session_id,
+        session_account=session_account,
+    )
+    write_state_atomic(state, state_path_for(queue_dir, task_id))
+    return state
+
+
+class TestForceDispatchAffinity:
+    """ADR-0024: force-dispatch (including ``--over-limit``) must NOT
+    cross-account-resume. The throttle bypass is a policy choice; the
+    affinity check is a correctness invariant — resuming under a
+    different ``CLAUDE_CONFIG_DIR`` produces ``No conversation found
+    with session ID``.
+    """
+
+    def test_tick_consume_routes_to_affined_account(self, queue_dir: Path) -> None:
+        _make_task(queue_dir, "t1", account="personal")
+        _seed_sessioned_state(queue_dir, "t1", session_id="sess1", session_account="work")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+        settings = _make_multi_account_settings()
+        in_flight: dict[str, DispatchSlot] = {}
+
+        captured: dict[str, str | None] = {}
+
+        def fake_spawn(**kwargs: object) -> None:
+            captured["account"] = str(kwargs["account"])
+            captured["config_dir"] = str(kwargs["claude_config_dir"])
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread", side_effect=fake_spawn):
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                in_flight_slots=in_flight,
+            )
+        assert n == 1
+        # Affinity wins over both task.account=personal AND first-configured.
+        assert captured["account"] == "work"
+        assert captured["config_dir"] == "/tmp/.claude_work"
+
+    def test_tick_consume_drops_request_for_orphaned_affined_account(self, queue_dir: Path) -> None:
+        _make_task(queue_dir, "t1")
+        _seed_sessioned_state(queue_dir, "t1", session_id="sess1", session_account="ghost")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+        settings = _make_multi_account_settings()
+        in_flight: dict[str, DispatchSlot] = {}
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread") as spawn:
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                in_flight_slots=in_flight,
+            )
+        assert n == 0
+        spawn.assert_not_called()
+        assert not fd_mod.request_path(queue_dir, "t1").exists()
+
+    def test_dispatch_synchronously_raises_when_affined_account_missing(
+        self, queue_dir: Path
+    ) -> None:
+        _make_task(queue_dir, "t1")
+        _seed_sessioned_state(
+            queue_dir,
+            "t1",
+            session_id="sess1",
+            session_account="ghost",
+            status="failed",
+        )
+        settings = _make_multi_account_settings()
+        with pytest.raises(fd_mod.ForceDispatchError, match="restart-fresh"):
+            fd_mod.dispatch_synchronously(
+                task_id="t1",
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+            )
+
+    def test_tick_consume_falls_back_to_pinning_with_no_session(self, queue_dir: Path) -> None:
+        """No session_id → no affinity constraint → honour task.account pin."""
+        _make_task(queue_dir, "t1", account="work")
+        # Seed state with no session at all.
+        write_state_atomic(
+            TaskState(task_id="t1", status="failed"),
+            state_path_for(queue_dir, "t1"),
+        )
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+        settings = _make_multi_account_settings()
+        in_flight: dict[str, DispatchSlot] = {}
+
+        captured: dict[str, str | None] = {}
+
+        def fake_spawn(**kwargs: object) -> None:
+            captured["account"] = str(kwargs["account"])
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread", side_effect=fake_spawn):
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                in_flight_slots=in_flight,
+            )
+        assert n == 1
+        assert captured["account"] == "work"
+
+
+# ---------------------------------------------------------------------------
 # CLI integration
 # ---------------------------------------------------------------------------
 

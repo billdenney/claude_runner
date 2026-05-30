@@ -13,6 +13,9 @@ Subcommands:
 * ``queue backfill-working-dir``  — populate ``working_dir`` on existing
                                     null-valued YAMLs from the per-queue
                                     template (ADR-0023).
+* ``queue restart-fresh``         — abandon a task's current claude session
+                                    so the next dispatch starts on any
+                                    available account (ADR-0024 escape hatch).
 * ``queue force-dispatch``        — bypass throttle gates and dispatch one task now.
 """
 
@@ -40,6 +43,7 @@ from claude_task_runner.queue.store import (
     queue_runtime_dir,
     state_path_for,
     task_path_for,
+    write_state_atomic,
     write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
@@ -610,6 +614,96 @@ def _supervisor_is_alive(queue_dir: Path) -> bool:
     pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
     pid = pidfile_mod.read_existing_pid(pid_path)
     return pid is not None and pidfile_mod.is_pid_alive(pid)
+
+
+@app.command("restart-fresh")
+def restart_fresh(
+    task_id: str = typer.Argument(..., help="Task id whose session to abandon."),
+    *,
+    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Clear a task's ``session_id`` so the next dispatch starts fresh.
+
+    Escape hatch for ADR-0024 session affinity: when a task's affined
+    account is stuck (weekly-throttled, paused, or removed from
+    ``[[accounts]]``), the orchestrator refuses to dispatch the task on
+    a different account because resuming the session under a different
+    ``CLAUDE_CONFIG_DIR`` produces ``No conversation found with session
+    ID: …``. ``restart-fresh`` nulls both ``session_id`` and
+    ``session_account`` on the state YAML. The next dispatch picks
+    whichever account ``choose_account`` selects normally, creates a
+    fresh session, and continues from the original task prompt
+    (cached context is lost — that's the trade-off).
+
+    Exits non-zero if the task has no state YAML or the YAML cannot be
+    parsed. Idempotent: a task without a session_id is left unchanged
+    (the command reports ``noop=True`` so scripts can branch).
+    """
+    console = Console()
+    qd = queue_dir.resolve()
+    state_path = state_path_for(qd, task_id)
+    if not state_path.exists():
+        msg = f"no state YAML for task {task_id!r}: {state_path}"
+        if json:
+            print(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2)
+    try:
+        state = load_state(state_path)
+    except (QueueIOError, QueueSchemaError) as exc:
+        msg = f"cannot parse state YAML {state_path}: {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2) from exc
+
+    if state.session_id is None and state.session_account is None:
+        if json:
+            print(
+                _json.dumps(
+                    {
+                        "ok": True,
+                        "noop": True,
+                        "task_id": task_id,
+                        "reason": "no session to clear",
+                    }
+                )
+            )
+        else:
+            console.print(f"[dim]task {task_id} has no active session; nothing to clear.[/]")
+        return
+
+    prior_session = state.session_id
+    prior_account = state.session_account
+    new_state = state.model_copy(
+        update={
+            "session_id": None,
+            "session_account": None,
+            "resume_attempts": 0,
+        }
+    )
+    write_state_atomic(new_state, state_path)
+    if json:
+        print(
+            _json.dumps(
+                {
+                    "ok": True,
+                    "noop": False,
+                    "task_id": task_id,
+                    "cleared_session_id": prior_session,
+                    "cleared_session_account": prior_account,
+                }
+            )
+        )
+    else:
+        console.print(
+            f"[green]cleared session for task {task_id}:[/] "
+            f"session_id={prior_session!r}, session_account={prior_account!r}. "
+            "Next dispatch starts fresh on any available account."
+        )
 
 
 @app.command("force-dispatch")

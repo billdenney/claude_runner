@@ -266,12 +266,39 @@ def tick_consume(
             )
             continue
 
-        # Pick the account: task.account pinning when present and known,
-        # else the first configured account. Force-dispatch deliberately
-        # bypasses choose_account's eligibility filter (that's the point
-        # of "force"), so a paused or throttled account still gets the
-        # task — the operator opted in.
-        if task.account and task.account in accounts_by_name:
+        # Pick the account. Force-dispatch deliberately bypasses
+        # choose_account's eligibility filter (that's the point of
+        # "force"), so a paused or throttled account still gets the
+        # task — the operator opted in. Account selection precedence:
+        #
+        #   1. Session affinity (ADR-0024). When the task has a
+        #      session_id, it MUST resume on the host account —
+        #      sessions are namespaced by CLAUDE_CONFIG_DIR, so
+        #      dispatching to a different account produces a 0.85s
+        #      ``No conversation found with session ID`` error.
+        #      ``--over-limit`` is a throttle bypass; it is NOT a
+        #      bypass of this correctness invariant. If the host
+        #      account is no longer configured, drop the request and
+        #      tell the operator to run ``queue restart-fresh`` so
+        #      the next dispatch starts a fresh session.
+        #   2. Task.account pinning when present and known.
+        #   3. First configured account (fallback).
+        affined = state.session_host_account() if state is not None else None
+        if affined is not None:
+            if affined not in accounts_by_name:
+                logger.warning(
+                    "force-dispatch %s: session affined to %r which is "
+                    "not in [[accounts]]; dropping request. Run "
+                    "`queue restart-fresh %s` to clear the session "
+                    "and dispatch fresh.",
+                    task.id,
+                    affined,
+                    task.id,
+                )
+                consume_request(queue_dir, task.id)
+                continue
+            picked = accounts_by_name[affined]
+        elif task.account and task.account in accounts_by_name:
             picked = accounts_by_name[task.account]
         else:
             picked = next(iter(accounts_by_name.values()))
@@ -373,7 +400,20 @@ def dispatch_synchronously(
 
     accounts = resolve_accounts(settings)
     accounts_by_name = {a.name: a for a in accounts}
-    if task.account and task.account in accounts_by_name:
+    # ADR-0024: session affinity wins over task.account pinning when
+    # both are set. A session opened on account X is invisible to
+    # claude running with account Y's CLAUDE_CONFIG_DIR, so this is
+    # a correctness gate, not a policy choice.
+    affined = state.session_host_account()
+    if affined is not None:
+        if affined not in accounts_by_name:
+            raise ForceDispatchError(
+                f"task {task.id} session affined to {affined!r} which "
+                "is not in [[accounts]]; run `queue restart-fresh "
+                f"{task.id}` to clear the session and dispatch fresh"
+            )
+        picked = accounts_by_name[affined]
+    elif task.account and task.account in accounts_by_name:
         picked = accounts_by_name[task.account]
     else:
         picked = next(iter(accounts_by_name.values()))
