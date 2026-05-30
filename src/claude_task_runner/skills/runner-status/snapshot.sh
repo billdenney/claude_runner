@@ -144,10 +144,53 @@ else
 fi
 echo ""
 
-# ----- Live usage -----
-if command -v claude-task-runner > /dev/null 2>&1; then
-  echo "**Live usage** (\`claude-task-runner usage render\`)"
-  echo '```'
-  claude-task-runner usage render 2>&1 | head -8 || echo "(render failed)"
-  echo '```'
+# ----- Per-account state -----
+#
+# Source the v3 supervisor.json's `accounts` map (one entry per
+# configured [[accounts]] block, populated by the multi-account
+# /usage capture round-robin from PR 8). Reports each account's
+# state, 5h util, weekly util, reset times, paused flag, and
+# last-capture timestamp.
+#
+# Requires supervisor.json v3 (schema_version: 3). The skill no
+# longer carries a v2 fallback — v2 supervisor.json files have not
+# been written since PR 1-12 landed, and an existing v2 file is
+# auto-migrated to v3 on first daemon load. If the operator hits
+# this branch they should run the supervisor at least once (which
+# migrates) or remove the stale v2 file.
+if [[ -f "$SUP_JSON" ]]; then
+python3 - "$SUP_JSON" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+schema_version = d.get("schema_version")
+accounts = d.get("accounts") or {}
+if not accounts:
+    print(
+        "**ERROR**: supervisor.json has no `accounts` map "
+        f"(schema_version={schema_version!r}). Expected v3 "
+        "(see ADR / PR 2 + PR 8). v2 files are auto-migrated on "
+        "next supervisor start; remove the stale file or restart "
+        "the supervisor to fix.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print("**Per-account state** (from supervisor.json `accounts`)")
+print()
+print("| account | state | 5h | weekly | paused | 5h reset | weekly reset | last capture |")
+print("|---|---|---:|---:|:-:|---|---|---|")
+for name in sorted(accounts):
+    a = accounts[name]
+    paused = "yes" if a.get("paused") else ""
+    last_cap = a.get("last_capture_at") or "—"
+    print(
+        f"| {name} | `{a.get('state','?')}` "
+        f"| {a.get('last_5h_util_pct','?')}% "
+        f"| {a.get('last_weekly_util_pct','?')}% "
+        f"| {paused} "
+        f"| {a.get('last_5h_reset_at','—')} "
+        f"| {a.get('last_weekly_reset_at','—')} "
+        f"| {last_cap} |"
+    )
+PY
 fi
