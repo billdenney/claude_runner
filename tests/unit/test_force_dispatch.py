@@ -764,3 +764,148 @@ class TestForceDispatchCLI:
         from claude_task_runner.cli.queue_cmd import _poll_until_running
 
         assert _poll_until_running(queue_dir, "t1", wait_seconds=0) is False
+
+    def test_missing_task_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """Without --json, missing task prints a red error to stdout."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        result = runner_cli.invoke(app, ["force-dispatch", "ghost", "--queue", str(queue_dir)])
+        assert result.exit_code == 2
+        assert "not in todo" in result.stdout
+
+    def test_corrupt_task_yaml_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """Corrupt task YAML produces a human error and non-zero exit."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        task_path_for(queue_dir, "broken").write_text("not yaml: ][", encoding="utf-8")
+        result = runner_cli.invoke(app, ["force-dispatch", "broken", "--queue", str(queue_dir)])
+        assert result.exit_code == 2
+        assert "task YAML invalid" in result.stdout
+
+    def test_corrupt_task_yaml_json_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """Corrupt task YAML with --json emits structured error payload."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        task_path_for(queue_dir, "broken").write_text("not yaml: ][", encoding="utf-8")
+        result = runner_cli.invoke(
+            app, ["force-dispatch", "broken", "--queue", str(queue_dir), "--json"]
+        )
+        assert result.exit_code == 2
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert "task YAML invalid" in payload["error"]
+
+    def test_completed_state_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """Already-completed task rejects without --json too."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        _seed_state(queue_dir, "t1", "completed")
+        result = runner_cli.invoke(app, ["force-dispatch", "t1", "--queue", str(queue_dir)])
+        assert result.exit_code == 2
+        assert "not dispatchable" in result.stdout
+
+    def test_corrupt_state_treated_as_dispatchable(
+        self, queue_dir: Path, runner_cli: CliRunner
+    ) -> None:
+        """A corrupt state YAML falls through to current_status=None, which
+        the policy treats as dispatchable. Covers the
+        (QueueIOError, QueueSchemaError) branch at queue_cmd.py:787-788.
+        """
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
+        fake_state = TaskState(task_id="t1", status="completed", attempts=1, stop_reason="end_turn")
+        with patch(
+            "claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously",
+            return_value=fake_state,
+        ):
+            result = runner_cli.invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), "--json"]
+            )
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "completed"
+
+    def test_synchronous_error_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """ForceDispatchError surfaces as a red error line in non-JSON mode."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        with patch(
+            "claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously",
+            side_effect=fd_mod.ForceDispatchError("hook failed"),
+        ):
+            result = runner_cli.invoke(app, ["force-dispatch", "t1", "--queue", str(queue_dir)])
+        assert result.exit_code == 2
+        assert "force-dispatch failed" in result.stdout
+
+    def test_supervised_picked_up_human_output(
+        self, queue_dir: Path, runner_cli: CliRunner
+    ) -> None:
+        """Supervised path with picked_up=True prints the running confirmation."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
+            patch("claude_task_runner.cli.queue_cmd._poll_until_running", return_value=True),
+        ):
+            result = runner_cli.invoke(
+                app,
+                [
+                    "force-dispatch",
+                    "t1",
+                    "--queue",
+                    str(queue_dir),
+                    "--wait-seconds",
+                    "1",
+                ],
+            )
+        assert result.exit_code == 0
+        assert "entered `running` status" in result.stdout
+
+    def test_supervised_timeout_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
+        """Supervised path with wait>0 but picked_up=False prints the yellow timeout note."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
+            patch("claude_task_runner.cli.queue_cmd._poll_until_running", return_value=False),
+        ):
+            result = runner_cli.invoke(
+                app,
+                [
+                    "force-dispatch",
+                    "t1",
+                    "--queue",
+                    str(queue_dir),
+                    "--wait-seconds",
+                    "1",
+                ],
+            )
+        assert result.exit_code == 0
+        assert "still not running" in result.stdout
+
+    def test_poll_until_running_observes_terminal_status(self, queue_dir: Path) -> None:
+        """A completed/failed/awaiting_sidecar state also returns True — the
+        task raced through 'running'. Covers queue_cmd.py:878.
+        """
+        from claude_task_runner.cli.queue_cmd import _poll_until_running
+
+        _make_task(queue_dir, "t1")
+        _seed_state(queue_dir, "t1", "completed")
+        assert _poll_until_running(queue_dir, "t1", wait_seconds=1.0) is True
+
+    def test_poll_until_running_handles_corrupt_state(self, queue_dir: Path) -> None:
+        """Corrupt state YAML is treated as status=None and the loop continues.
+        Covers queue_cmd.py:872-873.
+        """
+        from claude_task_runner.cli.queue_cmd import _poll_until_running
+
+        _make_task(queue_dir, "t1")
+        state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
+        # Loop returns False (never sees a real running status) within the budget.
+        assert _poll_until_running(queue_dir, "t1", wait_seconds=0.6) is False
