@@ -100,6 +100,94 @@ class TestAccountList:
         assert rows[0]["state"] is None  # no snapshot
         assert rows[0]["in_flight_count"] == 0
 
+    def test_auto_discovers_queue_config_when_config_flag_omitted(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Regression: ``account list --queue <dir>`` without ``--config`` must
+        pick up ``<dir>/claude_runner.toml`` instead of silently falling back
+        to package defaults.
+
+        Bug history: pre-fix, the operator-friendly invocation
+        ``claude-task-runner account list --queue <q> --json`` returned only
+        the synthesised ``"default"`` placeholder account, ignoring the real
+        ``[[accounts]]`` declarations sitting at ``<q>/claude_runner.toml``.
+        Operators (and the runner-status skill) had to know to pass
+        ``--config <q>/claude_runner.toml`` explicitly to see real state —
+        easy to forget; the supervisor itself always passes ``--config``.
+        """
+        cfg_dir_personal = tmp_path / "personal"
+        cfg_dir_personal.mkdir()
+        cfg_dir_work = tmp_path / "work"
+        cfg_dir_work.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        # Place the per-queue config AT the conventional path inside queue_dir,
+        # not at tmp_path. Auto-discovery should find it from --queue alone.
+        _write_queue_config(
+            queue_dir,
+            accounts=[
+                ("personal", str(cfg_dir_personal), None),
+                ("work", str(cfg_dir_work), None),
+            ],
+        )
+        result = runner.invoke(
+            app,
+            [
+                "account",
+                "list",
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["accounts"]
+        names = [r["name"] for r in rows]
+        assert names == ["personal", "work"], (
+            "auto-discovery of <queue>/claude_runner.toml regressed; "
+            f"saw {names!r} instead of ['personal', 'work']"
+        )
+
+    def test_explicit_config_overrides_auto_discovery(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """When ``--config`` is passed explicitly, honour it even if
+        ``<queue>/claude_runner.toml`` exists. Operators occasionally point
+        at a sibling TOML for testing / dry-runs."""
+        cfg_dir_inqueue = tmp_path / "inqueue_acct"
+        cfg_dir_inqueue.mkdir()
+        cfg_dir_explicit = tmp_path / "explicit_acct"
+        cfg_dir_explicit.mkdir()
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        explicit_dir = tmp_path / "explicit"
+        explicit_dir.mkdir()
+        # A different config at the auto-discovery path (would win if we
+        # auto-discovered)...
+        _write_queue_config(queue_dir, accounts=[("in_queue", str(cfg_dir_inqueue), None)])
+        # ...and an explicit one elsewhere — the explicit one should win.
+        explicit_cfg = _write_queue_config(
+            explicit_dir, accounts=[("explicit", str(cfg_dir_explicit), None)]
+        )
+        result = runner.invoke(
+            app,
+            [
+                "account",
+                "list",
+                "--config",
+                str(explicit_cfg),
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["accounts"]
+        names = [r["name"] for r in rows]
+        assert names == ["explicit"], (
+            f"explicit --config should win over auto-discovery; saw {names!r}"
+        )
+
     def test_per_account_file_overrides_defaults(self, runner: CliRunner, tmp_path: Path) -> None:
         cfg_dir = tmp_path / "personal"
         cfg_dir.mkdir()
