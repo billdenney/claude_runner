@@ -30,6 +30,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.queue.schema import Task
@@ -400,9 +401,9 @@ def add_task(
 
     Skills (``/runner-add-task``) drive this with operator answers.
     """
-    settings = load_settings(config)
     console = Console()
     qd = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, qd))
 
     if not _ID_RE.match(task_id):
         console.print(f"[bold red]invalid task id:[/] {task_id!r} (allowed: {_ID_RE.pattern})")
@@ -530,7 +531,7 @@ def backfill_working_dir(
     """
     console = Console()
     qd = queue_dir.resolve()
-    settings = load_settings(config)
+    settings = load_settings(resolve_per_queue_config(config, qd))
 
     template = settings.queue.working_dir_template
     if not template.strip():
@@ -758,7 +759,7 @@ def force_dispatch(
     """
     console = Console()
     qd = queue_dir.resolve()
-    settings = load_settings(config)
+    settings = load_settings(resolve_per_queue_config(config, qd))
     queue_runtime_dir(qd)
 
     task_path = task_path_for(qd, task_id)

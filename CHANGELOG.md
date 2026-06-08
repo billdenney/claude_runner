@@ -9,6 +9,27 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI commands now auto-discover `<queue>/claude_runner.toml`.** Most
+  CLI subcommands (`account list`, `account pause/resume`, `queue add`,
+  `queue backfill-working-dir`, `queue force-dispatch`, `supervisor
+  start`, `supervisor status`, `install`, `doctor`) accepted both
+  `--queue` and `--config` but treated them independently — passing only
+  `--queue` silently fell back to package defaults, hiding the operator's
+  real `[[accounts]]` declarations and other queue-side overrides. Most
+  visibly: `claude-task-runner account list --queue <q> --json` returned
+  only a synthesised `"default"` placeholder while the live supervisor
+  (which always passes `--config`) used the real `personal`/`work`
+  accounts from `<q>/claude_runner.toml`. New helper
+  `cli/_helpers.py::resolve_per_queue_config` applies the obvious
+  resolution: explicit `--config` wins; otherwise pick up
+  `<queue>/claude_runner.toml` if it exists; otherwise fall back to
+  package defaults (matches the historical no-config behaviour). The
+  `install` command additionally propagates the auto-discovered path
+  into the installed systemd ExecStart so the daemon sees the same
+  config the operator did.
+
 ### Added
 
 - **`--add-dir` propagation for dispatched agents.** Claude Code's

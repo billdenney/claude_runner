@@ -16,6 +16,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
+from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import install as cron_install
@@ -92,9 +93,10 @@ def install(
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
 
-    settings = load_settings(config)
-    console = Console()
     queue_path = queue_dir.resolve()
+    resolved_config = resolve_per_queue_config(config, queue_path)
+    settings = load_settings(resolved_config)
+    console = Console()
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
     console.print(
@@ -104,7 +106,7 @@ def install(
 
     if init_system == "systemd":
         sd_plan = systemd_mod.build_install_plan(
-            supervisor_command=_supervisor_command(queue_path, config),
+            supervisor_command=_supervisor_command(queue_path, resolved_config),
             queue_dir=queue_path,
         )
         verb = "replace" if sd_plan.block_existed else "create"

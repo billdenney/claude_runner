@@ -16,6 +16,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.observability import configure_logging
@@ -232,7 +233,8 @@ def start(
       and the previous config stays active.
     """
     console = Console()
-    settings = load_settings(config)
+    queue_path = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, queue_path))
     # Re-apply logging settings now that the queue's [logging] block has
     # been read. The CLI entry point's early configure runs before Typer
     # parses arguments (so it can use env-var overrides) with safe
@@ -241,7 +243,6 @@ def start(
     # defaults.
     configure_logging(level=settings.logging.level, fmt=settings.logging.format)
 
-    queue_path = queue_dir.resolve()
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
     # Use source_builder so the multi-account wrapper can be wired to
@@ -400,8 +401,8 @@ def status(
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show the supervisor's current state and recent activity."""
-    settings = load_settings(config)
     queue_path = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, queue_path))
     state_path = persist_mod.supervisor_state_path(queue_path, settings.supervisor.state_file)
     pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
 

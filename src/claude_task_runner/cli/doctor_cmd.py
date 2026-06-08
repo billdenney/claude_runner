@@ -13,6 +13,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.doctor.checks import CheckStatus, all_checks
 
@@ -63,8 +64,8 @@ def doctor(
 
     Exits 0 if everything is PASS / WARN, 1 if any FAIL.
     """
-    settings = load_settings(config)
     queue_path = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, queue_path))
 
     results = [
         factory()
