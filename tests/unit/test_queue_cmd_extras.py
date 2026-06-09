@@ -7,6 +7,7 @@ coverage) to hit the lines that handle invalid input / human formatting.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from typer.testing import CliRunner
 from claude_task_runner.cli.queue_cmd import app
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
+    load_state,
     queue_runtime_dir,
     state_path_for,
     task_path_for,
@@ -380,3 +382,97 @@ def test_add_via_prompt_file(runner: CliRunner, queue_dir: Path, tmp_path: Path)
     )
     assert result.exit_code == 0
     assert "wrote" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `restart-fresh` — ADR-0024 escape hatch for stuck session affinity
+# ---------------------------------------------------------------------------
+
+
+def _seed_state(qd: Path, task_id: str, **overrides: object) -> TaskState:
+    payload: dict[str, object] = {"task_id": task_id, "status": "pending", **overrides}
+    state = TaskState.model_validate(payload)
+    write_state_atomic(state, state_path_for(qd, task_id))
+    return state
+
+
+def test_restart_fresh_clears_session_human(runner: CliRunner, queue_dir: Path) -> None:
+    _seed_state(
+        queue_dir,
+        "t1",
+        session_id="sess-abc",
+        session_account="work",
+        resume_attempts=3,
+    )
+    result = runner.invoke(app, ["restart-fresh", "t1", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "cleared session for task t1" in result.stdout
+    # State on disk has cleared fields.
+    reloaded = load_state(state_path_for(queue_dir, "t1"))
+    assert reloaded.session_id is None
+    assert reloaded.session_account is None
+    assert reloaded.resume_attempts == 0
+
+
+def test_restart_fresh_json_payload(runner: CliRunner, queue_dir: Path) -> None:
+    _seed_state(queue_dir, "t2", session_id="sess-xyz", session_account="personal")
+    result = runner.invoke(app, ["restart-fresh", "t2", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "ok": True,
+        "noop": False,
+        "task_id": "t2",
+        "cleared_session_id": "sess-xyz",
+        "cleared_session_account": "personal",
+    }
+
+
+def test_restart_fresh_noop_when_already_clear(runner: CliRunner, queue_dir: Path) -> None:
+    _seed_state(queue_dir, "t3")  # no session_id, no session_account
+    result = runner.invoke(app, ["restart-fresh", "t3", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["noop"] is True
+    assert payload["task_id"] == "t3"
+
+
+def test_restart_fresh_noop_human(runner: CliRunner, queue_dir: Path) -> None:
+    _seed_state(queue_dir, "t4")
+    result = runner.invoke(app, ["restart-fresh", "t4", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "no active session" in result.stdout
+
+
+def test_restart_fresh_missing_state_yaml_human(runner: CliRunner, queue_dir: Path) -> None:
+    result = runner.invoke(app, ["restart-fresh", "ghost", "--queue", str(queue_dir)])
+    assert result.exit_code == 2
+    assert "no state YAML" in result.stdout
+
+
+def test_restart_fresh_missing_state_yaml_json(runner: CliRunner, queue_dir: Path) -> None:
+    result = runner.invoke(app, ["restart-fresh", "ghost", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "no state YAML" in payload["error"]
+
+
+def test_restart_fresh_corrupt_state_yaml_human(runner: CliRunner, queue_dir: Path) -> None:
+    state_path_for(queue_dir, "broken").write_text("not yaml: ][", encoding="utf-8")
+    result = runner.invoke(app, ["restart-fresh", "broken", "--queue", str(queue_dir)])
+    assert result.exit_code == 2
+    assert "cannot parse state YAML" in result.stdout
+
+
+def test_restart_fresh_corrupt_state_yaml_json(runner: CliRunner, queue_dir: Path) -> None:
+    state_path_for(queue_dir, "broken").write_text("not yaml: ][", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["restart-fresh", "broken", "--queue", str(queue_dir), "--json"],
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "cannot parse state YAML" in payload["error"]

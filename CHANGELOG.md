@@ -9,6 +9,52 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Silent orphan reaper at supervisor startup.** When a supervisor
+  exited ungracefully (OOM, SIGKILL, or a forced restart during a
+  multi-day DNS outage observed 2026-06-05), the per-dispatch
+  monitor threads that watched each subprocess's stream-json output
+  died with the parent process — but the `claude --print`
+  subprocesses survived, re-parented to init, with no monitor
+  thread updating heartbeats or enforcing the kill threshold. The
+  existing `reconcile_orphans` demoted every `running` state YAML
+  to `failed` on the next supervisor start, but it did so
+  undifferentiated: a task that had been silent for two days was
+  auto-redispatched the same as one that was healthy when the
+  supervisor died, frequently re-hanging on the original failure.
+  A new startup pass `supervisor/reconcile_silent.py` runs BEFORE
+  `reconcile_orphans` and grades each in-flight task by heartbeat
+  freshness using the same `runner.heartbeat.evaluate` the
+  dispatcher's monitor loop uses: SILENT tasks (alert window
+  crossed, no kill threshold) flip to `possibly_hung` so the
+  operator inspects rather than the orchestrator auto-redispatches;
+  KILL tasks (kill threshold exceeded) flip to `failed` with
+  `stop_reason="killed_by_silent_reaper"` and best-effort SIGTERM
+  the recorded subprocess pid. The dispatcher now persists the
+  subprocess pid into the TaskState YAML right after `Popen` (and
+  clears it on finalization) so the reaper has a target to signal.
+  HEALTHY tasks fall through to the existing `reconcile_orphans`
+  demotion sweep for the normal session-resume recovery path.
+- **CLI commands now auto-discover `<queue>/claude_runner.toml`.** Most
+  CLI subcommands (`account list`, `account pause/resume`, `queue add`,
+  `queue backfill-working-dir`, `queue force-dispatch`, `supervisor
+  start`, `supervisor status`, `install`, `doctor`) accepted both
+  `--queue` and `--config` but treated them independently — passing only
+  `--queue` silently fell back to package defaults, hiding the operator's
+  real `[[accounts]]` declarations and other queue-side overrides. Most
+  visibly: `claude-task-runner account list --queue <q> --json` returned
+  only a synthesised `"default"` placeholder while the live supervisor
+  (which always passes `--config`) used the real `personal`/`work`
+  accounts from `<q>/claude_runner.toml`. New helper
+  `cli/_helpers.py::resolve_per_queue_config` applies the obvious
+  resolution: explicit `--config` wins; otherwise pick up
+  `<queue>/claude_runner.toml` if it exists; otherwise fall back to
+  package defaults (matches the historical no-config behaviour). The
+  `install` command additionally propagates the auto-discovered path
+  into the installed systemd ExecStart so the daemon sees the same
+  config the operator did.
+
 ### Added
 
 - **`--add-dir` propagation for dispatched agents.** Claude Code's

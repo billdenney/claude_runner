@@ -28,6 +28,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import account_in_flight_count
@@ -105,9 +106,10 @@ def list_accounts(
     interactively without it for a human-readable summary.
     """
     console = Console()
-    settings = load_settings(config)
+    qd = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, qd))
     accounts = resolve_accounts(settings)
-    snapshot = _snapshot(settings, queue_dir.resolve())
+    snapshot = _snapshot(settings, qd)
 
     rows = [_account_row(a, snapshot) for a in accounts]
 
@@ -207,8 +209,9 @@ def pause_account(
     operator can use ``queue states`` and SIGTERM if needed).
     """
     console = Console()
-    settings = load_settings(config)
-    changed, message = _update_paused(queue_dir.resolve(), settings, name, paused=True)
+    qd = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, qd))
+    changed, message = _update_paused(qd, settings, name, paused=True)
     if json:
         print(_json.dumps({"changed": changed, "message": message}))
         return
@@ -227,8 +230,9 @@ def resume_account(
 ) -> None:
     """Reverse ``account pause <name>``; the dispatcher includes it again."""
     console = Console()
-    settings = load_settings(config)
-    changed, message = _update_paused(queue_dir.resolve(), settings, name, paused=False)
+    qd = queue_dir.resolve()
+    settings = load_settings(resolve_per_queue_config(config, qd))
+    changed, message = _update_paused(qd, settings, name, paused=False)
     if json:
         print(_json.dumps({"changed": changed, "message": message}))
         return
