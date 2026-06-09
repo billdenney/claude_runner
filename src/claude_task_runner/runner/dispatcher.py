@@ -708,6 +708,25 @@ def dispatch(
         env=spawn_env,
     )
 
+    # Record the subprocess pid on the TaskState so the supervisor's
+    # startup silent-orphan reaper can SIGTERM survivors of an
+    # ungraceful supervisor exit (kill threshold exceeded). The
+    # original "status=running" write above didn't carry the pid
+    # because Popen hadn't fired yet; do a second atomic write now
+    # the pid is known. Failures are non-fatal — the dispatch
+    # continues without pid-based reaping for this attempt.
+    if persist_state:
+        try:
+            new_state = new_state.model_copy(update={"pid": process.pid})
+            write_state_atomic(new_state, state_path_for(queue_dir, task.id))
+        except Exception as exc:
+            logger.warning(
+                "task %s: failed to persist pid=%s for reap tracking: %s",
+                task.id,
+                process.pid,
+                exc,
+            )
+
     summary, cap_violation = _dispatch_loop(
         process=process,
         settings_caps=settings_caps,
@@ -963,6 +982,10 @@ def _finalize_state(
             "stop_reason": run.stop_reason,
             "error": run.error,
             "runs": new_runs,
+            # Subprocess has exited (or been killed); clear the pid so
+            # the supervisor's silent-orphan reaper doesn't try to
+            # signal a now-recycled OS pid.
+            "pid": None,
         }
     )
     return new_state, run

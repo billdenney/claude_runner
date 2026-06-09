@@ -41,6 +41,7 @@ from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import reconcile as reconcile_mod
+from claude_task_runner.supervisor import reconcile_silent as reconcile_silent_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
 from claude_task_runner.supervisor.actions import (
     Action,
@@ -458,6 +459,39 @@ def start_daemon(
                 account_names=account_names,
             )
 
+            # Silent-orphan reaper (must precede reconcile_orphans):
+            # walks in-flight state YAMLs and grades each by heartbeat
+            # silence — SILENT → possibly_hung (parked for operator),
+            # KILL → failed + best-effort SIGTERM of the recorded pid.
+            # Skipping this pass would let reconcile_orphans's broad
+            # demotion sweep auto-redispatch tasks that are genuinely
+            # hung, burning slots on a re-hang.
+            silent_results = reconcile_silent_mod.reconcile_silent_orphans(
+                queue_dir,
+                settings=settings.task_caps,
+                clock=clk,
+            )
+            for result in silent_results:
+                if notify_callback is not None:
+                    notify_callback(
+                        "warning",
+                        f"silent-orphan task {result.task_id}: "
+                        f"verdict={result.verdict.value} silence="
+                        f"{result.silence_s:.0f}s pid={result.pid} "
+                        f"sigtermed={result.sigtermed}",
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "silent_orphan_reaped",
+                        {
+                            "task_id": result.task_id,
+                            "verdict": result.verdict.value,
+                            "silence_s": result.silence_s,
+                            "pid": result.pid,
+                            "sigtermed": result.sigtermed,
+                        },
+                    )
+
             # Orphan reconciliation (PR 12): if the previous supervisor
             # exited ungracefully (crash, SIGKILL after TimeoutStopSec, or
             # the bootstrap case of a pre-drain-handler supervisor being
@@ -468,7 +502,11 @@ def start_daemon(
             # (runner.session.plan_next_spawn → claude --resume <id>).
             # Clear the stale snapshot.in_flight records the dead
             # supervisor wrote — this supervisor owns the in-memory slot
-            # map from here on.
+            # map from here on. Runs AFTER the silent-orphan reaper so
+            # SILENT / KILL tasks have already been flagged distinctly;
+            # this sweep then handles the remaining HEALTHY-but-orphaned
+            # set (recent dispatches that the dead supervisor didn't
+            # have time to mark possibly_hung).
             snapshot, orphan_ids = reconcile_mod.reconcile_orphans(queue_dir, snapshot)
             if orphan_ids:
                 logger.info(
