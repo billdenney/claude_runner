@@ -207,6 +207,17 @@ class TaskState(_StrictBase):
     """Timestamp of the most recent stream-json event observed.
     ``runner.heartbeat`` flags ``possibly_hung`` when this falls behind
     by more than ``[task_caps].heartbeat_silence_alert_s``."""
+    pid: int | None = Field(default=None, ge=1)
+    """OS pid of the most recently spawned ``claude`` subprocess for
+    this task. Written by the dispatcher right after ``Popen`` (so the
+    YAML carries a live pointer to the subprocess while it's running)
+    and cleared on dispatch finalization. The supervisor's startup
+    silent-orphan reaper (:mod:`supervisor.reconcile_silent`) uses
+    this to SIGTERM subprocesses that survived a supervisor restart
+    but went silent past ``[task_caps].heartbeat_silence_kill_s``.
+    ``None`` on legacy state YAMLs that pre-date the field, on tasks
+    that have not yet been dispatched, and on tasks whose most recent
+    dispatch has finalized normally."""
     stop_reason: str | None = None
     error: str | None = None
     runs: list[RunRecord] = Field(default_factory=list)
