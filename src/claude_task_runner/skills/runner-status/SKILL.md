@@ -31,12 +31,24 @@ process liveness (PID + etime + cmd), `supervisor.json` fields
 (state / 5h / weekly / in_flight / since / scheduled_wakeup / drift),
 state-file status breakdown (completed / failed / running /
 awaiting_sidecar / possibly_hung / failed_circuit_breaker), todo/
-count, open-sidecar list (task_id + sequence), and live
-`claude-task-runner usage render` output.
+count, open-sidecar list (task_id + sequence), and a **per-account
+state table** sourced from supervisor.json's v3 `accounts` map
+(state, 5h/weekly util, paused, in-flight count, reset + wakeup
+times, last-capture timestamp). Multi-account queues see one row
+per configured `[[accounts]]` block; single-account queues see a
+single `default` row mirrored from the top-level fields.
 
 This is the **default invocation** when the user says
 `/runner-status` or "queue status" — produces the same output shape
 every time so snapshots can be compared across time.
+
+The per-account table replaces an earlier `claude-task-runner usage
+render` block that captured a fresh `/usage` reading for one account
+per call. The supervisor's per-account snapshot is at most one
+`poll_interval_s` old (typically 30-60s), shows every account, and
+costs no API tokens — better default for status checks. Operators
+who want a current `/usage` capture can still run
+`claude-task-runner usage render` directly.
 
 If the user wants a deeper investigation (e.g. focused on hung tasks
 or recent failures), follow the prioritized triage flow below.

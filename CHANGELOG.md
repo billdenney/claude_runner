@@ -9,6 +9,25 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **`/runner-status` reports per-account state from the v3
+  supervisor snapshot.** The bundled `snapshot.sh` previously
+  closed with a live `claude-task-runner usage render` block — one
+  fresh `/usage` capture per call, which on multi-account queues
+  showed only whichever account got picked, and burned tokens on
+  every status check. It now reads the v3 `supervisor.json`'s
+  `accounts` map directly and emits a per-account markdown table
+  with state, 5h/weekly util, paused flag, per-account in-flight
+  count (derived from the attributed `in_flight` records), 5h +
+  weekly reset, scheduled wakeup, and last-capture timestamp. Drift
+  messages — long, may contain pipes — render as a bulleted list
+  below the table. Pre-v3 files (or v3 snapshots not yet ticked)
+  soft-fail with an inline marker rather than aborting the script.
+  The per-account snapshot is at most one `poll_interval_s` old
+  (~30-60s on standard configs); operators who want a brand-new
+  capture can still run `claude-task-runner usage render` directly.
+
 ### Fixed
 
 - **Silent orphan reaper at supervisor startup.** When a supervisor
