@@ -304,6 +304,21 @@ def stop(
 @app.command("drain")
 def drain(
     *,
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "Per-queue claude_runner.toml. Accepted for symmetry with "
+            "`supervisor start` so the systemd unit's `ExecStop=... "
+            "drain ...` line can reuse the same argv as `ExecStart` "
+            "(see `cron/systemd_unit.py::_drain_command_from`). Drain "
+            "itself does not need settings — it only signals the "
+            "running supervisor via the queue's pidfile — so this is "
+            "currently a no-op, accepted to avoid `No such option: "
+            "--config` errors when the unit's `ExecStop` runs."
+        ),
+    ),
     queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
     wait: bool = typer.Option(
         True,
