@@ -307,3 +307,96 @@ def test_status_with_alive_pid(runner: CliRunner, queue_dir: Path) -> None:
     result = runner.invoke(app, ["status", "--queue", str(queue_dir)])
     assert result.exit_code == 0
     assert "alive" in result.stdout
+
+
+def test_drain_accepts_config_flag(runner: CliRunner, queue_dir: Path, tmp_path: Path) -> None:
+    """Regression: ``supervisor drain --config <toml>`` must NOT error
+    with ``No such option: --config``.
+
+    Bug history: ``cron/systemd_unit.py::_drain_command_from`` generates
+    the ExecStop line by substituting ``supervisor start`` → ``supervisor
+    drain`` on the ExecStart command. Since ExecStart includes
+    ``--config /path/to/claude_runner.toml``, the resulting ExecStop also
+    includes ``--config``. The ``drain`` command did not declare a
+    ``--config`` option, so every ``systemctl restart`` saw
+
+        No such option: --config
+        Try 'claude-task-runner supervisor drain --help' for help.
+
+    in the journal and ExecStop exited with status=2/INVALIDARGUMENT.
+    systemd then fell through to its main SIGTERM kill which still
+    triggered the supervisor's graceful-stop path, so end-to-end
+    behaviour was correct — but the spurious failure made every restart
+    look broken in logs.
+
+    The fix accepts ``--config`` as a no-op on ``drain`` (drain only
+    signals the running supervisor via the queue's pidfile; it doesn't
+    need settings). This pins the contract so the systemd-unit
+    generator and the drain CLI stay in sync.
+    """
+    config_path = tmp_path / "claude_runner.toml"
+    config_path.write_text("", encoding="utf-8")
+    # No pidfile → drain exits 1 with "No PID file" (the same path
+    # test_stop_no_pid_file exercises). The point of this test is that
+    # we reach that exit-1 instead of typer's "No such option" exit-2.
+    result = runner.invoke(
+        app,
+        ["drain", "--config", str(config_path), "--queue", str(queue_dir)],
+    )
+    assert result.exit_code == 1, (
+        f"expected exit 1 (no PID file); got {result.exit_code}.\noutput: {result.output!r}"
+    )
+    assert "No such option" not in result.output
+    assert "No PID file" in result.stdout
+
+
+def test_drain_config_short_flag_also_accepted(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path
+) -> None:
+    """``-c`` short flag also works (matches other commands' pattern)."""
+    config_path = tmp_path / "claude_runner.toml"
+    config_path.write_text("", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["drain", "-c", str(config_path), "--queue", str(queue_dir)],
+    )
+    assert result.exit_code == 1, (
+        f"expected exit 1 (no PID file); got {result.exit_code}.\noutput: {result.output!r}"
+    )
+    assert "No such option" not in result.output
+
+
+def test_drain_systemd_unit_execstop_argv_is_accepted_by_drain_cli(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path
+) -> None:
+    """Lock the contract between the systemd unit generator and drain.
+
+    The generator (``cron/systemd_unit.py::_drain_command_from``) takes
+    the ExecStart command and substitutes ``start`` → ``drain``, then
+    appends ``--no-wait``. Every flag on ExecStart that isn't stripped
+    by the generator MUST be accepted by drain. This test exercises the
+    full ExecStop argv the generator would produce.
+    """
+    from claude_task_runner.cron.systemd_unit import _drain_command_from
+
+    config_path = tmp_path / "claude_runner.toml"
+    config_path.write_text("", encoding="utf-8")
+    supervisor_command = (
+        f"/usr/local/bin/claude-task-runner supervisor start "
+        f"--queue {queue_dir} --config {config_path}"
+    )
+    drain_command = _drain_command_from(supervisor_command)
+    # Drop the binary path; CliRunner invokes the typer app directly.
+    drain_argv = drain_command.split(" ", 1)[1].split()
+    # Strip "supervisor" since CliRunner is rooted at the supervisor sub-app
+    # (see the fixture-level import: `from claude_task_runner.cli.supervisor_cmd import app`).
+    assert drain_argv[0] == "supervisor"
+    drain_argv = drain_argv[1:]  # ["drain", "--queue", ..., "--config", ..., "--no-wait"]
+    result = runner.invoke(app, drain_argv)
+    assert result.exit_code == 1, (
+        f"systemd-generated ExecStop argv was rejected by drain.\n"
+        f"argv: {drain_argv}\n"
+        f"exit: {result.exit_code}\n"
+        f"output: {result.output!r}"
+    )
+    assert "No such option" not in result.output

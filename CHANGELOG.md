@@ -9,6 +9,32 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`supervisor drain` now accepts `--config`**, so the systemd unit's
+  `ExecStop=` line stops failing with `No such option: --config`.
+  `cron/systemd_unit.py::_drain_command_from` generates the ExecStop
+  argv by substituting `supervisor start` → `supervisor drain` on the
+  ExecStart command — which left `--config /path/to/claude_runner.toml`
+  attached. `drain` didn't declare a `--config` option, so every
+  `systemctl restart` saw
+
+  ```
+  No such option: --config
+  Try 'claude-task-runner supervisor drain --help' for help.
+  ```
+
+  in the journal and ExecStop exited `status=2/INVALIDARGUMENT`.
+  systemd then fell through to its main SIGTERM kill which still
+  triggered the supervisor's graceful-stop path, so end-to-end
+  behaviour was correct — but the spurious failure made every restart
+  look broken in logs (recurring since at least 2026-05-22). `drain`
+  accepts `--config` as a no-op (it only signals the running supervisor
+  via the queue's pidfile; settings aren't needed). New regression
+  tests in `tests/unit/test_supervisor_cmd.py` lock the contract
+  between the systemd-unit generator and the drain CLI by replaying the
+  exact ExecStop argv the generator produces and asserting it parses.
+
 ### Changed
 
 - **`/runner-status` reports per-account state from the v3
