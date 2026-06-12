@@ -109,6 +109,29 @@ class TaskCapsSettings(_StrictModel):
     max_duration_s_per_task: float = Field(ge=0)
     heartbeat_silence_alert_s: float = Field(gt=0)
     heartbeat_silence_kill_s: float = Field(ge=0)
+    heartbeat_persist_interval_s: float = Field(gt=0, default=30.0)
+    """Minimum seconds between in-loop ``last_heartbeat_at`` writes from
+    the dispatcher. The dispatcher updates the in-memory heartbeat on
+    every stream-json event but only persists to the state YAML once
+    per interval so a chatty subprocess doesn't thrash the filesystem.
+
+    Must be well below ``heartbeat_silence_alert_s`` so the supervisor's
+    per-tick reaper sees fresh heartbeats for healthy long-running
+    tasks (e.g. interval=30 with alert=300 keeps a healthy task's
+    visible silence below 60s including the worst-case write skew).
+    """
+
+    steady_state_reap_interval_ticks: int = Field(ge=1, default=1)
+    """How many supervisor ticks elapse between two steady-state
+    silent-orphan reaper runs. ``1`` (the default) runs the reaper on
+    every tick — cheap because the pass only loads YAMLs for in-flight
+    tasks (capped at ``sum(max_concurrency)`` across accounts).
+
+    Operators with very long-running tasks or unusually expensive YAML
+    parses can dial this back to e.g. ``4`` to reduce per-tick load;
+    the trade-off is up to ``interval_ticks * poll_interval_s`` of
+    extra latency before a silent subprocess is flagged.
+    """
 
 
 class WatchdogSettings(_StrictModel):

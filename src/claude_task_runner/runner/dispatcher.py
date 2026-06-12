@@ -34,7 +34,7 @@ import os
 import shutil
 import signal
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -309,14 +309,27 @@ def _dispatch_loop(
     clock: Clock,
     task: Task,
     started_at: datetime,
+    heartbeat_persist_fn: Callable[[datetime], None] | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the process exits or we kill it.
 
     Returns the StreamSummary and any cap violation observed.
+
+    ``heartbeat_persist_fn``, when supplied, is invoked at most once
+    per ``settings_caps.heartbeat_persist_interval_s`` seconds with
+    the latest heartbeat timestamp. The caller writes that timestamp
+    into the task's state YAML so the supervisor's per-tick silent-
+    orphan reaper sees fresh liveness for healthy long-running tasks.
+    The rate limit keeps a chatty subprocess (multiple events per
+    second) from thrashing the filesystem — one write per interval
+    is enough since the interval is well below
+    ``heartbeat_silence_alert_s``.
     """
     summary = StreamSummary()
     cap_violation: caps_mod.CapViolation | None = None
-    last_heartbeat = None
+    last_heartbeat: datetime | None = None
+    last_persist_at: datetime | None = None
+    persist_interval_s = settings_caps.heartbeat_persist_interval_s
 
     assert process.stdout is not None
     for event in parse_lines(_read_lines(process.stdout), summary=summary):
@@ -324,6 +337,33 @@ def _dispatch_loop(
         if isinstance(event, (SystemInitEvent, AssistantMessageEvent, ResultEvent)):
             # Update last_heartbeat_at for every typed event.
             pass
+
+        # Persist the heartbeat to the state YAML so the supervisor's
+        # per-tick reaper sees the freshness. Rate-limited to one write
+        # per ``heartbeat_persist_interval_s`` because a chatty
+        # subprocess (many events per second) would otherwise produce
+        # one atomic write per event — needless I/O when one per
+        # interval is enough for the reaper's threshold comparison.
+        should_persist = (
+            heartbeat_persist_fn is not None
+            and last_heartbeat is not None
+            and (
+                last_persist_at is None
+                or (last_heartbeat - last_persist_at).total_seconds() >= persist_interval_s
+            )
+        )
+        if should_persist:
+            assert heartbeat_persist_fn is not None  # narrowed by guard above
+            assert last_heartbeat is not None
+            try:
+                heartbeat_persist_fn(last_heartbeat)
+            except Exception as exc:
+                logger.warning(
+                    "task %s: heartbeat persist failed (%s); continuing",
+                    task.id,
+                    exc,
+                )
+            last_persist_at = last_heartbeat
 
         # After each event, check caps.
         cap_violation = caps_mod.evaluate_caps(
@@ -727,12 +767,36 @@ def dispatch(
                 exc,
             )
 
+    # Persist heartbeats into the running-state YAML so the
+    # supervisor's per-tick silent-orphan reaper sees fresh liveness.
+    # The dispatcher's in-process kill check is event-driven and is
+    # blind to a subprocess that wedges with zero events (the
+    # 2026-06-12 ``frompeople-680-yu_2017`` zombie pattern); the
+    # YAML-mediated reaper is the steady-state safety net.
+    #
+    # Only persist when ``persist_state`` is True — the dispatch
+    # function's normal path. When the caller has opted into in-memory
+    # mode (e.g. force_dispatch) there is no state YAML to update and
+    # the reaper does not look for them.
+    heartbeat_persist_fn: Callable[[datetime], None] | None
+    if persist_state:
+
+        def _persist_heartbeat(when: datetime) -> None:
+            nonlocal new_state
+            new_state = new_state.model_copy(update={"last_heartbeat_at": when})
+            write_state_atomic(new_state, state_path_for(queue_dir, task.id))
+
+        heartbeat_persist_fn = _persist_heartbeat
+    else:
+        heartbeat_persist_fn = None
+
     summary, cap_violation = _dispatch_loop(
         process=process,
         settings_caps=settings_caps,
         clock=clock,
         task=task,
         started_at=started_at,
+        heartbeat_persist_fn=heartbeat_persist_fn,
     )
 
     # Drain remaining output and stderr.

@@ -11,6 +11,54 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Steady-state silent-orphan reaper inside live supervisor.** The
+  reaper added in PR #55 (`fix/reap-silent-orphans-on-restart`) ran
+  exactly once at supervisor startup, on the assumption that the
+  dispatcher's in-process kill-threshold check would handle the
+  steady-state silent-but-alive case. That assumption broke on
+  2026-06-12 with task
+  `frompeople-680-yu_2017_acta_pharmacologica_sinica`: the dispatched
+  `claude --print` subprocess (PID 4070819) stayed alive ~29 hours at
+  0.8% CPU emitting zero stream-json events, holding the `work`
+  account's only dispatch slot the entire time. The supervisor was
+  alive and ticking; the per-dispatch silence check never fired
+  because it is gated on event arrival (the dispatcher's
+  `_dispatch_loop` blocks on `parse_lines(process.stdout)` and only
+  re-evaluates the heartbeat threshold on a new event). SIGTERM on
+  the recorded pid caused the subprocess to exit with `end_turn`
+  cleanly — proving it was processing buffered work, not crashed —
+  but its silence was invisible to every existing detection layer.
+
+  Two-part fix:
+
+  1. **Dispatcher persists `last_heartbeat_at` per stream-json event**,
+     rate-limited to once per `[task_caps].heartbeat_persist_interval_s`
+     (default 30s). Previously the timestamp was only written at
+     dispatch finalization, so the YAML's heartbeat reflected a prior
+     (finished) run for the entire duration of the current attempt.
+     A live heartbeat in the YAML is what the per-tick reaper reads
+     to distinguish healthy long-running tasks from silent ones; the
+     rate limit (default 30s, alert default 300s) keeps a chatty
+     subprocess from thrashing the filesystem.
+  2. **Per-tick reaper in supervisor `daemon.run_forever`** runs every
+     `[task_caps].steady_state_reap_interval_ticks` ticks (default 1
+     — every tick) against the orchestrator's live in-flight slot map.
+     Same SILENT/KILL semantics as the startup pass via a shared
+     `_classify_and_act` helper; distinct stop_reasons
+     (`silent_steady_state` vs `silent_on_restart`) and error
+     prefixes (`silent-steady-state-reap` vs `orphaned-restart-reap`)
+     so the audit trail separates restart-orphans from in-supervisor
+     wedges. A TOCTOU re-check immediately before the demoting write
+     prevents the per-tick pass from clobbering a concurrent
+     dispatcher finalize. Skipped during drain mode so the operator's
+     "finish what's running and exit" intent isn't subverted.
+
+  New regression tests cover the dispatcher heartbeat-persist rate
+  limit, the per-tick pass's SILENT/KILL/HEALTHY verdicts, the
+  in-flight scope filter, the TOCTOU re-check, the two-tick
+  progression from healthy to stale, the daemon's interval throttling,
+  and the drain-mode skip.
+
 - **`supervisor drain` now accepts `--config`**, so the systemd unit's
   `ExecStop=` line stops failing with `No such option: --config`.
   `cron/systemd_unit.py::_drain_command_from` generates the ExecStop
