@@ -598,6 +598,56 @@ def start_daemon(
                     except Exception:
                         logger.exception("force-dispatch tick_consume failed")
 
+                # Steady-state silent-orphan reap (companion to the
+                # startup pass above). Runs every
+                # ``[task_caps].steady_state_reap_interval_ticks`` ticks
+                # against the orchestrator's live slot map. Covers the
+                # silent-but-alive case where the dispatcher's loop is
+                # wedged on a stdout read (the subprocess emits no
+                # events for hours) — its in-process kill check is
+                # event-driven and cannot fire. The supervisor's tick
+                # reads the state YAML and acts on the recorded pid
+                # without consulting the dispatcher.
+                #
+                # Skipped in drain mode: the operator's intent is
+                # "finish what's running and exit", and reaping a still-
+                # alive in-flight task during drain would cause the
+                # very thread the drain is waiting for to terminate
+                # mid-tick, racing the drain-complete check below.
+                reap_interval = max(1, settings.task_caps.steady_state_reap_interval_ticks)
+                if not drain_flag["draining"] and ticks % reap_interval == 0:
+                    try:
+                        steady_results = reconcile_silent_mod.reap_silent_orphans_tick(
+                            queue_dir,
+                            set(in_flight_slots.keys()),
+                            settings=settings.task_caps,
+                            clock=clk,
+                        )
+                    except Exception:
+                        logger.exception("per-tick silent-orphan reap failed")
+                    else:
+                        for result in steady_results:
+                            if notify_callback is not None:
+                                notify_callback(
+                                    "warning",
+                                    f"silent-orphan task {result.task_id}: "
+                                    f"verdict={result.verdict.value} silence="
+                                    f"{result.silence_s:.0f}s pid={result.pid} "
+                                    f"sigtermed={result.sigtermed} "
+                                    f"(steady-state)",
+                                )
+                            if event_callback is not None:
+                                event_callback(
+                                    "silent_orphan_reaped_steady_state",
+                                    {
+                                        "task_id": result.task_id,
+                                        "verdict": result.verdict.value,
+                                        "silence_s": result.silence_s,
+                                        "pid": result.pid,
+                                        "sigtermed": result.sigtermed,
+                                    },
+                                )
+
                 # Reap finished dispatch threads + spawn new ones up to the
                 # target concurrency. tick_dispatch returns the snapshot
                 # with the refreshed InFlightRecord list; persist it so

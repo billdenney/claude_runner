@@ -280,10 +280,12 @@ failure_circuit_breaker_threshold = 3
 # Per-task safety caps
 # ---------------------------------------------------------------------------
 [task_caps]
-max_tokens_per_task         = 0          # 0 = unlimited
-max_duration_s_per_task     = 14400      # 4h per attempt; 0 = unlimited
-heartbeat_silence_alert_s   = 300        # mark possibly_hung after N s of silence
-heartbeat_silence_kill_s    = 0          # 0 = never auto-kill
+max_tokens_per_task              = 0     # 0 = unlimited
+max_duration_s_per_task          = 14400 # 4h per attempt; 0 = unlimited
+heartbeat_silence_alert_s        = 300   # mark possibly_hung after N s of silence
+heartbeat_silence_kill_s         = 0     # 0 = never auto-kill
+heartbeat_persist_interval_s     = 30    # min s between in-loop heartbeat YAML writes
+steady_state_reap_interval_ticks = 1     # 1 = run per-tick silent-orphan reaper every tick
 
 # ---------------------------------------------------------------------------
 # Watchdog (cron / systemd)
