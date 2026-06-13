@@ -6,9 +6,12 @@ Covers:
   tie-breaks alphabetically.
 * Reading attribution: returned ``UsageReading.account`` matches the
   picked account.
-* Exception attribution: inner-source exceptions get the account name
-  attached via ``setattr(exc, "account", ...)`` so the daemon can
-  route the failure to that account's state.
+* Exception attribution: inner-source failures are re-raised as a
+  :class:`MultiAccountSourceError` that is *also* an instance of the
+  original exception's type (so the supervisor's type-based routing is
+  preserved) and carries ``.account`` / ``.original`` so the daemon can
+  route the failure to that account's state. The caught exception is
+  never mutated.
 * Construction: empty source map rejected.
 """
 
@@ -19,9 +22,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from claude_task_runner.usage.drift import UsageFormatDrift
+from claude_task_runner.usage.drift import UsageCaptureTimeout, UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
-from claude_task_runner.usage.multi_account_source import MultiAccountUsageSource
+from claude_task_runner.usage.multi_account_source import (
+    MultiAccountSourceError,
+    MultiAccountUsageSource,
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -184,14 +190,64 @@ def test_reading_account_set_to_picked_name() -> None:
 
 
 def test_exception_carries_account_attribute() -> None:
-    """Inner exception gets ``.account`` set so the daemon can route it."""
+    """Inner failure is re-raised carrying ``.account`` for routing.
+
+    The raised wrapper must still be catchable as the *original*
+    exception type (the supervisor's ``safe_poll`` routes on type), and
+    must expose ``.account`` so the daemon attributes it.
+    """
     err = UsageFormatDrift("simulated tui change")
     sources = {"personal": _RaisingSource(err)}
     snapshot = _FakeSnapshot(accounts={"personal": _FakeAccountState(last_capture_at=None)})
     src = MultiAccountUsageSource(sources, lambda: snapshot)
     with pytest.raises(UsageFormatDrift) as exc_info:
         src.read()
-    assert getattr(exc_info.value, "account", None) == "personal"
+    assert exc_info.value.account == "personal"
+
+
+def test_exception_preserves_original_type_for_routing() -> None:
+    """The wrapper is an instance of BOTH the original type and
+    ``MultiAccountSourceError`` — distinct inner types stay distinct so
+    the supervisor routes each failure mode correctly."""
+    drift_src = MultiAccountUsageSource(
+        {"a": _RaisingSource(UsageFormatDrift("drift"))},
+        lambda: _FakeSnapshot(accounts={"a": _FakeAccountState(last_capture_at=None)}),
+    )
+    with pytest.raises(MultiAccountSourceError) as drift_info:
+        drift_src.read()
+    assert isinstance(drift_info.value, UsageFormatDrift)
+    assert not isinstance(drift_info.value, UsageCaptureTimeout)
+
+    timeout_src = MultiAccountUsageSource(
+        {"a": _RaisingSource(UsageCaptureTimeout("slow"))},
+        lambda: _FakeSnapshot(accounts={"a": _FakeAccountState(last_capture_at=None)}),
+    )
+    with pytest.raises(MultiAccountSourceError) as timeout_info:
+        timeout_src.read()
+    assert isinstance(timeout_info.value, UsageCaptureTimeout)
+    assert not isinstance(timeout_info.value, UsageFormatDrift)
+
+
+def test_exception_does_not_mutate_original_and_chains_it() -> None:
+    """The caught exception is never mutated; it is preserved verbatim
+    as ``.original`` and chained via ``__cause__`` (``raise ... from``)."""
+    err = UsageFormatDrift("simulated tui change", raw=b"rawbytes")
+    sources = {"personal": _RaisingSource(err)}
+    snapshot = _FakeSnapshot(accounts={"personal": _FakeAccountState(last_capture_at=None)})
+    src = MultiAccountUsageSource(sources, lambda: snapshot)
+    with pytest.raises(MultiAccountSourceError) as exc_info:
+        src.read()
+    wrapper = exc_info.value
+    assert wrapper.original is err
+    assert wrapper.__cause__ is err
+    # The original is untouched: no `.account` leaked onto it, and its
+    # forensic payload survives.
+    assert "account" not in vars(err)
+    assert err.raw == b"rawbytes"
+    # The wrapper's message names the account and includes the original.
+    assert wrapper.account == "personal"
+    assert "personal" in str(wrapper)
+    assert "simulated tui change" in str(wrapper)
 
 
 def test_single_account_exception_does_not_break_next_read() -> None:
