@@ -8,6 +8,7 @@ asks the supervisor to exit; ``status`` is read-only.
 from __future__ import annotations
 
 import json as _json
+import logging
 import os
 import signal
 from collections.abc import Callable
@@ -39,6 +40,8 @@ from claude_task_runner.usage.source import (
 
 app = typer.Typer(no_args_is_help=True)
 
+logger = logging.getLogger(__name__)
+
 
 def _captures_dir(queue_dir: Path) -> Path:
     return queue_dir / ".claude_task_runner" / "usage_captures"
@@ -54,9 +57,11 @@ def _count_in_flight(queue_dir: Path) -> int:
     for path in list_state_files(queue_dir):
         try:
             state = load_state(path)
-        except Exception:
+        except Exception as exc:
             # Skip malformed state files for the purpose of counting; the
-            # ``doctor`` subcommand surfaces them separately.
+            # ``doctor`` subcommand surfaces them separately. Still warn
+            # so a silently-unparseable state file leaves a trace.
+            logger.warning("skipping unparseable state file %s: %s", path, exc)
             continue
         if state.status in ("running", "awaiting_sidecar", "possibly_hung"):
             n += 1
@@ -292,9 +297,9 @@ def stop(
         raise typer.Exit(code=1)
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except ProcessLookupError as exc:
         console.print(f"[yellow]PID {pid} disappeared before SIGTERM[/]")
-        raise typer.Exit(code=1) from None
+        raise typer.Exit(code=1) from exc
     except PermissionError as exc:
         console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -374,9 +379,9 @@ def drain(
         raise typer.Exit(code=1)
     try:
         os.kill(pid, signal.SIGUSR1)
-    except ProcessLookupError:
+    except ProcessLookupError as exc:
         console.print(f"[yellow]PID {pid} disappeared before SIGUSR1[/]")
-        raise typer.Exit(code=1) from None
+        raise typer.Exit(code=1) from exc
     except PermissionError as exc:
         console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
         raise typer.Exit(code=2) from exc

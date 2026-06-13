@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.watchdog_cmd import (
+    _spawn_supervisor,
     app,
     load_registered_queues,
     queues_registry_path,
@@ -146,3 +148,159 @@ class TestTickCommand:
         result = runner.invoke(app, ["tick", "--dry-run"])
         assert result.exit_code == 0
         assert "bad state file" in result.stdout
+
+    def test_tick_forwards_config_to_spawned_supervisor(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression (audit finding 1): ``tick --config <toml>`` must
+        forward ``--config`` to the supervisor it spawns. Without it the
+        spawned supervisor falls back to package defaults and its
+        throttle/backoff policy silently diverges from the operator's
+        ``claude_runner.toml``."""
+        queue = isolated_home / "q"
+        (queue / ".claude_task_runner").mkdir(parents=True)
+        register_queue(queue)
+
+        # A minimal-but-valid config file so ``load_settings`` succeeds.
+        config_path = isolated_home / "claude_runner.toml"
+        config_path.write_text("", encoding="utf-8")
+
+        spawned: dict[str, int] = {}
+
+        def _record(queue_dir: Path, config: Path | None = None) -> int:
+            spawned["called"] = spawned.get("called", 0) + 1
+            spawned["config"] = config  # type: ignore[assignment]
+            spawned["queue"] = queue_dir  # type: ignore[assignment]
+            return 4242
+
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _record)
+        result = runner.invoke(app, ["tick", "--config", str(config_path)])
+        assert result.exit_code == 0, result.output
+        assert spawned["called"] == 1
+        # The config Path the operator passed must be forwarded verbatim.
+        assert spawned["config"] == config_path
+        assert "spawned supervisor" in result.stdout
+
+
+class TestSpawnSupervisor:
+    """Direct tests of ``_spawn_supervisor`` argv construction."""
+
+    @staticmethod
+    def _popen_capturing_argv(pid: int) -> MagicMock:
+        """A ``Popen`` mock that records argv and closes the log file
+        handle it's handed.
+
+        The real subprocess inherits ``stdout``/``stderr`` and the OS
+        closes them when it exits; the mock never starts a process, so
+        without this the ``open(...)`` in ``_spawn_supervisor`` would
+        leak and surface as a ``ResourceWarning`` at teardown."""
+
+        def _factory(cmd, *, stdout=None, stderr=None, **_kw):
+            if stdout is not None:
+                stdout.close()
+            proc = MagicMock()
+            proc.pid = pid
+            return proc
+
+        return MagicMock(side_effect=_factory)
+
+    def test_spawn_appends_config_flag(self, tmp_path: Path) -> None:
+        """When a config path is given, the supervisor command line must
+        include ``--config <path>`` (audit finding 1)."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+        config = tmp_path / "claude_runner.toml"
+        config.write_text("", encoding="utf-8")
+
+        mock_popen = self._popen_capturing_argv(999)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+        ):
+            pid = _spawn_supervisor(queue, config)
+        assert pid == 999
+        argv = mock_popen.call_args.args[0]
+        assert argv[:3] == ["/usr/bin/claude-task-runner", "supervisor", "start"]
+        assert "--queue" in argv
+        assert argv[argv.index("--queue") + 1] == str(queue)
+        # The load-bearing assertion: --config is present and points at
+        # the path the caller provided.
+        assert "--config" in argv
+        assert argv[argv.index("--config") + 1] == str(config)
+
+    def test_spawn_omits_config_flag_when_none(self, tmp_path: Path) -> None:
+        """No config path → no ``--config`` token (so the supervisor uses
+        its own default-resolution, not an empty/garbage path)."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+
+        mock_popen = self._popen_capturing_argv(7)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+        ):
+            pid = _spawn_supervisor(queue, None)
+        assert pid == 7
+        argv = mock_popen.call_args.args[0]
+        assert "--config" not in argv
+
+
+class TestCorruptRegistryBackup:
+    """Audit finding 2: a corrupt registry must be logged + backed up,
+    not silently reset to empty."""
+
+    def test_corrupt_json_logs_and_backs_up(
+        self,
+        isolated_home: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+
+        with caplog.at_level("ERROR", logger="claude_task_runner.cli.watchdog_cmd"):
+            out = load_registered_queues()
+
+        assert out == []
+        # A .broken backup must be written alongside the original.
+        backup = path.with_suffix(path.suffix + ".broken")
+        assert backup.exists()
+        assert backup.read_text(encoding="utf-8") == "{not json"
+        # And the failure must be logged at ERROR with the path.
+        assert any(
+            record.levelname == "ERROR" and str(path) in record.getMessage()
+            for record in caplog.records
+        ), caplog.text
+
+    def test_non_object_payload_logs_and_backs_up(
+        self,
+        isolated_home: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A syntactically-valid JSON that isn't an object (e.g. a list)
+        is also corruption — same treatment."""
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('["not", "a", "dict"]', encoding="utf-8")
+
+        with caplog.at_level("ERROR", logger="claude_task_runner.cli.watchdog_cmd"):
+            out = load_registered_queues()
+
+        assert out == []
+        backup = path.with_suffix(path.suffix + ".broken")
+        assert backup.exists()
+        assert any(record.levelname == "ERROR" for record in caplog.records), caplog.text
+
+    def test_valid_registry_not_backed_up(self, isolated_home: Path) -> None:
+        """A well-formed registry must NOT trigger a .broken backup."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        backup = queues_registry_path().with_suffix(
+            queues_registry_path().suffix + ".broken"
+        )
+        assert load_registered_queues() == [queue.resolve()]
+        assert not backup.exists()

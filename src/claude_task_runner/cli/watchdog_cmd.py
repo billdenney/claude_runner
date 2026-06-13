@@ -17,6 +17,7 @@ Output is structured logs to stdout (the cron wrapper redirects to
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,8 @@ from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
+
+logger = logging.getLogger(__name__)
 
 QUEUES_REGISTRY_FILENAME = "queues.json"
 """Per-host registry of queue directories the watchdog should manage.
@@ -43,15 +46,38 @@ def queues_registry_path() -> Path:
     return Path.home() / ".claude_task_runner" / QUEUES_REGISTRY_FILENAME
 
 
+def _backup_broken_registry(path: Path) -> None:
+    """Preserve a corrupt registry as ``<name>.broken`` before it's lost.
+
+    Best-effort: a failure to back up must not crash the watchdog tick
+    (the registry is already unreadable; losing the backup is a smaller
+    problem than aborting the tick)."""
+    backup = path.with_suffix(path.suffix + ".broken")
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        logger.error("watchdog: could not back up corrupt registry to %s (%s)", backup, exc)
+    else:
+        logger.error("watchdog: backed up corrupt registry to %s", backup)
+
+
 def load_registered_queues() -> list[Path]:
     path = queues_registry_path()
     if not path.exists():
         return []
     try:
         payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        # A corrupt registry would otherwise silently lose every queue
+        # registration. Loudly log it and stash the bad file alongside
+        # so the operator can recover it (rather than overwriting it on
+        # the next register).
+        logger.error("watchdog: corrupt queues registry at %s (%s)", path, exc)
+        _backup_broken_registry(path)
         return []
     if not isinstance(payload, dict):
+        logger.error("watchdog: queues registry at %s is not a JSON object", path)
+        _backup_broken_registry(path)
         return []
     raw = payload.get("queues", [])
     if not isinstance(raw, list):
@@ -79,8 +105,14 @@ def _supervisor_is_alive(queue_dir: Path) -> tuple[bool, int | None]:
     return pidfile_mod.is_pid_alive(pid), pid
 
 
-def _spawn_supervisor(queue_dir: Path) -> int:
-    """Start the supervisor detached. Returns the new PID."""
+def _spawn_supervisor(queue_dir: Path, config: Path | None = None) -> int:
+    """Start the supervisor detached. Returns the new PID.
+
+    Forwards ``--config`` so the spawned supervisor loads the SAME
+    settings the watchdog used to make its restart decision. Without
+    this, the supervisor falls back to package defaults and its
+    throttle / backoff policy silently diverges from the operator's
+    ``claude_runner.toml``."""
     exe = shutil.which("claude-task-runner")
     if exe is None:
         raise RuntimeError("claude-task-runner not on PATH")
@@ -88,8 +120,11 @@ def _spawn_supervisor(queue_dir: Path) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "supervisor.log"
     log_fh = open(log_path, "ab")  # noqa: SIM115 — handed to subprocess
+    cmd = [exe, "supervisor", "start", "--queue", str(queue_dir)]
+    if config is not None:
+        cmd += ["--config", str(config)]
     proc = subprocess.Popen(
-        [exe, "supervisor", "start", "--queue", str(queue_dir)],
+        cmd,
         stdout=log_fh,
         stderr=log_fh,
         stdin=subprocess.DEVNULL,
@@ -143,7 +178,7 @@ def tick(
 
         if decision.verdict is backoff_mod.WatchdogVerdict.RESTART and not dry_run:
             try:
-                new_pid = _spawn_supervisor(queue_dir)
+                new_pid = _spawn_supervisor(queue_dir, config)
             except Exception as exc:
                 sys.stdout.write(f"{ts} watchdog: spawn failed for {queue_dir}: {exc}\n")
             else:
