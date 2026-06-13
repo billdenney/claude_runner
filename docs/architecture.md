@@ -47,9 +47,11 @@ introduces a new on-disk file MUST update this document in the same PR.
 3. If dispatch is approved: `runner.dispatcher` spawns `claude --print
    --output-format=stream-json --verbose ...`. Captures `session_id` from the
    first stream-json `system/init` event.
-4. `runner.stream` consumes NDJSON line-by-line, emitting events to
-   `<queue>/.claude_task_runner/events.ndjson` and updating
-   `<queue>/.claude_task_runner/state/<id>.yaml`.
+4. `runner.stream` consumes NDJSON line-by-line, updating
+   `<queue>/.claude_task_runner/state/<id>.yaml`. Supervisor state-machine
+   transitions additionally surface as `EmitEvent` actions, but these are
+   logged (default `event_callback` is `None`, routing them to the
+   supervisor log); no `events.ndjson` file is written today.
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
    after `task_caps.heartbeat_silence_alert_s` seconds of silence.
 6. On task completion: `runner.ema` updates per-(model, effort, tool-hash) EMA
@@ -60,7 +62,7 @@ introduces a new on-disk file MUST update this document in the same PR.
    which writes `response-NNN.json`. Supervisor re-dispatches via `claude --resume
    <session_id>`.
 8. On 5h-window reset mid-task: in-flight task continues. Supervisor's
-   `runner.session.resume_or_fresh` knows that resuming a task across a window
+   `runner.session.plan_next_spawn` knows that resuming a task across a window
    boundary is fine because we use `--resume <session_id>`.
 9. On task failure: `runner.retry` classifies the error
    (environmental | operator | task | unknown). Environmental → auto-retry.
@@ -113,11 +115,14 @@ all 100% test coverage in `tests/unit/test_curve.py`,
 ├── todo/                           # input: task YAMLs awaiting dispatch
 │   └── <id>.yaml
 └── .claude_task_runner/            # all runtime state lives here
-    ├── state/<id>.yaml             # TaskState (pydantic v2 schema)
+    ├── state/<id>.yaml             # TaskState (pydantic v2 schema) — the
+    │                               #   single source of truth per task; stream
+    │                               #   events are folded into it, not teed out
     ├── sidecar/<id>/request-NNN.json
     ├── sidecar/<id>/response-NNN.json
-    ├── logs/<id>/attempt-N.{stdout,stderr,streamjson}
-    ├── events.ndjson               # canonical event stream
+    ├── logs/                       # reserved (created at startup, currently
+    │                               #   unused — no per-attempt stdout/stderr/
+    │                               #   stream-json files are written yet)
     ├── supervisor.json             # supervisor state machine snapshot
     ├── supervisor.pid              # PID of the running supervisor
     ├── supervisor.log              # supervisor lifecycle + transitions
@@ -149,7 +154,9 @@ These properties are never violated; tests and assertions enforce them.
    any decrease without a detected reset is `UsageFormatDrift`.
 4. **No new dispatch when 5h utilization ≥ no-dispatch threshold** —
    regardless of EMA prediction; this is the safety net.
-5. **Every cutoff is a setting** — no magic numbers in runtime code.
+5. **Every behavior-affecting cutoff is a setting** — no magic numbers for
+   thresholds/timeouts/caps in runtime code (cosmetic presentation constants
+   such as log-truncation widths are exempt; see ADR-0014).
    `claude-task-runner config show` is the single source of truth.
 6. **All on-disk data has a `schema_version` field** — schema evolution can be
    detected and migrations versioned.

@@ -16,17 +16,26 @@ and the model has to re-read the entire paper / source files.
 
 ## Decision
 
-`runner.session.resume_or_fresh(task)`:
+`runner.session.plan_next_spawn(task, state, *, settings, …)` returns a
+`SpawnPlan` (`strategy` ∈ `{RESUME, FRESH}`):
 
-1. If `task.session_id` is set and the session JSONL file exists at
+> **Amended (2026-06-13):** the entry point was named `resume_or_fresh(task)`
+> in this ADR's original draft. It now lives at
+> `runner.session.plan_next_spawn` and takes the `Task` plus its `TaskState`
+> (session id and attempt counters live on the state, not the task) and a
+> `SessionSettings` slice, returning a `SpawnPlan`. The decision logic below
+> is unchanged in substance.
+
+1. If `state.session_id` is set and the session JSONL file exists at
    `~/.claude/projects/<proj>/<session_id>.jsonl`:
    - Spawn `claude --resume <session_id> --print "Continue where you left off."`
    - If process exits with a `--resume`-specific error within
      `session.resume_fail_fast_s` seconds, fall through.
-2. Fresh: spawn with original prompt; capture new session_id; update task.
+2. Fresh: spawn with original prompt; capture new session_id; update the
+   task's state.
 
-`task.resume_attempts` is incremented per try and capped at
-`session.max_resume_attempts` (default 3). Beyond cap, only fresh restarts
+`state.resume_attempts` is incremented per try and capped at
+`[session].max_resume_attempts` (default 3). Beyond cap, only fresh restarts
 are attempted.
 
 ## Alternatives considered

@@ -23,7 +23,11 @@ Re-enable EMA-driven concurrency:
 - At dispatch time:
   `predicted_pct = (used + sum(in_flight_estimates) + ema.predict(new_task.task_type)) / budget`.
 - Cold-start (no samples for this task_type): use a TOML-configured prior.
-  After `prior_warmup_samples` real samples, the prior is dropped.
+  Once at least one sample exists but fewer than `prior_warmup_samples`,
+  the prediction blends prior and observed EMA in proportion to sample
+  count: with `w = sample_count / prior_warmup_samples`, predict
+  `w * observed + (1 - w) * prior`. After `prior_warmup_samples` real
+  samples the prior is dropped entirely. (See `runner/ema.py`.)
 
 EMA values persist to `<queue>/.claude_task_runner/ema.json`.
 
