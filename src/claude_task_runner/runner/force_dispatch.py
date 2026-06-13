@@ -391,7 +391,11 @@ def _spawn_dispatch_thread(
             account,
         ),
         name=f"force-dispatch-{task.id}",
-        daemon=False,
+        # ADR-0025: match the orchestrator's thread lifetime — daemon when
+        # adoption is on so a fast stop need not join the (file-backed,
+        # restart-survivable) worker; non-daemon otherwise so the
+        # graceful-drain stop joins it as before.
+        daemon=bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False)),
     )
     thread.start()
     in_flight_slots[task.id] = DispatchSlot(

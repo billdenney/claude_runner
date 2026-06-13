@@ -278,6 +278,20 @@ def start(
 @app.command("stop")
 def stop(
     *,
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "Per-queue claude_runner.toml. Accepted for symmetry with "
+            "`supervisor start` so the systemd unit's fast-stop "
+            "`ExecStop=... supervisor stop ...` line can reuse the same "
+            "argv as `ExecStart` (ADR-0025). Stop itself only signals the "
+            "running supervisor via the queue's pidfile, so this is a "
+            "no-op — accepted to avoid `No such option: --config` when "
+            "the unit's ExecStop runs."
+        ),
+    ),
     queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
     timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for clean exit."),
 ) -> None:
@@ -285,7 +299,14 @@ def stop(
 
     Reads the PID from ``<queue>/.claude_task_runner/supervisor.pid``
     and signals it. Does NOT wait for completion beyond ``timeout``.
+
+    When ``[supervisor].adopt_workers`` is on (ADR-0025) this is the
+    fast-stop path: the SIGTERM trips the daemon's fast-stop handler, so
+    the supervisor stops dispatching and exits promptly while file-backed
+    workers keep running for the next supervisor to adopt. The systemd
+    unit's ``ExecStop`` is wired here in that mode.
     """
+    _ = config  # accepted for ExecStop symmetry; stop needs no settings.
     console = Console()
     pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
     pid = pidfile_mod.read_existing_pid(pid_path)

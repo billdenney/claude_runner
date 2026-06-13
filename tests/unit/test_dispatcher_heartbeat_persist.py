@@ -115,7 +115,8 @@ def test_persist_called_on_first_event() -> None:
         persists.append(when)
 
     _dispatch_loop(
-        process=process,  # type: ignore[arg-type]
+        lines=process.stdout,
+        terminate=lambda: None,
         settings_caps=_caps(persist_s=30.0, alert=600.0),
         clock=clock,
         task=_task(),
@@ -145,7 +146,8 @@ def test_persist_rate_limited_by_interval() -> None:
         # Don't advance the clock — simulate events arriving rapid-fire.
 
     _dispatch_loop(
-        process=process,  # type: ignore[arg-type]
+        lines=process.stdout,
+        terminate=lambda: None,
         settings_caps=_caps(persist_s=30.0),
         clock=clock,
         task=_task(),
@@ -192,7 +194,8 @@ def test_persist_fires_again_after_interval_elapses() -> None:
 
     try:
         _dispatch_loop(
-            process=process,  # type: ignore[arg-type]
+            lines=process.stdout,
+            terminate=lambda: None,
             settings_caps=_caps(persist_s=30.0),
             clock=clock,
             task=_task(),
@@ -218,7 +221,8 @@ def test_persist_fn_omitted_does_not_break() -> None:
 
     # No exception, no persists requested.
     summary, cap_violation = _dispatch_loop(
-        process=process,  # type: ignore[arg-type]
+        lines=process.stdout,
+        terminate=lambda: None,
         settings_caps=_caps(),
         clock=clock,
         task=_task(),
@@ -242,7 +246,8 @@ def test_persist_callback_failure_is_swallowed() -> None:
         raise OSError("disk full")
 
     summary, _ = _dispatch_loop(
-        process=process,  # type: ignore[arg-type]
+        lines=process.stdout,
+        terminate=lambda: None,
         settings_caps=_caps(),
         clock=clock,
         task=_task(),
@@ -300,7 +305,8 @@ def test_repeated_persist_failures_escalate_to_error(
     try:
         with caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.dispatcher"):
             _dispatch_loop(
-                process=process,  # type: ignore[arg-type]
+                lines=process.stdout,
+                terminate=lambda: None,
                 settings_caps=_caps(persist_s=30.0, alert=10_000.0),
                 clock=clock,
                 task=_task(),

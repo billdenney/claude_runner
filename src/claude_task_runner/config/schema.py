@@ -186,6 +186,18 @@ class SupervisorSettings(_StrictModel):
     window_start_delay_s: float = Field(ge=0)
     state_file: str
     preferred_init_system: str  # auto | systemd | cron
+    adopt_workers: bool = True
+    """Restart-survivable workers (ADR-0025). When true (default), the
+    dispatcher redirects each worker's stdout/stderr to per-attempt log
+    files instead of supervisor-owned pipes, and a fresh supervisor
+    *adopts* still-running workers on startup (re-tailing their logs to
+    completion) rather than demoting the tasks and losing in-flight work.
+    Stop also becomes fast (exit immediately, leave workers running).
+
+    Set false to restore the legacy pipe-backed behaviour: workers die
+    with the supervisor's pipes, stop drains, and a restart re-dispatches
+    running tasks from scratch. Defaulted (not required) so per-queue
+    configs that pre-date this field keep parsing."""
 
 
 class HookSettings(_StrictModel):

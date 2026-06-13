@@ -140,6 +140,14 @@ def tick_dispatch(
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
+    Dispatch-thread lifetime (ADR-0025): when
+    ``[supervisor].adopt_workers`` is on, dispatch threads are spawned as
+    daemon threads so a fast stop (SIGTERM) can exit the supervisor
+    promptly without joining them — the file-backed workers keep running
+    as independent OS processes and the next supervisor adopts them.
+    When adoption is off, threads are non-daemon so the graceful-drain
+    stop can join them, preserving the historical behaviour exactly.
+
     Mutates ``in_flight_slots`` in place: removes finished threads,
     inserts newly-spawned :class:`DispatchSlot` entries (one per
     dispatched task, with account attribution).
@@ -203,6 +211,13 @@ def tick_dispatch(
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
+    # ADR-0025 thread lifetime: daemon when adoption is on (fast stop need
+    # not join), non-daemon otherwise (drain joins). ``getattr`` tolerates
+    # the lightweight ``SimpleNamespace`` settings stubs some tests pass
+    # (which omit ``supervisor``); the real strict ``Settings`` always
+    # carries the field, so production reads the operator's value.
+    adopt_on = bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False))
+
     completed_ids = _completed_task_ids(queue_dir)
     candidates = _eligible_candidates(queue_dir, in_flight_slots, completed_ids)
     if not candidates:
@@ -250,7 +265,10 @@ def tick_dispatch(
                 choice.account,
             ),
             name=f"dispatch-{task.id}",
-            daemon=False,
+            # ADR-0025: daemon when adoption is on so a fast stop need not
+            # join the worker thread; the file-backed worker survives as
+            # its own process and is adopted by the next supervisor.
+            daemon=adopt_on,
         )
         thread.start()
         in_flight_slots[task.id] = DispatchSlot(
@@ -519,6 +537,14 @@ def _dispatch_one_safely(
             claude_config_dir=claude_config_dir,
             linux_user=linux_user,
             account=account,
+            # ADR-0025: file-backed, restart-survivable workers when the
+            # operator left adoption on (default). When off, dispatch
+            # keeps the legacy pipe-backed behaviour bit-for-bit. ``getattr``
+            # tolerates the SimpleNamespace settings stubs in some tests;
+            # the real strict ``Settings`` always carries the field.
+            adopt_workers=bool(
+                getattr(getattr(settings, "supervisor", None), "adopt_workers", False)
+            ),
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

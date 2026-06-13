@@ -10,8 +10,13 @@ It composes the pure :func:`state_machine.step` with:
 * Action execution: notifications, event emission, wakeup scheduling.
 
 In-flight tasks are NOT killed when the daemon exits — architectural
-invariant 2. Restart code in :func:`reattach_in_flight` polls each
-recorded PID and finalizes any that died while the supervisor was down.
+invariant 2. When ``[supervisor].adopt_workers`` is on (ADR-0025),
+restart recovery is done by :func:`supervisor.adoption.adopt_running_workers`,
+which re-attaches a monitor thread to each still-running file-backed
+worker (tailing its log to completion); the broad demotion sweep in
+:func:`supervisor.reconcile.reconcile_orphans` then only demotes the
+survivors that could NOT be adopted. With adoption off, every running
+orphan is demoted for a session-resume re-dispatch, as before.
 
 Driving a single tick is done by :func:`run_one_tick`, which is what
 tests exercise. The full daemon loop in :func:`run_forever` adds
@@ -38,6 +43,7 @@ from claude_task_runner.config.schema import (
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import reconcile as reconcile_mod
@@ -461,7 +467,21 @@ def start_daemon(
     drain_flag = {"draining": False}
 
     def _on_signal(signum: int, _frame: object) -> None:
-        logger.info("supervisor caught signal %s; stopping", signum)
+        # SIGTERM / SIGINT request a stop. The loop breaks on the next
+        # iteration. With adoption on (ADR-0025) the dispatch threads are
+        # daemons, so the process exits promptly WITHOUT joining them and
+        # the file-backed workers survive for the next supervisor to
+        # adopt. With adoption off the threads are non-daemon, so the
+        # interpreter joins them at exit and each in-flight attempt
+        # finishes first (the historical behaviour).
+        if settings.supervisor.adopt_workers:
+            logger.info(
+                "supervisor caught signal %s; fast stop (adopt_workers on — "
+                "workers keep running for the next supervisor)",
+                signum,
+            )
+        else:
+            logger.info("supervisor caught signal %s; stopping", signum)
         stop_flag["stop"] = True
 
     def _on_sighup(_signum: int, _frame: object) -> None:
@@ -542,6 +562,44 @@ def start_daemon(
                         },
                     )
 
+            # Startup adoption (ADR-0025): re-attach to still-running
+            # file-backed workers BEFORE the demotion sweep. Each adopted
+            # task gets a DispatchSlot whose thread tails the worker's log
+            # to completion; the adopted ids are then shielded from
+            # reconcile_orphans below so it doesn't demote a live worker.
+            # No-op when [supervisor].adopt_workers is off (legacy
+            # demote-on-restart behaviour is preserved). Runs AFTER the
+            # silent-orphan reaper so SILENT / KILL survivors are already
+            # demoted and only HEALTHY live workers are adopted.
+            adopted = adoption_mod.adopt_running_workers(
+                queue_dir,
+                settings=settings,
+                clock=clk,
+                in_flight_slots=in_flight_slots,
+            )
+            adopted_ids = {a.task_id for a in adopted}
+            for adoption in adopted:
+                if notify_callback is not None:
+                    notify_callback(
+                        "info",
+                        f"adopted running worker for task {adoption.task_id} (pid={adoption.pid})",
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "worker_adopted",
+                        {
+                            "task_id": adoption.task_id,
+                            "pid": adoption.pid,
+                            "log_path": adoption.log_path,
+                        },
+                    )
+            if adopted_ids:
+                logger.info(
+                    "adopted %d running worker(s) on startup: %s",
+                    len(adopted_ids),
+                    sorted(adopted_ids),
+                )
+
             # Orphan reconciliation (PR 12): if the previous supervisor
             # exited ungracefully (crash, SIGKILL after TimeoutStopSec, or
             # the bootstrap case of a pre-drain-handler supervisor being
@@ -556,8 +614,11 @@ def start_daemon(
             # SILENT / KILL tasks have already been flagged distinctly;
             # this sweep then handles the remaining HEALTHY-but-orphaned
             # set (recent dispatches that the dead supervisor didn't
-            # have time to mark possibly_hung).
-            snapshot, orphan_ids = reconcile_mod.reconcile_orphans(queue_dir, snapshot)
+            # have time to mark possibly_hung). Adopted tasks (ADR-0025)
+            # are shielded — they have a live worker + monitor thread.
+            snapshot, orphan_ids = reconcile_mod.reconcile_orphans(
+                queue_dir, snapshot, adopted_ids=adopted_ids
+            )
             if orphan_ids:
                 logger.info(
                     "reconciled %d orphan task(s) for session resume: %s",

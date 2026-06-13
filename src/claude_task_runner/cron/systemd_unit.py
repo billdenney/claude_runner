@@ -111,6 +111,26 @@ def _drain_command_from(supervisor_command: str) -> str:
     return supervisor_command.replace(" supervisor start", " supervisor drain") + " --no-wait"
 
 
+def _stop_command_from(supervisor_command: str) -> str:
+    """Derive the ``supervisor stop`` invocation from the ``supervisor start`` one.
+
+    The fast-stop ExecStop used when ``[supervisor].adopt_workers`` is on
+    (ADR-0025): ``supervisor stop`` sends a single SIGTERM and returns,
+    which trips the daemon's fast-stop handler (stop dispatching, exit
+    promptly without joining worker threads). Reuses the same binary
+    path, ``--queue``, and ``--config`` as ExecStart. Falls back to a
+    no-op substring substitution if ``supervisor start`` isn't present.
+    """
+    return supervisor_command.replace(" supervisor start", " supervisor stop")
+
+
+# Short ExecStop timeout for the adoption fast-stop path (ADR-0025).
+# The supervisor exits in well under a second once it stops dispatching;
+# 30s is a generous bound that still lets `systemctl restart` be
+# near-instant instead of waiting out the 4h drain ceiling.
+_ADOPT_TIMEOUT_STOP_SEC = 30
+
+
 def build_unit_text(
     *,
     supervisor_command: str,
@@ -119,7 +139,8 @@ def build_unit_text(
     restart_sec_s: int = 30,
     start_limit_burst: int = 5,
     start_limit_interval_s: int = 600,
-    timeout_stop_sec: int = 14400,
+    timeout_stop_sec: int | None = None,
+    adopt_workers: bool = True,
 ) -> str:
     """Build the ``[Unit]/[Service]/[Install]`` text.
 
@@ -129,27 +150,41 @@ def build_unit_text(
     protection for free; we additionally cap with ``StartLimitBurst``
     so a hopelessly broken supervisor doesn't churn forever.
 
-    Graceful-drain wiring (PR 11):
-      * ``ExecStop`` calls ``supervisor drain --no-wait`` so
-        ``systemctl stop`` / ``restart`` signals SIGUSR1 and lets
-        systemd's own main-PID wait take over. The daemon's drain
-        loop finishes in-flight tasks before exiting cleanly.
-      * ``KillMode=process`` keeps systemd from killing dispatched
-        ``claude`` subprocesses if it ever has to escalate to
-        SIGKILL on the main PID after ``TimeoutStopSec``. Children
-        stay in the unit's cgroup but aren't signalled.
-      * ``TimeoutStopSec`` is generous (default 14400s = 4h, matching
-        ``[task_caps].max_duration_s_per_task``) so a legitimately
-        long in-flight task isn't SIGKILL'd before drain completes.
-        Operators with shorter caps override with ``timeout_stop_sec``.
+    Stop wiring depends on ``adopt_workers`` (ADR-0025):
 
-    For ``systemctl restart``, systemd runs ExecStop, waits for the
-    main PID to exit, and then starts the unit again. For
-    ``systemctl stop``, it runs ExecStop, waits for exit, and stays
-    stopped. ``Restart=on-failure`` covers crashes only — it never
-    fires for an operator-driven stop/restart.
+    * **Adoption ON (default).** ``ExecStop`` calls ``supervisor stop``
+      (a single SIGTERM) so ``systemctl stop`` / ``restart`` trips the
+      daemon's *fast stop*: it stops dispatching and exits promptly
+      without joining worker threads. The file-backed workers keep
+      running as independent processes and the next supervisor adopts
+      them — so ``TimeoutStopSec`` drops to a short bound
+      (:data:`_ADOPT_TIMEOUT_STOP_SEC`) instead of the 4h drain ceiling.
+    * **Adoption OFF.** ``ExecStop`` calls ``supervisor drain --no-wait``
+      (SIGUSR1) and ``TimeoutStopSec`` stays generous (default 14400s =
+      4h, matching ``[task_caps].max_duration_s_per_task``) so the
+      graceful drain can finish the longest in-flight task before exit.
+      This is the historical PR-11 wiring, preserved bit-for-bit.
+
+    In both cases ``KillMode=process`` keeps systemd from signalling the
+    dispatched ``claude`` subprocesses if it ever escalates to SIGKILL
+    on the main PID after ``TimeoutStopSec`` — required for adoption so
+    the surviving workers aren't killed on supervisor stop, and harmless
+    for the drain path. Operators can override ``timeout_stop_sec``
+    explicitly; when left ``None`` it defaults per the mode above.
+
+    For ``systemctl restart``, systemd runs ExecStop, waits for the main
+    PID to exit, then starts the unit again. ``Restart=on-failure``
+    covers crashes only — it never fires for an operator-driven
+    stop/restart.
     """
-    drain_command = _drain_command_from(supervisor_command)
+    if adopt_workers:
+        stop_command = _stop_command_from(supervisor_command)
+        effective_timeout = (
+            timeout_stop_sec if timeout_stop_sec is not None else _ADOPT_TIMEOUT_STOP_SEC
+        )
+    else:
+        stop_command = _drain_command_from(supervisor_command)
+        effective_timeout = timeout_stop_sec if timeout_stop_sec is not None else 14400
     return (
         "[Unit]\n"
         f"Description={description}\n"
@@ -172,15 +207,17 @@ def build_unit_text(
         "Environment=PATH=%h/.local/bin:/usr/local/sbin:"
         "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
         f"ExecStart={supervisor_command}\n"
-        f"ExecStop={drain_command}\n"
+        f"ExecStop={stop_command}\n"
         f"WorkingDirectory={queue_dir}\n"
-        # PR 11: graceful-drain wiring (see docstring).
+        # Stop wiring (see docstring): KillMode=process so dispatched
+        # claude subprocesses are never signalled on supervisor stop —
+        # essential for the adoption path where they must survive.
         "KillMode=process\n"
-        f"TimeoutStopSec={timeout_stop_sec}\n"
+        f"TimeoutStopSec={effective_timeout}\n"
         "Restart=on-failure\n"
         f"RestartSec={restart_sec_s}\n"
         # Don't restart when supervisor exits cleanly (e.g., STOPPED state
-        # or successful drain).
+        # or a successful drain/fast-stop).
         "RestartPreventExitStatus=0\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"
@@ -197,14 +234,23 @@ def build_install_plan(
     unit_path: Path | None = None,
     restart_sec_s: int = 30,
     start_limit_burst: int = 5,
+    adopt_workers: bool = True,
 ) -> SystemdInstallPlan:
-    """Compute what installing the systemd unit will do."""
+    """Compute what installing the systemd unit will do.
+
+    ``adopt_workers`` selects the stop wiring (ADR-0025): True (default)
+    wires the fast-stop ExecStop + short ``TimeoutStopSec``; False keeps
+    the graceful-drain ExecStop + 4h timeout. The CLI passes the queue's
+    ``[supervisor].adopt_workers`` so the generated unit matches the
+    runtime behaviour.
+    """
     target = unit_path if unit_path is not None else systemd_unit_path()
     unit_text = build_unit_text(
         supervisor_command=supervisor_command,
         queue_dir=queue_dir,
         restart_sec_s=restart_sec_s,
         start_limit_burst=start_limit_burst,
+        adopt_workers=adopt_workers,
     )
     enable_command = [
         "systemctl",

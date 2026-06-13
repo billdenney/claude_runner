@@ -87,6 +87,8 @@ this specific phrase to find restarts that orphaned work)."""
 def reconcile_orphans(
     queue_dir: Path,
     snapshot: SupervisorSnapshot,
+    *,
+    adopted_ids: set[str] | None = None,
 ) -> tuple[SupervisorSnapshot, list[str]]:
     """Demote orphan ``"running"`` TaskStates to ``"failed"``.
 
@@ -111,7 +113,16 @@ def reconcile_orphans(
     snapshot
         The just-loaded supervisor snapshot. The function returns a
         copy with stale in-flight fields cleared.
+    adopted_ids
+        Task ids that a prior :func:`supervisor.adoption.adopt_running_workers`
+        pass re-attached to this supervisor (ADR-0025). These have a
+        live worker and a monitor thread; they are ``"running"`` for a
+        legitimate reason and must NOT be demoted. ``None`` / empty set
+        (the default, and the only possibility when
+        ``[supervisor].adopt_workers`` is off) preserves the historical
+        demote-every-running-orphan behaviour.
     """
+    shielded = adopted_ids or set()
     orphan_ids: list[str] = []
     for state_path in list_state_files(queue_dir):
         try:
@@ -124,6 +135,14 @@ def reconcile_orphans(
             )
             continue
         if state.status != "running":
+            continue
+        if state.task_id in shielded:
+            # Adopted by this supervisor — a live worker + monitor thread
+            # own it; demoting would orphan the worker and lose the work.
+            logger.info(
+                "reconcile_orphans: task %s is adopted (live worker); not demoting",
+                state.task_id,
+            )
             continue
         demoted = state.model_copy(
             update={
