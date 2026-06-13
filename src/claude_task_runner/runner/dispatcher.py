@@ -11,16 +11,27 @@ This is the top of the runner stack. It composes:
 
 Subprocess lifecycle:
 
-1. ``run_pre_dispatch`` — abort on non-zero exit.
+1. ``run_pre_dispatch`` — abort with an error RunRecord on non-zero exit.
 2. Build argv via :func:`build_argv` (uses :class:`SpawnPlan`).
-3. ``Popen`` with ``stdout=PIPE`` and line-buffered text mode.
-4. Each line is parsed by :func:`parse_lines`; events update
-   cumulative usage and last-heartbeat time.
+3. ``Popen`` with ``stdout=PIPE``, line-buffered text mode, and
+   ``start_new_session=True`` so a cap-kill can signal the whole
+   process group. The pid is then persisted to state for the
+   silent-orphan reaper, and a background :class:`_DispatcherAliveMonitor`
+   ticks ``dispatcher_alive_at`` independently of event arrival.
+4. Each line is parsed by :func:`parse_lines`, which updates the
+   :class:`StreamSummary` (cumulative usage, session id, final result)
+   as a side effect; every event also refreshes the in-memory
+   last-heartbeat time.
 5. After every event, evaluate :func:`runner.caps.evaluate_caps` and
-   :func:`runner.heartbeat.evaluate`. SIGTERM on cap breach or kill-level
-   silence.
-6. On EOF, build a :class:`RunRecord` from the final ResultEvent.
-7. ``run_post_dispatch`` (warning on failure, never task-failing).
+   :func:`runner.heartbeat.evaluate`; ``_terminate`` (SIGTERM→SIGKILL
+   on the group) fires on cap breach or kill-level silence. The
+   heartbeat is also written back to state, rate-limited to one write
+   per ``heartbeat_persist_interval_s``.
+6. On EOF, drain the remainder (stats-only re-parse), then build a
+   :class:`RunRecord` from the final ResultEvent.
+7. ``_finalize_state`` classifies completed/failed, applies the
+   circuit-breaker and the ADR-0020 output-evidence gate, and persists.
+8. ``run_post_dispatch`` (warning on failure, never task-failing).
 
 The function is **synchronous and blocking** — one subprocess at a
 time. The supervisor calls :func:`dispatch` in a thread (or
@@ -75,6 +86,13 @@ from claude_task_runner.runner.stream import (
 )
 
 logger = logging.getLogger(__name__)
+
+# After this many heartbeat-persist failures within a single dispatch
+# loop, escalate the per-failure log from WARNING to ERROR. One stray
+# failure is a transient hiccup (a momentarily-busy disk); a run of them
+# points at a real, sustained problem (disk full, read-only filesystem)
+# the operator needs to see at ERROR level.
+_HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER = 5
 
 
 class DispatchError(RuntimeError):
@@ -317,7 +335,8 @@ def _resolve_self_user() -> str:
         import pwd
 
         return pwd.getpwuid(os.getuid()).pw_name
-    except Exception:
+    except Exception as exc:
+        logger.debug("self-user lookup failed (%s); treating as unknown", exc)
         return ""
 
 
@@ -405,6 +424,7 @@ def _dispatch_loop(
     last_heartbeat: datetime | None = None
     last_persist_at: datetime | None = None
     persist_interval_s = settings_caps.heartbeat_persist_interval_s
+    heartbeat_persist_failures = 0
 
     assert process.stdout is not None
     for _event in parse_lines(_read_lines(process.stdout), summary=summary):
@@ -429,10 +449,21 @@ def _dispatch_loop(
             try:
                 heartbeat_persist_fn(last_heartbeat)
             except Exception as exc:
-                logger.warning(
-                    "task %s: heartbeat persist failed (%s); continuing",
+                # First few failures are WARNING (likely transient); a
+                # sustained run escalates to ERROR so a real disk problem
+                # isn't lost in a sea of warnings.
+                heartbeat_persist_failures += 1
+                log = (
+                    logger.error
+                    if heartbeat_persist_failures >= _HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER
+                    else logger.warning
+                )
+                log(
+                    "task %s: heartbeat persist failed (%s); continuing "
+                    "[failure %d this dispatch]",
                     task.id,
                     exc,
+                    heartbeat_persist_failures,
                 )
             last_persist_at = last_heartbeat
 
@@ -498,15 +529,43 @@ def _truncate_paths_for_log(paths: list[Path]) -> str:
     return f"{truncated}...]"
 
 
-def _terminate(process: subprocess.Popen[str]) -> None:
-    """Try SIGTERM, escalate to SIGKILL after grace period."""
+def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
+    """Send ``sig`` to the subprocess's whole process group.
+
+    The dispatcher spawns ``claude --print`` with ``start_new_session=True``
+    so the subprocess becomes a session/group leader; signalling the
+    group (rather than just ``process.pid``) reaches the ``claude``
+    process *and* any children it forked (MCP servers, shelled-out
+    ``git``/``Rscript``). Without this a cap-kill would SIGTERM only the
+    parent and leave its children running as orphans.
+
+    A vanished group (``ProcessLookupError``) is benign — the process
+    already exited between our check and the signal. Any other
+    ``OSError`` (e.g. EPERM) is logged rather than swallowed so a
+    genuinely failed signal-send surfaces in the journal.
+    """
     try:
-        process.send_signal(signal.SIGTERM)
+        os.killpg(os.getpgid(process.pid), sig)
+    except ProcessLookupError:
+        # Group already gone; nothing to signal.
+        pass
+    except OSError as exc:
+        logger.error("terminate signal failed pid=%s sig=%s: %s", process.pid, sig, exc)
+
+
+def _terminate(process: subprocess.Popen[str]) -> None:
+    """SIGTERM the subprocess's process group, escalate to SIGKILL.
+
+    Signals the whole group (see :func:`_signal_group`) so children
+    forked by ``claude`` are reaped too. After a 5s grace period the
+    group is SIGKILLed; a ``kill()`` that itself raises ``OSError`` (the
+    group raced away under us) is logged, not swallowed.
+    """
+    _signal_group(process, signal.SIGTERM)
+    try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        process.kill()
-    except OSError:
-        pass
+        _signal_group(process, signal.SIGKILL)
 
 
 def _snapshot_pre_dispatch_sha(working_dir: Path | None) -> str | None:
@@ -817,6 +876,11 @@ def dispatch(
         bufsize=1,
         cwd=str(task.working_dir) if task.working_dir else None,
         env=spawn_env,
+        # New session ⇒ the subprocess is a process-group leader, so a
+        # cap-kill (`_terminate`) can `os.killpg` the whole group and
+        # reap children `claude` forked (MCP servers, shelled-out
+        # git/Rscript). Without this the children survive as orphans.
+        start_new_session=True,
     )
 
     # Record the subprocess pid on the TaskState so the supervisor's
@@ -824,15 +888,26 @@ def dispatch(
     # ungraceful supervisor exit (kill threshold exceeded). The
     # original "status=running" write above didn't carry the pid
     # because Popen hadn't fired yet; do a second atomic write now
-    # the pid is known. Failures are non-fatal — the dispatch
-    # continues without pid-based reaping for this attempt.
+    # the pid is known.
+    #
+    # A failure here means this attempt is *untrackable*: the reaper
+    # can't find the pid to clean up if the supervisor dies ungracefully
+    # mid-run. We do NOT abort the dispatch — the subprocess has already
+    # been spawned, so raising now would either leak the running child
+    # (the very orphan pid-tracking exists to catch) or force us to kill
+    # in-flight work over what is usually a transient disk hiccup.
+    # Instead escalate to ERROR with an unmistakable UNTRACKED-PID marker
+    # so an operator grepping the journal sees that this attempt won't be
+    # reapable by pid.
     if persist_state:
         try:
             new_state = new_state.model_copy(update={"pid": process.pid})
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
         except Exception as exc:
-            logger.warning(
-                "task %s: failed to persist pid=%s for reap tracking: %s",
+            logger.error(
+                "task %s: UNTRACKED-PID — failed to persist pid=%s for reap "
+                "tracking (%s); dispatch continues but this attempt is not "
+                "pid-reapable if the supervisor dies ungracefully",
                 task.id,
                 process.pid,
                 exc,
@@ -904,14 +979,24 @@ def dispatch(
         if alive_monitor is not None:
             alive_monitor.stop()
 
-    # Drain remaining output and stderr.
+    # Drain remaining output and stderr. If the process won't finish
+    # draining within the grace period, SIGKILL its whole group (so any
+    # forked children die too) and drain again. `_signal_group` logs
+    # rather than swallowing an OSError, so a kill that races the
+    # process exiting is still surfaced.
     try:
         stdout_remainder, stderr = process.communicate(timeout=10)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _signal_group(process, signal.SIGKILL)
         stdout_remainder, stderr = process.communicate()
 
-    # Re-parse any remainder lines.
+    # Re-parse any remainder lines. parse_lines updates `summary`
+    # (cumulative usage, session id, final result) as a side effect;
+    # we iterate purely to drive that aggregation. Per-event handling
+    # (heartbeat persist, cap/silence checks) is intentionally NOT
+    # repeated here — the subprocess has already exited, so there is
+    # nothing left to kill and the heartbeat is about to be overwritten
+    # by `_finalize_state`. Remainder parsing is stats-only.
     if stdout_remainder:
         for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
             pass
