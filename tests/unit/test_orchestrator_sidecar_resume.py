@@ -150,17 +150,32 @@ def test_in_flight_task_is_skipped(queue_dir: Path) -> None:
     assert task.id not in {t.id for t in eligible}
 
 
-def test_unparseable_state_file_treated_as_undispatched(queue_dir: Path) -> None:
-    """A state file that can't parse must be ignored (treated as no-state)
-    so the next dispatch attempt overwrites it cleanly. The task should
-    therefore appear in the eligible list."""
+def test_unparseable_state_file_is_skipped_not_dispatched(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A state file that can't parse must cause the task to be SKIPPED, not
+    silently treated as "not yet dispatched".
+
+    Regression for the audit finding: the old ``except Exception: pass``
+    fell through to the eligible list, so a *completed* task with a
+    corrupt state file could be re-dispatched (duplicate work, wasted
+    cap). The fix skips the task and logs the corruption at ERROR so an
+    operator can locate and rebuild the bad file.
+    """
     task = _make_task("t-corrupt-state")
     _write_task_yaml(queue_dir, task)
     state_path_for(queue_dir, task.id).parent.mkdir(parents=True, exist_ok=True)
     state_path_for(queue_dir, task.id).write_text("not yaml: ][[", encoding="utf-8")
     in_flight: dict[str, DispatchSlot] = {}
-    eligible = _eligible_candidates(queue_dir, in_flight, set())
-    assert task.id in {t.id for t in eligible}
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        eligible = _eligible_candidates(queue_dir, in_flight, set())
+    # Corrupt state ⇒ task skipped entirely.
+    assert eligible == []
+    # The corruption is surfaced at ERROR with the offending path.
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert task.id in errors[0].getMessage()
+    assert str(state_path_for(queue_dir, task.id)) in errors[0].getMessage()
 
 
 def test_unmet_depends_on_blocks_dispatch(queue_dir: Path) -> None:

@@ -140,9 +140,10 @@ class Task(_StrictBase):
     """Paths (relative to ``working_dir``) the task is expected to
     produce. Consulted by the dispatcher's output-evidence gate when
     deciding whether a run that exited cleanly actually produced
-    anything externally observable. Empty list means the gate falls
-    back to "new commit on the branch" / "open sidecar" only. See
-    ADR-0020."""
+    anything externally observable. See ADR-0020. Empty list (default)
+    → the output gate falls back to new-commit-on-branch OR
+    open-sidecar. Populate this list for tasks that produce only
+    side-channel artefacts."""
     additional_dirs: list[Path] = Field(default_factory=list)
     """Extra absolute directory paths the dispatched ``claude`` subprocess
     should be allowed to read/write outside its cwd. Each entry is
@@ -178,7 +179,7 @@ class TaskState(_StrictBase):
     status: TaskStatus = "pending"
     session_id: str | None = None
     """Most recent claude session id this task has run under. Used by
-    ``runner.session.resume_or_fresh``."""
+    ``runner.session.plan_next_spawn``."""
     session_account: str | None = None
     """Account name (matches an entry in :class:`AccountSettings`) under
     which the current ``session_id`` was created. The dispatcher must

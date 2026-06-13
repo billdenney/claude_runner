@@ -22,6 +22,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from claude_task_runner.config.schema import (
     AccountPolicy,
     ResolvedAccount,
@@ -107,7 +109,7 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
 
     try:
         return Settings.model_validate(merged)
-    except Exception as exc:
+    except ValidationError as exc:
         raise ConfigError(f"Settings validation failed: {exc}") from exc
 
 
@@ -144,7 +146,7 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     _reject_legacy_throttle(payload, str(path))
     try:
         return AccountPolicy.model_validate(payload)
-    except Exception as exc:
+    except ValidationError as exc:
         raise ConfigError(f"Per-account policy validation failed for {path}: {exc}") from exc
 
 

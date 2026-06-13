@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import os
 import shutil
 from datetime import datetime
@@ -31,6 +32,8 @@ import pexpect
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import UsageSettings
 from claude_task_runner.usage.drift import UsageCaptureSpawnError, UsageCaptureTimeout
+
+logger = logging.getLogger(__name__)
 
 
 def _format_filename(when: datetime) -> str:
@@ -324,10 +327,21 @@ def capture(
         return raw_full, capture_path
 
     best = (-1, candidates[-1][1])  # (n_blocks, raw) — start with full
-    for _, candidate in candidates:
+    for label, candidate in candidates:
         try:
             blocks = _parser._extract_blocks(_render.render(candidate))
         except Exception:
+            # A candidate that can't be rendered/parsed is skipped in
+            # favour of the others; log which one (and why) so a total
+            # parse failure leaves a forensic trail in the .cap file's
+            # vicinity instead of vanishing silently.
+            logger.debug(
+                "usage capture: snapshot %r (%d bytes, %s) failed to parse; skipping",
+                label,
+                len(candidate),
+                capture_path.name,
+                exc_info=True,
+            )
             continue
         n = len(blocks)
         if n >= 2:

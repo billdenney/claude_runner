@@ -378,6 +378,99 @@ def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
     busy_thread.join(timeout=2)
 
 
+@pytest.mark.parametrize("target", [1, 2, 3, 5])
+def test_tick_dispatch_no_dispatch_at_exact_capacity_boundary(queue_dir: Path, target: int) -> None:
+    """Boundary of ``available = max(0, target - in_flight_count)``.
+
+    When ``in_flight_count == target`` the available-slot count is
+    exactly 0 and the loop must short-circuit before any dispatch —
+    even though there is a pending, eligible task waiting. The existing
+    ``test_tick_dispatch_respects_in_flight_capacity`` only pins
+    ``target == 1``; this parametrization exercises the equality edge
+    for several targets so an off-by-one in the subtraction (e.g.
+    ``target - count + 1``) is caught.
+    """
+    settings = _make_settings(initial=target, max_c=target)
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    # A pending task that WOULD be eligible if any slot were free.
+    _make_task(queue_dir, "pending-but-blocked")
+
+    # Fill in_flight to exactly `target` with live (busy) threads.
+    stop_evt = threading.Event()
+    busy_threads: list[threading.Thread] = []
+    in_flight: dict[str, DispatchSlot] = {}
+    for i in range(target):
+        th = threading.Thread(target=lambda: stop_evt.wait(timeout=5), daemon=True)
+        th.start()
+        busy_threads.append(th)
+        in_flight[f"busy-{i}"] = _slot(f"busy-{i}", th)
+    assert len(in_flight) == target
+
+    try:
+        with patch(
+            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch"
+        ) as mock_dispatch:
+            tick_dispatch(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                snapshot=snap,
+                in_flight_slots=in_flight,
+                accounts=_resolved(cap=target),
+            )
+        # available == 0 → no dispatch, in_flight unchanged.
+        mock_dispatch.assert_not_called()
+        assert set(in_flight.keys()) == {f"busy-{i}" for i in range(target)}
+    finally:
+        stop_evt.set()
+        for th in busy_threads:
+            th.join(timeout=2)
+
+
+def test_tick_dispatch_dispatches_exactly_one_below_capacity_boundary(
+    queue_dir: Path,
+) -> None:
+    """One slot below target (``in_flight == target - 1``) → exactly one dispatch.
+
+    The complement of the equality boundary above: confirms the
+    short-circuit is at ``available == 0`` and not one slot too early.
+    """
+    target = 3
+    settings = _make_settings(initial=target, max_c=target)
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    _make_task(queue_dir, "newcomer")
+
+    stop_evt = threading.Event()
+    busy_threads: list[threading.Thread] = []
+    in_flight: dict[str, DispatchSlot] = {}
+    for i in range(target - 1):  # one slot free
+        th = threading.Thread(target=lambda: stop_evt.wait(timeout=5), daemon=True)
+        th.start()
+        busy_threads.append(th)
+        in_flight[f"busy-{i}"] = _slot(f"busy-{i}", th)
+
+    try:
+        with patch(
+            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+            return_value=None,
+        ):
+            tick_dispatch(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                snapshot=snap,
+                in_flight_slots=in_flight,
+                accounts=_resolved(cap=target),
+            )
+        assert "newcomer" in in_flight
+        assert len(in_flight) == target
+        in_flight["newcomer"].thread.join(timeout=2)
+    finally:
+        stop_evt.set()
+        for th in busy_threads:
+            th.join(timeout=2)
+
+
 def test_tick_dispatch_reaps_before_evaluating_capacity(queue_dir: Path) -> None:
     """A dead thread in in_flight is reaped before computing free slots."""
     settings = _make_settings(initial=1, max_c=1)

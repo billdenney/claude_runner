@@ -11,6 +11,7 @@ from running.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -40,6 +41,8 @@ from claude_task_runner.runner import ema as ema_mod
 from claude_task_runner.runner.ema import EMAFileError
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
+
+logger = logging.getLogger(__name__)
 
 
 class CheckStatus(StrEnum):
@@ -203,12 +206,22 @@ def _looks_like_legacy_default(acct: object, legacy_config_dir: str) -> bool:
 
 
 def _current_username() -> str:
-    """Return the supervisor's own Linux username; empty if unknown."""
+    """Return the supervisor's own Linux username; empty if unknown.
+
+    Best-effort: the username is only used to render advisory text in
+    ``check_account_sudo`` (the suggested sudoers snippet) and to skip
+    same-user sudo probes. A lookup failure (no ``pwd`` module on a
+    non-POSIX host, an unmapped uid in a container) must not abort the
+    doctor run, so we fall back to an empty string. The failure is
+    logged at DEBUG so an operator chasing a "<unknown>" in the sudo
+    remediation can see why.
+    """
     try:
         import pwd
 
         return pwd.getpwuid(os.getuid()).pw_name
-    except Exception:
+    except Exception as exc:
+        logger.debug("could not resolve current username: %s", exc)
         return ""
 
 
@@ -631,6 +644,40 @@ def check_queue_layout(_settings: Settings, queue_dir: Path) -> CheckResult:
         name="queue_layout",
         status=CheckStatus.PASS,
         detail=str(queue_dir),
+    )
+
+
+def check_legacy_runner_dir(_settings: Settings, queue_dir: Path) -> CheckResult:
+    """WARN when a pre-v2 ``<queue>/.claude_runner/`` directory lingers.
+
+    ADR-0007 ("fresh schema, no migration") moved all runtime state to
+    ``<queue>/.claude_task_runner/`` and deliberately left any old
+    ``.claude_runner/`` directory in place untouched as historical
+    reference. The runner never reads it, so it's harmless — but an
+    operator migrating from v1 may be confused that the old tasks don't
+    show up, and the stale directory just accumulates cruft. This LOW-
+    priority check surfaces its presence and suggests archiving or
+    deleting it once the operator has confirmed nothing there is needed.
+
+    PASS when no legacy directory exists (the steady state).
+    """
+    legacy = queue_dir / ".claude_runner"
+    if not legacy.exists():
+        return CheckResult(
+            name="legacy_runner_dir",
+            status=CheckStatus.PASS,
+            detail="no legacy .claude_runner/ directory",
+        )
+    return CheckResult(
+        name="legacy_runner_dir",
+        status=CheckStatus.WARN,
+        detail=(f"legacy pre-v2 directory present: {legacy} (ignored by the runner; see ADR-0007)"),
+        remediation=(
+            "The current runner stores all state under "
+            f"{queue_dir / '.claude_task_runner'}; the old {legacy} is never "
+            "read. Once you've confirmed nothing there is needed, archive or "
+            f"delete it:\n  mv {legacy} {legacy}.archived\n  # or: rm -rf {legacy}"
+        ),
     )
 
 
@@ -1065,17 +1112,26 @@ def check_watchdog_installed(settings: Settings) -> CheckResult:
     """Either a systemd unit or a cron managed-block should exist."""
     systemd_present = systemd_mod.systemd_unit_path().exists()
 
-    # Try to read the crontab non-destructively. If `crontab(1)` is
-    # missing, that's an environment limitation rather than a runner
-    # failure, so WARN rather than FAIL.
+    # Try to read the crontab non-destructively. ``crontab_l`` already
+    # distinguishes "no crontab" (returns "") from a real failure
+    # (raises CrontabError — e.g. crontab(1) missing, or `crontab -l`
+    # erroring for a reason other than an empty crontab). We must
+    # preserve that distinction here: a CrontabError means we could NOT
+    # determine whether a cron watchdog exists, which is an operational
+    # issue, NOT evidence that no watchdog is installed.
     cron_present = False
-    try:
-        from claude_task_runner.cron.install import BLOCK_RE, crontab_l
+    cron_probe_error: str | None = None
+    from claude_task_runner.cron.install import BLOCK_RE, CrontabError, crontab_l
 
+    try:
         existing = crontab_l()
         cron_present = BLOCK_RE.search(existing) is not None
-    except Exception:
-        pass
+    except CrontabError as exc:
+        cron_probe_error = str(exc)
+        logger.debug("crontab probe failed: %s", exc)
+    except Exception as exc:  # pragma: no cover — defensive, crontab_l raises CrontabError
+        cron_probe_error = f"{type(exc).__name__}: {exc}"
+        logger.debug("unexpected error probing crontab: %s", exc)
 
     if systemd_present or cron_present:
         kind = "systemd" if systemd_present else "cron"
@@ -1086,6 +1142,28 @@ def check_watchdog_installed(settings: Settings) -> CheckResult:
         )
 
     preferred = settings.supervisor.preferred_init_system
+
+    # No systemd unit, and the cron side could not be inspected. Don't
+    # claim "no watchdog" — we genuinely don't know whether a cron
+    # watchdog is present. Surface the probe failure so the operator
+    # chases the real problem (e.g. crontab(1) not on PATH) rather than
+    # re-running `install` against a host that already has a cron entry.
+    if cron_probe_error is not None:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                "no systemd unit; could not inspect crontab to confirm a cron "
+                f"watchdog ({cron_probe_error})"
+            ),
+            remediation=(
+                "Resolve the crontab access issue above (is `crontab` on PATH "
+                "for this user?), then re-run `claude-task-runner doctor`. If no "
+                f"watchdog is installed, run `claude-task-runner install --queue "
+                f"<PATH>` (preferred init: {preferred})."
+            ),
+        )
+
     return CheckResult(
         name="watchdog_installed",
         status=CheckStatus.WARN,
@@ -1125,6 +1203,7 @@ def all_checks(
         lambda: check_queue_perms_for_linux_users(settings, queue_dir),
         lambda: check_global_lock(settings),
         lambda: check_queue_layout(settings, queue_dir),
+        lambda: check_legacy_runner_dir(settings, queue_dir),
         lambda: check_task_yamls(settings, queue_dir),
         lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
         lambda: check_working_dir_template(settings, queue_dir),

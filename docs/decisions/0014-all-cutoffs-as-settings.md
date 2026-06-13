@@ -13,10 +13,21 @@ requires a code change.
 
 ## Decision
 
-**No magic numbers in runtime code paths.** Every threshold, timeout,
-window size, percentile multiplier, retry cap, etc. lives in
+**No magic numbers for behavior-affecting constants.** Every value that
+changes *what the runner does* — thresholds, timeouts, window sizes,
+percentile multipliers, retry caps, etc. — lives in
 `claude_task_runner/config/defaults/settings.toml`. Per-queue
 `claude_runner.toml` overrides any default.
+
+**Scope — cosmetic constants are excluded.** This rule governs cutoffs and
+tunables that affect dispatch, throttling, retries, or any observable
+behavior. It does *not* extend to purely cosmetic presentation constants
+that have no effect on what the runner does — e.g. a log-string truncation
+width such as `_MAX_ADD_DIRS_LOG_CHARS = 300` in `runner/dispatcher.py`,
+which only bounds how much of an `--add-dir` list is echoed into a log
+line. Such a value is a formatting detail, not a cutoff; promoting it to a
+setting would add config surface with no operational benefit. Keep these as
+named module-level constants (never bare literals) so they stay greppable.
 
 `claude-task-runner config show` prints the merged effective config.
 `claude-task-runner config validate` checks the TOML against the schema

@@ -15,6 +15,15 @@ nothing is actually monitoring it. Worse, the orchestrator's
 ``"running"`` — so the new supervisor SKIPS those tasks forever,
 even though they're not really running. They're stranded.
 
+Division of labour, so this isn't read as "``running`` tasks are
+never reconciled": ``running`` TaskStates are handled by
+:mod:`supervisor.reconcile_silent` (a startup pass plus a per-tick
+reaper that grades each by heartbeat silence) and by this module's
+:func:`reconcile_orphans` (startup only). Both turn a stuck
+``running`` into ``failed``; only then does the orchestrator's
+steady-state loop — which covers ``pending`` / ``failed`` via
+``_DISPATCHABLE_STATUSES`` — pick the task back up.
+
 This module's :func:`reconcile_orphans` demotes those orphan tasks
 to ``"failed"`` so the orchestrator's normal re-dispatch flow picks
 them up. Crucially, ``TaskState.session_id`` is preserved across the

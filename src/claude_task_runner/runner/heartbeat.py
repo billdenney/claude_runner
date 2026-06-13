@@ -1,9 +1,13 @@
 """Stream-json silence detection for hung-task surfacing.
 
 Replaces the existing 2h "likely_stale" heuristic with a configurable
-fast-path. The dispatcher updates ``last_heartbeat_at`` on every
-stream-json event it receives; this module's pure functions decide
-whether silence has crossed the alert/kill thresholds.
+fast-path. The dispatcher refreshes an in-memory heartbeat on every
+stream-json event it parses and feeds that value to :func:`evaluate`
+each iteration; the persisted ``last_heartbeat_at`` state field it
+writes from the same value is rate-limited to one write per
+``heartbeat_persist_interval_s`` (so a chatty subprocess doesn't thrash
+the filesystem). This module's pure functions decide whether silence
+has crossed the alert/kill thresholds.
 
 Settings come from ``[task_caps]``:
 

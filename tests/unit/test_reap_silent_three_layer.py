@@ -632,3 +632,64 @@ def test_steady_silent_stop_reason_used_when_no_fs_evidence(tmp_path: Path) -> N
     reloaded = load_state(state_path_for(qd, "t-stale-fs"))
     assert reloaded.status == "possibly_hung"
     assert reloaded.stop_reason == STEADY_SILENT_STOP_REASON
+
+
+def test_fs_refresh_recheck_failure_treated_as_healthy_not_demoted(tmp_path: Path) -> None:
+    """When the Layer-3 FS check confirms recent activity but the
+    pre-write recheck-load then fails (the state file got corrupted /
+    partially written between the FS walk and the refresh write), the
+    reaper must NOT demote — the task was just proven HEALTHY by the
+    filesystem, so it's left untouched with no reap result.
+
+    Exercises the ``recheck_failed`` branch of ``DemoteOutcome`` on the
+    FS-refresh path: a recheck fault is distinct from a benign
+    dispatcher finalize, but both correctly yield "HEALTHY this pass".
+    Determinism: the state YAML is corrupted from inside ``fs_mtime_fn``,
+    which the reaper calls immediately before the refresh write's
+    recheck-load — so the recheck-load is guaranteed to hit invalid
+    YAML."""
+    qd = _queue(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    started = _now() - timedelta(seconds=3600)
+    stale_hb = _now() - timedelta(seconds=2000)  # KILL band absent kill cap
+    sp = state_path_for(qd, "t-fs-recheck-fail")
+    _seed_task_and_state(
+        qd,
+        "t-fs-recheck-fail",
+        started_at=started,
+        last_heartbeat_at=stale_hb,
+        dispatcher_alive_at=None,
+        pid=55,
+        working_dir=work,
+    )
+
+    fresh_mtime_unix = (_now() - timedelta(seconds=60)).timestamp()
+
+    def stub_mtime_then_corrupt(_path: Path) -> float | None:
+        # Report fresh activity (forces the refresh path), then corrupt
+        # the state file so the refresh write's recheck-load raises.
+        sp.write_text("not: valid: yaml: ][", encoding="utf-8")
+        return fresh_mtime_unix
+
+    calls: list[int] = []
+
+    def recorder(pid: int) -> bool:
+        calls.append(pid)
+        return True
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-fs-recheck-fail"},
+        settings=_settings(alert=300, kill=900, fs_window=600),
+        clock=FakeClock(_now()),
+        sigterm_fn=recorder,
+        fs_mtime_fn=stub_mtime_then_corrupt,
+    )
+
+    # FS proved activity → HEALTHY this pass → no reap result, no SIGTERM.
+    assert results == []
+    assert calls == []
+    # The corrupt file was NOT overwritten with a demotion; the reaper
+    # stood down and left it for a later pass / operator inspection.
+    assert sp.read_text(encoding="utf-8") == "not: valid: yaml: ]["

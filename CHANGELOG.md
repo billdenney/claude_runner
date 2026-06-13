@@ -9,6 +9,38 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Audit remediation — bug-class findings (full-codebase triage,
+  2026-06-13, branch `audit/full-codebase-2026-06`).**
+  - **Dispatcher orphan-child leak:** the `claude --print` subprocess is now
+    spawned with `start_new_session=True`, and cap/heartbeat terminations
+    signal the whole process group (`os.killpg`, SIGTERM→SIGKILL), so MCP and
+    tool grandchild processes no longer survive a cap kill. Signal-send and
+    post-timeout `kill()` failures are now logged instead of silently
+    swallowed, and a failed subprocess-PID persist escalates to ERROR with an
+    `UNTRACKED-PID` marker (was a quiet WARNING).
+  - **Corrupt-state re-dispatch:** an unparseable task state file is no longer
+    treated as "not yet dispatched" — the orchestrator and force-dispatch
+    paths log an error and skip it, so a completed task can't be re-dispatched.
+  - **Watchdog `--config` now forwarded** to the supervisor that `watchdog
+    tick` spawns, so the watchdog's policy and the live supervisor's policy
+    can't silently diverge.
+  - **Multi-account usage source no longer mutates caught exceptions** — a
+    dedicated, type-preserving `MultiAccountSourceError` carries the account
+    context while keeping the supervisor's exception-type routing intact.
+  - Hardened error handling across the supervisor daemon, queue store, CLI
+    commands and config loaders (narrowed broad `except` clauses, added
+    missing log context).
+
+### Removed
+
+- **Dead configuration removed (audit 2026-06-13).** Deleted five settings
+  sections with zero readers — `[notify]`, `[metrics]`, `[ui]`, `[sidecar]`,
+  `[fixtures]` — plus the unread `[supervisor].sigterm_grace_s` and
+  `[supervisor].dry_run` fields and the never-raised `QueueLayoutError`, so
+  operators can no longer populate options that silently do nothing.
+
 ### Added
 
 - **Three-layer heartbeat: separate `dispatcher_alive_at` field and
@@ -70,6 +102,16 @@ Breaking changes are called out in the version notes.
   the FS walk from running in the common HEALTHY case). An integration
   test in `tests/integration/test_dispatcher.py` asserts the field
   lands in the YAML during a normal dispatch.
+
+- **Supervisor tick-failure outage detection (audit 2026-06-13).**
+  Consecutive force-dispatch / reap / dispatch-tick failures are now counted;
+  a sustained dispatch outage escalates to a prominent ERROR plus a
+  `supervisor_dispatch_outage` event instead of the supervisor looking alive
+  while never dispatching. Queue YAML loads are size-bounded to guard against
+  pathological inputs hanging a tick. Adds regression coverage for the
+  SIGTERM→SIGKILL escalation, corrupt-state skipping, drain-to-exit,
+  all-accounts-exhausted, per-account reading isolation, state-machine
+  IDLE/STOPPED invariants, and the silent-reaper TOCTOU race.
 
 ### Fixed
 

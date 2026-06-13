@@ -137,6 +137,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import TaskCapsSettings
@@ -173,6 +174,32 @@ whether the orphan came from a supervisor restart (the original
 PR #55 case) or from a silent-but-alive subprocess inside a live
 supervisor (the 2026-06-12 ``frompeople-680-yu_2017`` case). Both
 demote to ``possibly_hung``; only the audit trail differs."""
+
+
+DemoteOutcome = Literal["demoted", "toctou_skipped", "recheck_failed", "write_failed"]
+"""Outcome of an attempted state-YAML write by :func:`_demote_if_still_running`.
+
+Callers branch on this deliberately rather than collapsing every
+non-write into a single boolean ``False`` (the pre-audit shape, which
+conflated "the dispatcher legitimately finalized" with "we couldn't
+re-read the state to check"):
+
+* ``"demoted"`` — the write landed; the transition is authoritative.
+* ``"toctou_skipped"`` — the recheck saw ``status != "running"``; a
+  concurrent dispatcher finalize won the race and we correctly stood
+  down. Expected, benign.
+* ``"recheck_failed"`` — the pre-write recheck-load itself raised
+  (corrupt / partially-written state file). We did NOT write. Distinct
+  from ``"toctou_skipped"`` because the cause is an I/O / parse fault,
+  not a benign race — the FS-refresh path logs it differently so a
+  recurring corruption doesn't masquerade as a steady stream of
+  dispatcher finalizes.
+* ``"write_failed"`` — the recheck (if any) passed but
+  ``write_state_atomic`` raised. Logged at ERROR.
+
+Only ``"demoted"`` represents a state change; the other three leave the
+on-disk state untouched and the caller produces no :class:`ReapResult`.
+"""
 
 
 @dataclass(frozen=True)
@@ -618,11 +645,16 @@ def _classify_and_act(
         }
     )
 
-    if not _demote_if_still_running(
+    outcome = _demote_if_still_running(
         state_path,
         demoted,
         require_recheck=recheck_running_before_write,
-    ):
+    )
+    if outcome != "demoted":
+        # "toctou_skipped" (dispatcher finalized first), "recheck_failed"
+        # (corrupt state — we conservatively don't clobber), or
+        # "write_failed" (already logged at ERROR). None of these wrote
+        # the demotion, so produce no ReapResult.
         return None
 
     logger.info(
@@ -714,10 +746,29 @@ def _maybe_refresh_from_filesystem(
     mtime_dt = datetime.fromtimestamp(latest_mtime, tz=UTC)
     refreshed = state.model_copy(update={"last_heartbeat_at": mtime_dt})
 
-    if not _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck):
-        # TOCTOU lost — the dispatcher's finalize wrote first. That's
-        # fine; we're not demoting anyway. Return True so the caller
-        # treats this as HEALTHY (no reap result).
+    outcome = _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck)
+    if outcome != "demoted":
+        # The refresh write didn't land, but the FS check already
+        # proved recent activity — so the task is HEALTHY for THIS pass
+        # regardless: return True (no reap result). We still log per
+        # outcome so a corrupt-state recheck fault doesn't masquerade as
+        # a benign dispatcher finalize.
+        if outcome == "recheck_failed":
+            logger.warning(
+                "silent-orphan reaper: %s: FS activity within %.0fs but recheck-load "
+                "failed; skipping last_heartbeat_at refresh, treating as HEALTHY this pass",
+                state.task_id,
+                settings.zombie_verify_fs_activity_window_s,
+            )
+        else:
+            # "toctou_skipped" (dispatcher finalized first) or
+            # "write_failed" (already logged at ERROR). Either way the
+            # refresh is moot; treat as HEALTHY.
+            logger.debug(
+                "silent-orphan reaper: %s: FS-refresh write skipped (%s); treating as HEALTHY",
+                state.task_id,
+                outcome,
+            )
         return True
 
     logger.info(
@@ -735,7 +786,7 @@ def _demote_if_still_running(
     demoted: TaskState,
     *,
     require_recheck: bool,
-) -> bool:
+) -> DemoteOutcome:
     """Persist ``demoted`` to ``state_path`` if safe.
 
     When ``require_recheck`` is True (per-tick path), re-load the state
@@ -750,8 +801,10 @@ def _demote_if_still_running(
     dispatcher exists, so we write unconditionally — matching the
     pre-existing reconcile_silent_orphans semantics.
 
-    Returns ``True`` iff the demotion was written. Logs and returns
-    ``False`` on either a TOCTOU skip or a write failure.
+    Returns a :data:`DemoteOutcome` so callers can branch deliberately
+    instead of collapsing a benign TOCTOU race, a corrupt-state recheck
+    fault, and a failed write into one ambiguous ``False`` (the
+    pre-audit shape). ``"demoted"`` is the only outcome that wrote.
     """
     if require_recheck:
         try:
@@ -762,7 +815,7 @@ def _demote_if_still_running(
                 state_path,
                 exc,
             )
-            return False
+            return "recheck_failed"
         if current.status != "running":
             logger.info(
                 "silent-orphan reaper: %s status changed to %s between "
@@ -770,7 +823,7 @@ def _demote_if_still_running(
                 demoted.task_id,
                 current.status,
             )
-            return False
+            return "toctou_skipped"
 
     try:
         write_state_atomic(demoted, state_path)
@@ -781,28 +834,48 @@ def _demote_if_still_running(
             state_path,
             exc,
         )
-        return False
-    return True
+        return "write_failed"
+    return "demoted"
 
 
 def _default_sigterm(pid: int) -> bool:
     """Best-effort SIGTERM. Returns ``True`` iff the signal was delivered.
 
-    ProcessLookupError (pid already gone) and PermissionError (pid
-    owned by another user, e.g. a Linux-user dispatch under sudo)
-    both return ``False`` without raising — the reaper logs the kill
-    attempt either way, and the state flip happens regardless.
+    Caller-facing contract: a ``False`` return means "the supervisor
+    could not signal this pid" — it does NOT mean "the process is
+    gone". The two failure modes are deliberately distinguished:
+
+    * ``ProcessLookupError`` (ESRCH) — the pid is genuinely gone. A
+      ``False`` here is the only case where the process is known-dead.
+    * ``PermissionError`` (EPERM) / other ``OSError`` — the supervisor
+      lacks permission to signal (e.g. the pid is owned by another
+      user after a Linux-user dispatch under sudo, or the supervisor
+      dropped privilege). The process state is UNKNOWN and very likely
+      still alive; we just couldn't reach it. These are logged at
+      WARNING so the operator can see the failed kill on diagnosis.
+
+    Either way the caller flips the state to ``failed`` (see the
+    ``ReapResult.sigtermed`` docstring and ``_classify_and_act``):
+    the demotion is unconditional, and ``sigtermed`` records whether
+    the signal actually landed so the operator can tell a clean kill
+    (``sigtermed=True``) from a could-not-signal demotion
+    (``sigtermed=False`` — pid may still be running and need a manual
+    ``kill``).
     """
     try:
         os.kill(pid, signal.SIGTERM)
         return True
     except ProcessLookupError:
+        # ESRCH — pid is genuinely gone; the only known-dead case.
         return False
     except PermissionError as exc:
-        logger.warning("SIGTERM of pid=%s denied: %s", pid, exc)
+        # EPERM — could not signal; the process is very likely still
+        # alive. Surface at WARNING so the operator sees it.
+        logger.warning("SIGTERM of pid=%s denied (EPERM); process may still be alive: %s", pid, exc)
         return False
     except OSError as exc:
-        logger.warning("SIGTERM of pid=%s failed: %s", pid, exc)
+        # Any other OSError — state unknown; assume still alive.
+        logger.warning("SIGTERM of pid=%s failed; process state unknown: %s", pid, exc)
         return False
 
 

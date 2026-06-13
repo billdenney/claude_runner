@@ -118,6 +118,24 @@ def test_count_in_flight_skips_unparseable_state(queue_dir: Path, monkeypatch) -
     assert _count_in_flight(queue_dir) == 0
 
 
+def test_count_in_flight_warns_on_unparseable_state(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Audit finding 3: skipping an unparseable state file must leave a
+    trace — a WARNING that names the offending path — rather than being
+    swallowed entirely."""
+    _make_task(queue_dir, "t1")
+    sp = state_path_for(queue_dir, "t1")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("not yaml: ][ broken\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="claude_task_runner.cli.supervisor_cmd"):
+        assert _count_in_flight(queue_dir) == 0
+    assert any(
+        record.levelname == "WARNING" and str(sp) in record.getMessage()
+        for record in caplog.records
+    ), caplog.text
+
+
 # ---------------------------------------------------------------------------
 # `stop` command
 # ---------------------------------------------------------------------------

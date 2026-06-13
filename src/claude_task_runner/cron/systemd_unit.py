@@ -18,10 +18,13 @@ to cron. Detection is in :func:`is_systemd_user_available`.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 UNIT_NAME = "claude-task-runner"
 """systemd unit name; appended to ``~/.config/systemd/user/`` as
@@ -267,9 +270,12 @@ def uninstall(
     """Disable + stop the unit and remove its file. Returns True if the
     unit existed and was removed; False if there was nothing to do.
 
-    Errors during ``disable``/``stop`` are tolerated (the unit may
-    already be gone), but failure to remove an existing unit file
-    raises.
+    Errors during ``disable``/``daemon-reload`` are tolerated (the unit
+    may already be gone) but no longer silent: a non-zero return code is
+    logged at WARNING with the failing command and stderr. A silent
+    ``disable`` failure would otherwise leave the unit enabled/active
+    even though the operator asked to uninstall it. Failure to remove an
+    existing unit file still raises (via ``unlink``).
     """
     target = unit_path if unit_path is not None else systemd_unit_path()
     existed = target.exists()
@@ -278,7 +284,14 @@ def uninstall(
             [systemctl_executable, "--user", "disable", "--now", f"{UNIT_NAME}.service"],
             [systemctl_executable, "--user", "daemon-reload"],
         ):
-            subprocess.run(argv, capture_output=True, text=True, check=False)
+            proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                logger.warning(
+                    "systemctl uninstall step %r returned %d: %s",
+                    " ".join(argv),
+                    proc.returncode,
+                    (proc.stderr or "").strip(),
+                )
     if existed:
         target.unlink()
     return existed

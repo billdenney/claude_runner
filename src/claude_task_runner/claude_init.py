@@ -99,6 +99,10 @@ def ensure_initialized(
     # Atomic write: rename onto the target preserves either old or new
     # for any concurrent reader. The 0o600 chmod mirrors what claude
     # writes (the existing file is mode 600 in observed installations).
+    # ADR-0019: this write can race with concurrent writes by ``claude``
+    # itself; we accept last-writer-wins (the onboarding/trust flags are
+    # sticky, so a lost race self-heals on the next spawn). See
+    # docs/decisions/0019-pre-init-claude-config-before-spawn.md.
     tmp = config_file.with_name(config_file.name + ".tmp")
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))

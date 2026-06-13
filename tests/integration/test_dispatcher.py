@@ -8,9 +8,11 @@ itself.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -27,6 +29,7 @@ from claude_task_runner.queue.store import (
     queue_runtime_dir,
     state_path_for,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import (
     DispatchError,
     build_argv,
@@ -553,3 +556,156 @@ class TestOutputEvidenceGate:
         )
         assert outcome.new_state.status == "completed"
         assert outcome.run_record.stop_reason == "end_turn"
+
+
+class TestOutputGateSkippedWithoutWorkingDir:
+    """Coverage B (audit dispatcher.py:986): a research-style task with
+    ``working_dir is None`` must complete WITHOUT ever calling the
+    output-evidence gate. The existing output-gate unit test asserts the
+    *outcome* (status=completed); this asserts the stronger property the
+    audit asked for — that ``_verify_output_evidence`` is never invoked,
+    so the legacy non-worktree path is provably bypassed end-to-end
+    through ``dispatch()`` against the shim."""
+
+    def test_research_task_completes_without_gate_firing(
+        self,
+        queue_dir: Path,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-research")
+        research_task = Task(
+            id="700-research",
+            title="Research only",
+            prompt="Summarize the literature",
+            working_dir=None,  # no worktree anchor → gate must be skipped
+        )
+        plan = fresh_plan.__class__(
+            strategy=ResumeStrategy.FRESH,
+            session_id=None,
+            prompt=research_task.prompt,
+            extra_args=[],
+        )
+
+        with mock.patch.object(
+            dispatcher_mod,
+            "_verify_output_evidence",
+            side_effect=AssertionError("gate must not fire for working_dir=None"),
+        ) as gate:
+            outcome = dispatch(
+                task=research_task,
+                state=TaskState(task_id=research_task.id),
+                plan=plan,
+                queue_dir=queue_dir,
+                clock=RealClock(),
+                settings_caps=_caps(),
+                settings_session=_session(),
+                settings_hooks=_hooks(),
+                claude_executable=str(SHIM_PATH),
+            )
+
+        gate.assert_not_called()
+        # The clean ``end_turn`` exit is honoured as completed, exactly
+        # as the legacy non-worktree path did before ADR-0020.
+        assert outcome.new_state.status == "completed"
+        assert outcome.run_record.stop_reason == "end_turn"
+
+
+class TestSpawnUsesNewSession:
+    """BUG #2 (orphan-child leak): the dispatcher must spawn the
+    ``claude`` subprocess with ``start_new_session=True`` so a cap-kill
+    can ``os.killpg`` the whole process group and reap children the
+    agent forked. Without the new session the subprocess shares the
+    supervisor's group and a group-kill would be unsafe / ineffective."""
+
+    def test_popen_called_with_start_new_session(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-newsess")
+
+        real_popen = dispatcher_mod.subprocess.Popen
+        captured: dict[str, object] = {}
+
+        def _spy_popen(*args: object, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return real_popen(*args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(dispatcher_mod.subprocess, "Popen", side_effect=_spy_popen):
+            outcome = dispatch(
+                task=task,
+                state=TaskState(task_id=task.id),
+                plan=fresh_plan,
+                queue_dir=queue_dir,
+                clock=RealClock(),
+                settings_caps=_caps(),
+                settings_session=_session(),
+                settings_hooks=_hooks(),
+                claude_executable=str(SHIM_PATH),
+            )
+
+        assert captured.get("start_new_session") is True
+        # Sanity: the real subprocess still ran to completion.
+        assert outcome.new_state.status == "completed"
+
+
+class TestPidPersistFailureSurfaces:
+    """BUG #5 (PID-persist failure under-logged): when the second
+    state write (the one that records the subprocess pid for the
+    silent-orphan reaper) fails, the dispatch must NOT abort — the
+    subprocess is already running — but it must escalate to an ERROR
+    log carrying an unmistakable ``UNTRACKED-PID`` marker so an operator
+    can grep for attempts that won't be pid-reapable."""
+
+    def test_pid_write_failure_logs_error_and_continues(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-untracked")
+
+        # Fail exactly the first pid-recording write (a transient disk
+        # hiccup). The status=running write before it and every write
+        # after it succeed, so this isolates the pid-persist failure
+        # path without breaking the rest of dispatch.
+        real_write = dispatcher_mod.write_state_atomic
+        state_holder = {"pid_write_failed": False}
+
+        def _selective_write(state: object, path: object) -> None:
+            if getattr(state, "pid", None) is not None and not state_holder["pid_write_failed"]:
+                state_holder["pid_write_failed"] = True
+                raise OSError("simulated disk full on pid write")
+            real_write(state, path)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(dispatcher_mod, "write_state_atomic", side_effect=_selective_write),
+            caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
+        ):
+            outcome = dispatch(
+                task=task,
+                state=TaskState(task_id=task.id),
+                plan=fresh_plan,
+                queue_dir=queue_dir,
+                clock=RealClock(),
+                settings_caps=_caps(),
+                settings_session=_session(),
+                settings_hooks=_hooks(),
+                claude_executable=str(SHIM_PATH),
+            )
+
+        # Dispatch continued to a normal completion despite the failed
+        # pid write.
+        assert outcome.new_state.status == "completed"
+        error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("UNTRACKED-PID" in m and task.id in m for m in error_msgs), (
+            f"expected an UNTRACKED-PID error log, got: {error_msgs}"
+        )

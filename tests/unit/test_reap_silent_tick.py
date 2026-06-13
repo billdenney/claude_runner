@@ -16,6 +16,7 @@ per-tick pass differs in three ways:
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -327,6 +328,90 @@ def test_recheck_skips_demote_if_dispatcher_finalized(tmp_path: Path) -> None:
     reloaded = load_state(state_path_for(qd, "t-race"))
     assert reloaded.status == "completed"
     assert reloaded.stop_reason == "end_turn"
+
+
+def test_recheck_skips_demote_under_real_thread_race(tmp_path: Path) -> None:
+    """Same TOCTOU guard as the synchronous test above, but the
+    dispatcher's authoritative finalize is written from a SEPARATE
+    THREAD that runs concurrently with the reaper — the scenario the
+    audit (reconcile_silent.py:58 coverage-gap) called for.
+
+    The reaper computes its verdict on a SILENT/KILL-looking state,
+    then a real dispatcher thread writes ``completed`` into the same
+    state YAML. The reaper's pre-write recheck (the only thing standing
+    between a stale demotion and clobbering the dispatcher's run record)
+    must observe the change and stand down.
+
+    Determinism: the cross-thread finalize is released inside the
+    injected ``sigterm_fn`` — which the reaper calls AFTER computing its
+    verdict but BEFORE ``_demote_if_still_running`` re-reads the state.
+    The hook signals the dispatcher thread, then blocks until that
+    thread has actually committed its ``write_state_atomic``. So the
+    recheck-load is guaranteed to race against a genuinely-concurrent
+    write that has already landed — no ``sleep`` heuristics, no
+    flakiness, but a real second thread doing the write."""
+    qd = _queue(tmp_path)
+    started = _now() - timedelta(seconds=3600)
+    stale_hb = _now() - timedelta(seconds=1500)  # KILL band (kill=900)
+    _seed_running(qd, "t-thread-race", started_at=started, last_heartbeat_at=stale_hb, pid=77)
+
+    release_dispatcher = threading.Event()
+    dispatcher_committed = threading.Event()
+    dispatcher_error: list[BaseException] = []
+
+    def dispatcher_finalize() -> None:
+        # Wait until the reaper has computed its verdict and entered the
+        # signal step, then write the authoritative completed state.
+        release_dispatcher.wait(timeout=5)
+        try:
+            finalized = TaskState(
+                task_id="t-thread-race",
+                status="completed",
+                stop_reason="end_turn",
+                last_started_at=started,
+                last_heartbeat_at=_now() - timedelta(seconds=5),
+            )
+            write_state_atomic(finalized, state_path_for(qd, "t-thread-race"))
+        except BaseException as exc:  # pragma: no cover - surfaced via assert below
+            dispatcher_error.append(exc)
+        finally:
+            dispatcher_committed.set()
+
+    dispatcher = threading.Thread(target=dispatcher_finalize, name="dispatcher-finalize")
+    dispatcher.start()
+
+    def sigterm_handoff(pid: int) -> bool:
+        # Reaper has decided to KILL pid=77. Hand control to the
+        # dispatcher thread and block until it has committed its write,
+        # so the recheck-load below observes a real concurrent finalize.
+        release_dispatcher.set()
+        assert dispatcher_committed.wait(timeout=5)
+        return True
+
+    try:
+        results = reap_silent_orphans_tick(
+            qd,
+            {"t-thread-race"},
+            settings=_settings(alert=300, kill=900),
+            clock=FakeClock(_now()),
+            sigterm_fn=sigterm_handoff,
+        )
+    finally:
+        dispatcher.join(timeout=5)
+
+    assert not dispatcher.is_alive()
+    assert dispatcher_error == []  # the concurrent write itself didn't raise
+
+    # The reaper's recheck saw "completed" (written by the other thread)
+    # and skipped the demotion — no ReapResult, and the dispatcher's
+    # authoritative state survives unclobbered.
+    assert results == []
+    reloaded = load_state(state_path_for(qd, "t-thread-race"))
+    assert reloaded.status == "completed"
+    assert reloaded.stop_reason == "end_turn"
+    # The dispatcher's heartbeat (5s ago), not the reaper's would-be
+    # demotion, is what persisted.
+    assert reloaded.last_heartbeat_at == _now() - timedelta(seconds=5)
 
 
 # ---------------------------------------------------------------------------

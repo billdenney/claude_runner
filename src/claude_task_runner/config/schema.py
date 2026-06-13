@@ -111,14 +111,21 @@ class TaskCapsSettings(_StrictModel):
     heartbeat_silence_kill_s: float = Field(ge=0)
     heartbeat_persist_interval_s: float = Field(gt=0, default=30.0)
     """Minimum seconds between in-loop ``last_heartbeat_at`` writes from
-    the dispatcher. The dispatcher updates the in-memory heartbeat on
+    the dispatcher. The dispatcher ticks the in-memory heartbeat on
     every stream-json event but only persists to the state YAML once
     per interval so a chatty subprocess doesn't thrash the filesystem.
 
-    Must be well below ``heartbeat_silence_alert_s`` so the supervisor's
-    per-tick reaper sees fresh heartbeats for healthy long-running
-    tasks (e.g. interval=30 with alert=300 keeps a healthy task's
-    visible silence below 60s including the worst-case write skew).
+    ``last_heartbeat_at`` advances *only* when the agent emits a
+    stream-json event, so a healthy but agent-quiet task (long Bash
+    subprocess, OAuth refresh) legitimately lets this field go stale
+    past ``heartbeat_silence_alert_s``. The per-tick reaper no longer
+    treats that as a hang on its own: it falls through to
+    ``dispatcher_alive_at`` (always advanced by the monitor thread) and
+    then a filesystem-mtime check (``zombie_verify_fs_activity_window_s``)
+    before reaping. This interval therefore only bounds the staleness of
+    the *active*-case freshness signal; keeping it well below
+    ``heartbeat_silence_alert_s`` still gives the reaper a recent
+    timestamp for tasks that are actively emitting events.
     """
 
     dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0)
@@ -178,17 +185,7 @@ class WatchdogSettings(_StrictModel):
 class SupervisorSettings(_StrictModel):
     window_start_delay_s: float = Field(ge=0)
     state_file: str
-    sigterm_grace_s: float = Field(gt=0)
-    dry_run: bool
     preferred_init_system: str  # auto | systemd | cron
-
-
-class NotifySettings(_StrictModel):
-    channels: list[str]
-    desktop_command: str
-    file_path: str
-    webhook_url: str
-    email_to: str
 
 
 class HookSettings(_StrictModel):
@@ -196,24 +193,6 @@ class HookSettings(_StrictModel):
     pre_dispatch_timeout_s: float = Field(gt=0)
     post_dispatch_command: str
     post_dispatch_timeout_s: float = Field(gt=0)
-
-
-class SidecarSettings(_StrictModel):
-    unanswered_alert_s: float = Field(ge=0)
-    unanswered_auto_recommended_s: float = Field(ge=0)
-
-
-class MetricsSettings(_StrictModel):
-    prometheus_enabled: bool
-    prometheus_textfile_path: str
-
-
-class UiSettings(_StrictModel):
-    refresh_interval_ms: int = Field(gt=0)
-
-
-class FixturesSettings(_StrictModel):
-    rotation_window_days: int = Field(ge=0)
 
 
 class QueueSettings(_StrictModel):
@@ -600,12 +579,7 @@ class Settings(_StrictModel):
     task_caps: TaskCapsSettings
     watchdog: WatchdogSettings
     supervisor: SupervisorSettings
-    notify: NotifySettings
     hooks: HookSettings
-    sidecar: SidecarSettings
-    metrics: MetricsSettings
-    ui: UiSettings
-    fixtures: FixturesSettings
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     """Process-wide logging knobs. See :class:`LoggingSettings`. Has a
     default so existing TOMLs that pre-date this block keep parsing

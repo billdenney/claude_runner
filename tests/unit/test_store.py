@@ -15,6 +15,7 @@ from claude_task_runner.queue.schema import (
     TokenUsage,
 )
 from claude_task_runner.queue.store import (
+    MAX_YAML_BYTES,
     QueueIOError,
     QueueSchemaError,
     list_pending_tasks,
@@ -152,6 +153,30 @@ class TestErrorHandling:
         path = tmp_path / "nope" / "x.yaml"
         with pytest.raises(QueueIOError, match="parent dir"):
             write_state_atomic(TaskState(task_id="x"), path)
+
+    def test_oversized_yaml_rejected_before_parse(self, queue_dir: Path) -> None:
+        """A pathological YAML larger than the size limit is rejected on
+        stat, before ``yaml.safe_load`` can expand it and stall a tick."""
+        path = task_path_for(queue_dir, "x")
+        # Valid YAML mapping, but padded with a comment past the limit so
+        # the rejection is purely size-driven (not a parse/validation fail).
+        padding = "#" + ("y" * (MAX_YAML_BYTES + 1))
+        path.write_text(f"id: x\ntitle: T\nprompt: P\n{padding}\n")
+        assert path.stat().st_size > MAX_YAML_BYTES
+        with pytest.raises(QueueSchemaError, match="exceeds limit"):
+            load_task(path)
+
+    def test_at_limit_yaml_loads(self, queue_dir: Path) -> None:
+        """A file at exactly the limit is accepted — the guard rejects
+        only strictly-larger files."""
+        path = task_path_for(queue_dir, "x")
+        body = "id: x\ntitle: T\nprompt: P\n"
+        # body + "#" (1) + pad_len "y"s + "\n" (1) == MAX_YAML_BYTES
+        pad_len = MAX_YAML_BYTES - len(body.encode()) - 2
+        path.write_text(f"{body}#{'y' * pad_len}\n")
+        assert path.stat().st_size == MAX_YAML_BYTES
+        loaded = load_task(path)
+        assert loaded.id == "x"
 
 
 class TestListing:

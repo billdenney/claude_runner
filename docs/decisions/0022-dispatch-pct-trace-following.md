@@ -42,6 +42,11 @@ Replace the `[throttle.*]` configuration tree and its three-layer
 implementation with a single `[dispatch_pct.*]` tree implementing
 **variant-C trace-following**:
 
+ADR-0022 removes the `[throttle.*]` tree from `settings.toml`. The config
+loader rejects it — `config/loader.py` raises `ConfigError` on any
+remaining top-level `throttle` key (both for the per-queue TOML and
+per-account policy files). Operators upgrading must delete that section.
+
 ### Schema
 
 ```toml

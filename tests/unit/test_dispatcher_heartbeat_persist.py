@@ -17,13 +17,19 @@ real subprocess.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import Task
-from claude_task_runner.runner.dispatcher import _dispatch_loop
+from claude_task_runner.runner.dispatcher import (
+    _HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER,
+    _dispatch_loop,
+)
 
 
 class _FakeStdout:
@@ -246,3 +252,75 @@ def test_persist_callback_failure_is_swallowed() -> None:
 
     # Loop completed; we got the result event.
     assert summary.session_id == "sess-1"
+
+
+def test_repeated_persist_failures_escalate_to_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Audit code-smell (dispatcher.py:360): a sustained run of
+    heartbeat-persist failures within one dispatch loop must escalate
+    from WARNING to ERROR after ``_HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER``
+    so a real disk problem (full / read-only) isn't lost in a stream of
+    warnings. A single failure stays at WARNING.
+
+    The stream carries enough events (and the clock advances past the
+    persist interval each event) that every event triggers a persist,
+    every persist raises, and the failure counter crosses the
+    escalation threshold."""
+    n_events = _HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER + 2
+    # system_init + (n_events - 2) assistant messages + result = n_events
+    # parsed events, each forcing a persist attempt.
+    lines = [
+        _system_init_line(),
+        *[_assistant_message_line() for _ in range(n_events - 2)],
+        _result_line(),
+    ]
+    process = _FakeProcess(lines)
+    clock = FakeClock(datetime(2026, 6, 12, 12, 0, tzinfo=UTC))
+    started = clock.now()
+
+    # Advance the clock 31s per event so each event clears the 30s
+    # rate-limit window and forces a fresh persist attempt.
+    event_counter = {"n": 0}
+
+    def advancing_now() -> datetime:
+        n = event_counter["n"]
+        event_counter["n"] = n + 1
+        return started + timedelta(seconds=31 * n)
+
+    original_now = clock.now
+    clock.now = advancing_now  # type: ignore[method-assign]
+
+    fail_count = {"n": 0}
+
+    def boom(_when: datetime) -> None:
+        fail_count["n"] += 1
+        raise OSError("disk full")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.dispatcher"):
+            _dispatch_loop(
+                process=process,  # type: ignore[arg-type]
+                settings_caps=_caps(persist_s=30.0, alert=10_000.0),
+                clock=clock,
+                task=_task(),
+                started_at=started,
+                heartbeat_persist_fn=boom,
+            )
+    finally:
+        clock.now = original_now  # type: ignore[method-assign]
+
+    # Every event forced a persist attempt, and all of them raised.
+    assert fail_count["n"] == n_events
+
+    dispatcher_records = [
+        r for r in caplog.records if r.name == "claude_task_runner.runner.dispatcher"
+    ]
+    warnings = [r for r in dispatcher_records if r.levelno == logging.WARNING]
+    errors = [r for r in dispatcher_records if r.levelno == logging.ERROR]
+
+    # First (threshold - 1) failures are WARNING; the rest are ERROR.
+    assert len(warnings) == _HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER - 1
+    assert len(errors) == n_events - (_HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER - 1)
+    # The escalated records carry the per-dispatch failure count marker.
+    assert all("failure" in r.getMessage() for r in errors)

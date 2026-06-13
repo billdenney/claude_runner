@@ -96,3 +96,11 @@ The `mab_human_consensus` deployment's literature corpus + active
 queue was consolidated into a new ingestion repo as part of the same
 work cycle. None of the new files live in `claude_task_runner`; this
 ADR records the cleanup that touches this package's source only.
+
+**Update (2026-06-13):** the "sixteen fields" audit above is a snapshot
+from 2026-05-13. The `Task` model in `queue/schema.py` has since grown to
+**19 fields**. The additions are `deliverable_paths` and `additional_dirs`
+(ADR-0020 output-evidence gate / `--add-dir` forwarding) and `account`
+(ADR-0021 / ADR-0024 multi-account pinning). The original removal of
+`inject_preamble` still stands; this note just records that the field
+count is no longer 16.

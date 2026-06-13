@@ -30,9 +30,11 @@ from claude_task_runner.queue.schema import (
 
 T = TypeVar("T", bound=BaseModel)
 
-
-class QueueLayoutError(ValueError):
-    """Queue layout invariants violated (missing dirs, malformed names)."""
+MAX_YAML_BYTES = 1 * 1024 * 1024
+"""Upper bound on a queue YAML file's size. Task/state YAMLs are a few
+KB at most; a file this large is pathological (an accident or a crafted
+billion-laughs-style payload) and is rejected before ``yaml.safe_load``
+gets a chance to expand it and stall the tick."""
 
 
 class QueueIOError(OSError):
@@ -79,6 +81,11 @@ def _check_schema_version(payload: dict[str, Any], path: Path) -> None:
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
+        size = path.stat().st_size
+        if size > MAX_YAML_BYTES:
+            raise QueueSchemaError(
+                f"{path}: file is {size} bytes, exceeds limit of {MAX_YAML_BYTES} bytes"
+            )
         with path.open("rb") as fh:
             data = yaml.safe_load(fh)
     except OSError as exc:

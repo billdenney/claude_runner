@@ -181,6 +181,45 @@ class TestUninstall:
         )
         assert existed is False
 
+    def _make_failing_systemctl(self, tmp_path: Path) -> Path:
+        """A fake systemctl that fails (rc=1) and writes to stderr."""
+        p = tmp_path / "systemctl"
+        p.write_text('#!/usr/bin/env bash\necho "Failed to disable unit" 1>&2\nexit 1\n')
+        p.chmod(0o755)
+        return p
+
+    def test_disable_failure_is_logged_not_silent(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A non-zero rc from ``systemctl --user disable`` must be logged at
+        WARNING — a silent failure would leave the unit enabled/active even
+        though the operator asked to uninstall it (audit finding)."""
+        unit_path = tmp_path / f"{UNIT_NAME}.service"
+        unit_path.write_text("[Unit]\nDescription=Test\n")
+        binary = self._make_failing_systemctl(tmp_path)
+        with caplog.at_level("WARNING", logger="claude_task_runner.cron.systemd_unit"):
+            existed = uninstall(unit_path=unit_path, systemctl_executable=str(binary))
+        # Tolerant behaviour preserved: the file is still removed.
+        assert existed is True
+        assert not unit_path.exists()
+        # But the failure is now visible.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("disable" in r.getMessage() for r in warnings)
+        assert any("Failed to disable unit" in r.getMessage() for r in warnings)
+
+    def test_successful_uninstall_logs_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """rc=0 from every systemctl step → no WARNING noise."""
+        unit_path = tmp_path / f"{UNIT_NAME}.service"
+        unit_path.write_text("[Unit]\nDescription=Test\n")
+        good = tmp_path / "systemctl"
+        good.write_text("#!/usr/bin/env bash\nexit 0\n")
+        good.chmod(0o755)
+        with caplog.at_level("WARNING", logger="claude_task_runner.cron.systemd_unit"):
+            uninstall(unit_path=unit_path, systemctl_executable=str(good))
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
 
 class TestIsSystemdUserAvailable:
     def test_missing_systemctl_returns_false(self) -> None:
