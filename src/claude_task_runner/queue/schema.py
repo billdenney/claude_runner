@@ -207,6 +207,20 @@ class TaskState(_StrictBase):
     """Timestamp of the most recent stream-json event observed.
     ``runner.heartbeat`` flags ``possibly_hung`` when this falls behind
     by more than ``[task_caps].heartbeat_silence_alert_s``."""
+    dispatcher_alive_at: datetime | None = None
+    """Timestamp of the most recent dispatcher monitor-thread tick.
+    Distinct from ``last_heartbeat_at``: this field advances on a fixed
+    cadence (``[task_caps].dispatcher_alive_write_interval_s``) whether
+    or not the agent emits stream-json events. It proves the dispatcher
+    is still pumping the subprocess pipe.
+
+    The per-tick reaper consults both fields. A task whose agent is
+    silent for a long stretch (long Bash subprocess, OAuth refresh) but
+    whose dispatcher is alive is HEALTHY; only when both fields are stale
+    does the reaper fall through to the bounded filesystem-activity
+    verification step. ``None`` on legacy state YAMLs that pre-date the
+    field — the reaper treats that as "old format" and falls back to
+    ``last_heartbeat_at`` alone (the pre-Layer-2 behaviour)."""
     pid: int | None = Field(default=None, ge=1)
     """OS pid of the most recently spawned ``claude`` subprocess for
     this task. Written by the dispatcher right after ``Popen`` (so the

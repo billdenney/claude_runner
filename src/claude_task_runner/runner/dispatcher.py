@@ -34,6 +34,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -69,10 +70,7 @@ from claude_task_runner.runner.session import (
     fall_through_to_fresh,
 )
 from claude_task_runner.runner.stream import (
-    AssistantMessageEvent,
-    ResultEvent,
     StreamSummary,
-    SystemInitEvent,
     parse_lines,
 )
 
@@ -230,6 +228,83 @@ def _read_lines(stream: Iterable[str]) -> Iterable[str]:
     yield from stream
 
 
+class _DispatcherAliveMonitor:
+    """Background thread that ticks ``dispatcher_alive_at`` on a fixed cadence.
+
+    The dispatch loop blocks on ``process.stdout`` reads — when the
+    subprocess emits no stream-json events, the loop's own heartbeat
+    persist callback never fires and ``last_heartbeat_at`` goes stale.
+    A monitor thread sidesteps this by writing ``dispatcher_alive_at``
+    every ``interval_s`` independently of event arrival, so the
+    supervisor's per-tick reaper can tell "agent quiet but dispatcher
+    alive" (HEALTHY) from "dispatcher and agent both silent" (suspect
+    zombie, fall through to filesystem verification).
+
+    The thread is a daemon so a supervisor crash doesn't leak it; on
+    a normal dispatch return the ``stop()`` call joins with a short
+    timeout. A persist failure inside the loop is logged and the
+    monitor keeps going — observability is best-effort and must never
+    take down the parent dispatch.
+    """
+
+    def __init__(
+        self,
+        *,
+        persist_fn: Callable[[datetime], None],
+        clock: Clock,
+        interval_s: float,
+        task_id: str,
+    ) -> None:
+        self._persist_fn = persist_fn
+        self._clock = clock
+        self._interval_s = interval_s
+        self._task_id = task_id
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"dispatcher-alive-monitor:{task_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """Persist the initial ``dispatcher_alive_at`` write and start the loop.
+
+        The initial write happens on the caller's thread so the YAML
+        field is non-None before ``dispatch()`` returns control to the
+        loop — otherwise a very-fast subprocess could finalize before
+        the monitor thread's first wake-up, leaving the field unset for
+        the entire run.
+        """
+        try:
+            self._persist_fn(self._clock.now())
+        except Exception as exc:
+            logger.warning(
+                "task %s: initial dispatcher_alive persist failed (%s); continuing",
+                self._task_id,
+                exc,
+            )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the thread to exit and wait briefly for it to join."""
+        self._stop_event.set()
+        # join() in case the test/supervisor doesn't care to wait, but
+        # cap the wait at one interval so a stuck persist doesn't block
+        # dispatch finalization.
+        self._thread.join(timeout=self._interval_s + 1.0)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_s):
+            try:
+                self._persist_fn(self._clock.now())
+            except Exception as exc:
+                logger.warning(
+                    "task %s: dispatcher_alive persist failed (%s); continuing",
+                    self._task_id,
+                    exc,
+                )
+
+
 def _resolve_self_user() -> str:
     """Return the supervisor's own Linux username; empty string on lookup failure.
 
@@ -332,11 +407,12 @@ def _dispatch_loop(
     persist_interval_s = settings_caps.heartbeat_persist_interval_s
 
     assert process.stdout is not None
-    for event in parse_lines(_read_lines(process.stdout), summary=summary):
+    for _event in parse_lines(_read_lines(process.stdout), summary=summary):
+        # Every typed event ticks the in-memory heartbeat; the
+        # in-process kill check below uses the un-coalesced value so a
+        # KILL fires as soon as the threshold is crossed, even when the
+        # YAML persist is still inside its rate-limit window.
         last_heartbeat = clock.now()
-        if isinstance(event, (SystemInitEvent, AssistantMessageEvent, ResultEvent)):
-            # Update last_heartbeat_at for every typed event.
-            pass
 
         # Persist the heartbeat to the state YAML so the supervisor's
         # per-tick reaper sees the freshness. Rate-limited to one write
@@ -344,17 +420,12 @@ def _dispatch_loop(
         # subprocess (many events per second) would otherwise produce
         # one atomic write per event — needless I/O when one per
         # interval is enough for the reaper's threshold comparison.
-        should_persist = (
-            heartbeat_persist_fn is not None
-            and last_heartbeat is not None
-            and (
-                last_persist_at is None
-                or (last_heartbeat - last_persist_at).total_seconds() >= persist_interval_s
-            )
+        should_persist = heartbeat_persist_fn is not None and (
+            last_persist_at is None
+            or (last_heartbeat - last_persist_at).total_seconds() >= persist_interval_s
         )
         if should_persist:
             assert heartbeat_persist_fn is not None  # narrowed by guard above
-            assert last_heartbeat is not None
             try:
                 heartbeat_persist_fn(last_heartbeat)
             except Exception as exc:
@@ -774,30 +845,64 @@ def dispatch(
     # 2026-06-12 ``frompeople-680-yu_2017`` zombie pattern); the
     # YAML-mediated reaper is the steady-state safety net.
     #
+    # Two writers share the state YAML for the duration of the dispatch
+    # loop:
+    #
+    # 1. ``heartbeat_persist_fn`` (in-loop, fires on stream-json events)
+    #    updates ``last_heartbeat_at``.
+    # 2. The dispatcher-alive monitor thread (below) updates
+    #    ``dispatcher_alive_at`` on a fixed cadence regardless of events.
+    #
+    # The state lock serializes the read-modify-write so neither writer
+    # clobbers the other's field. Both update ``new_state`` (the local
+    # source of truth) and atomic-write the YAML.
+    #
     # Only persist when ``persist_state`` is True — the dispatch
     # function's normal path. When the caller has opted into in-memory
     # mode (e.g. force_dispatch) there is no state YAML to update and
     # the reaper does not look for them.
     heartbeat_persist_fn: Callable[[datetime], None] | None
+    alive_monitor: _DispatcherAliveMonitor | None
     if persist_state:
+        state_lock = threading.Lock()
+        state_path = state_path_for(queue_dir, task.id)
 
         def _persist_heartbeat(when: datetime) -> None:
             nonlocal new_state
-            new_state = new_state.model_copy(update={"last_heartbeat_at": when})
-            write_state_atomic(new_state, state_path_for(queue_dir, task.id))
+            with state_lock:
+                new_state = new_state.model_copy(update={"last_heartbeat_at": when})
+                write_state_atomic(new_state, state_path)
+
+        def _persist_alive(when: datetime) -> None:
+            nonlocal new_state
+            with state_lock:
+                new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
+                write_state_atomic(new_state, state_path)
 
         heartbeat_persist_fn = _persist_heartbeat
+        alive_monitor = _DispatcherAliveMonitor(
+            persist_fn=_persist_alive,
+            clock=clock,
+            interval_s=settings_caps.dispatcher_alive_write_interval_s,
+            task_id=task.id,
+        )
+        alive_monitor.start()
     else:
         heartbeat_persist_fn = None
+        alive_monitor = None
 
-    summary, cap_violation = _dispatch_loop(
-        process=process,
-        settings_caps=settings_caps,
-        clock=clock,
-        task=task,
-        started_at=started_at,
-        heartbeat_persist_fn=heartbeat_persist_fn,
-    )
+    try:
+        summary, cap_violation = _dispatch_loop(
+            process=process,
+            settings_caps=settings_caps,
+            clock=clock,
+            task=task,
+            started_at=started_at,
+            heartbeat_persist_fn=heartbeat_persist_fn,
+        )
+    finally:
+        if alive_monitor is not None:
+            alive_monitor.stop()
 
     # Drain remaining output and stderr.
     try:

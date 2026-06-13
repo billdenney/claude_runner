@@ -315,6 +315,42 @@ class TestDispatchSuccess:
         # 'running' here, but the state path was written twice).
         assert outcome.new_state.status == "completed"
 
+    def test_dispatcher_alive_at_lands_in_state(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        """The monitor thread writes ``dispatcher_alive_at`` on the
+        running-state YAML so the supervisor's per-tick reaper can use
+        it as the cheap Layer-2 liveness signal. Even a fast shim run
+        should land the initial-write timestamp; without it the per-
+        tick reaper would have to fall back to the heartbeat-only
+        classifier for every healthy task."""
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-alive-it")
+        outcome = dispatch(
+            task=task,
+            state=TaskState(task_id=task.id),
+            plan=fresh_plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_session=_session(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+        )
+
+        # The dispatcher_alive_at field is set by the monitor thread's
+        # initial-write on start; it survives the finalize because
+        # _finalize_state preserves fields not in its update set.
+        assert outcome.new_state.dispatcher_alive_at is not None
+        # Also persisted to disk (the running-state write under the
+        # monitor lock was the last one before completion).
+        loaded = load_state(state_path_for(queue_dir, task.id))
+        assert loaded.dispatcher_alive_at is not None
+
 
 class TestDispatchError:
     def test_missing_claude_binary(
