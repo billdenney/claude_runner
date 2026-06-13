@@ -55,12 +55,14 @@ class TestBuildUnitText:
         )
         assert "StartLimitBurst=10" in text
 
-    def test_includes_drain_execstop(self) -> None:
-        """ExecStop runs ``supervisor drain --no-wait`` so systemctl
-        stop/restart goes through the graceful-drain path."""
+    def test_includes_drain_execstop_when_adoption_off(self) -> None:
+        """With adoption OFF, ExecStop runs ``supervisor drain --no-wait``
+        so systemctl stop/restart goes through the graceful-drain path
+        (the historical PR-11 wiring, preserved bit-for-bit)."""
         text = build_unit_text(
             supervisor_command="/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml",
             queue_dir=Path("/q"),
+            adopt_workers=False,
         )
         assert "ExecStop=" in text
         assert "supervisor drain" in text
@@ -72,29 +74,58 @@ class TestBuildUnitText:
         assert "--queue /q" in text
         assert "--config /q/claude_runner.toml" in text
 
+    def test_includes_fast_stop_execstop_when_adoption_on(self) -> None:
+        """ADR-0025: with adoption ON (the default), ExecStop runs
+        ``supervisor stop`` (a SIGTERM) so the daemon's fast stop trips —
+        the supervisor exits promptly and file-backed workers survive."""
+        text = build_unit_text(
+            supervisor_command="/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml",
+            queue_dir=Path("/q"),
+        )
+        assert "ExecStop=/usr/local/bin/claude-task-runner supervisor stop" in text
+        # Fast stop does NOT drain.
+        assert "supervisor drain" not in text
+        assert "--no-wait" not in text
+        assert "--queue /q" in text
+        assert "--config /q/claude_runner.toml" in text
+
     def test_kill_mode_process(self) -> None:
         """KillMode=process so dispatched claude subprocesses survive
-        systemd's SIGKILL escalation on the main PID."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
-        assert "KillMode=process" in text
+        systemd's SIGKILL escalation on the main PID — in BOTH modes."""
+        for adopt in (True, False):
+            text = build_unit_text(
+                supervisor_command="x", queue_dir=Path("/q"), adopt_workers=adopt
+            )
+            assert "KillMode=process" in text
 
-    def test_timeout_stop_sec_default_matches_max_task_duration(self) -> None:
-        """Default TimeoutStopSec=14400 (4h) matches the default
+    def test_timeout_stop_sec_default_short_when_adoption_on(self) -> None:
+        """ADR-0025: with adoption ON (default) the supervisor fast-stops,
+        so TimeoutStopSec drops to a short 30s bound instead of the 4h
+        drain ceiling — a `systemctl restart` is near-instant."""
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        assert "TimeoutStopSec=30" in text
+
+    def test_timeout_stop_sec_default_matches_max_task_duration_when_adoption_off(self) -> None:
+        """With adoption OFF, TimeoutStopSec=14400 (4h) matches the default
         [task_caps].max_duration_s_per_task so drain has time to finish
         the longest plausibly-allowed task."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), adopt_workers=False)
         assert "TimeoutStopSec=14400" in text
 
     def test_timeout_stop_sec_customizable(self) -> None:
-        text = build_unit_text(
-            supervisor_command="x",
-            queue_dir=Path("/q"),
-            timeout_stop_sec=1800,
-        )
-        assert "TimeoutStopSec=1800" in text
+        """An explicit timeout_stop_sec overrides the per-mode default in
+        both modes."""
+        for adopt in (True, False):
+            text = build_unit_text(
+                supervisor_command="x",
+                queue_dir=Path("/q"),
+                timeout_stop_sec=1800,
+                adopt_workers=adopt,
+            )
+            assert "TimeoutStopSec=1800" in text
 
-    def test_clean_drain_exit_does_not_restart(self) -> None:
-        """RestartPreventExitStatus=0 — a clean drain-exit means the
+    def test_clean_stop_exit_does_not_restart(self) -> None:
+        """RestartPreventExitStatus=0 — a clean stop/drain-exit means the
         operator asked for stop/restart, NOT a crash. systemd's stop
         sequence handles the eventual fresh-start when needed
         (``systemctl restart`` runs stop then start; ``stop`` alone

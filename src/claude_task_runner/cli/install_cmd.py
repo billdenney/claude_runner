@@ -108,6 +108,9 @@ def install(
         sd_plan = systemd_mod.build_install_plan(
             supervisor_command=_supervisor_command(queue_path, resolved_config),
             queue_dir=queue_path,
+            # ADR-0025: generate fast-stop wiring when adoption is on so
+            # the unit's ExecStop / TimeoutStopSec match runtime behaviour.
+            adopt_workers=settings.supervisor.adopt_workers,
         )
         verb = "replace" if sd_plan.block_existed else "create"
         console.print(f"\n[bold]Will {verb} systemd user unit at:[/]\n  {sd_plan.unit_path}\n")

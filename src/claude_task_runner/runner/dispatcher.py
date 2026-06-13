@@ -40,16 +40,19 @@ ProcessPoolExecutor) when ``target_concurrency > 1``.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
 import signal
 import subprocess
 import threading
-from collections.abc import Callable, Iterable
+import time
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import IO
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
@@ -67,6 +70,7 @@ from claude_task_runner.queue.schema import (
 )
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    load_state,
     state_path_for,
     write_state_atomic,
 )
@@ -246,6 +250,179 @@ def _read_lines(stream: Iterable[str]) -> Iterable[str]:
     yield from stream
 
 
+# Poll cadence for the file tailer's no-data wait. Small enough that a
+# worker exit is noticed promptly, large enough not to busy-spin a core
+# while a quiet agent thinks. Module-level so tests can monkeypatch it
+# to drive the loop deterministically without real sleeps.
+_TAIL_POLL_INTERVAL_S = 0.1
+
+
+def tail_lines(
+    path: Path,
+    *,
+    alive: Callable[[], bool],
+    poll_interval_s: float = _TAIL_POLL_INTERVAL_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    read_fn: Callable[[Path, int], tuple[str, int]] | None = None,
+) -> Iterator[str]:
+    r"""Tail ``path`` line-by-line until the producer is gone.
+
+    Yields only **complete, newline-terminated** lines (the trailing
+    ``\n`` is included, matching what iterating ``process.stdout`` would
+    produce so :func:`_read_lines` and this tailer are interchangeable
+    inputs to :func:`_dispatch_loop`). A partial trailing line — bytes
+    written without a terminating newline yet — is buffered and only
+    emitted once its newline arrives.
+
+    The ``alive`` predicate is the producer's liveness signal: the owned
+    path passes ``lambda: process.poll() is None``; the adopted path
+    passes ``lambda: <pid still alive>``. While ``alive()`` is True and
+    no new data is available, the tailer sleeps ``poll_interval_s`` and
+    retries (no busy-spin). Once ``alive()`` returns False the tailer
+    does **one** final read of whatever has been flushed since the last
+    poll, emits any remaining complete lines, and stops — so it never
+    hangs after the worker exits but also never drops output written in
+    the worker's final moments.
+
+    The file may not exist yet when the tailer starts (the worker's
+    ``Popen`` and the first write race the supervisor thread); a missing
+    file reads as empty and is polled for, subject to the same
+    ``alive()`` exit. Any bytes left un-terminated when the producer
+    dies are intentionally **not** emitted — a half-written final line
+    is corrupt and parsing it would risk a spurious event.
+
+    The read offset is tracked across polls so each byte is read exactly
+    once (the file is re-opened per poll rather than holding a handle for
+    the whole — possibly multi-hour — run, so a long adoption never pins
+    a file descriptor). ``read_fn`` / ``sleep_fn`` are injection seams
+    for unit tests; the defaults read the real file from a byte offset
+    and use ``time.sleep``.
+    """
+    if read_fn is None:
+        read_fn = _read_from_offset
+
+    buffer = ""
+    offset = 0
+
+    while True:
+        producer_alive = alive()
+        try:
+            chunk, offset = read_fn(path, offset)
+        except OSError as exc:
+            # A transient read error (e.g. the file was rotated out from
+            # under us) is logged and retried; a persistent one keeps the
+            # loop polling until alive() goes False, which then exits.
+            logger.warning("tail_lines: read of %s failed (%s); retrying", path, exc)
+            chunk = ""
+
+        if chunk:
+            buffer += chunk
+            while True:
+                idx = buffer.find("\n")
+                if idx == -1:
+                    break
+                line = buffer[: idx + 1]
+                buffer = buffer[idx + 1 :]
+                yield line
+
+        if not producer_alive:
+            # Producer was already gone before this read; the read above
+            # was the final drain. Stop without sleeping so we don't hang.
+            return
+
+        sleep_fn(poll_interval_s)
+
+
+def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
+    """Read ``path`` from byte ``offset`` to EOF; return ``(text, new_offset)``.
+
+    A missing file (the worker hasn't created it yet) reads as empty with
+    the offset unchanged. Errors mode ``replace`` so a momentarily torn
+    multi-byte sequence at a flush boundary doesn't raise — the parser
+    already tolerates garbage lines (see :func:`runner.stream.parse_line`).
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+            return chunk, handle.tell()
+    except FileNotFoundError:
+        return "", offset
+
+
+# Bytes of the stderr file retained for the RunRecord error tail —
+# matches the pipe-path's historical ``stderr[-500:]`` slice.
+_STDERR_TAIL_BYTES = 500
+
+
+def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Path, Path]:
+    """Return ``(stdout_log, stderr_log)`` for one file-backed attempt.
+
+    Layout (ADR-0025): ``<queue>/.claude_task_runner/logs/<task_id>/
+    attempt-<attempt>.stream.jsonl`` for stdout (the parsed NDJSON
+    stream) and ``attempt-<attempt>.stderr`` beside it. The per-task
+    directory is created if missing. ``attempt`` is the 1-based attempt
+    number already stored on ``TaskState.attempts`` for this run.
+    """
+    logs_dir = queue_dir / ".claude_task_runner" / "logs" / task_id
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = logs_dir / f"attempt-{attempt}.stream.jsonl"
+    stderr_log = _stderr_path_for_stdout_log(stdout_log)
+    return stdout_log, stderr_log
+
+
+def _stderr_path_for_stdout_log(stdout_log: Path) -> Path:
+    """Map ``attempt-N.stream.jsonl`` → its sibling ``attempt-N.stderr``.
+
+    The adopt path only has the stdout ``log_path`` recorded in state;
+    this reconstructs the paired stderr file by stripping the
+    ``.stream.jsonl`` double-suffix and appending ``.stderr``. Robust to
+    the double extension (``Path.with_suffix`` only handles one level).
+    """
+    name = stdout_log.name
+    base = name[: -len(".stream.jsonl")] if name.endswith(".stream.jsonl") else stdout_log.stem
+    return stdout_log.with_name(f"{base}.stderr")
+
+
+def _reparse_stdout_file(path: Path) -> StreamSummary:
+    """Re-parse the complete stdout log into a fresh :class:`StreamSummary`.
+
+    Used by the file-backed finalize so the summary reflects every event
+    the worker wrote, including any final flush the live tailer raced
+    past. Parsing from a clean ``StreamSummary`` (rather than mutating
+    the loop's) guarantees cumulative usage is counted exactly once.
+    A missing / unreadable file yields an empty summary — the finalize
+    then classifies it as a crash-without-result (failed), which is the
+    correct outcome for a worker that produced no parseable output.
+    """
+    summary = StreamSummary()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for _ in parse_lines(handle, summary=summary):
+                pass
+    except OSError as exc:
+        logger.warning("could not re-read stdout log %s for finalize: %s", path, exc)
+    return summary
+
+
+def _read_stderr_tail(path: Path, *, max_bytes: int = _STDERR_TAIL_BYTES) -> str:
+    """Return the last ``max_bytes`` of the stderr log as text.
+
+    Mirrors the pipe path's ``stderr[-500:]`` slice. Reads only the tail
+    (seeks from the end) so a pathologically large stderr file is never
+    slurped whole. A missing / unreadable file yields an empty string.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 class _DispatcherAliveMonitor:
     """Background thread that ticks ``dispatcher_alive_at`` on a fixed cadence.
 
@@ -323,6 +500,31 @@ class _DispatcherAliveMonitor:
                 )
 
 
+def _pid_alive(pid: int) -> bool:
+    """True iff ``pid`` is still a live process.
+
+    ``os.kill(pid, 0)`` is the standard liveness probe. ``ESRCH``
+    (``ProcessLookupError``) means the pid is genuinely gone → dead.
+    ``EPERM`` (``PermissionError``) means the pid exists but is owned by
+    another user (a Linux-user dispatch under ``sudo``) → treat as alive;
+    we just can't signal it. Any other ``OSError`` is conservatively
+    treated as alive so the adopt monitor doesn't finalize a worker
+    prematurely on a transient probe failure (ADR-0025).
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        # ESRCH ⇒ genuinely gone; anything else ⇒ conservatively alive.
+        return exc.errno != errno.ESRCH
+    return True
+
+
 def _resolve_self_user() -> str:
     """Return the supervisor's own Linux username; empty string on lookup failure.
 
@@ -398,16 +600,28 @@ def _build_run_record(
 
 def _dispatch_loop(
     *,
-    process: subprocess.Popen[str],
+    lines: Iterable[str],
+    terminate: Callable[[], None],
     settings_caps: TaskCapsSettings,
     clock: Clock,
     task: Task,
     started_at: datetime,
     heartbeat_persist_fn: Callable[[datetime], None] | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
-    """Run the consume-and-monitor loop until the process exits or we kill it.
+    """Run the consume-and-monitor loop until the stream ends or we kill it.
 
     Returns the StreamSummary and any cap violation observed.
+
+    The loop is decoupled from how its events arrive: ``lines`` is any
+    iterable of NDJSON lines and ``terminate`` is the side-effect that
+    stops the underlying worker on a cap/silence KILL. The owned path
+    (same-incarnation ``Popen``) passes ``_read_lines(process.stdout)``
+    or :func:`tail_lines` over the stdout log plus
+    ``lambda: _terminate(process)``; the adopted path (a worker this
+    supervisor did not spawn) passes :func:`tail_lines` over the
+    recorded log file plus a ``killpg``-by-pid terminate. The per-event
+    heartbeat / cap / silence logic below is identical across both —
+    only the source of lines and the kill mechanism differ (ADR-0025).
 
     ``heartbeat_persist_fn``, when supplied, is invoked at most once
     per ``settings_caps.heartbeat_persist_interval_s`` seconds with
@@ -426,8 +640,7 @@ def _dispatch_loop(
     persist_interval_s = settings_caps.heartbeat_persist_interval_s
     heartbeat_persist_failures = 0
 
-    assert process.stdout is not None
-    for _event in parse_lines(_read_lines(process.stdout), summary=summary):
+    for _event in parse_lines(_read_lines(lines), summary=summary):
         # Every typed event ticks the in-memory heartbeat; the
         # in-process kill check below uses the un-coalesced value so a
         # KILL fires as soon as the threshold is crossed, even when the
@@ -482,7 +695,7 @@ def _dispatch_loop(
                 cap_violation.observed,
                 cap_violation.cap,
             )
-            _terminate(process)
+            terminate()
             break
 
         # Heartbeat-based kill (silence threshold). Alert-level transitions
@@ -496,7 +709,7 @@ def _dispatch_loop(
         )
         if status.verdict is hb_mod.HeartbeatVerdict.KILL:
             logger.warning("task %s heartbeat silent for %.0fs; SIGTERM", task.id, status.silence_s)
-            _terminate(process)
+            terminate()
             cap_violation = caps_mod.CapViolation(
                 which="duration",
                 observed=status.silence_s,
@@ -528,28 +741,35 @@ def _truncate_paths_for_log(paths: list[Path]) -> str:
     return f"{truncated}...]"
 
 
-def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
-    """Send ``sig`` to the subprocess's whole process group.
+def _signal_group_by_pid(pid: int, sig: int) -> None:
+    """Send ``sig`` to the process group led by ``pid``.
 
-    The dispatcher spawns ``claude --print`` with ``start_new_session=True``
-    so the subprocess becomes a session/group leader; signalling the
-    group (rather than just ``process.pid``) reaches the ``claude``
-    process *and* any children it forked (MCP servers, shelled-out
-    ``git``/``Rscript``). Without this a cap-kill would SIGTERM only the
-    parent and leave its children running as orphans.
+    Workers are spawned with ``start_new_session=True`` so the worker is
+    a session/group leader; signalling the group (rather than just
+    ``pid``) reaches the ``claude`` process *and* any children it forked
+    (MCP servers, shelled-out ``git``/``Rscript``). Without this a
+    cap-kill would SIGTERM only the parent and leave its children
+    running as orphans.
 
     A vanished group (``ProcessLookupError``) is benign — the process
     already exited between our check and the signal. Any other
     ``OSError`` (e.g. EPERM) is logged rather than swallowed so a
-    genuinely failed signal-send surfaces in the journal.
+    genuinely failed signal-send surfaces in the journal. This is the
+    shared core of both the owned-path :func:`_signal_group` and the
+    adopted-path terminate (ADR-0025).
     """
     try:
-        os.killpg(os.getpgid(process.pid), sig)
+        os.killpg(os.getpgid(pid), sig)
     except ProcessLookupError:
         # Group already gone; nothing to signal.
         pass
     except OSError as exc:
-        logger.error("terminate signal failed pid=%s sig=%s: %s", process.pid, sig, exc)
+        logger.error("terminate signal failed pid=%s sig=%s: %s", pid, sig, exc)
+
+
+def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
+    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`)."""
+    _signal_group_by_pid(process.pid, sig)
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
@@ -565,6 +785,35 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         _signal_group(process, signal.SIGKILL)
+
+
+def _terminate_by_pid(
+    pid: int,
+    *,
+    alive: Callable[[], bool],
+    sleep_fn: Callable[[float], None],
+) -> None:
+    """SIGTERM the group led by ``pid``, escalate to SIGKILL after a grace.
+
+    The adopted-worker analogue of :func:`_terminate`. Because we did
+    NOT spawn the worker we have no ``Popen`` to ``wait()`` on; instead
+    we poll the supplied ``alive`` predicate for up to the grace period
+    and SIGKILL the group if it's still alive. Used as the ``terminate``
+    callback in :func:`_dispatch_loop` for the adopted path so a cap or
+    silence KILL still reaps a worker this supervisor never forked
+    (ADR-0025).
+    """
+    _signal_group_by_pid(pid, signal.SIGTERM)
+    deadline = 5.0
+    waited = 0.0
+    step = 0.1
+    while waited < deadline:
+        if not alive():
+            return
+        sleep_fn(step)
+        waited += step
+    if alive():
+        _signal_group_by_pid(pid, signal.SIGKILL)
 
 
 def _snapshot_pre_dispatch_sha(working_dir: Path | None) -> str | None:
@@ -706,6 +955,7 @@ def dispatch(
     linux_user: str | None = None,
     account: str | None = None,
     persist_state: bool = True,
+    adopt_workers: bool = False,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
 
@@ -717,6 +967,18 @@ def dispatch(
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
+
+    ``adopt_workers`` (ADR-0025): when True, the worker's stdout/stderr
+    are redirected to per-attempt files under
+    ``<queue>/.claude_task_runner/logs/<task_id>/`` and the dispatch
+    loop tails the stdout file instead of reading a supervisor-owned
+    pipe. The stdout log path is persisted to ``TaskState.log_path`` so
+    a fresh supervisor can re-tail and *adopt* a still-running worker
+    after a restart. When False (the default and the kill-switch path),
+    the legacy pipe-backed behaviour is preserved bit-for-bit: pipes,
+    drain on stop, demote-on-restart. ``persist_state=False`` (in-memory
+    force-dispatch) forces the pipe path regardless, since there is no
+    state YAML to record ``log_path`` for an adopter to find.
     """
     if shutil.which(claude_executable) is None:
         raise DispatchError(f"claude binary not found: {claude_executable}")
@@ -867,27 +1129,69 @@ def dispatch(
     # only sidecar/deliverable evidence.
     pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
 
-    process = subprocess.Popen(  # caller-controlled
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        cwd=str(task.working_dir) if task.working_dir else None,
-        env=spawn_env,
-        # New session ⇒ the subprocess is a process-group leader, so a
-        # cap-kill (`_terminate`) can `os.killpg` the whole group and
-        # reap children `claude` forked (MCP servers, shelled-out
-        # git/Rscript). Without this the children survive as orphans.
-        start_new_session=True,
-    )
+    # ADR-0025: file-backed output. When adoption is on (and we have a
+    # state YAML to record the log path on), redirect the worker's
+    # stdout/stderr to per-attempt files so the worker is independent of
+    # the supervisor's pipe lifetime — a supervisor exit can't EPIPE it,
+    # and a fresh supervisor can re-tail the log to adopt the still-
+    # running worker. ``persist_state=False`` (in-memory force-dispatch)
+    # keeps the pipe path because there's no state YAML for an adopter
+    # to find ``log_path`` on.
+    use_files = adopt_workers and persist_state
+    stdout_log_path: Path | None = None
+    stderr_log_path: Path | None = None
+    stdout_fh: IO[bytes] | None = None
+    stderr_fh: IO[bytes] | None = None
+    # PIPE for the legacy path, a real file fd for the file-backed path.
+    # Keep ``text=True`` in both cases: ``text`` only governs decoding of
+    # Popen-created PIPE streams, so it's a no-op for the file fds (the
+    # child writes raw bytes through them either way) and lets ``process``
+    # stay a uniform ``Popen[str]``.
+    stdout_sink: IO[bytes] | int = subprocess.PIPE
+    stderr_sink: IO[bytes] | int = subprocess.PIPE
+    if use_files:
+        stdout_log_path, stderr_log_path = _attempt_log_paths(
+            queue_dir, task.id, new_state.attempts
+        )
+        # Open in binary write mode: the worker writes here for its whole
+        # life and we tail it separately. We hold the write handles only
+        # long enough to hand the fds to Popen, then close our copies (in
+        # the finally below) — the child keeps its own dup'd fds. A
+        # ``with`` block can't express this fd hand-off, hence the noqa.
+        stdout_fh = open(stdout_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+        stderr_fh = open(stderr_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+        stdout_sink = stdout_fh
+        stderr_sink = stderr_fh
 
-    # Record the subprocess pid on the TaskState so the supervisor's
-    # startup silent-orphan reaper can SIGTERM survivors of an
-    # ungraceful supervisor exit (kill threshold exceeded). The
-    # original "status=running" write above didn't carry the pid
-    # because Popen hadn't fired yet; do a second atomic write now
-    # the pid is known.
+    try:
+        process = subprocess.Popen(  # caller-controlled
+            argv,
+            stdout=stdout_sink,
+            stderr=stderr_sink,
+            text=True,
+            bufsize=1,
+            cwd=str(task.working_dir) if task.working_dir else None,
+            env=spawn_env,
+            # New session ⇒ the subprocess is a process-group leader, so a
+            # cap-kill (`_terminate`) can `os.killpg` the whole group and
+            # reap children `claude` forked (MCP servers, shelled-out
+            # git/Rscript). Without this the children survive as orphans.
+            start_new_session=True,
+        )
+    finally:
+        # The child has dup'd the fds; our copies are no longer needed.
+        # Closing them lets the tailer (and the worker) own the file
+        # without us pinning extra descriptors for the whole run.
+        if stdout_fh is not None:
+            stdout_fh.close()
+        if stderr_fh is not None:
+            stderr_fh.close()
+
+    # Record the subprocess pid (and, for file-backed runs, the stdout
+    # log path) on the TaskState so the supervisor's startup reaper /
+    # adopter can find this worker after a restart. The original
+    # "status=running" write above didn't carry the pid because Popen
+    # hadn't fired yet; do a second atomic write now they're known.
     #
     # A failure here means this attempt is *untrackable*: the reaper
     # can't find the pid to clean up if the supervisor dies ungracefully
@@ -900,7 +1204,10 @@ def dispatch(
     # reapable by pid.
     if persist_state:
         try:
-            new_state = new_state.model_copy(update={"pid": process.pid})
+            pid_update: dict[str, object] = {"pid": process.pid}
+            if stdout_log_path is not None:
+                pid_update["log_path"] = str(stdout_log_path)
+            new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
         except Exception as exc:
             logger.error(
@@ -965,9 +1272,26 @@ def dispatch(
         heartbeat_persist_fn = None
         alive_monitor = None
 
+    # Build the line source + terminate callback for the loop. Both
+    # owned paths kill via the live Popen group; only the source of
+    # lines differs (a file tailer when file-backed, the stdout pipe
+    # otherwise). The terminate is wrapped so the loop stays oblivious
+    # to whether it's reading a pipe or a file (ADR-0025).
+    lines: Iterable[str]
+    if use_files:
+        assert stdout_log_path is not None
+        lines = tail_lines(stdout_log_path, alive=lambda: process.poll() is None)
+    else:
+        assert process.stdout is not None
+        lines = _read_lines(process.stdout)
+
+    def _terminate_owned() -> None:
+        _terminate(process)
+
     try:
         summary, cap_violation = _dispatch_loop(
-            process=process,
+            lines=lines,
+            terminate=_terminate_owned,
             settings_caps=settings_caps,
             clock=clock,
             task=task,
@@ -979,29 +1303,59 @@ def dispatch(
             alive_monitor.stop()
 
     # Drain remaining output and stderr. If the process won't finish
-    # draining within the grace period, SIGKILL its whole group (so any
-    # forked children die too) and drain again. `_signal_group` logs
-    # rather than swallowing an OSError, so a kill that races the
-    # process exiting is still surfaced.
-    try:
-        stdout_remainder, stderr = process.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        _signal_group(process, signal.SIGKILL)
-        stdout_remainder, stderr = process.communicate()
+    # within the grace period, SIGKILL its whole group (so any forked
+    # children die too) and drain again. `_signal_group` logs rather
+    # than swallowing an OSError, so a kill that races the process
+    # exiting is still surfaced.
+    if use_files:
+        # File-backed: there are no pipes to ``communicate`` over. Wait
+        # for the worker (it writes its own log files), SIGKILL the
+        # group on timeout. The tailer has already drained the stdout
+        # file up to the worker's exit; any final bytes are re-read from
+        # the file below. The stderr tail comes from the stderr file.
+        assert stdout_log_path is not None
+        assert stderr_log_path is not None
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _signal_group(process, signal.SIGKILL)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "task %s: worker pid=%s did not exit after SIGKILL; finalizing anyway",
+                    task.id,
+                    process.pid,
+                )
+        # Re-read the complete stdout log into a FRESH summary so the
+        # result reflects every event the worker wrote — the live tailer
+        # stops the instant the worker exits and can miss the very last
+        # flush. Reparsing the whole file into a new ``StreamSummary``
+        # (rather than appending to the loop's) keeps cumulative usage
+        # counted exactly once.
+        summary = _reparse_stdout_file(stdout_log_path)
+        stderr_tail = _read_stderr_tail(stderr_log_path)
+    else:
+        try:
+            stdout_remainder, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            _signal_group(process, signal.SIGKILL)
+            stdout_remainder, stderr = process.communicate()
 
-    # Re-parse any remainder lines. parse_lines updates `summary`
-    # (cumulative usage, session id, final result) as a side effect;
-    # we iterate purely to drive that aggregation. Per-event handling
-    # (heartbeat persist, cap/silence checks) is intentionally NOT
-    # repeated here — the subprocess has already exited, so there is
-    # nothing left to kill and the heartbeat is about to be overwritten
-    # by `_finalize_state`. Remainder parsing is stats-only.
-    if stdout_remainder:
-        for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
-            pass
+        # Re-parse any remainder lines. parse_lines updates `summary`
+        # (cumulative usage, session id, final result) as a side effect;
+        # we iterate purely to drive that aggregation. Per-event handling
+        # (heartbeat persist, cap/silence checks) is intentionally NOT
+        # repeated here — the subprocess has already exited, so there is
+        # nothing left to kill and the heartbeat is about to be
+        # overwritten by `_finalize_state`. Remainder parsing is
+        # stats-only.
+        if stdout_remainder:
+            for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
+                pass
+        stderr_tail = (stderr or "")[-500:] if stderr else ""
 
     finished_at = clock.now()
-    stderr_tail = (stderr or "")[-500:] if stderr else ""
 
     run_record = _build_run_record(
         attempt=new_state.attempts,
@@ -1072,6 +1426,262 @@ def dispatch(
         new_state=final_state,
         summary=summary,
     )
+
+
+def adopt_worker(
+    *,
+    task: Task,
+    state: TaskState,
+    queue_dir: Path,
+    clock: Clock,
+    settings_caps: TaskCapsSettings,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
+    account: str | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> DispatchOutcome:
+    """Monitor a worker this supervisor did NOT spawn, to completion.
+
+    ADR-0025 startup adoption. Given a ``state`` that is ``"running"``
+    with a live ``pid`` and a present ``log_path``, this re-attaches to
+    the orphaned ``claude --print`` worker without a ``Popen``:
+
+    * liveness is ``os.kill(pid, 0)`` (``_pid_alive`` — ESRCH ⇒ dead,
+      EPERM ⇒ alive);
+    * the recorded stdout log is tailed via :func:`tail_lines` and fed
+      through the SAME :func:`_dispatch_loop` as an owned worker, so the
+      per-event cap / heartbeat / silence enforcement is identical;
+    * a cap/silence KILL terminates the worker by pid
+      (:func:`_terminate_by_pid` → ``killpg``);
+    * the heartbeat + ``dispatcher_alive_at`` are refreshed on the state
+      YAML while tailing, so the per-tick reaper sees HEALTHY and never
+      demotes the adopted task out from under us.
+
+    On completion (the pid is gone) the outcome is **inferred** from the
+    terminal stream-json ``result`` event captured in the
+    :class:`StreamSummary` — there is no ``returncode`` for a process we
+    did not fork. If the pid vanished with no terminal result event the
+    run is finalized as failed (the worker crashed mid-run). The
+    finalize re-reads the on-disk status immediately before writing and
+    stands down if a concurrent reaper already moved the task off
+    ``"running"`` (the :func:`_demote_if_still_running` race guard),
+    mirroring the reaper's own TOCTOU mitigation so neither clobbers the
+    other.
+    """
+    started_at = state.last_started_at if state.last_started_at is not None else clock.now()
+    log_path = Path(state.log_path) if state.log_path is not None else None
+    pid = state.pid
+
+    if pid is None or log_path is None:
+        # Defensive: the caller (startup adoption) only adopts tasks with
+        # both fields present. If we somehow get here, finalize as a
+        # crash so the task isn't left stuck "running".
+        logger.warning(
+            "adopt_worker: task %s missing pid/log_path (pid=%s log_path=%s); "
+            "finalizing as crashed",
+            task.id,
+            pid,
+            log_path,
+        )
+        return _finalize_adopted(
+            task=task,
+            prior=state,
+            summary=StreamSummary(),
+            cap_violation=None,
+            started_at=started_at,
+            finished_at=clock.now(),
+            stderr_tail="",
+            account=account,
+            queue_dir=queue_dir,
+            settings_failure_classifier=settings_failure_classifier,
+        )
+
+    logger.info(
+        "[adopt] task_id=%s pid=%s log=%s attempt=%d",
+        task.id,
+        pid,
+        log_path,
+        state.attempts,
+    )
+
+    # Shared running-state writer (heartbeat + dispatcher-alive) — same
+    # lock discipline as dispatch()'s monitor so the two fields don't
+    # clobber each other. ``new_state`` is the local source of truth.
+    new_state = state
+    state_lock = threading.Lock()
+    state_path = state_path_for(queue_dir, task.id)
+
+    def _persist_heartbeat(when: datetime) -> None:
+        nonlocal new_state
+        with state_lock:
+            new_state = new_state.model_copy(update={"last_heartbeat_at": when})
+            write_state_atomic(new_state, state_path)
+
+    def _persist_alive(when: datetime) -> None:
+        nonlocal new_state
+        with state_lock:
+            new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
+            write_state_atomic(new_state, state_path)
+
+    alive_monitor = _DispatcherAliveMonitor(
+        persist_fn=_persist_alive,
+        clock=clock,
+        interval_s=settings_caps.dispatcher_alive_write_interval_s,
+        task_id=task.id,
+    )
+    alive_monitor.start()
+
+    def _alive() -> bool:
+        return _pid_alive(pid)
+
+    def _terminate_adopted() -> None:
+        _terminate_by_pid(pid, alive=_alive, sleep_fn=sleep_fn)
+
+    try:
+        summary, cap_violation = _dispatch_loop(
+            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn),
+            terminate=_terminate_adopted,
+            settings_caps=settings_caps,
+            clock=clock,
+            task=task,
+            started_at=started_at,
+            heartbeat_persist_fn=_persist_heartbeat,
+        )
+    finally:
+        alive_monitor.stop()
+
+    # The tailer exits once the pid is gone; re-read the full log so the
+    # summary reflects the worker's final flush (the live tailer may stop
+    # one read short of the terminal result event).
+    summary = _reparse_stdout_file(log_path)
+    stderr_tail = _read_stderr_tail(_stderr_path_for_stdout_log(log_path))
+    finished_at = clock.now()
+
+    return _finalize_adopted(
+        task=task,
+        prior=new_state,
+        summary=summary,
+        cap_violation=cap_violation,
+        started_at=started_at,
+        finished_at=finished_at,
+        stderr_tail=stderr_tail,
+        account=account,
+        queue_dir=queue_dir,
+        settings_failure_classifier=settings_failure_classifier,
+    )
+
+
+def _finalize_adopted(
+    *,
+    task: Task,
+    prior: TaskState,
+    summary: StreamSummary,
+    cap_violation: caps_mod.CapViolation | None,
+    started_at: datetime,
+    finished_at: datetime,
+    stderr_tail: str,
+    account: str | None,
+    queue_dir: Path,
+    settings_failure_classifier: FailureClassifierSettings | None,
+) -> DispatchOutcome:
+    """Build the RunRecord + persist terminal state for an adopted worker.
+
+    Exit code is inferred, not measured: a terminal ``result`` event in
+    ``summary`` drives the classification (its ``stop_reason`` / error),
+    exactly as the owned path would once ``_build_run_record`` consults
+    ``summary.final_result``. With NO terminal result event we pass a
+    non-zero ``process_exit_code`` so ``_build_run_record`` records a
+    ``no_result`` failure — the correct outcome for a worker that
+    vanished mid-run (crash, OOM-kill, or a kill we issued).
+
+    The terminal write uses the same recheck guard as the silent-orphan
+    reaper: if the on-disk status is no longer ``"running"`` a concurrent
+    reaper finalized first, so we stand down rather than clobber its
+    record (ADR-0025 concurrency note).
+    """
+    # No terminal result ⇒ infer a crash via a non-zero synthetic exit
+    # code so _build_run_record records ``no_result``. A present result
+    # event makes the exit code irrelevant (it branches on final_result).
+    inferred_exit = 0 if summary.final_result is not None else -1
+
+    # A "running" task always has attempts >= 1 (the dispatch that spawned
+    # the worker bumped it). max(1, ...) is a defensive floor so a
+    # hand-seeded / legacy state with attempts==0 can't trip RunRecord's
+    # ``attempt >= 1`` constraint.
+    run_record = _build_run_record(
+        attempt=max(1, prior.attempts),
+        started_at=started_at,
+        finished_at=finished_at,
+        plan=_ADOPT_PLAN,
+        summary=summary,
+        cap_violation=cap_violation,
+        process_exit_code=inferred_exit,
+        stderr_tail=stderr_tail,
+        account=account,
+    )
+
+    has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
+
+    final_state, run_record = _finalize_state(
+        prior=prior,
+        plan=_ADOPT_PLAN,
+        task=task,
+        run=run_record,
+        summary=summary,
+        cap_violation=cap_violation,
+        settings_failure_classifier=settings_failure_classifier,
+        pre_sha=None,
+        has_open_sidecar=has_open_sidecar,
+    )
+
+    if has_open_sidecar:
+        final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
+
+    # ``pid`` and ``log_path`` are already cleared by ``_finalize_state``
+    # (the attempt has terminated; nothing left to adopt or reap).
+
+    # Recheck guard (ADR-0025): a per-tick reaper can demote this task
+    # between our verdict and this write. Re-read; only persist if the
+    # on-disk status is still "running" (i.e. nothing else finalized it).
+    state_path = state_path_for(queue_dir, task.id)
+    try:
+        current = load_state(state_path)
+    except Exception as exc:
+        logger.warning(
+            "adopt_worker: recheck-load of %s failed (%s); persisting finalize anyway",
+            state_path,
+            exc,
+        )
+        write_state_atomic(final_state, state_path)
+    else:
+        if current.status == "running":
+            write_state_atomic(final_state, state_path)
+        else:
+            logger.info(
+                "adopt_worker: task %s status changed to %s before adopt finalize; "
+                "standing down so the concurrent writer's record wins",
+                task.id,
+                current.status,
+            )
+            final_state = current
+
+    return DispatchOutcome(
+        run_record=run_record,
+        new_state=final_state,
+        summary=summary,
+    )
+
+
+# A FRESH plan with no session id: adoption must not bump
+# ``resume_attempts`` or record a ``resumed_from_session`` (we don't
+# know whether the original spawn was a resume, and the session id is
+# captured from the log's init event regardless). Shared singleton so
+# the adopt path doesn't import SpawnPlan construction at every call.
+_ADOPT_PLAN = SpawnPlan(
+    strategy=ResumeStrategy.FRESH,
+    session_id=None,
+    prompt="",
+    extra_args=[],
+)
 
 
 _SUCCESS_STOP_REASONS: frozenset[str] = frozenset(
@@ -1239,6 +1849,12 @@ def _finalize_state(
             # the supervisor's silent-orphan reaper doesn't try to
             # signal a now-recycled OS pid.
             "pid": None,
+            # Clear the file-backed stream log pointer (ADR-0025): the
+            # attempt has finalized, so a fresh supervisor must not try to
+            # adopt this (now-terminal) task by re-tailing a stale log.
+            # The next dispatch records a new log_path. No-op for the
+            # pipe path, where log_path was never set.
+            "log_path": None,
         }
     )
     return new_state, run

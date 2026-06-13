@@ -1,17 +1,21 @@
 """Round-trip the generated systemd ``ExecStart`` / ``ExecStop`` lines
 back through the ``supervisor`` CLI.
 
-``build_unit_text`` writes two command lines into the unit:
+``build_unit_text`` writes two command lines into the unit. The
+ExecStop line depends on ``[supervisor].adopt_workers`` (ADR-0025):
 
     ExecStart=<binary> supervisor start  --queue <q> [--config <c>]
+    # adoption ON (default): fast stop
+    ExecStop=<binary>  supervisor stop   --queue <q> [--config <c>]
+    # adoption OFF: graceful drain
     ExecStop=<binary>  supervisor drain  --queue <q> [--config <c>] --no-wait
 
-The ExecStop line is *derived* from ExecStart by
-``_drain_command_from`` (swap ``start`` -> ``drain``, append
-``--no-wait``). If the ``drain`` subcommand ever stopped accepting a
-flag that ``start`` emits (the historical ``--config`` bug this test
-guards against), ``systemctl stop`` would die with ``No such option:
---config`` and the graceful-drain path would silently break.
+The ExecStop line is *derived* from ExecStart (swap ``start`` ->
+``stop``/``drain``). If the ``stop`` or ``drain`` subcommand ever
+stopped accepting a flag that ``start`` emits (the historical
+``--config`` bug this test guards against), ``systemctl stop`` would die
+with ``No such option: --config`` and the stop path would silently
+break. These tests guard BOTH modes.
 
 These tests parse the generated lines and feed the argv (minus the
 binary and the ``supervisor`` group name) into
@@ -109,10 +113,16 @@ class TestExecStartRoundTrip:
         assert start_daemon.called
 
 
-class TestExecStopRoundTrip:
+class TestExecStopDrainRoundTrip:
+    """Adoption OFF: ExecStop is ``supervisor drain --no-wait``."""
+
     def test_argv_shape(self) -> None:
         """ExecStop is the ``start`` line with ``drain`` + ``--no-wait``."""
-        text = build_unit_text(supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE))
+        text = build_unit_text(
+            supervisor_command=_SUPERVISOR_COMMAND,
+            queue_dir=Path(_QUEUE),
+            adopt_workers=False,
+        )
         argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
         assert argv == ["drain", "--queue", _QUEUE, "--config", _CONFIG, "--no-wait"]
 
@@ -129,7 +139,7 @@ class TestExecStopRoundTrip:
         # Re-derive the unit text with a real tmp queue so drain's pidfile
         # lookup resolves to a writable, definitely-empty directory.
         cmd = f"{_BINARY} supervisor start --queue {tmp_path} --config {tmp_path}/c.toml"
-        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path)
+        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path, adopt_workers=False)
         argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
         assert "--config" in argv  # the regression guard
         assert "--no-wait" in argv
@@ -153,16 +163,59 @@ class TestExecStopRoundTrip:
         assert "No such option" in result.output
 
 
+class TestExecStopFastStopRoundTrip:
+    """Adoption ON (default): ExecStop is ``supervisor stop`` (ADR-0025)."""
+
+    def test_argv_shape(self) -> None:
+        """ExecStop is the ``start`` line with ``start`` swapped to ``stop``."""
+        text = build_unit_text(supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE))
+        argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
+        assert argv == ["stop", "--queue", _QUEUE, "--config", _CONFIG]
+
+    def test_stop_subcommand_accepts_every_flag(self, runner: CliRunner, tmp_path: Path) -> None:
+        """The ``supervisor stop`` parser accepts the unit's flags —
+        including ``--config`` (added for ExecStop symmetry, ADR-0025).
+
+        Empty tmp queue ⇒ no running supervisor ⇒ stop exits 1 ("no PID
+        file"), a runtime outcome that still proves every flag parsed. A
+        rejected flag would be exit code 2.
+        """
+        cmd = f"{_BINARY} supervisor start --queue {tmp_path} --config {tmp_path}/c.toml"
+        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path)
+        argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
+        assert argv[0] == "stop"
+        assert "--config" in argv  # the regression guard for the new flag
+
+        result = runner.invoke(supervisor_app, argv)
+
+        assert result.exit_code != _USAGE_ERROR_EXIT, result.output
+        assert "No such option" not in result.output
+        assert result.exit_code == 1
+        assert "No PID file" in result.output
+
+
 class TestExecStartWithoutConfig:
     """The installer can emit a command line with no --config (queue-only).
-    The round-trip must still hold."""
+    The round-trip must still hold for both stop modes."""
 
-    def test_start_and_drain_accept_queue_only(self, runner: CliRunner, tmp_path: Path) -> None:
+    def test_start_and_stop_accept_queue_only(self, runner: CliRunner, tmp_path: Path) -> None:
         cmd = f"{_BINARY} supervisor start --queue {tmp_path}"
         text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path)
 
         start_argv = _argv_after_supervisor(_exec_line(text, "ExecStart"))
         assert start_argv == ["start", "--queue", str(tmp_path)]
+        stop_argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
+        assert stop_argv == ["stop", "--queue", str(tmp_path)]
+
+        # stop parses cleanly (runtime exit 1, no usage error).
+        result = runner.invoke(supervisor_app, stop_argv)
+        assert result.exit_code != _USAGE_ERROR_EXIT, result.output
+        assert result.exit_code == 1
+
+    def test_start_and_drain_accept_queue_only(self, runner: CliRunner, tmp_path: Path) -> None:
+        cmd = f"{_BINARY} supervisor start --queue {tmp_path}"
+        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path, adopt_workers=False)
+
         stop_argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
         assert stop_argv == ["drain", "--queue", str(tmp_path), "--no-wait"]
 
