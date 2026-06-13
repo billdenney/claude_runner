@@ -768,6 +768,61 @@ class TestStopAndResume:
         out = request_resume(snap, clock=clock)
         assert out is snap
 
+    @pytest.mark.parametrize(
+        "reading",
+        [
+            pytest.param(UsageFormatDrift("only 1 block found"), id="drift"),
+            pytest.param(
+                _reading(
+                    five_pct=80,
+                    weekly_pct=80,
+                    five_resets=datetime(2026, 5, 4, 13, 0, tzinfo=UTC),
+                    weekly_resets=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
+                ),
+                id="clean-80pct",
+            ),
+            pytest.param(UsageCaptureTimeout("slow"), id="capture-timeout"),
+            pytest.param(UsageCaptureSpawnError("missing"), id="spawn-error"),
+            pytest.param(UsageApiAuthExpired("HTTP 401"), id="auth-expired"),
+        ],
+    )
+    def test_stopped_is_sticky_under_various_readings(
+        self,
+        reading,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """STOPPED short-circuits ahead of every reading classifier
+        (drift, clean-but-high utilization, capture errors, auth-expired)
+        and returns exactly ``[MonitorInFlight()]`` with the snapshot
+        unchanged. Only :func:`request_resume` leaves STOPPED."""
+        snap = request_stop(_initial(SupervisorState.THROTTLED_5H), clock=clock)
+        assert snap.state is SupervisorState.STOPPED
+
+        new, actions = step(
+            _input(
+                snap,
+                reading,
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=10,
+                in_flight=3,
+            ),
+            clock,
+        )
+
+        # Stays STOPPED — the snapshot is returned untouched (same
+        # object: the STOPPED branch returns ``snapshot`` directly).
+        assert new is snap
+        assert new.state is SupervisorState.STOPPED
+        # The exact emitted command set is a single MonitorInFlight — no
+        # StopDispatch, no Notify, no EmitEvent leak through the sticky
+        # short-circuit.
+        assert actions == [MonitorInFlight()]
+
 
 # ----------------------------------------------------------------------------
 # State-transition events
@@ -944,3 +999,76 @@ class TestAllStates:
         values = {s.value for s in SupervisorState}
         assert "paused_weekly" not in values
         assert "end_of_week_push" not in values
+
+
+# ----------------------------------------------------------------------------
+# IDLE classification from every state (no pending, nothing in flight)
+# ----------------------------------------------------------------------------
+
+
+class TestIdleFromEveryState:
+    """When ``pending==0 and in_flight==0`` and the reading is clean, the
+    step function classifies to IDLE — from every prior state, with two
+    documented exceptions baked into the machine:
+
+    * STOPPED is sticky (only ``request_resume`` leaves it).
+    * ERROR_DRIFT must first clear ``drift_recovery_clean_polls`` clean
+      polls in a row before any further classification (IDLE included)
+      can fire; this test primes the counter so the threshold is met on
+      the tick under test, exercising the fall-through into the IDLE
+      branch.
+
+    Enumerates the full :class:`SupervisorState` enum so a newly-added
+    state can't silently skip the IDLE classification.
+    """
+
+    @pytest.mark.parametrize("prior", list(SupervisorState))
+    def test_no_work_classifies_idle(
+        self,
+        prior: SupervisorState,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        snap = _initial(prior)
+        if prior is SupervisorState.ERROR_DRIFT:
+            # Prime so this tick is the Nth clean poll → recovery
+            # threshold met → fall through to the IDLE branch.
+            snap = snap.model_copy(
+                update={
+                    "consecutive_clean_polls": usage_settings.drift_recovery_clean_polls - 1
+                }
+            )
+
+        reading = _reading(
+            five_pct=10,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(
+                snap,
+                reading,
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=0,
+                in_flight=0,
+            ),
+            clock,
+        )
+
+        if prior is SupervisorState.STOPPED:
+            # Sticky: never reaches the IDLE check.
+            assert new.state is SupervisorState.STOPPED
+            assert actions == [MonitorInFlight()]
+        else:
+            assert new.state is SupervisorState.IDLE, (
+                f"prior={prior.value} should classify to IDLE with no work"
+            )
+            assert MonitorInFlight in _action_types(actions)
+            # IDLE entry zeroes the drift bookkeeping.
+            assert new.consecutive_clean_polls == 0
+            assert new.last_drift_message == ""

@@ -327,17 +327,61 @@ def sleep_for_next_poll(
 
 
 @dataclass
+class TickFailureCounters:
+    """Per-subsystem tick-failure tallies for the daemon loop.
+
+    The three subsystems below each run inside a ``try/except
+    Exception`` in :func:`start_daemon`: a crash in one must not take
+    the supervisor down (architectural invariant — the loop stays
+    alive), but a *sustained* outage of any one of them means the
+    supervisor "looks alive" while a whole subsystem is silently dead.
+
+    These counters make that observable. ``*_total`` is the lifetime
+    count of failures; ``dispatch_consecutive`` tracks the current
+    run of back-to-back ``tick_dispatch`` failures (reset to 0 on the
+    first success) and drives the escalation in
+    :data:`DISPATCH_OUTAGE_ESCALATION_TICKS`. ``dispatch_outage`` is
+    set once the escalation fires so a doctor / ops surface can read a
+    single boolean rather than re-deriving the threshold.
+
+    A doctor check cannot read this in-memory object directly (it lives
+    in the supervisor process); the daemon surfaces the same numbers
+    via the ``supervisor_dispatch_outage`` :class:`EmitEvent` so the
+    operator's event sink / journal sees the escalation. Persisting the
+    counts onto :class:`SupervisorSnapshot` is the natural follow-up
+    for the doctor surface (see ``supervisor/states.py``).
+    """
+
+    force_dispatch_total: int = 0
+    reap_total: int = 0
+    dispatch_total: int = 0
+    dispatch_consecutive: int = 0
+    dispatch_outage: bool = False
+
+
+# After this many *consecutive* ``tick_dispatch`` failures the daemon
+# escalates: a prominent ERROR is logged and a
+# ``supervisor_dispatch_outage`` event is emitted. The supervisor is
+# NOT halted — halting would drop the live in-flight slot map and
+# orphan running tasks (architectural invariant 2). Escalation is the
+# clean alerting mechanism; the operator decides whether to restart.
+DISPATCH_OUTAGE_ESCALATION_TICKS = 5
+
+
+@dataclass
 class DaemonHandle:
     """Returned by :func:`start_daemon` so callers can inspect / stop it.
 
-    Currently a thin wrapper; here so the public API stays stable when
-    we add observability fields later (last tick time, action history
-    ring buffer, etc.).
+    The ``tick_failures`` field carries the
+    :class:`TickFailureCounters` accumulated over the loop's lifetime,
+    so a caller (or a test) can inspect whether a subsystem was
+    silently failing even though the supervisor stayed up.
     """
 
     queue_dir: Path
     state_path: Path
     pid_path: Path
+    tick_failures: TickFailureCounters = field(default_factory=TickFailureCounters)
 
 
 def _diff_settings(old: Settings, new: Settings) -> int:
@@ -404,7 +448,13 @@ def start_daemon(
 
     state_path = persist_mod.supervisor_state_path(queue_dir, settings.supervisor.state_file)
     pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
-    handle = DaemonHandle(queue_dir=queue_dir, state_path=state_path, pid_path=pid_path)
+    tick_failures = TickFailureCounters()
+    handle = DaemonHandle(
+        queue_dir=queue_dir,
+        state_path=state_path,
+        pid_path=pid_path,
+        tick_failures=tick_failures,
+    )
 
     stop_flag = {"stop": False}
     reload_flag = {"pending": False}
@@ -596,7 +646,16 @@ def start_daemon(
                             claude_executable=settings.claude.executable,
                         )
                     except Exception:
-                        logger.exception("force-dispatch tick_consume failed")
+                        # Keep the loop alive, but tally the failure so a
+                        # sustained force-dispatch outage is observable
+                        # (finding: was daemon.py:598). The doctor surface
+                        # is a separate concern; here we only expose the
+                        # count.
+                        tick_failures.force_dispatch_total += 1
+                        logger.exception(
+                            "force-dispatch tick_consume failed (total=%d)",
+                            tick_failures.force_dispatch_total,
+                        )
 
                 # Steady-state silent-orphan reap (companion to the
                 # startup pass above). Runs every
@@ -624,7 +683,14 @@ def start_daemon(
                             clock=clk,
                         )
                     except Exception:
-                        logger.exception("per-tick silent-orphan reap failed")
+                        # Tally so a sustained reap outage (orphans
+                        # silently accumulating) is observable (finding:
+                        # was daemon.py:626).
+                        tick_failures.reap_total += 1
+                        logger.exception(
+                            "per-tick silent-orphan reap failed (total=%d)",
+                            tick_failures.reap_total,
+                        )
                     else:
                         for result in steady_results:
                             if notify_callback is not None:
@@ -666,7 +732,63 @@ def start_daemon(
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
-                    logger.exception("tick_dispatch failed")
+                    # Dispatch is the supervisor's core job: if it is fully
+                    # broken the process still "looks alive" but never
+                    # dispatches. Count consecutive failures and escalate
+                    # once they exceed the threshold (finding: was
+                    # daemon.py:668). We do NOT halt — that would orphan
+                    # the live in-flight slot map (invariant 2); the
+                    # EmitEvent is the alerting hook a doctor/ops surface
+                    # consumes.
+                    tick_failures.dispatch_total += 1
+                    tick_failures.dispatch_consecutive += 1
+                    logger.exception(
+                        "tick_dispatch failed (consecutive=%d, total=%d)",
+                        tick_failures.dispatch_consecutive,
+                        tick_failures.dispatch_total,
+                    )
+                    # Escalate once on the threshold-crossing edge (the
+                    # ``dispatch_outage`` flag de-dupes so a long outage
+                    # doesn't spam the operator every tick). A later clean
+                    # tick clears the flag, re-arming escalation for a
+                    # fresh outage episode.
+                    if (
+                        tick_failures.dispatch_consecutive >= DISPATCH_OUTAGE_ESCALATION_TICKS
+                        and not tick_failures.dispatch_outage
+                    ):
+                        tick_failures.dispatch_outage = True
+                        logger.error(
+                            "DISPATCH OUTAGE: tick_dispatch has failed %d "
+                            "consecutive ticks; the supervisor is alive but "
+                            "not dispatching. Investigate immediately.",
+                            tick_failures.dispatch_consecutive,
+                        )
+                        if notify_callback is not None:
+                            notify_callback(
+                                "critical",
+                                "supervisor dispatch outage: tick_dispatch failed "
+                                f"{tick_failures.dispatch_consecutive} consecutive "
+                                "ticks (alive but not dispatching)",
+                            )
+                        if event_callback is not None:
+                            event_callback(
+                                "supervisor_dispatch_outage",
+                                {
+                                    "consecutive_failures": tick_failures.dispatch_consecutive,
+                                    "total_failures": tick_failures.dispatch_total,
+                                    "threshold": DISPATCH_OUTAGE_ESCALATION_TICKS,
+                                },
+                            )
+                else:
+                    # A clean dispatch cycle clears the consecutive run and
+                    # any active outage flag — the subsystem recovered.
+                    if tick_failures.dispatch_outage:
+                        logger.info(
+                            "dispatch recovered after %d consecutive failures",
+                            tick_failures.dispatch_consecutive,
+                        )
+                    tick_failures.dispatch_consecutive = 0
+                    tick_failures.dispatch_outage = False
 
                 # Drain-complete check: once every dispatch thread has
                 # finished, exit cleanly. Done AFTER tick_dispatch so the
