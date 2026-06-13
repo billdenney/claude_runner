@@ -86,6 +86,9 @@ def planned_dispatch_order(queue_dir: Path) -> list[Task]:
         try:
             tasks.append(load_task(path))
         except Exception as exc:
+            # Deliberate skip-and-warn (not fail-fast): one corrupt task
+            # YAML must not blind the operator to the rest of the pending
+            # pool. The path is logged so the bad file is locatable.
             logger.warning("skipping unparseable task at %s: %s", path, exc)
     tasks.sort(key=priority_sort_key)
     return tasks
@@ -363,7 +366,8 @@ def _has_any_completed(queue_dir: Path) -> bool:
     for sp in list_state_files(queue_dir):
         try:
             state = load_state(sp)
-        except Exception:
+        except Exception as exc:
+            logger.warning("skipping unparseable state %s: %s", sp, exc)
             continue
         if state.status == "completed":
             return True
@@ -375,7 +379,8 @@ def _completed_task_ids(queue_dir: Path) -> set[str]:
     for sp in list_state_files(queue_dir):
         try:
             state = load_state(sp)
-        except Exception:
+        except Exception as exc:
+            logger.warning("skipping unparseable state %s: %s", sp, exc)
             continue
         if state.status == "completed":
             ids.add(state.task_id)
@@ -428,28 +433,39 @@ def _eligible_candidates(
         if sp.exists():
             try:
                 state = load_state(sp)
-            except Exception:
-                # Unparseable state file — treat as "not yet dispatched".
-                # The next attempt will overwrite it cleanly.
-                pass
-            else:
-                if state.status not in _DISPATCHABLE_STATUSES:
-                    # Special case: awaiting_sidecar tasks become
-                    # dispatchable AGAIN once every sidecar request has
-                    # a matching response file. Without this, a task
-                    # that stopped to ask an operator question stays
-                    # stuck forever — the operator's response file is
-                    # written but the orchestrator never re-evaluates.
-                    # Fixed 2026-05-15 after live observation that 5
-                    # answered sidecars on the popPK queue had stayed
-                    # in awaiting_sidecar for >90 minutes despite
-                    # response-001.json files being in place.
-                    if state.status == "awaiting_sidecar" and task.id not in open_sidecar_task_ids:
-                        # All requests answered — fall through to the
-                        # depends_on check and add to out.
-                        pass
-                    else:
-                        continue
+            except Exception as exc:
+                # Unparseable state file (disk corruption, a partial
+                # write from a crashed dispatcher). Do NOT treat this as
+                # "not yet dispatched": that silently makes the task
+                # eligible, so a *completed* task could be re-dispatched —
+                # duplicate work and wasted cap. Skip the task and log so
+                # the corruption is visible; an operator (or the doctor
+                # check) must delete or rebuild the state file. Surfacing
+                # this via doctor is tracked separately.
+                logger.error("skipping task %s: unparseable state %s: %s", task.id, sp, exc)
+                continue
+            if state.status not in _DISPATCHABLE_STATUSES:
+                # Special case: awaiting_sidecar tasks become
+                # dispatchable AGAIN once every sidecar request has
+                # a matching response file. Without this, a task
+                # that stopped to ask an operator question stays
+                # stuck forever — the operator's response file is
+                # written but the orchestrator never re-evaluates.
+                # Fixed 2026-05-15 after live observation that 5
+                # answered sidecars on the popPK queue had stayed
+                # in awaiting_sidecar for >90 minutes despite
+                # response-001.json files being in place.
+                if state.status == "awaiting_sidecar" and task.id in open_sidecar_task_ids:
+                    # A request is still unanswered — keep the task
+                    # ineligible until the operator responds.
+                    continue
+                if state.status != "awaiting_sidecar":
+                    # Any other non-dispatchable status (running,
+                    # completed, failed_circuit_breaker, ...) stays
+                    # skipped.
+                    continue
+                # awaiting_sidecar with every request answered: fall
+                # through to the depends_on check and add to out.
 
         unmet = [d for d in task.depends_on if d not in completed_ids]
         if unmet:
