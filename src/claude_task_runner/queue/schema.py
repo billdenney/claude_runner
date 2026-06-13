@@ -233,6 +233,18 @@ class TaskState(_StrictBase):
     ``None`` on legacy state YAMLs that pre-date the field, on tasks
     that have not yet been dispatched, and on tasks whose most recent
     dispatch has finalized normally."""
+    log_path: str | None = None
+    """Absolute path to the current attempt's stream-json log file, when
+    the dispatcher runs in file-backed mode (``[supervisor].adopt_workers``).
+    The worker's stdout is redirected here instead of a supervisor-owned
+    pipe, so the stream survives a supervisor restart and a fresh
+    supervisor can re-tail it to *adopt* the still-running worker
+    (ADR-0025) rather than demoting the task and losing the work.
+
+    Written alongside ``pid`` right after ``Popen`` and cleared on
+    dispatch finalization. ``None`` on legacy state YAMLs, on tasks that
+    have not been dispatched, on finalized tasks, and whenever adoption
+    is disabled (the pipe-backed path records no log file)."""
     stop_reason: str | None = None
     error: str | None = None
     runs: list[RunRecord] = Field(default_factory=list)

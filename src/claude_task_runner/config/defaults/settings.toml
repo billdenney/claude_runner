@@ -302,6 +302,7 @@ crash_loop_threshold        = 5
 window_start_delay_s        = 300        # cron fires N s after detected window reset
 state_file                  = "supervisor.json"
 preferred_init_system       = "auto"     # auto | systemd | cron
+adopt_workers               = true       # ADR-0025: file-backed workers; adopt survivors on restart, fast stop
 
 # ---------------------------------------------------------------------------
 # Pre/post-dispatch hooks
