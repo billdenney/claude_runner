@@ -20,6 +20,7 @@ from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.doctor.checks import (
     CheckStatus,
+    _current_username,
     _extract_paths,
     all_checks,
     check_account_sudo,
@@ -28,6 +29,7 @@ from claude_task_runner.doctor.checks import (
     check_ema,
     check_global_lock,
     check_legacy_claude_config_dir,
+    check_legacy_runner_dir,
     check_orphaned_sessions,
     check_queue_layout,
     check_queue_perms_for_linux_users,
@@ -434,6 +436,36 @@ def test_check_account_sudo_missing_sudo_binary(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _current_username (best-effort; logs at DEBUG on failure)
+# ---------------------------------------------------------------------------
+
+
+def test_current_username_returns_name_normally() -> None:
+    """On a normal POSIX host the lookup succeeds and is non-empty."""
+    import getpass
+
+    assert _current_username() == getpass.getuser()
+
+
+def test_current_username_empty_and_debug_logged_on_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pwd lookup failure → empty string AND a DEBUG log (audit finding:
+    the empty-on-failure path was previously silent telemetry gap)."""
+    with (
+        patch("claude_task_runner.doctor.checks.os.getuid", side_effect=OSError("boom")),
+        caplog.at_level("DEBUG", logger="claude_task_runner.doctor.checks"),
+    ):
+        result = _current_username()
+    assert result == ""
+    assert any(
+        "could not resolve current username" in r.getMessage()
+        for r in caplog.records
+        if r.levelname == "DEBUG"
+    )
+
+
+# ---------------------------------------------------------------------------
 # check_queue_perms_for_linux_users
 # ---------------------------------------------------------------------------
 
@@ -572,6 +604,46 @@ def test_check_queue_layout_missing_todo_warns(settings: Settings, tmp_path: Pat
     result = check_queue_layout(settings, qd)
     assert result.status == CheckStatus.WARN
     assert "todo/" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# check_legacy_runner_dir (ADR-0007 — pre-v2 .claude_runner/ surface)
+# ---------------------------------------------------------------------------
+
+
+def test_check_legacy_runner_dir_absent_passes(settings: Settings, queue_dir: Path) -> None:
+    """No legacy .claude_runner/ → PASS (the steady state)."""
+    result = check_legacy_runner_dir(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert "no legacy" in result.detail
+
+
+def test_check_legacy_runner_dir_present_warns(settings: Settings, queue_dir: Path) -> None:
+    """A lingering pre-v2 .claude_runner/ → WARN pointing at archive/delete."""
+    legacy = queue_dir / ".claude_runner"
+    legacy.mkdir()
+    (legacy / "state").mkdir()  # some old cruft inside
+    result = check_legacy_runner_dir(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert str(legacy) in result.detail
+    assert "ADR-0007" in result.detail
+    # Remediation must give an actionable archive/delete command naming
+    # the absolute path.
+    assert str(legacy) in result.remediation
+    assert "rm -rf" in result.remediation or "mv" in result.remediation
+    # And it must NOT be confused with the current runtime dir.
+    assert ".claude_task_runner" in result.remediation
+
+
+def test_check_legacy_runner_dir_ignores_current_runtime_dir(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """Only ``.claude_runner`` triggers — the current
+    ``.claude_task_runner`` runtime dir must never be flagged."""
+    (queue_dir / ".claude_task_runner").mkdir(exist_ok=True)
+    # No .claude_runner present.
+    result = check_legacy_runner_dir(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +972,8 @@ def test_check_watchdog_systemd_present(settings: Settings, tmp_path: Path) -> N
 
 
 def test_check_watchdog_none(settings: Settings, tmp_path: Path) -> None:
+    """No systemd unit and an empty crontab (legitimate 'no crontab') →
+    WARN reporting that no watchdog is installed at all."""
     with (
         patch(
             "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
@@ -907,11 +981,45 @@ def test_check_watchdog_none(settings: Settings, tmp_path: Path) -> None:
         ),
         patch(
             "claude_task_runner.cron.install.crontab_l",
-            side_effect=Exception("crontab not available"),
+            return_value="",  # crontab_l's legitimate "no crontab" signal
         ),
     ):
         result = check_watchdog_installed(settings)
     assert result.status == CheckStatus.WARN
+    assert "no watchdog" in result.detail
+    # The legitimate-empty case must NOT mention a probe failure.
+    assert "could not inspect" not in result.detail
+
+
+def test_check_watchdog_crontab_error_distinguished_from_missing(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A CrontabError (operational failure reading the crontab) must NOT be
+    reported as 'no watchdog detected' (audit finding): the check can't
+    tell whether a cron watchdog exists, so it surfaces the probe failure
+    distinctly so the operator chases the right problem.
+    """
+    from claude_task_runner.cron.install import CrontabError
+
+    with (
+        patch(
+            "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
+            return_value=tmp_path / "nonexistent.service",
+        ),
+        patch(
+            "claude_task_runner.cron.install.crontab_l",
+            side_effect=CrontabError("'crontab' not found on PATH"),
+        ),
+    ):
+        result = check_watchdog_installed(settings)
+    assert result.status == CheckStatus.WARN
+    # Distinguishing detail: an inspection failure, not a clean "not installed".
+    assert "could not inspect crontab" in result.detail
+    assert "crontab" in result.detail
+    # The misleading flat "no watchdog (systemd or cron) detected" string
+    # must NOT be used for an operational failure.
+    assert result.detail != "no watchdog (systemd or cron) detected"
+    assert result.remediation != ""
 
 
 def test_check_watchdog_cron_present(settings: Settings, tmp_path: Path) -> None:
@@ -944,13 +1052,17 @@ def test_check_watchdog_cron_present(settings: Settings, tmp_path: Path) -> None
 def test_all_checks_returns_runnable_callables(settings: Settings, queue_dir: Path) -> None:
     checks = list(all_checks(settings, queue_dir))
     # 15 checks as of multi-account PR1 (added accounts, legacy,
-    # account_policies, sudo, perms).
-    assert len(checks) >= 15
+    # account_policies, sudo, perms); +1 for legacy_runner_dir.
+    assert len(checks) >= 16
     # Each is callable and produces a CheckResult.
+    names: set[str] = set()
     for fn in checks:
         result = fn()
         assert hasattr(result, "status")
         assert hasattr(result, "name")
+        names.add(result.name)
+    # The legacy-runner-dir surface (ADR-0007) is wired into the battery.
+    assert "legacy_runner_dir" in names
 
 
 def test_all_checks_can_disable_paths_check(settings: Settings, queue_dir: Path) -> None:
@@ -1070,7 +1182,11 @@ def test_check_working_dir_template_warns_on_null_with_hook(
     assert "211-null-b" in result.detail
     # The presets one MUST NOT be in the warning.
     assert "212-set" not in result.detail
-    assert "queue backfill-working-dir" in result.remediation
+    # ADR-0023: the remediation must print the EXACT copy-pasteable command
+    # with the resolved queue dir, so operators don't have to guess the flag.
+    assert (
+        f"claude-task-runner queue backfill-working-dir --queue {queue_dir}" in result.remediation
+    )
 
 
 def test_check_working_dir_template_no_null_tasks_passes(
