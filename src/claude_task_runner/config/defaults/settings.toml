@@ -301,19 +301,7 @@ crash_loop_threshold        = 5
 [supervisor]
 window_start_delay_s        = 300        # cron fires N s after detected window reset
 state_file                  = "supervisor.json"
-sigterm_grace_s             = 30
-dry_run                     = false
 preferred_init_system       = "auto"     # auto | systemd | cron
-
-# ---------------------------------------------------------------------------
-# Notifications
-# ---------------------------------------------------------------------------
-[notify]
-channels                    = ["desktop"]
-desktop_command             = "notify-send"
-file_path                   = "~/.claude_task_runner/banner.txt"
-webhook_url                 = ""
-email_to                    = ""
 
 # ---------------------------------------------------------------------------
 # Pre/post-dispatch hooks
@@ -323,32 +311,6 @@ pre_dispatch_command        = ""
 pre_dispatch_timeout_s      = 120
 post_dispatch_command       = ""
 post_dispatch_timeout_s     = 60
-
-# ---------------------------------------------------------------------------
-# Sidecars
-# ---------------------------------------------------------------------------
-[sidecar]
-unanswered_alert_s            = 86400    # re-emit notification after N s pending
-unanswered_auto_recommended_s = 0        # 0 = never auto-pick
-
-# ---------------------------------------------------------------------------
-# Metrics / observability
-# ---------------------------------------------------------------------------
-[metrics]
-prometheus_enabled       = false
-prometheus_textfile_path = "/var/lib/node_exporter/textfile_collector/claude_task_runner.prom"
-
-# ---------------------------------------------------------------------------
-# Terminal UI
-# ---------------------------------------------------------------------------
-[ui]
-refresh_interval_ms = 1000
-
-# ---------------------------------------------------------------------------
-# Fixture corpus rotation
-# ---------------------------------------------------------------------------
-[fixtures]
-rotation_window_days = 30
 
 # ---------------------------------------------------------------------------
 # Logging
