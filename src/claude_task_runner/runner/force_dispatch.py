@@ -180,13 +180,39 @@ def consume_request(queue_dir: Path, task_id: str) -> None:
 
 
 def _load_state_or_none(queue_dir: Path, task_id: str) -> TaskState | None:
+    """Load the task's state YAML, or ``None`` when it legitimately doesn't exist.
+
+    A *missing* state file is normal (the task was never dispatched) and
+    returns ``None``. A *corrupt* state file is NOT treated as "no prior
+    state": silently swallowing a parse error here would let a completed
+    or in-flight task be re-dispatched (the status check downstream reads
+    ``None`` as dispatchable). Parse/read errors are logged and re-raised
+    as :class:`ForceDispatchError` so the corruption surfaces to the
+    operator instead of being papered over.
+    """
     state_path = state_path_for(queue_dir, task_id)
     if not state_path.exists():
+        # Legitimately no prior state — the task hasn't been dispatched.
         return None
     try:
         return load_state(state_path)
-    except Exception:
-        return None
+    except Exception as exc:
+        # The file exists but could not be read/parsed (truncated write,
+        # disk corruption, schema drift). ``load_state`` wraps a vanished
+        # file as ``QueueIOError(FileNotFoundError)``; a genuine TOCTOU
+        # disappearance is still "no prior state".
+        if not state_path.exists():
+            return None
+        logger.error(
+            "force-dispatch %s: state YAML %s is unreadable/corrupt (%s); "
+            "refusing to treat as 'no prior state'",
+            task_id,
+            state_path,
+            exc,
+        )
+        raise ForceDispatchError(
+            f"task {task_id} state YAML is unreadable/corrupt: {state_path} ({exc})"
+        ) from exc
 
 
 def tick_consume(
@@ -246,7 +272,20 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
-        state = _load_state_or_none(queue_dir, task.id)
+        try:
+            state = _load_state_or_none(queue_dir, task.id)
+        except ForceDispatchError as exc:
+            # Corrupt state YAML: we cannot tell whether the task is
+            # already running/completed, so we must NOT dispatch. Leave
+            # the request in place (do not consume) so the operator can
+            # repair the state and the task is retried next tick rather
+            # than silently re-dispatched.
+            logger.error(
+                "force-dispatch %s: %s; leaving request for operator repair",
+                task.id,
+                exc,
+            )
+            continue
         status = state.status if state is not None else None
         if status not in _FORCE_DISPATCHABLE:
             logger.warning(

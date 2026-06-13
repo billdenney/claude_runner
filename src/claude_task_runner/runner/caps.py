@@ -10,6 +10,11 @@ Settings come from ``[task_caps]`` with optional per-task overrides on
 A value of ``0`` in settings means "unlimited"; ``None`` on the task
 override means "use settings value". The override always wins when
 non-None.
+
+Note: ``0`` means "no cap" / unlimited for both ``max_tokens`` and
+``max_duration_s`` (i.e. the ``[task_caps]`` ``max_tokens_per_task`` and
+``max_duration_s_per_task`` settings, and their per-task overrides).
+A cap is only enforced when its value is strictly greater than ``0``.
 """
 
 from __future__ import annotations

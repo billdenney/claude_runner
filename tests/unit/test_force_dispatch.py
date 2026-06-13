@@ -309,6 +309,61 @@ class TestTickConsume:
 
 
 # ---------------------------------------------------------------------------
+# Corrupt-state handling (audit finding: missing-vs-corrupt distinction)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadStateOrNone:
+    """``_load_state_or_none`` must distinguish a *missing* state file
+    (legitimately "no prior state" → ``None``) from a *corrupt* one
+    (refuse — surfacing a ``ForceDispatchError`` rather than silently
+    treating it as "no prior state", which would re-dispatch a task that
+    may already be running or completed)."""
+
+    def test_missing_state_returns_none(self, queue_dir: Path) -> None:
+        assert fd_mod._load_state_or_none(queue_dir, "never-dispatched") is None
+
+    def test_valid_state_round_trips(self, queue_dir: Path) -> None:
+        _seed_state(queue_dir, "t1", "failed")
+        state = fd_mod._load_state_or_none(queue_dir, "t1")
+        assert state is not None
+        assert state.status == "failed"
+
+    def test_corrupt_state_raises(self, queue_dir: Path) -> None:
+        state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
+        with pytest.raises(fd_mod.ForceDispatchError, match="unreadable/corrupt"):
+            fd_mod._load_state_or_none(queue_dir, "t1")
+
+
+class TestTickConsumeCorruptState:
+    def test_corrupt_state_leaves_request_and_does_not_dispatch(self, queue_dir: Path) -> None:
+        """A corrupt state YAML must NOT be treated as dispatchable. The
+        request file is left in place (for operator repair) and no
+        dispatch thread is spawned."""
+        _make_task(queue_dir, "t1")
+        state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
+        fd_mod.write_request(queue_dir, "t1")
+        settings = _make_settings()
+        in_flight: dict[str, DispatchSlot] = {}
+
+        with patch(
+            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+            return_value=None,
+        ) as mock_dispatch:
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                in_flight_slots=in_flight,
+            )
+        assert n == 0
+        mock_dispatch.assert_not_called()
+        assert in_flight == {}
+        # Request PERSISTS so the operator can repair the state YAML.
+        assert fd_mod.request_path(queue_dir, "t1").exists()
+
+
+# ---------------------------------------------------------------------------
 # dispatch_synchronously
 # ---------------------------------------------------------------------------
 
@@ -329,6 +384,20 @@ class TestDispatchSynchronously:
         _seed_state(queue_dir, "t1", "completed")
         settings = _make_settings()
         with pytest.raises(fd_mod.ForceDispatchError, match="not dispatchable"):
+            fd_mod.dispatch_synchronously(
+                task_id="t1",
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+            )
+
+    def test_raises_when_state_corrupt(self, queue_dir: Path) -> None:
+        """A corrupt state YAML must refuse rather than silently dispatch
+        with a fresh state (which could re-run a completed task)."""
+        _make_task(queue_dir, "t1")
+        state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
+        settings = _make_settings()
+        with pytest.raises(fd_mod.ForceDispatchError, match="unreadable/corrupt"):
             fd_mod.dispatch_synchronously(
                 task_id="t1",
                 queue_dir=queue_dir,
