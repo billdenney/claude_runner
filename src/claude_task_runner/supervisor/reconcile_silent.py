@@ -84,6 +84,48 @@ against that by treating any ``last_heartbeat_at`` older than
 then falls back to ``last_started_at`` as the baseline, which is the
 correct conservative answer for "what's the most recent confirmed
 liveness signal."
+
+The same correction is applied to ``dispatcher_alive_at`` for the same
+reason.
+
+Dual-heartbeat classification (Layer 2)
+---------------------------------------
+PR #57 wired ``last_heartbeat_at`` writes into the dispatcher loop;
+those writes only fire when the agent emits stream-json events. A
+healthy run that's mid-Bash-subprocess (R package check, large
+download, OAuth refresh) can be silent for tens of minutes despite
+the supervisor and dispatcher being alive and well.
+
+This module's classifier now consults a second field,
+``dispatcher_alive_at``, which the dispatcher monitor thread ticks
+every ``[task_caps].dispatcher_alive_write_interval_s`` *regardless*
+of whether the agent emitted anything. A fresh ``dispatcher_alive_at``
+proves the monitor thread is pumping the subprocess pipe; the task is
+HEALTHY even when ``last_heartbeat_at`` is stale. Only when both
+fields are stale does the classifier fall through to the filesystem
+verification step.
+
+State YAMLs from the pre-Layer-2 supervisor have ``dispatcher_alive_at
+= None``; the classifier treats that as "old format" and falls back to
+``last_heartbeat_at`` alone (the pre-Layer-2 behaviour), so an upgrade
+doesn't reap every running task.
+
+Filesystem activity verification (Layer 3)
+------------------------------------------
+When the cheap signals say a task is silent, the classifier walks the
+task's ``working_dir`` for the most recent file ``st_mtime`` before
+acting. If any file has been modified within
+``[task_caps].zombie_verify_fs_activity_window_s`` (default 600s),
+the task is treated as HEALTHY: a long-running Bash subprocess is
+clearly doing useful work even when no stream-json events have
+escaped through the pipe. ``last_heartbeat_at`` is refreshed from the
+mtime so the next pass starts from a fresh baseline.
+
+The walk is bounded — depth-limited, with well-known noisy directories
+skipped (``.git/``, ``node_modules/``, ``__pycache__/``, ...) — and
+runs at most once per in-flight task per reaper pass, only when the
+cheap signals already suggest a hang. Zero overhead when everything is
+healthy.
 """
 
 from __future__ import annotations
@@ -93,6 +135,7 @@ import os
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_task_runner.clock import Clock
@@ -101,6 +144,8 @@ from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
     load_state,
+    load_task,
+    task_path_for,
     write_state_atomic,
 )
 from claude_task_runner.runner.heartbeat import (
@@ -161,12 +206,103 @@ pass. Distinct from :data:`_STARTUP_ERROR_PREFIX` so the audit trail
 distinguishes restart-orphans from supervisor-live wedges."""
 
 
+_FS_WALK_SKIP_NAMES: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "target",  # rust/maven build output
+        "dist",
+        "build",
+    }
+)
+"""Directory names skipped by the bounded filesystem-activity walk.
+
+These are the well-known noisy build / VCS / cache trees: spinning
+through them just to find the freshest ``st_mtime`` would dominate the
+walk cost without telling us anything about whether the dispatched
+agent is doing useful work. The agent's deliverables (code, reports,
+sidecar JSON) all live outside these trees."""
+
+
+_FS_WALK_MAX_DEPTH = 4
+"""Worktree directory depth past which the bounded walk stops. Empirical
+observation: typical task worktrees keep deliverables within
+``<repo>/<package>/<file>`` — 2-3 levels deep. A depth-4 cap leaves
+headroom for nested R/Python subpackages while keeping the worst-case
+walk bounded even on a pathological tree."""
+
+
+def _latest_mtime_in_tree(
+    root: Path,
+    *,
+    max_depth: int = _FS_WALK_MAX_DEPTH,
+    skip_names: frozenset[str] = _FS_WALK_SKIP_NAMES,
+) -> float | None:
+    """Return the most recent ``st_mtime`` (as a unix timestamp) inside
+    ``root``, or ``None`` if the tree is empty / unreachable.
+
+    Walks at most ``max_depth`` levels below ``root`` and skips entries
+    whose ``name`` is in ``skip_names``. Skipped directories don't
+    contribute to the answer at all — their internal mtimes are
+    invisible to the caller. This is intentional: the build / VCS /
+    cache trees we skip have noisy mtimes that don't correlate with
+    the dispatched agent's activity.
+
+    Failures (permission errors, lost symlink targets, races against
+    file deletion) are swallowed silently — the caller should treat
+    ``None`` as "no observable activity" and proceed accordingly.
+    """
+    try:
+        if not root.exists() or not root.is_dir():
+            return None
+    except OSError:
+        return None
+
+    latest: float | None = None
+
+    def _walk(current: Path, depth: int) -> None:
+        nonlocal latest
+        if depth > max_depth:
+            return
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if entry.name in skip_names:
+                    continue
+                # follow_symlinks=False to avoid loops + so a symlink's
+                # mtime is the link's, not the target's.
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            mtime = stat.st_mtime
+            if latest is None or mtime > latest:
+                latest = mtime
+            if entry.is_dir(follow_symlinks=False):
+                _walk(Path(entry.path), depth + 1)
+
+    _walk(root, depth=0)
+    return latest
+
+
 def reconcile_silent_orphans(
     queue_dir: Path,
     *,
     settings: TaskCapsSettings,
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
+    fs_mtime_fn: Callable[[Path], float | None] | None = None,
 ) -> list[ReapResult]:
     """Walk in-flight state YAMLs and surface silent / hung subprocesses
     at supervisor startup.
@@ -207,6 +343,8 @@ def reconcile_silent_orphans(
     """
     if sigterm_fn is None:
         sigterm_fn = _default_sigterm
+    if fs_mtime_fn is None:
+        fs_mtime_fn = _latest_mtime_in_tree
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -214,12 +352,14 @@ def reconcile_silent_orphans(
     for state_path in list_state_files(queue_dir):
         result = _classify_and_act(
             state_path,
+            queue_dir=queue_dir,
             settings=settings,
             now=now,
             sigterm_fn=sigterm_fn,
             silent_stop_reason=SILENT_STOP_REASON,
             kill_error_prefix=_STARTUP_ERROR_PREFIX,
             recheck_running_before_write=False,
+            fs_mtime_fn=fs_mtime_fn,
         )
         if result is not None:
             results.append(result)
@@ -234,6 +374,7 @@ def reap_silent_orphans_tick(
     settings: TaskCapsSettings,
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
+    fs_mtime_fn: Callable[[Path], float | None] | None = None,
 ) -> list[ReapResult]:
     """Per-tick steady-state pass over live in-flight tasks.
 
@@ -282,6 +423,8 @@ def reap_silent_orphans_tick(
     """
     if sigterm_fn is None:
         sigterm_fn = _default_sigterm
+    if fs_mtime_fn is None:
+        fs_mtime_fn = _latest_mtime_in_tree
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -295,12 +438,14 @@ def reap_silent_orphans_tick(
 
         result = _classify_and_act(
             state_path,
+            queue_dir=queue_dir,
             settings=settings,
             now=now,
             sigterm_fn=sigterm_fn,
             silent_stop_reason=STEADY_SILENT_STOP_REASON,
             kill_error_prefix=_STEADY_ERROR_PREFIX,
             recheck_running_before_write=True,
+            fs_mtime_fn=fs_mtime_fn,
         )
         if result is not None:
             results.append(result)
@@ -311,19 +456,23 @@ def reap_silent_orphans_tick(
 def _classify_and_act(
     state_path: Path,
     *,
+    queue_dir: Path,
     settings: TaskCapsSettings,
-    now: object,  # datetime; using object to avoid circular import noise
+    now: datetime,
     sigterm_fn: Callable[[int], bool],
     silent_stop_reason: str,
     kill_error_prefix: str,
     recheck_running_before_write: bool,
+    fs_mtime_fn: Callable[[Path], float | None],
 ) -> ReapResult | None:
     """Classify a single state YAML and (when warranted) demote it.
 
     Shared between the startup and per-tick wrappers so the silence
     semantics — including the baseline-correction trick that treats a
-    pre-``last_started_at`` heartbeat as "no heartbeat this attempt"
-    — stay identical across the two passes.
+    pre-``last_started_at`` heartbeat as "no heartbeat this attempt",
+    the Layer-2 ``dispatcher_alive_at`` short-circuit, and the Layer-3
+    filesystem activity verification — stay identical across the two
+    passes.
 
     ``silent_stop_reason`` lets the caller distinguish the two paths
     in the audit trail (``SILENT_STOP_REASON`` for startup,
@@ -337,10 +486,15 @@ def _classify_and_act(
     because no dispatch threads run before the daemon's bootstrap
     completes.
 
-    Returns ``None`` for HEALTHY tasks, unparseable state files,
-    ``status != "running"`` rows, and rows where the TOCTOU guard
-    fired. Otherwise returns the :class:`ReapResult` describing the
-    state transition just performed.
+    ``fs_mtime_fn`` is the bounded filesystem walk that powers the
+    Layer-3 verification — injected so tests can stub it. The default
+    is :func:`_latest_mtime_in_tree`.
+
+    Returns ``None`` for HEALTHY tasks (including the dispatcher-alive
+    short-circuit and the filesystem-confirmed-activity refresh),
+    unparseable state files, ``status != "running"`` rows, and rows
+    where the TOCTOU guard fired. Otherwise returns the
+    :class:`ReapResult` describing the state transition just performed.
     """
     try:
         state = load_state(state_path)
@@ -371,12 +525,28 @@ def _classify_and_act(
     if last_hb is not None and last_hb < started_at:
         last_hb = None
 
+    # Layer 2: dispatcher_alive_at short-circuit.
+    # A fresh dispatcher_alive_at means the monitor thread is pumping
+    # the subprocess pipe — the task is HEALTHY regardless of how
+    # quiet the agent has been. The same baseline-correction trick
+    # applies (a pre-started_at value belongs to a prior attempt).
+    # ``None`` is the pre-Layer-2 legacy state YAML and falls back to
+    # the last_heartbeat_at-only path below.
+    dispatcher_alive_at = state.dispatcher_alive_at
+    if dispatcher_alive_at is not None and dispatcher_alive_at < started_at:
+        dispatcher_alive_at = None
+
+    if dispatcher_alive_at is not None:
+        alive_silence_s = (now - dispatcher_alive_at).total_seconds()
+        if alive_silence_s <= settings.heartbeat_silence_alert_s:
+            return None
+
     try:
         status = evaluate(
             settings=settings,
             last_heartbeat_at=last_hb,
             started_at=started_at,
-            now=now,  # type: ignore[arg-type]
+            now=now,
         )
     except ValueError as exc:
         # Clock skew or future-dated timestamps; defer to the broad
@@ -389,6 +559,25 @@ def _classify_and_act(
         return None
 
     if status.verdict is HeartbeatVerdict.HEALTHY:
+        return None
+
+    # Layer 3: filesystem activity verification.
+    # Before acting on a SILENT/KILL verdict, peek at the working_dir
+    # for recent file mtimes. A subprocess doing useful work via a
+    # long-running Bash invocation (R check, file generation, web
+    # download) won't emit stream-json events but will be writing
+    # files. Treat that as HEALTHY and refresh last_heartbeat_at from
+    # the mtime so the next pass starts from a fresh baseline.
+    fs_refreshed = _maybe_refresh_from_filesystem(
+        state_path=state_path,
+        queue_dir=queue_dir,
+        state=state,
+        settings=settings,
+        now=now,
+        fs_mtime_fn=fs_mtime_fn,
+        require_recheck=recheck_running_before_write,
+    )
+    if fs_refreshed:
         return None
 
     sigtermed = False
@@ -454,6 +643,91 @@ def _classify_and_act(
         pid=state.pid,
         sigtermed=sigtermed,
     )
+
+
+def _maybe_refresh_from_filesystem(
+    *,
+    state_path: Path,
+    queue_dir: Path,
+    state: TaskState,
+    settings: TaskCapsSettings,
+    now: datetime,
+    fs_mtime_fn: Callable[[Path], float | None],
+    require_recheck: bool,
+) -> bool:
+    """If ``state``'s working_dir has been touched recently, refresh
+    ``last_heartbeat_at`` from the mtime and return ``True``.
+
+    The Task YAML carries the ``working_dir`` (TaskState does not). If
+    the Task can't be loaded (missing, unparseable, no working_dir set),
+    the filesystem check is skipped — we can't verify activity for
+    something we can't locate. The caller treats a ``False`` return as
+    "no FS-confirmed activity, proceed to act on the SILENT/KILL verdict."
+
+    The window is governed by ``zombie_verify_fs_activity_window_s``.
+    When a recent mtime is found we write a refreshed TaskState with
+    the mtime persisted as ``last_heartbeat_at``; that timestamp is
+    what the next reaper pass will read, restarting the clock from the
+    most-recent confirmed activity.
+
+    The refresh write honours the same TOCTOU recheck as a demote
+    write: if the dispatcher finalized between our verdict computation
+    and the refresh write, skip — the authoritative state wins.
+    """
+    try:
+        task = load_task(task_path_for(queue_dir, state.task_id))
+    except Exception as exc:
+        logger.debug(
+            "silent-orphan reaper: %s: cannot load Task YAML (%s); skipping FS check",
+            state.task_id,
+            exc,
+        )
+        return False
+
+    working_dir = task.working_dir
+    if working_dir is None:
+        # Research/analysis tasks intentionally run without a worktree
+        # (mirror of the dispatcher's output-evidence gate). There's
+        # nothing to walk; act on the heartbeat verdict.
+        return False
+
+    try:
+        latest_mtime = fs_mtime_fn(working_dir)
+    except Exception as exc:
+        logger.warning(
+            "silent-orphan reaper: %s: fs_mtime_fn raised %s; skipping FS check",
+            state.task_id,
+            exc,
+        )
+        return False
+
+    if latest_mtime is None:
+        return False
+
+    fs_silence_s = now.timestamp() - latest_mtime
+    if fs_silence_s > settings.zombie_verify_fs_activity_window_s:
+        return False
+
+    # FS-confirmed activity. Refresh last_heartbeat_at from the mtime
+    # so the next reaper pass measures silence from the most-recent
+    # confirmed activity (NOT from the prior stale stream-json event).
+    mtime_dt = datetime.fromtimestamp(latest_mtime, tz=UTC)
+    refreshed = state.model_copy(update={"last_heartbeat_at": mtime_dt})
+
+    if not _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck):
+        # TOCTOU lost — the dispatcher's finalize wrote first. That's
+        # fine; we're not demoting anyway. Return True so the caller
+        # treats this as HEALTHY (no reap result).
+        return True
+
+    logger.info(
+        "silent-orphan reaper: %s: filesystem activity within %.0fs "
+        "(latest mtime %.0fs ago); refreshed last_heartbeat_at, treating as HEALTHY",
+        state.task_id,
+        settings.zombie_verify_fs_activity_window_s,
+        fs_silence_s,
+    )
+    return True
 
 
 def _demote_if_still_running(

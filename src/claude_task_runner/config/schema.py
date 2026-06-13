@@ -121,6 +121,41 @@ class TaskCapsSettings(_StrictModel):
     visible silence below 60s including the worst-case write skew).
     """
 
+    dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0)
+    """Seconds between the dispatcher's monitor-thread ``dispatcher_alive_at``
+    writes. Distinct from ``heartbeat_persist_interval_s`` because
+    ``last_heartbeat_at`` only updates when the agent emits a stream-json
+    event, while ``dispatcher_alive_at`` always advances — it proves the
+    monitor thread is still pumping the subprocess pipe and the supervisor
+    is alive.
+
+    This separation lets the per-tick reaper distinguish three cases:
+
+    * Healthy + active — both fields fresh.
+    * Healthy + agent-quiet — ``dispatcher_alive_at`` fresh but
+      ``last_heartbeat_at`` stale (long Bash subprocess, OAuth refresh in
+      progress, etc.). The reaper treats this as HEALTHY.
+    * Dead monitor — both stale. The reaper falls through to the
+      filesystem activity verification step (see
+      ``zombie_verify_fs_activity_window_s``).
+    """
+
+    zombie_verify_fs_activity_window_s: float = Field(gt=0, default=600.0)
+    """When the per-tick reaper would mark a task SILENT/KILL based on
+    the cheap heartbeat fields, it first walks the task's working_dir
+    for the most recent file ``st_mtime``. If anything was modified
+    within this window, the task is treated as HEALTHY (and
+    ``last_heartbeat_at`` is refreshed from the mtime so the next
+    pass starts from a fresh baseline).
+
+    The walk is bounded (depth-limited, well-known noisy directories
+    skipped) and runs at most once per in-flight task per reaper pass —
+    only when the cheap signals already suggest a hang. Zero overhead
+    when everything is healthy. Default 600s = 10 min, comfortably
+    longer than a typical Bash subprocess (R package check, large
+    download) but well below the default duration cap.
+    """
+
     steady_state_reap_interval_ticks: int = Field(ge=1, default=1)
     """How many supervisor ticks elapse between two steady-state
     silent-orphan reaper runs. ``1`` (the default) runs the reaper on

@@ -9,6 +9,68 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Three-layer heartbeat: separate `dispatcher_alive_at` field and
+  filesystem-activity verification for the silent-orphan reaper.**
+  PR #57 wired `last_heartbeat_at` writes into the dispatch loop, but
+  that field only ticks when the agent emits a stream-json event. A
+  healthy run mid-Bash-subprocess (R package check, large download,
+  OAuth refresh) can be silent for tens of minutes despite the
+  supervisor and dispatcher being alive and well. The per-tick reaper
+  would have flagged those tasks as SILENT and (once
+  `heartbeat_silence_kill_s > 0`) SIGTERM'd them — wrongly. Two new
+  layers protect against false positives without bogging down the
+  reaper:
+
+  1. **`dispatcher_alive_at` field on `TaskState`** plus a background
+     monitor thread inside the dispatcher that writes this field every
+     `[task_caps].dispatcher_alive_write_interval_s` (default 30s)
+     regardless of stream-json events. The reaper's classifier
+     consults BOTH fields: a fresh `dispatcher_alive_at` means the
+     monitor thread is pumping the subprocess pipe, so the task is
+     HEALTHY even when `last_heartbeat_at` is stale. The same baseline-
+     correction trick used for `last_heartbeat_at` (treat values older
+     than `last_started_at` as if from a prior attempt) is applied to
+     `dispatcher_alive_at` so a stale prior-run write doesn't
+     erroneously short-circuit the classifier. Legacy state YAMLs
+     (pre-this-release) carry `dispatcher_alive_at = None` and fall
+     back to the heartbeat-only path so an upgrade doesn't reap every
+     running task.
+
+  2. **One-shot bounded filesystem-activity walk** of the task's
+     `working_dir` before acting on a SILENT/KILL verdict. When both
+     heartbeat fields are stale, the reaper walks the worktree (depth-
+     capped at 4, well-known noisy directories like `.git/`,
+     `node_modules/`, `__pycache__/` skipped) for the most recent
+     `st_mtime`. If anything was modified within
+     `[task_caps].zombie_verify_fs_activity_window_s` (default 600s),
+     the task is treated as HEALTHY and `last_heartbeat_at` is
+     refreshed from the mtime so the next pass starts from a fresh
+     baseline. The walk runs ONLY when the cheap signals already
+     suggest a hang — at most once per in-flight task per reaper pass,
+     gated by the Layer-2 short-circuit. Zero filesystem overhead when
+     everything is healthy.
+
+  Three new `[task_caps]` knobs (all with operator-friendly defaults
+  so a no-config upgrade just works):
+
+  - `dispatcher_alive_write_interval_s = 30.0`
+  - `zombie_verify_fs_activity_window_s = 600.0`
+  - (existing `heartbeat_persist_interval_s = 30.0` for the
+    `last_heartbeat_at` rate limit, from PR #57)
+
+  New tests: `tests/unit/test_dispatcher_alive_monitor.py` exercises
+  the monitor thread (initial write, loop cadence, failure isolation,
+  clock consultation), and `tests/unit/test_reap_silent_three_layer.py`
+  covers the dual-heartbeat decision tree plus the filesystem
+  verification step (recent mtime → HEALTHY-and-refresh, stale mtime
+  → SILENT/KILL, missing Task YAML / no working_dir → skip FS check,
+  FS function raises → skip FS check, Layer-2 short-circuit prevents
+  the FS walk from running in the common HEALTHY case). An integration
+  test in `tests/integration/test_dispatcher.py` asserts the field
+  lands in the YAML during a normal dispatch.
+
 ### Fixed
 
 - **Steady-state silent-orphan reaper inside live supervisor.** The
