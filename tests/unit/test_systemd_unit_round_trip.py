@@ -116,9 +116,7 @@ class TestExecStopRoundTrip:
         argv = _argv_after_supervisor(_exec_line(text, "ExecStop"))
         assert argv == ["drain", "--queue", _QUEUE, "--config", _CONFIG, "--no-wait"]
 
-    def test_drain_subcommand_accepts_every_flag(
-        self, runner: CliRunner, tmp_path: Path
-    ) -> None:
+    def test_drain_subcommand_accepts_every_flag(self, runner: CliRunner, tmp_path: Path) -> None:
         """The ``supervisor drain`` parser accepts the unit's flags —
         including ``--config``, the flag the historical drain bug dropped.
 

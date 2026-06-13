@@ -299,8 +299,6 @@ class TestCorruptRegistryBackup:
         queue = isolated_home / "q"
         queue.mkdir()
         register_queue(queue)
-        backup = queues_registry_path().with_suffix(
-            queues_registry_path().suffix + ".broken"
-        )
+        backup = queues_registry_path().with_suffix(queues_registry_path().suffix + ".broken")
         assert load_registered_queues() == [queue.resolve()]
         assert not backup.exists()

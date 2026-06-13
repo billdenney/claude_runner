@@ -459,8 +459,7 @@ def _dispatch_loop(
                     else logger.warning
                 )
                 log(
-                    "task %s: heartbeat persist failed (%s); continuing "
-                    "[failure %d this dispatch]",
+                    "task %s: heartbeat persist failed (%s); continuing [failure %d this dispatch]",
                     task.id,
                     exc,
                     heartbeat_persist_failures,

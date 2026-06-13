@@ -379,9 +379,7 @@ def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
 
 
 @pytest.mark.parametrize("target", [1, 2, 3, 5])
-def test_tick_dispatch_no_dispatch_at_exact_capacity_boundary(
-    queue_dir: Path, target: int
-) -> None:
+def test_tick_dispatch_no_dispatch_at_exact_capacity_boundary(queue_dir: Path, target: int) -> None:
     """Boundary of ``available = max(0, target - in_flight_count)``.
 
     When ``in_flight_count == target`` the available-slot count is

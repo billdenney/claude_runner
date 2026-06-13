@@ -1036,9 +1036,7 @@ class TestIdleFromEveryState:
             # Prime so this tick is the Nth clean poll → recovery
             # threshold met → fall through to the IDLE branch.
             snap = snap.model_copy(
-                update={
-                    "consecutive_clean_polls": usage_settings.drift_recovery_clean_polls - 1
-                }
+                update={"consecutive_clean_polls": usage_settings.drift_recovery_clean_polls - 1}
             )
 
         reading = _reading(

@@ -706,6 +706,6 @@ class TestPidPersistFailureSurfaces:
         # pid write.
         assert outcome.new_state.status == "completed"
         error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any(
-            "UNTRACKED-PID" in m and task.id in m for m in error_msgs
-        ), f"expected an UNTRACKED-PID error log, got: {error_msgs}"
+        assert any("UNTRACKED-PID" in m and task.id in m for m in error_msgs), (
+            f"expected an UNTRACKED-PID error log, got: {error_msgs}"
+        )

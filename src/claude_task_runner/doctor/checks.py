@@ -671,10 +671,7 @@ def check_legacy_runner_dir(_settings: Settings, queue_dir: Path) -> CheckResult
     return CheckResult(
         name="legacy_runner_dir",
         status=CheckStatus.WARN,
-        detail=(
-            f"legacy pre-v2 directory present: {legacy} (ignored by the runner; "
-            "see ADR-0007)"
-        ),
+        detail=(f"legacy pre-v2 directory present: {legacy} (ignored by the runner; see ADR-0007)"),
         remediation=(
             "The current runner stores all state under "
             f"{queue_dir / '.claude_task_runner'}; the old {legacy} is never "
