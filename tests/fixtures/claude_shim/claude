@@ -19,12 +19,17 @@ Env vars:
 * ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
    with this message on stderr (used to test resume-fail-fast behavior)
 * ``SHIM_NUM_ASSISTANT_MSGS`` (default ``2``)
+* ``SHIM_IGNORE_SIGTERM`` (default ``""``) — when ``1`` / ``true``,
+   install ``signal.SIG_IGN`` for ``SIGTERM`` before emitting events.
+   Used by the cap-kill PG-wide-SIGKILL integration test to exercise
+   the SIGTERM → SIGKILL escalation path of ``_terminate``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -35,6 +40,9 @@ def emit(obj: dict) -> None:
 
 
 def main() -> int:
+    if os.environ.get("SHIM_IGNORE_SIGTERM", "").lower() in ("1", "true"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     fail_fast = os.environ.get("SHIM_FAIL_FAST", "")
     if fail_fast:
         sys.stderr.write(fail_fast + "\n")

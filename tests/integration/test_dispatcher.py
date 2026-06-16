@@ -709,3 +709,65 @@ class TestPidPersistFailureSurfaces:
         assert any("UNTRACKED-PID" in m and task.id in m for m in error_msgs), (
             f"expected an UNTRACKED-PID error log, got: {error_msgs}"
         )
+
+
+class TestCapKillSigtermIgnoringSubprocess:
+    """The 2026-06-13 zombie post-mortem: the dispatcher's ``_terminate``
+    must SIGKILL the process group when the subprocess ignores SIGTERM.
+    A real ``claude --print`` can wedge with SIGTERM queued behind a
+    blocking ``Bash(git push)`` waitpid, leaving the dispatcher's
+    SIGTERM unanswered. Without the PG-wide SIGKILL escalation +
+    post-kill ``wait`` verification, the dispatcher would finalize the
+    attempt as ``killed_by_cap=duration`` with the subprocess STILL
+    alive — locking the slot for the live runs observed at the
+    incident: ``frompeople-903-farrell_2013`` survived 30+ hours after
+    the bogus kill notice.
+
+    This integration test parameterises the shim to install
+    ``signal.SIG_IGN`` for SIGTERM, then trips the duration cap. The
+    expectations encode the post-fix contract: the run record reports
+    ``killed_by_cap``, the state is terminal (slot reclaimable), and
+    the recorded pid is cleared (the verified-dead path).
+    """
+
+    @pytest.mark.slow
+    def test_cap_kill_falls_through_to_sigkill_on_sigterm_ignorer(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        # Shim ignores SIGTERM and sleeps 0.4s between events. With
+        # max_duration=0.5s the cap fires on the second assistant event
+        # (~0.8s in). Total assistant messages set high so the shim
+        # won't naturally exit during the SIGTERM grace window.
+        monkeypatch.setenv("SHIM_IGNORE_SIGTERM", "1")
+        monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "0.4")
+        monkeypatch.setenv("SHIM_NUM_ASSISTANT_MSGS", "50")
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-cap-sigign")
+
+        outcome = dispatch(
+            task=task,
+            state=TaskState(task_id=task.id),
+            plan=fresh_plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(max_duration=0.5),
+            settings_session=_session(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+        )
+
+        # Cap-kill ran the full SIGTERM → 5s wait → SIGKILL → 2s verify
+        # path and the verify wait succeeded (SIGKILL is uncatchable).
+        # The finalize then writes a terminal state: status="failed",
+        # killed_by_cap="duration", pid=None.
+        assert outcome.new_state.status == "failed"
+        assert outcome.run_record.killed_by_cap == "duration"
+        assert outcome.new_state.pid is None
+        # Belt: the state file on disk agrees with the in-memory state.
+        persisted = load_state(state_path_for(queue_dir, task.id))
+        assert persisted.status == "failed"
+        assert persisted.pid is None

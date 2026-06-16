@@ -11,6 +11,29 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Dispatcher `_terminate` now verifies the parent actually exited
+  and raises `TerminateFailed` on kill failures (2026-06-13 zombie
+  post-mortem).** The audit-pass PG-wide signalling reaped MCP /
+  shell grandchildren, but the dispatcher still trusted a successful
+  `os.killpg(SIGKILL)` return as "the parent is dead" without
+  verifying. Two failure modes were observed live: a `killpg(SIGKILL)`
+  that raises `OSError` (the signal-send itself failed — EPERM, etc.)
+  and a parent that survives SIGKILL (TASK_UNINTERRUPTIBLE on a hung
+  syscall). In both cases the dispatcher previously returned
+  cleanly, the run was finalized as `killed_by_cap`, the slot was
+  freed, and the subprocess survived for hours afterward
+  (`frompeople-903-farrell_2013` survived 30+ hours past the bogus
+  kill, locking the `work` account's only slot). `_terminate` now
+  resolves the pgid once, falls through to SIGKILL on a non-vanished
+  SIGTERM OSError (logged at WARNING), and after the SIGKILL waits
+  another 2 seconds for the kernel to reap the parent — raising
+  `TerminateFailed` (ERROR-logged) when either step can't confirm
+  death. The raise propagates out of `dispatch()` so the state YAML
+  stays `"running"` with the recorded pid for the per-tick silent-
+  orphan reaper, instead of clearing the pid on a still-alive
+  subprocess. The integration test reproduces the live incident with
+  a SIGTERM-ignoring shim.
+
 - **Audit remediation — bug-class findings (full-codebase triage,
   2026-06-13, branch `audit/full-codebase-2026-06`).**
   - **Dispatcher orphan-child leak:** the `claude --print` subprocess is now
