@@ -30,8 +30,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
     from claude_task_runner.supervisor.states import SupervisorSnapshot
 
 logger = logging.getLogger(__name__)
+
+NotifyCallback = Callable[[str, str], None]
+EventCallback = Callable[[str, dict[str, Any]], None]
 
 
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
@@ -137,6 +141,8 @@ def tick_dispatch(
     accounts: list[ResolvedAccount] | None = None,
     claude_executable: str = "claude",
     draining: bool = False,
+    notify_callback: NotifyCallback | None = None,
+    event_callback: EventCallback | None = None,
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
@@ -175,7 +181,13 @@ def tick_dispatch(
     "open" and "closed" each tick when one account was throttled and
     another was fine, halving effective dispatch throughput.
     """
-    _reap_finished(in_flight_slots)
+    _reap_finished(
+        in_flight_slots,
+        queue_dir=queue_dir,
+        clock=clock,
+        notify_callback=notify_callback,
+        event_callback=event_callback,
+    )
 
     if draining:
         # Drain mode: skip both the candidate enumeration and
@@ -350,13 +362,105 @@ def _account_dispatch_mod_states() -> frozenset[SupervisorState]:
     return account_dispatch_mod._DISPATCHABLE_STATES
 
 
-def _reap_finished(in_flight_slots: dict[str, DispatchSlot]) -> None:
+def _reap_finished(
+    in_flight_slots: dict[str, DispatchSlot],
+    *,
+    queue_dir: Path | None = None,
+    clock: Clock | None = None,
+    notify_callback: NotifyCallback | None = None,
+    event_callback: EventCallback | None = None,
+) -> None:
+    """Reap dispatch threads that have exited; refuse to free leaked subprocesses.
+
+    Defence-in-depth post-kill sanity check (Bug 5 of the 2026-06
+    zombie-consolidated PR): for every slot whose dispatch thread has
+    exited, we look up the subprocess pid in the just-written run record
+    and probe ``os.kill(pid, 0)``. If the pid is still alive — the
+    dispatcher's SIGTERM→SIGKILL escalation failed (typically a kernel
+    D-state) — we log loudly, fire a one-shot operator notification,
+    and DO NOT delete the slot. Holding the slot prevents the queue
+    from re-dispatching to the leaked subprocess's account-slot until
+    operator intervention. Re-checks on subsequent ticks remain silent
+    until the pid eventually disappears, at which point the slot frees
+    normally.
+
+    ``queue_dir`` is required for the leak check; tests that call this
+    helper without it (legacy positional call sites, simple finished-
+    thread reaps) fall back to the historical behaviour (free the
+    slot unconditionally). ``clock`` is required to stamp
+    ``subprocess_leak_notified_at`` on first detection — also optional
+    so existing call sites stay compiling.
+    """
     finished = [tid for tid, slot in in_flight_slots.items() if not slot.thread.is_alive()]
     for tid in finished:
+        slot = in_flight_slots[tid]
         with contextlib.suppress(Exception):
-            in_flight_slots[tid].thread.join(timeout=0.1)
+            slot.thread.join(timeout=0.1)
+
+        leak_pid = _recorded_subprocess_pid(queue_dir, tid) if queue_dir is not None else None
+        if leak_pid is not None and dispatcher_mod._pid_alive(leak_pid):
+            if slot.subprocess_leak_notified_at is None:
+                logger.error(
+                    "SUBPROCESS_LEAK_DETECTED: task %s dispatch thread exited but "
+                    "subprocess pid=%s is still alive; refusing to free the "
+                    "in-flight slot until the kernel releases it (operator "
+                    "intervention may be required: SIGKILL the pid manually)",
+                    tid,
+                    leak_pid,
+                )
+                if notify_callback is not None:
+                    notify_callback(
+                        "critical",
+                        f"subprocess leak: task {tid} dispatch thread exited but "
+                        f"pid={leak_pid} is still alive; in-flight slot held until "
+                        f"the kernel releases it",
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "subprocess_leak_detected",
+                        {"task_id": tid, "pid": leak_pid},
+                    )
+                if clock is not None:
+                    slot.subprocess_leak_notified_at = clock.now()
+            # Leave the slot in place; do NOT delete.
+            continue
+
         del in_flight_slots[tid]
         logger.info("reaped finished dispatch thread for task %s", tid)
+
+
+def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
+    """Return the most recent run record's pid for ``task_id``, or ``None``.
+
+    Reads the task's state YAML and returns ``runs[-1].pid`` — the OS
+    pid of the subprocess most recently spawned for this task. Used by
+    the post-tick reap's subprocess-leak detection. Returns ``None``
+    when:
+
+    * the state file is missing or unparseable (defensive — a missing
+      state YAML means we have nothing to check)
+    * the task has no recorded runs (first dispatch hasn't finalized
+      yet)
+    * the most recent run record predates the ``pid`` field (legacy
+      run records carry ``pid=None`` by the schema default)
+    * the run was a pre-dispatch hook failure (no subprocess ever
+      spawned)
+    """
+    sp = state_path_for(queue_dir, task_id)
+    if not sp.exists():
+        return None
+    try:
+        state = load_state(sp)
+    except Exception as exc:
+        logger.debug(
+            "subprocess-leak check: %s state load failed (%s); skipping probe",
+            task_id,
+            exc,
+        )
+        return None
+    if not state.runs:
+        return None
+    return state.runs[-1].pid
 
 
 def _target_concurrency(

@@ -790,6 +790,8 @@ def start_daemon(
                         in_flight_slots=in_flight_slots,
                         claude_executable=settings.claude.executable,
                         draining=drain_flag["draining"],
+                        notify_callback=notify_callback,
+                        event_callback=event_callback,
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:

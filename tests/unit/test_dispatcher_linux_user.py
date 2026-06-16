@@ -67,6 +67,10 @@ class _FakePopen:
         # An empty iterable; the dispatcher iterates stdout via parse_lines.
         self.stdout = iter([])
         self.stderr = None
+        # Synthetic pid: real subprocess.Popen exposes one; _build_run_record
+        # threads ``process.pid`` into the run record so the orchestrator's
+        # subprocess-leak check has something to probe post-finalize.
+        self.pid = 4242
         self._argv = argv
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
@@ -337,3 +341,33 @@ def test_run_record_account_none_by_default(
             **settings_kwargs,
         )
     assert outcome.run_record.account is None
+
+
+def test_run_record_carries_subprocess_pid(
+    queue_dir: Path,
+    task: Task,
+    task_state: TaskState,
+    settings_kwargs: dict[str, object],
+) -> None:
+    """The RunRecord captures ``process.pid`` so the orchestrator's
+    post-tick subprocess-leak check can probe liveness after the
+    dispatch thread exits."""
+    _FakePopen.captured_argv.clear()
+    with (
+        patch("subprocess.Popen", _FakePopen),
+        patch("claude_task_runner.runner.dispatcher.shutil.which", return_value="/usr/bin/claude"),
+        patch("claude_task_runner.claude_init.ensure_initialized"),
+    ):
+        outcome = dispatch(
+            task=task,
+            state=task_state,
+            plan=_plan(),
+            queue_dir=queue_dir,
+            clock=_FrozenClock(),
+            claude_executable="claude",
+            claude_config_dir="",
+            persist_state=False,
+            **settings_kwargs,
+        )
+    # _FakePopen hard-codes pid=4242.
+    assert outcome.run_record.pid == 4242

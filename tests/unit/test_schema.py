@@ -136,6 +136,45 @@ class TestRunRecord:
                 killed_by_cap="memory",  # type: ignore[arg-type]
             )
 
+    def test_pid_field_defaults_to_none(self) -> None:
+        """Legacy run records that pre-date the pid field round-trip cleanly."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        r = RunRecord(
+            attempt=1,
+            started_at=t,
+            finished_at=t,
+            stop_reason="end_turn",
+            duration_s=1,
+        )
+        assert r.pid is None
+
+    def test_pid_field_accepts_positive_int(self) -> None:
+        """The subprocess pid is recorded so the orchestrator can probe
+        liveness post-finalize for subprocess-leak detection."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        r = RunRecord(
+            attempt=1,
+            started_at=t,
+            finished_at=t,
+            stop_reason="killed_by_cap",
+            duration_s=1,
+            pid=4242,
+        )
+        assert r.pid == 4242
+
+    def test_pid_field_rejects_non_positive(self) -> None:
+        """pid is constrained to ``ge=1`` (real Linux pids start at 1)."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        with pytest.raises(ValidationError):
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                pid=0,
+            )
+
 
 class TestTaskState:
     def test_defaults(self) -> None:

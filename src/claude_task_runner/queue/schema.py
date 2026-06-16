@@ -96,6 +96,23 @@ class RunRecord(_StrictBase):
     killed_by_cap: Literal["tokens", "duration"] | None = None
     """Set when the run was SIGTERM'd by ``runner.caps`` because a
     per-task safety cap was exceeded."""
+    pid: int | None = Field(default=None, ge=1)
+    """OS pid of the ``claude`` subprocess this run spawned.
+
+    Populated by the dispatcher's run-record builder. Distinct from
+    :attr:`TaskState.pid` (which is cleared on dispatch finalization):
+    the run record is a *historical* artefact and survives finalization,
+    so the orchestrator's post-tick reap (:func:`runner.orchestrator
+    ._reap_finished`) can re-check ``os.kill(pid, 0)`` AFTER the
+    dispatch thread exited and refuse to free the slot when the
+    subprocess survived the cap-kill (a TASK_UNINTERRUPTIBLE / D-state
+    leak). The supervisor only ever uses this for a read-only liveness
+    probe; it never signals a recycled pid because the check is gated
+    by the just-exited dispatch thread.
+
+    ``None`` on legacy run records that predate this field, on
+    pre-dispatch-hook failures (no subprocess was spawned), and on the
+    adopted path's resume of an already-finalized worker."""
     account: str | None = None
     """Which account this attempt was dispatched through. Matches the
     ``name`` of an entry in :class:`AccountSettings`. ``None`` on
