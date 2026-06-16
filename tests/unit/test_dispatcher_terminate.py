@@ -154,3 +154,77 @@ def test_terminate_logs_when_sigkill_races_process_exit(caplog: pytest.LogCaptur
 
     error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert any("terminate signal failed" in m and "6006" in m for m in error_msgs)
+
+
+class _FakeProcessVerify:
+    """Two-stage Popen drop-in: SIGTERM wait times out; SIGKILL wait
+    is configurable.
+
+    The first ``wait(timeout=5)`` raises ``TimeoutExpired`` so the
+    escalation runs; the second ``wait(timeout=2)`` either returns 0
+    (kill landed) or raises ``TimeoutExpired`` (subprocess still in
+    D-state). Lets us exercise the post-SIGKILL verify branch added
+    in the zombie-consolidated PR.
+    """
+
+    def __init__(self, *, pid: int, second_wait_times_out: bool) -> None:
+        self.pid = pid
+        self._wait_count = 0
+        self._second_wait_times_out = second_wait_times_out
+        self.wait_calls: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        self._wait_count += 1
+        if self._wait_count == 1:
+            # First wait: simulate "subprocess ignored SIGTERM" so the
+            # escalation to SIGKILL fires.
+            raise dispatcher_mod.subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        if self._second_wait_times_out:
+            # SIGKILL post-verify also timed out (D-state).
+            raise dispatcher_mod.subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        return 0
+
+
+def test_terminate_post_kill_verifies_with_second_wait() -> None:
+    """After SIGKILL ``_terminate`` runs a second ``wait(timeout=2)``.
+
+    Post-kill verification is what surfaces a TASK_UNINTERRUPTIBLE
+    (D-state) leak — without the second wait a SIGKILL that didn't
+    land silently returns and the caller proceeds to free the slot.
+    Exercises the second-wait branch added in the 2026-06
+    zombie-consolidated PR."""
+    process = _FakeProcessVerify(pid=7007, second_wait_times_out=False)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=7007),
+        mock.patch.object(dispatcher_mod.os, "killpg"),
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    # Two wait() calls in order: 5s grace then 2s post-kill verify.
+    assert process.wait_calls == [5, 2]
+
+
+def test_terminate_logs_when_subprocess_survives_sigkill(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A subprocess still alive 2s after group SIGKILL → ERROR log.
+
+    The error message includes the pid and the ``subprocess leak``
+    fingerprint so the orchestrator's tick-level reap can correlate
+    it with its own ``SUBPROCESS_LEAK_DETECTED`` log, and so an
+    operator grepping the journal for "subprocess leak" finds the
+    earliest evidence (dispatcher) and the held-slot consequence
+    (orchestrator) on the same scan."""
+    process = _FakeProcessVerify(pid=8008, second_wait_times_out=True)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=8008),
+        mock.patch.object(dispatcher_mod.os, "killpg"),
+        caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("subprocess leak" in m and "8008" in m for m in error_msgs)
