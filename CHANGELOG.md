@@ -33,6 +33,33 @@ Breaking changes are called out in the version notes.
   orphan reaper, instead of clearing the pid on a still-alive
   subprocess. The integration test reproduces the live incident with
   a SIGTERM-ignoring shim.
+- **Subprocess-leak follow-ups: adopted-path post-SIGKILL verify
+  and a supervisor-side held-slot defence (zombie-consolidated).**
+  Builds on the merged orphan-child fix (`start_new_session=True` +
+  process-group signalling) and the three-layer heartbeat (PRs #57,
+  #59). Two distinct paths the owned-path `_terminate` work above
+  did not itself close:
+  - The adopted-worker terminate (`_terminate_by_pid`) now polls its
+    `alive` predicate for 2s after escalating to group SIGKILL. A
+    worker in `TASK_UNINTERRUPTIBLE` (D-state) that doesn't reap
+    surfaces an ERROR log naming the pid (the owned-path `_terminate`
+    raises `TerminateFailed` in the same situation — see the entry
+    above). Without this the cap-kill silently "succeeded" on a
+    still-alive subprocess; the orchestrator would then free the slot
+    and re-dispatch onto a busy account.
+  - Supervisor-side post-kill PID sanity check
+    (`runner.orchestrator._reap_finished`): after every dispatch
+    thread exits, the orchestrator looks up the subprocess pid in
+    the just-written run record and probes `os.kill(pid, 0)`. If the
+    pid is still alive, the slot is **held** (not freed), a one-shot
+    `subprocess_leak_detected` event + `critical`-level notification
+    fire, and an ERROR log names the leak. Re-checks on subsequent
+    ticks stay silent (deduped via
+    `DispatchSlot.subprocess_leak_notified_at`) until the kernel
+    finally releases the pid, at which point the slot frees normally
+    and the queue can resume dispatching to that account. Defence in
+    depth against any future code path that forgets to kill, or any
+    kernel state the dispatcher's SIGKILL escalation can't break.
 
 - **Audit remediation — bug-class findings (full-codebase triage,
   2026-06-13, branch `audit/full-codebase-2026-06`).**
@@ -65,6 +92,17 @@ Breaking changes are called out in the version notes.
   operators can no longer populate options that silently do nothing.
 
 ### Added
+
+- **`RunRecord.pid`** — new optional field on each run record carrying
+  the OS pid of the subprocess that run spawned. Survives dispatch
+  finalization (unlike `TaskState.pid`, which is cleared on finalize)
+  so the orchestrator's tick-level reap can probe `os.kill(pid, 0)`
+  AFTER the dispatch thread exits. The check refuses to free the
+  in-flight slot when the recorded pid is still alive — the
+  supervisor-side leg of the subprocess-leak defence above. None on
+  legacy run records, on pre-dispatch-hook failures (no subprocess
+  spawned), and the field has a None default for backwards
+  compatibility with state YAMLs written before this release.
 
 - **Three-layer heartbeat: separate `dispatcher_alive_at` field and
   filesystem-activity verification for the silent-orphan reaper.**

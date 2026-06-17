@@ -26,12 +26,22 @@ class DispatchSlot:
     update e.g. heartbeats / observed status in the slot from the
     orchestrator's tick. Equality is identity-based via Python's
     default dataclass semantics.
+
+    ``subprocess_leak_notified_at`` is set the first time the
+    orchestrator's post-tick reap (:func:`runner.orchestrator
+    ._reap_finished`) finds the dispatch thread exited but the recorded
+    subprocess pid still alive — a TASK_UNINTERRUPTIBLE / D-state leak
+    that ``_terminate`` could not finish. Once set, the slot is held
+    open (NOT freed) and re-checks happen silently each tick until the
+    kernel releases the pid; only the first detection emits an
+    operator-visible notification. ``None`` on a healthy slot.
     """
 
     task_id: str
     account: str
     started_at: datetime
     thread: threading.Thread
+    subprocess_leak_notified_at: datetime | None = None
 
 
 def to_in_flight_records(slots: dict[str, DispatchSlot]) -> list[InFlightRecord]:
