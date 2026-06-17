@@ -780,37 +780,106 @@ def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
     _signal_group_by_pid(process.pid, sig)
 
 
-def _terminate(process: subprocess.Popen[str]) -> None:
-    """SIGTERM the subprocess's process group, escalate to SIGKILL, verify.
+class TerminateFailed(RuntimeError):
+    """``_terminate`` could not confirm the subprocess actually died.
 
-    Signals the whole group (see :func:`_signal_group`) so children
-    forked by ``claude`` are reaped too. After a 5s grace period the
-    group is SIGKILLed; a ``kill()`` that itself raises ``OSError`` (the
-    group raced away under us) is logged, not swallowed.
-
-    Post-kill verify: after the SIGKILL escalation we run a second
-    ``process.wait(timeout=2)`` and log ERROR if the subprocess still
-    has not reaped. A SIGKILL'd process that won't die is in
-    ``TASK_UNINTERRUPTIBLE`` (D-state) — typically blocked in a kernel
-    syscall — and there is nothing more userland can do. Logging here
-    lets the supervisor's tick-level reap (:func:`_reap_finished`) see
-    the leak and refuse to free the slot until operator intervention.
+    Raised by :func:`_terminate` when either the escalation SIGKILL
+    raised a non-``ProcessLookupError`` ``OSError`` (the signal-send
+    itself failed — EPERM, EINVAL, etc.) or the post-SIGKILL
+    ``process.wait(timeout=2)`` timed out (the parent survived
+    SIGKILL, suggesting a TASK_UNINTERRUPTIBLE kernel-level issue).
+    Callers MUST NOT treat the attempt as terminated when this is
+    raised: the state YAML stays ``"running"`` with the recorded pid
+    so the per-tick silent-orphan reaper can pick the orphan up on
+    its next pass instead of the dispatch finalizing a still-alive
+    subprocess to a slot-freeing ``failed``.
     """
-    _signal_group(process, signal.SIGTERM)
+
+
+def _terminate(process: subprocess.Popen[str]) -> None:
+    """SIGTERM the subprocess's process group, escalate to SIGKILL, verify dead.
+
+    SIGTERM/SIGKILL go to the PROCESS GROUP (resolved once via
+    :func:`os.getpgid`), not just the parent pid. Bash subprocesses
+    launched by ``claude --print`` for tool calls inherit the parent's
+    process group; signalling only the parent leaves Bash children
+    alive and blocking the parent's exit. See the 2026-06-13 zombie
+    post-mortem: ``frompeople-903-farrell_2013`` was marked
+    ``killed_by_cap=duration`` by the dispatcher but the subprocess
+    survived 30+ hours afterward, locking the slot.
+
+    Verifies the parent actually died via a post-SIGKILL
+    ``process.wait`` (SIGKILL is uncatchable, so a surviving parent
+    indicates a kernel-level issue). On any verifiable kill failure
+    raises :class:`TerminateFailed` — the caller MUST NOT mark the
+    slot free when the subprocess might still be alive.
+
+    Sequence:
+
+    1. ``getpgid`` once. ``ProcessLookupError`` ⇒ the parent is
+       already gone; return cleanly.
+    2. ``killpg(pgid, SIGTERM)``. ``ProcessLookupError`` ⇒ the group
+       raced its own exit; return cleanly. Other ``OSError`` ⇒ log
+       WARNING and fall through to SIGKILL (the SIGTERM-send failure
+       may itself be transient).
+    3. ``process.wait(timeout=5)``. Success ⇒ return.
+    4. ``killpg(pgid, SIGKILL)``. ``ProcessLookupError`` ⇒ raced its
+       own exit; return cleanly. Other ``OSError`` ⇒ log ERROR and
+       raise — the signal-send genuinely failed.
+    5. ``process.wait(timeout=2)``. ``TimeoutExpired`` ⇒ log ERROR and
+       raise — the kernel did not reap the parent.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return  # parent already gone
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return  # group vanished between getpgid and killpg
+    except OSError as exc:
+        logger.warning(
+            "SIGTERM to PG %d (task pid %d) failed: %s; falling through to SIGKILL",
+            pgid,
+            process.pid,
+            exc,
+        )
+
     try:
         process.wait(timeout=5)
         return
     except subprocess.TimeoutExpired:
-        _signal_group(process, signal.SIGKILL)
+        pass
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return  # raced its own exit between the wait timeout and the kill
+    except OSError as exc:
+        logger.error(
+            "SIGKILL to PG %d (task pid %d) failed: %s — subprocess may "
+            "survive; dispatcher will NOT mark this slot free, leaving it "
+            "for the per-tick silent reaper",
+            pgid,
+            process.pid,
+            exc,
+        )
+        raise TerminateFailed(
+            f"SIGKILL to PG {pgid} (task pid {process.pid}) failed: {exc}"
+        ) from exc
+
     try:
         process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         logger.error(
-            "subprocess leak: pid=%s did not exit within 2s of group SIGKILL; "
-            "likely TASK_UNINTERRUPTIBLE (D-state). Supervisor will refuse to "
-            "free the dispatch slot until the kernel releases the process.",
+            "task pid %d survived SIGKILL to PG %d — kernel-level issue "
+            "(TASK_UNINTERRUPTIBLE?); dispatcher will NOT mark this slot "
+            "free, leaving it for the per-tick silent reaper",
             process.pid,
+            pgid,
         )
+        raise TerminateFailed(f"task pid {process.pid} survived SIGKILL to PG {pgid}") from exc
 
 
 def _terminate_by_pid(
