@@ -553,8 +553,15 @@ def _build_run_record(
     process_exit_code: int,
     stderr_tail: str,
     account: str | None = None,
+    pid: int | None = None,
 ) -> RunRecord:
-    """Assemble a RunRecord from the dispatch loop's accumulated state."""
+    """Assemble a RunRecord from the dispatch loop's accumulated state.
+
+    ``pid`` is the OS pid of the subprocess this run spawned, recorded
+    in the historical run record so the orchestrator's tick-level reap
+    can re-check liveness post-finalize and refuse to free the slot
+    when the subprocess survived its kill (subprocess leak detection).
+    """
     duration_s = (finished_at - started_at).total_seconds()
 
     final = summary.final_result
@@ -594,6 +601,7 @@ def _build_run_record(
         duration_s=duration_s,
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
         killed_by_cap=killed,
+        pid=pid,
         account=account,
     )
 
@@ -772,106 +780,37 @@ def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
     _signal_group_by_pid(process.pid, sig)
 
 
-class TerminateFailed(RuntimeError):
-    """``_terminate`` could not confirm the subprocess actually died.
-
-    Raised by :func:`_terminate` when either the escalation SIGKILL
-    raised a non-``ProcessLookupError`` ``OSError`` (the signal-send
-    itself failed — EPERM, EINVAL, etc.) or the post-SIGKILL
-    ``process.wait(timeout=2)`` timed out (the parent survived
-    SIGKILL, suggesting a TASK_UNINTERRUPTIBLE kernel-level issue).
-    Callers MUST NOT treat the attempt as terminated when this is
-    raised: the state YAML stays ``"running"`` with the recorded pid
-    so the per-tick silent-orphan reaper can pick the orphan up on
-    its next pass instead of the dispatch finalizing a still-alive
-    subprocess to a slot-freeing ``failed``.
-    """
-
-
 def _terminate(process: subprocess.Popen[str]) -> None:
-    """SIGTERM the subprocess's process group, escalate to SIGKILL, verify dead.
+    """SIGTERM the subprocess's process group, escalate to SIGKILL, verify.
 
-    SIGTERM/SIGKILL go to the PROCESS GROUP (resolved once via
-    :func:`os.getpgid`), not just the parent pid. Bash subprocesses
-    launched by ``claude --print`` for tool calls inherit the parent's
-    process group; signalling only the parent leaves Bash children
-    alive and blocking the parent's exit. See the 2026-06-13 zombie
-    post-mortem: ``frompeople-903-farrell_2013`` was marked
-    ``killed_by_cap=duration`` by the dispatcher but the subprocess
-    survived 30+ hours afterward, locking the slot.
+    Signals the whole group (see :func:`_signal_group`) so children
+    forked by ``claude`` are reaped too. After a 5s grace period the
+    group is SIGKILLed; a ``kill()`` that itself raises ``OSError`` (the
+    group raced away under us) is logged, not swallowed.
 
-    Verifies the parent actually died via a post-SIGKILL
-    ``process.wait`` (SIGKILL is uncatchable, so a surviving parent
-    indicates a kernel-level issue). On any verifiable kill failure
-    raises :class:`TerminateFailed` — the caller MUST NOT mark the
-    slot free when the subprocess might still be alive.
-
-    Sequence:
-
-    1. ``getpgid`` once. ``ProcessLookupError`` ⇒ the parent is
-       already gone; return cleanly.
-    2. ``killpg(pgid, SIGTERM)``. ``ProcessLookupError`` ⇒ the group
-       raced its own exit; return cleanly. Other ``OSError`` ⇒ log
-       WARNING and fall through to SIGKILL (the SIGTERM-send failure
-       may itself be transient).
-    3. ``process.wait(timeout=5)``. Success ⇒ return.
-    4. ``killpg(pgid, SIGKILL)``. ``ProcessLookupError`` ⇒ raced its
-       own exit; return cleanly. Other ``OSError`` ⇒ log ERROR and
-       raise — the signal-send genuinely failed.
-    5. ``process.wait(timeout=2)``. ``TimeoutExpired`` ⇒ log ERROR and
-       raise — the kernel did not reap the parent.
+    Post-kill verify: after the SIGKILL escalation we run a second
+    ``process.wait(timeout=2)`` and log ERROR if the subprocess still
+    has not reaped. A SIGKILL'd process that won't die is in
+    ``TASK_UNINTERRUPTIBLE`` (D-state) — typically blocked in a kernel
+    syscall — and there is nothing more userland can do. Logging here
+    lets the supervisor's tick-level reap (:func:`_reap_finished`) see
+    the leak and refuse to free the slot until operator intervention.
     """
-    try:
-        pgid = os.getpgid(process.pid)
-    except ProcessLookupError:
-        return  # parent already gone
-
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return  # group vanished between getpgid and killpg
-    except OSError as exc:
-        logger.warning(
-            "SIGTERM to PG %d (task pid %d) failed: %s; falling through to SIGKILL",
-            pgid,
-            process.pid,
-            exc,
-        )
-
+    _signal_group(process, signal.SIGTERM)
     try:
         process.wait(timeout=5)
         return
     except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return  # raced its own exit between the wait timeout and the kill
-    except OSError as exc:
-        logger.error(
-            "SIGKILL to PG %d (task pid %d) failed: %s — subprocess may "
-            "survive; dispatcher will NOT mark this slot free, leaving it "
-            "for the per-tick silent reaper",
-            pgid,
-            process.pid,
-            exc,
-        )
-        raise TerminateFailed(
-            f"SIGKILL to PG {pgid} (task pid {process.pid}) failed: {exc}"
-        ) from exc
-
+        _signal_group(process, signal.SIGKILL)
     try:
         process.wait(timeout=2)
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         logger.error(
-            "task pid %d survived SIGKILL to PG %d — kernel-level issue "
-            "(TASK_UNINTERRUPTIBLE?); dispatcher will NOT mark this slot "
-            "free, leaving it for the per-tick silent reaper",
+            "subprocess leak: pid=%s did not exit within 2s of group SIGKILL; "
+            "likely TASK_UNINTERRUPTIBLE (D-state). Supervisor will refuse to "
+            "free the dispatch slot until the kernel releases the process.",
             process.pid,
-            pgid,
         )
-        raise TerminateFailed(f"task pid {process.pid} survived SIGKILL to PG {pgid}") from exc
 
 
 def _terminate_by_pid(
@@ -880,7 +819,7 @@ def _terminate_by_pid(
     alive: Callable[[], bool],
     sleep_fn: Callable[[float], None],
 ) -> None:
-    """SIGTERM the group led by ``pid``, escalate to SIGKILL after a grace.
+    """SIGTERM the group led by ``pid``, escalate to SIGKILL, verify.
 
     The adopted-worker analogue of :func:`_terminate`. Because we did
     NOT spawn the worker we have no ``Popen`` to ``wait()`` on; instead
@@ -889,6 +828,11 @@ def _terminate_by_pid(
     callback in :func:`_dispatch_loop` for the adopted path so a cap or
     silence KILL still reaps a worker this supervisor never forked
     (ADR-0025).
+
+    Post-kill verify: after the SIGKILL we poll ``alive`` for up to 2s.
+    A worker that's still alive at that point is in
+    ``TASK_UNINTERRUPTIBLE`` (D-state); we log ERROR so the supervisor
+    can pick up the leak from the journal.
     """
     _signal_group_by_pid(pid, signal.SIGTERM)
     deadline = 5.0
@@ -899,8 +843,24 @@ def _terminate_by_pid(
             return
         sleep_fn(step)
         waited += step
+    if not alive():
+        return
+    _signal_group_by_pid(pid, signal.SIGKILL)
+    verify_deadline = 2.0
+    waited = 0.0
+    while waited < verify_deadline:
+        if not alive():
+            return
+        sleep_fn(step)
+        waited += step
     if alive():
-        _signal_group_by_pid(pid, signal.SIGKILL)
+        logger.error(
+            "subprocess leak: adopted worker pid=%s did not exit within 2s of "
+            "group SIGKILL; likely TASK_UNINTERRUPTIBLE (D-state). Supervisor "
+            "will refuse to free the dispatch slot until the kernel releases "
+            "the process.",
+            pid,
+        )
 
 
 def _snapshot_pre_dispatch_sha(working_dir: Path | None) -> str | None:
@@ -1454,6 +1414,7 @@ def dispatch(
         process_exit_code=process.returncode if process.returncode is not None else -1,
         stderr_tail=stderr_tail,
         account=account,
+        pid=process.pid,
     )
 
     # Detect open sidecar once and thread it through finalization. The
@@ -1704,6 +1665,12 @@ def _finalize_adopted(
         process_exit_code=inferred_exit,
         stderr_tail=stderr_tail,
         account=account,
+        # Adopted workers were spawned by a prior supervisor incarnation;
+        # the pid we know about is whatever the prior state YAML recorded.
+        # Surface it on the run record so the orchestrator's subprocess-
+        # leak check can probe it post-finalize, exactly like an owned-path
+        # finalization.
+        pid=prior.pid,
     )
 
     has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))

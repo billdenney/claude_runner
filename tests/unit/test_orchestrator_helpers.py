@@ -286,6 +286,174 @@ def test_reap_finished_removes_dead_threads_only() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _reap_finished subprocess-leak detection (Bug 5)
+# ---------------------------------------------------------------------------
+
+
+def _exited_thread() -> threading.Thread:
+    """Return a Thread that has already exited (so is_alive() is False)."""
+    t = threading.Thread(target=lambda: None, daemon=True)
+    t.start()
+    t.join(timeout=2)
+    assert not t.is_alive()
+    return t
+
+
+def _seed_run_with_pid(qd: Path, task_id: str, pid: int | None, status: str = "running") -> None:
+    """Persist a TaskState whose most recent run record carries ``pid``."""
+    from claude_task_runner.queue.schema import RunRecord, TokenUsage
+
+    run = RunRecord(
+        attempt=1,
+        started_at=datetime(2026, 5, 21, tzinfo=UTC),
+        finished_at=datetime(2026, 5, 21, 0, 1, tzinfo=UTC),
+        stop_reason="killed_by_cap",
+        usage=TokenUsage(),
+        duration_s=60.0,
+        pid=pid,
+    )
+    state = TaskState(task_id=task_id, status=status, runs=[run])
+    write_state_atomic(state, state_path_for(qd, task_id))
+
+
+def test_reap_finished_frees_slot_when_pid_is_dead(queue_dir: Path) -> None:
+    """Standard path: pid in run record is no longer alive → slot is freed.
+
+    The post-tick check probes ``_pid_alive``; with the dispatcher_mod
+    helper returning ``False``, the slot is deleted exactly like the
+    legacy queue_dir=None path."""
+    t = _exited_thread()
+    d = {"t1": _slot("t1", t)}
+    _seed_run_with_pid(queue_dir, "t1", pid=99_999_999)
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=False,
+    ):
+        _reap_finished(d, queue_dir=queue_dir, clock=RealClock())
+
+    assert "t1" not in d
+
+
+def test_reap_finished_frees_slot_when_runs_have_no_pid(queue_dir: Path) -> None:
+    """Legacy run records (pid field absent / None) cannot be probed → free slot.
+
+    Skipping the probe matches the pre-Bug-5 behaviour for state YAMLs
+    written before the field landed, and for pre-dispatch-hook failures
+    that never spawned a subprocess."""
+    t = _exited_thread()
+    d = {"t1": _slot("t1", t)}
+    _seed_run_with_pid(queue_dir, "t1", pid=None)
+
+    _reap_finished(d, queue_dir=queue_dir, clock=RealClock())
+    assert "t1" not in d
+
+
+def test_reap_finished_holds_slot_when_pid_is_alive(queue_dir: Path) -> None:
+    """Subprocess-leak path: pid in run record is still alive → slot held.
+
+    The orchestrator refuses to free the slot so the queue doesn't
+    re-dispatch onto the same account while a leaked subprocess is
+    holding resources. A notify_callback and event_callback fire once
+    on first detection; the slot's ``subprocess_leak_notified_at`` is
+    stamped to deduplicate further re-checks."""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    d = {"t1": slot}
+    _seed_run_with_pid(queue_dir, "t1", pid=12345)
+    notifs: list[tuple[str, str]] = []
+    events: list[tuple[str, dict]] = []
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=True,
+    ):
+        _reap_finished(
+            d,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            notify_callback=lambda level, msg: notifs.append((level, msg)),
+            event_callback=lambda name, payload: events.append((name, payload)),
+        )
+
+    assert "t1" in d
+    assert slot.subprocess_leak_notified_at is not None
+    assert len(notifs) == 1
+    assert notifs[0][0] == "critical"
+    assert "t1" in notifs[0][1]
+    assert "12345" in notifs[0][1]
+    assert events == [("subprocess_leak_detected", {"task_id": "t1", "pid": 12345})]
+
+
+def test_reap_finished_does_not_renotify_known_leak(queue_dir: Path) -> None:
+    """Already-notified leak: subsequent reap_finished calls stay silent.
+
+    Once ``subprocess_leak_notified_at`` is set, the orchestrator keeps
+    probing on every tick (cheap), holds the slot, but does NOT spam
+    the notify/event callbacks. This is what lets the supervisor sit
+    on a leak for hours without flooding the operator."""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    slot.subprocess_leak_notified_at = datetime(2026, 5, 21, tzinfo=UTC)
+    d = {"t1": slot}
+    _seed_run_with_pid(queue_dir, "t1", pid=12345)
+    notifs: list = []
+    events: list = []
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=True,
+    ):
+        _reap_finished(
+            d,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            notify_callback=lambda level, msg: notifs.append((level, msg)),
+            event_callback=lambda name, payload: events.append((name, payload)),
+        )
+
+    assert "t1" in d
+    assert notifs == []
+    assert events == []
+
+
+def test_reap_finished_recovers_slot_when_pid_finally_dies(queue_dir: Path) -> None:
+    """A held slot frees normally once the leaked pid finally dies.
+
+    Operator workflow: the slot is held while the kernel keeps the
+    process in D-state, then SIGKILL eventually lands (or the kernel
+    unblocks) — the next reap sees the pid is gone and the slot is
+    released so the queue can dispatch again."""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    slot.subprocess_leak_notified_at = datetime(2026, 5, 21, tzinfo=UTC)
+    d = {"t1": slot}
+    _seed_run_with_pid(queue_dir, "t1", pid=12345)
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=False,
+    ):
+        _reap_finished(d, queue_dir=queue_dir, clock=RealClock())
+
+    assert "t1" not in d
+
+
+def test_reap_finished_legacy_signature_still_frees_slot() -> None:
+    """Backwards-compat: a single-arg call (no queue_dir) skips the leak check.
+
+    A handful of internal helpers and prior-revision tests pass just
+    the slot dict. The check is purely defence in depth; absent the
+    queue_dir the function must keep its historical free-the-slot
+    behaviour."""
+    t = _exited_thread()
+    d = {"t1": _slot("t1", t)}
+
+    _reap_finished(d)
+    assert "t1" not in d
+
+
+# ---------------------------------------------------------------------------
 # tick_dispatch
 # ---------------------------------------------------------------------------
 

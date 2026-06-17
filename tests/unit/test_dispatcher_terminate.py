@@ -1,28 +1,31 @@
 """Tests for the dispatcher's process-group termination path.
 
 ``_terminate`` is the cap-kill / silence-kill escalation. After
-ADR-0021 it signals the subprocess's whole process group rather than
-just the parent pid, so children ``claude`` forked (MCP servers,
-shelled-out ``git`` / ``Rscript``) are reaped too. The subprocess is
-spawned with ``start_new_session=True`` precisely so the group exists
-to be signalled.
+ADR-0021 (orphan-child fix) it signals the subprocess's whole process
+group rather than just the parent pid, so children ``claude`` forked
+(MCP servers, shelled-out ``git`` / ``Rscript``) are reaped too. The
+subprocess is spawned with ``start_new_session=True`` precisely so the
+group exists to be signalled.
 
-The 2026-06-13 ``frompeople-903-farrell_2013`` zombie post-mortem
-strengthened the contract further: ``_terminate`` now VERIFIES the
-parent actually exited via a post-SIGKILL ``process.wait`` and RAISES
-:class:`TerminateFailed` when the kill can't be confirmed (signal-send
-OSError on SIGKILL, or parent surviving SIGKILL). A raised
-``TerminateFailed`` propagates out of the dispatch loop so the
-dispatcher does not finalize the slot to ``failed`` and clear the pid
-— the on-disk state stays ``"running"`` for the per-tick silent-orphan
-reaper to pick up. Letting the dispatcher pretend the kill succeeded
-is the bug that lost 30+ hours of slot capacity in the live incident.
+The mocked unit cases exercise ``_terminate`` and ``_signal_group``
+with a fake process and patched ``os.killpg`` / ``os.getpgid`` so no
+real process or signal is involved:
 
-These tests cover both the mocked unit paths (one ``_terminate``
-invocation, patched ``os.killpg`` / ``os.getpgid``) and integration
-paths that spawn real Bash subprocesses to prove the PG-wide signal
-actually reaps SIGTERM-ignoring children + grandchildren in a live
-process tree.
+* SIGTERM is sent to the group; on a clean ``wait()`` no SIGKILL fires.
+* SIGTERM → (wait TimeoutExpired) → SIGKILL escalation, both on the
+  group (the audit BUG #2 / coverage A path).
+* A vanished group (``ProcessLookupError``) is swallowed silently.
+* Any other ``OSError`` on signal-send is logged, not swallowed
+  (audit BUG #3).
+* Post-SIGKILL verify wait (the zombie-consolidated PR) — clean and
+  TASK_UNINTERRUPTIBLE paths.
+
+The real-subprocess cases at the bottom spawn actual Bash subprocesses
+to prove the PG-wide signal reaps SIGTERM-ignoring parents and their
+forked grandchildren — these exercise the real ``os.killpg`` syscall,
+not the mocked one, so a future regression that breaks the kill chain
+in production cannot pass the suite even if the mocked branches still
+do.
 """
 
 from __future__ import annotations
@@ -38,60 +41,36 @@ from unittest import mock
 import pytest
 
 from claude_task_runner.runner import dispatcher as dispatcher_mod
-from claude_task_runner.runner.dispatcher import (
-    TerminateFailed,
-    _signal_group,
-    _terminate,
-)
+from claude_task_runner.runner.dispatcher import _signal_group, _terminate
 
 
 class _FakeProcess:
     """Minimal ``subprocess.Popen`` shape ``_terminate`` touches.
 
-    ``wait_outcomes`` is a list of side-effects consumed in order on
-    successive ``wait()`` calls — each entry is either an ``int``
-    (return that exit code) or an exception class (raise it). This lets
-    a single test express "SIGTERM grace wait times out, SIGKILL
-    verification wait succeeds" or vice versa.
-
-    The real Popen object's ``send_signal`` / ``kill`` are NOT used by
-    ``_terminate`` (it goes through ``os.killpg`` directly), so they're
-    absent on purpose — a regression that reintroduces a pid-only
-    ``process.kill()`` would ``AttributeError`` here and fail loudly.
+    ``wait`` either returns ``0`` or raises ``TimeoutExpired`` depending
+    on ``timeout_raises``. The real Popen object's ``send_signal`` /
+    ``kill`` are NOT used by ``_terminate`` anymore (it goes through
+    ``os.killpg``), so they're absent on purpose — a regression that
+    reintroduces a pid-only ``process.kill()`` would ``AttributeError``
+    here and fail loudly.
     """
 
-    def __init__(
-        self,
-        *,
-        pid: int = 4242,
-        wait_outcomes: list[int | type[BaseException]] | None = None,
-    ) -> None:
+    def __init__(self, *, pid: int = 4242, timeout_raises: bool = False) -> None:
         self.pid = pid
-        self._outcomes = list(wait_outcomes or [0])
+        self._timeout_raises = timeout_raises
         self.wait_calls: list[float | None] = []
 
     def wait(self, timeout: float | None = None) -> int:
         self.wait_calls.append(timeout)
-        if not self._outcomes:
-            return 0
-        outcome = self._outcomes.pop(0)
-        if isinstance(outcome, type) and issubclass(outcome, BaseException):
-            if outcome is subprocess.TimeoutExpired:
-                raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
-            raise outcome()
-        assert isinstance(outcome, int)
-        return outcome
-
-
-# --- Mocked unit tests ----------------------------------------------------
+        if self._timeout_raises:
+            raise dispatcher_mod.subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        return 0
 
 
 def test_terminate_sigterms_group_then_no_kill_on_clean_wait() -> None:
-    """A subprocess that exits within the 5s grace period gets exactly one
-    SIGTERM to its group and no SIGKILL. The verification wait is NOT
-    invoked when SIGTERM already worked (the second wait is only for
-    the SIGKILL escalation path)."""
-    process = _FakeProcess(pid=1000, wait_outcomes=[0])
+    """A subprocess that exits within the grace period gets exactly one
+    SIGTERM to its group and no SIGKILL."""
+    process = _FakeProcess(pid=1000, timeout_raises=False)
 
     with (
         mock.patch.object(dispatcher_mod.os, "getpgid", return_value=1000) as getpgid,
@@ -101,16 +80,14 @@ def test_terminate_sigterms_group_then_no_kill_on_clean_wait() -> None:
 
     getpgid.assert_called_once_with(1000)
     killpg.assert_called_once_with(1000, signal.SIGTERM)
+    # The 5s grace wait happened exactly once.
     assert process.wait_calls == [5]
 
 
-def test_terminate_escalates_sigterm_then_sigkill_then_verifies() -> None:
-    """When SIGTERM's 5s grace wait times out, escalate to SIGKILL on the
-    PG and verify with a 2s wait. Both signals target the pgid."""
-    process = _FakeProcess(
-        pid=2000,
-        wait_outcomes=[subprocess.TimeoutExpired, 0],
-    )
+def test_terminate_escalates_sigterm_then_sigkill_on_timeout() -> None:
+    """Coverage A / BUG #2: when ``wait()`` times out the group is
+    SIGKILLed after the SIGTERM, both via ``os.killpg`` on the pgid."""
+    process = _FakeProcess(pid=2000, timeout_raises=True)
 
     with (
         mock.patch.object(dispatcher_mod.os, "getpgid", return_value=2000),
@@ -118,174 +95,18 @@ def test_terminate_escalates_sigterm_then_sigkill_then_verifies() -> None:
     ):
         _terminate(process)  # type: ignore[arg-type]
 
+    # Exactly two group signals, in order: SIGTERM then SIGKILL.
     assert killpg.call_args_list == [
         mock.call(2000, signal.SIGTERM),
         mock.call(2000, signal.SIGKILL),
     ]
-    assert process.wait_calls == [5, 2]
-
-
-def test_terminate_returns_silently_when_parent_already_gone() -> None:
-    """``getpgid`` ``ProcessLookupError`` ⇒ parent is already dead; return
-    cleanly with no signals sent."""
-    process = _FakeProcess(pid=3000)
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", side_effect=ProcessLookupError),
-        mock.patch.object(dispatcher_mod.os, "killpg") as killpg,
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    killpg.assert_not_called()
-    assert process.wait_calls == []
-
-
-def test_terminate_returns_silently_when_group_vanished_on_sigterm() -> None:
-    """``killpg(SIGTERM)`` ``ProcessLookupError`` (the group raced its own
-    exit between getpgid and killpg) ⇒ return cleanly."""
-    process = _FakeProcess(pid=3100)
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=3100),
-        mock.patch.object(dispatcher_mod.os, "killpg", side_effect=ProcessLookupError) as killpg,
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    killpg.assert_called_once_with(3100, signal.SIGTERM)
-    assert process.wait_calls == []
-
-
-def test_terminate_warns_on_sigterm_oserror_and_falls_through_to_sigkill(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A non-vanished ``OSError`` on the SIGTERM call is logged at WARNING
-    and the function falls through to the SIGKILL escalation rather
-    than raising. The transient SIGTERM-send failure does not by itself
-    prove the kill chain has failed — SIGKILL gets the next try."""
-    process = _FakeProcess(
-        pid=4100,
-        wait_outcomes=[subprocess.TimeoutExpired, 0],
-    )
-
-    def killpg_side_effect(_pgid: int, sig: int) -> None:
-        if sig == signal.SIGTERM:
-            raise PermissionError("operation not permitted")
-        # SIGKILL succeeds.
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=4100),
-        mock.patch.object(dispatcher_mod.os, "killpg", side_effect=killpg_side_effect),
-        caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.dispatcher"),
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    warn = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warn, "expected a WARNING log for the SIGTERM EPERM"
-    msg = warn[0].getMessage()
-    assert "SIGTERM to PG 4100" in msg
-    assert "falling through to SIGKILL" in msg
-    assert process.wait_calls == [5, 2]
-
-
-def test_terminate_raises_terminate_failed_on_sigkill_oserror(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """When the escalation ``killpg(SIGKILL)`` raises a non-vanished
-    ``OSError``, ``_terminate`` logs ERROR and raises
-    :class:`TerminateFailed`. The caller must NOT mark the slot free —
-    the subprocess may still be alive."""
-    process = _FakeProcess(
-        pid=5100,
-        wait_outcomes=[subprocess.TimeoutExpired],
-    )
-
-    def killpg_side_effect(_pgid: int, sig: int) -> None:
-        if sig == signal.SIGKILL:
-            raise PermissionError("operation not permitted")
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=5100),
-        mock.patch.object(dispatcher_mod.os, "killpg", side_effect=killpg_side_effect),
-        caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
-        pytest.raises(TerminateFailed) as exc_info,
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    assert "SIGKILL to PG 5100" in str(exc_info.value)
-    assert isinstance(exc_info.value.__cause__, PermissionError)
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors, "expected an ERROR log for the SIGKILL EPERM"
-    msg = errors[0].getMessage()
-    assert "SIGKILL to PG 5100" in msg
-    assert "silent reaper" in msg
-
-
-def test_terminate_returns_silently_when_group_vanished_on_sigkill() -> None:
-    """Between the SIGTERM-wait timeout and the SIGKILL the parent could
-    exit on its own (slow SIGTERM handler that finally completed). A
-    ``ProcessLookupError`` on the SIGKILL is benign — return cleanly,
-    no raise."""
-    process = _FakeProcess(
-        pid=5200,
-        wait_outcomes=[subprocess.TimeoutExpired],
-    )
-
-    def killpg_side_effect(_pgid: int, sig: int) -> None:
-        if sig == signal.SIGKILL:
-            raise ProcessLookupError
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=5200),
-        mock.patch.object(dispatcher_mod.os, "killpg", side_effect=killpg_side_effect),
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    # SIGTERM wait timed out; SIGKILL hit ProcessLookupError, so we
-    # returned without invoking the post-kill wait.
-    assert process.wait_calls == [5]
-
-
-def test_terminate_raises_terminate_failed_when_parent_survives_sigkill(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """SIGKILL is uncatchable; a post-SIGKILL ``wait(timeout=2)`` that
-    itself times out means the kernel didn't reap the parent (e.g.
-    TASK_UNINTERRUPTIBLE on a hung syscall). Log ERROR, raise
-    :class:`TerminateFailed`."""
-    process = _FakeProcess(
-        pid=6100,
-        wait_outcomes=[subprocess.TimeoutExpired, subprocess.TimeoutExpired],
-    )
-
-    with (
-        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=6100),
-        mock.patch.object(dispatcher_mod.os, "killpg") as killpg,
-        caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
-        pytest.raises(TerminateFailed) as exc_info,
-    ):
-        _terminate(process)  # type: ignore[arg-type]
-
-    assert "survived SIGKILL" in str(exc_info.value)
-    assert isinstance(exc_info.value.__cause__, subprocess.TimeoutExpired)
-    # Both signals fired in order before we gave up.
-    assert killpg.call_args_list == [
-        mock.call(6100, signal.SIGTERM),
-        mock.call(6100, signal.SIGKILL),
-    ]
-    assert process.wait_calls == [5, 2]
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors, "expected an ERROR log for the survived-SIGKILL case"
-    assert "TASK_UNINTERRUPTIBLE" in errors[0].getMessage()
-
-
-# --- _signal_group passthrough tests (unchanged contract) -----------------
 
 
 def test_signal_group_swallows_process_lookup_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A group that already vanished (``ProcessLookupError``) is benign at
-    the ``_signal_group`` layer — no log, no raise."""
+    """A group that already vanished (``ProcessLookupError``) is benign
+    — no log, no raise."""
     process = _FakeProcess(pid=3000)
 
     with (
@@ -297,12 +118,13 @@ def test_signal_group_swallows_process_lookup_error(
     ):
         _signal_group(process, signal.SIGTERM)  # type: ignore[arg-type]
 
+    # Nothing logged for the benign already-gone case.
     assert caplog.records == []
 
 
 def test_signal_group_logs_other_oserror(caplog: pytest.LogCaptureFixture) -> None:
-    """A non-vanished ``OSError`` (e.g. EPERM) on signal-send is logged at
-    ERROR with the pid, never silently swallowed."""
+    """BUG #3: a non-vanished ``OSError`` (e.g. EPERM) on signal-send is
+    logged at ERROR with the pid, never silently swallowed."""
     process = _FakeProcess(pid=5005)
 
     with (
@@ -323,12 +145,114 @@ def test_signal_group_logs_other_oserror(caplog: pytest.LogCaptureFixture) -> No
     assert "operation not permitted" in msg
 
 
-# --- Real-subprocess integration tests ------------------------------------
+def test_terminate_logs_when_sigkill_races_process_exit(caplog: pytest.LogCaptureFixture) -> None:
+    """BUG #4: the post-timeout SIGKILL can itself hit a now-gone group.
+    ``ProcessLookupError`` is benign (swallowed), but any other OSError
+    on the escalation kill is still surfaced via ``_signal_group``'s
+    error log rather than crashing ``_terminate``."""
+    process = _FakeProcess(pid=6006, timeout_raises=True)
+
+    def killpg_side_effect(_pgid: int, sig: int) -> None:
+        # SIGTERM succeeds; the escalation SIGKILL hits EPERM.
+        if sig == signal.SIGKILL:
+            raise PermissionError("operation not permitted")
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=6006),
+        mock.patch.object(dispatcher_mod.os, "killpg", side_effect=killpg_side_effect),
+        caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
+    ):
+        # Must not raise.
+        _terminate(process)  # type: ignore[arg-type]
+
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("terminate signal failed" in m and "6006" in m for m in error_msgs)
+
+
+class _FakeProcessVerify:
+    """Two-stage Popen drop-in: SIGTERM wait times out; SIGKILL wait
+    is configurable.
+
+    The first ``wait(timeout=5)`` raises ``TimeoutExpired`` so the
+    escalation runs; the second ``wait(timeout=2)`` either returns 0
+    (kill landed) or raises ``TimeoutExpired`` (subprocess still in
+    D-state). Lets us exercise the post-SIGKILL verify branch added
+    in the zombie-consolidated PR.
+    """
+
+    def __init__(self, *, pid: int, second_wait_times_out: bool) -> None:
+        self.pid = pid
+        self._wait_count = 0
+        self._second_wait_times_out = second_wait_times_out
+        self.wait_calls: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        self._wait_count += 1
+        if self._wait_count == 1:
+            # First wait: simulate "subprocess ignored SIGTERM" so the
+            # escalation to SIGKILL fires.
+            raise dispatcher_mod.subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        if self._second_wait_times_out:
+            # SIGKILL post-verify also timed out (D-state).
+            raise dispatcher_mod.subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        return 0
+
+
+def test_terminate_post_kill_verifies_with_second_wait() -> None:
+    """After SIGKILL ``_terminate`` runs a second ``wait(timeout=2)``.
+
+    Post-kill verification is what surfaces a TASK_UNINTERRUPTIBLE
+    (D-state) leak — without the second wait a SIGKILL that didn't
+    land silently returns and the caller proceeds to free the slot.
+    Exercises the second-wait branch added in the 2026-06
+    zombie-consolidated PR."""
+    process = _FakeProcessVerify(pid=7007, second_wait_times_out=False)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=7007),
+        mock.patch.object(dispatcher_mod.os, "killpg"),
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    # Two wait() calls in order: 5s grace then 2s post-kill verify.
+    assert process.wait_calls == [5, 2]
+
+
+def test_terminate_logs_when_subprocess_survives_sigkill(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A subprocess still alive 2s after group SIGKILL → ERROR log.
+
+    The error message includes the pid and the ``subprocess leak``
+    fingerprint so the orchestrator's tick-level reap can correlate
+    it with its own ``SUBPROCESS_LEAK_DETECTED`` log, and so an
+    operator grepping the journal for "subprocess leak" finds the
+    earliest evidence (dispatcher) and the held-slot consequence
+    (orchestrator) on the same scan."""
+    process = _FakeProcessVerify(pid=8008, second_wait_times_out=True)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid", return_value=8008),
+        mock.patch.object(dispatcher_mod.os, "killpg"),
+        caplog.at_level(logging.ERROR, logger="claude_task_runner.runner.dispatcher"),
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("subprocess leak" in m and "8008" in m for m in error_msgs)
+
+
+# --- Real-subprocess integration ------------------------------------------
 #
-# These spawn real Bash subprocesses to prove the PG-wide signal actually
-# reaps SIGTERM-ignoring children + grandchildren. They use the real
-# ``_terminate``, real ``os.killpg``, real ``signal`` delivery. Marked
-# ``slow`` because they sleep briefly to let the kernel propagate signals.
+# These spawn a real Bash subprocess (one variant additionally backgrounds
+# a same-PG grandchild) and call the real ``_terminate`` against a real
+# ``subprocess.Popen``. The whole kill chain is exercised end-to-end: real
+# ``os.getpgid`` / ``os.killpg`` syscalls, real SIGTERM/SIGKILL delivery,
+# real ``waitpid`` reaping. A regression that breaks PG-wide signal
+# routing in production fails here even if every mocked unit test still
+# passes — the mocks can drift away from the syscall surface, real
+# subprocesses cannot.
 
 _LINUX_ONLY = pytest.mark.skipif(
     sys.platform == "win32",
@@ -339,10 +263,10 @@ _LINUX_ONLY = pytest.mark.skipif(
 def _spawn_sigterm_ignorer() -> subprocess.Popen[bytes]:
     """Bash subprocess that ignores SIGTERM and sleeps. Returns the Popen.
 
-    Caller spawns with ``start_new_session=True`` to mirror the
-    dispatcher's real ``Popen`` call. The shell script traps SIGTERM
-    to a no-op then runs ``sleep 300`` — SIGTERM cannot kill it, only
-    SIGKILL can.
+    ``start_new_session=True`` mirrors the dispatcher's real ``Popen``
+    call so the subprocess becomes its own process-group leader. The
+    shell traps SIGTERM to a no-op then runs ``sleep 300`` — SIGTERM
+    cannot kill it, only SIGKILL can.
     """
     script = "trap '' TERM; sleep 300"
     return subprocess.Popen(
@@ -357,12 +281,11 @@ def _spawn_sigterm_ignorer_with_child() -> subprocess.Popen[bytes]:
     """Bash subprocess that ignores SIGTERM AND backgrounds a sleeping
     child in the same process group. Returns the parent Popen.
 
-    Used to verify ``os.killpg`` reaps the whole group rather than
-    leaving the grandchild as an orphan.
+    Used to verify ``os.killpg`` reaches the whole group rather than
+    leaving the grandchild as an orphan after the parent dies. The
+    inner bash uses no ``setsid``, so the child inherits the parent's
+    PG; a PG-wide SIGKILL must reach it too.
     """
-    # Parent: ignore SIGTERM, background a child that also ignores
-    # SIGTERM, then wait. The child is in the same PG (no
-    # ``setsid``), so a PG-wide SIGKILL must reach it too.
     script = "trap '' TERM; bash -c \"trap '' TERM; sleep 300\" & wait"
     return subprocess.Popen(
         ["bash", "-c", script],
@@ -373,7 +296,7 @@ def _spawn_sigterm_ignorer_with_child() -> subprocess.Popen[bytes]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True iff ``pid`` is still a live process (os.kill(pid, 0))."""
+    """True iff ``pid`` is still a live process (``os.kill(pid, 0)``)."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -396,25 +319,24 @@ def _wait_until_dead(pid: int, *, timeout_s: float = 5.0) -> bool:
 @_LINUX_ONLY
 @pytest.mark.slow
 def test_terminate_kills_real_sigterm_ignoring_subprocess() -> None:
-    """Integration: a Bash subprocess that traps SIGTERM and ignores it
-    is killed via the SIGKILL escalation. After ``_terminate`` returns,
-    the parent pid is reaped by the kernel."""
+    """A Bash subprocess that traps SIGTERM and ignores it is killed via
+    the SIGKILL escalation. After ``_terminate`` returns, the kernel
+    has reaped the parent pid.
+
+    The dispatcher's 5s SIGTERM grace is shortened to 0.5s here via a
+    monkey-patched ``process.wait`` so the test doesn't burn the full
+    grace window — the real ``os.killpg`` is still exercised, only the
+    grace duration is shortened. (Without the cap-down, this single
+    test would take ~7s = 5s SIGTERM grace + 2s post-kill verify.)
+    """
     process = _spawn_sigterm_ignorer()
     pid = process.pid
-    # Let the trap take effect before we signal.
     time.sleep(0.2)
     assert _pid_alive(pid), "fixture failed to start"
 
-    # Use a shorter SIGTERM grace so the test doesn't hold the suite
-    # for the full 5s — patch the timeout via a monkey-patched
-    # ``process.wait``. The real ``os.killpg`` is exercised; only the
-    # grace duration is shortened.
     real_wait = process.wait
 
     def fast_wait(timeout: float | None = None) -> int:
-        # SIGTERM grace: cap at 0.5s so the SIGKILL escalation fires
-        # promptly. The post-SIGKILL verification wait uses
-        # ``timeout=2`` from ``_terminate`` itself, which is fine.
         return real_wait(timeout=min(timeout or 5.0, 0.5))
 
     process.wait = fast_wait  # type: ignore[method-assign]
@@ -422,24 +344,25 @@ def test_terminate_kills_real_sigterm_ignoring_subprocess() -> None:
     _terminate(process)  # type: ignore[arg-type]
 
     assert _wait_until_dead(pid), f"parent pid {pid} still alive after _terminate"
-    # Whitespace / pid recycle: the post-condition is "parent gone",
-    # which the wait above already established. The integration's job
-    # is to prove the SIGKILL escalation actually reached a real
-    # SIGTERM-ignorer; the orphan-children case is covered separately.
 
 
 @_LINUX_ONLY
 @pytest.mark.slow
 def test_terminate_kills_real_subprocess_pgwide_including_grandchild() -> None:
-    """Integration: a Bash subprocess that backgrounds a SIGTERM-ignoring
-    child in its own PG is reaped WHOLE — the child dies too because
-    ``os.killpg`` targets the group, not just the parent."""
+    """A Bash subprocess that backgrounds a SIGTERM-ignoring child in its
+    own PG is reaped WHOLE: the child dies too because ``os.killpg``
+    targets the group, not just the parent.
+
+    This is the BUG #2 regression test in real-process form: a fix
+    that signals only ``process.pid`` (instead of ``os.getpgid(pid)``)
+    would leave the grandchild alive and this test would fail. The
+    grandchild pid is discovered via ``/proc/<parent>/task/<parent>/
+    children`` — skipped if that path is missing (non-Linux /proc).
+    """
     process = _spawn_sigterm_ignorer_with_child()
     parent_pid = process.pid
-    time.sleep(0.3)  # let the bash fork the child
+    time.sleep(0.3)  # let the bash fork its child
 
-    # Discover the child's pid via /proc — read the parent's children
-    # list. On Linux this is exposed via /proc/<pid>/task/<pid>/children.
     children_path = f"/proc/{parent_pid}/task/{parent_pid}/children"
     try:
         with open(children_path) as fh:
