@@ -48,7 +48,7 @@ def test_skills_target_dir_creates_path(home_tmp: Path) -> None:
 
 
 def test_packaged_skill_dir_resolves_each_name() -> None:
-    """All four packaged skills must resolve to existing paths."""
+    """Every packaged skill (operator + agent) must resolve to an existing path."""
     for name in SKILL_NAMES:
         path = _packaged_skill_dir(name)
         assert path.exists()
