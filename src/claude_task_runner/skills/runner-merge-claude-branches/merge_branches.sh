@@ -34,7 +34,17 @@
 #                           merging into a repo that doesn't have these.
 #   --skip-check            Skip step 6 (devtools::check). Use for fast
 #                           iteration; the operator runs check separately.
-#   --skip-push             Don't push the branch (steps 1-6 only).
+#   --skip-vignettes        Skip step 7 (parallel vignette validation).
+#                           Use only when iterating; not recommended for
+#                           the final pre-push run because pkgdown CI's
+#                           sequential vignette build will surface the
+#                           failures one at a time.
+#   --vignette-jobs <N>     Parallel workers for vignette validation
+#                           (default: max(1, ncpus - 2)).
+#   --vignette-timeout <S>  Per-vignette wall-clock ceiling in seconds
+#                           (default: 900). Increase if you have a model
+#                           that legitimately needs >15 minutes.
+#   --skip-push             Don't push the branch (steps 1-7 only).
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
 #   -h, --help              Show this help.
@@ -47,6 +57,7 @@
 #   5  union-merge or verification failed
 #   6  devtools::check failed
 #   7  push failed
+#   8  parallel vignette validation failed (one or more Rmd did not render)
 set -euo pipefail
 
 REPO="${PWD}"
@@ -56,6 +67,9 @@ BRANCH_NAME=""
 UNION_FILE="inst/references/covariate-columns.md"
 SKIP_R_REGEN=0
 SKIP_CHECK=0
+SKIP_VIGNETTES=0
+VIGNETTE_JOBS=""
+VIGNETTE_TIMEOUT=900
 SKIP_PUSH=0
 DRY_RUN=0
 ASSUME_YES=0
@@ -64,7 +78,7 @@ EXTRA_REFS=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,34p' "$0" | sed 's/^# \?//'
+  sed -n '2,50p' "$0" | sed 's/^# \?//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -77,6 +91,9 @@ while [[ $# -gt 0 ]]; do
     --union-file) UNION_FILE="$2"; shift 2 ;;
     --skip-r-regen) SKIP_R_REGEN=1; shift ;;
     --skip-check) SKIP_CHECK=1; shift ;;
+    --skip-vignettes) SKIP_VIGNETTES=1; shift ;;
+    --vignette-jobs) VIGNETTE_JOBS="$2"; shift 2 ;;
+    --vignette-timeout) VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
@@ -84,6 +101,16 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+# Default vignette parallelism: ncpus - 2 (with a floor of 1).
+if [[ -z "$VIGNETTE_JOBS" ]]; then
+  if command -v nproc >/dev/null 2>&1; then
+    VIGNETTE_JOBS=$(( $(nproc) - 2 ))
+  else
+    VIGNETTE_JOBS=4
+  fi
+  [[ "$VIGNETTE_JOBS" -lt 1 ]] && VIGNETTE_JOBS=1
+fi
 
 if [[ -z "$BRANCH_NAME" ]]; then
   BRANCH_NAME="merge-all-claude-branches-$(date -u +%F)"
@@ -462,6 +489,47 @@ if (( ! SKIP_CHECK )); then
     echo "Fix the failures, re-run check, and push manually when green."
     exit 6
   fi
+fi
+
+# Parallel vignette validation pre-push gate.
+#
+# Why this exists: devtools::check runs with --no-build-vignettes (the
+# CarlssonPetri segfault is the on-disk reason), so vignette
+# evaluation is NOT covered by step 6. pkgdown's CI runs vignettes
+# sequentially and ABORTS on the first failure, so after a large
+# merge it surfaces broken vignettes one at a time across many cycles
+# — a 14-failure consolidation can take 14 CI iterations to drain.
+# A local parallel pass (callr-isolated, continues-on-failure) finds
+# them all in one shot. This is a HARD GATE: a failed vignette
+# blocks push.
+if (( ! SKIP_VIGNETTES )); then
+  echo
+  echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
+  echo "    jobs=$VIGNETTE_JOBS  timeout=${VIGNETTE_TIMEOUT}s/vignette"
+  VIGNETTE_RESULTS="${WT_ABS}/.vignette_results.jsonl"
+  if Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \
+       --worktree "$WT_ABS" \
+       --jobs "$VIGNETTE_JOBS" \
+       --timeout "$VIGNETTE_TIMEOUT" \
+       --results "$VIGNETTE_RESULTS" 2>&1 | tee "${WT_ABS}/.vignette_build.log" \
+       | grep -E '^\[FAIL|^SUMMARY|^FAILURES'; then
+    : # rendered cleanly; summary already emitted
+  fi
+  if grep -q '"ok":false' "$VIGNETTE_RESULTS" 2>/dev/null; then
+    echo
+    echo "ERROR: at least one vignette failed to render. Worktree at"
+    echo "  $WT_ABS"
+    echo "Full log:    $WT_ABS/.vignette_build.log"
+    echo "Per-file JSONL: $VIGNETTE_RESULTS"
+    echo
+    echo "Fix the failing vignettes (or the underlying model .R files),"
+    echo "re-run validation, and push manually when green:"
+    echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\"
+    echo "    --worktree $WT_ABS \\"
+    echo "    --jobs $VIGNETTE_JOBS"
+    exit 8
+  fi
+  echo "    all vignettes rendered cleanly"
 fi
 
 # Push.
