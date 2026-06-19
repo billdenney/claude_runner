@@ -286,6 +286,7 @@ heartbeat_silence_alert_s        = 300   # mark possibly_hung after N s of silen
 heartbeat_silence_kill_s         = 0     # 0 = never auto-kill
 heartbeat_persist_interval_s     = 30    # min s between in-loop heartbeat YAML writes
 steady_state_reap_interval_ticks = 1     # 1 = run per-tick silent-orphan reaper every tick
+bash_poll_antipattern_kill       = true  # /proc-walk detection of "until ! pgrep ...; do sleep N; done" descendants when agent is silent + monitor alive
 
 # ---------------------------------------------------------------------------
 # Watchdog (cron / systemd)

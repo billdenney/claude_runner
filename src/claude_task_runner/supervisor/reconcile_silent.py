@@ -132,6 +132,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -174,6 +175,23 @@ whether the orphan came from a supervisor restart (the original
 PR #55 case) or from a silent-but-alive subprocess inside a live
 supervisor (the 2026-06-12 ``frompeople-680-yu_2017`` case). Both
 demote to ``possibly_hung``; only the audit trail differs."""
+
+BASH_POLL_ANTIPATTERN_STOP_REASON = "killed_bash_poll_antipattern"
+"""``stop_reason`` written on tasks killed because a descendant bash
+process was found in the ``until ! pgrep ...; do sleep ...; done``
+poll-forever antipattern. Distinct from :data:`KILL_STOP_REASON` so the
+operator can grep journals for the specific antipattern and correlate
+across tasks. See :func:`_detect_bash_poll_antipattern` for the
+detection details and the recurring incident history that motivated it
+(frompeople-919-dong_2014, frompeople-948-van_2015,
+frompeople-937-hoglund_2015, frompeople-950-yu_2015 all wedged for
+2h-24h+ before manual operator intervention)."""
+
+BASH_POLL_ANTIPATTERN_EVENT = "subprocess_poll_antipattern_detected"
+"""Structured event name emitted via the supervisor's
+``event_callback`` when the antipattern detection fires. Operators /
+doctor surfaces subscribe to this to correlate kills with the matched
+bash argv."""
 
 
 DemoteOutcome = Literal["demoted", "toctou_skipped", "recheck_failed", "write_failed"]
@@ -220,6 +238,19 @@ class ReapResult:
     succeeded (the subprocess existed and we had permission). ``False``
     otherwise — KILL with no recorded pid, KILL with the process
     already gone, or a non-KILL verdict (SILENT never signals)."""
+
+    antipattern_bash_pid: int | None = None
+    """Pid of the bash descendant whose argv matched the poll-forever
+    antipattern, when the kill was triggered by
+    :func:`_detect_bash_poll_antipattern`. ``None`` for every other
+    reap path. Daemons key the
+    :data:`BASH_POLL_ANTIPATTERN_EVENT` emission off this being set."""
+
+    antipattern_matched_argv: str | None = None
+    """Truncated (≤200 chars) bash argv that matched the antipattern
+    regex. Goes into the structured event payload so operators can
+    correlate the kill with the exact buggy bash invocation. ``None``
+    when the kill was not antipattern-triggered."""
 
 
 _STARTUP_ERROR_PREFIX = "orphaned-restart-reap"
@@ -323,6 +354,162 @@ def _latest_mtime_in_tree(
     return latest
 
 
+_BASH_POLL_ANTIPATTERN_RE = re.compile(
+    r"until\s+!\s+pgrep\s+-f\b[^;\n]*;\s*do\s+sleep\s+\d+\s*;\s*done",
+)
+"""Regex for the worker-side bash poll-forever antipattern.
+
+The bug: an agent issues a paired Bash tool call sequence like ::
+
+    Rscript -e '...' &
+    until ! pgrep -f buildModelDb > /dev/null; do sleep 5; done
+
+If the background command finishes before the polling wait starts, the
+``until`` condition is already false and the loop ``sleep``s forever.
+``claude --print`` is blocked waiting on the bash subprocess; the
+dispatcher is happily pumping the (empty) pipe so ``dispatcher_alive_at``
+stays fresh; the agent emits nothing so ``last_heartbeat_at`` goes
+stale.  Without an explicit detector the task waits the full
+``max_duration_s_per_task`` cap (default 4h) to recover.
+
+The regex is intentionally permissive on the ``pgrep -f`` argument
+(``[^;\\n]*``) so it covers all four observed real-world shapes from
+the 2026-06-13..06-19 incidents on the nlmixr2lib_ingestion queue:
+
+* unquoted pattern + ``> /dev/null``
+* quoted pattern (no bracket-trick) + ``> /dev/null 2>&1``
+* quoted bracket-trick (``"[b]uildModelDb"``) + redirection
+* quoted bracket-trick + escaped parens (``"[b]uildModelDb\\(\\)"``)
+
+It still requires the exact ``until ! pgrep -f <X>; do sleep <N>; done``
+skeleton, so a single-iteration ``until ! pgrep ... && wait`` or
+``until ! pgrep ...; do something_useful; done`` does NOT match. The
+sleep-then-loop forever is the bug signature."""
+
+
+_PROC_ROOT = Path("/proc")
+"""Linux ``/proc`` root used by :func:`_detect_bash_poll_antipattern`.
+A constant (not a default argument) so tests can monkey-patch at the
+module level when simulating non-Linux."""
+
+
+_MAX_BASH_ARGV_LOG_CHARS = 200
+"""Cap on the bash argv string included in the structured event payload
+and the INFO log line. The argv shouldn't ever exceed this for a real
+antipattern (the regex skeleton is ~70 chars; the inner pattern is
+typically a single symbol name plus optional redirection), but a
+pathological agent could in principle paste arbitrary code, and we
+don't want one task's bug to fill journald with a single 8KB log line."""
+
+
+def _truncate_argv_for_log(argv: str) -> str:
+    """Cap ``argv`` for the structured log / event payload."""
+    if len(argv) <= _MAX_BASH_ARGV_LOG_CHARS:
+        return argv
+    return argv[: _MAX_BASH_ARGV_LOG_CHARS - 3] + "..."
+
+
+def _read_proc_children(pid: int) -> list[int]:
+    """Return the immediate-children pid list from ``/proc/<pid>/task/<pid>/children``.
+
+    Linux only. The ``children`` file is a space-separated list of pids,
+    populated by the kernel's CONFIG_PROC_CHILDREN. Returns ``[]`` on any
+    read failure (file missing — pid gone, kernel without
+    CONFIG_PROC_CHILDREN, race against process exit, permission denied).
+    """
+    try:
+        text = (_PROC_ROOT / str(pid) / "task" / str(pid) / "children").read_text()
+    except OSError:
+        return []
+    children: list[int] = []
+    for token in text.split():
+        try:
+            children.append(int(token))
+        except ValueError:
+            continue
+    return children
+
+
+def _read_proc_cmdline(pid: int) -> str | None:
+    """Return ``/proc/<pid>/cmdline`` with NULs replaced by spaces.
+
+    Returns ``None`` on read failure (pid gone, permission denied,
+    /proc not mounted). The trailing NUL the kernel emits after the last
+    argv element is stripped before the split so the returned string
+    has no trailing space.
+    """
+    try:
+        raw = (_PROC_ROOT / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    # cmdline ends with a trailing NUL byte; strip before splitting so
+    # the final element doesn't become an empty string.
+    if raw.endswith(b"\x00"):
+        raw = raw[:-1]
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    return text.replace("\x00", " ")
+
+
+def _detect_bash_poll_antipattern(
+    pid: int,
+    *,
+    max_descendants: int = 256,
+) -> tuple[int, str] | None:
+    """Walk the process tree under ``pid`` looking for the bash
+    poll-forever antipattern in a descendant's argv.
+
+    Linux-only. Returns ``(bash_descendant_pid, matched_argv_truncated)``
+    when a descendant's ``/proc/<descendant>/cmdline`` matches
+    :data:`_BASH_POLL_ANTIPATTERN_RE`, or ``None`` when no match is
+    found / the platform has no ``/proc`` / the root pid has no
+    accessible ``task/<pid>/children`` file.
+
+    The walk is breadth-first and capped at ``max_descendants`` visited
+    pids — a defensive cap against a runaway process tree. In practice
+    ``claude --print`` has 2-5 descendants (the worker, the bash for
+    the current Bash tool call, any subprocesses bash spawned), so the
+    cap never bites; it exists so a future regression that, say, fork-
+    bombs through this code cannot wedge the supervisor.
+
+    On match, INFO-logs the detection so the operator sees the
+    correlation in journald immediately. The caller is responsible for
+    the actual SIGTERM / state transition.
+    """
+    if not _PROC_ROOT.exists():
+        # Non-Linux (macOS test runner, container with /proc masked, etc.).
+        # The detector is a Linux-only optimisation; the duration cap
+        # still backstops the antipattern on other platforms.
+        return None
+
+    visited: set[int] = set()
+    queue: list[int] = [pid]
+    while queue and len(visited) < max_descendants:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for child in _read_proc_children(current):
+            if child in visited:
+                continue
+            cmdline = _read_proc_cmdline(child)
+            if cmdline is not None and _BASH_POLL_ANTIPATTERN_RE.search(cmdline):
+                truncated = _truncate_argv_for_log(cmdline)
+                logger.info(
+                    "bash poll-forever antipattern detected: parent_pid=%d bash_pid=%d argv=%r",
+                    pid,
+                    child,
+                    truncated,
+                )
+                return child, truncated
+            queue.append(child)
+    return None
+
+
 def reconcile_silent_orphans(
     queue_dir: Path,
     *,
@@ -330,6 +517,8 @@ def reconcile_silent_orphans(
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
     fs_mtime_fn: Callable[[Path], float | None] | None = None,
+    antipattern_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
+    killpg_fn: Callable[[int], bool] | None = None,
 ) -> list[ReapResult]:
     """Walk in-flight state YAMLs and surface silent / hung subprocesses
     at supervisor startup.
@@ -372,6 +561,10 @@ def reconcile_silent_orphans(
         sigterm_fn = _default_sigterm
     if fs_mtime_fn is None:
         fs_mtime_fn = _latest_mtime_in_tree
+    if antipattern_detect_fn is None:
+        antipattern_detect_fn = _detect_bash_poll_antipattern
+    if killpg_fn is None:
+        killpg_fn = _default_killpg
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -387,6 +580,8 @@ def reconcile_silent_orphans(
             kill_error_prefix=_STARTUP_ERROR_PREFIX,
             recheck_running_before_write=False,
             fs_mtime_fn=fs_mtime_fn,
+            antipattern_detect_fn=antipattern_detect_fn,
+            killpg_fn=killpg_fn,
         )
         if result is not None:
             results.append(result)
@@ -402,6 +597,8 @@ def reap_silent_orphans_tick(
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
     fs_mtime_fn: Callable[[Path], float | None] | None = None,
+    antipattern_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
+    killpg_fn: Callable[[int], bool] | None = None,
 ) -> list[ReapResult]:
     """Per-tick steady-state pass over live in-flight tasks.
 
@@ -452,6 +649,10 @@ def reap_silent_orphans_tick(
         sigterm_fn = _default_sigterm
     if fs_mtime_fn is None:
         fs_mtime_fn = _latest_mtime_in_tree
+    if antipattern_detect_fn is None:
+        antipattern_detect_fn = _detect_bash_poll_antipattern
+    if killpg_fn is None:
+        killpg_fn = _default_killpg
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -473,6 +674,8 @@ def reap_silent_orphans_tick(
             kill_error_prefix=_STEADY_ERROR_PREFIX,
             recheck_running_before_write=True,
             fs_mtime_fn=fs_mtime_fn,
+            antipattern_detect_fn=antipattern_detect_fn,
+            killpg_fn=killpg_fn,
         )
         if result is not None:
             results.append(result)
@@ -491,6 +694,8 @@ def _classify_and_act(
     kill_error_prefix: str,
     recheck_running_before_write: bool,
     fs_mtime_fn: Callable[[Path], float | None],
+    antipattern_detect_fn: Callable[[int], tuple[int, str] | None],
+    killpg_fn: Callable[[int], bool],
 ) -> ReapResult | None:
     """Classify a single state YAML and (when warranted) demote it.
 
@@ -566,6 +771,42 @@ def _classify_and_act(
     if dispatcher_alive_at is not None:
         alive_silence_s = (now - dispatcher_alive_at).total_seconds()
         if alive_silence_s <= settings.heartbeat_silence_alert_s:
+            # Cheap signals say the monitor is alive. Before short-
+            # circuiting to HEALTHY, peek at the agent's silence: when
+            # the agent has been silent past the alert threshold *and*
+            # we have a recorded pid, the "monitor alive + agent
+            # silent" combination is the exact signature of the bash
+            # poll-forever antipattern. Walk the process tree once for
+            # the known-buggy ``until ! pgrep ...; do sleep ...; done``
+            # shape; on a match, immediately escalate to a process-
+            # group SIGTERM rather than waiting the full duration cap.
+            #
+            # Gating: this is the ONLY place the /proc walk runs.
+            # Healthy chatty tasks (both heartbeats fresh) never hit the
+            # outer ``if dispatcher_alive_at is not None`` branch's
+            # silence comparison, never compute ``agent_silence_s``,
+            # and never call ``antipattern_detect_fn``. Per-tick cost
+            # for healthy tasks is zero (matching the operator's
+            # 2026-06-13 directive: don't run the FS walk continuously).
+            agent_baseline = last_hb if last_hb is not None else started_at
+            agent_silence_s = (now - agent_baseline).total_seconds()
+            if (
+                settings.bash_poll_antipattern_kill
+                and state.pid is not None
+                and agent_silence_s > settings.heartbeat_silence_alert_s
+            ):
+                antipattern_result = _maybe_kill_antipattern(
+                    state=state,
+                    state_path=state_path,
+                    now=now,
+                    agent_silence_s=agent_silence_s,
+                    settings=settings,
+                    antipattern_detect_fn=antipattern_detect_fn,
+                    killpg_fn=killpg_fn,
+                    recheck_running_before_write=recheck_running_before_write,
+                )
+                if antipattern_result is not None:
+                    return antipattern_result
             return None
 
     try:
@@ -838,6 +1079,156 @@ def _demote_if_still_running(
     return "demoted"
 
 
+def _maybe_kill_antipattern(
+    *,
+    state: TaskState,
+    state_path: Path,
+    now: datetime,
+    agent_silence_s: float,
+    settings: TaskCapsSettings,
+    antipattern_detect_fn: Callable[[int], tuple[int, str] | None],
+    killpg_fn: Callable[[int], bool],
+    recheck_running_before_write: bool,
+) -> ReapResult | None:
+    """Run the antipattern detector on ``state.pid``; on match, escalate
+    to a process-group SIGTERM and flip the state YAML to ``failed``.
+
+    Returns a :class:`ReapResult` with the antipattern fields populated
+    on a successful kill+demote, or ``None`` when the detector finds no
+    match (the dispatcher just happens to be quiet for a legitimate
+    reason), the recheck TOCTOU guard fires, or the state write fails.
+
+    The caller has already verified that ``settings.bash_poll_antipattern_kill``
+    is true, ``state.pid`` is not None, and the agent silence has crossed
+    the alert threshold — so the only remaining decision is whether the
+    process tree actually contains the buggy bash pattern.
+    """
+    assert state.pid is not None  # narrowed by caller
+    try:
+        antipattern = antipattern_detect_fn(state.pid)
+    except Exception as exc:
+        # /proc race / permission error / corrupt cmdline. The detector
+        # is a best-effort kill-fast path; don't let an FS hiccup
+        # propagate up and abort the entire reap pass. The duration cap
+        # still backstops the antipattern even when this path fails.
+        logger.warning(
+            "bash poll-forever detector raised on task %s pid=%s: %s; "
+            "deferring to existing reaper paths",
+            state.task_id,
+            state.pid,
+            exc,
+        )
+        return None
+    if antipattern is None:
+        return None
+
+    bash_pid, matched_argv = antipattern
+
+    # Process-group SIGTERM so the bash sleep loop's descendants die
+    # too. ``state.pid`` is the worker (claude --print) and was spawned
+    # with ``start_new_session=True``, so it leads its own process
+    # group. ``killpg`` reaches the bash + sleep children that an
+    # ``os.kill(state.pid, SIGTERM)`` would miss.
+    try:
+        sigtermed = killpg_fn(state.pid)
+    except Exception as exc:
+        logger.warning(
+            "bash poll-forever: killpg of pid=%s for task %s raised %s; still demoting state",
+            state.pid,
+            state.task_id,
+            exc,
+        )
+        sigtermed = False
+
+    demoted = state.model_copy(
+        update={
+            "status": "failed",
+            "stop_reason": BASH_POLL_ANTIPATTERN_STOP_REASON,
+            "error": (
+                f"bash-poll-antipattern: bash_pid={bash_pid} after "
+                f"{agent_silence_s:.0f}s agent silence; argv={matched_argv!r}"
+            ),
+            "pid": None,
+        }
+    )
+
+    outcome = _demote_if_still_running(
+        state_path,
+        demoted,
+        require_recheck=recheck_running_before_write,
+    )
+    if outcome != "demoted":
+        # toctou_skipped / recheck_failed / write_failed — log already
+        # emitted by the helper or above. No ReapResult to emit.
+        return None
+
+    logger.info(
+        "killed bash poll-forever antipattern: task=%s claude_pid=%s "
+        "bash_pid=%s agent_silence=%.0fs argv=%r",
+        state.task_id,
+        state.pid,
+        bash_pid,
+        agent_silence_s,
+        matched_argv,
+    )
+    return ReapResult(
+        task_id=state.task_id,
+        verdict=HeartbeatVerdict.KILL,
+        silence_s=agent_silence_s,
+        pid=state.pid,
+        sigtermed=sigtermed,
+        antipattern_bash_pid=bash_pid,
+        antipattern_matched_argv=matched_argv,
+    )
+
+
+def _default_killpg(pid: int) -> bool:
+    """Best-effort process-group SIGTERM. Returns ``True`` iff delivered.
+
+    Mirrors :func:`_default_sigterm` semantics but signals the GROUP led
+    by ``pid``. Required for the antipattern kill: the bash poll loop
+    runs as a child of ``claude --print`` (which the worker spawns with
+    ``start_new_session=True`` so it's its own group leader). A bare
+    ``os.kill(pid, SIGTERM)`` would only signal the claude parent; the
+    descendant bash + sleep would survive as orphans. ``os.killpg``
+    reaches every process in the group.
+
+    Failure modes are distinguished the same way as :func:`_default_sigterm`:
+
+    * ``ProcessLookupError`` — the parent / group is gone; nothing to do.
+    * ``PermissionError`` / ``OSError`` — could not signal; logged at
+      WARNING so the operator sees the orphaned process group.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return False  # parent already gone
+    except OSError as exc:
+        logger.warning("killpg setup (getpgid pid=%s) failed: %s", pid, exc)
+        return False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        logger.warning(
+            "killpg SIGTERM of PG %s (pid=%s) denied (EPERM); group may still be alive: %s",
+            pgid,
+            pid,
+            exc,
+        )
+        return False
+    except OSError as exc:
+        logger.warning(
+            "killpg SIGTERM of PG %s (pid=%s) failed; group state unknown: %s",
+            pgid,
+            pid,
+            exc,
+        )
+        return False
+
+
 def _default_sigterm(pid: int) -> bool:
     """Best-effort SIGTERM. Returns ``True`` iff the signal was delivered.
 
@@ -880,6 +1271,8 @@ def _default_sigterm(pid: int) -> bool:
 
 
 __all__ = [
+    "BASH_POLL_ANTIPATTERN_EVENT",
+    "BASH_POLL_ANTIPATTERN_STOP_REASON",
     "KILL_STOP_REASON",
     "SILENT_STOP_REASON",
     "STEADY_SILENT_STOP_REASON",
