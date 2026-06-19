@@ -110,6 +110,33 @@ State YAMLs from the pre-Layer-2 supervisor have ``dispatcher_alive_at
 ``last_heartbeat_at`` alone (the pre-Layer-2 behaviour), so an upgrade
 doesn't reap every running task.
 
+Stuck-sleep-loop pierce (Layer 2.5)
+-----------------------------------
+The Layer-2 short-circuit ("monitor alive ⇒ HEALTHY") is exactly what a
+stuck poll-sleep loop exploits: ``claude --print`` blocks forever on a
+bash subprocess that ``sleep``s in a loop whose exit condition never
+trips, so the agent emits nothing (``last_heartbeat_at`` stale) while
+the monitor keeps pumping the empty pipe (``dispatcher_alive_at``
+fresh). Five live incidents wedged 2h-24h+ each before the duration cap
+fired (``until ! pgrep ...`` on dong/van/hoglund/yu_2015; the
+``while ! [ -e <marker> ]; do sleep 5; done`` marker-wait on
+wojciechowski_2015, 2026-06-19).
+
+Before short-circuiting to HEALTHY, the classifier therefore checks
+three conditions (operator design, 2026-06-19): (1) the agent has been
+heartbeat-silent longer than ``stuck_sleep_loop_kill_threshold_s``
+(default 600s); (2) the monitor is still alive (the REUSED Layer-2
+dual-heartbeat gate — so the /proc walk runs only when heartbeat is
+already stale, never every tick for every task); (3) a live descendant
+of the worker is a recurring ``sleep`` inside a polling loop
+(:func:`_detect_stuck_sleep_loop`). All three ⇒ terminate the process
+group immediately (SIGTERM → SIGKILL → verify) with ``stop_reason``
+:data:`STUCK_SLEEP_LOOP_STOP_REASON`, rather than waiting the 4h cap.
+Detection is by BEHAVIOR + TIME, not loop syntax: a correctly-bounded
+poll self-terminates and lets the agent resume emitting events well
+before 600s, so it never trips; an unbounded one stays silent and is
+killed. Gated entirely behind ``[task_caps].bash_poll_antipattern_kill``.
+
 Filesystem activity verification (Layer 3)
 ------------------------------------------
 When the cheap signals say a task is silent, the classifier walks the
@@ -134,6 +161,7 @@ import logging
 import os
 import re
 import signal
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -176,22 +204,36 @@ PR #55 case) or from a silent-but-alive subprocess inside a live
 supervisor (the 2026-06-12 ``frompeople-680-yu_2017`` case). Both
 demote to ``possibly_hung``; only the audit trail differs."""
 
-BASH_POLL_ANTIPATTERN_STOP_REASON = "killed_bash_poll_antipattern"
-"""``stop_reason`` written on tasks killed because a descendant bash
-process was found in the ``until ! pgrep ...; do sleep ...; done``
-poll-forever antipattern. Distinct from :data:`KILL_STOP_REASON` so the
-operator can grep journals for the specific antipattern and correlate
-across tasks. See :func:`_detect_bash_poll_antipattern` for the
-detection details and the recurring incident history that motivated it
-(frompeople-919-dong_2014, frompeople-948-van_2015,
-frompeople-937-hoglund_2015, frompeople-950-yu_2015 all wedged for
-2h-24h+ before manual operator intervention)."""
+STUCK_SLEEP_LOOP_STOP_REASON = "killed_stuck_sleep_loop"
+"""``stop_reason`` written on tasks killed because a live descendant of
+the worker was found in a stuck poll-sleep loop (any of the forms in
+:data:`_STUCK_SLEEP_LOOP_FAST_PATHS` or the broad fallback). Distinct
+from :data:`KILL_STOP_REASON` so the operator can grep journals for the
+specific zombie class and correlate across tasks.
 
-BASH_POLL_ANTIPATTERN_EVENT = "subprocess_poll_antipattern_detected"
+Generalizes the narrower ``killed_bash_poll_antipattern`` reason from
+PR #65 (the ``until ! pgrep ...; do sleep N; done`` case): that is now
+one fast-path among several. The recurring incident history that
+motivated the detector:
+
+* frompeople-919-dong_2014, -948-van_2015, -937-hoglund_2015,
+  -950-yu_2015 — ``until ! pgrep ...; do sleep N; done`` (2h-24h+ each)
+* frompeople-949-wojciechowski_2015 (2026-06-19) — the Claude Code
+  Bash-tool background-marker wait
+  ``while ! [ -e <task>.output.exit_code ]; do sleep 5; done`` (2.5h),
+  which the pgrep-only regex would have MISSED.
+
+In every case the extraction work had already committed/pushed before
+the wedge; the kill only reclaims the held slot. See
+:func:`_detect_stuck_sleep_loop`."""
+
+STUCK_SLEEP_LOOP_EVENT = "stuck_sleep_loop_zombie_killed"
 """Structured event name emitted via the supervisor's
-``event_callback`` when the antipattern detection fires. Operators /
-doctor surfaces subscribe to this to correlate kills with the matched
-bash argv."""
+``event_callback`` when the stuck-sleep-loop detection fires and the
+worker is killed. Payload: ``task_id``, ``claude_pid``, ``bash_pid``,
+``matched_argv`` (truncated), ``heartbeat_staleness_s``, ``sigtermed``.
+Operators / doctor surfaces subscribe to this to correlate kills with
+the matched bash argv."""
 
 
 DemoteOutcome = Literal["demoted", "toctou_skipped", "recheck_failed", "write_failed"]
@@ -239,18 +281,18 @@ class ReapResult:
     otherwise — KILL with no recorded pid, KILL with the process
     already gone, or a non-KILL verdict (SILENT never signals)."""
 
-    antipattern_bash_pid: int | None = None
-    """Pid of the bash descendant whose argv matched the poll-forever
-    antipattern, when the kill was triggered by
-    :func:`_detect_bash_poll_antipattern`. ``None`` for every other
-    reap path. Daemons key the
-    :data:`BASH_POLL_ANTIPATTERN_EVENT` emission off this being set."""
+    stuck_loop_bash_pid: int | None = None
+    """Pid of the bash/sh descendant whose argv matched a stuck sleep
+    loop (or the loop-bash parent of a bare ``sleep`` child), when the
+    kill was triggered by :func:`_detect_stuck_sleep_loop`. ``None`` for
+    every other reap path. Daemons key the :data:`STUCK_SLEEP_LOOP_EVENT`
+    emission off this being set."""
 
-    antipattern_matched_argv: str | None = None
-    """Truncated (≤200 chars) bash argv that matched the antipattern
-    regex. Goes into the structured event payload so operators can
+    stuck_loop_matched_argv: str | None = None
+    """Truncated (≤200 chars) bash argv that matched a stuck-sleep-loop
+    rule. Goes into the structured event payload so operators can
     correlate the kill with the exact buggy bash invocation. ``None``
-    when the kill was not antipattern-triggered."""
+    when the kill was not stuck-sleep-loop-triggered."""
 
 
 _STARTUP_ERROR_PREFIX = "orphaned-restart-reap"
@@ -357,7 +399,8 @@ def _latest_mtime_in_tree(
 _BASH_POLL_ANTIPATTERN_RE = re.compile(
     r"until\s+!\s+pgrep\s+-f\b[^;\n]*;\s*do\s+sleep\s+\d+\s*;\s*done",
 )
-"""Regex for the worker-side bash poll-forever antipattern.
+"""Fast-path regex for the original worker-side bash poll-forever
+antipattern: ``until ! pgrep -f <X>; do sleep <N>; done``.
 
 The bug: an agent issues a paired Bash tool call sequence like ::
 
@@ -381,14 +424,111 @@ the 2026-06-13..06-19 incidents on the nlmixr2lib_ingestion queue:
 * quoted bracket-trick (``"[b]uildModelDb"``) + redirection
 * quoted bracket-trick + escaped parens (``"[b]uildModelDb\\(\\)"``)
 
-It still requires the exact ``until ! pgrep -f <X>; do sleep <N>; done``
-skeleton, so a single-iteration ``until ! pgrep ... && wait`` or
-``until ! pgrep ...; do something_useful; done`` does NOT match. The
-sleep-then-loop forever is the bug signature."""
+This is now ONE entry in :data:`_STUCK_SLEEP_LOOP_FAST_PATHS`; the broad
+fallback (:data:`_STUCK_SLEEP_LOOP_FALLBACK_RE`) catches everything the
+named fast paths don't. See :func:`_match_stuck_sleep_loop_argv`."""
+
+
+_MARKER_WAIT_RE = re.compile(
+    r"while\s+!\s+\[\s+-e\b[^;\n]*\]\s*;\s*do\s+sleep\s+\d+\s*;\s*done",
+)
+"""Fast-path regex for the Claude Code Bash-tool background-marker wait:
+``while ! [ -e <marker> ]; do sleep N; done``.
+
+The 2026-06-19 ``frompeople-949-wojciechowski_2015`` zombie (2.5h held
+slot): the agent launched a background command and waited on its
+``.output.exit_code`` marker file, which never appeared, so the loop
+spun forever. Same failure class as the pgrep poll but a syntax the
+pgrep regex does not match — the motivating case for this
+generalization."""
+
+
+_FILE_WAIT_RE = re.compile(
+    r"while\s+\[\s+!\s+-f\b[^;\n]*\]\s*;\s*do\s+sleep\s+\d+\s*;\s*done",
+)
+"""Fast-path regex for the ``while [ ! -f <path> ]; do sleep N; done``
+file-existence wait — the bracketed-negation sibling of
+:data:`_MARKER_WAIT_RE` (``[ ! -f ]`` vs ``! [ -e ]``)."""
+
+
+_FOR_SLEEP_RE = re.compile(
+    r"for\s+[^;\n]*;\s*do\b[^\n]*\bsleep\s+[\d.]+",
+)
+"""Fast-path regex for a counted ``for ...; do ... sleep N ... done``
+poll loop. A bounded ``for`` loop is still a zombie when the bound is
+effectively infinite (``$(seq 1 100000)`` at ``sleep 5`` is ~138h) or
+when the loop never breaks early; the heartbeat-staleness gate, not the
+regex, is what distinguishes a stuck loop from a correctly-bounded one
+that finishes and lets the agent resume emitting events."""
+
+
+_STUCK_SLEEP_LOOP_FAST_PATHS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("pgrep_poll", _BASH_POLL_ANTIPATTERN_RE),
+    ("marker_wait", _MARKER_WAIT_RE),
+    ("file_wait", _FILE_WAIT_RE),
+    ("for_sleep", _FOR_SLEEP_RE),
+)
+"""Named fast-path regexes, tried in order before the broad fallback.
+
+The name is purely for the structured log / event so the operator sees
+WHICH known incident shape matched. A match by any of these is
+equivalent to a match by :data:`_STUCK_SLEEP_LOOP_FALLBACK_RE`; the
+fast paths exist to document the known forms and give precise
+telemetry, not to change the kill decision."""
+
+
+_STUCK_SLEEP_LOOP_FALLBACK_RE = re.compile(
+    r"(?:while|until|for)\b.*\bsleep\b\s*[\d.]+",
+)
+"""Broad fallback: any loop keyword (``while`` / ``until`` / ``for``)
+followed somewhere by a ``sleep <number>``. This — together with the
+``stuck_sleep_loop_kill_threshold_s`` heartbeat-staleness gate — IS the
+generalization the operator asked for; the named fast paths are merely
+confirmations of known shapes.
+
+A bare ``sleep 30`` with NO enclosing loop keyword does NOT match (a
+one-shot pause between steps is legitimate). Requiring the loop keyword
+in the SAME argv is the discriminator; the separate
+:data:`_BARE_SLEEP_RE` / :data:`_LOOP_KEYWORD_RE` pair in
+:func:`_detect_stuck_sleep_loop` handles the case where the ``sleep`` is
+a *child process* of a loop bash rather than a token in its argv."""
+
+
+_BARE_SLEEP_RE = re.compile(r"^\s*(?:\S*/)?sleep\s+[\d.]+\s*$")
+"""Matches a cmdline that is ITSELF just a ``sleep <number>`` invocation
+(optionally a fully-qualified ``/bin/sleep``), with nothing else on the
+line. Used to recognise a bare ``sleep`` *child process* of a loop bash
+— NOT a ``bash -c '... sleep N ...'`` (which the argv matcher handles
+directly). The trailing ``\\s*$`` anchor is what keeps it from matching
+a shell that merely mentions ``sleep``."""
+
+
+_LOOP_KEYWORD_RE = re.compile(r"\b(?:while|until|for)\b")
+"""Bare loop-keyword presence test, used only for the bare-``sleep``-
+child case: a live ``sleep`` whose PARENT cmdline contains a loop
+keyword is treated as a stuck loop even when the parent's own argv does
+not literally contain ``sleep`` (e.g. the loop body calls a function
+that shells out to ``sleep``, or the parent is ``bash <script>`` whose
+loop lives in the script file)."""
+
+
+def _match_stuck_sleep_loop_argv(cmdline: str) -> str | None:
+    """Return the matched rule name if ``cmdline`` is a stuck sleep loop.
+
+    Tries the named fast paths first (returning their name for precise
+    telemetry), then the broad fallback (returning ``"fallback"``).
+    Returns ``None`` when nothing matches. This is the (a) "descendant
+    IS a loop+sleep" arm of :func:`_detect_stuck_sleep_loop`."""
+    for name, pattern in _STUCK_SLEEP_LOOP_FAST_PATHS:
+        if pattern.search(cmdline):
+            return name
+    if _STUCK_SLEEP_LOOP_FALLBACK_RE.search(cmdline):
+        return "fallback"
+    return None
 
 
 _PROC_ROOT = Path("/proc")
-"""Linux ``/proc`` root used by :func:`_detect_bash_poll_antipattern`.
+"""Linux ``/proc`` root used by :func:`_detect_stuck_sleep_loop`.
 A constant (not a default argument) so tests can monkey-patch at the
 module level when simulating non-Linux."""
 
@@ -396,9 +536,9 @@ module level when simulating non-Linux."""
 _MAX_BASH_ARGV_LOG_CHARS = 200
 """Cap on the bash argv string included in the structured event payload
 and the INFO log line. The argv shouldn't ever exceed this for a real
-antipattern (the regex skeleton is ~70 chars; the inner pattern is
-typically a single symbol name plus optional redirection), but a
-pathological agent could in principle paste arbitrary code, and we
+stuck sleep loop (the loop skeleton is ~70 chars; the inner condition is
+typically a single symbol / marker path plus optional redirection), but
+a pathological agent could in principle paste arbitrary code, and we
 don't want one task's bug to fill journald with a single 8KB log line."""
 
 
@@ -455,19 +595,37 @@ def _read_proc_cmdline(pid: int) -> str | None:
     return text.replace("\x00", " ")
 
 
-def _detect_bash_poll_antipattern(
+def _detect_stuck_sleep_loop(
     pid: int,
     *,
     max_descendants: int = 256,
 ) -> tuple[int, str] | None:
-    """Walk the process tree under ``pid`` looking for the bash
-    poll-forever antipattern in a descendant's argv.
+    """Walk the process tree under ``pid`` looking for a stuck sleep loop.
 
     Linux-only. Returns ``(bash_descendant_pid, matched_argv_truncated)``
-    when a descendant's ``/proc/<descendant>/cmdline`` matches
-    :data:`_BASH_POLL_ANTIPATTERN_RE`, or ``None`` when no match is
-    found / the platform has no ``/proc`` / the root pid has no
-    accessible ``task/<pid>/children`` file.
+    on a match, or ``None`` when no match is found / the platform has no
+    ``/proc`` / the root pid has no accessible ``task/<pid>/children``
+    file.
+
+    Two detection arms (per the operator's 2026-06-19 design):
+
+    (a) **argv mode** — a descendant whose ``/proc/<pid>/cmdline``
+        matches :func:`_match_stuck_sleep_loop_argv` (any named fast path
+        in :data:`_STUCK_SLEEP_LOOP_FAST_PATHS` or the broad
+        :data:`_STUCK_SLEEP_LOOP_FALLBACK_RE`). This is the common case:
+        the loop is an inline ``bash -c '... while/until/for … sleep N …
+        done'`` so the whole loop body is in the argv. Returns that
+        descendant's pid + argv.
+
+    (b) **bare-sleep mode** — a descendant that is itself just a
+        ``sleep N`` process (:data:`_BARE_SLEEP_RE`) whose PARENT cmdline
+        contains a loop keyword (:data:`_LOOP_KEYWORD_RE`). Catches the
+        case where the loop bash's own argv does not literally contain
+        ``sleep`` (the body shells out to ``sleep``, or the loop lives in
+        a script file). Returns the loop-bash PARENT's pid + argv so the
+        operator sees the loop, not the ephemeral ``sleep`` child. A bare
+        ``sleep`` whose parent is NOT a loop bash is deliberately ignored
+        — a one-shot ``sleep 30`` between steps is legitimate.
 
     The walk is breadth-first and capped at ``max_descendants`` visited
     pids — a defensive cap against a runaway process tree. In practice
@@ -476,15 +634,25 @@ def _detect_bash_poll_antipattern(
     cap never bites; it exists so a future regression that, say, fork-
     bombs through this code cannot wedge the supervisor.
 
-    On match, INFO-logs the detection so the operator sees the
-    correlation in journald immediately. The caller is responsible for
-    the actual SIGTERM / state transition.
+    On match, INFO-logs the detection (with the matched rule name) so the
+    operator sees the correlation in journald immediately. The caller is
+    responsible for the actual terminate / state transition.
     """
     if not _PROC_ROOT.exists():
         # Non-Linux (macOS test runner, container with /proc masked, etc.).
         # The detector is a Linux-only optimisation; the duration cap
-        # still backstops the antipattern on other platforms.
+        # still backstops the zombie on other platforms.
         return None
+
+    # cmdline is read once per pid and cached: each non-root pid is read
+    # once as a child (arms a/b) and possibly again as a parent (arm b
+    # parent-keyword check). The cache keeps the walk to one read per pid.
+    cmdline_cache: dict[int, str | None] = {}
+
+    def _cmdline(p: int) -> str | None:
+        if p not in cmdline_cache:
+            cmdline_cache[p] = _read_proc_cmdline(p)
+        return cmdline_cache[p]
 
     visited: set[int] = set()
     queue: list[int] = [pid]
@@ -493,19 +661,41 @@ def _detect_bash_poll_antipattern(
         if current in visited:
             continue
         visited.add(current)
+        current_cmdline = _cmdline(current)
         for child in _read_proc_children(current):
             if child in visited:
                 continue
-            cmdline = _read_proc_cmdline(child)
-            if cmdline is not None and _BASH_POLL_ANTIPATTERN_RE.search(cmdline):
-                truncated = _truncate_argv_for_log(cmdline)
-                logger.info(
-                    "bash poll-forever antipattern detected: parent_pid=%d bash_pid=%d argv=%r",
-                    pid,
-                    child,
-                    truncated,
-                )
-                return child, truncated
+            child_cmdline = _cmdline(child)
+            if child_cmdline is not None:
+                # (a) the descendant IS a loop+sleep argv.
+                rule = _match_stuck_sleep_loop_argv(child_cmdline)
+                if rule is not None:
+                    truncated = _truncate_argv_for_log(child_cmdline)
+                    logger.info(
+                        "stuck sleep loop detected (rule=%s): root_pid=%d bash_pid=%d argv=%r",
+                        rule,
+                        pid,
+                        child,
+                        truncated,
+                    )
+                    return child, truncated
+                # (b) the descendant is a bare ``sleep N`` whose parent
+                # (``current``) is a loop bash. Report the parent loop.
+                if (
+                    _BARE_SLEEP_RE.match(child_cmdline)
+                    and current_cmdline is not None
+                    and _LOOP_KEYWORD_RE.search(current_cmdline)
+                ):
+                    truncated = _truncate_argv_for_log(current_cmdline)
+                    logger.info(
+                        "stuck sleep loop detected (rule=bare_sleep_child): "
+                        "root_pid=%d loop_bash_pid=%d sleep_pid=%d argv=%r",
+                        pid,
+                        current,
+                        child,
+                        truncated,
+                    )
+                    return current, truncated
             queue.append(child)
     return None
 
@@ -517,8 +707,8 @@ def reconcile_silent_orphans(
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
     fs_mtime_fn: Callable[[Path], float | None] | None = None,
-    antipattern_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
-    killpg_fn: Callable[[int], bool] | None = None,
+    stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
+    terminate_fn: Callable[[int], bool] | None = None,
 ) -> list[ReapResult]:
     """Walk in-flight state YAMLs and surface silent / hung subprocesses
     at supervisor startup.
@@ -561,10 +751,10 @@ def reconcile_silent_orphans(
         sigterm_fn = _default_sigterm
     if fs_mtime_fn is None:
         fs_mtime_fn = _latest_mtime_in_tree
-    if antipattern_detect_fn is None:
-        antipattern_detect_fn = _detect_bash_poll_antipattern
-    if killpg_fn is None:
-        killpg_fn = _default_killpg
+    if stuck_loop_detect_fn is None:
+        stuck_loop_detect_fn = _detect_stuck_sleep_loop
+    if terminate_fn is None:
+        terminate_fn = _default_terminate_pg
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -580,8 +770,8 @@ def reconcile_silent_orphans(
             kill_error_prefix=_STARTUP_ERROR_PREFIX,
             recheck_running_before_write=False,
             fs_mtime_fn=fs_mtime_fn,
-            antipattern_detect_fn=antipattern_detect_fn,
-            killpg_fn=killpg_fn,
+            stuck_loop_detect_fn=stuck_loop_detect_fn,
+            terminate_fn=terminate_fn,
         )
         if result is not None:
             results.append(result)
@@ -597,8 +787,8 @@ def reap_silent_orphans_tick(
     clock: Clock,
     sigterm_fn: Callable[[int], bool] | None = None,
     fs_mtime_fn: Callable[[Path], float | None] | None = None,
-    antipattern_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
-    killpg_fn: Callable[[int], bool] | None = None,
+    stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
+    terminate_fn: Callable[[int], bool] | None = None,
 ) -> list[ReapResult]:
     """Per-tick steady-state pass over live in-flight tasks.
 
@@ -649,10 +839,10 @@ def reap_silent_orphans_tick(
         sigterm_fn = _default_sigterm
     if fs_mtime_fn is None:
         fs_mtime_fn = _latest_mtime_in_tree
-    if antipattern_detect_fn is None:
-        antipattern_detect_fn = _detect_bash_poll_antipattern
-    if killpg_fn is None:
-        killpg_fn = _default_killpg
+    if stuck_loop_detect_fn is None:
+        stuck_loop_detect_fn = _detect_stuck_sleep_loop
+    if terminate_fn is None:
+        terminate_fn = _default_terminate_pg
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -674,8 +864,8 @@ def reap_silent_orphans_tick(
             kill_error_prefix=_STEADY_ERROR_PREFIX,
             recheck_running_before_write=True,
             fs_mtime_fn=fs_mtime_fn,
-            antipattern_detect_fn=antipattern_detect_fn,
-            killpg_fn=killpg_fn,
+            stuck_loop_detect_fn=stuck_loop_detect_fn,
+            terminate_fn=terminate_fn,
         )
         if result is not None:
             results.append(result)
@@ -694,8 +884,8 @@ def _classify_and_act(
     kill_error_prefix: str,
     recheck_running_before_write: bool,
     fs_mtime_fn: Callable[[Path], float | None],
-    antipattern_detect_fn: Callable[[int], tuple[int, str] | None],
-    killpg_fn: Callable[[int], bool],
+    stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None],
+    terminate_fn: Callable[[int], bool],
 ) -> ReapResult | None:
     """Classify a single state YAML and (when warranted) demote it.
 
@@ -771,42 +961,52 @@ def _classify_and_act(
     if dispatcher_alive_at is not None:
         alive_silence_s = (now - dispatcher_alive_at).total_seconds()
         if alive_silence_s <= settings.heartbeat_silence_alert_s:
-            # Cheap signals say the monitor is alive. Before short-
-            # circuiting to HEALTHY, peek at the agent's silence: when
-            # the agent has been silent past the alert threshold *and*
-            # we have a recorded pid, the "monitor alive + agent
-            # silent" combination is the exact signature of the bash
-            # poll-forever antipattern. Walk the process tree once for
-            # the known-buggy ``until ! pgrep ...; do sleep ...; done``
-            # shape; on a match, immediately escalate to a process-
-            # group SIGTERM rather than waiting the full duration cap.
+            # Cheap signals say the monitor is alive (this is the
+            # dual-heartbeat gate the operator asked us to REUSE —
+            # condition 2 of the stuck-sleep-loop heuristic). Before
+            # short-circuiting to HEALTHY, peek at the agent's silence:
+            # when the agent has been heartbeat-silent past
+            # ``stuck_sleep_loop_kill_threshold_s`` (condition 1) *and*
+            # we have a recorded pid, the "monitor alive + agent silent"
+            # combination is the exact signature of a stuck poll-sleep
+            # loop. Walk the process tree once (condition 3) for a
+            # descendant ``while/until/for … sleep N`` loop; on a match,
+            # terminate the process group immediately rather than waiting
+            # the full duration cap.
             #
             # Gating: this is the ONLY place the /proc walk runs.
             # Healthy chatty tasks (both heartbeats fresh) never hit the
             # outer ``if dispatcher_alive_at is not None`` branch's
             # silence comparison, never compute ``agent_silence_s``,
-            # and never call ``antipattern_detect_fn``. Per-tick cost
+            # and never call ``stuck_loop_detect_fn``. Per-tick cost
             # for healthy tasks is zero (matching the operator's
             # 2026-06-13 directive: don't run the FS walk continuously).
+            #
+            # The agent-silence gate uses ``stuck_sleep_loop_kill_threshold_s``
+            # (default 600s), intentionally LONGER than the monitor-alive
+            # ``heartbeat_silence_alert_s`` (default 300s): the broad
+            # loop-detection fallback has a high silence bar to clear, so
+            # a correctly-bounded poll (which self-terminates and lets the
+            # agent resume emitting events) is never near the kill boundary.
             agent_baseline = last_hb if last_hb is not None else started_at
             agent_silence_s = (now - agent_baseline).total_seconds()
             if (
                 settings.bash_poll_antipattern_kill
                 and state.pid is not None
-                and agent_silence_s > settings.heartbeat_silence_alert_s
+                and agent_silence_s > settings.stuck_sleep_loop_kill_threshold_s
             ):
-                antipattern_result = _maybe_kill_antipattern(
+                zombie_result = _maybe_kill_stuck_sleep_loop(
                     state=state,
                     state_path=state_path,
                     now=now,
                     agent_silence_s=agent_silence_s,
                     settings=settings,
-                    antipattern_detect_fn=antipattern_detect_fn,
-                    killpg_fn=killpg_fn,
+                    stuck_loop_detect_fn=stuck_loop_detect_fn,
+                    terminate_fn=terminate_fn,
                     recheck_running_before_write=recheck_running_before_write,
                 )
-                if antipattern_result is not None:
-                    return antipattern_result
+                if zombie_result is not None:
+                    return zombie_result
             return None
 
     try:
@@ -1079,61 +1279,65 @@ def _demote_if_still_running(
     return "demoted"
 
 
-def _maybe_kill_antipattern(
+def _maybe_kill_stuck_sleep_loop(
     *,
     state: TaskState,
     state_path: Path,
     now: datetime,
     agent_silence_s: float,
     settings: TaskCapsSettings,
-    antipattern_detect_fn: Callable[[int], tuple[int, str] | None],
-    killpg_fn: Callable[[int], bool],
+    stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None],
+    terminate_fn: Callable[[int], bool],
     recheck_running_before_write: bool,
 ) -> ReapResult | None:
-    """Run the antipattern detector on ``state.pid``; on match, escalate
-    to a process-group SIGTERM and flip the state YAML to ``failed``.
+    """Run the stuck-sleep-loop detector on ``state.pid``; on match,
+    terminate the worker's process group and flip the state YAML to
+    ``failed``.
 
-    Returns a :class:`ReapResult` with the antipattern fields populated
-    on a successful kill+demote, or ``None`` when the detector finds no
+    Returns a :class:`ReapResult` with the stuck-loop fields populated on
+    a successful kill+demote, or ``None`` when the detector finds no
     match (the dispatcher just happens to be quiet for a legitimate
     reason), the recheck TOCTOU guard fires, or the state write fails.
 
     The caller has already verified that ``settings.bash_poll_antipattern_kill``
     is true, ``state.pid`` is not None, and the agent silence has crossed
-    the alert threshold — so the only remaining decision is whether the
-    process tree actually contains the buggy bash pattern.
+    ``stuck_sleep_loop_kill_threshold_s`` — so the only remaining decision
+    is whether the process tree actually contains a stuck sleep loop.
     """
     assert state.pid is not None  # narrowed by caller
     try:
-        antipattern = antipattern_detect_fn(state.pid)
+        detected = stuck_loop_detect_fn(state.pid)
     except Exception as exc:
         # /proc race / permission error / corrupt cmdline. The detector
         # is a best-effort kill-fast path; don't let an FS hiccup
         # propagate up and abort the entire reap pass. The duration cap
-        # still backstops the antipattern even when this path fails.
+        # still backstops the zombie even when this path fails.
         logger.warning(
-            "bash poll-forever detector raised on task %s pid=%s: %s; "
+            "stuck-sleep-loop detector raised on task %s pid=%s: %s; "
             "deferring to existing reaper paths",
             state.task_id,
             state.pid,
             exc,
         )
         return None
-    if antipattern is None:
+    if detected is None:
         return None
 
-    bash_pid, matched_argv = antipattern
+    bash_pid, matched_argv = detected
 
-    # Process-group SIGTERM so the bash sleep loop's descendants die
-    # too. ``state.pid`` is the worker (claude --print) and was spawned
-    # with ``start_new_session=True``, so it leads its own process
-    # group. ``killpg`` reaches the bash + sleep children that an
-    # ``os.kill(state.pid, SIGTERM)`` would miss.
+    # Terminate the worker's whole process group: SIGTERM → grace →
+    # SIGKILL → post-verify (the same escalation the dispatcher's cap-kill
+    # uses; see :func:`_default_terminate_pg`). ``state.pid`` is the
+    # worker (claude --print), spawned ``start_new_session=True`` so it
+    # leads its own group; signalling the group reaps the bash + sleep
+    # descendants that a bare ``os.kill(state.pid, …)`` would orphan. The
+    # SIGKILL escalation guarantees the slot is freed even if the bash
+    # ignores SIGTERM.
     try:
-        sigtermed = killpg_fn(state.pid)
+        sigtermed = terminate_fn(state.pid)
     except Exception as exc:
         logger.warning(
-            "bash poll-forever: killpg of pid=%s for task %s raised %s; still demoting state",
+            "stuck-sleep-loop: terminate of pid=%s for task %s raised %s; still demoting state",
             state.pid,
             state.task_id,
             exc,
@@ -1143,10 +1347,10 @@ def _maybe_kill_antipattern(
     demoted = state.model_copy(
         update={
             "status": "failed",
-            "stop_reason": BASH_POLL_ANTIPATTERN_STOP_REASON,
+            "stop_reason": STUCK_SLEEP_LOOP_STOP_REASON,
             "error": (
-                f"bash-poll-antipattern: bash_pid={bash_pid} after "
-                f"{agent_silence_s:.0f}s agent silence; argv={matched_argv!r}"
+                f"stuck-sleep-loop: bash_pid={bash_pid} after "
+                f"{agent_silence_s:.0f}s heartbeat staleness; argv={matched_argv!r}"
             ),
             "pid": None,
         }
@@ -1163,8 +1367,8 @@ def _maybe_kill_antipattern(
         return None
 
     logger.info(
-        "killed bash poll-forever antipattern: task=%s claude_pid=%s "
-        "bash_pid=%s agent_silence=%.0fs argv=%r",
+        "killed stuck sleep loop: task=%s claude_pid=%s "
+        "bash_pid=%s heartbeat_staleness=%.0fs argv=%r",
         state.task_id,
         state.pid,
         bash_pid,
@@ -1177,56 +1381,56 @@ def _maybe_kill_antipattern(
         silence_s=agent_silence_s,
         pid=state.pid,
         sigtermed=sigtermed,
-        antipattern_bash_pid=bash_pid,
-        antipattern_matched_argv=matched_argv,
+        stuck_loop_bash_pid=bash_pid,
+        stuck_loop_matched_argv=matched_argv,
     )
 
 
-def _default_killpg(pid: int) -> bool:
-    """Best-effort process-group SIGTERM. Returns ``True`` iff delivered.
+def _default_terminate_pg(pid: int) -> bool:
+    """SIGTERM → grace → SIGKILL → post-verify the process group led by
+    ``pid``; return ``True`` iff the process is confirmed gone afterward.
 
-    Mirrors :func:`_default_sigterm` semantics but signals the GROUP led
-    by ``pid``. Required for the antipattern kill: the bash poll loop
-    runs as a child of ``claude --print`` (which the worker spawns with
-    ``start_new_session=True`` so it's its own group leader). A bare
-    ``os.kill(pid, SIGTERM)`` would only signal the claude parent; the
-    descendant bash + sleep would survive as orphans. ``os.killpg``
-    reaches every process in the group.
+    This is the kill path the operator asked the stuck-sleep-loop reaper
+    to use. Rather than a bare one-shot SIGTERM (the pre-generalization
+    ``_default_killpg`` behaviour), it reuses the dispatcher's
+    battle-tested escalation, :func:`runner.dispatcher._terminate_by_pid`:
+    SIGTERM the worker's process group, poll for exit, escalate to
+    SIGKILL, then verify the process actually died. The bash sleep-loop
+    descendants share the worker's process group (the worker is spawned
+    ``start_new_session=True``), so a group signal reaches them; the
+    SIGKILL escalation guarantees the slot is freed even if the bash
+    ignores SIGTERM (or is wedged in a way that defers signal delivery).
 
-    Failure modes are distinguished the same way as :func:`_default_sigterm`:
+    The import is local so the supervisor's reconcile-silent module does
+    not pull the (heavy) dispatcher module at import time — only when the
+    default terminate path is actually exercised. ``supervisor.adoption``
+    already imports ``runner.dispatcher`` at module top, so there is no
+    circular-import risk; this defers the cost, it does not avoid a cycle.
 
-    * ``ProcessLookupError`` — the parent / group is gone; nothing to do.
-    * ``PermissionError`` / ``OSError`` — could not signal; logged at
-      WARNING so the operator sees the orphaned process group.
+    Returns ``True`` iff ``pid`` is no longer alive after the sequence,
+    recorded as :attr:`ReapResult.sigtermed` so the operator can tell a
+    confirmed kill from a could-not-confirm one (EPERM under a Linux-user
+    dispatch, or a ``TASK_UNINTERRUPTIBLE`` D-state). The escalation runs
+    in the supervisor tick; in practice a ``sleep`` loop dies on the first
+    SIGTERM within a fraction of the grace period, so the tick stall is
+    sub-second — and stuck-loop kills are rare.
     """
+    from claude_task_runner.runner import dispatcher as dispatcher_mod
+
     try:
-        pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        return False  # parent already gone
-    except OSError as exc:
-        logger.warning("killpg setup (getpgid pid=%s) failed: %s", pid, exc)
-        return False
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError as exc:
+        dispatcher_mod._terminate_by_pid(
+            pid,
+            alive=lambda: dispatcher_mod._pid_alive(pid),
+            sleep_fn=time.sleep,
+        )
+    except Exception as exc:
         logger.warning(
-            "killpg SIGTERM of PG %s (pid=%s) denied (EPERM); group may still be alive: %s",
-            pgid,
+            "stuck-sleep-loop: _terminate_by_pid(pid=%s) raised %s; reporting unconfirmed kill",
             pid,
             exc,
         )
         return False
-    except OSError as exc:
-        logger.warning(
-            "killpg SIGTERM of PG %s (pid=%s) failed; group state unknown: %s",
-            pgid,
-            pid,
-            exc,
-        )
-        return False
+    return not dispatcher_mod._pid_alive(pid)
 
 
 def _default_sigterm(pid: int) -> bool:
@@ -1271,11 +1475,11 @@ def _default_sigterm(pid: int) -> bool:
 
 
 __all__ = [
-    "BASH_POLL_ANTIPATTERN_EVENT",
-    "BASH_POLL_ANTIPATTERN_STOP_REASON",
     "KILL_STOP_REASON",
     "SILENT_STOP_REASON",
     "STEADY_SILENT_STOP_REASON",
+    "STUCK_SLEEP_LOOP_EVENT",
+    "STUCK_SLEEP_LOOP_STOP_REASON",
     "ReapResult",
     "reap_silent_orphans_tick",
     "reconcile_silent_orphans",

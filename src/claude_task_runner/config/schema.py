@@ -175,28 +175,55 @@ class TaskCapsSettings(_StrictModel):
     extra latency before a silent subprocess is flagged.
     """
 
-    bash_poll_antipattern_kill: bool = True
-    """When the agent has been silent past the heartbeat alert threshold
-    AND a descendant bash process is in a
-    ``until ! pgrep ... do sleep ... done`` pattern, kill immediately
-    rather than waiting for the duration cap.
+    stuck_sleep_loop_kill_threshold_s: int = Field(default=600, gt=0)
+    """How long ``last_heartbeat_at`` may be stale (agent emitting no
+    stream-json events) before a descendant stuck-sleep-loop is treated
+    as a zombie and killed — provided the monitor is still alive (see
+    ``bash_poll_antipattern_kill``). Default 600s = 10 min.
 
-    The pattern is a worker-side bug Claude Code's Bash tool reproduces
-    when it issues a background process followed by a polling wait — if
-    the background process finishes before the polling wait starts, the
-    ``until`` condition is already false and the loop ``sleep``s forever.
-    The reaper would otherwise wait the full
-    ``max_duration_s_per_task`` (default 4h) to recover the slot; with
-    this knob on, a /proc walk surfaces the pattern within one tick of
-    the heartbeat-silence alert threshold and SIGTERMs the process
-    group.
+    The operator framing: *"a 10-minute sleep when checking every 5
+    seconds would be likely zombie territory."* Detection is by
+    BEHAVIOR + TIME, not loop syntax: any bounded poll loop (the
+    ``agent-bash-patterns`` marker-file Pattern B caps at ~600s and
+    self-terminates, after which the agent resumes emitting events)
+    clears its silence well before an *unbounded* loop, which stays
+    heartbeat-silent indefinitely and crosses this threshold. Keep this
+    comfortably above the longest legitimate bounded poll a worker may
+    run so a correctly-written wait is never near the kill boundary.
+
+    Distinct from ``heartbeat_silence_alert_s`` (which still gates the
+    monitor-alive freshness check): the agent-silence gate for the
+    stuck-sleep-loop kill is intentionally longer so the broad
+    loop-detection regex has a high bar to clear before the /proc walk
+    runs and the process group is signalled.
+    """
+
+    bash_poll_antipattern_kill: bool = True
+    """Master switch for the stuck-sleep-loop zombie reaper. When the
+    agent has been silent past ``stuck_sleep_loop_kill_threshold_s`` AND
+    a live descendant of the worker is a recurring ``sleep`` inside a
+    polling loop, kill the process group immediately rather than waiting
+    for the duration cap.
+
+    Originally added for the narrow ``until ! pgrep ...; do sleep N;
+    done`` antipattern (hence the field name, kept stable so existing
+    per-queue TOMLs keep parsing); now gates the *generalized* detector
+    that also catches the ``while ! [ -e <marker> ]; do sleep N; done``
+    marker-wait, ``while [ ! -f <path> ]; do sleep N; done``,
+    ``for ...; do sleep N; ... done``, and a broad
+    ``(while|until|for) … sleep N`` fallback. All are the same failure
+    CLASS: a worker-side wait loop whose exit condition never trips, so
+    ``claude --print`` blocks on the bash subprocess forever while the
+    dispatcher monitor keeps ``dispatcher_alive_at`` fresh and the agent
+    emits nothing.
 
     Gated by dual-heartbeat staleness: the FS-walking detection only
-    runs when ``last_heartbeat_at`` is stale past the alert threshold
-    AND ``dispatcher_alive_at`` is still fresh (the supervisor's
-    monitor thread is healthy; the agent is the silent party). That
-    keeps the per-tick cost zero for healthy tasks. Set to ``false``
-    to revert to the duration-cap-only behaviour.
+    runs when ``last_heartbeat_at`` is stale past
+    ``stuck_sleep_loop_kill_threshold_s`` AND ``dispatcher_alive_at`` is
+    still fresh (within ``heartbeat_silence_alert_s`` — the monitor
+    thread is healthy; the agent is the silent party). That keeps the
+    per-tick cost zero for healthy tasks. Set to ``false`` to revert to
+    the duration-cap-only behaviour.
     """
 
 

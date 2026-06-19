@@ -62,10 +62,15 @@ on nlmixr2lib_ingestion burned 2h–24h+ each before the cap fired:
 `frompeople-937-hoglund_2015` (2h, $16.45), `frompeople-950-yu_2015`
 (2h45m, $12.38).
 
-The reaper now detects this exact signature (a bash descendant whose
-argv matches the poll-loop regex while the agent is silent) and
-`killpg`s the worker with stop_reason `killed_bash_poll_antipattern`
-instead of waiting 4h — but a killed task is still a failed task.
+The reaper now detects this signature generally — ANY live descendant
+running a `while`/`until`/`for` loop around a `sleep` while the agent is
+heartbeat-silent past `stuck_sleep_loop_kill_threshold_s` (default 10
+min) and the monitor is still alive — and terminates the worker's
+process group (SIGTERM → SIGKILL → verify) with stop_reason
+`killed_stuck_sleep_loop` instead of waiting 4h. This covers the
+`until ! pgrep …; do sleep N; done` form AND the
+`while ! [ -e <marker> ]; do sleep N; done` background-marker wait (and
+the broad fallback), but a killed task is still a failed task.
 **Prevention beats detection: don't write the loop.**
 
 ## Use one of these instead
@@ -130,6 +135,11 @@ cross-tool-call wait.
 - `agent-stop-and-ask` — the sibling rule for the *other* poll that
   burns a worker: never poll for a sidecar **response** file either.
   Write the request, exit, let the runner re-dispatch you.
-- The runner-side reaper (`subprocess_poll_antipattern_detected`
-  event, stop_reason `killed_bash_poll_antipattern`) is the safety
-  net, not a substitute for writing the command correctly.
+- The runner-side reaper (`stuck_sleep_loop_zombie_killed` event,
+  stop_reason `killed_stuck_sleep_loop`) is the safety net, not a
+  substitute for writing the command correctly. It detects any stuck
+  `while`/`until`/`for` + `sleep` loop by behaviour + time (silent past
+  the kill threshold while the monitor is alive), so a *bounded* poll
+  like Pattern B above — which self-terminates at its `seq … × sleep`
+  ceiling and lets your agent resume emitting events — never trips it;
+  only an unbounded loop that stays silent does.
