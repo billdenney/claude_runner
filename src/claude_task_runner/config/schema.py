@@ -175,6 +175,30 @@ class TaskCapsSettings(_StrictModel):
     extra latency before a silent subprocess is flagged.
     """
 
+    bash_poll_antipattern_kill: bool = True
+    """When the agent has been silent past the heartbeat alert threshold
+    AND a descendant bash process is in a
+    ``until ! pgrep ... do sleep ... done`` pattern, kill immediately
+    rather than waiting for the duration cap.
+
+    The pattern is a worker-side bug Claude Code's Bash tool reproduces
+    when it issues a background process followed by a polling wait — if
+    the background process finishes before the polling wait starts, the
+    ``until`` condition is already false and the loop ``sleep``s forever.
+    The reaper would otherwise wait the full
+    ``max_duration_s_per_task`` (default 4h) to recover the slot; with
+    this knob on, a /proc walk surfaces the pattern within one tick of
+    the heartbeat-silence alert threshold and SIGTERMs the process
+    group.
+
+    Gated by dual-heartbeat staleness: the FS-walking detection only
+    runs when ``last_heartbeat_at`` is stale past the alert threshold
+    AND ``dispatcher_alive_at`` is still fresh (the supervisor's
+    monitor thread is healthy; the agent is the silent party). That
+    keeps the per-tick cost zero for healthy tasks. Set to ``false``
+    to revert to the duration-cap-only behaviour.
+    """
+
 
 class WatchdogSettings(_StrictModel):
     restart_cooldown_s: float = Field(gt=0)
