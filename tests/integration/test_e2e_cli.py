@@ -7,7 +7,7 @@ queue, without spawning real ``claude``. Proves that:
 * ``queue list``/``states`` see the task.
 * ``watchdog register`` + ``watchdog tick --dry-run`` decide
   ``RESTART`` for a queue with no live supervisor.
-* ``install-skills --copy`` materializes the four packaged skills.
+* ``install-skills --copy`` materializes all packaged skills.
 * ``doctor`` runs end-to-end with no FAILures on a clean queue.
 
 The dispatcher's full lifecycle (claude-shim → state machine →
@@ -122,19 +122,18 @@ class TestQueueLifecycle:
 
 
 class TestSkillInstall:
-    def test_copy_yes_installs_all_four(self, runner: CliRunner, isolated_home: Path) -> None:
+    def test_copy_yes_installs_all_skills(self, runner: CliRunner, isolated_home: Path) -> None:
+        from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES
+
         code, out, _ = _invoke(
             runner,
             ["install-skills", "--yes", "--copy"],
         )
         assert code == 0, out
         skills_dir = isolated_home / ".claude" / "skills"
-        for name in (
-            "runner-status",
-            "runner-usage",
-            "runner-add-task",
-            "runner-answer-sidecar",
-        ):
+        # Every packaged skill — operator (runner-*) AND worker (agent-*) —
+        # must land in ~/.claude/skills/ so dispatched workers can load them.
+        for name in SKILL_NAMES:
             assert (skills_dir / name / "SKILL.md").is_file()
 
 

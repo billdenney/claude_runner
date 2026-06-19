@@ -9,7 +9,36 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Added
+
+- **`agent-bash-patterns` worker skill — prevention half of the
+  bash-poll-forever antipattern.** Companion to the reaper that
+  *detects* `Rscript … &` + `until ! pgrep -f X; do sleep N; done`
+  and kills with stop_reason `killed_bash_poll_antipattern`. The new
+  skill teaches the dispatched agent not to write the loop in the
+  first place: run long commands synchronously with `timeout`, via a
+  marker-file sentinel, or in an `&&`-chain — never background-then-
+  poll across two Bash tool calls. This guidance previously lived
+  (wrongly) inside the nlmixr2lib `extract-literature-model` skill,
+  which only reached one queue's workers; it belongs in the runner so
+  every dispatched agent gets it. Incidents that motivated it:
+  `frompeople-919/948/937/950` (2h–24h+ each).
+
 ### Fixed
+
+- **Worker-facing `agent-*` skills are now actually delivered.**
+  `install-skills` shipped only the five operator `runner-*` skills;
+  `agent-stop-and-ask` existed in the package but was in no install
+  list, so the sidecar-protocol skill reached no dispatched worker
+  (workers read `~/.claude/skills/`, populated by `install-skills`,
+  since their prompt carries no skill injection). `SKILL_NAMES` is
+  now `OPERATOR_SKILL_NAMES + AGENT_SKILL_NAMES`; `install-skills`,
+  `uninstall`, `list`, and the doctor `skills_installed` check all
+  cover both `agent-stop-and-ask` and the new `agent-bash-patterns`.
+  `runner-merge-claude-branches` (previously installed by hand) is
+  also added to the operator list so a clean `install-skills` and the
+  doctor both account for it. First-time-setup docs now document the
+  `install-skills` step and the worker-delivery model.
 
 - **Dispatcher `_terminate` now verifies the parent actually exited
   and raises `TerminateFailed` on kill failures (2026-06-13 zombie

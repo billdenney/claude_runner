@@ -14,6 +14,34 @@ which claude-task-runner   # verify on PATH
 The `dev` extras include `pytest` and the doctor's check dependencies; the
 `ui` extras include the optional terminal UI.
 
+Then install the skills into `~/.claude/skills/`:
+
+```sh
+claude-task-runner install-skills --yes
+```
+
+This installs two kinds of skill (symlinked by default, so edits to the
+source tree flow through):
+
+- **Operator skills** (`runner-status`, `runner-usage`, `runner-add-task`,
+  `runner-answer-sidecar`, `runner-merge-claude-branches`) — invoked by you
+  from an interactive `claude` session.
+- **Agent skills** (`agent-stop-and-ask`, `agent-bash-patterns`) — consulted
+  by the *dispatched worker*, not by you. A worker's prompt is just
+  `task.prompt` with no skill injection, so a worker discovers skills the
+  same way any `claude` session does: from `~/.claude/skills/`. Because the
+  worker runs as the same Linux user, installing here is what lets it load
+  these. They no-op in interactive use, so installing them globally is
+  harmless.
+
+> **Custom `config_dir` caveat.** `install-skills` writes to
+> `~/.claude/skills/`. If a queue sets `[claude] config_dir` to a non-default
+> `CLAUDE_CONFIG_DIR` (e.g. `~/.claude_personal`), its dispatched workers
+> read skills from *that* dir's `skills/` — mirror the skills there too
+> (symlink or `--copy`) or the agent skills won't reach those workers.
+
+`claude-task-runner doctor` reports any skills that aren't installed.
+
 ## 2. Create the queue directory
 
 ```sh
