@@ -126,6 +126,72 @@ override per repo.
    warnings / 1 note` (the `.git`-in-worktree note is pre-existing
    and ignorable).
 
+   **Important**: this gate does NOT cover vignette evaluation. Step
+   8b below does that — do not skip it.
+
+8b. **Parallel vignette validation pre-push gate** (HARD gate; exit
+    code 8 on any failure):
+
+    ```bash
+    Rscript verify_vignettes_parallel.R \
+      --worktree <worktree> \
+      --jobs $(($(nproc) - 2)) \
+      --timeout 900
+    ```
+
+    Renders every `vignettes/articles/*.Rmd` in a callr subprocess so a
+    single failure doesn't poison the others. Continues on failure and
+    writes a JSON-lines report (`.vignette_results.jsonl` in the
+    worktree). The orchestrator script (`merge_branches.sh`) runs this
+    automatically before push; in that script's own step list it is
+    step 7 (the `--skip-vignettes` gate).
+
+    **Why this gate exists.** pkgdown's CI vignette build runs
+    sequentially and ABORTS on the first failure. After a 130-branch
+    merge that can leave 14+ latent failures undiscovered, each
+    surfaced one at a time across many CI iterations. Catching them
+    all in one local parallel pass keeps the PR loop short and
+    surfaces shared root causes (e.g. the "rxUi auto-injects `cmt()`
+    for algebraic observables AFTER ODE states and renumbers slots"
+    bug pattern that broke 12 vignettes in the 2026-06-17 merge) in
+    one batch.
+
+    **What to do on failure.** The `.vignette_results.jsonl` lists
+    every failing vignette with its error message. Common patterns:
+
+    - `chol(): decomposition failed` — model has a rank-1 / numerically
+      indefinite OMEGA matrix. Re-encode as a single standardized
+      shared eta scaled per-parameter in `model({})` instead of a
+      multi-eta block with `r = +1`. See
+      `inst/modeldb/specificDrugs/Fanta_2007_ciclosporin.R` for the
+      canonical example.
+    - `'cmt' on observation record or on a undefined compartment` /
+      `following parameter(s) are required for solving: <state>` /
+      vignette filters dropping all rows — the model declares ODE
+      states (`d/dt(central) <- ...`) plus algebraic observables
+      (`Cc <- central / vc`) and the vignette event table references
+      the observables on observation rows (`cmt = "Cc"`). rxUi
+      auto-injects `cmt()` for the observables AFTER the ODE states,
+      renumbering slot indices and breaking references to ODE states
+      past the inserted slot. **Fix in the EVENT TABLE**: change the
+      observation `cmt` value to the actual ODE state name (e.g.
+      `cmt = "central"`). rxode2 returns every algebraic observable
+      as a column in the output regardless of which compartment the
+      `cmt` pointed at — the `cmt` says when, not what. **Do NOT
+      add `cmt()` declarations to `model({})`** to silence this; that
+      pollutes the model body to mask a bug whose home is in the
+      event table.
+    - `unique(x) returned >1 value` in dplyr `summarise()` — the
+      grouping is too coarse. Fix the `group_by` to include the
+      covariate that varies, or switch to `first()` / `mean()`.
+    - `callr timed out` — the vignette ran longer than the 900s
+      ceiling. Usually a too-large `n_per_group` for the merge's
+      parallel-worker contention; reduce the cohort size or raise
+      `--vignette-timeout` if the run legitimately needs it.
+
+    Skipping this gate (`--skip-vignettes`) is allowed only for
+    iteration. NEVER push without it green on the final pass.
+
 9. **Per-task tracking is automatic.** Because step 4 used real
    merges, each source `claude/<task-id>` branch tip is already an
    ancestor of the consolidation branch. Once the consolidation PR
@@ -163,6 +229,34 @@ override per repo.
   inside the nlmixr2lib repo's worktree.
 
 ## Important nuances
+
+### Vignette failures are EXPECTED on major merges
+
+Every consolidation of this size has historically surfaced a handful
+of broken vignettes that the per-paper extractions did not catch.
+The 2026-06-17 merge surfaced 15. Common shapes:
+
+- A model whose IIV block was published with `r = +1` between several
+  etas (rank-1 OMEGA) — fine for fitting, but rxode2's Cholesky-
+  based simulator can't decompose it. Re-encode as a single
+  standardized shared eta.
+- Vignettes whose event tables reference algebraic observables
+  (e.g. `cmt = "Cc"`) instead of ODE state names. Auto-injected
+  `cmt()`s shift slot numbering and break references to ODE states
+  and dose history. Fix: in the event table, use the actual ODE
+  state name (`cmt = "central"`) on observation rows; rxode2
+  reports the algebraic observable in the output dataframe
+  regardless. Do NOT add `cmt()` calls to `model({})` — that
+  pollutes the model body to silence the symptom.
+- Per-vignette code bugs (`unique(x)` on a varying column;
+  `filter()` chains that drop every row; cohort sizes that overflow
+  the per-vignette timeout under parallel-build contention).
+
+**This is a recurring failure mode**, not a one-off. The validation
+gate in step 8b exists specifically to catch all of them in one
+local parallel pass instead of dribbling them through the CI
+sequential build one at a time. NEVER push a consolidation branch
+without the green gate.
 
 ### Per-task tracking: real merges make it free
 
