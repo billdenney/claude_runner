@@ -9,7 +9,8 @@
 #   5. Union-merge of covariate-columns.md (recovers the annotations
 #      -X theirs would have lost)
 #   6. devtools::check pre-push gate
-#   7. Push branch + print PR title/body
+#   7. Parallel vignette validation pre-push gate
+#   8. Push branch + print PR title/body
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -78,7 +79,7 @@ EXTRA_REFS=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,50p' "$0" | sed 's/^# \?//'
+  sed -n '2,51p' "$0" | sed 's/^# \?//'
 }
 
 while [[ $# -gt 0 ]]; do

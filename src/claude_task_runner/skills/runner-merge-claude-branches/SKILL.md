@@ -133,7 +133,8 @@ override per repo.
     single failure doesn't poison the others. Continues on failure and
     writes a JSON-lines report (`.vignette_results.jsonl` in the
     worktree). The orchestrator script (`merge_branches.sh`) runs this
-    automatically before push.
+    automatically before push; in that script's own step list it is
+    step 7 (the `--skip-vignettes` gate).
 
     **Why this gate exists.** pkgdown's CI vignette build runs
     sequentially and ABORTS on the first failure. After a 130-branch
