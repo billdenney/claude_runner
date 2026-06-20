@@ -185,57 +185,57 @@ echo
 echo "==> Creating worktree $WT_REL on new branch $BRANCH_NAME off $BASE"
 git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 
-# Sequential cherry-pick.
+# Sequential merge.
 #
-# We use cherry-pick rather than `git merge -X theirs` because the
-# claude/* branches are often based on an OUTDATED main (e.g. created
-# off the merge-base of a prior consolidation PR, not the current
-# main HEAD). With `merge -X theirs` we'd silently roll back the
-# main-side updates for any file the stale branch carries unchanged
-# (binary registry blobs, NEWS.md sections, covariate-columns.md
-# entries from previously-merged work). Cherry-pick applies the
-# commit's DELTA on top of the new branch, which is exactly the
-# semantic the operator wants: "fold each branch's per-task commit
-# into one branch."
+# We use a real `git merge --no-ff -X theirs` (one merge commit per
+# source branch) rather than cherry-pick. The decisive advantage: a
+# real merge makes each source branch's tip a true ANCESTOR of the
+# consolidation branch. Once the consolidation PR lands on main, every
+# folded branch is therefore reported as merged by
+# `git branch --merged origin/main` and shown as "Merged" on GitHub —
+# with NO SHA rewrite, NO post-merge force-advance dance, and NO
+# content-equivalence guesswork to decide whether a branch is already
+# in. "Is this branch merged?" becomes a trivial ancestor query.
 #
-# `-X theirs` is still passed so per-commit conflicts (e.g. two
-# branches each editing the same NEWS.md line) resolve to the
-# incoming side; the covariate-columns.md union-merge step below
-# repairs structured-markdown losses.
+# The historical objection to merge — that merging a branch based on
+# an OUTDATED main "rolls back" main-side updates — only ever bites the
+# shared bookkeeping files, and every one of those is rebuilt or
+# repaired downstream:
+#   * binary registry blobs (data/modeldb.rda, inst/modeldb.qs2),
+#     man/*.Rd, and the _pkgdown.yml navbar  -> regenerated in step 5;
+#   * covariate-columns.md structured lines                -> union-merged in step 6.
+# New model .R / vignette .Rmd files live at unique paths, so a 3-way
+# merge keeps every prior branch's additions untouched. `-X theirs`
+# only changes how CONFLICTING hunks resolve (incoming side wins),
+# which is incidental for the regenerated/union-merged files above.
+#
+# A branch fails here only on a true conflict -X theirs cannot resolve
+# (modify/delete, rename/rename); those are aborted and logged, and
+# the remaining branches continue.
 cd "$WT_ABS"
 echo
-echo "==> Sequential cherry-pick with -X theirs (one commit per branch;"
+echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
 echo "    binaries regenerated and covariate-columns.md union-merged after)"
 SUCCESS=0
 FAIL=0
 FAILED_LIST=()
-# Map source-branch -> (new_sha_on_consolidation, original_source_sha).
-# Used by the post-merge advance script (emitted at end) to force-push
-# each source branch tip to its cherry-picked commit AFTER the
-# consolidation PR lands on main — preserving per-task tracking so
-# GitHub shows each claude/<task-id> branch as "merged" rather than
-# perpetually "1 commit ahead".
-CHERRY_BRANCH=()
-CHERRY_NEW_SHA=()
-CHERRY_ORIG_SHA=()
+MERGED_LIST=()
 for br in "${UNMERGED[@]}"; do
   short=${br#origin/}
   ahead=$(git rev-list --count "$BASE..$br")
-  echo "    --- $short ($ahead commit ahead) ---"
-  if git cherry-pick --strategy=recursive -X theirs \
-        --keep-redundant-commits \
-        "$BASE..$br" >/dev/null 2>&1; then
+  echo "    --- $short ($ahead commit(s) ahead) ---"
+  if git merge --no-ff --no-edit -X theirs \
+        -m "Merge branch '$short' into $BRANCH_NAME" \
+        "$br" >/dev/null 2>&1; then
     SUCCESS=$((SUCCESS+1))
-    CHERRY_BRANCH+=("$short")
-    CHERRY_NEW_SHA+=("$(git rev-parse HEAD)")
-    CHERRY_ORIG_SHA+=("$(git rev-parse "$br")")
+    MERGED_LIST+=("$short")
   else
     FAIL=$((FAIL+1))
     FAILED_LIST+=("$short")
-    echo "      FAIL — conflicted files:"
+    echo "      FAIL — conflicted files -X theirs could not resolve:"
     git diff --name-only --diff-filter=U | sed 's/^/        /'
     echo "      ABORTING this branch; continuing with the rest."
-    git cherry-pick --abort 2>/dev/null || git merge --abort 2>/dev/null || true
+    git merge --abort 2>/dev/null || true
   fi
 done
 
@@ -322,120 +322,13 @@ union-merger script and the procedural rationale." >/dev/null
   fi
 fi
 
-# Emit post_merge_advance.sh in the worktree. After the consolidation
-# PR lands on origin/main, the operator runs this script to advance
-# each source claude/<task-id> branch to its cherry-picked commit.
-# That makes the source branch tip an ancestor of main, so GitHub
-# shows it as "merged" instead of "1 commit ahead" (the latter is
-# the visible artifact of cherry-pick creating new SHAs).
-echo
-echo "==> Emitting post_merge_advance.sh"
-ADVANCE_SCRIPT="$WT_ABS/post_merge_advance.sh"
-REPO_ABS="$(cd "$REPO" && pwd)"
-{
-  cat <<EOSHEAD
-#!/bin/bash
-# Auto-generated by merge_branches.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ).
-#
-# AFTER the consolidation PR ($BRANCH_NAME) is merged into
-# origin/main, run this script to advance each source claude/* branch
-# tip to its cherry-picked commit. The branches will then sit on
-# main and GitHub will show them as "merged" rather than the
-# perpetual "1 commit ahead" that cherry-pick's SHA-rewrite causes.
-#
-# Usage:
-#   bash post_merge_advance.sh             # dry-run (default; shows what would happen)
-#   bash post_merge_advance.sh --apply     # actually force-push each branch
-#
-# Safety:
-#   * Aborts if any cherry-picked SHA is not yet on origin/main
-#     (i.e. the consolidation PR hasn't merged yet).
-#   * Uses --force-with-lease=<branch>:<original_sha> so a source
-#     branch that was updated between cherry-pick time and now
-#     (e.g. the runner re-dispatched the task) won't be silently
-#     clobbered — the push fails and the operator can investigate.
-#   * Skips any branch whose origin tip has already moved past the
-#     recorded original SHA (would be lossy without manual review).
-#
-# Exit codes:
-#   0  applied (or dry-ran) all branches successfully
-#   1  one or more branches not yet on main (PR not merged?)
-#   2  one or more pushes rejected (branches moved since cherry-pick;
-#      operator must inspect)
-set -u
-APPLY=0
-[[ "\${1:-}" == "--apply" ]] && APPLY=1
-cd "$REPO_ABS"
-
-git fetch origin --quiet
-NOT_ON_MAIN=0
-REJECTED=0
-ADVANCED=0
-SKIPPED=0
-
-EOSHEAD
-  for i in "${!CHERRY_BRANCH[@]}"; do
-    short="${CHERRY_BRANCH[$i]}"
-    new="${CHERRY_NEW_SHA[$i]}"
-    orig="${CHERRY_ORIG_SHA[$i]}"
-    cat <<EOENTRY
-# --- $short ---
-NEW='$new'
-ORIG='$orig'
-BR='$short'
-echo "=== \$BR ==="
-if ! git merge-base --is-ancestor "\$NEW" origin/main 2>/dev/null; then
-  echo "  SKIP: cherry-picked commit \$NEW is not on origin/main yet."
-  echo "        (consolidation PR not merged, or refs out of date — try git fetch)"
-  NOT_ON_MAIN=\$((NOT_ON_MAIN+1))
-elif (( APPLY )); then
-  if git push --force-with-lease=\$BR:\$ORIG origin "\$NEW:refs/heads/\$BR" 2>&1 | sed 's/^/  /'; then
-    ADVANCED=\$((ADVANCED+1))
-  else
-    echo "  REJECTED: source branch moved since cherry-pick. Inspect manually."
-    REJECTED=\$((REJECTED+1))
-  fi
-else
-  if [[ \$(git ls-remote origin "refs/heads/\$BR" | cut -f1) != "\$ORIG" ]]; then
-    echo "  WARN: source branch moved since cherry-pick — push would be rejected."
-    echo "        current remote tip: \$(git ls-remote origin "refs/heads/\$BR" | cut -f1)"
-    echo "        expected original:  \$ORIG"
-    SKIPPED=\$((SKIPPED+1))
-  else
-    echo "  DRY-RUN: would push --force-with-lease=\$BR:\$ORIG origin \$NEW:refs/heads/\$BR"
-  fi
-fi
-
-EOENTRY
-  done
-  cat <<'EOSTAIL'
-
-echo
-echo "=== Summary ==="
-echo "  advanced:    $ADVANCED"
-echo "  rejected:    $REJECTED   (source branch moved since cherry-pick; manual review)"
-echo "  skipped:     $SKIPPED    (dry-run only; would have been rejected)"
-echo "  not-on-main: $NOT_ON_MAIN"
-if (( ! APPLY )); then
-  echo
-  echo "(dry-run — re-run with --apply to actually advance the branches.)"
-fi
-if (( NOT_ON_MAIN > 0 )); then exit 1; fi
-if (( REJECTED > 0 )); then exit 2; fi
-exit 0
-EOSTAIL
-} > "$ADVANCE_SCRIPT"
-chmod +x "$ADVANCE_SCRIPT"
-echo "    wrote $ADVANCE_SCRIPT (${#CHERRY_BRANCH[@]} branch mappings)"
-
-# Verify no per-branch contributions were lost. NB: this runs AFTER
-# post_merge_advance.sh is emitted because the verifier may legitimately
-# exit non-zero (brand-new section header lost; see SAPS_II in the
-# 2026-05-20 consolidation). With `set -e` active, a non-zero verifier
-# would abort the script before the advance script could be written —
-# but the SHA mapping doesn't depend on verifier success, and the
-# operator typically wants the advance script available even when the
-# union-file needs hand-touching first.
+# Verify no per-branch contributions were lost. The verifier may
+# legitimately exit non-zero (e.g. a brand-new section header the
+# union-merger does not relocate; see SAPS_II in the 2026-05-20
+# consolidation). With `set -e` active a non-zero exit would abort the
+# whole run, so we tolerate it here: a failed verdict is surfaced as a
+# WARNING for the operator to reconcile covariate-columns.md by hand
+# before opening the PR, rather than killing the pipeline outright.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
 verify_args=(
@@ -448,7 +341,11 @@ verify_args=(
 for er in "${EXTRA_REFS[@]:-}"; do
   [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
 done
-"$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"
+if ! "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"; then
+  echo "WARNING: verifier reported missing contributions in $UNION_FILE."
+  echo "         Reconcile by hand before opening the PR (the union-merger does"
+  echo "         not relocate brand-new section headers)."
+fi
 
 # devtools::check pre-push gate.
 if (( ! SKIP_CHECK )); then
@@ -541,15 +438,13 @@ parsing each branch's diff and unioning per-model annotations.
 
 ### Per-task tracking after this PR merges
 
-The cherry-pick strategy creates new commit SHAs on this branch, so
-each source \`claude/<task-id>\` branch's original tip never becomes
-an ancestor of main and GitHub will show every consolidated branch
-as "1 commit ahead" indefinitely. To restore per-task tracking,
-run \`post_merge_advance.sh\` from the worktree AFTER merging this
-PR — it force-advances each source branch tip to its cherry-picked
-commit on main, so GitHub then displays the branch as "merged".
-\`bash post_merge_advance.sh\` is a dry-run; add \`--apply\` to
-actually push.
+Each source \`claude/<task-id>\` branch was folded in with a real
+\`git merge\`, so its tip is a true ancestor of this branch. Once
+this PR lands on main, every consolidated branch is reported as
+merged by \`git branch --merged origin/main\` and GitHub marks each
+as "Merged" automatically — no force-advance step required. The
+source branches can then be deleted at the operator's discretion
+(\`git push --delete origin claude/<task-id>\`).
 
 ## Test plan
 
@@ -568,6 +463,6 @@ echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
 echo
 echo "Worktree left at: $WT_ABS"
 echo
-echo "After the PR merges, restore per-task tracking with:"
-echo "  bash $WT_ABS/post_merge_advance.sh              # dry-run"
-echo "  bash $WT_ABS/post_merge_advance.sh --apply      # force-push each branch"
+echo "Source branches were folded in with real merges, so after this PR"
+echo "lands on main they show as \"Merged\" automatically (git branch"
+echo "--merged origin/main lists them). No post-merge advance step needed."
