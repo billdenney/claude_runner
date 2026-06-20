@@ -55,7 +55,17 @@ override per repo.
 1. **Pre-flight survey.** Identify which `origin/claude/*` branches
    have unmerged commits (i.e. `git rev-list --count origin/main..<br>`
    is non-zero). Print the list, file counts, and commit subjects so
-   the operator can confirm scope before merging.
+   the operator can confirm scope before merging. Because this skill
+   folds branches in with *real merges* (step 4), a branch from a
+   previous consolidation round is a true ancestor of main and so
+   reports zero unmerged commits — the survey is authoritative on its
+   own, with no content-equivalence guesswork needed to tell whether a
+   branch is already in. (Historical note: branches folded in via the
+   pre-2026-06 *cherry-pick* flow are NOT ancestors and will still show
+   as "unmerged" here even though their content is on main; for a
+   one-off transition pass over such branches, fall back to a
+   path-based check — "does this branch add a model `.R` file whose
+   path is absent on main?".)
 
 2. **Operator confirms scope.** Present the list via
    `AskUserQuestion` with options for: all branches, the new-model
@@ -182,16 +192,14 @@ override per repo.
     Skipping this gate (`--skip-vignettes`) is allowed only for
     iteration. NEVER push without it green on the final pass.
 
-9. **Emit `post_merge_advance.sh`** in the worktree root. This is a
-   small, idempotent script the operator runs AFTER the
-   consolidation PR is merged. It force-advances each source
-   `claude/<task-id>` branch's tip to its cherry-picked commit on
-   main, so per-task tracking is preserved — GitHub then shows each
-   source branch as "merged" instead of the perpetual "1 commit
-   ahead" that cherry-pick's SHA rewrite causes. Safety: uses
-   `--force-with-lease=<branch>:<original_sha>` so a source branch
-   that's been updated since cherry-pick (e.g. the runner
-   re-dispatched the task) is not silently clobbered.
+9. **Per-task tracking is automatic.** Because step 4 used real
+   merges, each source `claude/<task-id>` branch tip is already an
+   ancestor of the consolidation branch. Once the consolidation PR
+   lands on main, `git branch --merged origin/main` lists every
+   folded branch and GitHub marks each as "Merged" — no force-advance
+   step, no `post_merge_advance.sh`, no SHA bookkeeping. The operator
+   can then delete the source branches at leisure
+   (`git push --delete origin claude/<task-id>`).
 
 10. **Push the branch** to origin:
 
@@ -203,8 +211,7 @@ override per repo.
     manually. The body lists which branches were folded in,
     categorised as new-model additions / vignette ASCII fixes /
     follow-up edits, plus a procedural note on the `-X theirs`
-    caveat for covariate-columns.md AND instructions for running
-    `post_merge_advance.sh` after the PR merges.
+    caveat for covariate-columns.md.
 
 ## Things this skill does NOT do
 
@@ -251,37 +258,44 @@ local parallel pass instead of dribbling them through the CI
 sequential build one at a time. NEVER push a consolidation branch
 without the green gate.
 
-### Per-task tracking: cherry-pick + post-process
+### Per-task tracking: real merges make it free
 
-The skill uses `git cherry-pick -X theirs` rather than `git merge -X
-theirs` because the latter rolls back earlier-merged branches' work
-when source branches are based on stale main (the common case for
-long-lived `claude/*` task branches). Cherry-pick applies only the
-commit delta, but each cherry-picked commit gets a NEW SHA — so
-source branches never become true ancestors of main, and GitHub
-shows them as "1 commit ahead" indefinitely after the consolidation
-PR merges.
+The skill folds each source branch in with a real
+`git merge --no-ff -X theirs` (one merge commit per branch), NOT
+cherry-pick. This is the design decision that makes per-task tracking
+*free*: a real merge makes each source branch's tip a true ANCESTOR
+of the consolidation branch, so the moment the consolidation PR lands
+on main, every folded branch is reported as merged by
+`git branch --merged origin/main` and shown as "Merged" on GitHub.
+There is no SHA rewrite, no `post_merge_advance.sh`, and — crucially —
+no content-equivalence guesswork to decide whether a branch is already
+in. "Is this branch merged?" is a one-line ancestor query.
 
-`post_merge_advance.sh` resolves this. Step 9 emits the script
-inside the worktree, recording a mapping of
-`(source_branch, cherry_picked_sha, original_source_sha)` per
-cherry-picked branch. After the consolidation PR merges into main:
+This replaces the older cherry-pick flow, which gave every folded
+branch a NEW commit SHA. Cherry-picked branches never became
+ancestors of main, so GitHub showed them as "1 commit ahead"
+indefinitely and an extra `post_merge_advance.sh` force-advance step
+(plus per-branch SHA bookkeeping) was needed to fake the ancestry.
+That whole apparatus is gone.
 
-```bash
-cd <repo>/.worktrees/<branch-name>
-bash post_merge_advance.sh             # dry-run; shows what would happen
-bash post_merge_advance.sh --apply     # force-push each source branch
-```
+The historical objection to merge — "merging a stale-based branch
+rolls back main-side updates" — does not survive scrutiny: the only
+files a stale branch can roll back are the shared bookkeeping files,
+and every one of those is rebuilt or repaired downstream (registry
+blobs + `man/` + navbar regenerated in step 5; covariate-columns.md
+union-merged in step 6). New model `.R` / vignette `.Rmd` files live
+at unique paths, so a 3-way merge keeps every prior branch's
+additions intact. `-X theirs` only changes how *conflicting* hunks
+resolve, which is incidental for exactly those regenerated /
+union-merged files.
 
-The `--force-with-lease=<branch>:<original_sha>` form means a source
-branch that was UPDATED since cherry-pick time (e.g. the runner
-re-dispatched the same task and pushed new commits) will be
-rejected rather than silently clobbered. Operator then triages
-those individually.
-
-If the operator forgets to run the advance script, nothing breaks —
-the source branches just stay "1 commit ahead" and can be deleted
-manually if desired. The script is optional and idempotent.
+One-off transition caveat: branches that were folded in by the OLD
+cherry-pick flow are still not ancestors of main, so a consolidation
+pass that needs to re-examine them cannot rely on the ancestor check
+alone — use a path-based content check ("does the branch add a model
+`.R` at a path absent on main?") for that single transition pass.
+Every branch merged by *this* (merge-based) skill is trackable by
+ancestry from then on.
 
 ### Why `-X theirs` for binaries is safe
 

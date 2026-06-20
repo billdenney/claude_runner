@@ -28,14 +28,36 @@ from rich.prompt import Confirm
 app = typer.Typer(no_args_is_help=False, invoke_without_command=False)
 
 
-SKILL_NAMES = (
+OPERATOR_SKILL_NAMES = (
     "runner-status",
     "runner-usage",
     "runner-add-task",
     "runner-answer-sidecar",
+    "runner-merge-claude-branches",
 )
-"""The four skills shipped with the package. Listed explicitly so we
-fail loudly if a directory is missing rather than silently skipping."""
+"""Operator-facing skills — invoked by the human running the queue
+from an interactive ``claude`` session (status, usage, enqueue,
+answer sidecars, consolidate branches)."""
+
+AGENT_SKILL_NAMES = (
+    "agent-stop-and-ask",
+    "agent-bash-patterns",
+)
+"""Worker-facing skills — consulted by the *dispatched* agent, not the
+operator. Dispatched workers run ``claude --print`` as the same Linux
+user, so they discover skills from the same ``~/.claude/skills/`` the
+operator skills land in (there is no per-worktree skill injection — a
+worker's prompt is just ``task.prompt``). These must therefore be
+installed alongside the operator skills for a worker to load them.
+Each guards itself to no-op in interactive use (``agent-stop-and-ask``
+defers to ``AskUserQuestion`` when ``$TASK_ID`` is unset;
+``agent-bash-patterns`` is simply good universal advice)."""
+
+SKILL_NAMES = OPERATOR_SKILL_NAMES + AGENT_SKILL_NAMES
+"""All skills shipped with the package. Listed explicitly so we fail
+loudly if a directory is missing rather than silently skipping.
+``install-skills``, ``uninstall``, ``list``, and the doctor's
+``skills_installed`` check all iterate this union."""
 
 
 def _skills_target_dir() -> Path:
@@ -120,7 +142,12 @@ def install_skills(
         help="Replace existing skill directories of the same name.",
     ),
 ) -> None:
-    """Install the four task-runner skills into ``~/.claude/skills/``.
+    """Install the task-runner skills into ``~/.claude/skills/``.
+
+    Installs both the operator-facing skills (``runner-*``) and the
+    worker-facing agent skills (``agent-*``) — dispatched workers read
+    the same ``~/.claude/skills/`` as the operator, so the agent skills
+    must be installed here for a worker to load them.
 
     Symlinks by default (so edits to the source tree are picked up
     automatically); use ``--copy`` to materialize independent copies.
@@ -173,9 +200,9 @@ def uninstall_skills(
     *,
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the y/N confirmation."),
 ) -> None:
-    """Remove the four skills from ``~/.claude/skills/``.
+    """Remove the packaged skills from ``~/.claude/skills/``.
 
-    Only removes the four packaged names; never touches user skills
+    Only removes the packaged names; never touches user skills
     that share a directory.
     """
     console = Console()

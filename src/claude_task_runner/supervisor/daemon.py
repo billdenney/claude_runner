@@ -774,21 +774,21 @@ def start_daemon(
                                         "sigtermed": result.sigtermed,
                                     },
                                 )
-                                # An antipattern kill rides on the same
-                                # ReapResult but carries an extra event
-                                # so operators can grep for the specific
-                                # cause and correlate with the matched
-                                # bash argv (see
-                                # ``BASH_POLL_ANTIPATTERN_EVENT``).
-                                if result.antipattern_bash_pid is not None:
+                                # A stuck-sleep-loop kill rides on the
+                                # same ReapResult but carries an extra
+                                # event so operators can grep for the
+                                # specific cause and correlate with the
+                                # matched bash argv (see
+                                # ``STUCK_SLEEP_LOOP_EVENT``).
+                                if result.stuck_loop_bash_pid is not None:
                                     event_callback(
-                                        reconcile_silent_mod.BASH_POLL_ANTIPATTERN_EVENT,
+                                        reconcile_silent_mod.STUCK_SLEEP_LOOP_EVENT,
                                         {
                                             "task_id": result.task_id,
                                             "claude_pid": result.pid,
-                                            "bash_pid": result.antipattern_bash_pid,
-                                            "matched_argv": result.antipattern_matched_argv,
-                                            "agent_silence_s": result.silence_s,
+                                            "bash_pid": result.stuck_loop_bash_pid,
+                                            "matched_argv": result.stuck_loop_matched_argv,
+                                            "heartbeat_staleness_s": result.silence_s,
                                             "sigtermed": result.sigtermed,
                                         },
                                     )
