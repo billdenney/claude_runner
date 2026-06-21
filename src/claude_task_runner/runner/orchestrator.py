@@ -31,6 +31,7 @@ import contextlib
 import logging
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -231,7 +232,7 @@ def tick_dispatch(
     adopt_on = bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False))
 
     completed_ids = _completed_task_ids(queue_dir)
-    candidates = _eligible_candidates(queue_dir, in_flight_slots, completed_ids)
+    candidates = _eligible_candidates(queue_dir, in_flight_slots, completed_ids, now=clock.now())
     if not candidates:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -532,7 +533,12 @@ def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: dict[str, DispatchSlot],
     completed_ids: set[str],
+    now: datetime | None = None,
 ) -> list[Task]:
+    # ``now`` gates the re-check cooldown for `deferred` tasks; the
+    # production caller (tick_dispatch) always passes ``clock.now()``.
+    # When omitted (older unit tests that exercise non-deferred paths),
+    # a deferred task simply isn't cooldown-gated.
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots.keys())
 
@@ -581,13 +587,32 @@ def _eligible_candidates(
                     # A request is still unanswered — keep the task
                     # ineligible until the operator responds.
                     continue
-                if state.status != "awaiting_sidecar":
+                if state.status == "deferred":
+                    # A task parked by a pre-dispatch hook deferral (exit
+                    # 1 — e.g. an input awaiting operator re-acquisition
+                    # or a pending trim) becomes dispatchable again once
+                    # its re-check cooldown elapses. Re-dispatch re-runs
+                    # the hook: if the input is ready it proceeds,
+                    # otherwise the dispatcher re-parks it with a fresh
+                    # cooldown. The cooldown is what keeps a still-blocked
+                    # task from being re-picked every tick — the original
+                    # reason exit-1 deferrals were (wrongly) force-counted
+                    # toward the circuit breaker.
+                    if (
+                        now is not None
+                        and state.next_eligible_at is not None
+                        and now < state.next_eligible_at
+                    ):
+                        continue
+                    # cooldown elapsed (or unset) → fall through, re-attempt.
+                elif state.status != "awaiting_sidecar":
                     # Any other non-dispatchable status (running,
                     # completed, failed_circuit_breaker, ...) stays
                     # skipped.
                     continue
-                # awaiting_sidecar with every request answered: fall
-                # through to the depends_on check and add to out.
+                # awaiting_sidecar with every request answered, OR a
+                # deferred task past its cooldown: fall through to the
+                # depends_on check and add to out.
 
         unmet = [d for d in task.depends_on if d not in completed_ids]
         if unmet:

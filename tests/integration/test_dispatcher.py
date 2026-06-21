@@ -408,6 +408,11 @@ class TestPreDispatchHook:
         fresh_plan: SpawnPlan,
         reset_shim_env: None,
     ) -> None:
+        # A HARD hook failure (non-1 non-zero exit) aborts dispatch and is
+        # recorded as a failure. NOTE: must NOT use `false` here — `false`
+        # exits 1, which is now the hook's documented *deferral* code
+        # (parked in `deferred`, see TestPreDispatchHookExitCodeRouting).
+        # Use exit 2 to exercise the genuine hard-failure path.
         outcome = dispatch(
             task=task,
             state=TaskState(task_id=task.id),
@@ -416,7 +421,7 @@ class TestPreDispatchHook:
             clock=RealClock(),
             settings_caps=_caps(),
             settings_session=_session(),
-            settings_hooks=_hooks(pre="false"),
+            settings_hooks=_hooks(pre="shell:exit 2"),
             claude_executable=str(SHIM_PATH),
         )
         assert outcome.new_state.status == "failed"
@@ -771,3 +776,66 @@ class TestCapKillSigtermIgnoringSubprocess:
         persisted = load_state(state_path_for(queue_dir, task.id))
         assert persisted.status == "failed"
         assert persisted.pid is None
+
+
+class TestPreDispatchHookExitCodeRouting:
+    """The dispatcher honors the pre-dispatch hook's documented exit-code
+    contract (ADR-0013 / the popPK queue's ``setup_worktree.sh``):
+
+    * ``exit 1``     -> transient DEFER: park in ``deferred`` with a
+                        re-check cooldown, never counted toward the
+                        circuit breaker.
+    * other non-zero -> HARD failure: recorded as a failure run, eligible
+                        for the breaker like any other dispatch failure.
+
+    Regression guard for 5 live tasks (June 2026) that died as
+    ``failed_circuit_breaker`` while merely awaiting paper re-acquisition.
+    """
+
+    def test_exit1_hook_parks_task_deferred(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+    ) -> None:
+        outcome = dispatch(
+            task=task,
+            state=TaskState(task_id=task.id),
+            plan=fresh_plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_session=_session(),
+            settings_hooks=_hooks(pre="shell:exit 1"),
+            claude_executable=str(SHIM_PATH),
+        )
+        assert outcome.new_state.status == "deferred"
+        assert outcome.new_state.runs == []  # not counted toward the breaker
+        assert outcome.new_state.attempts == 0  # a defer is not an attempt
+        assert outcome.new_state.deferral_count == 1
+        assert outcome.new_state.next_eligible_at is not None
+        # Persisted to disk as deferred.
+        persisted = load_state(state_path_for(queue_dir, task.id))
+        assert persisted.status == "deferred"
+
+    def test_exit2_hook_is_hard_failure(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+    ) -> None:
+        outcome = dispatch(
+            task=task,
+            state=TaskState(task_id=task.id),
+            plan=fresh_plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_session=_session(),
+            settings_hooks=_hooks(pre="shell:exit 2"),
+            claude_executable=str(SHIM_PATH),
+        )
+        assert outcome.new_state.status == "failed"
+        assert len(outcome.new_state.runs) == 1
+        assert outcome.new_state.runs[0].stop_reason == "pre_dispatch_hook_failed"
+        assert outcome.new_state.attempts == 1

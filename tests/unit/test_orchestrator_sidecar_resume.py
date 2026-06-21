@@ -310,3 +310,64 @@ def test_other_terminal_statuses_still_skipped(queue_dir: Path) -> None:
             )
         else:
             assert eligible == [], f"expected nothing eligible for status={status!r}"
+
+
+# --- `deferred` cooldown gating in `_eligible_candidates` ----------------
+#
+# A task parked by a pre-dispatch exit-1 deferral (input awaiting
+# re-acquisition / trim) is re-dispatchable only once its
+# `next_eligible_at` cooldown elapses. This is what lets a deferral stay
+# OUT of the circuit breaker without being re-picked every tick — the
+# starvation that originally forced hook failures to count toward it.
+
+_NOW = dt.datetime(2026, 6, 21, 12, 0, 0, tzinfo=dt.UTC)
+
+
+def _make_deferred_state(task_id: str, next_eligible_at: dt.datetime | None) -> TaskState:
+    return TaskState(
+        task_id=task_id,
+        status="deferred",
+        attempts=0,
+        deferral_count=1,
+        deferred_reason="DEFERRED: input awaits re-acquisition: /q/papers/PMID_X/PMID_X.pdf",
+        next_eligible_at=next_eligible_at,
+    )
+
+
+def test_deferred_before_cooldown_is_skipped(queue_dir: Path) -> None:
+    """Parked deferral whose cooldown has NOT elapsed: not re-dispatched."""
+    task = _make_task("t-deferred-future")
+    _write_task_yaml(queue_dir, task)
+    write_state_atomic(
+        _make_deferred_state(task.id, _NOW + dt.timedelta(minutes=10)),
+        state_path_for(queue_dir, task.id),
+    )
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert task.id not in {t.id for t in eligible}
+
+
+def test_deferred_after_cooldown_is_eligible(queue_dir: Path) -> None:
+    """Once the cooldown elapses, the parked task is re-dispatchable — the
+    re-dispatch re-runs the hook (which proceeds if the input is ready, or
+    re-parks with a fresh cooldown)."""
+    task = _make_task("t-deferred-past")
+    _write_task_yaml(queue_dir, task)
+    write_state_atomic(
+        _make_deferred_state(task.id, _NOW - dt.timedelta(minutes=1)),
+        state_path_for(queue_dir, task.id),
+    )
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert task.id in {t.id for t in eligible}
+
+
+def test_deferred_without_next_eligible_at_is_eligible(queue_dir: Path) -> None:
+    """A deferred state lacking a cooldown timestamp (legacy/edge) falls
+    through as eligible so it isn't stranded."""
+    task = _make_task("t-deferred-none")
+    _write_task_yaml(queue_dir, task)
+    write_state_atomic(
+        _make_deferred_state(task.id, None),
+        state_path_for(queue_dir, task.id),
+    )
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert task.id in {t.id for t in eligible}

@@ -102,6 +102,14 @@ class FailureClassifierSettings(_StrictModel):
     operator_patterns: list[str]
     task_patterns: list[str]
     failure_circuit_breaker_threshold: int = Field(ge=1)
+    deferral_recheck_cooldown_s: float = Field(default=900.0, ge=0)
+    """Seconds a task parked in ``deferred`` (pre-dispatch hook exit
+    code 1 — its documented transient-defer contract) waits before the
+    orchestrator re-attempts dispatch. Deferrals are NOT failures and do
+    not trip the circuit breaker; this cooldown only bounds how often a
+    still-blocked task re-runs the hook, so a long wait (e.g. a paper
+    awaiting operator re-acquisition) re-checks periodically instead of
+    being re-picked every tick and starving ready work. Default 15 min."""
 
 
 class TaskCapsSettings(_StrictModel):

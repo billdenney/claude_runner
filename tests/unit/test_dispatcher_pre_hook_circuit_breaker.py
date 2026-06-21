@@ -12,6 +12,17 @@ the candidate list, starving the rest of the queue every tick.
 The fix routes hook failures through ``_finalize_state`` so the same
 trailing-failures + classifier-threshold logic that the regular run
 path uses applies here too.
+
+NOTE (deferral split): the dispatcher now honors the hook's documented
+exit-code contract — ``exit 1`` is a TRANSIENT defer (input awaiting
+re-acquisition/trim) and is routed to ``_record_pre_dispatch_deferral``
+(parked in ``deferred``, never counted toward the breaker); only
+*other* non-zero exits and timeouts reach ``_record_pre_dispatch_failure``
+and the breaker. These tests call ``_record_pre_dispatch_failure``
+directly, so they still exercise its mechanical breaker behaviour (now
+reached only for HARD failures). The deferral path is covered in
+``test_dispatcher_pre_hook_deferral.py`` and the exit-code routing in
+``tests/integration/test_dispatcher.py``.
 """
 
 from __future__ import annotations

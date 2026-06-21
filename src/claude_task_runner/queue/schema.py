@@ -32,13 +32,22 @@ TaskStatus = Literal[
     "pending",
     "running",
     "awaiting_sidecar",
+    "deferred",
     "possibly_hung",
     "completed",
     "failed",
     "failed_circuit_breaker",
     "weekly_paused",
 ]
-"""Lifecycle states a task can occupy in its state YAML."""
+"""Lifecycle states a task can occupy in its state YAML.
+
+``deferred`` is a *parked* state, distinct from ``failed``: the
+pre-dispatch hook exited 1 (its documented "transient defer" contract —
+e.g. an input paper awaiting operator re-acquisition or a pending trim),
+which is NOT a task failure and must never trip the circuit breaker. The
+orchestrator skips a ``deferred`` task until ``next_eligible_at``, then
+re-dispatches (re-running the hook). Contrast ``failed`` (a real
+attempt that errored, counted toward the breaker)."""
 
 Effort = Annotated[str, Field(min_length=1)]
 """Free-form string; validated against the per-model accepted set in
@@ -264,6 +273,23 @@ class TaskState(_StrictBase):
     is disabled (the pipe-backed path records no log file)."""
     stop_reason: str | None = None
     error: str | None = None
+    deferral_count: int = Field(ge=0, default=0)
+    """Consecutive pre-dispatch deferrals (hook exit code 1) since the
+    task last actually dispatched. Deferrals are NOT failures and are
+    deliberately kept out of ``runs`` so they never reach the
+    circuit-breaker counter. Reset to 0 once the task dispatches. ``0``
+    on legacy state YAMLs that pre-date the field."""
+    next_eligible_at: datetime | None = None
+    """When ``status == "deferred"``, the earliest time the orchestrator
+    will re-attempt dispatch (and so re-run the pre-dispatch hook). Until
+    then the parked task is skipped, so a still-deferring hook re-checks
+    on a cooldown instead of being re-picked at every tick. ``None`` when
+    not parked / on legacy state YAMLs."""
+    deferred_reason: str | None = None
+    """Last pre-dispatch deferral message (hook stderr) while a task is
+    parked in ``deferred`` — operator-visible context for *why* it's
+    waiting (which input awaits re-acquisition/trim). ``None`` when not
+    parked."""
     runs: list[RunRecord] = Field(default_factory=list)
 
     def session_host_account(self) -> str | None:
