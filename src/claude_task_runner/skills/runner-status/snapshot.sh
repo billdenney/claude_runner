@@ -81,77 +81,6 @@ else
 fi
 echo ""
 
-# ----- State-file & queue counts -----
-STATE_DIR="$QUEUE/.claude_task_runner/state"
-if [[ -d "$STATE_DIR" ]]; then
-  STATE_COUNT="$(find "$STATE_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l)"
-else
-  STATE_COUNT=0
-fi
-
-TODO_DIR="$QUEUE/todo"
-if [[ -d "$TODO_DIR" ]]; then
-  TODO_COUNT="$(find "$TODO_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l)"
-else
-  TODO_COUNT=0
-fi
-
-# Status breakdown across state YAMLs (completed / failed / running / etc.)
-if [[ -d "$STATE_DIR" ]]; then
-python3 - "$STATE_DIR" <<'PY'
-import os, sys, glob, re
-from collections import Counter
-state_dir = sys.argv[1]
-counts = Counter()
-status_re = re.compile(r"^status:\s*(\S+)\s*$", re.M)
-for p in glob.glob(os.path.join(state_dir, "*.yaml")):
-    try:
-        with open(p) as f:
-            text = f.read(2000)
-        m = status_re.search(text)
-        if m:
-            counts[m.group(1)] += 1
-    except Exception:
-        counts["read_error"] += 1
-print("**Queue counts**")
-print()
-print("| field | value |")
-print("|---|---|")
-for k in ("completed","failed","running","awaiting_sidecar","possibly_hung","failed_circuit_breaker"):
-    print(f"| state.{k} | {counts.get(k,0)} |")
-total_state = sum(counts.values())
-print(f"| state files (total) | {total_state} |")
-PY
-fi
-echo "| todo/*.yaml | $TODO_COUNT |"
-echo ""
-
-# ----- Open sidecars -----
-if command -v claude-task-runner > /dev/null 2>&1; then
-  SC_FILE="$(mktemp)"
-  trap 'rm -f "$SC_FILE"' EXIT
-  claude-task-runner sidecar list --queue "$QUEUE" --json > "$SC_FILE" 2>/dev/null || echo '{"sidecars":[]}' > "$SC_FILE"
-  SC_FILE="$SC_FILE" python3 - <<'PY'
-import json
-import os
-with open(os.environ["SC_FILE"]) as f:
-    d = json.load(f)
-n = len(d.get("sidecars", []))
-print(f"**Open sidecars**: {n}")
-print()
-if n == 0:
-    print("(none)")
-else:
-    print("| task_id | sequence |")
-    print("|---|---|")
-    for s in d["sidecars"]:
-        print(f"| {s['task_id']} | {s.get('sequence','?')} |")
-PY
-else
-  echo "**Open sidecars**: claude-task-runner not on PATH"
-fi
-echo ""
-
 # ----- Per-account state -----
 #
 # Source the v3 supervisor.json's `accounts` map (one entry per
@@ -239,3 +168,75 @@ if drift_rows:
         print(f"- `{name}`: {safe}")
 PY
 fi
+echo ""
+
+# ----- State-file & queue counts -----
+STATE_DIR="$QUEUE/.claude_task_runner/state"
+if [[ -d "$STATE_DIR" ]]; then
+  STATE_COUNT="$(find "$STATE_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l)"
+else
+  STATE_COUNT=0
+fi
+
+TODO_DIR="$QUEUE/todo"
+if [[ -d "$TODO_DIR" ]]; then
+  TODO_COUNT="$(find "$TODO_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | wc -l)"
+else
+  TODO_COUNT=0
+fi
+
+# Status breakdown across state YAMLs (completed / failed / running / etc.)
+if [[ -d "$STATE_DIR" ]]; then
+python3 - "$STATE_DIR" <<'PY'
+import os, sys, glob, re
+from collections import Counter
+state_dir = sys.argv[1]
+counts = Counter()
+status_re = re.compile(r"^status:\s*(\S+)\s*$", re.M)
+for p in glob.glob(os.path.join(state_dir, "*.yaml")):
+    try:
+        with open(p) as f:
+            text = f.read(2000)
+        m = status_re.search(text)
+        if m:
+            counts[m.group(1)] += 1
+    except Exception:
+        counts["read_error"] += 1
+print("**Queue counts**")
+print()
+print("| field | value |")
+print("|---|---|")
+for k in ("completed","failed","running","awaiting_sidecar","possibly_hung","failed_circuit_breaker"):
+    print(f"| state.{k} | {counts.get(k,0)} |")
+total_state = sum(counts.values())
+print(f"| state files (total) | {total_state} |")
+PY
+fi
+echo "| todo/*.yaml | $TODO_COUNT |"
+echo ""
+
+# ----- Open sidecars -----
+if command -v claude-task-runner > /dev/null 2>&1; then
+  SC_FILE="$(mktemp)"
+  trap 'rm -f "$SC_FILE"' EXIT
+  claude-task-runner sidecar list --queue "$QUEUE" --json > "$SC_FILE" 2>/dev/null || echo '{"sidecars":[]}' > "$SC_FILE"
+  SC_FILE="$SC_FILE" python3 - <<'PY'
+import json
+import os
+with open(os.environ["SC_FILE"]) as f:
+    d = json.load(f)
+n = len(d.get("sidecars", []))
+print(f"**Open sidecars**: {n}")
+print()
+if n == 0:
+    print("(none)")
+else:
+    print("| task_id | sequence |")
+    print("|---|---|")
+    for s in d["sidecars"]:
+        print(f"| {s['task_id']} | {s.get('sequence','?')} |")
+PY
+else
+  echo "**Open sidecars**: claude-task-runner not on PATH"
+fi
+echo ""
