@@ -50,7 +50,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import IO
 
@@ -1114,7 +1114,35 @@ def dispatch(
         cwd=pre_hook_cwd,
     )
     if hook_result is not None and (hook_result.timed_out or hook_result.exit_code != 0):
-        # Pre-dispatch hook failure aborts dispatch with an error RunRecord.
+        # Honor the pre-dispatch hook's documented exit-code contract
+        # (ADR-0013 / queue setup_worktree.sh):
+        #   exit 1         -> TRANSIENT DEFER (input awaiting operator
+        #                     re-acquisition or a pending trim). NOT a
+        #                     task failure: park in `deferred` with a
+        #                     re-check cooldown; never count toward the
+        #                     circuit breaker.
+        #   other non-zero -> HARD failure (config/git bug); count toward
+        #                     the breaker so a permanently-broken hook
+        #                     stops being re-dispatched.
+        # A timeout is treated as a hard failure (the hook did not get to
+        # signal a clean deferral). Before this gate, every exit-1 defer
+        # was recorded as `pre_dispatch_hook_failed` and tripped the
+        # breaker after `failure_circuit_breaker_threshold` attempts —
+        # so a paper merely awaiting re-acquisition died as
+        # `failed_circuit_breaker` (observed live: 5 tasks, June 2026).
+        if not hook_result.timed_out and hook_result.exit_code == 1:
+            return _record_pre_dispatch_deferral(
+                task=task,
+                state=state,
+                plan=plan,
+                queue_dir=queue_dir,
+                hook_result=hook_result,
+                clock=clock,
+                persist_state=persist_state,
+                settings_failure_classifier=settings_failure_classifier,
+                account=account,
+            )
+        # Pre-dispatch hook hard failure aborts dispatch with an error RunRecord.
         return _record_pre_dispatch_failure(
             task=task,
             state=state,
@@ -1981,6 +2009,83 @@ def _finalize_state(
         }
     )
     return new_state, run
+
+
+def _record_pre_dispatch_deferral(
+    *,
+    task: Task,
+    state: TaskState,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    hook_result: hooks_mod.HookResult,
+    clock: Clock,
+    persist_state: bool,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
+    account: str | None = None,
+) -> DispatchOutcome:
+    """Park a task whose pre-dispatch hook exited 1 (its documented
+    transient-defer contract) in the ``deferred`` status WITHOUT counting
+    it as a failure.
+
+    Unlike :func:`_record_pre_dispatch_failure`, this deliberately does
+    NOT append a RunRecord to ``state.runs`` and does NOT bump
+    ``state.attempts``. The circuit-breaker counter
+    (:func:`_count_trailing_failures`) scans ``runs``, so keeping
+    deferrals out of ``runs`` is exactly what guarantees a
+    long-deferred task (e.g. a paper awaiting operator re-acquisition)
+    never trips the breaker no matter how many times it re-checks. The
+    deferral is instead recorded compactly on the state itself
+    (``deferral_count``, ``deferred_reason``, ``next_eligible_at``); the
+    returned ``run_record`` carries ``stop_reason="pre_dispatch_deferred"``
+    purely for the attempt log/stream.
+
+    ``next_eligible_at`` is set to ``now + deferral_recheck_cooldown_s``
+    so the orchestrator re-attempts (and so re-runs the hook) only after
+    the cooldown elapses — a still-blocked hook re-checks on a cadence
+    instead of being re-picked at every tick and starving ready work.
+    """
+    now = clock.now()
+    reason = "pre-dispatch hook deferred (exit 1)" + (
+        f": {hook_result.stderr.strip()}" if hook_result.stderr.strip() else ""
+    )
+    # For the attempt log only — NOT appended to state.runs (see docstring).
+    run = RunRecord(
+        attempt=state.attempts + 1,
+        started_at=now,
+        finished_at=now,
+        stop_reason="pre_dispatch_deferred",
+        error=reason,
+        usage=TokenUsage(),
+        cost_usd=0.0,
+        duration_s=0.0,
+        resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
+        account=account,
+    )
+    cooldown_s = (
+        settings_failure_classifier.deferral_recheck_cooldown_s
+        if settings_failure_classifier is not None
+        else 900.0
+    )
+    new_state = state.model_copy(
+        update={
+            "status": "deferred",
+            "deferral_count": state.deferral_count + 1,
+            "deferred_reason": reason,
+            "next_eligible_at": now + timedelta(seconds=cooldown_s),
+            "last_started_at": now,
+            "last_finished_at": now,
+            "stop_reason": "pre_dispatch_deferred",
+            "error": None,
+        }
+    )
+    if persist_state:
+        os.makedirs(state_path_for(queue_dir, task.id).parent, exist_ok=True)
+        write_state_atomic(new_state, state_path_for(queue_dir, task.id))
+    return DispatchOutcome(
+        run_record=run,
+        new_state=new_state,
+        summary=StreamSummary(),
+    )
 
 
 def _record_pre_dispatch_failure(

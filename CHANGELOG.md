@@ -26,6 +26,27 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Pre-dispatch hook `exit 1` deferrals no longer trip the circuit
+  breaker — new parked `deferred` status (ADR-0026).** The hook's
+  documented exit-code contract is `exit 1` = transient defer (an input
+  awaiting operator re-acquisition or a pending trim), other non-zero =
+  hard failure. The dispatcher ignored it and counted *every* non-zero
+  hook exit toward `failure_circuit_breaker_threshold`, so a paper merely
+  awaiting re-acquisition burned through the threshold and died as
+  `failed_circuit_breaker` (observed live June 2026: `zotero-009` awaiting
+  `PMID_22257150`, plus `zotero-015/074/081` and `frompeople-695` — their
+  PDFs arrived later but the tasks never re-dispatched). `exit 1` now
+  parks the task in a new `deferred` lifecycle status via
+  `_record_pre_dispatch_deferral`: deliberately kept out of `runs` (so it
+  never reaches the breaker counter) and out of the `attempts` count, and
+  re-checked only after `[failure_classifier].deferral_recheck_cooldown_s`
+  (default 15 min) instead of at every tick — preserving the
+  anti-starvation property that made hook failures count in the first
+  place. Other non-zero exits and hook timeouts remain hard failures and
+  still reach the breaker. Adds three backward-compatible `TaskState`
+  fields (`deferral_count`, `next_eligible_at`, `deferred_reason`);
+  legacy state YAMLs load unchanged.
+
 - **Worker-facing `agent-*` skills are now actually delivered.**
   `install-skills` shipped only the five operator `runner-*` skills;
   `agent-stop-and-ask` existed in the package but was in no install
