@@ -35,7 +35,7 @@ pip install -e '.[dev,ui]'
 ```sh
 # in your queue directory — write a minimal claude_runner.toml first
 # (see docs/first-time-setup.md for the template)
-claude-task-runner queue add  # or `add-batch <manifest.csv>`
+claude-task-runner queue add  # interactive; repeat per task
 claude-task-runner install    # auto-detects systemd vs cron, asks confirmation
 claude-task-runner supervisor start
 ```

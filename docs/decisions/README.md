@@ -31,6 +31,9 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0021 | Per-account long-lived OAuth token via `claude setup-token` | proposed | 2026-05-23 |
 | 0022 | `[dispatch_pct.*]` variant-C trace-following, replacing `[throttle.*]` | accepted | 2026-05-27 |
 | 0023 | `[queue].working_dir_template` for `queue add` | proposed | 2026-05-29 |
+| 0024 | Multi-account session affinity | proposed | 2026-05-29 |
+| 0025 | Restart-survivable workers (worker adoption) | accepted | 2026-06-13 |
+| 0026 | Honor the pre-dispatch hook's exit-1 deferral contract (`deferred` status) | proposed | 2026-06-21 |
 
 ## Template
 
@@ -61,5 +64,5 @@ What follows from this — positive, negative, neutral?
 How hard would it be to undo? (low / medium / high)
 ```
 
-Use `claude-task-runner adr new "<title>"` to scaffold a new ADR with the
-next number and template filled in.
+To add an ADR, copy the template above into the next-numbered
+`docs/decisions/NNNN-<slug>.md`, fill it in, and add a row to the index.

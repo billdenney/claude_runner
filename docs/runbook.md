@@ -37,7 +37,8 @@ sequence variant.
    crashes — verify in `watchdog.log` that exponential backoff is active.
 2. Read `supervisor.log` for the failing exception. Common causes:
    - Disk full → `usage_captures/` rotation hadn't run; clear old captures.
-   - Settings TOML invalid → `claude-task-runner config validate`.
+   - Settings TOML invalid → `claude-task-runner doctor` (loads the TOML
+     through the schema and reports the offending field).
    - Stale `global.lock` from a hard kill → check `~/.claude_task_runner/global.lock`,
      remove if no live process.
 3. Once root cause is fixed, manual restart: `claude-task-runner supervisor start`.
@@ -48,7 +49,7 @@ sequence variant.
 N hours old. EMA suggests it should have completed by now.
 
 **Steps:**
-1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.streamjson` —
+1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl` —
    does it show partial progress, or is it truly silent?
 2. Check the underlying `claude` PID via `ps -ef | grep <session_id>`.
    If the process is alive but not emitting events, it may be hung on
@@ -71,7 +72,7 @@ utilization above the trace target for the current elapsed fraction.
    `eow_time_switch="40h"`, the EOW elbow is at `t ≈ 0.76`.
 2. The supervisor's `scheduled_wakeup_at` should already point to
    the analytical catch-up time (when the curve rises to meet
-   observed); confirm via `claude-task-runner status`.
+   observed); confirm via `claude-task-runner supervisor status`.
 3. If catch-up is far in the future and you have urgent work, either
    raise `[dispatch_pct.week].early_pct` for the queue, or use
    `claude-task-runner queue force-dispatch <task_id>` to bypass
@@ -79,8 +80,8 @@ utilization above the trace target for the current elapsed fraction.
 
 ## Sidecars piling up
 
-**Symptom:** `claude-task-runner queue status` shows many tasks in
-`awaiting_sidecar`.
+**Symptom:** `claude-task-runner queue list --status awaiting_sidecar`
+shows many tasks waiting.
 
 **Steps:**
 1. From Claude Code, `/runner-answer-sidecar` lists all open sidecars.
