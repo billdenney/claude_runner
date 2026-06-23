@@ -6,7 +6,10 @@ exposed by ``queue add``, so operators hand-write YAML and guess. This module
 turns that around with three operator-facing helpers, all derived from the
 :class:`~claude_task_runner.queue.schema.Task` model so they never drift:
 
-* :func:`task_template` — a complete, copy-paste, annotated example YAML.
+* :func:`task_template` — a complete, copy-paste, annotated example YAML,
+  *generated* from the model (field list, types, defaults, and descriptions all
+  come from ``Task.model_fields``; only the handful of example values and the
+  choice of which fields to show uncommented are curated here).
 * :func:`field_reference` — the authoritative field table (name / required /
   type / default / description) generated from the model.
 * :func:`explain_validation_error` — turns a pydantic ``ValidationError`` into
@@ -67,8 +70,24 @@ def _default_str(field: Any) -> str:
     return repr(field.default)
 
 
+def _clean_desc(desc: str | None) -> str:
+    """Collapse whitespace and drop RST ``double-backticks`` for plain text."""
+    return " ".join((desc or "").replace("``", "").split())
+
+
+def _first_sentence(desc: str | None, cap: int = 100) -> str:
+    """First sentence of a cleaned description, for a terse inline comment."""
+    text = _clean_desc(desc)
+    dot = text.find(". ")
+    if dot != -1:
+        text = text[: dot + 1]
+    if len(text) > cap:
+        text = text[: cap - 3].rstrip() + "..."
+    return text
+
+
 # ---------------------------------------------------------------------------
-# Public helpers
+# Field reference (authoritative; generated from the model)
 # ---------------------------------------------------------------------------
 
 
@@ -77,7 +96,7 @@ def field_reference() -> str:
     rows = []
     for name, field in Task.model_fields.items():
         req = "required" if field.is_required() else "optional"
-        desc = " ".join((field.description or "").split())
+        desc = _clean_desc(field.description)
         rows.append((name, req, _type_str(field.annotation), _default_str(field), desc))
     name_w = max(len(r[0]) for r in rows)
     type_w = min(28, max(len(r[2]) for r in rows))
@@ -95,55 +114,143 @@ def field_reference() -> str:
     return "\n".join(out)
 
 
-_TEMPLATE = """\
-# claude-task-runner Task YAML  -- save as <queue>/todo/<id>.yaml
+# ---------------------------------------------------------------------------
+# Template (generated from the model)
+# ---------------------------------------------------------------------------
+
+# The two curated tables below are the only parts NOT derivable from the model:
 #
-# Required keys are uncommented; optional keys are shown commented with their
-# default. Unknown keys are REJECTED (the schema forbids extras), so do not
-# invent fields. Authoritative field list: `claude-task-runner queue template --reference`.
+# * _EXAMPLES — illustrative values. A required field (id/title/prompt) has no
+#   default to show, and a default of ``None``/``[]`` makes a poor example, so a
+#   concrete value is supplied. Everything else uses the field's own default.
+# * _FEATURED — which fields appear UNCOMMENTED, so the emitted YAML is a
+#   runnable starting point. Every required field is always featured; these
+#   common optional ones are added on top. Pure presentation.
+#
+# Both are keyed/named by Task field; ``test_queue_help`` asserts every key is a
+# real field, so a rename can't leave a stale entry. (They could move onto the
+# model as ``Field(examples=...)`` / metadata later; kept local for now.)
 
-schema_version: 2                       # required, always 2
-id: 001-author_year_drug                # required; unique, == filename stem
-title: "Extract the Author 20xx drug popPK model"   # required
-prompt: |                               # required; block scalar keeps quoting safe
-  Use the /extract-literature-model skill to add the population PK model from
-  the paper at /abs/path/to/PMID_XXXX_pmc.xml. Values and equations must come
-  from the source on disk.
+_EXAMPLES: dict[str, Any] = {
+    "id": "001-author_year_drug",
+    "title": "Extract the Author 20xx drug popPK model",
+    "prompt": (
+        "Use the /extract-literature-model skill to add the population PK model\n"
+        "from the paper at /abs/path/to/PMID_XXXX_pmc.xml. Values and equations\n"
+        "must come from the source on disk."
+    ),
+    "working_dir": "/abs/path/to/worktree",
+    "allowed_tools": ["Read", "Edit", "Write", "Bash", "Grep", "Glob", "WebFetch"],
+    "account": "personal",
+    "max_tokens_override": 2000000,
+    "max_duration_s_override": 7200,
+}
 
-model: claude-opus-4-7                   # default; a model id the runner config knows
-effort: high                            # validated per model (e.g. low | medium | high)
-priority: normal                        # low | normal | high  (dispatch ordering)
-allowed_tools: [Read, Edit, Write, Bash, Grep, Glob, WebFetch]
-working_dir: /abs/path/to/worktree      # agent cwd ($TASK_WORKING_DIR); null = use template
+_FEATURED: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "id",
+        "title",
+        "prompt",
+        "model",
+        "effort",
+        "priority",
+        "allowed_tools",
+        "working_dir",
+    }
+)
 
-# --- optional scheduling / throttle controls ---
-# weekly_critical: false                # true = dispatch first within the weekly window
-# weekly_deferrable: false              # true = OK to skip to next week; deprioritized in EOW push
-# force_dispatch_in_eow: false          # true = bypass the end-of-week runtime-safety throttle
-#                                       #   (to force one task now you can instead run:
-#                                       #    claude-task-runner queue force-dispatch <id>)
+_HEADER = [
+    "# claude-task-runner Task YAML  --  save as <queue>/todo/<id>.yaml",
+    "#",
+    "# Generated from the Task model: every field below is real, shown with its",
+    "# default and description. Required + common fields are uncommented (a",
+    "# runnable starting point); the rest are commented with their default.",
+    "# Unknown keys are REJECTED -- field table: `queue template --reference`.",
+    "",
+]
 
-# --- optional dependencies / routing ---
-# depends_on: []                        # task ids that must finish first
-# tags: []                              # free-form cohort labels
-# account: personal                     # pin to a [[accounts]] name; unset = auto-pick
-# additional_dirs: []                   # extra absolute dirs the agent may read/write
+_COMMENT_COL = 42  # align trailing `# description` comments to this column
 
-# --- optional per-task cap overrides ---
-# max_tokens_override: 2000000          # overrides [task_caps].max_tokens_per_task
-# max_duration_s_override: 7200         # overrides [task_caps].max_duration_s_per_task
-# deliverable_paths: []                 # files the task must produce (output-evidence gate)
-"""
+
+def _example_for(name: str, field: Any) -> Any:
+    """Best example value for a field: its curated example, else its default."""
+    if name in _EXAMPLES:
+        return _EXAMPLES[name]
+    if not field.is_required():
+        if field.default_factory is not None:
+            return field.default_factory()
+        return field.default
+    return "<value>"  # required field with no curated example (shouldn't happen)
+
+
+def _yaml_scalar(v: Any) -> str:
+    """Render a Python value as a single-line YAML scalar/flow value."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_yaml_scalar(x) for x in v) + "]"
+    s = str(v)
+    specials = set(" :#[]{}>|*&!%@,`\"'")
+    if s == "" or s.strip() != s or any(c in specials for c in s):
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def _emit_field(name: str, field: Any, *, commented: bool) -> list[str]:
+    """Render one field as YAML line(s): ``key: value    # description``.
+
+    A multi-line string value becomes a block scalar (``key: |`` + indented
+    body); only ever used for an uncommented field (e.g. ``prompt``).
+    """
+    prefix = "# " if commented else ""
+    desc = _first_sentence(field.description)
+    value = _example_for(name, field)
+    if isinstance(value, str) and "\n" in value:
+        head = f"{prefix}{name}: |"
+        if desc:
+            head = f"{head.ljust(_COMMENT_COL)} # {desc}"
+        body = [f"{prefix}  {ln}" for ln in value.rstrip("\n").split("\n")]
+        return [head, *body]
+    line = f"{prefix}{name}: {_yaml_scalar(value)}"
+    if desc:
+        line = f"{line.ljust(_COMMENT_COL)} # {desc}"
+    return [line]
 
 
 def task_template() -> str:
-    """A complete, annotated, copy-paste Task YAML covering every field."""
-    return _TEMPLATE
+    """A complete, annotated, copy-paste Task YAML, generated from the model.
+
+    Featured fields (required + common) are uncommented so the result is a
+    runnable starting point; every other field is emitted commented with its
+    default, so nothing is hidden and the example always covers the full schema.
+    """
+    lines = list(_HEADER)
+    for name, field in Task.model_fields.items():
+        if name in _FEATURED or field.is_required():
+            lines += _emit_field(name, field, commented=False)
+    lines.append("")
+    lines.append("# --- optional (defaults shown; uncomment and edit to set) ---")
+    for name, field in Task.model_fields.items():
+        if name in _FEATURED or field.is_required():
+            continue
+        lines += _emit_field(name, field, commented=True)
+    return "\n".join(lines) + "\n"
 
 
 def template_covers_all_fields() -> list[str]:
-    """Field names absent from the template (drift guard for the test suite)."""
-    return [n for n in Task.model_fields if f"{n}:" not in _TEMPLATE]
+    """Field names the generated template fails to emit (generator self-check)."""
+    tpl = task_template()
+    return [n for n in Task.model_fields if f"{n}:" not in tpl]
+
+
+# ---------------------------------------------------------------------------
+# Friendly validation errors
+# ---------------------------------------------------------------------------
 
 
 def explain_validation_error(

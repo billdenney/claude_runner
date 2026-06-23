@@ -6,6 +6,8 @@ import yaml
 from pydantic import ValidationError
 
 from claude_task_runner.queue.help import (
+    _EXAMPLES,
+    _FEATURED,
     explain_validation_error,
     field_reference,
     task_template,
@@ -56,3 +58,11 @@ def test_explain_missing_required_and_bad_enum():
     assert "required field 'prompt' is missing" in msg
     assert "invalid value 'urgent'" in msg
     assert "low" in msg and "high" in msg
+
+
+def test_curated_tables_reference_only_real_fields():
+    # The two curated tables are keyed by field name; a rename must not leave a
+    # stale entry. (Structure/types/defaults/descriptions come from the model.)
+    fields = set(Task.model_fields)
+    assert set(_EXAMPLES) <= fields, set(_EXAMPLES) - fields
+    assert set(_FEATURED) <= fields, set(_FEATURED) - fields

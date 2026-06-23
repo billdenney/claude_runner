@@ -145,6 +145,7 @@ class Task(_StrictBase):
     """
 
     schema_version: int = CURRENT_SCHEMA_VERSION
+    """Queue schema version; always ``2``."""
     id: str = Field(min_length=1)
     """Unique task identifier. Also the ``todo/<id>.yaml`` filename stem and the
     ``claude/<id>`` worktree branch suffix; keep it filesystem- and git-safe."""
