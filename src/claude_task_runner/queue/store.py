@@ -101,7 +101,13 @@ def _validate(model: type[T], payload: dict[str, Any], path: Path) -> T:
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
-        raise QueueSchemaError(f"{path}: {exc}") from exc
+        # Translate the raw pydantic error into actionable authoring guidance
+        # (unknown/missing/enum fields + a pointer to `queue template`). Bad
+        # task YAMLs are a recurring authoring failure; a fixable message is
+        # worth more than the pydantic dump.
+        from .help import explain_validation_error
+
+        raise QueueSchemaError(explain_validation_error(exc, path, model)) from exc
 
 
 def load_task(path: Path) -> Task:

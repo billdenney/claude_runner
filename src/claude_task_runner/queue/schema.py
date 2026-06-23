@@ -57,9 +57,15 @@ Priority = Literal["low", "normal", "high"]
 
 
 class _StrictBase(BaseModel):
-    """Forbid unknown keys to surface schema drift early."""
+    """Forbid unknown keys to surface schema drift early.
 
-    model_config = ConfigDict(extra="forbid")
+    ``use_attribute_docstrings`` lifts each field's trailing ``\"\"\"docstring\"\"\"``
+    into its ``FieldInfo.description`` so the authoring help (``queue template``)
+    and the friendly load-error messages stay in sync with the model with no
+    duplicated field catalogue.
+    """
+
+    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
 
 class TokenUsage(_StrictBase):
@@ -140,14 +146,29 @@ class Task(_StrictBase):
 
     schema_version: int = CURRENT_SCHEMA_VERSION
     id: str = Field(min_length=1)
+    """Unique task identifier. Also the ``todo/<id>.yaml`` filename stem and the
+    ``claude/<id>`` worktree branch suffix; keep it filesystem- and git-safe."""
     title: str
+    """Short human-readable title shown in ``queue list`` / ``queue show``."""
     prompt: str
+    """The full instruction handed to the agent. Use a YAML block scalar
+    (``prompt: |``) for multi-line content so quoting stays safe."""
     working_dir: Path | None = None
+    """Absolute cwd the dispatched agent runs in (exported to the pre-dispatch
+    hook as ``$TASK_WORKING_DIR``). ``null`` lets the per-queue
+    ``[queue].working_dir_template`` fill it, or means no worktree."""
     model: str = "claude-opus-4-7"
+    """Model id to dispatch with; must be one the runner config knows."""
     effort: Effort = "medium"
+    """Reasoning-effort level, validated against the per-model accepted set at
+    load time (commonly ``low`` / ``medium`` / ``high``)."""
     priority: Priority = "normal"
+    """Dispatch ordering within the eligible set: ``low`` | ``normal`` | ``high``."""
     depends_on: list[str] = Field(default_factory=list)
+    """Task ids that must reach a terminal state before this task dispatches."""
     allowed_tools: list[str] = Field(default_factory=list)
+    """Claude tool names the agent may use (e.g. ``Read``, ``Edit``, ``Write``,
+    ``Bash``). Empty = the dispatcher's default tool set."""
     tags: list[str] = Field(default_factory=list)
     """Free-form labels used for cohort reporting and EMA grouping
     overrides."""
