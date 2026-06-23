@@ -41,9 +41,10 @@ introduces a new on-disk file MUST update this document in the same PR.
 
 ## Data flow: lifecycle of one task
 
-1. Operator adds a task: `claude-task-runner queue add` (or `/runner-add-task`,
-   or `queue add-batch <manifest>`). Task YAML lands in `<queue>/todo/<id>.yaml`.
-2. Supervisor poll tick: reads usage, asks `runner.concurrency` whether to dispatch.
+1. Operator adds a task: `claude-task-runner queue add` (or `/runner-add-task`).
+   Task YAML lands in `<queue>/todo/<id>.yaml`.
+2. Supervisor poll tick: reads usage, asks the throttle decision
+   (`throttle.decision.decide`, via `supervisor.state_machine.step`) whether to dispatch.
 3. If dispatch is approved: `runner.dispatcher` spawns `claude --print
    --output-format=stream-json --verbose ...`. Captures `session_id` from the
    first stream-json `system/init` event.
@@ -120,9 +121,10 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │                               #   events are folded into it, not teed out
     ├── sidecar/<id>/request-NNN.json
     ├── sidecar/<id>/response-NNN.json
-    ├── logs/                       # reserved (created at startup, currently
-    │                               #   unused — no per-attempt stdout/stderr/
-    │                               #   stream-json files are written yet)
+    ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
+    │   ├── attempt-<N>.stream.jsonl  #   parsed stdout NDJSON stream (re-read
+    │   │                             #   on adoption to rebuild StreamSummary)
+    │   └── attempt-<N>.stderr        #   paired stderr (error tail kept in state)
     ├── supervisor.json             # supervisor state machine snapshot
     ├── supervisor.pid              # PID of the running supervisor
     ├── supervisor.log              # supervisor lifecycle + transitions
@@ -156,8 +158,11 @@ These properties are never violated; tests and assertions enforce them.
    regardless of EMA prediction; this is the safety net.
 5. **Every behavior-affecting cutoff is a setting** — no magic numbers for
    thresholds/timeouts/caps in runtime code (cosmetic presentation constants
-   such as log-truncation widths are exempt; see ADR-0014).
-   `claude-task-runner config show` is the single source of truth.
+   such as log-truncation widths are exempt; see ADR-0014). The merged
+   `claude_runner.toml` (per-queue overrides + package
+   `config/defaults/settings.toml` + schema defaults) is the single source of
+   truth; `claude-task-runner doctor` loads it through the schema and surfaces
+   any invalid override.
 6. **All on-disk data has a `schema_version` field** — schema evolution can be
    detected and migrations versioned.
 7. **`UsageFormatDrift` halts dispatch** — supervisor enters `ErrorDrift`;

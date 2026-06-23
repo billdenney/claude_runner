@@ -48,7 +48,12 @@ class Notify(_ActionBase):
 
 @dataclass(frozen=True)
 class EmitEvent(_ActionBase):
-    """Append a structured event to ``events.ndjson``."""
+    """Surface a structured event to the supervisor's ``event_callback``.
+
+    With no callback wired (the default in the daemon's action dispatch)
+    the event is logged to the supervisor log; a host may install an
+    ``event_callback`` to route events elsewhere (e.g. an
+    ``events.ndjson`` sink). No event file is written by default."""
 
     event_type: str
     """Short slug, e.g. ``"state_transition"`` or ``"drift_detected"``."""

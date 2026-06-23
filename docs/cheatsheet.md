@@ -9,9 +9,9 @@ links to the decision log under [decisions/](decisions/) explain the
 
 | Want to see | Command |
 |---|---|
-| Supervisor state + utilization | `claude-task-runner status` |
+| Supervisor state + utilization | `claude-task-runner supervisor status` |
 | Live 5h / weekly utilization | `claude-task-runner usage` (parses `claude /usage`) |
-| Effective bands for *right now* | `claude-task-runner status --verbose` (logs the computed `_EffectiveBands` snapshot) |
+| Full machine-readable snapshot (state, util, next wakeup) | `claude-task-runner supervisor status --json` |
 | Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` |
 | Recent supervisor transitions | `tail -F <queue>/.claude_task_runner/supervisor.log` |
 | Drift / capture failures | `tail -F <queue>/.claude_task_runner/drift.log` |
@@ -84,15 +84,22 @@ throttle stack into two pictures the operator can hold in mind:
 
 ## Common operator tasks
 
-### Read the current effective bands
+### Read the current supervisor state
 
 ```sh
-claude-task-runner status --verbose | grep -E "five_hour|weekly|dispatch_pct"
+claude-task-runner supervisor status --json
 ```
 
-The `state_transition` / `throttled_5h_entry` / `throttled_weekly_entry`
-events in `events.ndjson` include the band, thresholds, and
-target_pct at the moment of the transition.
+The JSON snapshot includes `state`, `last_5h_util_pct`,
+`last_weekly_util_pct`, and `scheduled_wakeup_at` — the inputs and
+output of the most recent dispatch decision.
+
+On each transition the supervisor also emits `state_transition` /
+`throttled_5h_entry` / `throttled_weekly_entry` events whose payloads
+carry the band, thresholds, and `target_pct`. By default these are
+written to the supervisor log
+(`<queue>/.claude_task_runner/supervisor.log`); there is no separate
+`events.ndjson` sink unless a host wires an event callback.
 
 ### Make a queue push harder during the day
 
@@ -159,26 +166,22 @@ git remote prune origin
 
 ## Raising the coverage gate
 
-The CI gate is currently 75% (set in `.github/workflows/ci.yml`). Aspirational
-target is 90%. Modules currently below the global threshold (sorted by
-gap to 80%):
+The CI gate is currently 75% (`--cov-fail-under=75` in
+`.github/workflows/ci.yml`); the aspirational target is 90%. To find
+where the current gaps are, run the suite with a per-module miss report
+and sort by what's least covered:
 
-* `cli/install_cmd.py` — 12% — typer plumbing; need CLI integration tests
-* `cli/usage_cmd.py` — 18% — same
-* `cli/supervisor_cmd.py` — 24% — same
-* `runner/orchestrator.py` — 16% — needs unit tests against fake queue dirs
-* `supervisor/daemon.py` — 48% — needs harness tests around the tick loop
-* `cli/sidecar_cmd.py` — 56% — same as other CLI commands
-* `cli/queue_cmd.py` — 59% — same
-* `doctor/checks.py` — 68% — needs subprocess-mocked tests
-* `runner/dispatcher.py` — 77% — close; needs edge cases
-* `usage/capture.py` — 14% — by design; requires real `claude` binary
-* `usage/source.py` — 43% — covered by live-test suite (`CTR_RUN_LIVE_TESTS=1`)
+```sh
+pytest -m "not live" --cov --cov-report=term-missing
+```
 
-`throttle.curve`, `throttle.time_of_day`, `throttle.policy`,
-`throttle.decision`, and `supervisor.state_machine` are at 100%
-coverage. The new code is fully covered; the global gap is in
-modules untouched by this PR.
+The gaps cluster in two predictable places: the typer CLI command
+modules (`cli/*_cmd.py`), which need CLI-invocation harnesses, and the
+I/O-heavy `runner/orchestrator`, `supervisor/daemon`, and
+`usage/capture` modules (the last covered only by the live-test suite,
+`CTR_RUN_LIVE_TESTS=1`, because it requires a real `claude` binary). The
+pure logic in `throttle/` (`curve`, `time_of_day`, `policy`, `decision`)
+and `supervisor/state_machine` carries the project's highest coverage.
 
 ## Add a new plan
 
