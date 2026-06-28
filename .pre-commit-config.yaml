@@ -51,3 +51,23 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=500]
+
+  # Type check — mirrors the CI ``mypy src`` step (.github/workflows/ci.yml).
+  # Uses the dev venv's mypy via ``language: system`` so it is byte-identical
+  # to CI and needs no ``additional_dependencies`` list to keep in sync (the
+  # alternative ``mirrors-mypy`` hook runs mypy in an isolated env and would
+  # have to mirror the whole typed dependency tree — pydantic + its mypy
+  # plugin, structlog, typer, textual, types-*, … — and would drift). Requires
+  # ``pip install -e '.[dev]'`` first, same prerequisite as the hooks above.
+  # ``pass_filenames: false`` + ``entry: mypy src`` runs the whole-package
+  # check (mypy needs full type context, not just changed files);
+  # ``types: [python]`` skips it on docs-only commits.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (type check — mirrors CI `mypy src`)
+        entry: mypy src
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
