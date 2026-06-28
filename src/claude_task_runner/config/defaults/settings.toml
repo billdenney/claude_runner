@@ -275,6 +275,11 @@ operator_patterns = [
 ]
 task_patterns = []
 failure_circuit_breaker_threshold = 3
+# ADR-0027: give up (failed_circuit_breaker, stop_reason sidecar_refile_loop)
+# after this many consecutive sidecar re-files with no commit in between.
+# A run that commits resets the counter. Stops the answered-sidecar ->
+# re-dispatch -> re-file-same-blocker loop.
+sidecar_refile_loop_threshold = 4
 
 # ---------------------------------------------------------------------------
 # Per-task safety caps

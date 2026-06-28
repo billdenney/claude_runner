@@ -11,6 +11,16 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **Sidecar re-file loop guard (ADR-0027).** A task that keeps filing
+  sidecars without committing any progress now gives up to
+  `failed_circuit_breaker` (stop_reason `sidecar_refile_loop`) after
+  `failure_classifier.sidecar_refile_loop_threshold` (default 4)
+  consecutive no-progress re-files, instead of looping
+  `answered → re-dispatch → re-file the same blocker` forever. A run that
+  commits resets the counter, so a legitimate ask→build→ask flow is never
+  penalised. Adds `TaskState.sidecar_refile_count`. Complements the
+  queue-side `block_dispatch` pre-dispatch hook check (which parks
+  file/supplement/upstream blockers as `deferred`).
 - **`agent-bash-patterns` worker skill — prevention half of the
   bash-poll-forever antipattern.** Companion to the reaper that
   *detects* `Rscript … &` + `until ! pgrep -f X; do sleep N; done`
