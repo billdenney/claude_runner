@@ -27,7 +27,7 @@ import difflib
 import typing
 from typing import Any, Literal, Union
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .schema import Task
 
@@ -254,7 +254,7 @@ def template_covers_all_fields() -> list[str]:
 
 
 def explain_validation_error(
-    exc: ValidationError, path: Any | None = None, model: type = Task
+    exc: ValidationError, path: Any | None = None, model: type[BaseModel] = Task
 ) -> str:
     """Render a pydantic ValidationError as actionable authoring guidance."""
     valid = list(model.model_fields)
