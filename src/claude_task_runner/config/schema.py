@@ -110,6 +110,14 @@ class FailureClassifierSettings(_StrictModel):
     still-blocked task re-runs the hook, so a long wait (e.g. a paper
     awaiting operator re-acquisition) re-checks periodically instead of
     being re-picked every tick and starving ready work. Default 15 min."""
+    sidecar_refile_loop_threshold: int = Field(default=4, ge=1)
+    """Consecutive no-progress sidecar re-files (a dispatch that ends
+    ``awaiting_sidecar`` without committing anything) after which the
+    dispatcher gives up: status ``failed_circuit_breaker``, stop_reason
+    ``sidecar_refile_loop`` (ADR-0027). Stops the "operator answers the
+    sidecar -> task re-dispatches -> agent re-files the same unresolved
+    blocker" loop. A run that commits resets the counter, so a legitimate
+    ask -> build -> ask flow is never penalised. Default 4."""
 
 
 class TaskCapsSettings(_StrictModel):

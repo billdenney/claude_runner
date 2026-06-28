@@ -989,6 +989,21 @@ def _new_commit_since(working_dir: Path, pre_sha: str) -> bool:
         return False
 
 
+def _sidecar_refile_decision(
+    prior_count: int, made_progress: bool, threshold: int
+) -> tuple[int, bool]:
+    """Sidecar re-file loop-guard arithmetic (ADR-0027).
+
+    Returns ``(new_count, tripped)``. ``new_count`` resets to 0 when the
+    run made progress (committed) and otherwise increments ``prior_count``;
+    ``tripped`` is True once ``new_count`` reaches ``threshold``, at which
+    point the dispatcher gives up to ``failed_circuit_breaker`` instead of
+    re-dispatching the task and letting it re-file the same blocker.
+    """
+    new_count = 0 if made_progress else prior_count + 1
+    return new_count, new_count >= threshold
+
+
 @dataclass(frozen=True)
 class OutputEvidence:
     """Why a clean-exit run is (or isn't) judged to have produced output.
@@ -1539,7 +1554,52 @@ def dispatch(
     # check skips awaiting_sidecar tasks, so the slot frees for the next
     # pending task while this one waits for the operator.
     if has_open_sidecar:
-        final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
+        # Sidecar re-file loop guard (ADR-0027). A task that keeps filing
+        # sidecars without ever committing is stuck — the operator's
+        # answers are not unblocking it (e.g. an answer that needs an
+        # upstream fix which never lands, or the agent re-asking the same
+        # unresolved question). Count consecutive no-progress re-files; at
+        # the threshold, give up to ``failed_circuit_breaker`` (operator
+        # intervention) rather than re-dispatch forever. A run that
+        # committed resets the counter, so a legitimate ask->build->ask
+        # flow is never penalised.
+        made_progress = (
+            task.working_dir is not None
+            and pre_sha is not None
+            and _new_commit_since(task.working_dir, pre_sha)
+        )
+        threshold = settings_failure_classifier.sidecar_refile_loop_threshold
+        refiles, tripped = _sidecar_refile_decision(
+            new_state.sidecar_refile_count, made_progress, threshold
+        )
+        if tripped:
+            logger.warning(
+                "task %s tripped the sidecar re-file loop guard "
+                "(%d consecutive no-progress sidecars >= threshold %d); "
+                "giving up to failed_circuit_breaker",
+                task.id,
+                refiles,
+                threshold,
+            )
+            final_state = final_state.model_copy(
+                update={
+                    "status": "failed_circuit_breaker",
+                    "stop_reason": "sidecar_refile_loop",
+                    "error": (
+                        f"sidecar re-file loop: {refiles} consecutive sidecars "
+                        f"filed with no commit (>= threshold {threshold}); "
+                        f"operator intervention required"
+                    ),
+                    "sidecar_refile_count": refiles,
+                }
+            )
+        else:
+            final_state = final_state.model_copy(
+                update={
+                    "status": "awaiting_sidecar",
+                    "sidecar_refile_count": refiles,
+                }
+            )
 
     if persist_state:
         write_state_atomic(final_state, state_path_for(queue_dir, task.id))

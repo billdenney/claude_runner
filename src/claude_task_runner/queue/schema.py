@@ -279,6 +279,15 @@ class TaskState(_StrictBase):
     deliberately kept out of ``runs`` so they never reach the
     circuit-breaker counter. Reset to 0 once the task dispatches. ``0``
     on legacy state YAMLs that pre-date the field."""
+    sidecar_refile_count: int = Field(ge=0, default=0)
+    """Consecutive sidecars this task has filed WITHOUT committing any
+    progress (ADR-0027). Incremented by each dispatch that ends
+    ``awaiting_sidecar`` with no new commit on the worktree branch; reset
+    to 0 by any run that commits. When it reaches
+    ``failure_classifier.sidecar_refile_loop_threshold`` the dispatcher
+    gives up to ``failed_circuit_breaker`` (stop_reason
+    ``sidecar_refile_loop``) instead of re-dispatching the same blocker
+    forever. ``0`` on legacy state YAMLs that pre-date the field."""
     next_eligible_at: datetime | None = None
     """When ``status == "deferred"``, the earliest time the orchestrator
     will re-attempt dispatch (and so re-run the pre-dispatch hook). Until
