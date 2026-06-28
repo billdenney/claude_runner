@@ -1568,10 +1568,19 @@ def dispatch(
             and pre_sha is not None
             and _new_commit_since(task.working_dir, pre_sha)
         )
-        threshold = settings_failure_classifier.sidecar_refile_loop_threshold
-        refiles, tripped = _sidecar_refile_decision(
-            new_state.sidecar_refile_count, made_progress, threshold
+        threshold = (
+            settings_failure_classifier.sidecar_refile_loop_threshold
+            if settings_failure_classifier is not None
+            else None
         )
+        if threshold is not None:
+            refiles, tripped = _sidecar_refile_decision(
+                new_state.sidecar_refile_count, made_progress, threshold
+            )
+        else:
+            # No failure-classifier configured (edge/test path): leave the
+            # counter untouched and never trip — the guard is a no-op.
+            refiles, tripped = new_state.sidecar_refile_count, False
         if tripped:
             logger.warning(
                 "task %s tripped the sidecar re-file loop guard "
