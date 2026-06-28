@@ -17,6 +17,14 @@ This skill is interactive. It collects required fields via
 asking directly (where there's free-form text), then invokes
 `claude-task-runner queue add` to write the task YAML.
 
+> **Authoring a YAML by hand (or setting a field `queue add` doesn't expose —
+> e.g. `force_dispatch_in_eow`, `depends_on`, `deliverable_paths`,
+> `account`)?** Run `claude-task-runner queue template` for a complete,
+> annotated, copy-paste example, or `queue template --reference` for the
+> field-by-field table. Unknown keys are rejected, with an error that names the
+> offending field and suggests the closest valid one — so a typo'd key fails
+> fast and fixably rather than silently.
+
 ## Required fields
 
 Drive the operator through these one at a time. Don't ask for them

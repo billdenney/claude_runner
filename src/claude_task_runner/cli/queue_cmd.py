@@ -118,6 +118,30 @@ def _safe_load_state(path: Path) -> dict[str, object] | None:
         return None
 
 
+@app.command("template")
+def template(
+    *,
+    reference: bool = typer.Option(
+        False,
+        "--reference",
+        help="Print the field table (name/required/type/default/description) instead of an example.",
+    ),
+) -> None:
+    """Print a complete, annotated example Task YAML -- how to author one.
+
+    Redirect it into a new task file and edit in place::
+
+        claude-task-runner queue template > todo/001-author_year_drug.yaml
+
+    The example covers every field with inline comments (required vs optional,
+    allowed values, defaults). Use ``--reference`` for the field-by-field table.
+    Unknown keys are rejected by the loader, so this is the source of truth.
+    """
+    from claude_task_runner.queue.help import field_reference, task_template
+
+    typer.echo(field_reference() if reference else task_template())
+
+
 @app.command("list")
 def list_tasks(
     *,
