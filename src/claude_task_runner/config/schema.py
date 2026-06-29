@@ -266,6 +266,18 @@ class SupervisorSettings(_StrictModel):
     running tasks from scratch. Defaulted (not required) so per-queue
     configs that pre-date this field keep parsing."""
 
+    quarantine_corrupt_state: bool = True
+    """Corrupt-state-file quarantine (ADR-0028). When true (default), the
+    supervisor scans the state dir on startup (and on the steady-state
+    reap cadence) for ``TaskState`` YAMLs that fail to parse — truncated
+    or garbled by a crash / power-loss mid-write — and moves each into
+    ``state/.corrupt/`` so the task reverts to pending and re-dispatches,
+    instead of being silently skipped by every recovery sweep forever (a
+    "corrupt-state zombie"). A salvageable ``completed`` status is
+    preserved so finished work is not redone. Set false to restore the
+    legacy silent-skip behaviour. Defaulted so pre-existing configs keep
+    parsing."""
+
 
 class HookSettings(_StrictModel):
     pre_dispatch_command: str
