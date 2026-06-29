@@ -310,6 +310,7 @@ window_start_delay_s        = 300        # cron fires N s after detected window 
 state_file                  = "supervisor.json"
 preferred_init_system       = "auto"     # auto | systemd | cron
 adopt_workers               = true       # ADR-0025: file-backed workers; adopt survivors on restart, fast stop
+quarantine_corrupt_state    = true       # ADR-0028: quarantine unparseable state YAMLs -> task reverts to pending
 
 # ---------------------------------------------------------------------------
 # Pre/post-dispatch hooks

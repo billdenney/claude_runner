@@ -47,6 +47,7 @@ from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor import reconcile as reconcile_mod
+from claude_task_runner.supervisor import reconcile_corrupt as reconcile_corrupt_mod
 from claude_task_runner.supervisor import reconcile_silent as reconcile_silent_mod
 from claude_task_runner.supervisor import state_machine as sm_mod
 from claude_task_runner.supervisor.actions import (
@@ -528,6 +529,46 @@ def start_daemon(
                 since=clk.now(),
                 account_names=account_names,
             )
+
+            # Corrupt-state quarantine (ADR-0028): MUST run before every
+            # other recovery pass. A TaskState YAML left unparseable by a
+            # crash / power-loss mid-write is silently skipped by the
+            # silent-orphan reaper, adoption, AND reconcile_orphans alike
+            # -- the task never reconciles, never re-dispatches, never
+            # finishes (a "corrupt-state zombie"). Move each such file to
+            # state/.corrupt/ so the task reverts to the no-state==pending
+            # baseline and re-dispatches; a salvageable completed status
+            # is preserved so finished work is not redone.
+            if settings.supervisor.quarantine_corrupt_state:
+                corrupt_results = reconcile_corrupt_mod.quarantine_corrupt_state_files(
+                    queue_dir, now=clk.now()
+                )
+                for cr in corrupt_results:
+                    if notify_callback is not None:
+                        notify_callback(
+                            "warning",
+                            f"corrupt-state quarantine: task {cr.task_id} "
+                            + (
+                                f"(preserved {cr.preserved_status})"
+                                if cr.preserved_status
+                                else "(reverts to pending)"
+                            ),
+                        )
+                    if event_callback is not None:
+                        event_callback(
+                            "corrupt_state_quarantined",
+                            {
+                                "task_id": cr.task_id,
+                                "quarantined_path": cr.quarantined_path,
+                                "preserved_status": cr.preserved_status,
+                            },
+                        )
+                if corrupt_results:
+                    logger.warning(
+                        "quarantined %d corrupt state file(s) on startup: %s",
+                        len(corrupt_results),
+                        sorted(cr.task_id for cr in corrupt_results),
+                    )
 
             # Silent-orphan reaper (must precede reconcile_orphans):
             # walks in-flight state YAMLs and grades each by heartbeat
