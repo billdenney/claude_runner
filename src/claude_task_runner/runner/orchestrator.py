@@ -28,6 +28,7 @@ machine. The orchestrator returns the updated snapshot (with refreshed
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 from collections.abc import Callable
@@ -232,7 +233,18 @@ def tick_dispatch(
     adopt_on = bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False))
 
     completed_ids = _completed_task_ids(queue_dir)
-    candidates = _eligible_candidates(queue_dir, in_flight_slots, completed_ids, now=clock.now())
+    # Opt-in dispatch block-list (ADR-0029): a queue-relative JSONL of
+    # `block_dispatch: true` task ids the selector skips outright.
+    # ``getattr`` tolerates the SimpleNamespace settings stubs some
+    # tests pass; the real strict ``Settings`` always carries the field.
+    block_file = getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None)
+    candidates = _eligible_candidates(
+        queue_dir,
+        in_flight_slots,
+        completed_ids,
+        now=clock.now(),
+        block_file=block_file,
+    )
     if not candidates:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -440,12 +452,25 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
 
     * the state file is missing or unparseable (defensive — a missing
       state YAML means we have nothing to check)
+    * the task is ``deferred`` (ADR-0029): a pre-dispatch hook exit-1
+      deferral spawns NO subprocess and, unlike every other outcome,
+      does NOT append a RunRecord (ADR-0026). So ``runs[-1]`` is a
+      STALE record from an earlier *real* dispatch whose subprocess has
+      long exited — and whose OS pid may since be RECYCLED by an
+      unrelated process (or owned by another user, which
+      :func:`dispatcher._pid_alive` reports alive on ``EPERM``).
+      Reading that pid made :func:`_reap_finished` mistake the recycled
+      pid for a live leaked subprocess and hold the in-flight slot
+      forever, starving low-concurrency accounts (``work`` at
+      ``max_concurrency=1`` sat at 0% dispatch for days). The deferring
+      dispatch had no subprocess to leak, so there is nothing to guard.
     * the task has no recorded runs (first dispatch hasn't finalized
       yet)
     * the most recent run record predates the ``pid`` field (legacy
       run records carry ``pid=None`` by the schema default)
     * the run was a pre-dispatch hook failure (no subprocess ever
-      spawned)
+      spawned — that path DOES append a RunRecord, but with
+      ``pid=None``, so this returns ``None`` for it too)
     """
     sp = state_path_for(queue_dir, task_id)
     if not sp.exists():
@@ -458,6 +483,12 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
             task_id,
             exc,
         )
+        return None
+    # A deferral parks the task in `deferred` without spawning a worker
+    # or appending a run (ADR-0026), so `runs[-1]` here belongs to an
+    # earlier dispatch, not the just-finished one. Probing its
+    # (possibly recycled) pid would wrongly hold the slot (ADR-0029).
+    if state.status == "deferred":
         return None
     if not state.runs:
         return None
@@ -529,11 +560,62 @@ def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
     return state.session_host_account()
 
 
+def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[str]:
+    """Return task ids an operator has flagged ``block_dispatch: true`` (ADR-0029).
+
+    ``block_file`` is the queue-relative path from
+    ``[dispatch].dispatch_block_file``; ``None`` / empty means the
+    feature is off, so this returns an empty set. The file is JSONL:
+    each line is parsed independently and contributes a task id only
+    when it is a JSON object with ``block_dispatch is True`` and a
+    non-empty string ``task``. Every other line — an index row, a
+    ``target_path`` re-acquisition row, a blank line, or malformed
+    JSON — is skipped, so a mixed-content block-list (the
+    ``needs_acquisition.jsonl`` convention carries all three kinds) is
+    read without acting on rows this selector shouldn't.
+
+    Fail-safe by construction: an unreadable file or an unparseable
+    line yields NO blocked id, so the affected task simply dispatches
+    and the pre-dispatch hook re-checks the block. A block-list problem
+    therefore *under*-blocks (a wasted defer at worst) rather than
+    *over*-blocking (stranding a runnable task) — the safe direction.
+    """
+    if not block_file:
+        return set()
+    path = queue_dir / block_file
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        logger.debug("dispatch block-list %s unreadable (%s); treating as empty", path, exc)
+        return set()
+
+    blocked: set[str] = set()
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except ValueError:
+            # A non-JSON / partially-written line is not a block entry;
+            # skip it (debug, not warning — the block file is expected
+            # to carry rows this reader deliberately ignores).
+            continue
+        if isinstance(entry, dict) and entry.get("block_dispatch") is True:
+            tid = entry.get("task")
+            if isinstance(tid, str) and tid:
+                blocked.add(tid)
+    return blocked
+
+
 def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: dict[str, DispatchSlot],
     completed_ids: set[str],
     now: datetime | None = None,
+    block_file: str | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -548,11 +630,28 @@ def _eligible_candidates(
     # matching response-NNN.json.
     open_sidecar_task_ids: set[str] = {tid for tid, _seq, _path in list_open_sidecars(queue_dir)}
 
+    # Operator-maintained dispatch block-list (ADR-0029, Part 2): task
+    # ids flagged `block_dispatch: true`. Read once per call. Off (empty)
+    # unless the queue set `[dispatch].dispatch_block_file`.
+    blocked_ids = _dispatch_blocked_task_ids(queue_dir, block_file)
+    if blocked_ids:
+        logger.debug("dispatch block-list active: %d task(s) parked", len(blocked_ids))
+
     for path in list_pending_tasks(queue_dir):
         try:
             task = load_task(path)
         except Exception as exc:
             logger.warning("skipping unparseable task at %s: %s", path, exc)
+            continue
+        if task.id in blocked_ids:
+            # An operator has flagged this task `block_dispatch: true`
+            # (e.g. a paper awaiting a supplement). Skip it in the
+            # SELECTOR — without spawning a dispatch that the
+            # pre-dispatch hook would only exit-1 defer. That avoids
+            # burning a dispatch+defer cycle (and, on a 1-slot account,
+            # briefly re-occupying the only slot) every cooldown for a
+            # task known to be blocked. The hook remains the enforcing
+            # backstop for any task that slips through. (ADR-0029)
             continue
         if task.id in in_flight_ids:
             continue

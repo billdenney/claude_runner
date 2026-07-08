@@ -642,6 +642,27 @@ class DispatchSettings(_StrictModel):
     task's prompt text and add the ones that resolve to existing
     directories to the per-dispatch ``--add-dir`` list. Off by default."""
 
+    dispatch_block_file: str | None = None
+    """Opt-in dispatch block-list, relative to the queue dir (ADR-0029).
+
+    When set (e.g. ``"needs_acquisition.jsonl"``), the orchestrator's
+    candidate selector reads this JSONL file each tick and skips any
+    task whose id appears in an entry marked ``"block_dispatch": true``
+    — WITHOUT spawning a dispatch that a pre-dispatch hook would only
+    defer. This makes an operator's known-blocked parking (e.g. a paper
+    awaiting a supplement) visible to the *selector*, not just the hook,
+    so a permanently-blocked task stops burning a dispatch+defer cycle
+    every ``deferral_recheck_cooldown_s`` — which, on a low-concurrency
+    account, briefly re-occupies the only slot each cooldown.
+
+    Fail-safe: a missing file, or a malformed / non-matching line, means
+    "not blocked" — the task dispatches and the hook enforces the block
+    as before, so a broken block-list never strands work. ``None`` (the
+    default) disables the feature entirely; queues without this
+    convention are unaffected. Entries without ``block_dispatch: true``
+    (index rows, ``target_path`` re-acquisition rows) are ignored: the
+    selector acts only on the task-keyed, explicitly-flagged block."""
+
 
 class PlanSettings(_StrictModel):
     """Per-plan token budgets.
