@@ -11,6 +11,21 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **Mechanical readiness gates — `Task.requires` (ADR-0030).** A task can now
+  declare no-AI, no-dispatch preconditions the supervisor's selector checks
+  every tick: `requires: [{kind: "file", path: "<rel-or-abs>"}]` (the path
+  must exist) or `{kind: "sidecar_response"}` (all the task's sidecars are
+  answered). A task with any unmet requirement is kept OUT of the candidate
+  set — never dispatched to discover the gap — and is admitted the first tick
+  after every element is satisfied. This brings a *file* wait to parity with
+  the *sidecar-response* wait (always selector-side): no wasted dispatch
+  cycle, no in-flight-slot churn, and unblock within one poll interval
+  instead of a `deferral_recheck_cooldown_s` (~15 min) lag. Evaluated by
+  `runner.readiness.unmet_requirements` (pure `Path.exists()` + set lookup,
+  safe to run for the whole pending pool each tick); extend `ReadinessKind`
+  + one branch to add gate types. Additive + defaulted (`[]`) — existing task
+  YAMLs load unchanged; a queue opts in by populating `requires` on its tasks.
+
 - **Opt-in dispatch block-list — `[dispatch].dispatch_block_file`
   (ADR-0029).** A queue-relative JSONL of task ids the candidate selector
   skips outright when flagged `"block_dispatch": true` — *without*

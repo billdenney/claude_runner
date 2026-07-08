@@ -48,6 +48,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
+from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
     UnknownModel,
@@ -322,9 +323,11 @@ def show_task(
     state_path = state_path_for(qd, task_id)
 
     payload: dict[str, object] = {"task_id": task_id}
+    task_obj: Task | None = None
     try:
         if task_path.exists():
-            payload["task"] = load_task(task_path).model_dump(mode="json")
+            task_obj = load_task(task_path)
+            payload["task"] = task_obj.model_dump(mode="json")
         else:
             payload["task"] = None
     except (QueueIOError, QueueSchemaError) as exc:
@@ -337,6 +340,17 @@ def show_task(
             payload["state"] = None
     except (QueueIOError, QueueSchemaError) as exc:
         payload["state_error"] = str(exc)
+
+    # Mechanical readiness (ADR-0030): surface which declared `requires`
+    # elements are unmet so an operator can see why a task is not being
+    # selected — without reading state or grepping logs. Evaluated live.
+    if task_obj is not None and task_obj.requires:
+        unmet = readiness_mod.unmet_requirements(task_obj, qd)
+        payload["readiness"] = {
+            "required": len(task_obj.requires),
+            "satisfied": len(task_obj.requires) - len(unmet),
+            "unmet": unmet,
+        }
 
     if json:
         print(_json.dumps(payload, default=str, indent=2))
@@ -358,6 +372,14 @@ def show_task(
         console.print(f"  session_id: {state_payload.get('session_id')}")
     if "state_error" in payload:
         console.print(f"  [red]state error:[/] {payload['state_error']}")
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict):
+        satisfied = readiness["satisfied"]
+        required = readiness["required"]
+        colour = "green" if satisfied == required else "yellow"
+        console.print(f"  requires: [{colour}]{satisfied}/{required} satisfied[/]")
+        for reason in readiness.get("unmet", []):
+            console.print(f"    [yellow]✗[/] {reason}")
 
 
 @app.command("add")

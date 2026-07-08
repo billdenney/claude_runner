@@ -24,9 +24,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CURRENT_SCHEMA_VERSION = 2
+
+ReadinessKind = Literal["file", "sidecar_response"]
+"""The mechanical predicate a :class:`ReadinessRequirement` checks. Extend
+this Literal (and :mod:`claude_task_runner.runner.readiness`'s evaluator) to
+add new no-AI gate types. See ADR-0030."""
 
 TaskStatus = Literal[
     "pending",
@@ -136,6 +141,43 @@ class RunRecord(_StrictBase):
     .choose_account` on multi-account dispatches."""
 
 
+class ReadinessRequirement(_StrictBase):
+    """A mechanical (no-AI, no-dispatch) precondition for dispatching a task.
+
+    The supervisor's candidate selector evaluates every requirement on each
+    tick with cheap in-process probes (a filesystem ``exists()``, a set
+    lookup) — it never spawns a worker or consults an LLM. A task with any
+    unmet requirement is simply not selected; it dispatches the first tick
+    after all its requirements are satisfied. This is the same shape the
+    sidecar-response check has always had, generalised so a *file* wait no
+    longer needs a dispatch+hook+cooldown cycle to discover the file arrived.
+    See ADR-0030.
+    """
+
+    kind: ReadinessKind
+    """Which mechanical predicate to check. ``file``: ``path`` must exist.
+    ``sidecar_response``: every sidecar request this task has filed has a
+    matching response (i.e. the task is not in the open-sidecar set)."""
+    path: str | None = None
+    """For ``kind = "file"``: the path to probe. A relative path resolves
+    against the queue dir; an absolute path is used as-is. Omitted for
+    ``sidecar_response`` (which is keyed on the task id, not a path)."""
+    note: str | None = None
+    """Optional operator-facing description of what this element is and why
+    it gates dispatch — surfaced verbatim when reporting why a task is
+    waiting (e.g. ``queue why-blocked``)."""
+
+    @model_validator(mode="after")
+    def _validate_kind_fields(self) -> ReadinessRequirement:
+        # Fail loud at authoring time (strict schema) rather than silently
+        # treating a malformed requirement as satisfied at dispatch time.
+        if self.kind == "file" and not self.path:
+            raise ValueError("readiness requirement kind='file' requires a non-empty 'path'")
+        if self.kind == "sidecar_response" and self.path is not None:
+            raise ValueError("readiness requirement kind='sidecar_response' takes no 'path'")
+        return self
+
+
 class Task(_StrictBase):
     """A queued task as authored by the operator.
 
@@ -167,6 +209,16 @@ class Task(_StrictBase):
     """Dispatch ordering within the eligible set: ``low`` | ``normal`` | ``high``."""
     depends_on: list[str] = Field(default_factory=list)
     """Task ids that must reach a terminal state before this task dispatches."""
+    requires: list[ReadinessRequirement] = Field(default_factory=list)
+    """Mechanical (no-AI, no-dispatch) preconditions the supervisor checks
+    each tick before selecting this task — e.g. an input file that must
+    exist. Unlike the pre-dispatch hook's exit-1 defer (which spawns a
+    dispatch to discover a missing file and only re-checks on a cooldown),
+    an unmet ``requires`` element keeps the task OUT of the candidate set
+    entirely, and the task dispatches the first tick after every element is
+    satisfied. Empty (default) → no mechanical gate; backward compatible
+    with task YAMLs that pre-date this field. See ADR-0030 and
+    :mod:`claude_task_runner.runner.readiness`."""
     allowed_tools: list[str] = Field(default_factory=list)
     """Claude tool names the agent may use (e.g. ``Read``, ``Edit``, ``Write``,
     ``Bash``). Empty = the dispatcher's default tool set."""
