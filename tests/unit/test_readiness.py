@@ -1,0 +1,180 @@
+"""Tests for mechanical readiness gates (ADR-0030).
+
+Covers the schema (``ReadinessRequirement`` validation + ``Task.requires``
+round-trip) and the evaluator (``runner.readiness.unmet_requirements`` /
+``is_ready``). The selector integration (``_eligible_candidates`` skips a task
+with unmet requirements without dispatching, and re-admits it once satisfied)
+lives in ``test_orchestrator_sidecar_resume.py`` alongside the other
+selector-gating tests.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from claude_task_runner.queue.schema import ReadinessRequirement, Task
+from claude_task_runner.queue.sidecar import write_request
+from claude_task_runner.queue.store import queue_runtime_dir
+from claude_task_runner.runner.readiness import is_ready, unmet_requirements
+
+
+def _task(**overrides: object) -> Task:
+    payload: dict[str, object] = {"id": "t1", "title": "T", "prompt": "do it"}
+    payload.update(overrides)
+    return Task.model_validate(payload)
+
+
+@pytest.fixture
+def queue_dir(tmp_path: Path) -> Path:
+    queue_runtime_dir(tmp_path).mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
+# --- schema validation --------------------------------------------------
+
+
+def test_file_requirement_needs_path() -> None:
+    with pytest.raises(ValidationError, match="requires a non-empty 'path'"):
+        ReadinessRequirement(kind="file")
+
+
+def test_file_requirement_rejects_empty_path() -> None:
+    with pytest.raises(ValidationError, match="requires a non-empty 'path'"):
+        ReadinessRequirement(kind="file", path="")
+
+
+def test_sidecar_requirement_rejects_path() -> None:
+    with pytest.raises(ValidationError, match="takes no 'path'"):
+        ReadinessRequirement(kind="sidecar_response", path="nope")
+
+
+def test_unknown_kind_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ReadinessRequirement(kind="carrier_pigeon")  # type: ignore[arg-type]
+
+
+def test_task_requires_defaults_empty() -> None:
+    assert _task().requires == []
+
+
+def test_task_requires_round_trips_through_dump() -> None:
+    t = _task(requires=[{"kind": "file", "path": "papers/x_trimmed.md", "note": "trim"}])
+    again = Task.model_validate(t.model_dump(mode="json"))
+    assert again.requires[0].kind == "file"
+    assert again.requires[0].path == "papers/x_trimmed.md"
+    assert again.requires[0].note == "trim"
+
+
+# --- evaluator: no requirements / file gate -----------------------------
+
+
+def test_no_requirements_is_ready(queue_dir: Path) -> None:
+    assert unmet_requirements(_task(), queue_dir) == []
+    assert is_ready(_task(), queue_dir)
+
+
+def test_file_present_is_ready(queue_dir: Path) -> None:
+    (queue_dir / "papers").mkdir()
+    (queue_dir / "papers" / "x_trimmed.md").write_text("content", encoding="utf-8")
+    task = _task(requires=[{"kind": "file", "path": "papers/x_trimmed.md"}])
+    assert unmet_requirements(task, queue_dir) == []
+    assert is_ready(task, queue_dir)
+
+
+def test_file_missing_is_unmet(queue_dir: Path) -> None:
+    task = _task(requires=[{"kind": "file", "path": "papers/x_trimmed.md"}])
+    reasons = unmet_requirements(task, queue_dir)
+    assert len(reasons) == 1
+    assert "missing file" in reasons[0]
+    assert str(queue_dir / "papers" / "x_trimmed.md") in reasons[0]
+    assert not is_ready(task, queue_dir)
+
+
+def test_file_absolute_path_used_as_is(tmp_path: Path, queue_dir: Path) -> None:
+    ext = tmp_path / "elsewhere" / "input.pdf"
+    ext.parent.mkdir(parents=True)
+    task = _task(requires=[{"kind": "file", "path": str(ext)}])
+    assert not is_ready(task, queue_dir)  # absolute path, not yet present
+    ext.write_text("x", encoding="utf-8")
+    assert is_ready(task, queue_dir)  # appears -> ready, no dispatch involved
+
+
+def test_note_included_in_reason(queue_dir: Path) -> None:
+    task = _task(requires=[{"kind": "file", "path": "a.md", "note": "the trimmed paper"}])
+    (reason,) = unmet_requirements(task, queue_dir)
+    assert "the trimmed paper" in reason
+
+
+def test_multiple_requirements_reports_only_unmet(queue_dir: Path) -> None:
+    (queue_dir / "present.md").write_text("x", encoding="utf-8")
+    task = _task(
+        requires=[
+            {"kind": "file", "path": "present.md"},
+            {"kind": "file", "path": "missing_a.md"},
+            {"kind": "file", "path": "missing_b.md"},
+        ]
+    )
+    reasons = unmet_requirements(task, queue_dir)
+    assert len(reasons) == 2
+    assert all("missing_" in r for r in reasons)
+
+
+# --- evaluator: sidecar_response gate -----------------------------------
+
+
+def test_sidecar_response_ready_when_no_open_request(queue_dir: Path) -> None:
+    task = _task(requires=[{"kind": "sidecar_response"}])
+    assert is_ready(task, queue_dir)  # no open sidecar for t1
+
+
+def test_sidecar_response_unmet_when_request_open(queue_dir: Path) -> None:
+    # An unanswered request makes t1 "sidecar-open".
+    write_request(queue_dir, _sidecar_request("t1", 1))
+    task = _task(requires=[{"kind": "sidecar_response"}])
+    reasons = unmet_requirements(task, queue_dir)
+    assert reasons == ["awaiting sidecar response"]
+
+
+def test_sidecar_response_uses_precomputed_set(queue_dir: Path) -> None:
+    # When the caller passes the open-sidecar set, no directory scan is needed;
+    # the task id's membership decides the gate.
+    task = _task(requires=[{"kind": "sidecar_response"}])
+    assert unmet_requirements(task, queue_dir, open_sidecar_task_ids={"t1"}) == [
+        "awaiting sidecar response"
+    ]
+    assert unmet_requirements(task, queue_dir, open_sidecar_task_ids=set()) == []
+
+
+def _sidecar_request(task_id: str, seq: int):
+    from datetime import UTC, datetime
+
+    from claude_task_runner.queue.schema import (
+        CURRENT_SCHEMA_VERSION,
+        SidecarOption,
+        SidecarQuestion,
+        SidecarRequest,
+    )
+
+    return SidecarRequest(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        task_id=task_id,
+        sequence=seq,
+        created_at=datetime(2026, 7, 8, tzinfo=UTC),
+        summary="s",
+        context="c",
+        questions=[
+            SidecarQuestion(
+                id="q1",
+                prompt="?",
+                options=[
+                    SidecarOption(value="A", label="a", description=""),
+                    SidecarOption(value="B", label="b", description=""),
+                ],
+                recommended="A",
+                multi_select=False,
+            )
+        ],
+    )

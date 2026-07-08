@@ -47,6 +47,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.supervisor.states import SupervisorState
@@ -715,6 +716,25 @@ def _eligible_candidates(
 
         unmet = [d for d in task.depends_on if d not in completed_ids]
         if unmet:
+            continue
+
+        # Mechanical readiness gates (ADR-0030): a task waiting on a file
+        # (or any no-AI precondition) is kept OUT of the candidate set until
+        # every element is satisfied — checked here in-process each tick, so
+        # it never burns a dispatch+hook+cooldown cycle and unblocks the
+        # first tick after the element appears. The open-sidecar set is
+        # already computed above; share it so a `sidecar_response` gate is a
+        # free set lookup. Empty `requires` (the default) → no-op.
+        unmet_reqs = readiness_mod.unmet_requirements(
+            task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids
+        )
+        if unmet_reqs:
+            logger.debug(
+                "task %s held by %d unmet readiness requirement(s): %s",
+                task.id,
+                len(unmet_reqs),
+                "; ".join(unmet_reqs),
+            )
             continue
 
         out.append(task)

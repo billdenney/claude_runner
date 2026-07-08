@@ -167,6 +167,50 @@ def test_show_corrupt_task(runner: CliRunner, queue_dir: Path) -> None:
     assert "task error" in result.stdout
 
 
+def _make_task_with_requires(qd: Path, task_id: str, rel_path: str) -> Task:
+    task = Task.model_validate(
+        {
+            "id": task_id,
+            "title": f"Task {task_id}",
+            "prompt": "do thing",
+            "requires": [{"kind": "file", "path": rel_path, "note": "the trimmed input"}],
+        }
+    )
+    write_task_atomic(task, task_path_for(qd, task_id))
+    return task
+
+
+def test_show_reports_unmet_requirement(runner: CliRunner, queue_dir: Path) -> None:
+    """`queue show` surfaces an unmet readiness requirement (ADR-0030)."""
+    _make_task_with_requires(queue_dir, "t1", "papers/x_trimmed.md")
+    result = runner.invoke(app, ["show", "t1", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "0/1 satisfied" in result.stdout
+    assert "missing file" in result.stdout
+    assert "the trimmed input" in result.stdout
+
+
+def test_show_reports_satisfied_requirement(runner: CliRunner, queue_dir: Path) -> None:
+    _make_task_with_requires(queue_dir, "t1", "papers/x_trimmed.md")
+    (queue_dir / "papers").mkdir()
+    (queue_dir / "papers" / "x_trimmed.md").write_text("x", encoding="utf-8")
+    result = runner.invoke(app, ["show", "t1", "--queue", str(queue_dir)])
+    assert result.exit_code == 0
+    assert "1/1 satisfied" in result.stdout
+
+
+def test_show_requirement_status_in_json(runner: CliRunner, queue_dir: Path) -> None:
+    _make_task_with_requires(queue_dir, "t1", "papers/x_trimmed.md")
+    result = runner.invoke(app, ["show", "t1", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["readiness"] == {
+        "required": 1,
+        "satisfied": 0,
+        "unmet": [f"missing file: {queue_dir / 'papers' / 'x_trimmed.md'} (the trimmed input)"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # `add` — input validation branches
 # ---------------------------------------------------------------------------

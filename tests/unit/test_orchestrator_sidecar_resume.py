@@ -482,3 +482,55 @@ def test_eligible_candidates_block_file_does_not_skip_other_tasks(queue_dir: Pat
     eligible = {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW, block_file=name)}
     assert "t-ready" in eligible
     assert "t-blocked" not in eligible
+
+
+# --- Mechanical readiness gates: `requires` (ADR-0030) -------------------
+#
+# A task waiting on a file is kept OUT of the candidate set by the selector
+# itself — no dispatch, no hook, no cooldown — and re-admitted the first tick
+# after the file appears. The file-wait analogue of the sidecar-response
+# gating already exercised above.
+
+
+def _make_task_requiring_file(task_id: str, rel_path: str) -> Task:
+    return Task(
+        id=task_id,
+        title=f"needs {rel_path}",
+        prompt="do the thing",
+        requires=[{"kind": "file", "path": rel_path}],  # type: ignore[list-item]
+    )
+
+
+def test_eligible_candidates_skips_task_with_unmet_file_requirement(queue_dir: Path) -> None:
+    """Pending task whose required file is absent: not selected — and no
+    dispatch is attempted to discover that (the check is in-process)."""
+    task = _make_task_requiring_file("t-needs-file", "papers/PMID_1/PMID_1_trimmed.md")
+    _write_task_yaml(queue_dir, task)
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert task.id not in {t.id for t in eligible}
+
+
+def test_eligible_candidates_admits_task_once_file_appears(queue_dir: Path) -> None:
+    """The instant the required file exists, the selector admits the task (a
+    later tick in production) — the mechanical unblock, no cooldown."""
+    task = _make_task_requiring_file("t-needs-file", "papers/PMID_1/PMID_1_trimmed.md")
+    _write_task_yaml(queue_dir, task)
+
+    assert task.id not in {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+
+    target = queue_dir / "papers" / "PMID_1" / "PMID_1_trimmed.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    assert task.id in {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+
+
+def test_eligible_candidates_unmet_requirement_does_not_block_ready_peer(queue_dir: Path) -> None:
+    """A file-blocked task must not suppress an unrelated ready task."""
+    blocked = _make_task_requiring_file("t-blocked-file", "never/there.md")
+    ready = _make_task("t-ready")
+    _write_task_yaml(queue_dir, blocked)
+    _write_task_yaml(queue_dir, ready)
+    eligible = {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+    assert "t-ready" in eligible
+    assert "t-blocked-file" not in eligible
