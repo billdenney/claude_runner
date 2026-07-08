@@ -11,6 +11,18 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **Opt-in dispatch block-list — `[dispatch].dispatch_block_file`
+  (ADR-0029).** A queue-relative JSONL of task ids the candidate selector
+  skips outright when flagged `"block_dispatch": true` — *without*
+  spawning a dispatch a pre-dispatch hook would only `exit 1` defer. Set
+  it to e.g. `"needs_acquisition.jsonl"` so an operator's known-blocked
+  parking (a paper awaiting a supplement/upstream) stops burning a
+  dispatch+defer cycle every `deferral_recheck_cooldown_s` — which, on a
+  low-`max_concurrency` account, briefly re-occupies the only slot each
+  cooldown. Fail-safe: a missing file / malformed line / row without the
+  flag means "not blocked", so a broken list never strands work. Unset
+  (the default) disables the feature; queues without the convention are
+  unaffected.
 - **Sidecar re-file loop guard (ADR-0027).** A task that keeps filing
   sidecars without committing any progress now gives up to
   `failed_circuit_breaker` (stop_reason `sidecar_refile_loop`) after
@@ -36,6 +48,23 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Deferred tasks no longer leak their in-flight concurrency slot
+  (ADR-0029).** `_reap_finished`'s subprocess-leak guard (ADR-0025) read
+  `runs[-1].pid` to decide whether a finished dispatch thread left a live
+  subprocess behind. A pre-dispatch `exit 1` deferral (ADR-0026) spawns
+  no worker and appends no run, so `runs[-1]` stayed pointing at a *prior*
+  real dispatch's pid — long exited, and often **recycled** by an
+  unrelated process (or owned by another user, which `_pid_alive` reports
+  alive on `EPERM`). The guard then mistook the recycled pid for a leaked
+  subprocess and **held the slot forever.** On a `max_concurrency: 1`
+  account this meant one `deferred` task pinned the only slot and the
+  account dispatched **0% for days** (observed live 2026-07-08 on the
+  `work` account: 614 runnable tasks starved behind 145 file-blocked
+  deferrals; two parked tasks had `deferral_count` 858/860 with real
+  prior `runs[-1].pid`s). `_recorded_subprocess_pid` now returns `None`
+  when the task is `deferred` — a deferral has no subprocess to guard, so
+  the slot frees on the next reap like any worker-less dispatch. The
+  genuine-leak path is unchanged for statuses that do append a run.
 - **Pre-dispatch hook `exit 1` deferrals no longer trip the circuit
   breaker — new parked `deferred` status (ADR-0026).** The hook's
   documented exit-code contract is `exit 1` = transient defer (an input

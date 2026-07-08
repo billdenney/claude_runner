@@ -386,6 +386,21 @@ working_dir_template = ""
 # ones that resolve to existing directories. Useful for queues whose
 # prompts inline source paths; off by default because absolute-path
 # strings in prose are not always directories (false positives).
+#
+# `dispatch_block_file` (ADR-0029) is an opt-in dispatch block-list,
+# relative to the queue dir. When set (e.g. "needs_acquisition.jsonl"),
+# the candidate selector skips any task whose id appears in a JSONL
+# entry marked `"block_dispatch": true` — WITHOUT spawning a dispatch a
+# pre-dispatch hook would only exit-1 defer. This stops a known-blocked
+# task (a paper awaiting a supplement, an upstream dependency, ...) from
+# burning a dispatch+defer cycle every `deferral_recheck_cooldown_s`,
+# which on a low-`max_concurrency` account briefly re-occupies the only
+# slot each cooldown. Fail-safe: a missing file / malformed line / row
+# without the flag means "not blocked" — the task dispatches and the
+# hook enforces the block, so a broken list never strands work. Unset
+# (the default) disables the feature; queues without the convention are
+# unaffected.
 # ---------------------------------------------------------------------------
 [dispatch]
 auto_detect_paths_in_prompt = false
+# dispatch_block_file = "needs_acquisition.jsonl"

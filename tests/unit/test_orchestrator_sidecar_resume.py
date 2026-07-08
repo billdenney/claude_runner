@@ -39,7 +39,10 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner.in_flight import DispatchSlot
-from claude_task_runner.runner.orchestrator import _eligible_candidates
+from claude_task_runner.runner.orchestrator import (
+    _dispatch_blocked_task_ids,
+    _eligible_candidates,
+)
 
 
 def _write_task_yaml(queue_dir: Path, task: Task) -> Path:
@@ -371,3 +374,111 @@ def test_deferred_without_next_eligible_at_is_eligible(queue_dir: Path) -> None:
     )
     eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
     assert task.id in {t.id for t in eligible}
+
+
+# --- Dispatch block-list: `block_dispatch: true` selector skip (ADR-0029) --
+#
+# Part 2 of the slot-leak fix. An operator flags a known-blocked task
+# (e.g. a paper awaiting a supplement) with `block_dispatch: true` in a
+# queue-relative JSONL (the `needs_acquisition.jsonl` convention). The
+# selector reads it and skips those tasks WITHOUT spending a
+# dispatch+defer cycle each cooldown. The reader is fail-safe: a missing
+# file / malformed line / non-matching row means "not blocked".
+
+
+def _write_block_file(queue_dir: Path, name: str, lines: list[str]) -> str:
+    (queue_dir / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return name
+
+
+def test_dispatch_blocked_task_ids_off_when_unset(queue_dir: Path) -> None:
+    """No configured block file → feature off → empty set (even if a file
+    with that content would exist elsewhere)."""
+    assert _dispatch_blocked_task_ids(queue_dir, None) == set()
+    assert _dispatch_blocked_task_ids(queue_dir, "") == set()
+
+
+def test_dispatch_blocked_task_ids_missing_file_is_empty(queue_dir: Path) -> None:
+    """Configured but absent file → empty set (fail-safe, not an error)."""
+    assert _dispatch_blocked_task_ids(queue_dir, "needs_acquisition.jsonl") == set()
+
+
+def test_dispatch_blocked_task_ids_reads_only_flagged_task_rows(queue_dir: Path) -> None:
+    """Mixed-content JSONL: only object rows with ``block_dispatch: true``
+    AND a non-empty string ``task`` contribute. Everything else — an
+    explicit ``false``, an index row, a ``target_path`` re-acquisition
+    row, a flagged row missing ``task``, a malformed line, a blank line —
+    is ignored."""
+    name = _write_block_file(
+        queue_dir,
+        "needs_acquisition.jsonl",
+        [
+            '{"task": "211-goulooze", "block_dispatch": true, "needed": "suppl"}',
+            '{"task": "400-metrum", "block_dispatch": true}',
+            '{"task": "999-cleared", "block_dispatch": false}',
+            '{"title": "some paper", "status": "INDEX_NEEDS_ACQUISITION"}',
+            '{"target_path": "papers/PMID_X/PMID_X.pdf"}',
+            '{"block_dispatch": true}',
+            "not valid json at all",
+            "",
+        ],
+    )
+    assert _dispatch_blocked_task_ids(queue_dir, name) == {"211-goulooze", "400-metrum"}
+
+
+def test_eligible_candidates_skips_blocked_pending_task(queue_dir: Path) -> None:
+    """A pending task (normally eligible on its first attempt) is skipped
+    when block-flagged — so the very first dispatch+defer is avoided —
+    and remains eligible when the feature is off."""
+    task = _make_task("t-blocked-pending")
+    _write_task_yaml(queue_dir, task)
+    name = _write_block_file(
+        queue_dir,
+        "needs_acquisition.jsonl",
+        ['{"task": "t-blocked-pending", "block_dispatch": true}'],
+    )
+
+    with_block = _eligible_candidates(queue_dir, {}, set(), now=_NOW, block_file=name)
+    assert task.id not in {t.id for t in with_block}
+
+    without_block = _eligible_candidates(queue_dir, {}, set(), now=_NOW, block_file=None)
+    assert task.id in {t.id for t in without_block}
+
+
+def test_eligible_candidates_skips_blocked_deferred_task_past_cooldown(queue_dir: Path) -> None:
+    """The churn case: a ``deferred`` task whose cooldown HAS elapsed is
+    normally re-dispatchable (see test_deferred_after_cooldown_is_eligible),
+    which is exactly the dispatch+defer loop the block-list short-circuits.
+    With the task block-flagged, the selector drops it before dispatch."""
+    task = _make_task("t-blocked-deferred")
+    _write_task_yaml(queue_dir, task)
+    write_state_atomic(
+        _make_deferred_state(task.id, _NOW - dt.timedelta(minutes=1)),
+        state_path_for(queue_dir, task.id),
+    )
+    name = _write_block_file(
+        queue_dir,
+        "needs_acquisition.jsonl",
+        ['{"task": "t-blocked-deferred", "block_dispatch": true}'],
+    )
+
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW, block_file=name)
+    assert task.id not in {t.id for t in eligible}
+
+
+def test_eligible_candidates_block_file_does_not_skip_other_tasks(queue_dir: Path) -> None:
+    """A block entry for one task must not suppress an unrelated ready
+    task sharing the same enumeration pass."""
+    blocked = _make_task("t-blocked")
+    ready = _make_task("t-ready")
+    _write_task_yaml(queue_dir, blocked)
+    _write_task_yaml(queue_dir, ready)
+    name = _write_block_file(
+        queue_dir,
+        "needs_acquisition.jsonl",
+        ['{"task": "t-blocked", "block_dispatch": true}'],
+    )
+
+    eligible = {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW, block_file=name)}
+    assert "t-ready" in eligible
+    assert "t-blocked" not in eligible

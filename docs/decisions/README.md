@@ -34,6 +34,9 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0024 | Multi-account session affinity | proposed | 2026-05-29 |
 | 0025 | Restart-survivable workers (worker adoption) | accepted | 2026-06-13 |
 | 0026 | Honor the pre-dispatch hook's exit-1 deferral contract (`deferred` status) | proposed | 2026-06-21 |
+| 0027 | Sidecar re-file loop guard | accepted | 2026-06-28 |
+| 0028 | Corrupt-state-file quarantine | accepted | 2026-06-29 |
+| 0029 | Release the in-flight slot on a pre-dispatch deferral | accepted | 2026-07-08 |
 
 ## Template
 

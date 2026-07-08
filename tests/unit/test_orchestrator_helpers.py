@@ -33,6 +33,7 @@ from claude_task_runner.runner.orchestrator import (
     _dispatch_one_safely,
     _has_any_completed,
     _reap_finished,
+    _recorded_subprocess_pid,
     _target_concurrency,
     tick_dispatch,
 )
@@ -437,6 +438,89 @@ def test_reap_finished_recovers_slot_when_pid_finally_dies(queue_dir: Path) -> N
         _reap_finished(d, queue_dir=queue_dir, clock=RealClock())
 
     assert "t1" not in d
+
+
+def test_recorded_subprocess_pid_returns_pid_for_running_task(queue_dir: Path) -> None:
+    """Non-deferred task: the helper returns ``runs[-1].pid`` so the leak
+    guard can probe the just-finished dispatch's subprocess."""
+    _seed_run_with_pid(queue_dir, "t1", pid=4242, status="running")
+    assert _recorded_subprocess_pid(queue_dir, "t1") == 4242
+
+
+def test_recorded_subprocess_pid_returns_none_for_deferred_task(queue_dir: Path) -> None:
+    """Deferred task (ADR-0029): the helper returns None despite a pid on
+    ``runs[-1]`` — that run belongs to an earlier real dispatch, not the
+    deferral (which spawned no subprocess and appended no run)."""
+    _seed_run_with_pid(queue_dir, "t1", pid=4242, status="deferred")
+    assert _recorded_subprocess_pid(queue_dir, "t1") is None
+
+
+def test_recorded_subprocess_pid_none_when_state_missing(queue_dir: Path) -> None:
+    """No state file → nothing to probe → None."""
+    assert _recorded_subprocess_pid(queue_dir, "nope") is None
+
+
+def test_reap_finished_frees_deferred_slot_despite_alive_pid(queue_dir: Path) -> None:
+    """Regression (ADR-0029): a ``deferred`` task frees its slot even when
+    ``runs[-1].pid`` probes alive — the deferral spawned no subprocess.
+
+    A pre-dispatch exit-1 deferral parks the task in ``deferred`` WITHOUT
+    spawning a worker and WITHOUT appending a RunRecord (ADR-0026), so
+    ``runs[-1]`` here is a STALE record from an earlier *real* dispatch.
+    Its OS pid has long exited and may now be RECYCLED by an unrelated
+    process — which ``_pid_alive`` reports alive (it even reports alive
+    on ``EPERM`` for a foreign-owned pid). Before the fix,
+    :func:`_recorded_subprocess_pid` handed that recycled pid to the leak
+    guard, which HELD the slot forever: one deferred task pinned a
+    low-concurrency account (``work`` at ``max_concurrency=1`` sat at 0%
+    dispatch for days). The deferring dispatch had nothing to leak, so
+    the slot MUST free and NO leak notification may fire — contrast
+    :func:`test_reap_finished_holds_slot_when_pid_is_alive`, which is the
+    identical setup but ``status="running"`` (a genuine leak, held)."""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    d = {"t1": slot}
+    # Stale prior run carries a real pid, but the task is now `deferred`.
+    _seed_run_with_pid(queue_dir, "t1", pid=12345, status="deferred")
+    notifs: list[tuple[str, str]] = []
+    events: list[tuple[str, dict]] = []
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=True,
+    ):
+        _reap_finished(
+            d,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            notify_callback=lambda level, msg: notifs.append((level, msg)),
+            event_callback=lambda name, payload: events.append((name, payload)),
+        )
+
+    assert "t1" not in d
+    assert slot.subprocess_leak_notified_at is None
+    assert notifs == []
+    assert events == []
+
+
+def test_reap_finished_still_holds_running_leak_after_deferral_fix(queue_dir: Path) -> None:
+    """The ADR-0029 deferral carve-out must NOT weaken the real leak guard:
+    a ``running`` task with a live ``runs[-1].pid`` is still a genuine
+    subprocess leak and its slot stays held. (Guards against a fix that
+    over-broadly returns None for any status.)"""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    d = {"t1": slot}
+    _seed_run_with_pid(queue_dir, "t1", pid=12345, status="running")
+
+    with patch(
+        "claude_task_runner.runner.dispatcher._pid_alive",
+        return_value=True,
+    ):
+        _reap_finished(d, queue_dir=queue_dir, clock=RealClock())
+
+    assert "t1" in d
+    assert slot.subprocess_leak_notified_at is not None
 
 
 def test_reap_finished_legacy_signature_still_frees_slot() -> None:
