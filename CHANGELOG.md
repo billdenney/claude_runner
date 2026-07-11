@@ -11,6 +11,20 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **Session-affinity TTL — `[dispatch].affinity_ttl_seconds` (default 1.5h).**
+  Session affinity (ADR-0024) pins a task to the account hosting its Claude
+  session, because a session created under one `CLAUDE_CONFIG_DIR` cannot be
+  resumed under another. But once the session has been idle past the TTL its
+  resume/cache value is spent (prompt-cache warmth is gone after ~1h), so if
+  the host account cannot take the task (throttled / paused / at-capacity) the
+  orchestrator now clears the session — the automatic form of `queue
+  restart-fresh` — and dispatches it fresh on any eligible account instead of
+  leaving it stranded on a throttled host while another account sits idle.
+  Affinity is still honoured while the host has capacity and for sessions
+  younger than the TTL; the feature never resumes a session on the wrong
+  account (it clears first, then dispatches fresh). Set `affinity_ttl_seconds`
+  very large to restore strict always-affinity behaviour.
+
 - **Mechanical readiness gates — `Task.requires` (ADR-0030).** A task can now
   declare no-AI, no-dispatch preconditions the supervisor's selector checks
   every tick: `requires: [{kind: "file", path: "<rel-or-abs>"}]` (the path
