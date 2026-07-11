@@ -663,6 +663,27 @@ class DispatchSettings(_StrictModel):
     (index rows, ``target_path`` re-acquisition rows) are ignored: the
     selector acts only on the task-keyed, explicitly-flagged block."""
 
+    affinity_ttl_seconds: float = 5400.0
+    """Session-affinity TTL, in seconds (default 5400 = 1.5h).
+
+    Session affinity (ADR-0024) pins a task to the account that hosts
+    its Claude session, because a session created under one
+    ``CLAUDE_CONFIG_DIR`` cannot be resumed under another. That gate is
+    load-bearing only while the session is worth resuming — once it has
+    been idle longer than this TTL its resume/cache value is spent
+    (prompt-cache warmth is gone after ~1h), so keeping the task
+    stranded on a busy/throttled host account only wastes throughput.
+
+    When the host account cannot take the task AND the session's last
+    activity is older than this TTL, the orchestrator clears the session
+    (the automatic form of ``queue restart-fresh``) and dispatches the
+    task fresh on any eligible account. Affinity is still honoured while
+    the host account has capacity (a resumable session prefers its home),
+    and for sessions younger than the TTL. Set very large to restore
+    strict always-affinity behaviour; the feature never wrongly resumes
+    a session on the wrong account (it clears first, then dispatches
+    fresh)."""
+
 
 class PlanSettings(_StrictModel):
     """Per-plan token budgets.

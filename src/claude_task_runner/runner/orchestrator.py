@@ -44,6 +44,7 @@ from claude_task_runner.queue.store import (
     load_state,
     load_task,
     state_path_for,
+    write_state_atomic,
 )
 from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
@@ -274,6 +275,37 @@ def tick_dispatch(
             in_flight=live_in_flight,
             affined_account=affined,
         )
+        # Session-affinity TTL (ADR-0024 extension): affinity blocked the
+        # dispatch (host account busy / throttled / paused), but if the
+        # session has been idle past the affinity TTL its resume/cache
+        # value is spent — so clear it and re-select on any eligible
+        # account rather than leaving the task stranded on its throttled
+        # host. Clearing first (session_id -> None) is what makes the
+        # cross-account dispatch safe: the next spawn starts FRESH instead
+        # of trying to resume a session that lives under the old account's
+        # CLAUDE_CONFIG_DIR. Affinity is still honoured while the host has
+        # capacity and for sessions younger than the TTL.
+        if choice.account is None and affined is not None:
+            ttl = getattr(getattr(settings, "dispatch", None), "affinity_ttl_seconds", 5400.0)
+            if _session_affinity_expired(queue_dir, task.id, now=clock.now(), ttl_seconds=ttl):
+                _clear_session_for_fresh_dispatch(queue_dir, task.id)
+                choice = account_dispatch_mod.choose_account(
+                    task=task,
+                    accounts=accounts_by_name,
+                    account_states=dict(snapshot.accounts),
+                    in_flight=live_in_flight,
+                    affined_account=None,
+                )
+                if choice.account is not None:
+                    logger.info(
+                        "task %s: session affinity expired (idle > %.0fs on "
+                        "host %r); cleared session, dispatching fresh via "
+                        "account=%s",
+                        task.id,
+                        ttl,
+                        affined,
+                        choice.account,
+                    )
         if choice.account is None:
             logger.info("dispatch skipped task %s: %s", task.id, choice.reason)
             continue
@@ -559,6 +591,64 @@ def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
     except Exception:
         return None
     return state.session_host_account()
+
+
+def _session_affinity_expired(
+    queue_dir: Path,
+    task_id: str,
+    *,
+    now: datetime,
+    ttl_seconds: float,
+) -> bool:
+    """True iff ``task_id`` has a session idle longer than ``ttl_seconds``.
+
+    Idleness is measured from the most recent of ``last_finished_at`` /
+    ``last_heartbeat_at`` / ``last_started_at``. Returns ``False`` when
+    the task has no state file, the state cannot be parsed, the task has
+    no ``session_id`` (nothing to expire), or no timestamp is available.
+    A non-positive ``ttl_seconds`` never expires (guards against a
+    misconfigured zero disabling affinity for every task).
+    """
+    if ttl_seconds <= 0:
+        return False
+    sp = state_path_for(queue_dir, task_id)
+    if not sp.exists():
+        return False
+    try:
+        state = load_state(sp)
+    except Exception:
+        return False
+    if state.session_id is None:
+        return False
+    last = state.last_finished_at or state.last_heartbeat_at or state.last_started_at
+    if last is None:
+        return False
+    return (now - last).total_seconds() > ttl_seconds
+
+
+def _clear_session_for_fresh_dispatch(queue_dir: Path, task_id: str) -> None:
+    """Clear a task's session so its next dispatch starts fresh anywhere.
+
+    The automatic, time-gated form of ``queue restart-fresh``: drops
+    ``session_id`` / ``session_account`` / ``resume_attempts`` so the
+    dispatcher spawns a new session (no ``--resume``) on whichever
+    account ``choose_account`` picks. Best-effort — a load/write failure
+    leaves the existing affinity intact (the task simply stays blocked
+    this tick rather than dispatching incorrectly).
+    """
+    sp = state_path_for(queue_dir, task_id)
+    try:
+        state = load_state(sp)
+        new_state = state.model_copy(
+            update={
+                "session_id": None,
+                "session_account": None,
+                "resume_attempts": 0,
+            }
+        )
+        write_state_atomic(new_state, sp)
+    except Exception:
+        pass
 
 
 def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[str]:
