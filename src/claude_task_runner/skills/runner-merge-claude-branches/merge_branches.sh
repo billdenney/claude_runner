@@ -350,6 +350,36 @@ union-merger script and the procedural rationale." >/dev/null
   fi
 fi
 
+# Collapse duplicate ### canonical headers the union-merger cannot fix.
+# When two branches each ADD the same brand-new ### CANONICAL block
+# (both branched from an older main), -X theirs leaves the canonical
+# registered twice. union_merge_lines.py folds Example-model lines but
+# does not collapse whole duplicate blocks, and verify_section_headers.py
+# checks headers survived, not that they are unique. This step collapses
+# them (whole-file uniqueness for the covariate register) and then gates:
+# a duplicate that somehow survives aborts the run rather than shipping.
+if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
+  echo
+  echo "==> Deduping duplicate canonical headers in $UNION_FILE"
+  PYTHON3="${PYTHON3:-$(command -v python3)}"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global "$UNION_FILE"
+  if ! git diff --quiet -- "$UNION_FILE"; then
+    git add "$UNION_FILE"
+    git commit -m "Dedup duplicate canonical headers in $UNION_FILE
+
+Two branches that each added the same brand-new ### CANONICAL block
+leave exact-duplicate H3 headings after the -X theirs bulk merge.
+Collapse each to a single entry, unioning example .R filenames." >/dev/null
+    echo "    committed canonical-header dedup"
+  else
+    echo "    no duplicate canonical headers."
+  fi
+  if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global --check "$UNION_FILE"; then
+    echo "ERROR: duplicate canonical headers remain in $UNION_FILE after dedup." >&2
+    exit 1
+  fi
+fi
+
 # Verify no per-branch contributions were lost. The verifier may
 # legitimately exit non-zero (e.g. a brand-new section header the
 # union-merger does not relocate; see SAPS_II in the 2026-05-20
