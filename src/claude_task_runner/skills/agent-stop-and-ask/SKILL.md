@@ -130,8 +130,12 @@ from pathlib import Path
 
 target = sidecar_dir / f"request-{sequence:03d}.json"
 with tempfile.NamedTemporaryFile(
-    mode="w", encoding="utf-8", dir=sidecar_dir,
-    delete=False, prefix=f".{target.name}.", suffix=".tmp",
+    mode="w",
+    encoding="utf-8",
+    dir=sidecar_dir,
+    delete=False,
+    prefix=f".{target.name}.",
+    suffix=".tmp",
 ) as tmp:
     json.dump(payload, tmp, indent=2, default=str)
     tmp.flush()

@@ -109,6 +109,21 @@ override per repo.
      preserving the most-informative annotation per filename.
    - Re-emits each Example-models line as a single deduplicated list.
 
+6b. **Dedup duplicate canonical headers** via
+   `dedup_canonical_headers.py --global inst/references/covariate-columns.md`.
+   The union-merger folds Example-model *lines* but cannot collapse a
+   whole duplicate `### CANONICAL` *block* — which is exactly what
+   survives when two branches each ADD the same brand-new canonical
+   (both branched from an older main, so `-X theirs` keeps one copy per
+   branch). `verify_section_headers.py` only checks headers *survived*,
+   not that they are *unique*, so these slip through (8 such pairs were
+   on origin/main on 2026-07-25). This step collapses each to one entry
+   (unioning example `.R` filenames) and then re-runs with `--check`;
+   any duplicate that survives **aborts the run**. `--global` (whole-file
+   uniqueness) is correct for the covariate register; the default
+   per-`##`-section scope is what you'd use on `compartment-names.md`,
+   where the same token is legitimately both a compartment and a suffix.
+
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh` which checks, per branch:
    every distinct `*.R` model filename the branch added to
