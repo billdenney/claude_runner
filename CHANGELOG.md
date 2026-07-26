@@ -9,6 +9,23 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Default model for newly-authored tasks is now **Opus 5**
+  (`claude-opus-5`), replacing `claude-opus-4-7` in `queue add`'s
+  `--model` default, the `Task.model` schema default, and the
+  `runner-add-task` skill. Opus 5 reaches the same result with fewer
+  tokens. `claude-sonnet-5` replaces `claude-sonnet-4-6` in the
+  documented model set; `claude-haiku-4-5` is unchanged (still current).
+  Previous-generation models stay registered in `[effort_levels]` so
+  queues with in-flight task YAMLs naming them keep dispatching rather
+  than raising `UnknownModel`. Cold-start `[ema.priors]` for the new
+  models are copied from their predecessors rather than lowered:
+  over-estimating token spend only paces the dispatcher more
+  conservatively, whereas under-estimating would over-dispatch into the
+  weekly cap, and the EMA converges on the real figures after a few
+  completions.
+
 ### Added
 
 - **Session-affinity TTL — `[dispatch].affinity_ttl_seconds` (default 1.5h).**

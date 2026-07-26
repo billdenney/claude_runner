@@ -397,7 +397,7 @@ def add_task(
         "--prompt",
         help="Inline prompt (use --prompt-file for long content).",
     ),
-    model: str = typer.Option("claude-opus-4-7", "--model", help="Model identifier."),
+    model: str = typer.Option("claude-opus-5", "--model", help="Model identifier."),
     effort: str = typer.Option("medium", "--effort", help="Effort level (validated per model)."),
     priority: str = typer.Option("normal", "--priority", help="low | normal | high"),
     allowed_tools: list[str] = typer.Option(

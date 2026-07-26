@@ -198,6 +198,30 @@ prior_warmup_samples        = 3
 runtime_p90_multiplier      = 1.5
 
 # Conservative cold-start priors per (model, effort). Override per queue.
+[ema.priors."claude-opus-5".low]
+tokens                      = 1_500_000
+duration_s                  = 600
+
+[ema.priors."claude-opus-5".medium]
+tokens                      = 2_500_000
+duration_s                  = 1200
+
+[ema.priors."claude-opus-5".high]
+tokens                      = 3_000_000
+duration_s                  = 1800
+
+[ema.priors."claude-opus-5".max]
+tokens                      = 6_000_000
+duration_s                  = 3600
+
+[ema.priors."claude-opus-5".extra_high]
+tokens                      = 10_000_000
+duration_s                  = 7200
+
+[ema.priors."claude-sonnet-5".medium]
+tokens                      = 1_000_000
+duration_s                  = 600
+
 [ema.priors."claude-opus-4-7".low]
 tokens                      = 1_500_000
 duration_s                  = 600
@@ -230,9 +254,13 @@ duration_s                  = 300
 # Effort levels per model (varies; updated as Anthropic adds/removes levels)
 # ---------------------------------------------------------------------------
 [effort_levels]
+"claude-opus-5"     = ["low", "medium", "high", "max", "extra_high"]
+"claude-sonnet-5"   = ["low", "medium", "high"]
+"claude-haiku-4-5"  = ["low", "medium", "high"]
+# Previous-generation models retained so queues with in-flight task YAMLs
+# that still name them keep dispatching instead of raising UnknownModel.
 "claude-opus-4-7"   = ["low", "medium", "high", "max", "extra_high"]
 "claude-sonnet-4-6" = ["low", "medium", "high"]
-"claude-haiku-4-5"  = ["low", "medium", "high"]
 
 # ---------------------------------------------------------------------------
 # Session resume

@@ -68,7 +68,7 @@ class TestPreDispatch:
         )
         assert result is not None
         assert result.exit_code == 0
-        assert result.stdout == "001-test|claude-opus-4-7|3"
+        assert result.stdout == "001-test|claude-opus-5|3"
 
     def test_session_id_empty_when_none(self, tmp_path: Path) -> None:
         script = tmp_path / "echo_session.py"
