@@ -200,7 +200,7 @@ class Task(_StrictBase):
     """Absolute cwd the dispatched agent runs in (exported to the pre-dispatch
     hook as ``$TASK_WORKING_DIR``). ``null`` lets the per-queue
     ``[queue].working_dir_template`` fill it, or means no worktree."""
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-5"
     """Model id to dispatch with; must be one the runner config knows."""
     effort: Effort = "medium"
     """Reasoning-effort level, validated against the per-model accepted set at

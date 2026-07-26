@@ -45,7 +45,7 @@ all at once.
 
 4. **Model** — `AskUserQuestion` with the configured models from
    `claude-task-runner usage whoami` (or hardcoded common set if you
-   can't read it: `claude-opus-4-7`, `claude-sonnet-4-6`,
+   can't read it: `claude-opus-5`, `claude-sonnet-5`,
    `claude-haiku-4-5`). Default opus for substantive work.
 
 5. **Effort** — `AskUserQuestion` with the per-model accepted set.
@@ -127,7 +127,7 @@ claude-task-runner queue add \
     --id 007-foo \
     --title "Extract Bar 2026 abciximab popPK" \
     --prompt-file /tmp/007-foo.prompt.txt \
-    --model claude-opus-4-7 \
+    --model claude-opus-5 \
     --effort high \
     --priority normal
 ```
