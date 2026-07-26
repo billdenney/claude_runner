@@ -54,14 +54,16 @@ ANY_HEAD = re.compile(r"^#{2,6}\s")  # any block boundary (## or ###+)
 EXR = re.compile(r"([A-Za-z0-9_]+\.R)")
 
 
-def _parse(lines):
-    """Return (heads, bounds, sect_of) where:
+Key = str | tuple[str, str]
+
+
+def _parse(lines: list[str]) -> tuple[list[tuple[int, str, str]], list[int]]:
+    """Return (heads, bounds) where:
     heads    = list of (line_idx, name, section) for each ### heading
     bounds   = sorted block-boundary indices (## / ### headings + EOF)
-    sect_of  = dict line_idx -> owning ## section name
     """
-    heads = []
-    bounds = set()
+    heads: list[tuple[int, str, str]] = []
+    bounds: set[int] = set()
     cur_sect = ""
     for i, ln in enumerate(lines):
         s = SECT2.match(ln)
@@ -73,51 +75,53 @@ def _parse(lines):
         if m:
             heads.append((i, m.group(1), cur_sect))
     bounds.add(len(lines))
-    return heads, sorted(bounds), None
+    return heads, sorted(bounds)
 
 
-def _block_end(i, bounds):
+def _block_end(i: int, bounds: list[int]) -> int:
     for b in bounds:
         if b > i:
             return b
     return bounds[-1]
 
 
-def _key(name, sect, global_unique):
+def _key(name: str, sect: str, global_unique: bool) -> Key:
     return name if global_unique else (sect, name)
 
 
-def find_dups(lines, global_unique=False):
+def find_dups(lines: list[str], global_unique: bool = False) -> dict[Key, list[int]]:
     """Return {key: [line_idx, ...]} for names appearing >1. Key is the
     bare name when ``global_unique`` else ``(section, name)``."""
-    heads, _, _ = _parse(lines)
-    groups = defaultdict(list)
+    heads, _ = _parse(lines)
+    groups: dict[Key, list[int]] = defaultdict(list)
     for i, name, sect in heads:
         groups[_key(name, sect, global_unique)].append(i)
     return {k: v for k, v in groups.items() if len(v) > 1}
 
 
-def dedup(lines, global_unique=False):
+def dedup(
+    lines: list[str], global_unique: bool = False
+) -> tuple[list[str], list[tuple[str, int, list[str]]]]:
     """Collapse duplicate ### blocks in place. Returns
     (new_lines, collapsed) where collapsed is a list of (name, n, extra)."""
-    heads, bounds, _ = _parse(lines)
-    groups = defaultdict(list)
-    names = {}
+    heads, bounds = _parse(lines)
+    groups: dict[Key, list[int]] = defaultdict(list)
+    names: dict[Key, str] = {}
     for i, name, sect in heads:
         k = _key(name, sect, global_unique)
         groups[k].append(i)
         names[k] = name
 
-    to_delete = []
-    collapsed = []
-    for k, idxs in groups.items():
+    to_delete: list[tuple[int, int]] = []
+    collapsed: list[tuple[str, int, list[str]]] = []
+    for key, idxs in groups.items():
         if len(idxs) < 2:
             continue
-        name = names[k]
+        name = names[key]
         blocks = [(i, _block_end(i, bounds)) for i in idxs]
-        keeper = max(blocks, key=lambda b: sum(len(lines[k]) for k in range(b[0], b[1])))
+        keeper = max(blocks, key=lambda b: sum(len(lines[n]) for n in range(b[0], b[1])))
         keep_ex = set(EXR.findall("\n".join(lines[keeper[0] : keeper[1]])))
-        extra = []
+        extra: list[str] = []
         for b in blocks:
             if b == keeper:
                 continue
@@ -127,12 +131,12 @@ def dedup(lines, global_unique=False):
                     extra.append(r)
             to_delete.append(b)
         if extra:
-            for k in range(keeper[0], keeper[1]):
-                if lines[k].lstrip().startswith("- **Example models:**"):
-                    t = lines[k].rstrip()
+            for j in range(keeper[0], keeper[1]):
+                if lines[j].lstrip().startswith("- **Example models:**"):
+                    t = lines[j].rstrip()
                     if t.endswith("."):
                         t = t[:-1]
-                    lines[k] = (
+                    lines[j] = (
                         t
                         + ", "
                         + ", ".join(f"`{r}`" for r in extra)
@@ -146,7 +150,7 @@ def dedup(lines, global_unique=False):
     return lines, collapsed
 
 
-def main(argv):
+def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("files", nargs="+")
     ap.add_argument(
