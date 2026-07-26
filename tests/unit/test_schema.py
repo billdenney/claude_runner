@@ -44,7 +44,7 @@ class TestTask:
     def test_minimal_valid(self) -> None:
         t = Task(id="001-foo", title="Foo", prompt="do foo")
         assert t.schema_version == CURRENT_SCHEMA_VERSION
-        assert t.model == "claude-opus-4-7"
+        assert t.model == "claude-opus-5"
         assert t.effort == "medium"
         assert t.priority == "normal"
         assert t.allowed_tools == []
