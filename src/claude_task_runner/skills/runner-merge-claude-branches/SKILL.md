@@ -155,7 +155,23 @@ override per repo.
     ```
 
     Renders every `vignettes/articles/*.Rmd` in a callr subprocess so a
-    single failure doesn't poison the others. Continues on failure and
+    single failure doesn't poison the others.
+
+    **The workers run against a DESCRIPTION-only library path** (default;
+    `--full-lib` opts out). The gate links only the packages declared in
+    DESCRIPTION's Depends/Imports/Suggests/LinkingTo, plus the render
+    harness (rmarkdown/knitr/callr/...), plus the transitive closure of
+    both — nothing else on the machine is visible. This exists because a
+    vignette that uses an UNDECLARED package renders fine locally (the
+    developer happens to have it installed) and then dies on the CI
+    runner, which installs only what DESCRIPTION declares. That is not
+    hypothetical: pkgdown failed on `Fu_2022_atenolol_qsp` with "there is
+    no package called 'units'" *after* this gate had passed all 1215
+    vignettes, because `units` was present on the dev box and absent in
+    CI. A gate that cannot go red for the thing CI goes red for is not a
+    gate. The worker also forces `knitr::opts_chunk$set(error = FALSE)`
+    so a chunk error fails the render instead of being written into the
+    HTML and reported as success. Continues on failure and
     writes a JSON-lines report (`.vignette_results.jsonl` in the
     worktree). The orchestrator script (`merge_branches.sh`) runs this
     automatically before push; in that script's own step list it is
