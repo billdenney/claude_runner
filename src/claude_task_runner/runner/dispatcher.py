@@ -1017,10 +1017,21 @@ class OutputEvidence:
     has_commit: bool
     has_sidecar: bool
     has_deliverable: bool
+    uncommitted: tuple[str, ...] = ()
 
     @property
     def any(self) -> bool:
         return self.has_commit or self.has_sidecar or self.has_deliverable
+
+    @property
+    def left_work_uncommitted(self) -> bool:
+        """True when the run ended with work still uncommitted in the worktree.
+
+        Distinct from ``any``: a clean SKIP legitimately produces a deliverable
+        and no commit, and leaves the worktree CLEAN. Work sitting uncommitted
+        means the run is not actually finished, whatever the report says.
+        """
+        return bool(self.uncommitted)
 
     def missed_gates(self) -> str:
         misses: list[str] = []
@@ -1031,6 +1042,35 @@ class OutputEvidence:
         if not self.has_deliverable:
             misses.append("no declared deliverable on disk")
         return "; ".join(misses)
+
+
+def _uncommitted_paths(working_dir: Path) -> list[str]:
+    """Return uncommitted (modified/untracked, non-ignored) paths in the worktree.
+
+    A clean-exit run that leaves work uncommitted is the failure mode ADR-0020's
+    original gate could not see: the worker writes its deliverable REPORT, so
+    ``has_deliverable`` is True and the run is judged ``completed``, while the
+    actual product -- new model files, edited registers -- sits untracked in the
+    worktree forever. The task is never re-dispatched (it is "done"), and the
+    work is one ``git worktree remove`` from silent loss. Observed twice on the
+    nlmixr2lib queue: 23 models across 5 worktrees (2026-07-27) and 2 more
+    (2026-07-30), every one of them marked ``completed``.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("post-dispatch dirty check failed for %s: %s", working_dir, exc)
+        return []
+    if completed.returncode != 0:
+        return []
+    return [ln[3:].strip() for ln in completed.stdout.splitlines() if ln.strip()]
 
 
 def _verify_output_evidence(
@@ -1062,10 +1102,23 @@ def _verify_output_evidence(
             has_deliverable = True
             break
 
+    # A declared deliverable written INTO the worktree (a report, say) is a
+    # legitimate uncommitted file -- it is the run's output, not abandoned
+    # product. Exclude it so the gate below fires only on real leftover work.
+    deliverable_rel: set[str] = set()
+    for rel in task.deliverable_paths:
+        try:
+            candidate = rel if rel.is_absolute() else working_dir / rel
+            deliverable_rel.add(str(candidate.resolve().relative_to(working_dir.resolve())))
+        except (ValueError, OSError):
+            continue
+    leftover = tuple(pth for pth in _uncommitted_paths(working_dir) if pth not in deliverable_rel)
+
     return OutputEvidence(
         has_commit=has_commit,
         has_sidecar=has_open_sidecar,
         has_deliverable=has_deliverable,
+        uncommitted=leftover,
     )
 
 
@@ -2014,6 +2067,29 @@ def _finalize_state(
                 update={
                     "stop_reason": "end_turn_no_output",
                     "error": (f"no observable output produced ({evidence.missed_gates()})"),
+                }
+            )
+        elif evidence.left_work_uncommitted:
+            # The run produced SOMETHING (usually the deliverable report) but
+            # left work uncommitted. That is not "completed": the product is
+            # untracked in the worktree, the task will never be re-dispatched,
+            # and the next `git worktree remove` destroys it silently.
+            #
+            # A genuine skip is unaffected -- it writes its report and leaves a
+            # CLEAN worktree, so this branch is not taken.
+            n = len(evidence.uncommitted)
+            sample = ", ".join(evidence.uncommitted[:5])
+            if n > 5:
+                sample += f", ... (+{n - 5} more)"
+            new_status = "failed"
+            run = run.model_copy(
+                update={
+                    "stop_reason": "uncommitted_work_left",
+                    "error": (
+                        f"run ended with {n} uncommitted path(s) in the worktree; "
+                        f"the work is not committed to the task branch and would be "
+                        f"lost when the worktree is reclaimed: {sample}"
+                    ),
                 }
             )
 
