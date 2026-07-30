@@ -5,6 +5,8 @@
 #   1. Pre-flight survey (which branches have unmerged commits)
 #   2. Worktree creation off the configured base
 #   3. Sequential merge with -X theirs
+#   3b. Resurrected-path guard (re-remove files the base deleted that a
+#       stale branch brought back via -X theirs)
 #   4. R-side registry regeneration (buildModelDb + document)
 #   5. Union-merge of covariate-columns.md (recovers the annotations
 #      -X theirs would have lost)
@@ -28,6 +30,13 @@
 #                           verify_branch_contributions.sh.
 #   --branch-name <name>    New consolidation branch name
 #                           (default: merge-all-claude-branches-<YYYY-MM-DD>).
+#   --forbid-path <path>    Repo-relative path that must NOT come back if the
+#                           BASE has deleted it. After merging, if the path is
+#                           absent on --base but present in the merge result, a
+#                           stale branch resurrected it via -X theirs; the guard
+#                           re-removes it and commits. No-op while the base
+#                           still has the path. Repeatable. Default:
+#                           inst/modeldb.qs2. Pass "" to disable.
 #   --union-file <path>     Structured markdown file requiring union merge
 #                           (default: inst/references/covariate-columns.md).
 #                           Pass "" to disable the union step.
@@ -66,6 +75,7 @@ BASE="origin/main"
 PATTERN="origin/claude/*"
 BRANCH_NAME=""
 UNION_FILE="inst/references/covariate-columns.md"
+FORBID_PATHS=("inst/modeldb.qs2")
 SKIP_R_REGEN=0
 SKIP_CHECK=0
 SKIP_VIGNETTES=0
@@ -79,7 +89,7 @@ EXTRA_REFS=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,51p' "$0" | sed 's/^# \?//'
+  sed -n '2,60p' "$0" | sed 's/^# \?//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -90,6 +100,11 @@ while [[ $# -gt 0 ]]; do
     --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
     --branch-name) BRANCH_NAME="$2"; shift 2 ;;
     --union-file) UNION_FILE="$2"; shift 2 ;;
+    --forbid-path)
+      if [[ -z "$2" ]]; then FORBID_PATHS=(); else
+        if [[ "${FORBID_PATHS[*]}" == "inst/modeldb.qs2" ]]; then FORBID_PATHS=(); fi
+        FORBID_PATHS+=("$2")
+      fi; shift 2 ;;
     --skip-r-regen) SKIP_R_REGEN=1; shift ;;
     --skip-check) SKIP_CHECK=1; shift ;;
     --skip-vignettes) SKIP_VIGNETTES=1; shift ;;
@@ -258,6 +273,36 @@ for br in "${UNMERGED[@]}"; do
     SUCCESS=$((SUCCESS+1))
     MERGED_LIST+=("$short")
   else
+    # modify/delete on a base-deleted path is EXPECTED, not a real conflict:
+    # the base dropped the file on purpose and this branch predates that, so it
+    # still regenerates it (e.g. every model branch rewrites inst/modeldb.qs2
+    # via buildModelDb). git cannot resolve modify/delete with -X theirs, so
+    # without this the merge aborts and a perfectly good branch is skipped.
+    # Resolve it the only correct way -- keep the deletion -- and finish the
+    # merge. Anything else still aborts and is logged.
+    mapfile -t UNRES < <(git diff --name-only --diff-filter=U)
+    autoresolve=0
+    if (( ${#FORBID_PATHS[@]} > 0 )) && (( ${#UNRES[@]} > 0 )); then
+      autoresolve=1
+      for u in "${UNRES[@]}"; do
+        hit=0
+        for fp in "${FORBID_PATHS[@]}"; do [[ "$u" == "$fp" ]] && { hit=1; break; }; done
+        (( hit )) || { autoresolve=0; break; }
+        # only auto-resolve if the BASE really deleted it
+        if git cat-file -e "${BASE}:${u}" 2>/dev/null; then autoresolve=0; break; fi
+      done
+    fi
+    if (( autoresolve )); then
+      for u in "${UNRES[@]}"; do
+        git rm -q -f --ignore-unmatch "$u" >/dev/null 2>&1 || rm -f "$u"
+      done
+      if git commit -q --no-edit >/dev/null 2>&1; then
+        SUCCESS=$((SUCCESS+1))
+        MERGED_LIST+=("$short")
+        echo "      modify/delete on base-deleted path(s) -> kept deleted: ${UNRES[*]}"
+        continue
+      fi
+    fi
     FAIL=$((FAIL+1))
     FAILED_LIST+=("$short")
     echo "      FAIL — conflicted files -X theirs could not resolve:"
@@ -279,6 +324,53 @@ fi
 if (( SUCCESS == 0 )); then
   echo "ERROR: no merges succeeded; nothing to push." >&2
   exit 4
+fi
+
+# ---------------------------------------------------------------------------
+# Resurrected-path guard.
+#
+# `-X theirs` happily restores a file the BASE deliberately deleted, if any
+# stale source branch still carries it. The branch predates the deletion, so
+# there is no conflict for git to report -- the file simply reappears, and the
+# consolidation silently undoes a structural change.
+#
+# The case this was written for: nlmixr2lib dropped `inst/modeldb.qs2` and now
+# ships `inst/modeldb.rds`, so readModelDb() no longer needs `qs2` (which was
+# only in Suggests yet used unconditionally). Every claude/* branch cut before
+# that lands still contains modeldb.qs2, so the next consolidation would
+# resurrect it and quietly reintroduce the bug.
+#
+# The check is conditional on the BASE, so it is correct both before and after
+# such a removal lands: if the base still HAS the path, nothing is forbidden
+# yet and this is a no-op.
+# ---------------------------------------------------------------------------
+if (( ${#FORBID_PATHS[@]} > 0 )); then
+  echo
+  echo "==> Checking for paths resurrected by the merge"
+  resurrected=()
+  for p in "${FORBID_PATHS[@]}"; do
+    if git cat-file -e "${BASE}:${p}" 2>/dev/null; then
+      echo "    '$p' still exists on ${BASE} -- not forbidden yet, skipping."
+      continue
+    fi
+    if [[ -e "$p" ]] || git ls-files --error-unmatch "$p" >/dev/null 2>&1; then
+      echo "    RESURRECTED: '$p' is absent on ${BASE} but present after merging."
+      git rm -q -f --ignore-unmatch "$p" 2>/dev/null || rm -f "$p"
+      resurrected+=("$p")
+    else
+      echo "    ok: '$p' stayed deleted."
+    fi
+  done
+  if (( ${#resurrected[@]} > 0 )); then
+    git commit -q -m "Re-remove path(s) resurrected by the merge
+
+-X theirs restored the following from source branches that predate the
+deletion on ${BASE}: ${resurrected[*]}
+
+The base deleted these deliberately; a stale branch still carrying the old
+file must not undo that. Removed again."
+    echo "    committed re-removal of ${#resurrected[@]} path(s)"
+  fi
 fi
 
 # R-side registry regeneration.
