@@ -11,6 +11,29 @@ Breaking changes are called out in the version notes.
 
 ### Changed
 
+- **`requires` (ADR-0030) is enforced on every dispatch path, and a held
+  task now says so.** The selector already checked `requires` for every
+  resume status — including an `awaiting_sidecar` task whose sidecars have
+  all been answered — but nothing pinned that, and two paths bypassed the
+  check outright: `force_dispatch.tick_consume` and
+  `dispatch_synchronously` spawn a dispatch without consulting the selector.
+  Force-dispatch overrides the *throttle*; an unmet `requires` says the
+  input the run reads is not on disk, so forcing past it only buys a worker
+  that re-discovers the gap and exits. Both force paths now refuse and name
+  the missing element, and `_dispatch_one_safely` — the thread entrypoint
+  every dispatch path funnels through — re-checks as a structural backstop
+  (which also closes the selector's select-then-spawn race). A regression
+  test enumerates every resume status against an unsatisfied requirement in
+  both directions.
+- A task the readiness gate holds is now parked as `deferred` with a
+  `readiness hold: <reasons>` reason instead of being an invisible per-tick
+  skip, so `queue list` shows why it has never run. No `next_eligible_at` is
+  set — a cooldown would forfeit ADR-0030's promise to unblock the first
+  tick after the element appears — and the park is written only on
+  transition, leaves `attempts` / `runs` untouched, and clears itself back
+  to `pending` once the requirement is satisfied. The marker scopes the
+  self-healing: an operator's manual park and the pre-dispatch hook's exit-1
+  deferral carry different reasons and are never cleared or overwritten.
 - Default model for newly-authored tasks is now **Opus 5**
   (`claude-opus-5`), replacing `claude-opus-4-7` in `queue add`'s
   `--model` default, the `Task.model` schema default, and the

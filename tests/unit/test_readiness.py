@@ -18,7 +18,13 @@ from pydantic import ValidationError
 from claude_task_runner.queue.schema import ReadinessRequirement, Task
 from claude_task_runner.queue.sidecar import write_request
 from claude_task_runner.queue.store import queue_runtime_dir
-from claude_task_runner.runner.readiness import is_ready, unmet_requirements
+from claude_task_runner.runner.readiness import (
+    HOLD_REASON_PREFIX,
+    hold_reason,
+    is_hold_reason,
+    is_ready,
+    unmet_requirements,
+)
 
 
 def _task(**overrides: object) -> Task:
@@ -178,3 +184,36 @@ def _sidecar_request(task_id: str, seq: int):
             )
         ],
     )
+
+
+# --- Hold-reason vocabulary ---------------------------------------------
+#
+# The marker is what lets the runner distinguish a hold IT parked (and may
+# therefore clear on its own) from an operator's manual park or the
+# pre-dispatch hook's exit-1 deferral, which it must never touch.
+
+
+def test_hold_reason_carries_the_marker_and_every_reason() -> None:
+    reason = hold_reason(["missing file: /q/a.md", "awaiting sidecar response"])
+    assert reason.startswith(HOLD_REASON_PREFIX)
+    assert "missing file: /q/a.md" in reason
+    assert "awaiting sidecar response" in reason
+
+
+def test_is_hold_reason_recognises_its_own_output() -> None:
+    assert is_hold_reason(hold_reason(["missing file: /q/a.md"]))
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "",
+        "PARKED 2026-08-06: blocked on a missing parameter",
+        "pre-dispatch hook deferred (exit 1): awaiting trim",
+        # Near-miss: the words appear but not as the marker prefix.
+        "operator note - readiness hold: not ours",
+    ],
+)
+def test_is_hold_reason_rejects_reasons_it_did_not_write(reason: str | None) -> None:
+    assert not is_hold_reason(reason)

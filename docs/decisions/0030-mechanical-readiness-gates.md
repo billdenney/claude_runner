@@ -111,3 +111,47 @@ wait off the dispatch machinery entirely.
 High. The gate is additive: a task with no `requires` behaves exactly as
 before. Reverting means deleting the field + the one selector call; no
 persisted state depends on it.
+
+## Amendment (2026-08-07) — enforcement scope and visibility
+
+Two under-specifications in the decision above, both surfaced by an operator
+report that the gate was being skipped on the `awaiting_sidecar` resume path.
+It was not — the selector check sits after the status branching and did hold
+those tasks (the report's evidence predated this ADR: the attempts it cited
+were logged 2026-06-06, a month before the gate shipped, and the `requires:`
+entries were added to those task YAMLs on 2026-07-26). But investigating it
+showed the claim was *plausible* precisely because nothing pinned or
+publicised the behaviour.
+
+1. **"Evaluation in the selector" was read as "the selector is the only
+   gate."** It is the only gate on the *normal* path, but
+   `force_dispatch.tick_consume` / `dispatch_synchronously` spawn a dispatch
+   without consulting the selector at all. Force-dispatch is scoped to
+   overriding the **throttle**; a `requires` element is not a throttle but a
+   statement that the run's input is absent, so forcing past one buys a
+   worker that can only re-discover the gap and exit. The gate is now
+   enforced at three sites: the selector (for every resume status),
+   `_dispatch_one_safely` — the thread entrypoint every path funnels
+   through, making the invariant structural rather than per-caller — and
+   both force-dispatch entrypoints, which now refuse and name the missing
+   element. `tests/unit/test_orchestrator_sidecar_resume.py` enumerates the
+   resume statuses (`pending`, `failed`, `deferred` past cooldown,
+   `awaiting_sidecar` fully answered, and no state file) against an
+   unsatisfied requirement in both directions, so a special case added to
+   the status branching cannot quietly route around the gate.
+
+2. **A held task was invisible.** The consequences above anticipated a
+   `queue why-blocked` command that was never built, so a hold was a
+   per-tick debug log and nothing else: `queue list` still showed the task
+   `pending`, and operators resorted to hand-parking blocked tasks with a
+   written-out `deferred_reason` to leave any trace at all. The selector now
+   records the hold on the task's state as `deferred` with a
+   `readiness hold: <reasons>` reason. Deliberately with **no**
+   `next_eligible_at`: a cooldown would forfeit this ADR's core promise of
+   unblocking the first tick after the element appears, and the every-tick
+   re-check is already the gate. The park is written only on transition (not
+   per tick), never touches `attempts` / `runs`, and clears itself back to
+   `pending` once the requirement is satisfied. The `readiness hold:` marker
+   scopes that self-healing: an operator's manual park and the pre-dispatch
+   hook's exit-1 deferral carry different reasons and are never cleared or
+   overwritten by this gate.

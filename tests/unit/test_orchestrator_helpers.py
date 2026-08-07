@@ -20,6 +20,7 @@ import pytest
 from claude_task_runner.clock import RealClock
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
+    load_state,
     queue_runtime_dir,
     state_path_for,
     task_path_for,
@@ -27,6 +28,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
     _completed_task_ids,
@@ -951,3 +953,82 @@ def test_dispatch_one_safely_logs_exceptions(queue_dir: Path) -> None:
     ):
         # Must not raise.
         _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_one_safely: the readiness backstop (ADR-0030)
+#
+# Every dispatch path funnels through this function — the orchestrator's
+# selector and force_dispatch.tick_consume both spawn it — so the gate here
+# is what makes "`requires` is checked on every dispatch decision" hold
+# structurally instead of depending on each caller remembering to ask. It
+# also covers the selector's inherent race: candidates are chosen once per
+# tick, and a requirement can be withdrawn between selection and spawn.
+# ---------------------------------------------------------------------------
+
+
+def _task_requiring(qd: Path, task_id: str, rel_path: str) -> Task:
+    return _make_task(qd, task_id, requires=[{"kind": "file", "path": rel_path}])
+
+
+def test_dispatch_one_safely_refuses_when_requirement_unmet(queue_dir: Path) -> None:
+    """No spawn at all — not a spawn that fails downstream."""
+    task = _task_requiring(queue_dir, "t1", "inputs/missing.md")
+    settings = _make_settings()
+    calls: list[Any] = []
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+        side_effect=lambda **kw: calls.append(kw),
+    ):
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
+
+    assert calls == []
+
+
+def test_dispatch_one_safely_records_the_hold_it_refused_on(queue_dir: Path) -> None:
+    """A refusal an operator can read, not a silent no-op in a thread."""
+    task = _task_requiring(queue_dir, "t1", "inputs/missing.md")
+    settings = _make_settings()
+
+    with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch"):
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
+
+    state = load_state(state_path_for(queue_dir, task.id))
+    assert state.status == "deferred"
+    assert readiness.is_hold_reason(state.deferred_reason)
+    assert "missing.md" in (state.deferred_reason or "")
+
+
+def test_dispatch_one_safely_dispatches_once_requirement_is_met(queue_dir: Path) -> None:
+    """The gate is not a one-way door: with the file present it spawns."""
+    task = _task_requiring(queue_dir, "t1", "inputs/present.md")
+    target = queue_dir / "inputs" / "present.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+    settings = _make_settings()
+    calls: list[Any] = []
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+        side_effect=lambda **kw: calls.append(kw),
+    ):
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
+
+    assert len(calls) == 1
+
+
+def test_dispatch_one_safely_without_requires_is_unaffected(queue_dir: Path) -> None:
+    """Empty `requires` (the default, and the vast majority of tasks) must
+    not acquire a new failure mode from the backstop."""
+    task = _make_task(queue_dir, "t1")
+    settings = _make_settings()
+    calls: list[Any] = []
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+        side_effect=lambda **kw: calls.append(kw),
+    ):
+        _dispatch_one_safely(task, queue_dir, settings, RealClock(), "claude", "", None, "default")
+
+    assert len(calls) == 1

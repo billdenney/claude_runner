@@ -701,6 +701,75 @@ def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[s
     return blocked
 
 
+def _record_readiness_hold(
+    queue_dir: Path,
+    task_id: str,
+    state: TaskState | None,
+    reason: str,
+) -> None:
+    """Park a task the readiness gate is holding as ``deferred`` + ``reason``.
+
+    Makes a mechanical hold VISIBLE. Without this the gate is silent: the
+    selector skips the task on every tick with only a debug log, so
+    ``queue list`` still shows it ``pending`` and an operator investigating
+    "why has this never run?" has nothing to read. That gap is what forced
+    hand-parking five refharvest tasks with a hand-written
+    ``deferred_reason`` on 2026-08-06.
+
+    Deliberately writes NO ``next_eligible_at``. A cooldown would break the
+    ADR-0030 promise that a held task dispatches the first tick after its
+    element appears: the `deferred` branch in :func:`_eligible_candidates`
+    falls straight through when ``next_eligible_at`` is unset, so the
+    readiness check itself stays the only gate and re-admission is immediate.
+
+    Writes only on TRANSITION (when the persisted status/reason differ), so
+    a queue holding hundreds of blocked tasks costs one write each — not one
+    per task per tick. ``attempts`` / ``runs`` are untouched: a hold is not
+    an attempt and must never feed the circuit breaker.
+    """
+    if state is not None and state.status == "deferred" and state.deferred_reason == reason:
+        return  # already parked with this exact reason — no rewrite, no churn
+    base = state if state is not None else TaskState(task_id=task_id)
+    new_state = base.model_copy(
+        update={
+            "status": "deferred",
+            "deferred_reason": reason,
+            "next_eligible_at": None,
+        }
+    )
+    sp = state_path_for(queue_dir, task_id)
+    try:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        write_state_atomic(new_state, sp)
+    except Exception as exc:
+        # Best-effort bookkeeping: the task is already being skipped by the
+        # caller, so a failed write costs visibility, never correctness.
+        logger.warning("could not record readiness hold for task %s: %s", task_id, exc)
+
+
+def _clear_readiness_hold(queue_dir: Path, task_id: str, state: TaskState | None) -> None:
+    """Un-park a task whose readiness hold (and only ours) is now satisfied.
+
+    Restores ``pending`` and clears the reason so the state stops claiming a
+    block that no longer exists. Scoped by
+    :func:`readiness.is_hold_reason`: an operator's manual park and the
+    pre-dispatch hook's exit-1 deferral carry different reasons and are left
+    exactly as they are — self-healing must never quietly undo a human's
+    decision to hold a task.
+    """
+    if state is None or state.status != "deferred":
+        return
+    if not readiness_mod.is_hold_reason(state.deferred_reason):
+        return
+    new_state = state.model_copy(
+        update={"status": "pending", "deferred_reason": None, "next_eligible_at": None}
+    )
+    try:
+        write_state_atomic(new_state, state_path_for(queue_dir, task_id))
+    except Exception as exc:
+        logger.warning("could not clear readiness hold for task %s: %s", task_id, exc)
+
+
 def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: dict[str, DispatchSlot],
@@ -747,6 +816,11 @@ def _eligible_candidates(
         if task.id in in_flight_ids:
             continue
 
+        # ``state`` stays in scope past this block: the readiness gate below
+        # needs it to record / clear a hold, and it must apply to a task that
+        # has no state file yet (never dispatched) exactly as it does to one
+        # resuming from awaiting_sidecar, deferred, or failed.
+        state: TaskState | None = None
         sp = state_path_for(queue_dir, task.id)
         if sp.exists():
             try:
@@ -815,6 +889,13 @@ def _eligible_candidates(
         # first tick after the element appears. The open-sidecar set is
         # already computed above; share it so a `sidecar_response` gate is a
         # free set lookup. Empty `requires` (the default) → no-op.
+        #
+        # This sits AFTER the per-status branching on purpose, so it is the
+        # last word for EVERY resume path — pending, failed, deferred past
+        # its cooldown, and awaiting_sidecar whose requests have all been
+        # answered. `test_orchestrator_sidecar_resume.py` enumerates those
+        # statuses against an unsatisfied requirement so a future special
+        # case added above cannot quietly route around the gate.
         unmet_reqs = readiness_mod.unmet_requirements(
             task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids
         )
@@ -825,7 +906,12 @@ def _eligible_candidates(
                 len(unmet_reqs),
                 "; ".join(unmet_reqs),
             )
+            _record_readiness_hold(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
             continue
+
+        # Satisfied — if THIS gate is what parked the task, un-park it so the
+        # state stops advertising a block that has cleared.
+        _clear_readiness_hold(queue_dir, task.id, state)
 
         out.append(task)
     return out
@@ -848,6 +934,16 @@ def _dispatch_one_safely(
     :func:`runner.account_dispatch.choose_account` and routed through to
     :func:`runner.dispatcher.dispatch` so the spawned ``claude``
     subprocess hits the right account's credentials (and uid).
+
+    Re-checks the ADR-0030 readiness gate immediately before spawning. This
+    is the LAST chokepoint every dispatch path funnels through — the
+    orchestrator's selector and :func:`runner.force_dispatch.tick_consume`
+    both spawn this exact function — so enforcing here makes "``requires``
+    is checked on every dispatch decision" hold structurally rather than by
+    each caller remembering to ask. It also closes the selector's inherent
+    race: candidates are chosen once per tick, and a requirement can be
+    withdrawn (a re-acquisition park deleting a bad trim) between selection
+    and spawn.
     """
     sp = state_path_for(queue_dir, task.id)
     if sp.exists():
@@ -857,6 +953,17 @@ def _dispatch_one_safely(
             state = TaskState(task_id=task.id)
     else:
         state = TaskState(task_id=task.id)
+
+    unmet_reqs = readiness_mod.unmet_requirements(task, queue_dir)
+    if unmet_reqs:
+        logger.warning(
+            "refusing to dispatch task %s: %d unmet readiness requirement(s): %s",
+            task.id,
+            len(unmet_reqs),
+            "; ".join(unmet_reqs),
+        )
+        _record_readiness_hold(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
+        return
 
     try:
         plan = plan_next_spawn(task, state, settings=settings.session)

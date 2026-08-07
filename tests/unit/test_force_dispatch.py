@@ -978,3 +978,80 @@ class TestForceDispatchCLI:
         state_path_for(queue_dir, "t1").write_text("not yaml: ][", encoding="utf-8")
         # Loop returns False (never sees a real running status) within the budget.
         assert _poll_until_running(queue_dir, "t1", wait_seconds=0.6) is False
+
+
+class TestForceDispatchReadinessGate:
+    """Force overrides the THROTTLE, not a missing input (ADR-0030).
+
+    A `requires` element says the file this run reads is not on disk. Forcing
+    past one buys a worker that can only discover the gap, file a sidecar and
+    exit — the dispatch/re-file loop the gate exists to prevent. So both
+    force paths enforce it, and both say which element is missing.
+    """
+
+    def test_tick_consume_refuses_task_with_unmet_requirement(self, queue_dir: Path) -> None:
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/missing.md"}])
+        _seed_state(queue_dir, "t1", "pending")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread") as spawn:
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+
+        assert n == 0
+        spawn.assert_not_called()
+
+    def test_tick_consume_consumes_the_refused_request(self, queue_dir: Path) -> None:
+        """Dropped, not left to fire later: a "force NOW" that silently
+        re-arms itself would surprise the operator, and the ordinary selector
+        admits the task the tick after the file appears anyway."""
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/missing.md"}])
+        _seed_state(queue_dir, "t1", "pending")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread"):
+            fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+
+        assert fd_mod.list_requests(queue_dir) == []
+
+    def test_tick_consume_dispatches_once_requirement_is_met(self, queue_dir: Path) -> None:
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/present.md"}])
+        _seed_state(queue_dir, "t1", "pending")
+        target = queue_dir / "inputs" / "present.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("trimmed", encoding="utf-8")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread") as spawn:
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+
+        assert n == 1
+        spawn.assert_called_once()
+
+    def test_dispatch_synchronously_raises_naming_the_missing_element(
+        self, queue_dir: Path
+    ) -> None:
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/missing.md"}])
+        _seed_state(queue_dir, "t1", "pending")
+
+        with pytest.raises(fd_mod.ForceDispatchError, match=r"missing\.md"):
+            fd_mod.dispatch_synchronously(
+                task_id="t1",
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+            )
