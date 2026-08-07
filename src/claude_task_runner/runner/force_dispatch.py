@@ -16,9 +16,15 @@ supervisor (no race with the supervisor's own dispatch loop):
 2. The supervisor's tick loop calls :func:`tick_consume` BEFORE the
    throttle gate. It scans the request directory, revalidates each
    task (still in ``todo/``, still in a dispatchable status, not
-   already in-flight), respects ``max_concurrency`` unless the
-   request was written with ``allow_over_limit=True``, and spawns
-   exactly the same per-task dispatch thread the orchestrator does.
+   already in-flight, ``requires`` satisfied), respects
+   ``max_concurrency`` unless the request was written with
+   ``allow_over_limit=True``, and spawns exactly the same per-task
+   dispatch thread the orchestrator does.
+
+The bypass is scoped to the THROTTLE. The ADR-0030 ``requires`` gate is
+still enforced on both paths: those elements are mechanical preconditions
+on the run's inputs, so forcing past one only buys a worker that discovers
+the missing file and exits.
 
 For the "no supervisor running" case (CLI smoke tests, local
 fixture-queue debugging), :func:`dispatch_synchronously` runs one
@@ -54,6 +60,7 @@ from claude_task_runner.queue.store import (
     task_path_for,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.session import plan_next_spawn
 
@@ -69,8 +76,9 @@ class ForceDispatchError(RuntimeError):
 
     Reasons: task YAML missing from ``todo/``, task already in a
     non-dispatchable status (``running``, ``awaiting_sidecar``,
-    ``completed``, ``failed_circuit_breaker``), or, in the
-    synchronous path, ``claude`` is not on PATH.
+    ``completed``, ``failed_circuit_breaker``), an unmet ADR-0030
+    ``requires`` element, or, in the synchronous path, ``claude`` is
+    not on PATH.
     """
 
 
@@ -296,6 +304,28 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
+        # Mechanical readiness (ADR-0030). Force-dispatch bypasses the
+        # THROTTLE — that is its whole purpose — but a `requires` element is
+        # not a throttle: it says the input this run reads is not on disk.
+        # Forcing past it spawns a worker that can only discover the gap and
+        # exit, which is exactly the dispatch/re-file loop the gate exists to
+        # prevent. Drop the request (matching the not-dispatchable branch
+        # above) and name the missing element, so the operator sees WHY their
+        # force did not fire. Once the element appears the ordinary selector
+        # admits the task on the next tick without a second force.
+        unmet_reqs = readiness.unmet_requirements(task, queue_dir)
+        if unmet_reqs:
+            logger.warning(
+                "force-dispatch %s: %d unmet readiness requirement(s) "
+                "(%s); dropping request — force overrides the throttle, "
+                "not a missing input",
+                task.id,
+                len(unmet_reqs),
+                "; ".join(unmet_reqs),
+            )
+            consume_request(queue_dir, task.id)
+            continue
+
         if not req.allow_over_limit and len(in_flight_slots) >= cap:
             logger.warning(
                 "force-dispatch %s: in-flight=%d >= max_concurrency=%d; leaving request",
@@ -440,6 +470,16 @@ def dispatch_synchronously(
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
     if state.status not in _FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
+
+    # ADR-0030, same reasoning as tick_consume: force overrides the throttle,
+    # not a missing input. Raising (rather than dispatching into a guaranteed
+    # no-op run) tells the CLI operator exactly which element to place.
+    unmet_reqs = readiness.unmet_requirements(task, queue_dir)
+    if unmet_reqs:
+        raise ForceDispatchError(
+            f"task {task.id} has {len(unmet_reqs)} unmet readiness "
+            f"requirement(s): {'; '.join(unmet_reqs)}"
+        )
 
     accounts = resolve_accounts(settings)
     accounts_by_name = {a.name: a for a in accounts}

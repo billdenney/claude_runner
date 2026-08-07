@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -34,10 +35,13 @@ from claude_task_runner.queue.schema import (
 )
 from claude_task_runner.queue.sidecar import write_request, write_response
 from claude_task_runner.queue.store import (
+    load_state,
     queue_runtime_dir,
     state_path_for,
     write_state_atomic,
 )
+from claude_task_runner.runner import orchestrator as orchestrator_mod
+from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
     _dispatch_blocked_task_ids,
@@ -58,6 +62,15 @@ def _write_task_yaml(queue_dir: Path, task: Task) -> Path:
         encoding="utf-8",
     )
     return p
+
+
+def _raise_oserror(msg: str) -> Callable[..., None]:
+    """A write_state_atomic stand-in that always fails."""
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError(msg)
+
+    return _boom
 
 
 def _make_task(task_id: str = "t1") -> Task:
@@ -534,3 +547,288 @@ def test_eligible_candidates_unmet_requirement_does_not_block_ready_peer(queue_d
     eligible = {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
     assert "t-ready" in eligible
     assert "t-blocked-file" not in eligible
+
+
+# --- `requires` binds on EVERY resume path, not just the first dispatch ---
+#
+# The gate sits after all the per-status branching in `_eligible_candidates`,
+# so it is the last word for every status that reaches it. The tests above
+# only ever exercised a never-dispatched (`pending`) task, which left the
+# RESUME paths — awaiting_sidecar-answered, deferred-past-cooldown, failed —
+# unpinned: a future special case added to the status branching could return
+# or fall through around the gate and nothing would go red.
+#
+# The awaiting_sidecar row is the one that matters most operationally,
+# because that status re-enters the eligible set purely because a response
+# file appeared. A task that stopped to ask "where is this PDF?" must not be
+# grandfathered back in by the answer alone while the file is still absent —
+# it would dispatch, re-discover the gap, re-file, and loop.
+
+
+def _requires_task_in_status(
+    queue_dir: Path,
+    task_id: str,
+    status: str,
+    *,
+    rel_path: str = "inputs/never_trimmed.md",
+) -> Task:
+    """Write a task requiring an absent file, parked in ``status``.
+
+    ``awaiting_sidecar`` gets a filed AND answered request, so the resume
+    branch admits it on sidecar grounds and only `requires` can hold it.
+    """
+    task = _make_task_requiring_file(task_id, rel_path)
+    _write_task_yaml(queue_dir, task)
+    if status == "awaiting_sidecar":
+        write_state_atomic(
+            _make_state_awaiting_sidecar(task_id), state_path_for(queue_dir, task_id)
+        )
+        write_request(queue_dir, _make_request(task_id, 1))
+        write_response(queue_dir, _make_response(task_id, 1))
+    elif status == "deferred":
+        # Cooldown already elapsed → the deferred branch falls through.
+        write_state_atomic(
+            _make_deferred_state(task_id, _NOW - dt.timedelta(minutes=1)),
+            state_path_for(queue_dir, task_id),
+        )
+    elif status != "no-state":
+        write_state_atomic(
+            TaskState(task_id=task_id, status=status, attempts=1),
+            state_path_for(queue_dir, task_id),
+        )
+    return task
+
+
+# Every status from which a task can reach the readiness gate. Enumerated
+# rather than sampled: a status added to `_DISPATCHABLE_STATUSES` or given
+# its own resume branch must be added here too, and until it is, this list
+# is the record of what was actually verified.
+_RESUME_STATUSES = ["no-state", "pending", "failed", "deferred", "awaiting_sidecar"]
+
+
+@pytest.mark.parametrize("status", _RESUME_STATUSES)
+def test_unmet_requirement_blocks_dispatch_from_every_resume_status(
+    queue_dir: Path, status: str
+) -> None:
+    """THE regression test. An unsatisfied `requires` keeps the task out of
+    the candidate set no matter which status it is resuming from — including
+    awaiting_sidecar with every request answered."""
+    sub = queue_dir / f"q-{status}"
+    queue_runtime_dir(sub).mkdir(parents=True, exist_ok=True)
+    (sub / "todo").mkdir(parents=True, exist_ok=True)
+    task = _requires_task_in_status(sub, f"t-{status}", status)
+
+    eligible = _eligible_candidates(sub, {}, set(), now=_NOW)
+
+    assert task.id not in {t.id for t in eligible}
+
+
+@pytest.mark.parametrize("status", _RESUME_STATUSES)
+def test_satisfied_requirement_admits_from_every_resume_status(
+    queue_dir: Path, status: str
+) -> None:
+    """The other half of the contract: the gate must not become a one-way
+    door. With the file present, every one of those statuses dispatches —
+    proving the block above is the requirement and not the status."""
+    sub = queue_dir / f"q-{status}"
+    queue_runtime_dir(sub).mkdir(parents=True, exist_ok=True)
+    (sub / "todo").mkdir(parents=True, exist_ok=True)
+    task = _requires_task_in_status(sub, f"t-{status}", status)
+    target = sub / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    eligible = _eligible_candidates(sub, {}, set(), now=_NOW)
+
+    assert task.id in {t.id for t in eligible}
+
+
+def test_answered_sidecar_alone_does_not_readmit_a_file_blocked_task(
+    queue_dir: Path,
+) -> None:
+    """The live failure mode in one test: answering the sidecar is what makes
+    an awaiting_sidecar task eligible again, and that must NOT be enough when
+    the input it asked about is still missing. Placing the file is."""
+    task = _requires_task_in_status(queue_dir, "t-refharvest", "awaiting_sidecar")
+
+    # Sidecar answered, file absent → still held.
+    assert task.id not in {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+
+    target = queue_dir / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    # File placed → admitted on the very next tick, no cooldown to wait out.
+    assert task.id in {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+
+
+# --- Self-healing: a held task records WHY, and un-parks itself ----------
+#
+# Before this, a held task was skipped with only a debug log — `queue list`
+# still showed it `pending`, so the block was invisible and operators
+# hand-parked tasks with a written-out `deferred_reason` to leave a trace.
+
+
+def _state_of(queue_dir: Path, task_id: str) -> TaskState:
+    return load_state(state_path_for(queue_dir, task_id))
+
+
+def test_unmet_requirement_parks_task_as_deferred_with_reason(queue_dir: Path) -> None:
+    """The hold is recorded on the state so it is visible to the operator."""
+    task = _requires_task_in_status(queue_dir, "t-held", "pending")
+
+    _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+
+    state = _state_of(queue_dir, task.id)
+    assert state.status == "deferred"
+    assert readiness.is_hold_reason(state.deferred_reason)
+    assert "never_trimmed.md" in (state.deferred_reason or "")
+
+
+def test_readiness_hold_sets_no_cooldown(queue_dir: Path) -> None:
+    """No `next_eligible_at`: a cooldown would delay re-admission past the
+    tick the file appears, which is exactly what ADR-0030 promises not to
+    do. The readiness re-check every tick IS the gate."""
+    task = _requires_task_in_status(queue_dir, "t-held", "pending")
+    _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert _state_of(queue_dir, task.id).next_eligible_at is None
+
+
+def test_readiness_hold_does_not_count_as_an_attempt(queue_dir: Path) -> None:
+    """A hold is not a run: `attempts` / `runs` stay untouched so a
+    long-blocked task can never drift toward the circuit breaker."""
+    task = _requires_task_in_status(queue_dir, "t-held", "failed")
+    before = _state_of(queue_dir, task.id)
+    _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    after = _state_of(queue_dir, task.id)
+    assert (after.attempts, after.runs) == (before.attempts, before.runs)
+
+
+def test_readiness_hold_is_written_once_not_every_tick(queue_dir: Path) -> None:
+    """Write on transition only. The selector runs every tick over the whole
+    pool, so a re-write per tick per blocked task would be a state-churn
+    storm on a queue with hundreds of them."""
+    task = _requires_task_in_status(queue_dir, "t-held", "pending")
+    _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    sp = state_path_for(queue_dir, task.id)
+    first_mtime = sp.stat().st_mtime_ns
+
+    for _ in range(3):
+        _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+
+    assert sp.stat().st_mtime_ns == first_mtime
+
+
+def test_readiness_hold_clears_itself_once_the_file_appears(queue_dir: Path) -> None:
+    """Self-heal: the queue recovers without operator action."""
+    task = _requires_task_in_status(queue_dir, "t-held", "pending")
+    _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert _state_of(queue_dir, task.id).status == "deferred"
+
+    target = queue_dir / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+
+    assert task.id in {t.id for t in eligible}
+    state = _state_of(queue_dir, task.id)
+    assert state.status == "pending"
+    assert state.deferred_reason is None
+
+
+def test_readiness_hold_never_clears_an_operator_park(queue_dir: Path) -> None:
+    """An operator's manual park carries a hand-written reason and a far-future
+    cooldown. Self-healing must not undo a human's decision to hold a task —
+    only holds this gate itself wrote."""
+    task = _make_task_requiring_file("t-parked", "inputs/never_trimmed.md")
+    _write_task_yaml(queue_dir, task)
+    parked = TaskState(
+        task_id=task.id,
+        status="deferred",
+        deferred_reason="PARKED 2026-08-06: blocked on a missing parameter",
+        next_eligible_at=dt.datetime(2027, 1, 1, tzinfo=dt.UTC),
+    )
+    write_state_atomic(parked, state_path_for(queue_dir, task.id))
+    target = queue_dir / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+
+    assert task.id not in {t.id for t in eligible}
+    state = _state_of(queue_dir, task.id)
+    assert state.status == "deferred"
+    assert state.deferred_reason == parked.deferred_reason
+    assert state.next_eligible_at == parked.next_eligible_at
+
+
+def test_readiness_hold_does_not_overwrite_a_hook_deferral_reason_when_ready(
+    queue_dir: Path,
+) -> None:
+    """A pre-dispatch exit-1 deferral past its cooldown owns its own reason.
+    With the requirement satisfied the task dispatches (and the dispatcher
+    rewrites the state), so the gate must leave that reason alone rather
+    than clearing a park it did not create."""
+    task = _make_task_requiring_file("t-hook-deferred", "inputs/never_trimmed.md")
+    _write_task_yaml(queue_dir, task)
+    hook_parked = _make_deferred_state(task.id, _NOW - dt.timedelta(minutes=1))
+    write_state_atomic(hook_parked, state_path_for(queue_dir, task.id))
+    target = queue_dir / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+
+    assert task.id in {t.id for t in eligible}
+    assert _state_of(queue_dir, task.id).deferred_reason == hook_parked.deferred_reason
+
+
+# --- Hold bookkeeping is best-effort ------------------------------------
+#
+# Recording (or clearing) a hold is VISIBILITY, not correctness: the gating
+# decision is already made by the time the write is attempted. A read-only
+# state dir, a full disk, or a permissions problem must therefore degrade to
+# a warning — never propagate out of the selector and abort the whole tick,
+# which would strand every other ready task in the queue.
+
+
+def test_failed_hold_write_does_not_break_the_selector(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = _requires_task_in_status(queue_dir, "t-held", "pending")
+    ready = _make_task("t-ready")
+    _write_task_yaml(queue_dir, ready)
+    monkeypatch.setattr(
+        orchestrator_mod, "write_state_atomic", _raise_oserror("state dir read-only")
+    )
+
+    eligible = {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}
+
+    assert blocked.id not in eligible
+    assert "t-ready" in eligible  # the tick still serves everyone else
+
+
+def test_failed_hold_clear_does_not_break_the_selector(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _make_task_requiring_file("t-held", "inputs/never_trimmed.md")
+    _write_task_yaml(queue_dir, task)
+    write_state_atomic(
+        TaskState(
+            task_id=task.id,
+            status="deferred",
+            deferred_reason=readiness.hold_reason(["missing file: /q/inputs/never_trimmed.md"]),
+        ),
+        state_path_for(queue_dir, task.id),
+    )
+    target = queue_dir / "inputs" / "never_trimmed.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("trimmed", encoding="utf-8")
+    monkeypatch.setattr(
+        orchestrator_mod, "write_state_atomic", _raise_oserror("state dir read-only")
+    )
+
+    # Un-parking is bookkeeping too: a failure to record it must not keep a
+    # now-ready task out of the candidate set.
+    assert task.id in {t.id for t in _eligible_candidates(queue_dir, {}, set(), now=_NOW)}

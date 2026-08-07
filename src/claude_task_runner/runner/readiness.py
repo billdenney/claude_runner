@@ -7,6 +7,24 @@ probe — a filesystem ``exists()`` or a set membership test — so it is safe t
 run for the whole pending pool every tick. Nothing here spawns a worker, runs
 a hook subprocess, writes state, or consults an LLM.
 
+The gate binds on EVERY dispatch decision, not just the first. Three call
+sites enforce it, and each exists because a task can reach a spawn without
+passing the one before it:
+
+* the selector, for every resume status — ``pending``, ``failed``,
+  ``deferred`` past its cooldown, and ``awaiting_sidecar`` whose requests
+  have all been answered (that last one re-enters the eligible set purely
+  because a response file appeared, so it must be re-gated, not grandfathered
+  in on the strength of having been dispatched before);
+* :func:`runner.orchestrator._dispatch_one_safely`, the thread entrypoint
+  every path funnels through, as the structural backstop;
+* :mod:`runner.force_dispatch`, whose operator override is scoped to the
+  throttle and not to a missing input.
+
+When the selector holds a task it records the reason on the task's state as
+a ``deferred`` park (see :data:`HOLD_REASON_PREFIX`), so a mechanical block is
+visible in ``queue list`` rather than being an invisible skip.
+
 This exists so a task *waiting on a file* behaves like a task *waiting on a
 sidecar response* always has: parked purely by the selector, re-checked every
 tick, and dispatched the instant the element appears — instead of being
@@ -94,3 +112,21 @@ def is_ready(
 ) -> bool:
     """True iff ``task`` has no unmet readiness requirements."""
     return not unmet_requirements(task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids)
+
+
+#: Marker every runner-written readiness hold reason starts with. It is what
+#: distinguishes a hold this gate parked (and may therefore un-park on its own,
+#: the moment the requirement is satisfied) from an operator's manual
+#: ``deferred_reason`` or the pre-dispatch hook's exit-1 deferral — neither of
+#: which the runner may silently overwrite or clear.
+HOLD_REASON_PREFIX = "readiness hold: "
+
+
+def hold_reason(unmet: list[str]) -> str:
+    """Format ``unmet`` reasons into the ``deferred_reason`` the gate writes."""
+    return HOLD_REASON_PREFIX + "; ".join(unmet)
+
+
+def is_hold_reason(reason: str | None) -> bool:
+    """True iff ``reason`` is a ``deferred_reason`` this gate wrote."""
+    return reason is not None and reason.startswith(HOLD_REASON_PREFIX)
