@@ -42,3 +42,11 @@ Thumbs.db
 ~/.claude_task_runner/
 *.cap
 !tests/fixtures/usage/*.cap
+
+# Per-task git worktrees created inside the repo (Claude Code / the runner's
+# own dispatch hooks put one here per task). They are checkouts, not sources.
+# Left untracked-but-not-ignored they show in `git status` forever, and any
+# tooling that treats a dirty tree as "do not touch" — including the
+# housekeeping pass's fast-forward of the default branch — silently declines
+# to act. Scoped to worktrees/ so tracked .claude/ config stays tracked.
+.claude/worktrees/
