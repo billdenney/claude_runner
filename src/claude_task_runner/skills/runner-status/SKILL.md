@@ -31,7 +31,8 @@ process liveness (PID + etime + cmd), `supervisor.json` fields
 (state / 5h / weekly / in_flight / since / scheduled_wakeup / drift),
 state-file status breakdown (completed / failed / running /
 awaiting_sidecar / possibly_hung / failed_circuit_breaker), todo/
-count, open-sidecar list (task_id + sequence), and a **per-account
+count, open-sidecar list (task_id + sequence + the outstanding
+question ids), and a **per-account
 state table** sourced from supervisor.json's v3 `accounts` map
 (state, 5h/weekly util, paused, in-flight count, reset + wakeup
 times, last-capture timestamp). Multi-account queues see one row
@@ -82,6 +83,13 @@ or recent failures), follow the prioritized triage flow below.
       `claude-task-runner queue states --status awaiting_sidecar
       --queue <CWD> --json` and report count + task IDs. Suggest
       `/runner-answer-sidecar` if any.
+
+      Report the **question** count alongside the request count: sidecars
+      are open per question (ADR-0031), so one request can owe four
+      answers, and a request whose response answered only some of its
+      questions is still open. `sidecar list --json` carries both as
+      `n_open` and `n_outstanding_questions`. Never report "0 open
+      sidecars" off the request count alone.
 
    5. **Hung tasks** — run with `--status possibly_hung`. Report each.
 

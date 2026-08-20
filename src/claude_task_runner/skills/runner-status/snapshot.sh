@@ -225,16 +225,35 @@ import json
 import os
 with open(os.environ["SC_FILE"]) as f:
     d = json.load(f)
-n = len(d.get("sidecars", []))
-print(f"**Open sidecars**: {n}")
+rows = d.get("sidecars", [])
+n = d.get("n_open", len(rows))
+# Openness is per QUESTION (ADR-0031): one request can hold several
+# unanswered ids, and a request whose response answered only some of them
+# is still open. Reporting requests alone understates the work owed.
+nq = d.get("n_outstanding_questions")
+if nq is None:
+    nq = sum(len(s.get("outstanding") or []) for s in rows)
+print(f"**Open sidecars**: {n} request(s), {nq} unanswered question(s)")
 print()
 if n == 0:
     print("(none)")
 else:
-    print("| task_id | sequence |")
-    print("|---|---|")
-    for s in d["sidecars"]:
-        print(f"| {s['task_id']} | {s.get('sequence','?')} |")
+    print("| task_id | sequence | outstanding | state |")
+    print("|---|---|---|---|")
+    for s in rows:
+        out = ", ".join(s.get("outstanding") or []) or "-"
+        answered = s.get("answered") or []
+        if s.get("error"):
+            state = "unreadable"
+        elif s.get("partial") and answered:
+            state = "partial (answered: %s)" % ", ".join(answered)
+        elif s.get("partial"):
+            # A response exists but credits none of the asked ids -- usually
+            # an answer written against the wrong question id.
+            state = "unmatched response"
+        else:
+            state = "unanswered"
+        print(f"| {s['task_id']} | {s.get('sequence','?')} | {out} | {state} |")
 PY
 else
   echo "**Open sidecars**: claude-task-runner not on PATH"

@@ -60,8 +60,8 @@ runner accepts JSON with these fields:
       "id": "q1",
       "prompt": "<the actual question — concrete and answerable>",
       "options": [
-        {"value": "A", "label": "<short choice>", "description": "<what happens if the operator picks this>"},
-        {"value": "B", "label": "<short choice>", "description": "<what happens if the operator picks this>"}
+        {"value": "A", "label": "<short choice>", "description": "<what happens if the operator picks this>", "proposed_names": []},
+        {"value": "B", "label": "<short choice>", "description": "<what happens if the operator picks this>", "proposed_names": []}
       ],
       "recommended": "A",
       "multi_select": false,
@@ -73,7 +73,9 @@ runner accepts JSON with these fields:
 
 Required fields per question:
 
-- `id` — short identifier (`q1`, `q2`, ...).
+- `id` — short identifier (`q1`, `q2`, ...). **Unique within the request.**
+  The runner tracks answers per question id, so two questions sharing an id
+  collapse into one and the second silently never gets answered.
 - `prompt` — the operator-facing question. Phrase it so a click on
   one of your options is enough; never a yes/no without options.
 - `options[]` — at least 2 concrete choices. Common pattern for an
@@ -91,6 +93,51 @@ Optional but recommended:
   together (rare).
 - `allow_free_text` — set true to let the operator type a custom
   answer. Default false (forces a click).
+
+### 1b. If you are proposing a canonical name, make it machine-readable
+
+Naming questions — "ratify `FED_HIGHFAT` as the canonical covariate for a
+high-fat meal" — are the single largest category of sidecar traffic, and
+they are the most mechanically triageable: a queue-side script can
+collision-check a proposed name against the project's registers and
+auto-approve it under the operator's standing rule, without the operator
+reading anything. That only works if a machine can tell which token is the
+proposed name.
+
+**Two rules, both required:**
+
+1. **Put the names in `proposed_names`** on each option that would create
+   or adopt them. This is the authoritative, structured field:
+
+   ```json
+   {"value": "A",
+    "label": "Adopt `MEAL_INTERVAL` as the canonical name",
+    "description": "New canonical; no existing register entry covers dose-to-meal interval.",
+    "proposed_names": ["MEAL_INTERVAL"]}
+   ```
+
+   Multiple names per option are fine (`["CLCR", "CLCR_CG"]`). Leave it
+   `[]` — or omit it — on options that propose no name ("skip this task",
+   "defer to the operator").
+
+2. **Also write each name in backticks inside `label`**, exactly as it
+   would appear in code. The operator reads the label, not the JSON, and a
+   backticked token shows them precisely which string they are ratifying.
+
+**Why both.** The structured field is what a script should read. Backticks
+are the fallback for anything that misses it, and they are the reason to
+never write a proposed name as bare prose. Recovering names from prose was
+tried on a real backlog and abandoned: it pulled ordinary English words
+("other", "label", "scope", "list"), producing both bogus collision hits
+and — far worse — false clean results, where a question looked
+collision-free only because the actual names were never checked. Of 118
+naming questions, only 10 could be cleared mechanically; the other 88
+failed purely because their names were not backticked.
+
+- ❌ `"label": "Use the high fat meal covariate name"`
+- ❌ `"label": "Adopt FED_HIGHFAT"` — extractable only by guessing which
+  bare word is the name.
+- ✅ `"label": "Adopt \`FED_HIGHFAT\`"` + `"proposed_names": ["FED_HIGHFAT"]`
 
 ### 2. Compute the sequence number
 
@@ -174,8 +221,10 @@ because your subprocess is still alive.
    error, or even cap-killed).
 2. The runner's `runner.dispatcher.dispatch` post-run code scans
    `<queue>/.claude_task_runner/sidecar/<task_id>/` for an unanswered
-   request (any `request-NNN.json` without a matching
-   `response-NNN.json`).
+   request. "Unanswered" is judged **per question**: a request is open
+   while any `questions[].id` it asked is missing from the response's
+   `answers[].id`. A `response-NNN.json` that answers only `q1` of a
+   `q1`/`q2`/`q3` request leaves the task waiting on `q2` and `q3`.
 3. If found, it overrides the task's final status to
    `awaiting_sidecar` regardless of how you exited.
 4. The orchestrator's eligibility check skips `awaiting_sidecar`
@@ -218,6 +267,11 @@ runner's job badly.
 - ❌ "I'll set `allow_free_text: true` so the operator can type
   anything." — most decisions are between a small set of options;
   free-text is a fallback, not a default.
+- ❌ "I'll reuse `q1` for both questions." — ids are the unit of
+  answer accounting; a duplicate id means one question is never answered.
+- ❌ "I'll name the proposed canonical in the description prose." — put it
+  in `proposed_names` and in backticks in the label, or it stays manual
+  forever.
 
 ## See also
 

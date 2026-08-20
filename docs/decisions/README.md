@@ -38,6 +38,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0028 | Corrupt-state-file quarantine | accepted | 2026-06-29 |
 | 0029 | Release the in-flight slot on a pre-dispatch deferral | accepted | 2026-07-08 |
 | 0030 | Mechanical readiness gates (`Task.requires`) | accepted | 2026-07-08 |
+| 0031 | Sidecar openness is accounted per QUESTION, not per file | accepted | 2026-08-20 |
 
 ## Template
 
