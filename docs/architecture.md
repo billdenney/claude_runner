@@ -181,8 +181,6 @@ Operators extend behavior without code changes:
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.
-- **Notification channels**: set `[notify].channels` to any subset of
-  `["desktop", "file", "webhook", "email"]`.
 - **EMA priors per (model, effort)**: edit `[ema.priors.<model>.<effort>]`.
 - **Task templates**: drop Jinja2 templates into
   `~/.claude_task_runner/templates/` or per-queue `templates/`.

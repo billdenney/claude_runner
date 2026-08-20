@@ -87,9 +87,6 @@ shows many tasks waiting.
 1. From Claude Code, `/runner-answer-sidecar` lists all open sidecars.
 2. Walk through them; each click resolves one (no typing needed for the
    common case).
-3. To enable auto-pick of the recommended option after N hours, set
-   `[sidecar].unanswered_auto_recommended_s = 86400`. Off by default
-   because auto-resolution is project-sensitive.
 
 ## Cron / systemd watchdog not installed
 
