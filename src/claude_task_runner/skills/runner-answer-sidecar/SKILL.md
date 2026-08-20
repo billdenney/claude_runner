@@ -39,9 +39,11 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
    {
      "queue": "<dir>",
      "n_open": <int>,
+     "n_outstanding_questions": <int>,
      "sidecars": [
        {"task_id": "...", "sequence": N,
         "summary": "...", "context": "...",
+        "outstanding": ["q2", "q3"], "answered": ["q1"], "partial": true,
         "questions": [{"id": "...", "prompt": "...", "options": [...],
                        "multi_select": <bool>, "allow_free_text": <bool>,
                        "recommended": "..."}]},
@@ -54,7 +56,17 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
    the raw file directly and synthesising a v2-shaped record with a
    `schema_warning` field so the agent can still present them.
 
+   **`questions[]` holds only the questions still outstanding.** A sidecar
+   is open per QUESTION, not per file: a request that asked `q1`/`q2`/`q3`
+   whose response answered only `q1` is still open on `q2` and `q3`, and
+   arrives here with `partial: true`, `answered: ["q1"]`. Present only what
+   `questions[]` contains — re-asking `q1` wastes the operator's clicks.
+
 2. **If `n_open == 0`**, tell the user "No open sidecars." and stop.
+
+   Report **`n_outstanding_questions`**, not just `n_open`, whenever you
+   state how much is pending. One request can hold four unanswered
+   questions; the request count understates the work.
 
 3. **Present a one-paragraph summary per sidecar to the operator.**
    Don't dump the full context block — it's often multi-paragraph and
@@ -99,15 +111,45 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
    ...
    ```
 
+   **Every question the request asked must be answered in one call.**
+   `sidecar answer` rewrites `response-NNN.json` wholesale and refuses
+   (exit 3) a response that omits any asked id — that refusal is what
+   stops partially-answered sidecars being created. If the sidecar came
+   back `partial: true`, add **`--merge`**: it carries the recorded
+   answers for ids you did not supply forward from the existing response,
+   so answering just the outstanding questions still produces a complete
+   one.
+
+   ```bash
+   claude-task-runner sidecar answer <tid> <seq> --queue $QUEUE --merge \
+       --answers '[{"id":"q2","value":"<answer2>"},{"id":"q3","value":"<answer3>"}]'
+   ```
+
    For multi-select questions, `value` is a JSON array of the chosen
    option values. For free-text "Other" answers, `value` is the
    operator's free-text string verbatim — no validation, no sanitization.
+   An optional per-answer `"notes"` string is accepted alongside `value`.
+
+   `--allow-partial` exists to force a write that leaves questions open.
+   **Do not reach for it to make a rejection go away** — the omitted
+   questions stay outstanding and reappear on the next pass. Use it only
+   when the operator explicitly wants to answer some questions now and
+   defer the rest.
 
 6. **Verify the queue is clear.** Run `claude-task-runner sidecar list
-   --queue <CWD> --json` once more and confirm `n_open == 0`. If new
-   sidecars opened during the answer pass (the supervisor may dispatch
-   while you're working), repeat from Step 1 — the operator can decide
-   whether to handle this round or stop.
+   --queue <CWD> --json` once more and confirm both `n_open == 0` and
+   `n_outstanding_questions == 0`. A non-zero question count with answers
+   you believe you submitted means a response landed incomplete — check
+   the `outstanding` ids on those rows. If new sidecars opened during the
+   answer pass (the supervisor may dispatch while you're working), repeat
+   from Step 1 — the operator can decide whether to handle this round or
+   stop.
+
+   Rows carrying an `error` field are requests whose own JSON could not be
+   read well enough to tell what they asked. They are listed as open
+   deliberately: an undecidable sidecar must never be counted as answered.
+   Surface them to the operator as needing a hand-repaired request file;
+   they will not clear on their own.
 
 7. **Final summary.** Emit a markdown table:
 
@@ -129,6 +171,10 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
 - **Doesn't paraphrase the operator's free-text answers.** When a
   question has `allow_free_text: true` and the operator types
   something via "Other", pass the string verbatim to `--answers`.
+- **Doesn't invent an answer to clear the completeness gate.** If the
+  operator answered 2 of a request's 3 questions, either ask the third or
+  submit with `--allow-partial` and say it is still open. Never fill one
+  in to make the command succeed.
 
 ## Important nuances
 
@@ -195,6 +241,22 @@ runner's `sidecar answer` accepts answers against legacy requests as
 long as the `--answers` JSON has the right `id` keys (the v1 schema's
 options have `id`, e.g. "A"/"B"/"C", which map directly to v2's
 `option.value`).
+
+### Partially answered sidecars
+
+`sidecar list` counts per question, so a request can be open while a
+response file already exists for it. Those rows carry `partial: true`,
+`answered: [...]` and `outstanding: [...]`, and the human-readable listing
+marks them `partial` with an `already answered:` line. Two things follow:
+
+- Present only the `outstanding` questions — `fetch_all.sh` has already
+  filtered `questions[]` to them.
+- Submit with `--merge` so the previously recorded answers survive the
+  rewrite. Without it the call is rejected for omitting them.
+
+A backlog of these can build up silently: 53 such requests existed in the
+nlmixr2lib ingestion queue before per-question counting landed, holding
+questions no count had ever reported.
 
 ### Batch sizing for AskUserQuestion
 

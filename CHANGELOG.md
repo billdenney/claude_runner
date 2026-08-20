@@ -9,6 +9,55 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Sidecar openness is accounted per QUESTION, not per response file
+  (ADR-0031).** A request asking `q1`/`q2`/`q3` whose response answered only
+  `q1` was reported *closed* by every openness test in the codebase —
+  `list_open_sidecars` and, through it, the readiness gate, the
+  orchestrator's eligibility sweep, the dispatcher's post-run status
+  override, `sidecar list`, `fetch_all.sh` and `/runner-answer-sidecar` all
+  asked only whether `response-NNN.json` existed. The unanswered questions
+  became invisible to every counter at once and the task was released back
+  to the runner as though the operator had decided. In the nlmixr2lib
+  ingestion queue this hid **53 partially-answered requests**; the queue read
+  as 73 open requests when it actually owed 166 answers across 124.
+  A request is now open while any asked `questions[].id` is missing from the
+  response's `answers[].id`; a request with no questions (a `file_and_exit`
+  notification) is still closed by the presence of a response.
+- A sidecar whose own JSON cannot be read well enough to tell what it asked
+  is now reported **open with an `error`** rather than silently counted as
+  answered. Openness reads `questions[].id` / `answers[].id` from raw JSON
+  instead of validating the whole payload, so schema drift that says nothing
+  about answeredness (a legacy request missing `created_at`, an answer
+  carrying `notes`) no longer decides it.
+
+### Added
+
+- **`sidecar answer` refuses to write a partial response.** Omitting any
+  asked question id exits 3 and names the missing ids — the durable half of
+  the fix, since correcting the counts alone would let the gap keep being
+  created. `--merge` carries forward the recorded answers for ids not
+  supplied (so topping up an already-partial request stays one call), and
+  `--allow-partial` is the explicit override, which leaves the sidecar open
+  on the omitted ids.
+- **`sidecar list` names the outstanding question ids.** JSON output gained
+  `outstanding`, `answered`, `partial`, `response_path`, `prompts`,
+  `proposed_names`, `n_open` and `n_outstanding_questions`; the human
+  listing marks partial rows and ends with a request/question count. An
+  operator told only which task is stuck cannot tell what is still missing.
+  `fetch_all.sh` now presents only the outstanding questions.
+- **`SidecarOption.proposed_names`** — canonical names an option would create
+  or adopt, as structured data. Routine naming questions are mechanically
+  triageable (collision-check against a register, auto-approve under a
+  standing rule) only if a machine can tell which token is the name;
+  recovering them from prose was tried on a real backlog and abandoned
+  because it produced both false collisions and false all-clears. The
+  `agent-stop-and-ask` skill now requires both this field and backticks
+  around any proposed name in the option label.
+- **`SidecarAnswer.notes`** — per-answer operator note. Answering flows
+  already wrote it and `extra="forbid"` made those responses unreadable.
+
 ### Changed
 
 - **`requires` (ADR-0030) is enforced on every dispatch path, and a held

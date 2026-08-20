@@ -412,6 +412,22 @@ class SidecarOption(_StrictBase):
     value: str
     label: str
     description: str | None = None
+    proposed_names: list[str] = Field(default_factory=list)
+    """Canonical names this option would create or adopt, verbatim.
+
+    Naming questions ("ratify ``FED_HIGHFAT`` as the canonical covariate")
+    are the bulk of sidecar traffic and are mechanically triageable -- a
+    queue-side script can collision-check a proposed name against its
+    registers and auto-approve under an operator's standing rule. That only
+    works if the names are machine-readable. Recovering them from the prose
+    of ``label``/``description`` does not work: free-prose extraction pulls
+    ordinary words and yields both false collisions and false all-clears,
+    the second being the dangerous one. Put the names here. ``sidecar list
+    --json`` surfaces them per open request.
+
+    Authoring rule (see the ``agent-stop-and-ask`` skill): also write each
+    name in backticks inside ``label`` so a human reading the question sees
+    exactly the token being ratified."""
 
 
 class SidecarQuestion(_StrictBase):
@@ -453,6 +469,12 @@ class SidecarAnswer(_StrictBase):
     id: str
     value: str | list[str]
     """Single string for single-select; list for ``multi_select=true``."""
+    notes: str = ""
+    """Optional per-answer operator note.
+
+    Distinct from :attr:`SidecarResponse.notes`, which covers the whole
+    response. Declared because answering flows already write it and
+    ``extra="forbid"`` would otherwise make those responses unreadable."""
 
 
 class SidecarResponse(_StrictBase):

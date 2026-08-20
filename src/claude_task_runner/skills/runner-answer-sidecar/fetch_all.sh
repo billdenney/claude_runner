@@ -8,10 +8,12 @@
 #   {
 #     "queue": "<dir>",
 #     "n_open": <int>,
+#     "n_outstanding_questions": <int>,
 #     "sidecars": [
 #       {
 #         "task_id": "...", "sequence": <n>,
 #         "summary": "...", "context": "...",
+#         "outstanding": ["q2", "q3"], "answered": ["q1"], "partial": <bool>,
 #         "questions": [
 #           {"id": "...", "prompt": "...", "options": [...],
 #            "multi_select": <bool>, "allow_free_text": <bool>,
@@ -21,6 +23,12 @@
 #       ...
 #     ]
 #   }
+#
+# `questions` holds ONLY the questions still outstanding. A request whose
+# response answered q1 but not q2/q3 is still open, and re-presenting q1
+# would waste the operator's clicks -- and `sidecar answer` requires every
+# asked id, so the caller must resupply q1's recorded answer alongside the
+# new ones (`answered` names them; the response file holds the values).
 #
 # Exits non-zero if claude-task-runner is missing or list/show errors.
 # Tolerates v1-schema (legacy) sidecar requests by capturing whatever
@@ -51,11 +59,37 @@ with open(os.environ["LIST_FILE"]) as f:
     listing = json.load(f)
 sidecars = listing.get("sidecars", [])
 
-out = {"queue": queue, "n_open": len(sidecars), "sidecars": []}
+out = {
+    "queue": queue,
+    "n_open": listing.get("n_open", len(sidecars)),
+    "n_outstanding_questions": listing.get("n_outstanding_questions"),
+    "sidecars": [],
+}
+
+
+def carry(s):
+    """Per-question fields `sidecar list` already computed."""
+    return {
+        "outstanding": s.get("outstanding", []),
+        "answered": s.get("answered", []),
+        "partial": s.get("partial", False),
+        "response_path": s.get("response_path"),
+    }
+
 
 for s in sidecars:
     tid = s["task_id"]
     seq = s["sequence"]
+    outstanding = set(s.get("outstanding") or [])
+    if s.get("error"):
+        # Request unreadable: openness could not be decided from its
+        # question ids, so it is reported open on purpose. Surface it.
+        out["sidecars"].append({
+            "task_id": tid, "sequence": seq,
+            "schema_warning": s["error"],
+            **carry(s),
+        })
+        continue
     try:
         raw = subprocess.run(
             ["claude-task-runner", "sidecar", "show", tid, str(seq),
@@ -66,6 +100,7 @@ for s in sidecars:
         out["sidecars"].append({
             "task_id": tid, "sequence": seq,
             "schema_warning": "show command timed out",
+            **carry(s),
         })
         continue
     if raw.returncode != 0:
@@ -96,8 +131,9 @@ for s in sidecars:
                 "task_id": tid, "sequence": seq,
                 "summary": d.get("summary", ""),
                 "context": d.get("context", d.get("details", "")),
-                "questions": qs,
+                "questions": [q for q in qs if q.get("id") in outstanding],
                 "schema_warning": "v1 schema (legacy); read directly from request file",
+                **carry(s),
             })
         except Exception as e:
             out["sidecars"].append({
@@ -111,6 +147,7 @@ for s in sidecars:
         out["sidecars"].append({
             "task_id": tid, "sequence": seq,
             "schema_warning": f"parse error: {e}",
+            **carry(s),
         })
         continue
     out["sidecars"].append({
@@ -118,7 +155,9 @@ for s in sidecars:
         "sequence": seq,
         "summary": d.get("summary", ""),
         "context": d.get("context", ""),
-        "questions": d.get("questions", []),
+        # Outstanding only -- see the header note.
+        "questions": [q for q in d.get("questions", []) if q.get("id") in outstanding],
+        **carry(s),
     })
 
 print(json.dumps(out, indent=2))

@@ -59,7 +59,10 @@ introduces a new on-disk file MUST update this document in the same PR.
    with observed token / duration / cost samples.
 7. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
-   task to `awaiting_sidecar`. Operator answers via `/runner-answer-sidecar`,
+   task to `awaiting_sidecar`. The request stays open until **every**
+   question id it asked appears in the response's `answers` (ADR-0031) — a
+   response file alone does not close it. Operator answers via
+   `/runner-answer-sidecar`,
    which writes `response-NNN.json`. Supervisor re-dispatches via `claude --resume
    <session_id>`.
 8. On 5h-window reset mid-task: in-flight task continues. Supervisor's

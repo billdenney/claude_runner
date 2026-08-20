@@ -154,7 +154,51 @@ def test_sidecar_response_uses_precomputed_set(queue_dir: Path) -> None:
     assert unmet_requirements(task, queue_dir, open_sidecar_task_ids=set()) == []
 
 
-def _sidecar_request(task_id: str, seq: int):
+def test_sidecar_response_unmet_when_only_some_questions_answered(queue_dir: Path) -> None:
+    # The readiness gate consumes list_open_sidecars, so per-question
+    # openness has to reach it: a response answering q1 of a q1/q2 request
+    # must NOT release the task. Before the per-question fix, the mere
+    # existence of the response file cleared this gate and the task was
+    # re-dispatched with q2 never answered.
+    from datetime import UTC, datetime
+
+    from claude_task_runner.queue.schema import SidecarAnswer, SidecarResponse
+    from claude_task_runner.queue.sidecar import write_response
+
+    write_request(queue_dir, _sidecar_request("t1", 1, question_ids=("q1", "q2")))
+    write_response(
+        queue_dir,
+        SidecarResponse(
+            task_id="t1",
+            sequence=1,
+            responded_at=datetime(2026, 7, 8, 1, tzinfo=UTC),
+            answers=[SidecarAnswer(id="q1", value="A")],
+        ),
+    )
+    task = _task(requires=[{"kind": "sidecar_response"}])
+    assert unmet_requirements(task, queue_dir) == ["awaiting sidecar response"]
+
+
+def test_sidecar_response_ready_once_every_question_answered(queue_dir: Path) -> None:
+    from datetime import UTC, datetime
+
+    from claude_task_runner.queue.schema import SidecarAnswer, SidecarResponse
+    from claude_task_runner.queue.sidecar import write_response
+
+    write_request(queue_dir, _sidecar_request("t1", 1, question_ids=("q1", "q2")))
+    write_response(
+        queue_dir,
+        SidecarResponse(
+            task_id="t1",
+            sequence=1,
+            responded_at=datetime(2026, 7, 8, 1, tzinfo=UTC),
+            answers=[SidecarAnswer(id="q1", value="A"), SidecarAnswer(id="q2", value="B")],
+        ),
+    )
+    assert is_ready(_task(requires=[{"kind": "sidecar_response"}]), queue_dir)
+
+
+def _sidecar_request(task_id: str, seq: int, question_ids: tuple[str, ...] = ("q1",)):
     from datetime import UTC, datetime
 
     from claude_task_runner.queue.schema import (
@@ -173,7 +217,7 @@ def _sidecar_request(task_id: str, seq: int):
         context="c",
         questions=[
             SidecarQuestion(
-                id="q1",
+                id=qid,
                 prompt="?",
                 options=[
                     SidecarOption(value="A", label="a", description=""),
@@ -182,6 +226,7 @@ def _sidecar_request(task_id: str, seq: int):
                 recommended="A",
                 multi_select=False,
             )
+            for qid in question_ids
         ],
     )
 

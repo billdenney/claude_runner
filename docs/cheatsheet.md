@@ -12,7 +12,7 @@ links to the decision log under [decisions/](decisions/) explain the
 | Supervisor state + utilization | `claude-task-runner supervisor status` |
 | Live 5h / weekly utilization | `claude-task-runner usage` (parses `claude /usage`) |
 | Full machine-readable snapshot (state, util, next wakeup) | `claude-task-runner supervisor status --json` |
-| Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` |
+| Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` (counts per question, not per file — see `n_outstanding_questions`) |
 | Recent supervisor transitions | `tail -F <queue>/.claude_task_runner/supervisor.log` |
 | Drift / capture failures | `tail -F <queue>/.claude_task_runner/drift.log` |
 
