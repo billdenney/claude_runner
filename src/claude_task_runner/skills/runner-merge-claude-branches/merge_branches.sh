@@ -70,6 +70,11 @@
 #   8  parallel vignette validation failed (one or more Rmd did not render)
 set -euo pipefail
 
+# Resolved once: the union-merger, the dedup, the dropped-section restore and
+# the NEWS union all need it, and they no longer all live inside the same
+# conditional block (see NOTE ON ORDER below).
+PYTHON3="$(command -v python3 || true)"
+
 REPO="${PWD}"
 BASE="origin/main"
 PATTERN="origin/claude/*"
@@ -373,38 +378,13 @@ file must not undo that. Removed again."
   fi
 fi
 
-# R-side registry regeneration.
-if (( ! SKIP_R_REGEN )); then
-  echo
-  echo "==> Regenerating registry artifacts (Rscript)"
-  if ! command -v Rscript >/dev/null 2>&1; then
-    echo "ERROR: Rscript not found in PATH. Pass --skip-r-regen if you'll do it later." >&2
-    exit 5
-  fi
-  Rscript -e '
-    suppressPackageStartupMessages(library(devtools))
-    cat("--- load_all ---\n")
-    load_all(".", quiet = TRUE)
-    if (exists("buildModelDb", where = asNamespace("nlmixr2lib"), inherits = FALSE)) {
-      cat("--- buildModelDb ---\n")
-      nlmixr2lib:::buildModelDb()
-    } else {
-      cat("--- skipping buildModelDb (function not found in nlmixr2lib namespace) ---\n")
-    }
-    cat("--- document ---\n")
-    document()
-    cat("--- done ---\n")
-  ' 2>&1 | tail -10
-
-  if ! git diff --quiet; then
-    git add -A _pkgdown.yml data/modeldb.rda inst/modeldb.qs2 man/ 2>/dev/null || true
-    if ! git diff --staged --quiet; then
-      git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
-      echo "    committed regen artifacts"
-    fi
-  fi
-fi
-
+# NOTE ON ORDER (changed 2026-08-20): the register repairs run BEFORE the R
+# regeneration, not after. buildModelDb() calls checkModelConventions(), which
+# treats a duplicate register entry as an ERROR -- and duplicate entries are
+# exactly what `-X theirs` produces when two branches each add the same new
+# canonical. Running the regen first therefore aborted the whole pipeline on
+# damage that the very next step exists to repair (observed 2026-08-20:
+# DIS_PH1, ORGVOL_KIDNEY, FORM_ODT, T_FIRSTDOSE). Repair, then regenerate.
 # Union-merge covariate-columns.md (or the configured union-file).
 if [[ -n "$UNION_FILE" ]]; then
   echo
@@ -412,7 +392,6 @@ if [[ -n "$UNION_FILE" ]]; then
   if [[ ! -f "$UNION_FILE" ]]; then
     echo "    union-file not present on this branch; skipping."
   else
-    PYTHON3="$(command -v python3)"
     union_args=(
       --repo "$REPO"
       --branch "$BRANCH_NAME"
@@ -477,6 +456,31 @@ fi
 # union-merger does not relocate; see SAPS_II in the 2026-05-20
 # consolidation). With `set -e` active a non-zero exit would abort the
 # whole run, so we tolerate it here: a failed verdict is surfaced as a
+# Restore whole `### CANONICAL` blocks that -X theirs dropped. The union-merger
+# folds Example-model LINES inside buckets that already exist; it cannot bring
+# back a canonical whose entire block is gone, which is what happens when a
+# branch adds a brand-new canonical and a later branch (based on an older main,
+# so lacking it) touches the same region. verify_branch_contributions.sh below
+# REPORTS that loss but does not repair it, so this was a manual step on every
+# large merge -- 21 blocks on 2026-08-20 alone.
+if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
+  echo
+  echo "==> Restoring canonical blocks dropped by the merge"
+  restore_args=(
+    --repo "$REPO"
+    --branch "$BRANCH_NAME"
+    --base "$BASE"
+    --pattern "$PATTERN"
+    --file "$UNION_FILE"
+  )
+  "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}"
+  if ! git diff --quiet -- "$UNION_FILE"; then
+    git add "$UNION_FILE"
+    git commit -m "Restore canonical blocks dropped by -X theirs in $UNION_FILE" >/dev/null
+    echo "    committed restored blocks"
+  fi
+fi
+
 # WARNING for the operator to reconcile covariate-columns.md by hand
 # before opening the PR, rather than killing the pipeline outright.
 echo
@@ -495,6 +499,58 @@ if ! "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"; then
   echo "WARNING: verifier reported missing contributions in $UNION_FILE."
   echo "         Reconcile by hand before opening the PR (the union-merger does"
   echo "         not relocate brand-new section headers)."
+fi
+
+# Union-merge NEWS.md. It has ONE append point ("# development version"), so
+# every branch edits the same lines and -X theirs takes the last branch's whole
+# copy -- which, being cut from an older main, is missing what main accumulated
+# since. The loss is doubly silent: entries already on main are DELETED and
+# every other branch's bullet is dropped. On 2026-08-20 NEWS.md came out of the
+# merge 85 lines SHORT with not one of the 169 merged models represented; an
+# earlier round lost 60. Rebuild from base + every branch's bullets, gated on
+# the model actually being shipped by this merge.
+if [[ -f NEWS.md ]]; then
+  echo
+  echo "==> Union-merging NEWS.md"
+  "$PYTHON3" "$SCRIPT_DIR/union_merge_news.py" \
+    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN"
+  if ! git diff --quiet -- NEWS.md; then
+    git add NEWS.md
+    git commit -m "Union-merge NEWS.md across all folded branches" >/dev/null
+    echo "    committed NEWS.md union"
+  fi
+fi
+
+# R-side registry regeneration.
+if (( ! SKIP_R_REGEN )); then
+  echo
+  echo "==> Regenerating registry artifacts (Rscript)"
+  if ! command -v Rscript >/dev/null 2>&1; then
+    echo "ERROR: Rscript not found in PATH. Pass --skip-r-regen if you'll do it later." >&2
+    exit 5
+  fi
+  Rscript -e '
+    suppressPackageStartupMessages(library(devtools))
+    cat("--- load_all ---\n")
+    load_all(".", quiet = TRUE)
+    if (exists("buildModelDb", where = asNamespace("nlmixr2lib"), inherits = FALSE)) {
+      cat("--- buildModelDb ---\n")
+      nlmixr2lib:::buildModelDb()
+    } else {
+      cat("--- skipping buildModelDb (function not found in nlmixr2lib namespace) ---\n")
+    }
+    cat("--- document ---\n")
+    document()
+    cat("--- done ---\n")
+  ' 2>&1 | tail -10
+
+  if ! git diff --quiet; then
+    git add -A _pkgdown.yml data/modeldb.rda inst/modeldb.qs2 man/ 2>/dev/null || true
+    if ! git diff --staged --quiet; then
+      git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
+      echo "    committed regen artifacts"
+    fi
+  fi
 fi
 
 # devtools::check pre-push gate.
