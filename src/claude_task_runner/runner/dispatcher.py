@@ -1018,6 +1018,7 @@ class OutputEvidence:
     has_sidecar: bool
     has_deliverable: bool
     uncommitted: tuple[str, ...] = ()
+    unpushed: tuple[str, ...] = ()
 
     @property
     def any(self) -> bool:
@@ -1032,6 +1033,30 @@ class OutputEvidence:
         means the run is not actually finished, whatever the report says.
         """
         return bool(self.uncommitted)
+
+    @property
+    def left_commits_unpushed(self) -> bool:
+        """True when the branch carries commits that exist on no remote.
+
+        The sibling of :attr:`left_work_uncommitted`, one step further along.
+        ``has_commit`` is satisfied the moment the worker commits, so a run
+        that commits as a CHECKPOINT and then ends its turn waiting on a slow
+        gate (``buildModelDb()``, ``devtools::check()``, the vignette render)
+        passes the ADR-0020 evidence gate and is marked ``completed`` -- even
+        though it never pushed and said so in its own final message.
+
+        ``completed`` is not in the orchestrator's dispatchable set, so the
+        task is never re-selected and the only copy of the work is a local
+        branch tip, one ``git worktree remove``/``git branch -D`` from loss.
+
+        Observed on the nlmixr2lib queue 2026-08-20: 51 branches carrying
+        complete extractions (model files, vignettes, NEWS entries,
+        regenerated registry artifacts), spanning three weeks, none of which
+        ever ran ``git push`` -- and 19 of them reached that state via an
+        earlier attempt that failed ``uncommitted_work_left``, i.e. the
+        uncommitted-work guard converted a loud failure into a silent one.
+        """
+        return bool(self.unpushed)
 
     def missed_gates(self) -> str:
         misses: list[str] = []
@@ -1071,6 +1096,53 @@ def _uncommitted_paths(working_dir: Path) -> list[str]:
     if completed.returncode != 0:
         return []
     return [ln[3:].strip() for ln in completed.stdout.splitlines() if ln.strip()]
+
+
+def _unpushed_commits(working_dir: Path) -> list[str]:
+    """Return one-line summaries of commits on HEAD that no remote ref contains.
+
+    Uses ``git rev-list HEAD --not --remotes``, the canonical "not pushed
+    anywhere" query. Remote-tracking refs are updated by ``git push`` itself,
+    so a branch pushed during the run is seen as pushed without needing a
+    fetch.
+
+    Returns ``[]`` -- explicitly NOT flagging -- when the repository has no
+    remote-tracking refs at all. Without that guard every commit in a
+    remote-less checkout would count as unpushed and the gate would fail
+    every run in local-only queues.
+    """
+    try:
+        remotes = subprocess.run(
+            ["git", "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("post-dispatch remote-ref probe failed for %s: %s", working_dir, exc)
+        return []
+    if remotes.returncode != 0 or not remotes.stdout.strip():
+        # No remotes configured (or the probe failed): nothing to push TO, so
+        # "unpushed" is not a meaningful judgement. Stay silent.
+        return []
+
+    try:
+        completed = subprocess.run(
+            ["git", "rev-list", "--oneline", "HEAD", "--not", "--remotes"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("post-dispatch unpushed check failed for %s: %s", working_dir, exc)
+        return []
+    if completed.returncode != 0:
+        return []
+    return [ln.strip() for ln in completed.stdout.splitlines() if ln.strip()]
 
 
 def _verify_output_evidence(
@@ -1119,6 +1191,7 @@ def _verify_output_evidence(
         has_sidecar=has_open_sidecar,
         has_deliverable=has_deliverable,
         uncommitted=leftover,
+        unpushed=tuple(_unpushed_commits(working_dir)),
     )
 
 
@@ -2089,6 +2162,32 @@ def _finalize_state(
                         f"run ended with {n} uncommitted path(s) in the worktree; "
                         f"the work is not committed to the task branch and would be "
                         f"lost when the worktree is reclaimed: {sample}"
+                    ),
+                }
+            )
+        elif evidence.left_commits_unpushed:
+            # The run committed but never pushed. `has_commit` alone used to
+            # satisfy the evidence gate, so this was marked `completed` -- and
+            # `completed` is not dispatchable, so the task was never re-run and
+            # the only copy of the work was a local branch tip.
+            #
+            # Typical shape: the worker commits as a checkpoint, then ends its
+            # turn waiting on a slow gate ("I'll push once check() returns").
+            # Marking this `failed` puts the task back in the dispatchable set
+            # so it resumes, finishes its gates and pushes; the circuit breaker
+            # still bounds the retries.
+            n = len(evidence.unpushed)
+            sample = "; ".join(evidence.unpushed[:5])
+            if n > 5:
+                sample += f"; ... (+{n - 5} more)"
+            new_status = "failed"
+            run = run.model_copy(
+                update={
+                    "stop_reason": "unpushed_commit_left",
+                    "error": (
+                        f"run ended with {n} commit(s) on the task branch that exist "
+                        f"on no remote; the work is not pushed and would be lost if "
+                        f"the worktree or branch is reclaimed: {sample}"
                     ),
                 }
             )
