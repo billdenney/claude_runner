@@ -91,6 +91,14 @@ override per repo.
      model. Step 6 below repairs the damage via a union merger;
      do NOT skip that step.
 
+**ORDER NOTE (changed 2026-08-20).** The register repairs (steps 6, 6b, 6c,
+6d) now run BEFORE the R regeneration (step 5 below), not after.
+`buildModelDb()` calls `checkModelConventions()`, which treats a duplicate
+register entry as an ERROR -- and duplicate entries are exactly what `-X
+theirs` produces when two branches each add the same new canonical. Running
+the regen first aborted the entire pipeline on damage the very next step
+exists to repair. Repair, then regenerate.
+
 5. **Regenerate registry artifacts** via R:
 
    ```bash
@@ -124,11 +132,43 @@ override per repo.
    per-`##`-section scope is what you'd use on `compartment-names.md`,
    where the same token is legitimately both a compartment and a suffix.
 
+6c. **Restore whole canonical blocks dropped by the merge** via
+   `restore_dropped_sections.py`. The union-merger folds Example-model
+   *lines* inside buckets that already exist; it cannot bring back a
+   canonical whose ENTIRE `### NAME` block is gone. That happens when a
+   branch adds a brand-new canonical and a later branch (cut from an older
+   main, so lacking it) touches the same region -- `-X theirs` takes the
+   later copy and the block vanishes. `verify_branch_contributions.sh`
+   REPORTS this but does not repair it, so it was a manual step on every
+   large merge: **21 blocks on 2026-08-20 alone** (AUCMIC_TYLO, HEPARIN_RT,
+   CNSREG_PFC/SC, SNP_SLC22A1_RS2282143, STUDY_TLV_PHASE2/3, ...). The
+   script preserves each branch's own `##` placement rather than
+   re-categorising, and is idempotent.
+
+6d. **Union-merge NEWS.md** via `union_merge_news.py`. NEWS.md has ONE
+   append point (`# development version`), so every branch edits the same
+   lines and `-X theirs` takes the last branch's whole copy -- which, being
+   cut from an older main, is missing what main accumulated since. The loss
+   is doubly silent: entries already on main are DELETED *and* every other
+   branch's bullet is dropped. On 2026-08-20 NEWS.md came out of the merge
+   **85 lines short with not one of the 169 merged models represented**; an
+   earlier round lost 60. The script rebuilds from base plus every branch's
+   bullets, **gated on the model actually being shipped by this merge** --
+   a branch whose tip advanced after the survey may carry bullets for models
+   that were not folded in, and announcing those would advertise models the
+   package does not have.
+
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh` which checks, per branch:
    every distinct `*.R` model filename the branch added to
    `inst/references/covariate-columns.md` must appear in the
    reconstructed file. Aborts the pipeline if anything is missing.
+
+   **Known false positive.** The verifier splits a multi-name header such as
+   `### CONMED_ATORVASTATIN_DOSE, CONMED_FLV_DOSE, ...` into separate names
+   and then cannot find each as a standalone `###` entry, so it reports the
+   branch as missing contributions when the block is present. Confirm
+   against the file before acting on such a report.
 
 8. **`devtools::check` pre-push gate**:
 

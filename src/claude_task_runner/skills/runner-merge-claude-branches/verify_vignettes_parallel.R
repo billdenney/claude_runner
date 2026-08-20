@@ -184,8 +184,15 @@ render_one <- function(rmd) {
   dt <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
   out$file <- basename(rmd)
   out$secs <- dt
-  cat(jsonlite::toJSON(out, auto_unbox = TRUE), "\n",
-      sep = "", file = RESULTS, append = TRUE)
+  # ONE write() call. `cat(json, "\n", ...)` emits the JSON and the newline as
+  # two separate writes, so a second forked worker can append its record between
+  # them -- producing `...}{"ok":true,...` on one line, which the per-line
+  # fromJSON() below then rejects with "trailing garbage", failing the gate
+  # after every vignette rendered fine. Observed 2026-08-20: 1516/1516 rendered
+  # OK, gate exited non-zero. Pasting the newline in first makes it a single
+  # O_APPEND write, which Linux serialises between processes.
+  cat(paste0(jsonlite::toJSON(out, auto_unbox = TRUE), "\n"),
+      file = RESULTS, append = TRUE)
   if (out$ok) {
     cat(sprintf("[OK   %5.1fs] %s\n", dt, out$file))
   } else {
@@ -197,7 +204,14 @@ render_one <- function(rmd) {
 
 invisible(mclapply(rmds, render_one, mc.cores = JOBS, mc.preschedule = FALSE))
 
-res <- lapply(readLines(RESULTS), jsonlite::fromJSON)
+# Belt-and-braces against a torn append: split any line carrying more than one
+# record before parsing, so an interleaved write degrades to a cosmetic blip
+# rather than failing the gate.
+.split_records <- function(line) {
+  parts <- strsplit(gsub("\\}\\{", "}\n{", line), "\n", fixed = TRUE)[[1]]
+  parts[nzchar(parts)]
+}
+res <- lapply(unlist(lapply(readLines(RESULTS), .split_records)), jsonlite::fromJSON)
 ok_n   <- sum(vapply(res, function(x) isTRUE(x$ok), logical(1L)))
 fail_n <- length(res) - ok_n
 cat(sprintf("\nSUMMARY: %d ok / %d failed / %d total\n", ok_n, fail_n, length(res)))
