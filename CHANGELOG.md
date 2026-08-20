@@ -11,6 +11,27 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Docs no longer advertise two config keys that make the config
+  unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
+  operators to set `[sidecar].unanswered_auto_recommended_s`, and
+  `docs/architecture.md` ("Extension points") told them to set
+  `[notify].channels`. Both tables had been deleted as dead config in the
+  2026-06-13 audit, and every settings model is `extra="forbid"` — so an
+  operator following either instruction got a `claude_runner.toml` that
+  refused to load *entirely*, not merely an option that did nothing. Both
+  paragraphs are removed. The auto-answer behaviour the runbook described
+  was never implemented; sidecars are resolved by the operator via
+  `/runner-answer-sidecar`.
+- **A docs-vs-schema gate so that cannot recur** —
+  `tests/unit/test_docs_config_refs.py` walks the `Settings` model for
+  every valid config path, then scans `docs/**/*.md` for `[table].field`
+  references, whole-code-span references, and the table headers and keys
+  inside fenced `toml` blocks (the copy-paste path), failing on any that
+  the schema does not define. `[throttle.*]` is allowlisted with its
+  reason: ADR-0022 retired it, superseded ADRs 0015/0016 record it as
+  history, and `config.loader._reject_legacy_throttle` already hard-errors
+  on it — which is precisely why *its* docs stayed accurate while the two
+  prose-only removals rotted.
 - **Sidecar openness is accounted per QUESTION, not per response file
   (ADR-0031).** A request asking `q1`/`q2`/`q3` whose response answered only
   `q1` was reported *closed* by every openness test in the codebase —
