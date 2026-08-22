@@ -456,6 +456,33 @@ fi
 # union-merger does not relocate; see SAPS_II in the 2026-05-20
 # consolidation). With `set -e` active a non-zero exit would abort the
 # whole run, so we tolerate it here: a failed verdict is surfaced as a
+# Dedup the OTHER register files too. The step above only sweeps $UNION_FILE,
+# so duplicates -X theirs creates in compartment-names.md / parameter-names.md
+# survive -- and buildModelDb() calls checkModelConventions(), which treats a
+# duplicate register entry as an ERROR, so they abort the R regen further down.
+# Observed 2026-08-22: ndmima and mprotein in compartment-names.md killed the
+# round-2 regen after the union-file had already been swept clean.
+#
+# PER-SECTION scope here, deliberately NOT --global: in compartment-names.md
+# the same token is legitimately both a compartment and a metabolite suffix
+# (8 such pairs on main), so whole-file uniqueness would delete real entries.
+for reg in inst/references/compartment-names.md inst/references/parameter-names.md; do
+  [[ -f "$reg" ]] || continue
+  [[ "$reg" == "$UNION_FILE" ]] && continue
+  echo
+  echo "==> Deduping duplicate canonical headers in $reg (per-section)"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$reg"
+  if ! git diff --quiet -- "$reg"; then
+    git add "$reg"
+    git commit -m "Dedup duplicate canonical headers in $reg" >/dev/null
+    echo "    committed dedup of $reg"
+  fi
+  if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$reg"; then
+    echo "ERROR: duplicate canonicals remain in $reg after dedup." >&2
+    exit 9
+  fi
+done
+
 # Restore whole `### CANONICAL` blocks that -X theirs dropped. The union-merger
 # folds Example-model LINES inside buckets that already exist; it cannot bring
 # back a canonical whose entire block is gone, which is what happens when a
