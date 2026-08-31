@@ -46,6 +46,11 @@ has_flag <- function(name) name %in% args
 
 WORKTREE <- normalizePath(get_arg("--worktree", getwd()), mustWork = TRUE)
 JOBS     <- as.integer(get_arg("--jobs", max(1L, parallel::detectCores() - 2L)))
+# rxode2 solver threads INSIDE each worker (not the number of workers). Default
+# 2 to mirror a CI runner rather than the dev box; see the long note in the
+# worker. Pass --rx-threads 0 to leave rxode2 at its own default.
+RXTHREADS <- as.integer(get_arg("--rx-threads", "2"))
+if (is.na(RXTHREADS) || RXTHREADS < 1L) RXTHREADS <- NULL
 TIMEOUT  <- as.integer(get_arg("--timeout", 900L))
 RESULTS  <- get_arg("--results", "/tmp/vignette_results.jsonl")
 SKIP_INSTALL <- has_flag("--skip-install")
@@ -158,11 +163,29 @@ render_one <- function(rmd) {
   t0 <- Sys.time()
   out <- tryCatch({
     callr::r(
-      function(rmd) {
+      function(rmd, rxthreads) {
         suppressPackageStartupMessages({
           library(nlmixr2lib)
           library(rxode2)
         })
+        # PIN THE THREAD COUNT. rxSetSeed() makes an rxode2 simulation
+        # reproducible only for a GIVEN number of threads: the parallel RNG
+        # streams are partitioned per thread, so the same seed on a different
+        # thread count draws different numbers. A dev box solving on 16 threads
+        # and a CI runner on 2 therefore produce different simulated cohorts
+        # from identical source, and any vignette whose stopifnot() is tight
+        # enough will pass here and fail there.
+        #
+        # That is not hypothetical: on the 2026-08-31 consolidation this gate
+        # reported 1680/1682 green and CI then failed four vignettes
+        # (Bardhi_2026_ampicillin_foal, Chatterjee_2016_pembrolizumab,
+        # Lin_2024_adverseEvent_markov, Riccobene_2017_ceftaroline) on their own
+        # assertions. All four pass at 16 threads and fail at 1, 2 and 4. A gate
+        # that runs at the dev box's default thread count cannot see the class
+        # of bug CI trips on, so pin low and match the runner.
+        if (!is.null(rxthreads) && exists("setRxThreads", asNamespace("rxode2"))) {
+          try(rxode2::setRxThreads(as.integer(rxthreads)), silent = TRUE)
+        }
         # FORCE error = FALSE. knitr's default renders a chunk error inline and
         # returns success, so a broken vignette silently "passes" -- the exact
         # false negative that shipped latent-broken vignettes to main before.
@@ -173,7 +196,7 @@ render_one <- function(rmd) {
                           quiet = TRUE, envir = new.env())
         list(ok = TRUE, msg = "", outfile = outfile)
       },
-      args = list(rmd = rmd),
+      args = list(rmd = rmd, rxthreads = RXTHREADS),
       libpath = LIBPATH,
       timeout = TIMEOUT,
       show = FALSE

@@ -80,6 +80,12 @@ BASE="origin/main"
 PATTERN="origin/claude/*"
 BRANCH_NAME=""
 UNION_FILE="inst/references/covariate-columns.md"
+# Register files that are NOT the Example-models union file but are still
+# structured '### CANONICAL' registers that -X theirs can silently gut.  The
+# 2026-08-31 consolidation had 23 branches touching compartment-names.md and 11
+# touching parameter-names.md while every repair ran only against UNION_FILE;
+# 11 canonical blocks were lost.  These get restore + dedup + placement checks.
+REGISTER_FILES=("inst/references/compartment-names.md" "inst/references/parameter-names.md")
 FORBID_PATHS=("inst/modeldb.qs2")
 SKIP_R_REGEN=0
 SKIP_CHECK=0
@@ -105,6 +111,8 @@ while [[ $# -gt 0 ]]; do
     --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
     --branch-name) BRANCH_NAME="$2"; shift 2 ;;
     --union-file) UNION_FILE="$2"; shift 2 ;;
+    --register-file) REGISTER_FILES+=("$2"); shift 2 ;;
+    --no-register-files) REGISTER_FILES=(); shift ;;
     --forbid-path)
       if [[ -z "$2" ]]; then FORBID_PATHS=(); else
         if [[ "${FORBID_PATHS[*]}" == "inst/modeldb.qs2" ]]; then FORBID_PATHS=(); fi
@@ -463,43 +471,71 @@ fi
 # so lacking it) touches the same region. verify_branch_contributions.sh below
 # REPORTS that loss but does not repair it, so this was a manual step on every
 # large merge -- 21 blocks on 2026-08-20 alone.
-if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
+RESTORE_TARGETS=()
+[[ -n "$UNION_FILE" && -f "$UNION_FILE" ]] && RESTORE_TARGETS+=("$UNION_FILE")
+for rf in "${REGISTER_FILES[@]:-}"; do
+  [[ -n "$rf" && -f "$rf" ]] && RESTORE_TARGETS+=("$rf")
+done
+if (( ${#RESTORE_TARGETS[@]} )); then
   echo
   echo "==> Restoring canonical blocks dropped by the merge"
-  restore_args=(
-    --repo "$REPO"
-    --branch "$BRANCH_NAME"
-    --base "$BASE"
-    --pattern "$PATTERN"
-    --file "$UNION_FILE"
-  )
-  "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}"
-  if ! git diff --quiet -- "$UNION_FILE"; then
-    git add "$UNION_FILE"
-    git commit -m "Restore canonical blocks dropped by -X theirs in $UNION_FILE" >/dev/null
-    echo "    committed restored blocks"
-  fi
+  for rf in "${RESTORE_TARGETS[@]}"; do
+    restore_args=(
+      --repo "$REPO"
+      --branch "$BRANCH_NAME"
+      --base "$BASE"
+      --pattern "$PATTERN"
+      --file "$rf"
+    )
+    echo "    -- $rf"
+    "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}"
+    if ! git diff --quiet -- "$rf"; then
+      git add "$rf"
+      git commit -m "Restore canonical blocks dropped by -X theirs in $rf" >/dev/null
+      echo "       committed restored blocks"
+    fi
+  done
+  # The extra registers are per-##-section scoped for dedup (the same token can
+  # legitimately be both a compartment and a suffix), unlike the covariate
+  # register which is globally unique and deduped with --global above.
+  for rf in "${REGISTER_FILES[@]:-}"; do
+    [[ -n "$rf" && -f "$rf" ]] || continue
+    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$rf" >/dev/null || true
+    if ! git diff --quiet -- "$rf"; then
+      git add "$rf"
+      git commit -m "Dedup duplicate canonical headers in $rf" >/dev/null
+      echo "    deduped headers in $rf"
+    fi
+    if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$rf" >/dev/null; then
+      echo "ERROR: duplicate canonical headers remain in $rf after dedup." >&2
+      exit 6
+    fi
+  done
 fi
 
 # WARNING for the operator to reconcile covariate-columns.md by hand
 # before opening the PR, rather than killing the pipeline outright.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
+for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
 verify_args=(
   --repo "$REPO"
   --branch "$BRANCH_NAME"
   --base "$BASE"
   --pattern "$PATTERN"
-  --file "$UNION_FILE"
+  --file "$vf"
 )
 for er in "${EXTRA_REFS[@]:-}"; do
   [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
 done
 if ! "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"; then
-  echo "WARNING: verifier reported missing contributions in $UNION_FILE."
+  echo "WARNING: verifier reported missing contributions in $vf."
   echo "         Reconcile by hand before opening the PR (the union-merger does"
-  echo "         not relocate brand-new section headers)."
+  echo "         not relocate brand-new section headers, and neither it nor"
+  echo "         restore_dropped_sections.py unions two branches' competing"
+  echo "         entries for the SAME canonical -- see the placement report)."
 fi
+done
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
 # every branch edits the same lines and -X theirs takes the last branch's whole
@@ -524,6 +560,7 @@ fi
 # R-side registry regeneration.
 if (( ! SKIP_R_REGEN )); then
   echo
+  PRE_REGEN_DIRTY="$(git status --porcelain)"
   echo "==> Regenerating registry artifacts (Rscript)"
   if ! command -v Rscript >/dev/null 2>&1; then
     echo "ERROR: Rscript not found in PATH. Pass --skip-r-regen if you'll do it later." >&2
@@ -544,12 +581,31 @@ if (( ! SKIP_R_REGEN )); then
     cat("--- done ---\n")
   ' 2>&1 | tail -10
 
-  if ! git diff --quiet; then
-    git add -A _pkgdown.yml data/modeldb.rda inst/modeldb.qs2 man/ 2>/dev/null || true
-    if ! git diff --staged --quiet; then
-      git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
-      echo "    committed regen artifacts"
-    fi
+  # Stage whatever the regen actually WROTE, not a hardcoded artifact list.
+  #
+  # The old list named `inst/modeldb.qs2` -- a path this same script carries on
+  # its forbidden-resurrection list, because nlmixr2lib dropped it in favour of
+  # `inst/modeldb.rds`.  So the staging line asked for a file that cannot exist
+  # and never named the one that does: on the 2026-08-31 consolidation the
+  # regenerated registry would have been left unstaged and the branch pushed
+  # with a registry blob stale against 181 new model files.  A hardcoded list
+  # silently under-stages every time the package renames a derived artifact.
+  #
+  # Every earlier step commits its own work, so the worktree is clean on entry
+  # here and anything dirty now is regen output.  Assert that rather than
+  # assume it: if the tree was already dirty the operator needs to know, since
+  # `git add -A` would sweep unrelated edits into the regen commit.
+  if [[ -n "$PRE_REGEN_DIRTY" ]]; then
+    echo "    WARN: worktree was already dirty before the regen step; staging"
+    echo "          only known artifact paths to avoid committing unrelated edits:"
+    printf '%s\n' "$PRE_REGEN_DIRTY" | sed 's/^/            /'
+    git add -A _pkgdown.yml data/ inst/ man/ NAMESPACE 2>/dev/null || true
+  elif ! git diff --quiet; then
+    git add -A
+  fi
+  if ! git diff --staged --quiet; then
+    git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
+    echo "    committed regen artifacts: $(git show --stat --format= --name-only HEAD | tr '\n' ' ')"
   fi
 fi
 

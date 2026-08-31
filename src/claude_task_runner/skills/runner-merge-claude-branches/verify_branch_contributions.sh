@@ -139,7 +139,31 @@ if [[ -f "$HEADER_SCRIPT" ]]; then
   fi
 fi
 
-if (( MISSING_COUNT == 0 && SECTION_FAIL == 0 )); then
+# Placement check (delegated to verify_register_placement.py). The filename
+# check above asks whether a branch's *.R appears ANYWHERE in the file; this
+# asks whether it is still filed UNDER THE CANONICAL the branch filed it under.
+# Both of the weaker checks pass when two branches register the same canonical
+# and -X theirs keeps one entry, discarding the other's aliases and example
+# models -- four such losses survived every existing check on 2026-08-31.
+PLACEMENT_FAIL=0
+PLACEMENT_OUTPUT=""
+PLACEMENT_SCRIPT="$SCRIPT_DIR/verify_register_placement.py"
+if [[ -f "$PLACEMENT_SCRIPT" ]] && command -v python3 >/dev/null 2>&1; then
+  placement_args=(
+    --repo "$REPO"
+    --branch "$BRANCH"
+    --base "$BASE"
+    --pattern "$PATTERN"
+    --file "$FILE"
+  )
+  for er in "${EXTRA_REFS[@]:-}"; do
+    [[ -n "$er" ]] && placement_args+=( --extra-ref "$er" )
+  done
+  PLACEMENT_OUTPUT="$(python3 "$PLACEMENT_SCRIPT" "${placement_args[@]}")" || PLACEMENT_FAIL=1
+fi
+
+if (( MISSING_COUNT == 0 && SECTION_FAIL == 0 && PLACEMENT_FAIL == 0 )); then
+  [[ -n "$PLACEMENT_OUTPUT" ]] && printf "%s\n" "$PLACEMENT_OUTPUT"
   echo "    (verifier) OK — all per-branch *.R additions and brand-new ##/### canonical-section headers are present in $FILE"
   exit 0
 fi
@@ -151,6 +175,9 @@ if (( MISSING_COUNT > 0 )); then
 fi
 if (( SECTION_FAIL )); then
   printf "%s\n" "$SECTION_OUTPUT"
+fi
+if (( PLACEMENT_FAIL )); then
+  printf "%s\n" "$PLACEMENT_OUTPUT"
 fi
 echo
 echo "    Worktree left at: $WT"
