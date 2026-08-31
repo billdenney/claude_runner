@@ -105,9 +105,19 @@ exists to repair. Repair, then regenerate.
    Rscript -e 'devtools::load_all("."); nlmixr2lib:::buildModelDb(); devtools::document()'
    ```
 
-   - `buildModelDb()` writes `data/modeldb.rda` + `inst/modeldb.qs2`
-     and refreshes the pkgdown navbar.
+   - `buildModelDb()` writes the registry blob (`data/modeldb.rda` plus
+     whichever of `inst/modeldb.rds` / `inst/modeldb.qs2` the package
+     currently ships) and refreshes the pkgdown navbar.
    - `document()` regenerates `man/*.Rd`.
+
+   **Do not hardcode the artifact list when staging.** The script stages
+   whatever the regen actually wrote (`git add -A`, valid because every
+   earlier step commits its own work, and guarded by a pre-regen dirty
+   check). The old hardcoded list named `inst/modeldb.qs2` — a path on this
+   script's own forbidden-resurrection list, because nlmixr2lib had already
+   moved to `inst/modeldb.rds`. It therefore staged a file that could not
+   exist and never staged the one that did, which would have pushed a
+   registry blob stale against 181 new model files.
 
 6. **Union-merge covariate-columns.md** via
    `union_merge_lines.py`. This script:
@@ -133,7 +143,11 @@ exists to repair. Repair, then regenerate.
    where the same token is legitimately both a compartment and a suffix.
 
 6c. **Restore whole canonical blocks dropped by the merge** via
-   `restore_dropped_sections.py`. The union-merger folds Example-model
+   `restore_dropped_sections.py`. This runs against `--union-file` AND every
+   `--register-file` (default `compartment-names.md`, `parameter-names.md`),
+   which are deduped with per-`##`-section scope rather than `--global`.
+   Restricting the repairs to the union file alone lost 11 canonical blocks
+   on 2026-08-31 across two registers that 23 and 11 branches had touched. The union-merger folds Example-model
    *lines* inside buckets that already exist; it cannot bring back a
    canonical whose ENTIRE `### NAME` block is gone. That happens when a
    branch adds a brand-new canonical and a later branch (cut from an older
@@ -159,10 +173,36 @@ exists to repair. Repair, then regenerate.
    package does not have.
 
 7. **Verify no contributions were lost.** Run
-   `verify_branch_contributions.sh` which checks, per branch:
-   every distinct `*.R` model filename the branch added to
-   `inst/references/covariate-columns.md` must appear in the
-   reconstructed file. Aborts the pipeline if anything is missing.
+   `verify_branch_contributions.sh`, which now applies THREE checks per
+   branch, per register file:
+
+   a. **Filename** — every distinct `*.R` the branch added must appear
+      somewhere in the reconstructed file.
+   b. **Section header** (`verify_section_headers.py`) — every brand-new
+      `##` / `### CANONICAL` header the branch introduced must survive.
+   c. **Placement** (`verify_register_placement.py`) — every
+      *(canonical, model.R)* pair the branch recorded must still be filed
+      **under that canonical**.
+
+   Check (c) was added 2026-08-31 because (a) and (b) both pass in the case
+   that matters most: two branches register the SAME canonical from mains
+   lacking each other's copy, `-X theirs` keeps one entry, and the other's
+   aliases and example models are discarded. The surviving entry keeps the
+   header (so (b) passes) and the dropped models are usually cited elsewhere
+   in the file (so (a) passes). Four such losses survived every check on the
+   97-branch consolidation: `UGT2B15_STAR2_HET`/`_HOM`,
+   `RRT_CRRT_EFFLUENT_FLOW`, and `lkst`.
+
+   Two subtleties (c) handles, both learned the hard way:
+
+   - It only considers branches that are **ancestors** of the consolidation
+     branch. The queue keeps pushing while a merge runs, so the pattern also
+     matches branches that appeared after the survey; blaming the merge for
+     their content is a false positive.
+   - A header may name several canonicals sharing one block
+     (`### QTc, QTcF, QTcI, QTcP, QTcS`), and that list GROWS as spellings are
+     ratified. Each name is indexed separately, so a block that *gained* a
+     name is not read as a different canonical with everything under it lost.
 
    **Known false positive.** The verifier splits a multi-name header such as
    `### CONMED_ATORVASTATIN_DOSE, CONMED_FLV_DOSE, ...` into separate names
