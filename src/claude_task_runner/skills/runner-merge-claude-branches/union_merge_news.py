@@ -45,12 +45,20 @@ def git(args: list[str], cwd: Path) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
+# NEWS.md files mix bullet markers -- this package's older entries use "* " and
+# newer ones "- ". Matching only "- " silently skipped every "* " bullet, so
+# they were never detected as branch additions and never restored (found
+# 2026-08-22: Ketharanathan 2023 pentobarbital, whose branch bullet is "* Add
+# ...", went missing while the check reported NEWS complete).
+BULLET = ("- ", "* ")
+
+
 def bullets(text: str) -> list[str]:
-    """Bullet blocks: a `- ` line plus any wrapped continuation lines."""
+    """Bullet blocks: a `- ` / `* ` line plus any wrapped continuation lines."""
     blocks: list[str] = []
     cur: list[str] = []
     for line in text.splitlines():
-        if line.startswith("- "):
+        if line.startswith(BULLET):
             if cur:
                 blocks.append("\n".join(cur).rstrip())
             cur = [line]
@@ -66,7 +74,10 @@ def bullets(text: str) -> list[str]:
 
 
 def key(block: str) -> str:
-    return re.sub(r"\s+", " ", block).strip().lower()
+    # Normalise the marker away so the same entry written "- Add X" on one
+    # branch and "* Add X" on another is recognised as one bullet.
+    k = re.sub(r"^[-*]\s+", "", block.strip())
+    return re.sub(r"\s+", " ", k).strip().lower()
 
 
 def worktree_for(repo: Path, branch: str) -> Path:
@@ -77,6 +88,33 @@ def worktree_for(repo: Path, branch: str) -> Path:
         elif line == f"branch refs/heads/{branch}":
             return cand
     return repo
+
+
+def bullet_ships(block: str, tokens: set[str]) -> bool:
+    """True when the bullet's OWN author-year names a model this merge adds.
+
+    Parses the bullet rather than substring-scanning it. A substring test
+    false-positives badly on short surnames -- "xu" and "ai" match inside
+    squashed compound names like "vandenberg" -- which would let through
+    bullets for models the merge does not ship.
+    """
+    if not tokens:
+        return True  # no modeldb diff to gate on; keep prior behaviour
+    m = re.match(r"^[-*]\s+(?:Add|Update|Fix)\s+(.+?)\s+((?:19|20)\d{2})\b", block.strip())
+    if not m:
+        return True  # not an "Add <Author> <Year>" bullet; do not gate it out
+    raw = m.group(1).strip()
+    # A surname is a few words at most ("van den Berg", "Olsson Gisleskog").
+    # A long capture means this is not the per-model form -- e.g. "Add 14
+    # published imatinib population PK models transcribed from the Yang 2025
+    # external evaluation", where the non-greedy match swallows the whole
+    # phrase. Such a bullet legitimately covers many models and MUST NOT be
+    # gated out on a failed surname match; keep it.
+    if len(raw.split()) > 3:
+        return True
+    author = re.sub(r"[^a-z]", "", raw.lower())
+    year = m.group(2)
+    return (author, year) in {(a.replace(" ", ""), y) for a, y in (t.split(" ", 1) for t in tokens)}
 
 
 def main() -> int:
@@ -115,25 +153,6 @@ def main() -> int:
         if len(parts) >= 2:
             tokens.add(f"{parts[0]} {parts[1]}")
 
-    def ships(block: str) -> bool:
-        """True when the bullet's OWN author-year names a model this merge adds.
-
-        Parses the bullet rather than substring-scanning it. A substring test
-        false-positives badly on short surnames -- "xu" and "ai" match inside
-        squashed compound names like "vandenberg" -- which would let through
-        bullets for models the merge does not ship.
-        """
-        if not tokens:
-            return True  # no modeldb diff to gate on; keep prior behaviour
-        m = re.match(r"^-\s+(?:Add|Update|Fix)\s+(.+?)\s+((?:19|20)\d{2})\b", block.strip())
-        if not m:
-            return True  # not an "Add <Author> <Year>" bullet; do not gate it out
-        author = re.sub(r"[^a-z]", "", m.group(1).lower())
-        year = m.group(2)
-        return (author, year) in {
-            (a.replace(" ", ""), y) for a, y in (t.split(" ", 1) for t in tokens)
-        }
-
     refs = git(
         ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
     ).split()
@@ -149,7 +168,7 @@ def main() -> int:
             if k in seen:
                 continue
             seen.add(k)
-            if not ships(b):
+            if not bullet_ships(b, tokens):
                 skipped += 1
                 continue
             added.append(b)
