@@ -9,6 +9,34 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Added
+
+- **A terminal close now writes its own dispatch gate (ADR-0033).** A run
+  that ends as a clean skip or defer writes a deliverable, commits nothing
+  and leaves the worktree clean; ADR-0020 marks that `completed`, which is
+  not dispatchable, so on its own it never re-fires. But a task that filed a
+  sidecar sits in `awaiting_sidecar`, and answering every request makes it
+  eligible again — correct when there is a ruling to act on, pure waste when
+  the disposition was terminal. The task then re-derives the same verdict at
+  full effort and files the same sidecar. Observed on the nlmixr2lib queue:
+  `oare_PMC6930853` was acked as a skip and re-fired 24h later at
+  `effort: high` reaching the identical verdict; `oare_PMC9823018` did the
+  same. The dispatch selector reads only the `block_dispatch` register, so a
+  row there is the only thing that holds such a task down, and until now
+  nothing wrote one except an operator by hand.
+
+  `_finalize_state` now appends that row itself when the ADR-0020 evidence
+  shows the unambiguous terminal shape. The status is unchanged — a terminal
+  close is a genuine completion, and flipping it to `failed` would be worse,
+  since `failed` IS dispatchable. A run that committed is not gated (that
+  would strand real work), and a run that left work uncommitted is not gated
+  (it must be re-dispatched to finish). An existing row is never overwritten
+  or duplicated, so a curated operator ruling always wins; auto-written rows
+  carry `status: AUTO_GATED` so they can be audited or reversed in bulk; and
+  any write failure is swallowed, because a register problem must never fail
+  a run that genuinely succeeded. No-op when `[dispatch].dispatch_block_file`
+  is unset.
+
 ### Fixed
 
 - **Docs no longer advertise two config keys that make the config

@@ -79,6 +79,7 @@ from claude_task_runner.runner import caps as caps_mod
 from claude_task_runner.runner import heartbeat as hb_mod
 from claude_task_runner.runner import hooks as hooks_mod
 from claude_task_runner.runner import retry as retry_mod
+from claude_task_runner.runner import terminal_gate as terminal_gate_mod
 from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
@@ -1671,6 +1672,8 @@ def dispatch(
         settings_failure_classifier=settings_failure_classifier,
         pre_sha=pre_sha,
         has_open_sidecar=has_open_sidecar,
+        queue_dir=queue_dir,
+        settings_dispatch=settings_dispatch,
     )
 
     # Stop-and-ask override: if the agent wrote a sidecar request that has
@@ -2094,6 +2097,8 @@ def _finalize_state(
     task: Task | None = None,
     pre_sha: str | None = None,
     has_open_sidecar: bool = False,
+    queue_dir: Path | None = None,
+    settings_dispatch: DispatchSettings | None = None,
 ) -> tuple[TaskState, RunRecord]:
     """Apply a RunRecord to a TaskState, returning the post-attempt state
     and the (possibly amended) RunRecord.
@@ -2116,6 +2121,15 @@ def _finalize_state(
     ``task.working_dir is not None``. The original-attempt RunRecord
     is amended so its ``stop_reason`` and ``error`` reflect the gate
     miss; the returned RunRecord is what callers should persist.
+
+    A third gate (ADR-0033) writes a ``block_dispatch`` row when the run
+    closed on a TERMINAL disposition -- a deliverable, no commit, a clean
+    worktree: the shape of a skip or defer. ``completed`` alone does not
+    hold such a task down, because answering its sidecar makes it eligible
+    again and it re-derives the same verdict at full effort. Requires
+    ``queue_dir`` and a ``settings_dispatch.dispatch_block_file``; without
+    either it is a no-op, so queues not using that convention are
+    unaffected.
     """
     if cap_violation is not None:
         new_status = "failed"
@@ -2191,6 +2205,24 @@ def _finalize_state(
                     ),
                 }
             )
+        elif evidence.has_deliverable and not evidence.has_commit:
+            # ADR-0033: a terminal close (skip / defer). The run wrote its
+            # report, committed nothing and left the worktree clean, so there
+            # is no code to collect -- but the task is still selectable the
+            # moment its sidecar is answered, and would re-derive the same
+            # verdict at full effort. Only the block_dispatch register stops
+            # that, and until now nothing wrote a row except an operator by
+            # hand. Status is unchanged: this IS a genuine completion.
+            if queue_dir is not None and settings_dispatch is not None:
+                terminal_gate_mod.ensure_terminal_gate(
+                    queue_dir=queue_dir,
+                    block_file=settings_dispatch.dispatch_block_file,
+                    task_id=task.id,
+                    stop_reason=run.stop_reason,
+                    deliverable=(
+                        str(task.deliverable_paths[0]) if task.deliverable_paths else None
+                    ),
+                )
 
     new_runs = [*prior.runs, run]
 
