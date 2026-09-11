@@ -40,6 +40,49 @@ If you are running interactively (`$TASK_ID` unset), use the built-in
 `AskUserQuestion` tool instead — it's cheaper for the user and shows
 the same options as a sidecar would.
 
+## Never file a sidecar to announce completion
+
+**Finishing a task is not a question.** Commit, push, and move the task
+YAML from `todo/` to `done/` — that IS the completion signal, and it is
+the only one the runner needs. Then exit.
+
+Do **not** file a sidecar to:
+
+* report that the work is done, pushed and green ("NOTIFICATION ONLY -
+  no decision required");
+* ask whether the operator wants the PR opened, or hand over a PR title
+  and body for them to paste;
+* ask them to confirm a close when nothing is outstanding.
+
+Those cost a real dispatch each and they do not terminate. A task whose
+YAML stays in `todo/` is still a dispatch candidate, so answering its
+notification sidecar makes it eligible again: it re-runs, finds nothing
+to do, and files another one. On 2026-09-11 the nlmixr2lib ingestion
+queue held **27** such sidecars, and one task (`oasweep_PMC11754279`)
+had burned three dispatches confirming work that had been merged since
+2026-09-07.
+
+**Why moving the YAML is sufficient.** `queue.store.list_pending()`
+enumerates candidates from `todo/` only, and `tick_dispatch` then
+filters on `_DISPATCHABLE_STATUSES = {pending, failed}`. A YAML in
+`done/` is never a candidate, whatever its state file says.
+
+**The one hazard: move it only after the push is verified.** A YAML
+moved to `done/` on work that did not actually reach the remote
+disappears from the queue silently and will never be re-dispatched.
+Verify the branch is on origin (e.g. `git ls-remote --heads origin
+<branch>` returns the SHA you just pushed) BEFORE moving it.
+
+**PRs are not the agent's job.** The operator's `gh` key is read-only by
+policy, so you could not open one anyway. Put the suggested title and
+body in the deliverable report and stop — pushed branches are landed by
+a bulk consolidation pass (`/runner-merge-claude-branches`), not one PR
+per model.
+
+This rule is about NOTIFICATIONS. A genuine question — an ambiguous
+source value, a novel canonical name, a structural choice — still gets a
+sidecar, exactly as described below.
+
 ## Protocol
 
 ### 1. Build the SidecarRequest payload
