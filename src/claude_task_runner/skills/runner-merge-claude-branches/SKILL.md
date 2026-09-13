@@ -159,6 +159,36 @@ exists to repair. Repair, then regenerate.
    script preserves each branch's own `##` placement rather than
    re-categorising, and is idempotent.
 
+   **It is gated on the merge set (added 2026-09-13).** Without that gate it
+   resurrected blocks that had been removed ON PURPOSE, which is worse than the
+   loss it repairs -- on an 80-branch round it proposed 31 blocks of which 20
+   were pre-rename spellings. Three skips, each reported in its output:
+
+   - **ancestry** -- only branches that are ancestors of the consolidation
+     branch contribute; the `--pattern` glob also matches earlier rounds and
+     branches pushed after the survey.
+   - **fork point** -- only blocks a branch ADDED count. Comparing against the
+     current base is not enough: when main renames a canonical, every branch cut
+     before the rename still carries the old spelling, which is then absent from
+     both the base and the merge result. Comparing against the branch's own
+     `merge-base` shows it was inherited.
+   - **deliberate removal** -- a name present at the LAST MERGE COMMIT and
+     absent now was retired by a repair commit on the branch (e.g. an operator
+     naming ruling that post-dates the branch); restoring it would undo the
+     rename on every re-run. Tested by content at that commit, NOT by scanning
+     diffs for removed `### ` lines -- `union_merge_lines.py` rewrites the file
+     wholesale, so a diff scan reads every MOVED header as a removal.
+
+   It also indexes EVERY name in a multi-name header (`### fm_a, fm_b, fm_c`).
+   When a folded branch added a name to a header that survived under a different
+   name, the block is present but the name is not; re-inserting the block would
+   duplicate it, so that case is REPORTED for a manual header union rather than
+   auto-repaired. `buildModelDb()` fails on those until fixed -- that is how the
+   loss of `fm_cysmer` / `fm_gluc` / `fm_sulf` surfaced when no register
+   verifier caught it.
+
+   Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.
+
 6d. **Union-merge NEWS.md** via `union_merge_news.py`. NEWS.md has ONE
    append point (`# development version`), so every branch edits the same
    lines and `-X theirs` takes the last branch's whole copy -- which, being
