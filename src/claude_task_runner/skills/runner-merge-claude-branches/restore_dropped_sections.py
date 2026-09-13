@@ -178,17 +178,27 @@ def main() -> int:
     #     absent from the result", and must still not be restored or every
     #     re-run undoes the rename.
     #
-    #     Tested by CONTENT, not by scanning diffs for removed `### ` lines:
-    #     union_merge_lines.py rewrites this file wholesale, so a diff scan
-    #     reads every MOVED header as a removal and swallows the real losses
-    #     too (it mislabelled 526 blocks that way). Instead, snapshot the file
-    #     at the LAST MERGE COMMIT on the branch -- after every branch is
-    #     folded in, before any repair ran. A name present there and absent now
-    #     was removed on purpose; a name absent there was lost by the merge.
-    last_merge = git(["rev-list", "--merges", "-1", args.branch], repo).strip()
-    post_merge_blocks = (
-        blocks(git(["show", f"{last_merge}:{args.file}"], repo)) if last_merge else {}
-    )
+    #     Tested by comparing PARSED BLOCK SETS across each NON-MERGE commit on
+    #     the branch: a name present in a commit's parent and absent in the
+    #     commit itself was removed by that commit. Two things this gets right
+    #     that simpler tests do not:
+    #
+    #       - Not a diff scan for removed `### ` lines. union_merge_lines.py
+    #         rewrites the file wholesale, so a diff reads every MOVED header as
+    #         a removal; an earlier draft mislabelled 526 blocks that way.
+    #         Comparing parsed sets is immune to moves.
+    #       - Only NON-MERGE commits count. A name can also disappear at a later
+    #         MERGE (branch A adds it, branch B is folded in afterwards and
+    #         -X theirs takes B's copy) -- that is the real loss this script
+    #         exists to repair, and must not be mistaken for a deliberate one.
+    #         Testing "present at any merge commit" gets this backwards.
+    deliberately_removed: set[str] = set()
+    for sha in git(
+        ["rev-list", "--no-merges", f"{args.base}..{args.branch}", "--", args.file], repo
+    ).split():
+        after = blocks(git(["show", f"{sha}:{args.file}"], repo))
+        before = blocks(git(["show", f"{sha}^:{args.file}"], repo))
+        deliberately_removed.update(set(before) - set(after))
 
     in_merge_set = []
     for ref in refs:
@@ -215,9 +225,10 @@ def main() -> int:
         for name, (section, block, owner) in blocks(text).items():
             if name in base_blocks or name in merged_blocks:
                 continue
-            if name in post_merge_blocks:
-                # Survived every merge, then was removed by a repair commit on
-                # this branch: a deliberate rename or retirement.
+            if name in deliberately_removed:
+                # Present in the file at some merge commit on this branch and
+                # absent now: a repair commit removed it on purpose (a rename
+                # or a retirement), so restoring it would undo that.
                 deliberate += 1
                 continue
             if name in fork_blocks:

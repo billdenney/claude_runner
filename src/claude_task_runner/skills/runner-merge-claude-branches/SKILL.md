@@ -172,12 +172,17 @@ exists to repair. Repair, then regenerate.
      before the rename still carries the old spelling, which is then absent from
      both the base and the merge result. Comparing against the branch's own
      `merge-base` shows it was inherited.
-   - **deliberate removal** -- a name present at the LAST MERGE COMMIT and
-     absent now was retired by a repair commit on the branch (e.g. an operator
-     naming ruling that post-dates the branch); restoring it would undo the
-     rename on every re-run. Tested by content at that commit, NOT by scanning
-     diffs for removed `### ` lines -- `union_merge_lines.py` rewrites the file
-     wholesale, so a diff scan reads every MOVED header as a removal.
+   - **deliberate removal** -- a name removed by a NON-MERGE commit on the
+     branch was retired on purpose (e.g. applying an operator naming ruling
+     that post-dates the branch); restoring it would undo the rename on every
+     re-run. Tested by comparing PARSED BLOCK SETS across each non-merge commit
+     (present in the parent, absent in the commit), which is immune to
+     `union_merge_lines.py` rewriting the file and moving every header. Note
+     that a name can ALSO vanish at a later MERGE -- that is the real loss this
+     script repairs, so only non-merge commits count. Both simpler tests fail:
+     scanning diffs for removed `### ` lines mislabelled 526 blocks, and
+     "present at the last merge commit" breaks as soon as a reconciled branch
+     has more branches folded into it, which is how a consolidation grows.
 
    It also indexes EVERY name in a multi-name header (`### fm_a, fm_b, fm_c`).
    When a folded branch added a name to a header that survived under a different
