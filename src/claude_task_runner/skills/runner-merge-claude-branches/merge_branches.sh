@@ -23,6 +23,9 @@
 #   --pattern <glob>        Refspec pattern for source branches
 #                           (default: origin/claude/*).
 #   --extra-ref <refname>   Additional fully-qualified ref to include
+#   --exclude-ref <refname> Fully-qualified ref to leave out even though the
+#                           pattern matches it (repeatable), e.g. a WIP task
+#                           branch: --exclude-ref origin/claude/oasweep_PMC6813168.
 #                           (repeatable). Use for hand-picked feature
 #                           branches that don't match --pattern, e.g.
 #                           --extra-ref origin/add-Fiedler-Kelly_2019_fremanezumab.
@@ -96,6 +99,7 @@ SKIP_PUSH=0
 DRY_RUN=0
 ASSUME_YES=0
 EXTRA_REFS=()
+EXCLUDE_REFS=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -109,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --base) BASE="$2"; shift 2 ;;
     --pattern) PATTERN="$2"; shift 2 ;;
     --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
+    --exclude-ref) EXCLUDE_REFS+=("$2"); shift 2 ;;
     --branch-name) BRANCH_NAME="$2"; shift 2 ;;
     --union-file) UNION_FILE="$2"; shift 2 ;;
     --register-file) REGISTER_FILES+=("$2"); shift 2 ;;
@@ -167,6 +172,24 @@ echo "    base = $(git rev-parse --short "$BASE")"
 mapfile -t ALL_MATCHES < <(
   git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN" 2>/dev/null | sort -u
 )
+# Drop any --exclude-ref entries (a WIP task branch, a branch with its own PR).
+# Each exclusion is printed so the survey shows what was left out on purpose;
+# an exclusion that matched nothing is a warning, not an error, because the
+# branch may simply have been merged and pruned since the command was written.
+for ex in "${EXCLUDE_REFS[@]:-}"; do
+  [[ -z "$ex" ]] && continue
+  kept=(); dropped=0
+  for m in "${ALL_MATCHES[@]:-}"; do
+    [[ -z "$m" ]] && continue
+    if [[ "$m" == "$ex" ]]; then dropped=1; else kept+=("$m"); fi
+  done
+  if (( dropped )); then
+    echo "    excluding $ex (--exclude-ref)"
+    ALL_MATCHES=("${kept[@]:-}")
+  else
+    echo "WARNING: --exclude-ref '$ex' matched no candidate branch" >&2
+  fi
+done
 if [[ ${#ALL_MATCHES[@]} -eq 0 && ${#EXTRA_REFS[@]} -eq 0 ]]; then
   echo "ERROR: no branches matched refspec '$PATTERN' under refs/remotes/ and no --extra-ref supplied" >&2
   exit 3

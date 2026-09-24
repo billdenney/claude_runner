@@ -11,6 +11,11 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`merge_branches.sh --exclude-ref <ref>`** (repeatable) leaves a branch out of a
+  consolidation even though `--pattern` matches it, printing each exclusion in
+  the survey; a WIP task checkpoint or a branch with its own PR no longer forces
+  a narrower glob or a temporary branch deletion.
+
 - **A terminal close now writes its own dispatch gate (ADR-0033).** A run
   that ends as a clean skip or defer writes a deliverable, commits nothing
   and leaves the worktree clean; ADR-0020 marks that `completed`, which is
