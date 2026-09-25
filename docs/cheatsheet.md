@@ -179,7 +179,8 @@ A tick skips a registered queue that is not an existing directory and logs an
 entry, so a queue on a filesystem that was not mounted is managed again once it
 is. `claude-task-runner install uninstall` removes the crontab block but leaves
 `~/.claude_task_runner/queues.json`, so a later cron `install` manages every
-queue still listed. See the runbook's
+queue still listed. It prints those queues, each with the `unregister` command
+that drops it. See the runbook's
 [A registered queue was deleted or moved](runbook.md#a-registered-queue-was-deleted-or-moved).
 
 ### Stale branch cleanup

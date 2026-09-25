@@ -194,7 +194,13 @@ def uninstall(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the y/N confirmation."),
 ) -> None:
-    """Remove the watchdog installation (systemd unit AND/OR cron block)."""
+    """Remove the watchdog installation (systemd unit AND/OR cron block).
+
+    Leaves ``~/.claude_task_runner/queues.json`` as it is. Once no cron
+    block is installed, lists the queues it still holds with the
+    ``watchdog unregister`` command for each, because a later cron
+    ``install`` manages all of them again.
+    """
     settings = load_settings(config)
     console = Console()
 
@@ -226,6 +232,7 @@ def uninstall(
 
     if not cron_plan.block_existed:
         console.print("[dim]No managed block in crontab; nothing to remove there.[/]")
+        _report_registered_queues(console)
         return
 
     console.print("\n[bold]crontab change:[/]")
@@ -244,3 +251,43 @@ def uninstall(
         console.print(f"[bold red]cron uninstall failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab block removed.[/]")
+    _report_registered_queues(console)
+
+
+def _report_registered_queues(console: Console) -> None:
+    """List what ``queues.json`` still holds once no cron block is installed.
+
+    ``uninstall`` leaves the registry alone, and a later cron ``install``
+    manages every queue it lists again, including any that has since
+    been moved or deleted. Printed without Rich markup, so a ``[`` in a
+    path stays as typed. A corrupt registry is reported and left as it
+    is; the uninstall itself has already succeeded."""
+    registry = registry_mod.queues_registry_path()
+    try:
+        queues = registry_mod.read_registered_queues()
+    except registry_mod.RegistryError as exc:
+        console.print(
+            f"warning: {exc}; uninstall left it as it is.",
+            style="yellow",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        return
+    if not queues:
+        return
+    count = "1 queue" if len(queues) == 1 else f"{len(queues)} queues"
+    console.print(
+        f"{registry} still lists {count}, and a later cron install manages every "
+        "queue it lists. To drop one:",
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+    for q in queues:
+        console.print(
+            f"  claude-task-runner watchdog unregister --queue {q}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )

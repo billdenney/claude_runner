@@ -199,7 +199,13 @@ Breaking changes are called out in the version notes.
   it exit 2 and is left as it was. The tick's lenient reader would treat
   that file as empty, and rewriting it would drop every other queue.
   `--queue` defaults to the current directory, as it does for
-  `watchdog register`.
+  `watchdog register`. `install uninstall` still leaves the registry alone,
+  but once no cron block is installed it prints the queues the registry
+  still lists, each with the `unregister` command that drops it, because a
+  later cron `install` would manage all of them again. It stays silent when
+  the operator keeps the cron block, since the watchdog is still using those
+  queues, and when `crontab -l` cannot be read. A corrupt registry gets a
+  warning and is left as it is.
 - **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
   (ADR-0034).** A queue whose pre-dispatch hook creates one git worktree per
   task accumulated them forever. On 2026-09-25 the nlmixr2lib queue had 305
