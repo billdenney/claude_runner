@@ -57,3 +57,18 @@ each component receives its slice at construction time.
 
 Low — once cutoffs are settings, hardcoding them again is a regression
 in flexibility. But the goal is permanence.
+
+## Update (2026-09-25)
+
+The `config show` and `config validate` subcommands described in the
+Decision section were never built; the CLI has no `config` group. Their
+jobs are covered elsewhere:
+
+- **Validation happens on every load.** Every settings model is
+  `extra="forbid"`, so an unknown key is a hard `load_settings` error
+  rather than a warning, and any command that loads the queue's TOML
+  surfaces it — e.g. `claude-task-runner doctor` run from the queue
+  directory.
+- **The merged effective config** prints from Python with the
+  `load_settings` snippet in the cheat sheet's "Where each setting lives
+  in the schema" section (`docs/cheatsheet.md`).

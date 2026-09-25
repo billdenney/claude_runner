@@ -66,6 +66,15 @@ Breaking changes are called out in the version notes.
   not have, and now uses `CLAUDE_CONFIG_DIR=<dir> claude /login`. The
   cheat sheet's `load_settings` snippet also gained the
   `from pathlib import Path` it needed to run.
+- **The same defect in four more docs.** `docs/runbook.md` and
+  `docs/first-time-setup.md` passed `--status` to `queue list`. The
+  option belongs to `queue states`, where it is repeatable
+  (`--status running --status failed`). A comma-joined value, which
+  `docs/first-time-setup.md` also used, matches no status and prints
+  nothing. ADR-0010 and ADR-0014 describe `effort list`, `config show`
+  and `config validate` subcommands that were never built. Both ADRs are
+  append-only, so each gets a dated update that says so and names what
+  to use instead.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
