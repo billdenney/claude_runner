@@ -80,7 +80,7 @@ utilization above the trace target for the current elapsed fraction.
 
 ## Sidecars piling up
 
-**Symptom:** `claude-task-runner queue list --status awaiting_sidecar`
+**Symptom:** `claude-task-runner queue states --status awaiting_sidecar`
 shows many tasks waiting.
 
 **Steps:**

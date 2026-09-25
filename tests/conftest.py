@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
@@ -32,3 +33,18 @@ def usage_fixtures_dir(fixtures_dir: Path) -> Path:
 def default_settings() -> Settings:
     """The package defaults loaded with no per-queue overrides."""
     return load_settings(None)
+
+
+@pytest.fixture(params=["libyaml", "pure-python"])
+def yaml_backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run a test once per YAML loader ``queue.store`` can select.
+
+    ``pure-python`` deletes ``yaml.CSafeLoader``, which is what a PyYAML
+    built without LibYAML looks like, so the store falls back to
+    ``SafeLoader``. ``libyaml`` is skipped on such a build.
+    """
+    if request.param == "pure-python":
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+    elif not yaml.__with_libyaml__:
+        pytest.skip("PyYAML was built without LibYAML")
+    return str(request.param)

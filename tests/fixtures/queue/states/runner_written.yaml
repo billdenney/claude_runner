@@ -1,0 +1,55 @@
+schema_version: 2
+task_id: 042-smith_2021_examplumab
+status: awaiting_sidecar
+session_id: 9d43c201-fbfd-4b64-ad89-b0ff74ae6225
+session_account: work
+attempts: 2
+resume_attempts: 1
+last_started_at: '2026-09-24T22:05:01.543428Z'
+last_finished_at: '2026-09-24T22:08:01.543428Z'
+last_heartbeat_at: '2026-09-24T22:08:01.543428Z'
+dispatcher_alive_at: '2026-09-24T22:08:01.543428Z'
+pid: 4243
+log_path: .claude_task_runner/logs/042-smith_2021_examplumab.jsonl
+stop_reason: end_turn
+error: 'sidecar filed: covariate encoding is ambiguous'
+deferral_count: 3
+sidecar_refile_count: 1
+next_eligible_at: '2026-09-25T21:05:01.543428Z'
+deferred_reason: 'readiness hold: inputs/smith_2021.pdf missing'
+runs:
+- schema_version: 2
+  attempt: 1
+  started_at: '2026-09-24T21:05:01.543428Z'
+  finished_at: '2026-09-24T21:07:22.828054Z'
+  stop_reason: error
+  error: "Traceback (most recent call last):\n  File \"x.py\", line 1\nValueError:\
+    \ bad: value\n"
+  usage:
+    input_tokens: 23
+    output_tokens: 8856
+    cache_read_tokens: 755513
+    cache_creation_tokens: 50415
+  cost_usd: 0.91617825
+  duration_s: 141.284626
+  resumed_from_session: 3f1c0a9e-0000-4000-8000-000000000001
+  killed_by_cap: duration
+  pid: 4242
+  account: work
+- schema_version: 2
+  attempt: 2
+  started_at: '2026-09-24T22:05:01.543428Z'
+  finished_at: '2026-09-24T22:08:01.543428Z'
+  stop_reason: end_turn
+  error: null
+  usage:
+    input_tokens: 23
+    output_tokens: 8856
+    cache_read_tokens: 755513
+    cache_creation_tokens: 50415
+  cost_usd: 0.0
+  duration_s: 180.0
+  resumed_from_session: null
+  killed_by_cap: tokens
+  pid: 4243
+  account: personal

@@ -185,7 +185,7 @@ liveness with `claude-task-runner supervisor status`.
 …or directly:
 
 ```sh
-claude-task-runner queue list --status running,completed,failed
+claude-task-runner queue states --status running --status completed --status failed
 ```
 
 When the first task is `completed`, the setup is done.

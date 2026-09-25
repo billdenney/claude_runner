@@ -9,6 +9,45 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
+  so a tick's `todo/` scan is about 11× faster.** Every supervisor tick,
+  `_eligible_candidates` and `planned_dispatch_order` load every task YAML in
+  `todo/`, and `queue/store.py` parsed them with PyYAML's pure-Python
+  `SafeLoader`. On the 5,294-task nlmixr2lib queue (read-only, best of 3), a
+  full `load_task` pass went from 14.6 s to 1.3 s. Parsing alone went from
+  14.4 s to 1.1 s; pydantic validation is 0.04 s. `_load_yaml` is the only
+  YAML parse site in `src/`, so every reader of task and state files (the
+  orchestrator, reconcile, adoption, doctor and the CLI) gets the speedup.
+  A PyYAML built without LibYAML falls back to `SafeLoader`.
+
+  Both loaders parsed all 5,294 task and 4,623 state files of that queue to
+  identical objects, type for type. They share PyYAML's resolver and
+  constructor, and their scanners differ only on hand-written edge cases,
+  each now pinned by a test. `CSafeLoader` accepts a tab as separating
+  whitespace (`key:<TAB>value`, a trailing tab), which `SafeLoader` rejected,
+  so a hand-written task skipped as unparseable for that reason alone now
+  loads and becomes dispatchable. In the other direction, it rejects escaped
+  surrogates (`"\ud83d"`), `%YAML` versions other than 1.1/1.2 and unknown
+  `%` directives, which `SafeLoader` accepted. The runner's own writers never
+  emit any of these, and no file in that queue parses differently.
+
+### Fixed
+
+- **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
+  (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
+  `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,
+  which is a 26 KB file and far under `MAX_YAML_BYTES`. Unbounded, one such
+  file in `todo/` would have killed the supervisor on every tick. Under
+  `SafeLoader`, the same file raised `RecursionError` from about 490 levels
+  on, and that escapes every `except QueueSchemaError`: a 2 KB task nested
+  1,000 levels deep made `claude-task-runner queue list` crash with a
+  traceback, hiding every other task. Depth is now counted while composing,
+  under either loader, and a deeper document is rejected with its location.
+  The deepest schema-valid document is 5 levels, so no file that could
+  validate is affected.
+
 ### Added
 
 - **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
@@ -68,6 +107,68 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The ADR index lists ADR-0033.** `docs/decisions/README.md` stopped
+  at 0032: ADR-0033 (a terminal close writes its own dispatch gate)
+  landed on 2026-09-04 without its row, and only a sentence of prose
+  asked for one. `tests/unit/test_docs_adr_index.py` now fails when an
+  ADR file has no index row, a row has no ADR file, a number is used
+  twice (two branches can each claim the next free number), or a file
+  under `docs/decisions/` is not named `NNNN-<slug>.md` and so would
+  escape those checks. Known-answer tests pin the row parser, and a row
+  it cannot read fails the gate rather than dropping out of it.
+- **README and the cheat sheet quote the coverage gate CI enforces
+  (90%).** CI raised `--cov-fail-under` from 75 to 90 on 2026-05-16, but
+  the "pipeline that CI runs" in `README.md` still ran
+  `--cov-fail-under=75` — so it could pass locally where CI failed — and
+  `docs/cheatsheet.md` still called 90% "aspirational". The cheat-sheet
+  section is rewritten as "Coverage gate" and drops its claim that a
+  live-test suite (`CTR_RUN_LIVE_TESTS=1`) covers `usage/capture.py`: no
+  test carries the `live` marker, so `capture()` is simply uncovered.
+  `tests/unit/test_docs_coverage_gate.py` now fails when README's gate
+  differs from the one in `.github/workflows/ci.yml`, which it reads
+  from the workflow's parsed `run:` steps so a gate quoted in a comment
+  cannot stand in for it. Known-answer tests pin both parsers, and a
+  missing README block or a CI file with zero or two gates fails rather
+  than comparing nothing.
+- **The cheat sheet's "Add a new plan" recipe now works.** Its last step
+  ran a `supervisor` subcommand that does not exist and failed with
+  `No such command 'restart'`. Reading the code showed the recipe was
+  wrong in more places than that. `[claude].plan` and `[plans.*]` are
+  schema-validated but read by no runtime code, so changing them needs
+  neither a reload nor a restart. What does matter is the account switch
+  (`[claude].config_dir` or `[[accounts]]`), and that needs a real
+  restart: `supervisor drain` then `supervisor start` (or the cron
+  watchdog), or `systemctl --user restart claude-task-runner` under
+  systemd. A SIGHUP reload is not enough, because the `/usage` poller is
+  built once at `supervisor start`. After a reload the supervisor would
+  dispatch through the new account while throttling on the old one's
+  utilization. Step 1 used `claude --config-dir`, a flag `claude` does
+  not have, and now uses `CLAUDE_CONFIG_DIR=<dir> claude /login`. The
+  cheat sheet's `load_settings` snippet also gained the
+  `from pathlib import Path` it needed to run.
+- **The same defect in four more docs.** `docs/runbook.md` and
+  `docs/first-time-setup.md` passed `--status` to `queue list`. The
+  option belongs to `queue states`, where it is repeatable
+  (`--status running --status failed`). A comma-joined value, which
+  `docs/first-time-setup.md` also used, matches no status and prints
+  nothing. ADR-0010 and ADR-0014 describe `effort list`, `config show`
+  and `config validate` subcommands that were never built. Both ADRs are
+  append-only, so each gets a dated update that says so and names what
+  to use instead.
+- **A docs-vs-CLI gate so that cannot recur.**
+  `tests/unit/test_docs_cli_refs.py` walks the real typer command tree
+  (`typer.main.get_command(app)`) for every `claude-task-runner ...`
+  invocation in a code span or fenced block. It covers `docs/**/*.md`,
+  `README.md`, `CHANGELOG.md` and the skills' `SKILL.md` files, plus
+  every code span led by a top-level group, such as `sidecar answer`.
+  It fails on an unknown command, subcommand or option, and it checks
+  each option against the command it follows, as click does. The walker
+  has known-answer tests, including the original bug. It is also
+  enumerated over the whole tree, so it cannot reject a real command or
+  option. Docs that name a command only to say it was never built are
+  allowlisted per file with a reason. These are `config init`,
+  ADR-0030's `why-blocked`, and the two ADRs above. A companion test
+  fails when an allowlist entry goes stale.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and

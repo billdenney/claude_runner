@@ -1,0 +1,42 @@
+%YAML 1.1
+---
+# Written the way an operator (or an agent) writes a task by hand, rather
+# than in the double-quoted form write_task_atomic emits.
+schema_version: 2
+id: 043-hand_authored
+title: 'It''s hand-written: with a colon'  # single-quoted, '' escape
+prompt: |
+  # Goal
+
+  Extract the model from `inputs/paper.pdf`.
+
+    - a more-indented line, kept verbatim by the literal block
+  Keys like CL: 1.5 L/h stay text; so do yes, no, ~ and 2026-05-03.
+  Non-ASCII stays raw: Ménière, 中文, 😀.
+working_dir: &wd /srv/queue/worktrees/043-hand_authored
+effort: medium
+priority: low
+depends_on: [041-a, "042-b"]
+requires:
+  - &pdf
+    kind: file
+    path: inputs/paper.pdf
+    note: >-
+      lead PDF, folded
+      onto one line
+  - <<: *pdf
+    path: inputs/supplement.pdf
+    note: supplement (merge key; path and note overridden)
+  - {kind: sidecar_response}
+allowed_tools: [Read, Grep, Glob]
+tags:
+  - hand-written
+  - 'on'  # quoted, so a string rather than YAML 1.1 true
+weekly_critical: yes  # YAML 1.1 boolean
+weekly_deferrable: off  # YAML 1.1 boolean
+max_tokens_override: 1_500_000  # YAML 1.1 digit grouping
+max_duration_s_override: 3_600.5
+additional_dirs:
+  - *wd
+account: ~
+...

@@ -9,18 +9,27 @@
 Atomic writes use ``tempfile.NamedTemporaryFile`` + ``os.replace`` so
 concurrent reads always see a complete file (key invariant 8 in
 ``docs/architecture.md``).
+
+Reads parse with LibYAML's ``CSafeLoader`` when PyYAML was built with it
+(see :func:`_yaml_loader`): every supervisor tick loads every task YAML
+in ``todo/``, and on a 5,294-file queue that is ~11x faster than the
+pure-Python ``SafeLoader``.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeAlias, TypeVar, cast
 
 import yaml
 from pydantic import BaseModel, ValidationError
+from yaml.composer import ComposerError
+from yaml.nodes import Node
+from yaml.resolver import BaseResolver
 
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
@@ -33,8 +42,20 @@ T = TypeVar("T", bound=BaseModel)
 MAX_YAML_BYTES = 1 * 1024 * 1024
 """Upper bound on a queue YAML file's size. Task/state YAMLs are a few
 KB at most; a file this large is pathological (an accident or a crafted
-billion-laughs-style payload) and is rejected before ``yaml.safe_load``
+billion-laughs-style payload) and is rejected before the YAML parser
 gets a chance to expand it and stall the tick."""
+
+MAX_YAML_DEPTH = 64
+"""Upper bound on how deeply a queue YAML's nodes nest. The deepest
+schema-valid document is five levels (``TaskState.runs[].usage.<field>``),
+so no file that could validate comes near it. The bound exists because
+both loaders recurse once per level while composing, so an unbounded
+deep document makes ``SafeLoader`` raise ``RecursionError`` (~490
+levels) and makes ``CSafeLoader`` overflow the C stack and SEGFAULT the
+process (~26,000 levels on an 8 MiB stack, i.e. a 26 KB file, far under
+:data:`MAX_YAML_BYTES`). Like :data:`MAX_YAML_BYTES` this is a
+parser-safety bound, not an operator setting (ADR-0014): raising it far
+enough would bring the segfault back."""
 
 
 class QueueIOError(OSError):
@@ -79,6 +100,65 @@ def _check_schema_version(payload: dict[str, Any], path: Path) -> None:
         )
 
 
+class _DepthLimit(BaseResolver):
+    """Loader mixin that rejects nesting deeper than :data:`MAX_YAML_DEPTH`.
+
+    Both composers, PyYAML's pure-Python one and LibYAML's Cython one,
+    call ``descend_resolver`` before composing each node and
+    ``ascend_resolver`` after it, so counting here stops the recursion
+    long before it gets dangerous, whichever loader is in use.
+    """
+
+    _depth = 0
+
+    def descend_resolver(self, current_node: Node | None, current_index: Node | int | None) -> None:
+        self._depth += 1
+        if self._depth > MAX_YAML_DEPTH:
+            # The hook sees only the parent, so point at the collection
+            # being composed; the too-deep node starts inside it.
+            raise ComposerError(
+                "while composing a collection",
+                None if current_node is None else current_node.start_mark,
+                f"found a node nested more than {MAX_YAML_DEPTH} levels deep (MAX_YAML_DEPTH)",
+            )
+        super().descend_resolver(current_node, current_index)
+
+    def ascend_resolver(self) -> None:
+        super().ascend_resolver()
+        self._depth -= 1
+
+
+# Quoted so it is never evaluated: a PyYAML built without LibYAML has no
+# yaml.CSafeLoader, and this module must still import there.
+_SafeLoaderClass: TypeAlias = "type[yaml.SafeLoader] | type[yaml.CSafeLoader]"
+
+
+@functools.cache
+def _depth_limited(base: _SafeLoaderClass) -> _SafeLoaderClass:
+    """``base`` with :class:`_DepthLimit` mixed in, built once per base."""
+    return cast(_SafeLoaderClass, type(f"_DepthLimited{base.__name__}", (_DepthLimit, base), {}))
+
+
+def _yaml_loader() -> _SafeLoaderClass:
+    """The loader class ``_load_yaml`` parses with.
+
+    LibYAML's ``CSafeLoader`` when PyYAML was built with it (the
+    manylinux wheels are), else the pure-Python ``SafeLoader``. Both run
+    PyYAML's Python resolver and constructor, so scalars resolve and
+    objects build identically; only the scanners differ, and only on
+    hand-written edge cases. ``CSafeLoader`` accepts a tab as separating
+    whitespace (``key:<TAB>value``, a trailing tab), which ``SafeLoader``
+    rejects; it rejects surrogate escapes (``"\\ud83d"``), ``%YAML``
+    versions other than 1.1/1.2 and unknown ``%`` directives, which
+    ``SafeLoader`` accepts. ``TestLoaderDivergence`` in
+    ``tests/unit/test_store.py`` pins each difference.
+
+    Resolved per call, so a test can simulate a PyYAML built without
+    LibYAML by deleting ``yaml.CSafeLoader``.
+    """
+    return _depth_limited(getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
         size = path.stat().st_size
@@ -87,7 +167,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
                 f"{path}: file is {size} bytes, exceeds limit of {MAX_YAML_BYTES} bytes"
             )
         with path.open("rb") as fh:
-            data = yaml.safe_load(fh)
+            # Safe: _yaml_loader() is always a SafeLoader or CSafeLoader.
+            data = yaml.load(fh, Loader=_yaml_loader())
     except OSError as exc:
         raise QueueIOError(f"failed to read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
