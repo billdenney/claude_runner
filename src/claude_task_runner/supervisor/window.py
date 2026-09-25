@@ -78,9 +78,9 @@ def crossed_reset(
     if ``previous`` is ``None`` (cold start — caller sees this as
     "no comparison available").
 
-    Used by the supervisor to distinguish a legitimate drop in
-    utilization across a reset boundary from the spurious-decrease
-    monotonicity drift in :mod:`usage.drift`.
+    Utilization can legitimately go down only across such a boundary.
+    Nothing in the supervisor compares consecutive readings, though:
+    see invariant 3 in ``docs/architecture.md``.
     """
     if previous is None or previous.resets_at is None or current.resets_at is None:
         return False
