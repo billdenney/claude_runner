@@ -164,24 +164,29 @@ git push origin --delete <branch>
 git remote prune origin
 ```
 
-## Raising the coverage gate
+## Coverage gate
 
-The CI gate is currently 75% (`--cov-fail-under=75` in
-`.github/workflows/ci.yml`); the aspirational target is 90%. To find
-where the current gaps are, run the suite with a per-module miss report
-and sort by what's least covered:
+CI fails the test job when total line+branch coverage is below 90%
+(`--cov-fail-under=90` in `.github/workflows/ci.yml`). README.md's
+"Development" section shows the same flag in its copy of the CI
+pipeline, and `tests/unit/test_docs_coverage_gate.py` fails when the
+two disagree, so change the gate in both in one commit, along with the
+figure at the top of this section.
+
+When a change pulls coverage under the gate, list the misses, leaving
+out files that are already fully covered:
 
 ```sh
-pytest -m "not live" --cov --cov-report=term-missing
+pytest -m "not live" --cov --cov-report=term-missing:skip-covered
 ```
 
-The gaps cluster in two predictable places: the typer CLI command
-modules (`cli/*_cmd.py`), which need CLI-invocation harnesses, and the
-I/O-heavy `runner/orchestrator`, `supervisor/daemon`, and
-`usage/capture` modules (the last covered only by the live-test suite,
-`CTR_RUN_LIVE_TESTS=1`, because it requires a real `claude` binary). The
-pure logic in `throttle/` (`curve`, `time_of_day`, `policy`, `decision`)
-and `supervisor/state_machine` carries the project's highest coverage.
+The largest standing gap is `usage/capture.py`: its `capture()` drives
+the real `claude` TUI through pexpect, and the suite never spawns a real
+`claude`, so only the helpers around it are covered (callers mock
+`capture()` itself). The gate is set with that gap in place. Most other
+misses sit in I/O-heavy modules — chiefly the typer commands in
+`cli/*_cmd.py`, `runner/dispatcher` and `doctor/checks` — so new code
+there needs tests of its own to hold the total above the gate.
 
 ## Add a new plan
 

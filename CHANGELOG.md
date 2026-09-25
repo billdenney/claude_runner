@@ -89,6 +89,29 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The ADR index lists ADR-0033.** `docs/decisions/README.md` stopped
+  at 0032: ADR-0033 (a terminal close writes its own dispatch gate)
+  landed on 2026-09-04 without its row, and only a sentence of prose
+  asked for one. `tests/unit/test_docs_adr_index.py` now fails when an
+  ADR file has no index row, a row has no ADR file, a number is used
+  twice (two branches can each claim the next free number), or a file
+  under `docs/decisions/` is not named `NNNN-<slug>.md` and so would
+  escape those checks. Known-answer tests pin the row parser, and a row
+  it cannot read fails the gate rather than dropping out of it.
+- **README and the cheat sheet quote the coverage gate CI enforces
+  (90%).** CI raised `--cov-fail-under` from 75 to 90 on 2026-05-16, but
+  the "pipeline that CI runs" in `README.md` still ran
+  `--cov-fail-under=75` — so it could pass locally where CI failed — and
+  `docs/cheatsheet.md` still called 90% "aspirational". The cheat-sheet
+  section is rewritten as "Coverage gate" and drops its claim that a
+  live-test suite (`CTR_RUN_LIVE_TESTS=1`) covers `usage/capture.py`: no
+  test carries the `live` marker, so `capture()` is simply uncovered.
+  `tests/unit/test_docs_coverage_gate.py` now fails when README's gate
+  differs from the one in `.github/workflows/ci.yml`, which it reads
+  from the workflow's parsed `run:` steps so a gate quoted in a comment
+  cannot stand in for it. Known-answer tests pin both parsers, and a
+  missing README block or a CI file with zero or two gates fails rather
+  than comparing nothing.
 - **The cheat sheet's "Add a new plan" recipe now works.** Its last step
   ran a `supervisor` subcommand that does not exist and failed with
   `No such command 'restart'`. Reading the code showed the recipe was
