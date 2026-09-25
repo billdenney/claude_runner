@@ -1,0 +1,28 @@
+# A state file edited by hand (e.g. to un-stick a task). The timestamps
+# are UNQUOTED, so the YAML 1.1 resolver turns them into datetime objects
+# before pydantic sees them: an implicit-resolution path the runner's own
+# quoted-string output never takes.
+schema_version: 2
+task_id: 043-hand_authored
+status: deferred
+session_id: null
+attempts: 1
+last_started_at: 2026-09-24T21:05:01.5Z  # 'T' separator, fraction, Z
+last_finished_at: 2026-09-24 21:07:22.828054 +00:00  # space-separated, offset
+last_heartbeat_at: 2026-09-24t21:07:22Z  # lowercase 't'
+next_eligible_at: 2026-09-25T09:00:00+05:30  # non-UTC offset
+deferred_reason: >
+  pre-dispatch hook deferred:
+  supplement still downloading
+error: |+
+  first line
+  second line
+
+runs:
+  - attempt: 1
+    started_at: 2026-09-24T21:05:01.5Z
+    finished_at: 2026-09-24T21:07:22.828054Z
+    stop_reason: end_turn
+    usage: {input_tokens: 1_000, output_tokens: 20, cache_read_tokens: 0}
+    cost_usd: .5
+    duration_s: 1.4128e+2

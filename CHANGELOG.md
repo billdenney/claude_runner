@@ -9,6 +9,45 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
+  so a tick's `todo/` scan is about 11× faster.** Every supervisor tick,
+  `_eligible_candidates` and `planned_dispatch_order` load every task YAML in
+  `todo/`, and `queue/store.py` parsed them with PyYAML's pure-Python
+  `SafeLoader`. On the 5,294-task nlmixr2lib queue (read-only, best of 3), a
+  full `load_task` pass went from 14.6 s to 1.3 s. Parsing alone went from
+  14.4 s to 1.1 s; pydantic validation is 0.04 s. `_load_yaml` is the only
+  YAML parse site in `src/`, so every reader of task and state files (the
+  orchestrator, reconcile, adoption, doctor and the CLI) gets the speedup.
+  A PyYAML built without LibYAML falls back to `SafeLoader`.
+
+  Both loaders parsed all 5,294 task and 4,623 state files of that queue to
+  identical objects, type for type. They share PyYAML's resolver and
+  constructor, and their scanners differ only on hand-written edge cases,
+  each now pinned by a test. `CSafeLoader` accepts a tab as separating
+  whitespace (`key:<TAB>value`, a trailing tab), which `SafeLoader` rejected,
+  so a hand-written task skipped as unparseable for that reason alone now
+  loads and becomes dispatchable. In the other direction, it rejects escaped
+  surrogates (`"\ud83d"`), `%YAML` versions other than 1.1/1.2 and unknown
+  `%` directives, which `SafeLoader` accepted. The runner's own writers never
+  emit any of these, and no file in that queue parses differently.
+
+### Fixed
+
+- **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
+  (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
+  `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,
+  which is a 26 KB file and far under `MAX_YAML_BYTES`. Unbounded, one such
+  file in `todo/` would have killed the supervisor on every tick. Under
+  `SafeLoader`, the same file raised `RecursionError` from about 490 levels
+  on, and that escapes every `except QueueSchemaError`: a 2 KB task nested
+  1,000 levels deep made `claude-task-runner queue list` crash with a
+  traceback, hiding every other task. Depth is now counted while composing,
+  under either loader, and a deeper document is rejected with its location.
+  The deepest schema-valid document is 5 levels, so no file that could
+  validate is affected.
+
 ### Added
 
 - **`merge_branches.sh` aborts on same-path collisions.** Two branches that each add a
