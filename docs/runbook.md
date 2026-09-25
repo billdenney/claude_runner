@@ -99,3 +99,52 @@ come back.
    proposed change, asks for confirmation. Accept it.
 3. Verify: kill the supervisor manually; within ~60s (cron) or ~30s
    (systemd) it should restart. Check `watchdog.log`.
+
+## Task worktrees filling the disk
+
+**Symptom:** the repository's `.claude/worktrees/` holds hundreds of
+directories and the disk is filling up. A queue whose pre-dispatch hook
+creates one git worktree per task (ADR-0013) never removes them on its own.
+On 2026-09-25 the nlmixr2lib queue had 305 of them, holding 36 GB.
+
+**Steps (ADR-0034):**
+1. Dry run. It fetches `<remote>/<parent_branch>` but removes nothing:
+
+   ```sh
+   claude-task-runner worktree reclaim --queue <queue>
+   ```
+
+   Each worktree whose task YAML names it gets one line: `would` (removable),
+   `keep` with the condition it failed, or `FAIL`. The last line counts them.
+2. Read the `keep` lines before applying:
+   - `unmerged`: the branch is not in `origin/main` yet. Consolidate it
+     first (`/runner-merge-claude-branches`).
+   - `dirty`: uncommitted work. Look at it by hand; the reclaim never
+     discards it.
+   - `status`: the task is not `completed`. A sidecar, resume or retry
+     still needs the directory.
+   - `in_flight`: a dispatch thread still holds the task; try again later.
+3. Apply, optionally in batches:
+
+   ```sh
+   claude-task-runner worktree reclaim --queue <queue> --apply --limit 50
+   ```
+
+   The command exits 1 when a fetch, a probe or a removal failed, and 2 when
+   it could not run at all. A summary ending in `branch(es) kept by git
+   branch -d` means the worktree is gone but git refused to delete a local
+   branch that is not merged into its upstream. Check it with
+   `git branch -vv`; the reclaim never uses `-D`.
+4. To keep the count bounded from now on, add this to
+   `<queue>/claude_runner.toml` and send the supervisor SIGHUP (it re-reads
+   the file on its next tick) or restart it:
+
+   ```toml
+   [worktree_reclaim]
+   periodic  = true
+   lock_file = ".run/setup_worktree.lock"   # the flock the pre-dispatch hook takes
+   ```
+
+   Each pass removes at most `max_per_pass` worktrees, so clear a large
+   backlog with the CLI first. A task whose YAML has left `todo/` is invisible
+   to the runner. Remove its worktree by hand, or reclaim before moving YAMLs.

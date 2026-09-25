@@ -351,7 +351,12 @@ exists to repair. Repair, then regenerate.
    folded branch and GitHub marks each as "Merged" — no force-advance
    step, no `post_merge_advance.sh`, no SHA bookkeeping. The operator
    can then delete the source branches at leisure
-   (`git push --delete origin claude/<task-id>`).
+   (`git push --delete origin claude/<task-id>`). The same ancestry makes
+   each completed task's local worktree reclaimable: once the PR lands,
+   `claude-task-runner worktree reclaim --queue <queue>` lists them (a dry
+   run) and `--apply` removes them with their local branches (ADR-0034).
+   The supervisor does this on its own when `[worktree_reclaim].periodic`
+   is on.
 
 10. **Push the branch** to origin:
 
@@ -376,6 +381,9 @@ exists to repair. Repair, then regenerate.
   origin as the per-task audit trail. When the consolidation PR
   merges, the operator can clean up via `git push --delete origin
   claude/<task-id>` as they prefer.
+- **Does not remove the per-task worktrees.** That is
+  `claude-task-runner worktree reclaim`'s job, after the consolidation PR
+  has landed (see step 9).
 - **Does not modify the queue's runtime state.** The supervisor /
   daemons / sidecar files are untouched. The merge runs entirely
   inside the nlmixr2lib repo's worktree.
