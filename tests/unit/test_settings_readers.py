@@ -41,13 +41,6 @@ ROOTS: dict[str, type[BaseModel]] = {
 """The two files an operator writes, and the model each one loads into."""
 
 KNOWN_UNREAD: dict[str, str] = {
-    "ClaudeSettings.plan": (
-        "selects a [plans.*] entry, and nothing reads those; ADR-0022 throttles "
-        "on the /usage utilization percentages"
-    ),
-    "Settings.plans": "token budgets for ADR-0011's EMA formula, which was never built",
-    "PlanSettings.five_hour_tokens": "see Settings.plans",
-    "PlanSettings.weekly_tokens": "see Settings.plans",
     "UsageSettings.healthcheck_interval_s": "schedules a drift canary that was never built",
     "UsageSettings.suspicious_delta_pct": (
         "a parameter of usage.drift.validate_monotonicity, which nothing calls"

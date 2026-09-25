@@ -190,12 +190,14 @@ there needs tests of its own to hold the total above the gate.
 
 ## Add a new plan
 
-`[claude].plan` and the `[plans.*]` token budgets are schema-validated
-but **no runtime code reads them**. The throttle compares the
-utilization *percentages* that `claude /usage` reports against
-`[dispatch_pct.*]`, and those percentages are already relative to the
-account's tier. A new tier therefore needs no `[plans.*]` entry, and
-editing `plan` or `[plans.*]` needs neither a reload nor a restart.
+There is no plan setting. The throttle compares the utilization
+*percentages* that `claude /usage` reports against `[dispatch_pct.*]`,
+and those percentages are already relative to the account's tier, so a
+new tier needs no configuration of its own. `[claude].plan` and the
+`[plans.*]` token budgets were removed on 2026-09-25 because no runtime
+code ever read them. A `claude_runner.toml` that still sets either one
+fails to load with a message saying to delete it, and deleting it
+changes nothing.
 
 What matters is which account the supervisor dispatches through and
 polls. When the new tier is a different login:

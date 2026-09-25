@@ -22,12 +22,13 @@ from typing import Any, get_args, get_origin
 import pytest
 from pydantic import BaseModel
 
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.config.schema import Settings
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 DOCS_DIR = REPO_ROOT / "docs"
 
-RETIRED_TABLES = {
+RETIRED_KEYS = {
     "throttle": (
         "ADR-0022 replaced [throttle.*] with [dispatch_pct.*]. Docs reference "
         "it deliberately: superseded ADRs 0015/0016 record it as history and "
@@ -35,13 +36,34 @@ RETIRED_TABLES = {
         "config.loader._reject_legacy_throttle hard-errors on the key, so an "
         "operator cannot silently resurrect it."
     ),
+    "claude.plan": (
+        "Never read by any runtime code; removed 2026-09-25. ADR-0022 records "
+        "the design that named it, and the cheat sheet's 'Add a new plan' "
+        "says it is gone."
+    ),
+    "plans": "Never read; removed with claude.plan, and documented alongside it.",
 }
-"""Tables that no longer exist but which docs may still name.
+"""Tables and fields that no longer exist but which docs may still name.
 
-Add an entry ONLY for a table that docs describe as retired/historical.
-A table an operator might still be told to *set* does not belong here --
-that is the bug this test exists to catch.
+A dotted entry covers itself and everything under it: ``"throttle"`` is
+the whole ``[throttle.*]`` tree, ``"claude.plan"`` one field. Add an
+entry ONLY for a key that docs describe as retired/historical. A key an
+operator might still be told to *set* does not belong here -- that is
+the bug this test exists to catch. Every entry must also be rejected by
+a loader guard that names it (checked below), so an operator who follows
+a stale mention gets told to delete the key.
 """
+
+
+def _is_retired(path: str) -> bool:
+    return any(path == key or path.startswith(f"{key}.") for key in RETIRED_KEYS)
+
+
+def _retired_shown(key: str) -> str:
+    """How the loader's messages write a retired key: ``[claude].plan``, ``[plans.*]``."""
+    table, _, field = key.rpartition(".")
+    return f"[{table}].{field}" if table else f"[{field}.*]"
+
 
 _PLACEHOLDER = re.compile(r"^(?:\*|<[^>]*>|\.\.\.|N|NNN)$")
 """A doc placeholder segment (``<model>``, ``*``). Unverifiable, so it
@@ -171,6 +193,11 @@ class TestSchemaWalker:
     def test_rejects_deleted_table(self) -> None:
         assert not _is_known("sidecar.unanswered_auto_recommended_s")
         assert not _is_known("notify.channels")
+        assert not _is_known("plans.max20x.weekly_tokens")
+
+    def test_rejects_deleted_field_on_real_table(self) -> None:
+        assert _is_known("claude.config_dir")
+        assert not _is_known("claude.plan")
 
     def test_rejects_unknown_field_on_real_table(self) -> None:
         assert not _is_known("queue.no_such_field")
@@ -214,7 +241,7 @@ class TestDocsMatchSchema:
     def test_every_config_reference_exists(self, doc: Path) -> None:
         bad: list[str] = []
         for lineno, path in _iter_doc_refs(doc.read_text()):
-            if path.split(".")[0] in RETIRED_TABLES or _is_known(path):
+            if _is_retired(path) or _is_known(path):
                 continue
             table, _, field = path.partition(".")
             shown = f"[{table}].{field}" if field else f"[{table}]"
@@ -225,6 +252,34 @@ class TestDocsMatchSchema:
             "following these would get a config that refuses to load.\n"
             + "\n".join(bad)
             + "\nFix the docs, add the field to config/schema.py, or -- only "
-            "for a table docs describe as retired -- add it to "
-            "RETIRED_TABLES in this file."
+            "for a key docs describe as retired -- add it to "
+            "RETIRED_KEYS in this file."
         )
+
+
+class TestRetiredKeys:
+    def test_an_entry_covers_itself_and_what_is_under_it(self) -> None:
+        assert _is_retired("throttle")
+        assert _is_retired("throttle.five_hour.band_slowdown_max_pct")
+        assert _is_retired("claude.plan")
+        assert not _is_retired("claude.config_dir")
+        assert not _is_retired("claude")
+        # A prefix match on whole segments only.
+        assert not _is_retired("plansx")
+        assert not _is_retired("claude.planned")
+
+    def test_shown_like_the_loader_messages(self) -> None:
+        assert _retired_shown("throttle") == "[throttle.*]"
+        assert _retired_shown("claude.plan") == "[claude].plan"
+
+    @pytest.mark.parametrize("key", sorted(RETIRED_KEYS))
+    def test_the_loader_rejects_it_by_name(self, key: str, tmp_path: Path) -> None:
+        # Docs may keep naming a retired key only because an operator who
+        # follows a stale mention is told to delete it. A plain
+        # extra="forbid" rejection would not name it as [table].field, so
+        # this fails unless a dedicated guard fired.
+        table, _, field = key.rpartition(".")
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(f"[{table}]\n{field} = 1\n" if table else f"[{field}]\n")
+        with pytest.raises(ConfigError, match=re.escape(_retired_shown(key))):
+            load_settings(toml)

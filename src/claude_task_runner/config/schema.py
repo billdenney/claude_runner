@@ -340,15 +340,10 @@ class ClaudeSettings(_StrictModel):
     compatibility. When both are present, ``[[accounts]]`` wins and this
     field is ignored. Empty string means "use claude's default"
     (``~/.claude``).
-
-    ``plan`` selects an entry from the top-level ``[plans.*]`` table so
-    the loader can pull the 5h and weekly token caps for that plan.
-    Empty string means "no auto-tune; use the explicit budgets."
     """
 
     executable: str = "claude"
     config_dir: str = ""
-    plan: str = ""
 
 
 class AccountSettings(_StrictModel):
@@ -685,17 +680,6 @@ class DispatchSettings(_StrictModel):
     fresh)."""
 
 
-class PlanSettings(_StrictModel):
-    """Per-plan token budgets.
-
-    ADR-0022 simplified this block to token caps only; dispatch shape
-    lives in ``[dispatch_pct.*]`` which the operator sets directly.
-    """
-
-    five_hour_tokens: int = Field(gt=0)
-    weekly_tokens: int = Field(gt=0)
-
-
 class Settings(_StrictModel):
     """Root settings model — the merged effective configuration."""
 
@@ -722,7 +706,6 @@ class Settings(_StrictModel):
     """``[queue]`` block — task-authoring knobs consumed by ``queue add``.
     Has a default so existing TOMLs that pre-date this block keep
     parsing unchanged. See :class:`QueueSettings` and ADR-0023."""
-    plans: dict[str, PlanSettings] = Field(default_factory=dict)
     accounts: list[AccountSettings] = Field(default_factory=list)
     """One or more Claude accounts the supervisor may dispatch through.
 

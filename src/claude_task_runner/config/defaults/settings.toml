@@ -14,13 +14,6 @@ config_dir = ""        # LEGACY single-account alias; superseded by [[accounts]]
                        # emits a WARN). Operators with a bare [claude] block
                        # keep working: the loader synthesises a single account
                        # named "default" from this field.
-plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
-                       # "team_standard" | "team_premium".
-                       # Determines the 5h:weekly token ratio used to derive
-                       # default throttle thresholds. Operator can still
-                       # override `[throttle.*]` fields explicitly below.
-                       # If empty / unrecognised, the explicit `[throttle.*]`
-                       # values are used as-is (no auto-tuning).
 
 # ---------------------------------------------------------------------------
 # Claude accounts (multi-account dispatch)
@@ -151,39 +144,6 @@ time_end            = "06:00"   # night ends at 06:00 local (wraps midnight)
 early_pct       = 60          # target % at start of EOW segment
 eow_pct         = 95          # target % at week reset
 eow_time_switch = "40h"       # length of EOW segment (~2 nights)
-
-# ---------------------------------------------------------------------------
-# Plan-specific token budgets
-#
-# When `[claude].plan` is one of the keys below, the loader uses the
-# plan's `five_hour_tokens` and `weekly_tokens` as the source of truth
-# for the supervisor's window budgets. Dispatch shape lives entirely in
-# `[dispatch_pct.*]` (ADR-0022); plans no longer carry band hints.
-#
-# Rows are approximate ceilings observed on each plan; verify against
-# `claude /usage` for the target account before relying on them.
-# ---------------------------------------------------------------------------
-[plans.max20x]
-five_hour_tokens = 99_000_000
-weekly_tokens    = 798_841_951
-
-[plans.max5x]
-five_hour_tokens = 24_750_000     # ~1/4 of Max20x
-weekly_tokens    = 199_710_488
-
-[plans.pro]
-five_hour_tokens = 4_950_000      # ~1/20 of Max20x
-weekly_tokens    = 39_942_098
-
-[plans.team_standard]
-# Team Standard: operator-noted ratio 1.25 x Pro.
-five_hour_tokens = 6_187_500
-weekly_tokens    = 49_927_622
-
-[plans.team_premium]
-# Team Premium: operator-noted ratio 6.25 x Pro.
-five_hour_tokens = 30_937_500
-weekly_tokens    = 249_638_112
 
 # ---------------------------------------------------------------------------
 # Concurrency / EMA
