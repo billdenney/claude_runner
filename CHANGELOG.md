@@ -35,6 +35,26 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`--help` no longer drops bracketed words such as `[queue]` and
+  `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
+  every help string as Rich console markup. Rich takes `[` followed by a
+  lowercase letter as the start of a style tag and deletes the tag, so ten
+  help texts in nine commands lost text. `supervisor drain --help` showed
+  `[task_caps].max_duration_s_per_task` as `.max_duration_s_per_task`,
+  `queue restart-fresh --help` showed `[[accounts]]` as `[]`, and
+  `sidecar answer --help` showed `list[str]` as `list`. Every `typer.Typer`
+  in `cli/` now passes `rich_markup_mode=None`, so help prints exactly as
+  written. It is now in click's plain format rather than Rich panels, and
+  usage errors print as click's plain `Error:` lines. `console.print`
+  output keeps its colours. Click re-wraps help paragraphs, so the two
+  "Exit codes:" tables and the bullet lists in `supervisor start` and
+  `queue force-dispatch` now open with click's `\b` no-rewrap line.
+  `tests/unit/test_docs_cli_help.py` renders every command's `--help`. It
+  fails when a bracketed token in the help text is missing from the output,
+  when any `typer.Typer` in the tree uses a markup mode, or when a laid-out
+  paragraph has no `\b`. Known-answer tests pin the checker: under the old
+  mode it reports exactly the tokens Rich drops, both on a demo app and on
+  the real CLI.
 - **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
   (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
   `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,
