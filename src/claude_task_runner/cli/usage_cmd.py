@@ -34,7 +34,7 @@ from claude_task_runner.usage.drift import (
     UsageFormatDrift,
 )
 
-app = typer.Typer(no_args_is_help=False, invoke_without_command=True)
+app = typer.Typer(no_args_is_help=False, invoke_without_command=True, rich_markup_mode=None)
 
 EXIT_OK = 0
 EXIT_PARSE_DRIFT = 1
@@ -175,6 +175,7 @@ def to_json(ctx: typer.Context) -> None:
 def healthcheck(ctx: typer.Context) -> None:
     """Capture+parse and report PASS/FAIL/WARN. Exit code signals state.
 
+    \b
     Exit codes:
       0  clean
       1  parse drift

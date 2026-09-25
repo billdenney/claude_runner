@@ -45,7 +45,7 @@ Format: ``{"queues": ["/path/to/queue1", "/path/to/queue2"]}``. The
 ``install`` subcommand auto-adds the queue directory it was invoked
 with."""
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 def queues_registry_path() -> Path:

@@ -39,7 +39,7 @@ from claude_task_runner.queue.sidecar import (
 )
 from claude_task_runner.queue.store import QueueIOError, QueueSchemaError
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 _SUMMARY_WIDTH = 100
 

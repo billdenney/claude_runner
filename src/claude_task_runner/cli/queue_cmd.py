@@ -58,7 +58,7 @@ from claude_task_runner.runner.effort_levels import (
 )
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -789,6 +789,7 @@ def force_dispatch(
 
     Behavior depends on whether the supervisor is running:
 
+    \b
     * **Supervisor running.** Writes a request file under
       ``<queue>/.claude_task_runner/force_dispatch/<task_id>.req``;
       the supervisor consumes it on the next tick (typically <30 s).

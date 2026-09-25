@@ -26,7 +26,7 @@ from claude_task_runner.config.schema import Settings
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.worktree import reclaim as reclaim_mod
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 _LABELS = {
     reclaim_mod.Outcome.RECLAIMED: "gone",

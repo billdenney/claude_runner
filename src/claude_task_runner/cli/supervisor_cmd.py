@@ -40,7 +40,7 @@ from claude_task_runner.usage.source import (
     UsageSource,
 )
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,7 @@ def start(
     Signals (delivered with ``kill -<NAME> <pid>`` against the PID file
     at ``<queue>/.claude_task_runner/supervisor.pid``):
 
+    \b
     * ``SIGTERM`` / ``SIGINT`` — request a clean stop; in-flight
       dispatch threads finish their current attempt (architectural
       invariant 2: in-flight tasks are NOT killed when the supervisor
@@ -395,6 +396,7 @@ def drain(
     (typically minutes for extraction work; up to
     ``[task_caps].max_duration_s_per_task`` for the hard cap).
 
+    \b
     Exit codes:
       0  supervisor exited cleanly (or --no-wait and signal delivered)
       1  no PID file / stale PID file
