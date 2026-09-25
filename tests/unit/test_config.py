@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from claude_task_runner.config.loader import (
     _RETIRED_KEYS,
@@ -18,7 +19,7 @@ from claude_task_runner.config.loader import (
     load_defaults,
     load_settings,
 )
-from claude_task_runner.config.schema import Settings
+from claude_task_runner.config.schema import Settings, WorktreeReclaimSettings
 
 
 class TestDeepMerge:
@@ -208,3 +209,103 @@ class TestRetiredKeys:
     def test_the_defaults_set_no_retired_key(self) -> None:
         defaults = load_defaults()
         assert [path for path in _RETIRED_KEYS if _has_path(defaults, path)] == []
+
+
+class TestWorktreeReclaimSettings:
+    """ADR-0034 ``[worktree_reclaim]``: defaults, overrides, and the validators
+    that keep an unsafe value from ever reaching a ``git`` argv."""
+
+    def test_package_toml_mirrors_the_model_defaults(self) -> None:
+        # The defaults live in two places (model + package TOML) so a queue
+        # TOML without the section parses; this gate stops them drifting.
+        assert load_settings(None).worktree_reclaim == WorktreeReclaimSettings()
+
+    def test_defaults(self) -> None:
+        s = load_settings(None).worktree_reclaim
+        assert s.periodic is False
+        assert s.interval_s == 3600.0
+        assert s.max_per_pass == 20
+        assert (s.remote, s.parent_branch) == ("origin", "main")
+        assert s.branch_template == "claude/{task_id}"
+        assert s.discardable_untracked == ["tests/testthat/_problems/"]
+        assert s.lock_file == ""
+        assert s.lock_timeout_s == 60.0
+        assert s.git_timeout_s == 300.0
+
+    def test_override(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(
+            "[worktree_reclaim]\n"
+            "periodic = true\n"
+            'lock_file = ".run/setup_worktree.lock"\n'
+            "discardable_untracked = []\n"
+            'parent_branch = "release/1.x"\n'
+        )
+        s = load_settings(toml).worktree_reclaim
+        assert s.periodic is True
+        assert s.lock_file == ".run/setup_worktree.lock"
+        assert s.discardable_untracked == []
+        assert s.parent_branch == "release/1.x"
+        assert s.remote == "origin"  # untouched keys keep their default
+
+    def test_unknown_key_rejected(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[worktree_reclaim]\nenabled = true\n")
+        with pytest.raises(ConfigError, match="validation failed"):
+            load_settings(toml)
+
+    @pytest.mark.parametrize("template", ["claude/{task_id}", "{task_id}", "wt/{worktree_name}"])
+    def test_branch_template_accepted(self, template: str) -> None:
+        assert WorktreeReclaimSettings(branch_template=template).branch_template == template
+
+    @pytest.mark.parametrize(
+        ("template", "message"),
+        [
+            ("main", "must contain {task_id} or {worktree_name}"),
+            ("claude/{task}", "unknown placeholder 'task'"),
+            ("claude/{task_id", "not a valid template"),
+            ("-{task_id}", "not a safe git ref/remote name"),
+            ("claude/{task_id}.lock", "not a safe git ref/remote name"),
+            ("claude/{task_id} x", "not a safe git ref/remote name"),
+        ],
+    )
+    def test_branch_template_rejected(self, template: str, message: str) -> None:
+        with pytest.raises(ValidationError, match=re.escape(message)):
+            WorktreeReclaimSettings(branch_template=template)
+
+    def test_render_branch(self) -> None:
+        s = WorktreeReclaimSettings(branch_template="{worktree_name}/{task_id}")
+        assert s.render_branch(task_id="t-1", worktree_name="wt") == "wt/t-1"
+
+    @pytest.mark.parametrize("field", ["remote", "parent_branch"])
+    @pytest.mark.parametrize(
+        "value", ["", "-upload-pack=x", "a b", "a..b", "a//b", "main/", "x.lock"]
+    )
+    def test_git_names_rejected(self, field: str, value: str) -> None:
+        with pytest.raises(ValidationError, match="not a safe git ref/remote name"):
+            WorktreeReclaimSettings(**{field: value})
+
+    @pytest.mark.parametrize(
+        "entry", ["tests/testthat/_problems/", "Rplots.pdf", "build", ".Rcheck/"]
+    )
+    def test_discardable_entries_accepted(self, entry: str) -> None:
+        assert WorktreeReclaimSettings(discardable_untracked=[entry]).discardable_untracked == [
+            entry
+        ]
+
+    @pytest.mark.parametrize(
+        "entry", ["", "/", ".", "./", "/abs/path", "../up", "a/../b", " padded", "a\\b"]
+    )
+    def test_discardable_entries_rejected(self, entry: str) -> None:
+        # Each of these would widen "discard these paths" to "discard
+        # anything" or point outside the worktree.
+        with pytest.raises(ValidationError, match="must be a non-empty path"):
+            WorktreeReclaimSettings(discardable_untracked=[entry])
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("interval_s", 0), ("max_per_pass", 0), ("lock_timeout_s", 0), ("git_timeout_s", -1)],
+    )
+    def test_non_positive_limits_rejected(self, field: str, value: float) -> None:
+        with pytest.raises(ValidationError):
+            WorktreeReclaimSettings(**{field: value})

@@ -165,8 +165,10 @@ class ReadinessRequirement(_StrictBase):
     ``sidecar_response`` (which is keyed on the task id, not a path)."""
     note: str | None = None
     """Optional operator-facing description of what this element is and why
-    it gates dispatch — surfaced verbatim when reporting why a task is
-    waiting (e.g. ``queue why-blocked``)."""
+    it gates dispatch. It is appended verbatim to the element's unmet
+    reason, which ``queue show`` lists, the task's ``readiness hold:``
+    deferred reason records, and a refused ``queue force-dispatch``
+    reports."""
 
     @model_validator(mode="after")
     def _validate_kind_fields(self) -> ReadinessRequirement:

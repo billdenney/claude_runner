@@ -7,22 +7,22 @@ introduces a new on-disk file MUST update this document in the same PR.
 ## Component map
 
 ```
-+----------------------------------------------------------------+
-|                        CLI (cli/)                              |
-|   typer-based entry; dispatches to subcommands per concern     |
-+--+------+----------+-----------+---------+--------+------------+
-   |      |          |           |         |        |
-   v      v          v           v         v        v
-+-----+ +------+ +--------+ +--------+ +-------+ +-------+
-|usage| |queue | |runner  | |sup-    | |cron / | |doctor |
-|     | |      | |        | |ervisor | |systemd| |       |
-+-----+ +------+ +--------+ +--------+ +-------+ +-------+
-   |      |          |           |
-   v      v          v           v
-+---------------------+ +-------------------+
-| YAML state          | | UsageSource       |
-| (queue/store)       | | (usage/source)    |
-+---------------------+ +-------------------+
++--------------------------------------------------------------------+
+|                        CLI (cli/)                                  |
+|   typer-based entry; dispatches to subcommands per concern         |
++--+------+----------+-----------+---------+--------+----------+-----+
+   |      |          |           |         |        |          |
+   v      v          v           v         v        v          v
++-----+ +------+ +--------+ +--------+ +-------+ +-------+ +--------+
+|usage| |queue | |runner  | |sup-    | |cron / | |doctor | |worktree|
+|     | |      | |        | |ervisor | |systemd| |       | |reclaim |
++-----+ +------+ +--------+ +--------+ +-------+ +-------+ +--------+
+   |      |          |           |                             |
+   v      v          v           v                             v
++---------------------+ +-------------------+         +---------------+
+| YAML state          | | UsageSource       |         | git: per-task |
+| (queue/store)       | | (usage/source)    |         | worktrees     |
++---------------------+ +-------------------+         +---------------+
                                  |
                                  v
                          +-------------+
@@ -45,9 +45,12 @@ introduces a new on-disk file MUST update this document in the same PR.
    first stream-json `system/init` event.
 4. `runner.stream` consumes NDJSON line-by-line, updating
    `<queue>/.claude_task_runner/state/<id>.yaml`. Supervisor state-machine
-   transitions additionally surface as `EmitEvent` actions, but these are
-   logged (default `event_callback` is `None`, routing them to the
-   supervisor log); no `events.ndjson` file is written today.
+   transitions additionally surface as `EmitEvent` actions
+   (`state_transition`, `drift_detected`, `usage_capture_error`, ...).
+   `supervisor start` wires no `event_callback`, so each event is logged
+   to the supervisor log at DEBUG level only, below the default
+   `[logging].level` of INFO; no `events.ndjson` file is written today.
+   See [Supervisor log and drift evidence](#supervisor-log-and-drift-evidence).
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
    after `task_caps.heartbeat_silence_alert_s` seconds of silence.
 6. If task hits a sidecar question: writes
@@ -64,6 +67,13 @@ introduces a new on-disk file MUST update this document in the same PR.
 8. On task failure: `runner.retry` classifies the error
    (environmental | operator | task | unknown). Environmental → auto-retry.
    Other → surface to operator.
+10. After the task's branch has been merged into the parent branch (e.g. by
+    the `runner-merge-claude-branches` consolidation), `worktree.reclaim`
+    removes the task's worktree and local branch (ADR-0034). It runs from
+    `claude-task-runner worktree reclaim` on demand, or from the supervisor
+    loop every `[worktree_reclaim].interval_s` when
+    `[worktree_reclaim].periodic` is on. The runner still never *creates* a
+    worktree; that stays the pre-dispatch hook's job (ADR-0013).
 
 ## State machine summary
 
@@ -115,19 +125,23 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     ├── state/<id>.yaml             # TaskState (pydantic v2 schema) — the
     │                               #   single source of truth per task; stream
     │                               #   events are folded into it, not teed out
+    ├── state/.corrupt/<id>.<ts>.yaml  # unparseable state YAMLs, quarantined
+    │                                  #   (ADR-0028)
     ├── sidecar/<id>/request-NNN.json
     ├── sidecar/<id>/response-NNN.json
+    ├── force_dispatch/<id>.req     # `queue force-dispatch` requests, consumed
+    │                               #   on the next supervisor tick
     ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
     │   ├── attempt-<N>.stream.jsonl  #   parsed stdout NDJSON stream (re-read
     │   │                             #   on adoption to rebuild StreamSummary)
     │   └── attempt-<N>.stderr        #   paired stderr (error tail kept in state)
-    ├── supervisor.json             # supervisor state machine snapshot
+    ├── supervisor.json             # supervisor state machine snapshot; holds
+    │                               #   last_drift_message while in ErrorDrift
     ├── supervisor.pid              # PID of the running supervisor
-    ├── supervisor.log              # supervisor lifecycle + transitions
-    ├── watchdog.log                # cron/systemd watchdog actions
-    ├── drift.log                   # parser drift + healthcheck results
-    ├── usage_captures/<ts>.cap     # raw PTY captures of /usage (rotated)
-    └── banner.txt                  # human-readable status banner
+    ├── supervisor.log              # supervisor stdout/stderr, only when the
+    │                               #   cron watchdog started it (see below)
+    └── usage_captures/<ts>.cap     # raw PTY captures of the supervisor's
+                                    #   /usage polls (rotated)
 ```
 
 Global (cross-queue):
@@ -135,8 +149,43 @@ Global (cross-queue):
 ```
 ~/.claude_task_runner/
 ├── global.lock                     # fcntl lock; single supervisor across queues
+├── queues.json                     # queues the cron watchdog manages
+│                                   #   (`watchdog register`)
+├── watchdog_state.json             # cron watchdog restart history + backoff
+├── watchdog.log                    # cron watchdog output (watchdog.sh)
+├── usage_captures/<ts>.cap         # raw PTY captures from the `usage` CLI
+│                                   #   commands (rotated)
 └── crontab.backup.<ts>             # crontab snapshot before install
 ```
+
+### Supervisor log and drift evidence
+
+The supervisor logs to stderr, so where its log lands depends on what
+started it:
+
+| Started by | Supervisor log |
+|---|---|
+| systemd user unit (what `claude-task-runner install` sets up by default when `systemctl --user` works) | journald: `journalctl --user -u claude-task-runner` |
+| cron watchdog (`watchdog.sh` → `claude-task-runner watchdog tick`) | `<queue>/.claude_task_runner/supervisor.log` |
+| `claude-task-runner supervisor start` run by hand | that terminal |
+
+At the default `[logging].level` of INFO, `Notify` actions appear as
+`notify[<level>]: <message>` lines on entry to `ErrorDrift`, `SlowingDown`,
+`Throttled5h` and `ThrottledWeekly`. `EmitEvent` actions (`state_transition`,
+`drift_detected`, `drift_clean_poll`, `usage_capture_error`, ...) are logged
+at DEBUG level only; set `[logging].level = "DEBUG"` in `claude_runner.toml`
+to see them. A usage capture that times out or cannot spawn `claude` produces
+only a `usage_capture_error` event, so at INFO it leaves no trace in the log.
+
+There is no separate drift log. Parser drift leaves three pieces of evidence:
+
+- `claude-task-runner supervisor status` shows state `error_drift` and a
+  `Last drift:` line, read from `last_drift_message` in `supervisor.json`.
+- The supervisor log has one `notify[error]: parser drift: ...` line from the
+  tick that entered `ErrorDrift`.
+- With the TTY usage source, the capture that failed to parse is the newest
+  `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. The API source writes
+  no `.cap`, and neither does a capture that times out or cannot spawn.
 
 ## Key invariants
 
@@ -168,6 +217,11 @@ These properties are never violated; tests and assertions enforce them.
    requires `usage.drift_recovery_clean_polls` consecutive clean readings to recover.
 8. **Atomic writes for state files** — every YAML/JSON state write is via
    tempfile + `os.replace` to prevent torn reads.
+9. **A task worktree is removed only when nothing in it can be lost** — the
+   task is `completed` and not in flight, its branch is an ancestor of
+   `<remote>/<parent_branch>` right after a fetch, and `git status` is clean
+   apart from allow-listed untracked paths. The branch goes with
+   `git branch -d`, never `-D`. See ADR-0034.
 
 ## Extension points
 
@@ -177,6 +231,9 @@ Operators extend behavior without code changes:
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.
+- **Worktree reclamation**: `[worktree_reclaim]` sets the branch template,
+  parent branch, disposable untracked paths, the hook's lock file, and the
+  opt-in periodic supervisor pass (ADR-0034).
 - **Task templates**: drop Jinja2 templates into
   `~/.claude_task_runner/templates/` or per-queue `templates/`.
 

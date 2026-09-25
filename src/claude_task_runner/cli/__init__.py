@@ -16,6 +16,7 @@ from claude_task_runner.cli import (
     supervisor_cmd,
     usage_cmd,
     watchdog_cmd,
+    worktree_cmd,
 )
 from claude_task_runner.observability import LogFormat, configure_logging
 
@@ -85,6 +86,11 @@ app.add_typer(
     doctor_cmd.app,
     name="doctor",
     help="Self-diagnostic battery (pass/warn/fail per check).",
+)
+app.add_typer(
+    worktree_cmd.app,
+    name="worktree",
+    help="Reclaim the git worktrees of completed, merged tasks.",
 )
 
 

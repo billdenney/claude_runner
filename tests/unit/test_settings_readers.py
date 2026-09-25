@@ -10,13 +10,17 @@ as live: ``[claude].plan``, ``[plans.*]``, ``[ema]``,
 commit.
 
 A field counts as read when its name appears anywhere in
-``src/claude_task_runner`` outside ``config/schema.py`` (which only
-declares fields) as a loaded attribute (``settings.usage.poll_interval_s``)
-or as the literal name in ``getattr(obj, "name")``. Docstrings and
-comments do not count. The match is by name alone, so an unrelated
-attribute that shares a dead field's name hides it: the test errs toward
-passing. It also cannot tell whether the reading code ever runs;
-``[ema].prior_warmup_samples`` was read, by a module nothing called.
+``src/claude_task_runner`` outside ``config/schema.py`` as a loaded
+attribute (``settings.usage.poll_interval_s``) or as the literal name in
+``getattr(obj, "name")``. Inside ``config/schema.py`` only the models'
+helper methods count: runtime code calls
+``WorktreeReclaimSettings.render_branch`` to use ``branch_template``. A
+``field_validator`` or ``model_validator`` only checks the value it is
+given, so its reads do not count. Docstrings and comments do not count.
+The match is by name alone, so an unrelated attribute that shares a dead
+field's name hides it: the test errs toward passing. It also cannot tell
+whether the reading code ever runs; ``[ema].prior_warmup_samples`` was
+read, by a module nothing called.
 """
 
 from __future__ import annotations
@@ -103,10 +107,10 @@ def _all_fields() -> dict[str, str]:
     }
 
 
-def _read_names(source: str) -> set[str]:
-    """Names ``source`` reads as an attribute or by a literal ``getattr``."""
+def _names_read_in(tree: ast.AST) -> set[str]:
+    """Names ``tree`` reads as an attribute or by a literal ``getattr``."""
     names: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
             names.add(node.attr)
         elif (
@@ -121,6 +125,36 @@ def _read_names(source: str) -> set[str]:
     return names
 
 
+def _read_names(source: str) -> set[str]:
+    return _names_read_in(ast.parse(source))
+
+
+_VALIDATOR_DECORATORS = frozenset({"field_validator", "model_validator"})
+
+
+def _is_validator(method: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for decorator in method.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        if name in _VALIDATOR_DECORATORS:
+            return True
+    return False
+
+
+def _helper_method_reads(source: str) -> set[str]:
+    """Names read inside the non-validator methods of the classes in ``source``."""
+    names: set[str] = set()
+    for cls in ast.parse(source).body:
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        for method in cls.body:
+            if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef) and not _is_validator(
+                method
+            ):
+                names |= _names_read_in(method)
+    return names
+
+
 def _runtime_sources() -> list[Path]:
     """Every module of the package except the schema that declares the fields."""
     return sorted(path for path in SRC_DIR.rglob("*.py") if path != SCHEMA_FILE)
@@ -128,7 +162,10 @@ def _runtime_sources() -> list[Path]:
 
 @functools.cache
 def _runtime_reads() -> frozenset[str]:
-    return frozenset().union(*(_read_names(path.read_text()) for path in _runtime_sources()))
+    return frozenset().union(
+        *(_read_names(path.read_text()) for path in _runtime_sources()),
+        _helper_method_reads(SCHEMA_FILE.read_text()),
+    )
 
 
 class _Leaf(BaseModel):
@@ -187,6 +224,31 @@ class TestInstrument:
             "value = getattr(settings, name)\n"
         )
         assert _read_names(source) == set()
+
+    def test_counts_schema_helper_methods_but_not_validators(self) -> None:
+        source = (
+            "class Model(BaseModel):\n"
+            "    @field_validator('a')\n"
+            "    @classmethod\n"
+            "    def _check(cls, value):\n"
+            "        return value.only_validated\n"
+            "    @model_validator(mode='after')\n"
+            "    def _cross(self):\n"
+            "        return self.cross_checked\n"
+            "    @pydantic.field_validator('b')\n"
+            "    def _dotted(cls, value):\n"
+            "        return value.dotted_validator\n"
+            "    def render(self):\n"
+            "        return self.used_by_runtime\n"
+            "\n"
+            "top_level = settings.outside_any_model\n"
+        )
+        assert _helper_method_reads(source) == {"used_by_runtime"}
+
+    def test_the_schema_helper_the_runtime_calls_counts(self) -> None:
+        # worktree/reclaim.py uses branch_template only through
+        # settings.render_branch(), which config/schema.py defines.
+        assert "branch_template" in _helper_method_reads(SCHEMA_FILE.read_text())
 
     def test_scans_the_runtime_but_not_the_schema(self) -> None:
         # Guards the suite: scanning the schema would find every field

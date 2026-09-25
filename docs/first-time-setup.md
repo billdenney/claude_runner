@@ -92,6 +92,13 @@ and every other setting come from the defaults. There is no plan setting:
 the throttle works from the utilization percentages `claude /usage`
 reports, which are already relative to the account's tier.
 
+If your pre-dispatch hook creates a git worktree per task, the runner will not
+remove those worktrees on its own. `claude-task-runner worktree reclaim`
+removes the ones whose task is `completed` and already merged. To have the
+supervisor do that periodically, add a `[worktree_reclaim]` block. Set
+`periodic = true`, and point `lock_file` at the flock your hook takes. See
+ADR-0034 and the "Task worktrees filling the disk" section of the runbook.
+
 ## 4. Add a task
 
 The skill way (recommended — picks effort and tools interactively):

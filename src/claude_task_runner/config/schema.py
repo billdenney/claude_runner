@@ -293,6 +293,157 @@ class QueueSettings(_StrictModel):
     manually. See ADR-0023."""
 
 
+_GIT_NAME_RE = re.compile(r"^(?!-)(?!.*\.\.)(?!.*//)(?!.*/$)(?!.*\.lock$)[A-Za-z0-9._/-]+$")
+"""Conservative shape for a remote or branch name passed to ``git``.
+
+Rejects a leading ``-`` (which ``git`` would parse as an option), ``..``,
+``//``, a trailing ``/`` or ``.lock``, and anything outside
+``[A-Za-z0-9._/-]``. Stricter than ``git check-ref-format``; a name this
+rejects can still be used by renaming the ref, never by weakening the check.
+"""
+
+_BRANCH_TEMPLATE_FIELDS = ("task_id", "worktree_name")
+"""Placeholders ``[worktree_reclaim].branch_template`` may use."""
+
+
+def _validate_git_name(value: str, field_name: str) -> str:
+    if not _GIT_NAME_RE.match(value):
+        raise ValueError(
+            f"{field_name}={value!r} is not a safe git ref/remote name "
+            f"(must match {_GIT_NAME_RE.pattern})"
+        )
+    return value
+
+
+class WorktreeReclaimSettings(_StrictModel):
+    """Reclaim the git worktrees of finished tasks (ADR-0034).
+
+    A queue whose pre-dispatch hook creates one git worktree per task
+    (ADR-0013) accumulates them forever: the runner never removes one on its
+    own initiative, because a worktree can hold the only copy of unpushed
+    work (ADR-0020, ADR-0032). ``claude-task-runner worktree reclaim`` removes
+    a task's worktree only when ALL of these hold:
+
+    1. the task's state says ``completed`` and no dispatch thread holds it;
+    2. the worktree has ``branch_template`` checked out, and that branch is an
+       ancestor of ``<remote>/<parent_branch>`` right after a fetch;
+    3. ``git status --porcelain`` is empty, except for untracked paths under
+       ``discardable_untracked`` (those are removed with ``--force``).
+
+    The local branch is then deleted with ``git branch -d`` (never ``-D``).
+
+    Defaults live in this model and are mirrored in the package TOML, so a
+    ``claude_runner.toml`` that predates the section keeps parsing unchanged.
+    """
+
+    periodic: bool = False
+    """Also run the reclaim from the supervisor, every ``interval_s``.
+
+    Gates ONLY the supervisor's periodic pass. The ``worktree reclaim`` CLI is
+    always available (and is a dry run unless given ``--apply``)."""
+
+    interval_s: float = Field(default=3600.0, gt=0)
+    """Seconds between two periodic supervisor passes. The first pass runs on
+    the supervisor's first tick; a pass that raises still waits a full
+    interval before the next attempt."""
+
+    max_per_pass: int = Field(default=20, ge=1)
+    """Upper bound on removals attempted by one periodic pass. The pass runs
+    inside the supervisor loop, and removing a large worktree takes seconds,
+    so a backlog drains over several passes instead of stalling dispatch.
+    The CLI is unbounded unless given ``--limit``."""
+
+    remote: str = "origin"
+    """Remote holding ``parent_branch``; fetched once per repository per pass."""
+
+    parent_branch: str = "main"
+    """Branch on ``remote`` that a task branch must already be merged into."""
+
+    branch_template: str = "claude/{task_id}"
+    """The branch a task's worktree must have checked out. Placeholders:
+    ``{task_id}`` and ``{worktree_name}`` (the working_dir's basename). A
+    worktree on any other branch, or on a detached HEAD, is kept."""
+
+    discardable_untracked: list[str] = Field(default_factory=lambda: ["tests/testthat/_problems/"])
+    """Untracked paths (relative to the worktree root) that may be discarded.
+
+    An entry matches that exact path or, as a directory prefix, anything
+    beneath it. Only UNTRACKED entries (``??``) qualify; a modified or staged
+    tracked file under the same prefix still keeps the worktree. The default
+    covers testthat's failure snapshots, which are rewritten on every test run.
+    Set ``[]`` to require a completely clean ``git status``."""
+
+    lock_file: str = ""
+    """``flock`` file shared with the pre-dispatch hook, relative to the queue
+    dir (or absolute). Held around the fetch and around each worktree removal,
+    so a concurrent ``git worktree add`` waits instead of failing on git's
+    repository locks. Empty (the default) takes no lock."""
+
+    lock_timeout_s: float = Field(default=60.0, gt=0)
+    """How long to wait for ``lock_file``. A worktree whose lock wait times out
+    is kept for the next pass; it is not an error."""
+
+    git_timeout_s: float = Field(default=300.0, gt=0)
+    """Timeout for each ``git`` invocation (the fetch, a status probe, one
+    ``git worktree remove`` of a large tree)."""
+
+    @field_validator("remote")
+    @classmethod
+    def _check_remote(cls, value: str) -> str:
+        return _validate_git_name(value, "remote")
+
+    @field_validator("parent_branch")
+    @classmethod
+    def _check_parent_branch(cls, value: str) -> str:
+        return _validate_git_name(value, "parent_branch")
+
+    @field_validator("branch_template")
+    @classmethod
+    def _check_branch_template(cls, value: str) -> str:
+        sample = {name: "sample-id" for name in _BRANCH_TEMPLATE_FIELDS}
+        try:
+            rendered = value.format(**sample)
+        except KeyError as exc:
+            raise ValueError(
+                f"branch_template={value!r} references unknown placeholder "
+                f"{exc.args[0]!r}; allowed: {', '.join(_BRANCH_TEMPLATE_FIELDS)}"
+            ) from exc
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"branch_template={value!r} is not a valid template: {exc}") from exc
+        if not any("{" + name + "}" in value for name in _BRANCH_TEMPLATE_FIELDS):
+            # A constant template would name the same branch for every task --
+            # e.g. "main" -- and reclaim would then target a shared branch.
+            raise ValueError(
+                f"branch_template={value!r} must contain {{task_id}} or {{worktree_name}}"
+            )
+        _validate_git_name(rendered, "branch_template")
+        return value
+
+    @field_validator("discardable_untracked")
+    @classmethod
+    def _check_discardable(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            stripped = entry.strip()
+            parts = [p for p in stripped.split("/") if p]
+            if (
+                not parts
+                or stripped != entry
+                or entry.startswith("/")
+                or "\\" in entry
+                or any(p in (".", "..") for p in parts)
+            ):
+                raise ValueError(
+                    f"discardable_untracked entry {entry!r} must be a non-empty path "
+                    "relative to the worktree root, without '.', '..', backslashes "
+                    "or surrounding whitespace"
+                )
+        return value
+
+    def render_branch(self, *, task_id: str, worktree_name: str) -> str:
+        """The branch a task's worktree must have checked out."""
+        return self.branch_template.format(task_id=task_id, worktree_name=worktree_name)
+
+
 class LoggingSettings(_StrictModel):
     """Process-wide logging knobs honoured by :mod:`observability`.
 
@@ -690,6 +841,9 @@ class Settings(_StrictModel):
     """``[queue]`` block — task-authoring knobs consumed by ``queue add``.
     Has a default so existing TOMLs that pre-date this block keep
     parsing unchanged. See :class:`QueueSettings` and ADR-0023."""
+    worktree_reclaim: WorktreeReclaimSettings = Field(default_factory=WorktreeReclaimSettings)
+    """``[worktree_reclaim]`` block — reclaiming finished tasks' git
+    worktrees (ADR-0034). Defaulted so pre-existing TOMLs keep parsing."""
     accounts: list[AccountSettings] = Field(default_factory=list)
     """One or more Claude accounts the supervisor may dispatch through.
 

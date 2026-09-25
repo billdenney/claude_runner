@@ -13,8 +13,9 @@ links to the decision log under [decisions/](decisions/) explain the
 | Live 5h / weekly utilization | `claude-task-runner usage` (parses `claude /usage`) |
 | Full machine-readable snapshot (state, util, next wakeup) | `claude-task-runner supervisor status --json` |
 | Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` (counts per question, not per file — see `n_outstanding_questions`) |
-| Recent supervisor transitions | `tail -F <queue>/.claude_task_runner/supervisor.log` |
-| Drift / capture failures | `tail -F <queue>/.claude_task_runner/drift.log` |
+| Supervisor log (throttle / drift notices) | `journalctl --user -f -u claude-task-runner` under the systemd unit, or `tail -F <queue>/.claude_task_runner/supervisor.log` when the cron watchdog started the supervisor (see [where the log goes](architecture.md#supervisor-log-and-drift-evidence)) |
+| Parser drift | `claude-task-runner supervisor status` shows state `error_drift` and a `Last drift:` line; with the TTY usage source the capture that failed to parse is the newest `<queue>/.claude_task_runner/usage_captures/<ts>.cap` |
+| Usage capture failures (timeout / spawn) | Not logged at the default INFO level; set `[logging].level = "DEBUG"` to log `usage_capture_error` events, or reproduce with `claude-task-runner usage healthcheck` (exit 2 = timeout, 3 = spawn error) |
 
 ## Configuration precedence
 
@@ -96,10 +97,13 @@ output of the most recent dispatch decision.
 
 On each transition the supervisor also emits `state_transition` /
 `throttled_5h_entry` / `throttled_weekly_entry` events whose payloads
-carry the band, thresholds, and `target_pct`. By default these are
-written to the supervisor log
-(`<queue>/.claude_task_runner/supervisor.log`); there is no separate
-`events.ndjson` sink unless a host wires an event callback.
+carry the band, thresholds, and `target_pct`. These events are logged at
+DEBUG level only, so they reach the supervisor log (journald under the
+systemd unit, `<queue>/.claude_task_runner/supervisor.log` under the cron
+watchdog) only when `claude_runner.toml` sets `[logging].level = "DEBUG"`.
+At the default INFO level the log has just a `notify[...]` line on entry to
+`SlowingDown`, `Throttled5h`, `ThrottledWeekly` or `ErrorDrift`. There is
+no separate `events.ndjson` sink unless a host wires an event callback.
 
 ### Make a queue push harder during the day
 
@@ -144,6 +148,23 @@ mapping table below is the migration recipe.
 
 Run `claude-task-runner doctor` to list any TOML still carrying a
 legacy block.
+
+### Reclaim finished tasks' worktrees
+
+```sh
+# Dry run: list every task worktree as would / keep (with the reason) / FAIL
+claude-task-runner worktree reclaim --queue <queue>
+
+# Remove the completed, merged, clean ones (and their local branches, git branch -d)
+claude-task-runner worktree reclaim --queue <queue> --apply
+```
+
+A worktree goes only when its task is `completed`, its branch is an ancestor
+of `origin/main` after a fetch, and `git status` is clean apart from
+`[worktree_reclaim].discardable_untracked`. Set
+`[worktree_reclaim].periodic = true` to have the supervisor do this every
+`interval_s`, and set `[worktree_reclaim].lock_file` to your pre-dispatch
+hook's flock. See ADR-0034 and the runbook.
 
 ### Stale branch cleanup
 

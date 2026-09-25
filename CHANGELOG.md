@@ -35,6 +35,53 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The docs no longer send operators to a `drift.log` that nothing
+  writes.** `docs/architecture.md`'s per-queue tree listed
+  `<queue>/.claude_task_runner/drift.log` ("parser drift + healthcheck
+  results"), `docs/cheatsheet.md` said to `tail -F` it for drift and
+  capture failures, and the runbook's drift symptom said it "has recent
+  entries". No commit has ever written it, and the periodic runtime
+  healthcheck whose results it was to hold was never built. The same
+  symptom line said a desktop notification fires. None does: the
+  `[notify]` backends were deleted as dead config on 2026-06-13, and
+  `supervisor start` wires no notifier, so a `Notify` action is only an
+  INFO log line. The docs now name the evidence that does exist.
+  `supervisor status` shows state `error_drift` and a `Last drift:` line,
+  from `last_drift_message` in `supervisor.json`. The supervisor log has
+  one `notify[error]: parser drift: ...` line. With the TTY usage source,
+  the capture that failed to parse is the newest `usage_captures/<ts>.cap`.
+  The architecture doc and cheat sheet also said the `EmitEvent` actions
+  (`drift_detected`, `state_transition`, `usage_capture_error`, ...)
+  reach the supervisor log. They are logged at DEBUG only, below the
+  default INFO, so a usage capture that times out leaves no trace at INFO.
+  A new "Supervisor log and drift evidence" section in the architecture
+  doc says so, and says where the log goes: journald under the systemd
+  unit, and `<queue>/.claude_task_runner/supervisor.log` only when the cron
+  watchdog started the supervisor.
+- **The rest of the on-disk layout matches the code.** `banner.txt` is
+  gone from the per-queue tree: nothing ever wrote it either, and its only
+  source was the deleted `[notify].file_path`. `watchdog.log` moves to the
+  global tree, because `cron/watchdog.sh` writes
+  `~/.claude_task_runner/watchdog.log`, and the runbook's crash-loop and
+  watchdog-install steps now give its full path, with the `journalctl`
+  equivalent under systemd. The global tree gains `queues.json`,
+  `watchdog_state.json` and the `usage_captures/` that the `usage` CLI
+  commands write. The per-queue tree gains `state/.corrupt/` (ADR-0028)
+  and `force_dispatch/`. The cheat sheet's supervisor-log row pointed only
+  at `supervisor.log`, which does not exist under the systemd unit.
+- **A docs-vs-code gate for the on-disk layout.**
+  `tests/unit/test_docs_disk_layout.py` parses both trees in
+  `docs/architecture.md` and fails on any entry whose name no code spells
+  out. A name counts when it appears in a string literal in a `.py` file
+  under `src/claude_task_runner/` (docstrings excluded), or in a value or
+  code line of a `.sh` or `.toml` file there (comments excluded).
+  `skills/` is not searched. Templated names are split at their
+  placeholders, so `request-NNN.json` needs both `request-` and `.json`.
+  Run against the old tree, it reports exactly `drift.log` and
+  `banner.txt`. Known-answer tests pin the parser, and a missing section,
+  an empty tree, or an entry that is not a single path fails the gate
+  instead of dropping out of it. It checks names, not placement, so it
+  would not have caught `watchdog.log` in the wrong tree.
 - **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
   (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
   `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,
@@ -50,6 +97,24 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
+  (ADR-0034).** A queue whose pre-dispatch hook creates one git worktree per
+  task accumulated them forever. On 2026-09-25 the nlmixr2lib queue had 305
+  of them holding 36 GB, and 244 belonged to tasks that were long finished
+  and merged. A worktree is removed only when its task is `completed` and not
+  in flight, and its branch is checked out there and is an ancestor of
+  `<remote>/<parent_branch>` after a fetch. Its `git status` must also be
+  clean, except for untracked paths in `discardable_untracked` (default
+  `tests/testthat/_problems/`), which are discarded with `--force`. The local
+  branch goes with `git branch -d`, never `-D`. The command is a dry run
+  unless given `--apply`. It lists every kept worktree with the condition it
+  failed, and it takes the hook's `flock` around the fetch and each removal
+  when `lock_file` is set.
+- **Opt-in periodic reclaim from the supervisor.** With
+  `[worktree_reclaim].periodic = true`, the supervisor runs the same pass on
+  its first tick and every `interval_s` after that, at most `max_per_pass`
+  removals at a time and never during drain. Removals are emitted as
+  `worktree_reclaimed` events; failures raise a warning notification.
 - **`merge_branches.sh` aborts on same-path collisions.** Two branches that each add a
   file at the same path under `inst/modeldb/` or `vignettes/articles/` with
   different content cannot both survive `-X theirs`; the survey now lists them and
@@ -151,6 +216,61 @@ Breaking changes are called out in the version notes.
   allowlisted per file with a reason. These are `config init`,
   ADR-0030's `why-blocked`, and the two ADRs above. A companion test
   fails when an allowlist entry goes stale.
+- **Docstrings in the package gave CLI forms that fail.** The docstring
+  of `usage/oauth_refresh.py` ran `usage refresh` with `--queue` and
+  `--config` after the subcommand, which fails with
+  `No such option: --queue`. `refresh` takes no options, nothing on the
+  `usage` path takes `--queue`, and `--config` belongs to the `usage`
+  group, so it has to come first:
+  `claude-task-runner usage --config <queue>/claude_runner.toml refresh`.
+  The `usage_cmd.py` docstring now says so too. `cli/install_skills_cmd.py`
+  named an `uninstall-skills` command and `cli/install_cmd.py` a bare
+  `uninstall`; the commands are `install-skills uninstall` and
+  `install uninstall`. In `queue/schema.py`, the `note` of a `requires`
+  element was said to be reported by `why-blocked`, a `queue` subcommand
+  that was never built. Notes appear in `queue show`, in the task's
+  `readiness hold:` deferred reason, and in a refused
+  `queue force-dispatch`.
+- **`supervisor drain --help` no longer says systemd restarts a drained
+  supervisor.** It said the unit is `Restart=on-success`. The unit that
+  `claude-task-runner install` writes is `Restart=on-failure` with
+  `RestartPreventExitStatus=0`, so a supervisor that drains and exits 0
+  stays down. The help now says to run
+  `systemctl --user restart claude-task-runner` under systemd. It also
+  says the unit's `ExecStop` is `supervisor drain --no-wait` only when
+  `[supervisor].adopt_workers` is false. By default `ExecStop` is
+  `supervisor stop`, and the new supervisor adopts the running workers.
+- **Each CLI module docstring lists every subcommand of its group.**
+  `supervisor_cmd.py` listed `start | stop | status` without `drain`.
+  `usage_cmd.py` lacked `whoami` and `refresh`, `queue_cmd.py` lacked
+  `template`, `install_skills_cmd.py` lacked `list`, and
+  `watchdog_cmd.py` lacked `register` and `queues`.
+- **The CLI gate now covers the package's scripts, Python sources and CLI
+  module docstrings.** `tests/unit/test_docs_cli_refs.py` also walks
+  every invocation in the shell scripts under `src/claude_task_runner`
+  (the skills' helpers and `cron/watchdog.sh`), and in every string
+  literal, docstring and f-string in `src/claude_task_runner/**/*.py`.
+  A small lexer splits each script into code, which is checked word by
+  word like a fenced block, and prose: comments, quoted strings and
+  heredoc bodies. A heredoc fed to `python` is parsed as Python, so the
+  argv list with which `fetch_all.sh` runs `sidecar show` is checked
+  too. Prose is checked in code spans, and a bare `claude-task-runner`
+  in prose counts only when the next word is a top-level group or an
+  option. So English such as "claude-task-runner not on PATH" is not
+  read as a command, while an echo telling the operator to run a
+  missing subcommand still fails. A second test fails when a CLI
+  module's docstring leaves out a subcommand of its group. The walker
+  also no longer reads a placeholder followed by a path, such as
+  `<queue>/claude_runner.toml`, as a `<` redirection. That misreading
+  ended the walk early, so the words after the placeholder went
+  unchecked. Run against the sources as they were before these fixes,
+  the new tests fail on the `--queue` preflight, the `why-blocked` note
+  and the five incomplete subcommand lists, and on nothing else. The
+  `Restart=` claim and the bare `uninstall` are not invocations the gate
+  can check. Once `claude-task-runner worktree` existed, the gate also
+  caught two docstring spans in `worktree/reclaim.py` that named git's
+  own worktree removal without the `git` prefix, so they read as a
+  subcommand of that group. They now say `git worktree remove`.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
