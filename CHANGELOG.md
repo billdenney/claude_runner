@@ -50,6 +50,22 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The cheat sheet's "Add a new plan" recipe now works.** Its last step
+  ran a `supervisor` subcommand that does not exist and failed with
+  `No such command 'restart'`. Reading the code showed the recipe was
+  wrong in more places than that. `[claude].plan` and `[plans.*]` are
+  schema-validated but read by no runtime code, so changing them needs
+  neither a reload nor a restart. What does matter is the account switch
+  (`[claude].config_dir` or `[[accounts]]`), and that needs a real
+  restart: `supervisor drain` then `supervisor start` (or the cron
+  watchdog), or `systemctl --user restart claude-task-runner` under
+  systemd. A SIGHUP reload is not enough, because the `/usage` poller is
+  built once at `supervisor start`. After a reload the supervisor would
+  dispatch through the new account while throttling on the old one's
+  utilization. Step 1 used `claude --config-dir`, a flag `claude` does
+  not have, and now uses `CLAUDE_CONFIG_DIR=<dir> claude /login`. The
+  cheat sheet's `load_settings` snippet also gained the
+  `from pathlib import Path` it needed to run.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
