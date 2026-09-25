@@ -18,16 +18,11 @@ introduces a new on-disk file MUST update this document in the same PR.
 |     | |      | |        | |ervisor | |systemd| |       |
 +-----+ +------+ +--------+ +--------+ +-------+ +-------+
    |      |          |           |
-   |      |          v           |
-   |      |      +------+        |
-   |      |      | EMA  |        |
-   |      |      +------+        |
-   |      |                      |
-   v      v                      v
-+----------------+      +-------------------+
-| YAML state     |      | UsageSource       |
-| (queue/store)  |      | (usage/source)    |
-+----------------+      +-------------------+
+   v      v          v           v
++---------------------+ +-------------------+
+| YAML state          | | UsageSource       |
+| (queue/store)       | | (usage/source)    |
++---------------------+ +-------------------+
                                  |
                                  v
                          +-------------+
@@ -55,9 +50,7 @@ introduces a new on-disk file MUST update this document in the same PR.
    supervisor log); no `events.ndjson` file is written today.
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
    after `task_caps.heartbeat_silence_alert_s` seconds of silence.
-6. On task completion: `runner.ema` updates per-(model, effort, tool-hash) EMA
-   with observed token / duration / cost samples.
-7. If task hits a sidecar question: writes
+6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**
    question id it asked appears in the response's `answers` (ADR-0031) — a
@@ -65,10 +58,10 @@ introduces a new on-disk file MUST update this document in the same PR.
    `/runner-answer-sidecar`,
    which writes `response-NNN.json`. Supervisor re-dispatches via `claude --resume
    <session_id>`.
-8. On 5h-window reset mid-task: in-flight task continues. Supervisor's
+7. On 5h-window reset mid-task: in-flight task continues. Supervisor's
    `runner.session.plan_next_spawn` knows that resuming a task across a window
    boundary is fine because we use `--resume <session_id>`.
-9. On task failure: `runner.retry` classifies the error
+8. On task failure: `runner.retry` classifies the error
    (environmental | operator | task | unknown). Environmental → auto-retry.
    Other → surface to operator.
 
@@ -134,7 +127,6 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     ├── watchdog.log                # cron/systemd watchdog actions
     ├── drift.log                   # parser drift + healthcheck results
     ├── usage_captures/<ts>.cap     # raw PTY captures of /usage (rotated)
-    ├── ema.json                    # per-task-type EMA values
     └── banner.txt                  # human-readable status banner
 ```
 
@@ -160,8 +152,9 @@ These properties are never violated; tests and assertions enforce them.
    was written but never called, and it has been removed. Each reading is used
    as reported. The slot keeps its number because code comments cite these
    invariants by number.
-4. **No new dispatch when 5h utilization ≥ no-dispatch threshold** —
-   regardless of EMA prediction; this is the safety net.
+4. **No new dispatch when 5h utilization ≥ the active band's stop threshold**
+   (`fivehr_stop_pct` in `[dispatch_pct.day]` or `[dispatch_pct.night]`) —
+   this is the safety net.
 5. **Every behavior-affecting cutoff is a setting** — no magic numbers for
    thresholds/timeouts/caps in runtime code (cosmetic presentation constants
    such as log-truncation widths are exempt; see ADR-0014). The merged
@@ -184,7 +177,6 @@ Operators extend behavior without code changes:
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.
-- **EMA priors per (model, effort)**: edit `[ema.priors.<model>.<effort>]`.
 - **Task templates**: drop Jinja2 templates into
   `~/.claude_task_runner/templates/` or per-queue `templates/`.
 

@@ -46,7 +46,7 @@ sequence variant.
 ## Task `possibly_hung` for hours
 
 **Symptom:** A task's state shows `possibly_hung` and last_heartbeat is
-N hours old. EMA suggests it should have completed by now.
+N hours old.
 
 **Steps:**
 1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl` —

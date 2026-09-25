@@ -5,8 +5,8 @@ Each check is a small, pure-ish function that returns a
 FAIL / WARN per check. Exit code is non-zero on any FAIL.
 
 Checks are deliberately isolated so they survive partial failures:
-a corrupt ``ema.json`` shouldn't prevent the binary-existence check
-from running.
+a corrupt ``supervisor.json`` shouldn't prevent the binary-existence
+check from running.
 """
 
 from __future__ import annotations
@@ -37,8 +37,6 @@ from claude_task_runner.queue.store import (
     load_task,
     queue_runtime_dir,
 )
-from claude_task_runner.runner import ema as ema_mod
-from claude_task_runner.runner.ema import EMAFileError
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
@@ -979,31 +977,6 @@ def check_supervisor_state(settings: Settings, queue_dir: Path) -> CheckResult:
     )
 
 
-def check_ema(_settings: Settings, queue_dir: Path) -> CheckResult:
-    """``ema.json`` parses cleanly (or doesn't exist yet)."""
-    path = queue_dir / ".claude_task_runner" / ema_mod.EMA_FILE_NAME
-    if not path.exists():
-        return CheckResult(
-            name="ema",
-            status=CheckStatus.PASS,
-            detail="no ema.json yet (cold start)",
-        )
-    try:
-        ema = ema_mod.load(path)
-    except EMAFileError as exc:
-        return CheckResult(
-            name="ema",
-            status=CheckStatus.FAIL,
-            detail=str(exc),
-            remediation=f"Remove or fix {path}",
-        )
-    return CheckResult(
-        name="ema",
-        status=CheckStatus.PASS,
-        detail=f"{len(ema.buckets)} task-type buckets",
-    )
-
-
 def check_skills_installed(_settings: Settings) -> CheckResult:
     """Skills should be present in ``~/.claude/skills/``."""
     from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES
@@ -1210,7 +1183,6 @@ def all_checks(
         lambda: check_state_yamls(settings, queue_dir),
         lambda: check_orphaned_sessions(settings, queue_dir),
         lambda: check_supervisor_state(settings, queue_dir),
-        lambda: check_ema(settings, queue_dir),
         lambda: check_skills_installed(settings),
         lambda: check_watchdog_installed(settings),
     ]

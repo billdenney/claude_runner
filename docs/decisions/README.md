@@ -18,7 +18,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0008 | Use pexpect, not raw pty + subprocess | accepted | 2026-05-03 |
 | 0009 | Inject Clock protocol everywhere (testability) | accepted | 2026-05-03 |
 | 0010 | Effort levels are TOML-driven per model | accepted | 2026-05-03 |
-| 0011 | EMA-driven concurrency tuning (re-enabled) | accepted | 2026-05-03 |
+| 0011 | EMA-driven concurrency tuning (re-enabled) | deprecated | 2026-05-03 |
 | 0012 | Extensible failure classifier via TOML patterns | accepted | 2026-05-03 |
 | 0013 | Pre/post-dispatch shell hooks (replaces built-in worktree mgmt) | accepted | 2026-05-03 |
 | 0014 | Every cutoff is a TOML setting | accepted | 2026-05-03 |

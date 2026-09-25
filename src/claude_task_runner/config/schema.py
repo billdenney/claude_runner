@@ -78,18 +78,6 @@ class ConcurrencySettings(_StrictModel):
     initial_concurrency: int = Field(ge=1)
 
 
-class EMAPrior(_StrictModel):
-    tokens: int = Field(gt=0)
-    duration_s: float = Field(gt=0)
-
-
-class EMASettings(_StrictModel):
-    alpha: float = Field(gt=0.0, le=1.0)
-    prior_warmup_samples: int = Field(ge=0)
-    runtime_p90_multiplier: float = Field(gt=0)
-    priors: dict[str, dict[str, EMAPrior]] = Field(default_factory=dict)
-
-
 class SessionSettings(_StrictModel):
     max_resume_attempts: int = Field(ge=0)
 
@@ -686,7 +674,6 @@ class Settings(_StrictModel):
     """ADR-0022 ``[dispatch_pct.*]`` tree. Variant-C trace-following
     dispatch policy."""
     concurrency: ConcurrencySettings
-    ema: EMASettings
     effort_levels: dict[str, list[str]]
     session: SessionSettings
     failure_classifier: FailureClassifierSettings

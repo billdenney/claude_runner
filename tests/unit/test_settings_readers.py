@@ -40,19 +40,13 @@ ROOTS: dict[str, type[BaseModel]] = {
 }
 """The two files an operator writes, and the model each one loads into."""
 
-KNOWN_UNREAD: dict[str, str] = {
-    "Settings.ema": "no runtime code reads settings.ema; runner/ema.py is reached only from tests",
-    "EMASettings.alpha": "a parameter of runner.ema.update_bucket, which nothing calls",
-    "EMAPrior.tokens": "read by a computed getattr in runner.ema, reached only from tests",
-    "EMAPrior.duration_s": "see EMAPrior.tokens",
-}
+KNOWN_UNREAD: dict[str, str] = {}
 """``"Model.field"`` entries exempt from the check, each with its reason.
 
-The entries below are the dead settings this gate found when it was
-added; each is deleted, with a loader guard, and its entry with it.
-After that, an entry belongs here only for a field that is read in a way
-the scan cannot see (a computed ``getattr``, ``model_dump()``) -- never
-for a field nothing reads.
+Only for a field that is read in a way the scan cannot see (a computed
+``getattr``, ``model_dump()``) -- never for a field nothing reads. The
+eleven entries this gate started with on 2026-09-25 were all dead
+settings, and each was deleted, with a loader guard, instead.
 """
 
 

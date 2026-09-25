@@ -87,7 +87,8 @@ class TokenUsage(_StrictBase):
 
     @property
     def total_tokens(self) -> int:
-        """Sum used by the EMA / throttle predictor."""
+        """Sum checked against the per-task token cap
+        (``[task_caps].max_tokens_per_task``)."""
         return (
             self.input_tokens
             + self.output_tokens
@@ -223,8 +224,8 @@ class Task(_StrictBase):
     """Claude tool names the agent may use (e.g. ``Read``, ``Edit``, ``Write``,
     ``Bash``). Empty = the dispatcher's default tool set."""
     tags: list[str] = Field(default_factory=list)
-    """Free-form labels used for cohort reporting and EMA grouping
-    overrides."""
+    """Free-form labels. ``queue add --tag`` sets them and ``queue list``
+    reports them; the runner attaches no meaning to them."""
     weekly_critical: bool = False
     """Dispatched first within a window; ensures completion before the
     week closes."""

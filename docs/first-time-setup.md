@@ -75,7 +75,7 @@ A working minimum:
 
 [concurrency]
 max_concurrency     = 2
-initial_concurrency = 1   # cap until the EMA has warmed up
+initial_concurrency = 1   # cap until a first task completes in this queue
 
 [hooks]
 # Pre-dispatch: create the worktree (or any other per-task setup).

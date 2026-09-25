@@ -78,6 +78,11 @@ _RETIRED_KEYS: dict[tuple[str, ...], str] = {
         "a resume is retried until [session].max_resume_attempts, then goes fresh "
         "(ADR-0005)"
     ),
+    ("ema",): (
+        "the per-task-type EMA (ADR-0011) was never wired into dispatch and has "
+        "been removed; concurrency comes from [concurrency] and each account's "
+        "max_concurrency, throttled by [dispatch_pct.*]"
+    ),
 }
 """Queue-TOML keys removed from the schema because no code ever read them.
 

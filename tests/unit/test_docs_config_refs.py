@@ -46,6 +46,10 @@ RETIRED_KEYS = {
         "Never read; removed 2026-09-25. ADR-0005 records the fall-through it "
         "was meant to time, and its dated update says that was never built."
     ),
+    "ema": (
+        "Never wired into dispatch; removed 2026-09-25. ADR-0011 (deprecated) "
+        "records the design, and its dated update says the table is gone."
+    ),
 }
 """Tables and fields that no longer exist but which docs may still name.
 
@@ -77,12 +81,13 @@ _INLINE_REF = re.compile(r"\[([a-z_][\w.]*)\]\.([a-z_][\w.<>]*)")
 """``[table].field`` written in prose -- the shape of both real bugs."""
 
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
-_SPAN_REF = re.compile(r"^\[\[?([a-z_][\w.]*?)(?:\.\*)?\]?\](?:\.([a-z_][\w.<>]*))?$")
+_SPAN_REF = re.compile(r"^\[\[?([a-z_][\w.<>]*?)(?:\.\*)?\]?\](?:\.([a-z_][\w.<>]*))?$")
 """A whole code span that is a config reference: `[queue]`,
-`[hooks].pre_dispatch_command`, `[ema.priors.<model>.<effort>]`."""
+`[hooks].pre_dispatch_command`, `[[accounts]]`, `[dispatch_pct.*]`,
+`[dispatch_pct.<band>]`."""
 
 _FENCE = re.compile(r"^```+\s*([a-zA-Z0-9_-]*)\s*$")
-_TOML_TABLE = re.compile(r"^\[\[?([a-z_][\w.]*)\]?\]$")
+_TOML_TABLE = re.compile(r"^\[\[?([a-z_][\w.<>]*)\]?\]$")
 _TOML_KEY = re.compile(r"^([a-z_][\w]*)\s*=")
 
 
@@ -175,6 +180,14 @@ def _doc_files() -> list[Path]:
     return sorted(DOCS_DIR.rglob("*.md"))
 
 
+class _Leaf(BaseModel):
+    depth: int
+
+
+class _ByTwoKeys(BaseModel):
+    table: dict[str, dict[str, _Leaf]]
+
+
 class TestSchemaWalker:
     """The matcher itself -- a broken checker would pass everything."""
 
@@ -188,16 +201,26 @@ class TestSchemaWalker:
         assert _is_known("accounts.config_dir")
 
     def test_resolves_through_nested_dict_keys(self) -> None:
-        # priors is dict[str, dict[str, EMAPrior]]: two operator-chosen keys.
-        assert _is_known("ema.priors.opus.high.duration_s")
+        # No live table nests two operator-chosen keys since [ema.priors]
+        # went, so a stand-in model keeps this branch covered.
+        assert _matches(_ByTwoKeys, ("table", "opus", "high", "depth"))
+        assert not _matches(_ByTwoKeys, ("table", "opus", "high", "nope"))
+
+    def test_resolves_through_a_dict_of_lists(self) -> None:
+        # effort_levels is dict[str, list[str]]: the model name is the key.
+        assert _is_known("effort_levels.claude-opus-5-5")
 
     def test_placeholder_segment_terminates(self) -> None:
-        assert _is_known("ema.priors.<model>.<effort>")
+        # dispatch_pct is a model, not a dict: only the placeholder rule
+        # lets "<band>" through.
+        assert _is_known("dispatch_pct.<band>.fivehr_stop_pct")
+        assert not _is_known("dispatch_pct.band.fivehr_stop_pct")
 
     def test_rejects_deleted_table(self) -> None:
         assert not _is_known("sidecar.unanswered_auto_recommended_s")
         assert not _is_known("notify.channels")
         assert not _is_known("plans.max20x.weekly_tokens")
+        assert not _is_known("ema.priors.<model>.<effort>")
 
     def test_rejects_deleted_field_on_real_table(self) -> None:
         assert _is_known("claude.config_dir")
@@ -226,6 +249,19 @@ class TestDocRefExtraction:
         refs = _iter_doc_refs(block)
         assert (2, "dispatch_pct.week") in refs
         assert (3, "dispatch_pct.week.eow_time_switch") in refs
+
+    def test_extracts_a_table_with_placeholder_segments(self) -> None:
+        # docs/architecture.md said "edit `[ema.priors.<model>.<effort>]`";
+        # until 2026-09-25 this shape was not extracted, so the gate could
+        # not have flagged it once [ema] was gone.
+        assert _iter_doc_refs("edit `[ema.priors.<model>.<effort>]` per queue") == [
+            (1, "ema.priors.<model>.<effort>")
+        ]
+        block = "```toml\n[plans.<tier>]\nweekly_tokens = 1\n```"
+        assert _iter_doc_refs(block) == [(2, "plans.<tier>"), (3, "plans.<tier>.weekly_tokens")]
+
+    def test_extracts_an_array_of_tables(self) -> None:
+        assert _iter_doc_refs("one `[[accounts]]` block per login") == [(1, "accounts")]
 
     def test_ignores_non_toml_fence(self) -> None:
         assert _iter_doc_refs("```bash\n[notify].channels\n```") == []
