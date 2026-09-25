@@ -7,6 +7,7 @@ PATH lookups are deterministic regardless of the developer's machine.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -491,6 +492,74 @@ def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Pa
     assert result.exit_code == 0, result.output
     mock_apply.assert_called_once()
     assert not queues_registry_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# `install` — where the queue's [watchdog] settings and --config go
+# ---------------------------------------------------------------------------
+
+
+def test_install_systemd_unit_ignores_the_watchdog_table(runner: CliRunner, tmp_path: Path) -> None:
+    """Pins current behaviour: the unit's restart policy is hardcoded.
+
+    The queue's TOML sets every ``[watchdog]`` key away from its default,
+    and the unit still gets ``RestartSec=30``, ``StartLimitBurst=5`` and
+    ``StartLimitIntervalSec=600``."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(
+        "[watchdog]\n"
+        "restart_cooldown_s = 120\n"
+        "restart_backoff_max_s = 1800\n"
+        "crash_loop_threshold = 9\n",
+        encoding="utf-8",
+    )
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="systemd",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.shutil.which",
+            return_value="/usr/local/bin/claude-task-runner",
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    unit_lines = mock_apply.call_args.args[0].unit_text.splitlines()
+    assert "RestartSec=30" in unit_lines
+    assert "StartLimitBurst=5" in unit_lines
+    assert "StartLimitIntervalSec=600" in unit_lines
+
+
+def test_install_cron_does_not_record_config(runner: CliRunner, tmp_path: Path) -> None:
+    """Pins current behaviour: a cron ``install --config`` is dropped.
+
+    The registry keeps only the queue's path, so the tick the crontab
+    line runs spawns ``supervisor start`` without ``--config``, and that
+    supervisor finds only ``<queue>/claude_runner.toml``."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = tmp_path / "elsewhere" / "custom.toml"
+    config.parent.mkdir()
+    config.write_text("[watchdog]\nrestart_cooldown_s = 999\n", encoding="utf-8")
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        installed = runner.invoke(app, ["--yes", "--queue", str(queue), "--config", str(config)])
+    assert installed.exit_code == 0, installed.output
+    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+    assert registry == {"queues": [str(queue.resolve())]}
+
+    spawned: list[tuple[Path, Path | None]] = []
+
+    def _record(queue_dir: Path, config: Path | None = None) -> int:
+        spawned.append((queue_dir, config))
+        return 4242
+
+    with patch.object(watchdog_cmd, "_spawn_supervisor", _record):
+        ticked = runner.invoke(watchdog_cmd.app, ["tick"])
+    assert ticked.exit_code == 0, ticked.output
+    assert spawned == [(queue.resolve(), None)]
 
 
 # ---------------------------------------------------------------------------
