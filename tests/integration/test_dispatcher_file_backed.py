@@ -24,7 +24,6 @@ import pytest
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.schema import (
     HookSettings,
-    SessionSettings,
     TaskCapsSettings,
 )
 from claude_task_runner.queue.schema import Task, TaskState
@@ -71,10 +70,6 @@ def _caps() -> TaskCapsSettings:
     )
 
 
-def _session() -> SessionSettings:
-    return SessionSettings(max_resume_attempts=3, resume_fail_fast_s=5)
-
-
 def _hooks() -> HookSettings:
     return HookSettings(
         pre_dispatch_command="",
@@ -99,7 +94,6 @@ def _dispatch(queue_dir: Path, task: Task, plan: SpawnPlan, *, adopt: bool) -> o
         queue_dir=queue_dir,
         clock=RealClock(),
         settings_caps=_caps(),
-        settings_session=_session(),
         settings_hooks=_hooks(),
         claude_executable=str(SHIM_PATH),
         adopt_workers=adopt,
