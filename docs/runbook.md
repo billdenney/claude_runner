@@ -5,19 +5,27 @@ relevant component / ADR for deeper context.
 
 ## Parser drift detected
 
-**Symptom:** `claude-task-runner usage healthcheck` returns non-zero.
-Supervisor is in `ErrorDrift`. `drift.log` has recent entries. Desktop
-notification fired.
+**Symptom:** `claude-task-runner supervisor status` shows state
+`error_drift` and a `Last drift:` line with the parser's message. The
+supervisor log has a `notify[error]: parser drift: ...` line from the tick
+that entered `ErrorDrift` (journald under the systemd unit,
+`<queue>/.claude_task_runner/supervisor.log` under the cron watchdog; see
+[where the log goes](architecture.md#supervisor-log-and-drift-evidence)).
+`claude-task-runner usage healthcheck`, which always captures through the
+TUI, exits 1. No desktop notification is sent, and there is no separate
+drift log.
 
 **Causes:** Anthropic changed the `/usage` TUI layout. Most common forms:
 field rename (`Resets` → `Resets at`), new section added, ANSI escape
 sequence variant.
 
 **Steps:**
-1. `claude-task-runner usage capture --save /tmp/drift-$(date +%s).cap`
-   to record fresh raw output.
-2. `claude-task-runner usage parse-file /tmp/drift-*.cap` to see exact
-   parse failure.
+1. Get the raw output. With the TTY usage source, the capture that failed
+   to parse is already on disk as the newest
+   `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. To record a fresh
+   one, run `claude-task-runner usage capture --save /tmp/drift-$(date +%s).cap`.
+2. `claude-task-runner usage parse-file <path-to.cap>` to see the parse
+   failure.
 3. Inspect the `.cap` (cat with ANSI rendering) to identify what changed.
 4. Update `usage/parser.py` state machine (or add a fixture variant).
 5. Run `pytest tests/unit/test_parser.py` until green.
@@ -29,8 +37,14 @@ sequence variant.
 
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 
-**Symptom:** `watchdog.log` shows multiple restarts in a short window.
-`supervisor.log` ends with the same exception each time.
+**Symptom:** `~/.claude_task_runner/watchdog.log` shows multiple restarts
+in a short window. `<queue>/.claude_task_runner/supervisor.log` ends with the
+same exception each time.
+
+This section covers the cron watchdog. Under the systemd unit, systemd
+restarts the supervisor itself (`Restart=on-failure`) and stops once it has
+started the unit `StartLimitBurst` times within `StartLimitIntervalSec`;
+read the exception with `journalctl --user -u claude-task-runner`.
 
 **Steps:**
 1. Watchdog backoff should have engaged after `crash_loop_threshold`
@@ -98,7 +112,8 @@ come back.
 2. `claude-task-runner install` auto-detects systemd vs cron, shows the
    proposed change, asks for confirmation. Accept it.
 3. Verify: kill the supervisor manually; within ~60s (cron) or ~30s
-   (systemd) it should restart. Check `watchdog.log`.
+   (systemd) it should restart. Check `~/.claude_task_runner/watchdog.log`
+   (cron) or `journalctl --user -u claude-task-runner` (systemd).
 
 ## Task worktrees filling the disk
 
