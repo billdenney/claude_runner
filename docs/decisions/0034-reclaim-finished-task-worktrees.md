@@ -130,8 +130,9 @@ after `tick_dispatch`, like the steady-state reaper. Each removal becomes a
   worktrees, which takes a few seconds each for a large tree. Clear a backlog
   with the CLI instead. Every pass also reads every task YAML in `todo/`, the
   same scan the orchestrator makes each tick. On the 5,294-task nlmixr2lib
-  queue that took 12.5 s of the 14 s a dry run needed on 2026-09-25. The
-  git work took about one second.
+  queue that scan took 12.5 s with PyYAML's pure-Python loader, and 1.6 s
+  once the queue store switched to LibYAML's `CSafeLoader` (both measured
+  2026-09-25). The git work of a dry run took about one second.
 - (−) A task whose YAML has left `todo/` (for example, moved to a `done/`
   directory by hand) is invisible to the runner, and so is its worktree.
   Reclaim before moving YAMLs, or remove those worktrees by hand.
