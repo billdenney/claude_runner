@@ -82,7 +82,7 @@ The full lint / format / type / test pipeline that CI runs is:
 ruff check src tests
 ruff format --check src tests
 mypy src
-pytest -m "not live" --cov --cov-fail-under=75
+pytest -m "not live" --cov --cov-fail-under=90
 ```
 
 ## Architecture

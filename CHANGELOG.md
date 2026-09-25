@@ -50,6 +50,20 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **README and the cheat sheet quote the coverage gate CI enforces
+  (90%).** CI raised `--cov-fail-under` from 75 to 90 on 2026-05-16, but
+  the "pipeline that CI runs" in `README.md` still ran
+  `--cov-fail-under=75` — so it could pass locally where CI failed — and
+  `docs/cheatsheet.md` still called 90% "aspirational". The cheat-sheet
+  section is rewritten as "Coverage gate" and drops its claim that a
+  live-test suite (`CTR_RUN_LIVE_TESTS=1`) covers `usage/capture.py`: no
+  test carries the `live` marker, so `capture()` is simply uncovered.
+  `tests/unit/test_docs_coverage_gate.py` now fails when README's gate
+  differs from the one in `.github/workflows/ci.yml`, which it reads
+  from the workflow's parsed `run:` steps so a gate quoted in a comment
+  cannot stand in for it. Known-answer tests pin both parsers, and a
+  missing README block or a CI file with zero or two gates fails rather
+  than comparing nothing.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
