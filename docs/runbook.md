@@ -137,13 +137,17 @@ come back.
 
    Do not test with `kill <pid>` or `supervisor stop`. Both send SIGTERM,
    the supervisor exits 0, and `RestartPreventExitStatus=0` leaves it
-   down. `systemctl --user status` then shows the unit
-   `failed (Result: exit-code)`: its ExecStop (`supervisor stop`, or
-   `supervisor drain --no-wait` with adoption off) runs after the
-   supervisor has gone and exits 1. Nothing crashed. Start it again with
-   `systemctl --user start claude-task-runner`. Do not drop
-   `--kill-whom=main` either: the default, `all`, also SIGKILLs every
-   in-flight `claude` worker in the unit's cgroup.
+   down, so `systemctl --user status` shows the unit `inactive (dead)`.
+   A unit whose `ExecStop=` line has no leading `-` (see
+   `systemctl --user cat claude-task-runner`) was installed before that
+   prefix was added, and it shows `failed (Result: exit-code)` instead.
+   Its ExecStop (`supervisor stop`, or `supervisor drain --no-wait` with
+   adoption off) runs after the supervisor has gone and exits 1, and
+   without the `-` systemd records that as a failure. Nothing crashed.
+   Re-run `claude-task-runner install` to get the current unit. Start the
+   supervisor again with `systemctl --user start claude-task-runner`. Do
+   not drop `--kill-whom=main` either: the default, `all`, also SIGKILLs
+   every in-flight `claude` worker in the unit's cgroup.
 
 ## Cron watchdog installed, but the supervisor stays down
 
