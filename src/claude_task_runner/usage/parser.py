@@ -13,8 +13,8 @@ Pipeline:
 3. Classification — match the configured five-hour and weekly section
    headers ("Current session", "Current week (all models)") to the
    blocks. Additional sections like ``"Current week (Sonnet only)"``
-   are exposed via :attr:`UsageReading.extra_windows` so EMA / cohort
-   reasoning can use them later.
+   are exposed via :attr:`UsageReading.extra_windows`, which the ``usage``
+   command prints.
 4. Validation — percentages in [0, 100], both windows present.
 
 The parser is pure: it raises :class:`UsageFormatDrift` on any

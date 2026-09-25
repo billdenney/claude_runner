@@ -26,7 +26,6 @@ from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
     HookSettings,
-    SessionSettings,
     TaskCapsSettings,
 )
 from claude_task_runner.queue.schema import Task, TaskState
@@ -116,7 +115,6 @@ def settings_kwargs() -> dict[str, object]:
             heartbeat_silence_alert_s=300,
             heartbeat_silence_kill_s=0,
         ),
-        "settings_session": SessionSettings(max_resume_attempts=3, resume_fail_fast_s=5),
         "settings_hooks": HookSettings(
             pre_dispatch_command="",
             pre_dispatch_timeout_s=120,

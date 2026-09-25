@@ -18,16 +18,11 @@ introduces a new on-disk file MUST update this document in the same PR.
 |     | |      | |        | |ervisor | |systemd| |       | |reclaim |
 +-----+ +------+ +--------+ +--------+ +-------+ +-------+ +--------+
    |      |          |           |                             |
-   |      |          v           |                             |
-   |      |      +------+        |                             |
-   |      |      | EMA  |        |                             |
-   |      |      +------+        |                             |
-   |      |                      |                             |
-   v      v                      v                             v
-+----------------+      +-------------------+         +---------------+
-| YAML state     |      | UsageSource       |         | git: per-task |
-| (queue/store)  |      | (usage/source)    |         | worktrees     |
-+----------------+      +-------------------+         +---------------+
+   v      v          v           v                             v
++---------------------+ +-------------------+         +---------------+
+| YAML state          | | UsageSource       |         | git: per-task |
+| (queue/store)       | | (usage/source)    |         | worktrees     |
++---------------------+ +-------------------+         +---------------+
                                  |
                                  v
                          +-------------+
@@ -58,9 +53,7 @@ introduces a new on-disk file MUST update this document in the same PR.
    See [Supervisor log and drift evidence](#supervisor-log-and-drift-evidence).
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
    after `task_caps.heartbeat_silence_alert_s` seconds of silence.
-6. On task completion: `runner.ema` updates per-(model, effort, tool-hash) EMA
-   with observed token / duration / cost samples.
-7. If task hits a sidecar question: writes
+6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**
    question id it asked appears in the response's `answers` (ADR-0031) — a
@@ -68,10 +61,10 @@ introduces a new on-disk file MUST update this document in the same PR.
    `/runner-answer-sidecar`,
    which writes `response-NNN.json`. Supervisor re-dispatches via `claude --resume
    <session_id>`.
-8. On 5h-window reset mid-task: in-flight task continues. Supervisor's
+7. On 5h-window reset mid-task: in-flight task continues. Supervisor's
    `runner.session.plan_next_spawn` knows that resuming a task across a window
    boundary is fine because we use `--resume <session_id>`.
-9. On task failure: `runner.retry` classifies the error
+8. On task failure: `runner.retry` classifies the error
    (environmental | operator | task | unknown). Environmental → auto-retry.
    Other → surface to operator.
 10. After the task's branch has been merged into the parent branch (e.g. by
@@ -147,9 +140,8 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     ├── supervisor.pid              # PID of the running supervisor
     ├── supervisor.log              # supervisor stdout/stderr, only when the
     │                               #   cron watchdog started it (see below)
-    ├── usage_captures/<ts>.cap     # raw PTY captures of the supervisor's
-    │                               #   /usage polls (rotated)
-    └── ema.json                    # per-task-type EMA values
+    └── usage_captures/<ts>.cap     # raw PTY captures of the supervisor's
+                                    #   /usage polls (rotated)
 ```
 
 Global (cross-queue):
@@ -204,10 +196,14 @@ These properties are never violated; tests and assertions enforce them.
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs.
-3. **Usage utilization is monotonically non-decreasing within a window** —
-   any decrease without a detected reset is `UsageFormatDrift`.
-4. **No new dispatch when 5h utilization ≥ no-dispatch threshold** —
-   regardless of EMA prediction; this is the safety net.
+3. *(Retired 2026-09-25.)* This slot said a utilization decrease without a
+   detected reset is `UsageFormatDrift`. Nothing ever enforced that: the check
+   was written but never called, and it has been removed. Each reading is used
+   as reported. The slot keeps its number because code comments cite these
+   invariants by number.
+4. **No new dispatch when 5h utilization ≥ the active band's stop threshold**
+   (`fivehr_stop_pct` in `[dispatch_pct.day]` or `[dispatch_pct.night]`) —
+   this is the safety net.
 5. **Every behavior-affecting cutoff is a setting** — no magic numbers for
    thresholds/timeouts/caps in runtime code (cosmetic presentation constants
    such as log-truncation widths are exempt; see ADR-0014). The merged
@@ -238,7 +234,6 @@ Operators extend behavior without code changes:
 - **Worktree reclamation**: `[worktree_reclaim]` sets the branch template,
   parent branch, disposable untracked paths, the hook's lock file, and the
   opt-in periodic supervisor pass (ADR-0034).
-- **EMA priors per (model, effort)**: edit `[ema.priors.<model>.<effort>]`.
 - **Task templates**: drop Jinja2 templates into
   `~/.claude_task_runner/templates/` or per-queue `templates/`.
 

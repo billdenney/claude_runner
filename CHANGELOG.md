@@ -9,6 +9,65 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Removed
+
+- **Settings that no code ever read are gone, and a queue TOML that still
+  sets one no longer loads (breaking).** Every settings model is
+  `extra="forbid"`, so each of these loaded without complaint and did nothing:
+  - `[claude].plan` and the `[plans.*]` token budgets. They were staged on
+    2026-05-11 for loader auto-tuning that never came, and ADR-0022 made them
+    moot: the throttle compares the utilization percentages `/usage` reports,
+    already relative to the account's tier, against `[dispatch_pct.*]`.
+    `docs/first-time-setup.md` put `plan = "max20x"` in every new queue.
+  - `[ema]` (`alpha`, `prior_warmup_samples`, `runtime_p90_multiplier` and the
+    `[ema.priors.*]` tables), the EMA of ADR-0011, now deprecated. No
+    production code ever called `update_bucket`, so no queue ever had an
+    `ema.json`, and the predictions' only caller was an end-of-week-push check
+    that nothing called. `runner/ema.py`, `runner/runtime_stats.py` and the
+    doctor's `ema` check are gone too. Concurrency never depended on the EMA:
+    `initial_concurrency` holds until a first task completes, then
+    `max_concurrency`.
+  - `[usage].suspicious_delta_pct`, together with
+    `usage.drift.validate_monotonicity` and `UsageMonotonicityDrift`, which
+    nothing called or raised. Key invariant 3 in `docs/architecture.md` said
+    a utilization decrease without a detected reset "is `UsageFormatDrift`",
+    under a heading saying tests and assertions enforce every invariant. It
+    is retired in place, because code comments cite invariants by number. The
+    check was removed rather than wired in because a false alarm would halt
+    dispatch. For example, the API source rounds the header's fraction to a
+    whole percent while the TUI prints its own whole number, so an
+    `api_then_tty` fallback can read a point lower than the poll before it.
+  - `[usage].healthcheck_interval_s`, the period of a background healthcheck
+    that nothing ever scheduled. `claude-task-runner usage healthcheck` still
+    runs one on demand.
+  - `[session].resume_fail_fast_s`, with `runner.session.fall_through_to_fresh`
+    and `dispatch()`'s `settings_session` parameter. The fast fall-through
+    ADR-0005 describes was never built. Every `--resume` counts toward
+    `[session].max_resume_attempts`, whatever its outcome, and at the cap
+    dispatch goes fresh. `TestResumeAttemptCounting` now pins that.
+
+  **Migration:** the loader rejects any of these keys in a `claude_runner.toml`
+  with one `ConfigError` that lists each retired key in the file and why it
+  went. Delete them. None was ever read, so deleting them changes nothing, and
+  it is safe to do before upgrading, while the old runner is still running.
+  README, the architecture doc, the cheat sheet, first-time setup, the runbook,
+  the `runner-add-task` skill and ADRs 0005, 0011 and 0022 no longer describe
+  any of them as live.
+- **A gate so that cannot recur.** `tests/unit/test_settings_readers.py` walks
+  every field reachable from `Settings` and `AccountPolicy` and fails when no
+  runtime code reads its name. It scans with `ast`, so docstrings and comments
+  do not count. Reads in the schema's own helper methods count; validators'
+  reads do not. It found every setting above, including
+  `[session].resume_fail_fast_s`, which a text search had missed because
+  docstrings spell it. Its allowlist is empty.
+- **The docs-vs-schema gate handles retired keys.**
+  `tests/unit/test_docs_config_refs.py` can allowlist a single retired field
+  (`claude.plan`) as well as a whole table, and it requires a loader guard
+  that names each allowlisted key, so an operator following a stale mention is
+  told to delete it. It also now reads a bracketed reference with a
+  `<placeholder>` segment, such as `[ema.priors.<model>.<effort>]`, which it
+  used to skip.
+
 ### Changed
 
 - **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
@@ -32,6 +91,22 @@ Breaking changes are called out in the version notes.
   surrogates (`"\ud83d"`), `%YAML` versions other than 1.1/1.2 and unknown
   `%` directives, which `SafeLoader` accepted. The runner's own writers never
   emit any of these, and no file in that queue parses differently.
+
+### Removed
+
+- **The unused `supervisor/window.py` module and its tests.** No module
+  imported it, at module level or inside a function, so neither the CLI nor
+  the supervisor daemon nor the runner could reach it. Its contents either
+  live elsewhere or belonged to removed behavior. `schedule_window_start_wakeup`
+  duplicated `throttle.decision._next_5h_reset_wakeup`, which is what actually
+  schedules the wakeup after a 5-hour reset; that path is unchanged.
+  `in_eow_push_window` served the end-of-week push that ADR-0022 removed.
+  `crossed_reset`, `crossed_reset_5h` and `crossed_reset_weekly` were the reset
+  detection for `usage.drift.validate_monotonicity`, which nothing called and
+  which is now removed along with `[usage].suspicious_delta_pct`.
+  `time_until_reset_s` had no caller, and the module's `FIVE_HOUR_LENGTH_S` and
+  `SEVEN_DAY_LENGTH_S` duplicated `throttle.decision.FIVE_HOUR_LENGTH_S` and
+  `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
 
 ### Fixed
 

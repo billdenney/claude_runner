@@ -5,10 +5,11 @@ See ADR-0005. The resume path is:
 1. If the task has a ``session_id`` AND a session JSONL exists at the
    conventional Claude Code location, try ``claude --resume <id>`` with
    a continuation prompt.
-2. If the resume process exits within ``[session].resume_fail_fast_s``
-   with a non-zero code, fall through to a fresh dispatch.
-3. If ``[session].max_resume_attempts`` is exceeded for a task, only
-   fresh dispatches are attempted.
+2. Every resume attempt, whatever its outcome, increments
+   ``TaskState.resume_attempts``. A resume that fails is not retried
+   fresh within the same attempt; the next attempt is planned again.
+3. Once ``resume_attempts`` reaches ``[session].max_resume_attempts``,
+   only fresh dispatches are attempted.
 
 This module decides **which strategy to use** and constructs the argv
 for the dispatcher. The actual subprocess management is in
@@ -123,15 +124,13 @@ def plan_next_spawn(
     Decision tree:
 
     * No ``state.session_id`` → FRESH.
-    * ``state.resume_attempts >= max_resume_attempts`` → FRESH (the cap
-      gives up on resume after repeated failures).
+    * ``state.resume_attempts >= max_resume_attempts`` → FRESH (the
+      dispatcher counts every resume attempt, successful or not).
     * Session JSONL doesn't exist on disk → FRESH.
     * Otherwise → RESUME.
 
-    The dispatcher is responsible for falling through to FRESH if the
-    actual ``--resume`` invocation errors within
-    ``[session].resume_fail_fast_s``; that runtime decision is separate
-    from this static planning step.
+    There is no fast fall-through: a ``--resume`` that fails counts
+    toward the cap like any other, and the next attempt is planned here.
     """
     args = list(extra_args or [])
 
@@ -164,20 +163,4 @@ def plan_next_spawn(
         session_id=state.session_id,
         prompt=CONTINUATION_PROMPT,
         extra_args=args,
-    )
-
-
-def fall_through_to_fresh(plan: SpawnPlan, original_prompt: str) -> SpawnPlan:
-    """Convert a RESUME plan into FRESH after a failed resume attempt.
-
-    Called by the dispatcher when ``claude --resume`` exits with a
-    resume-specific error within ``resume_fail_fast_s``.
-    """
-    if plan.strategy is ResumeStrategy.FRESH:
-        return plan
-    return SpawnPlan(
-        strategy=ResumeStrategy.FRESH,
-        session_id=None,
-        prompt=original_prompt,
-        extra_args=list(plan.extra_args),
     )

@@ -54,3 +54,17 @@ are attempted.
 ## Reversibility
 
 High. Setting `max_resume_attempts = 0` makes the system always-fresh.
+
+## Update (2026-09-25)
+
+The fast fall-through in step 1 was never built. The dispatcher runs one
+`claude --resume` per attempt and never turns a failed resume into a
+fresh spawn within that attempt. Every resume attempt, successful or
+not, increments `resume_attempts`. Once the count reaches
+`[session].max_resume_attempts`, `runner.session.plan_next_spawn` plans a
+fresh dispatch, and a resume whose session JSONL is missing goes fresh
+at once. `[session].resume_fail_fast_s` existed only for the unbuilt
+step, and it has been removed, along with the never-called
+`fall_through_to_fresh`. The loader rejects a queue TOML that still sets
+the key, with a message saying to delete it. `tests/integration/test_dispatcher.py`
+(`TestResumeAttemptCounting`) pins the behaviour described here.

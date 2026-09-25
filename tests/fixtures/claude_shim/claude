@@ -17,7 +17,7 @@ Env vars:
 * ``SHIM_DURATION_MS`` (default ``500``)
 * ``SHIM_SLEEP_BETWEEN_S`` (default ``0``) — sleep between events
 * ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
-   with this message on stderr (used to test resume-fail-fast behavior)
+   with this message on stderr (e.g. a ``--resume`` of an unknown session)
 * ``SHIM_NUM_ASSISTANT_MSGS`` (default ``2``)
 * ``SHIM_IGNORE_SIGTERM`` (default ``""``) — when ``1`` / ``true``,
    install ``signal.SIG_IGN`` for ``SIGTERM`` before emitting events.
