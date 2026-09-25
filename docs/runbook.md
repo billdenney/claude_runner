@@ -124,7 +124,9 @@ come back.
 ## Cron watchdog installed, but the supervisor stays down
 
 **Symptom:** `crontab -l` shows the `# BEGIN claude_task_runner` block,
-yet a stopped supervisor never comes back, and every tick in
+yet a stopped supervisor never comes back. Run in the queue directory,
+`claude-task-runner doctor` warns under `watchdog_installed` that the
+registry does not list the queue. With an empty registry, every tick in
 `~/.claude_task_runner/watchdog.log` logs
 `watchdog: no queues registered; nothing to do`.
 

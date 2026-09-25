@@ -23,7 +23,7 @@ from claude_task_runner.cli.install_cmd import (
     _watchdog_script_path,
     app,
 )
-from claude_task_runner.cli.watchdog_cmd import load_registered_queues
+from claude_task_runner.cron.registry import load_registered_queues, queues_registry_path
 
 
 @pytest.fixture
@@ -409,7 +409,7 @@ def test_install_cron_abort_does_not_register(runner: CliRunner, tmp_path: Path)
         result = runner.invoke(app, ["--queue", str(queue)], input="n\n")
     assert result.exit_code == 1
     mock_apply.assert_not_called()
-    assert not watchdog_cmd.queues_registry_path().exists()
+    assert not queues_registry_path().exists()
 
 
 def test_install_cron_rerun_registers_queue_once(runner: CliRunner, tmp_path: Path) -> None:
@@ -467,7 +467,7 @@ def test_install_cron_missing_queue_dir_is_not_registered(
     assert "not an existing directory" in result.stdout
     mock_apply.assert_not_called()
     assert not missing.exists()
-    assert not watchdog_cmd.queues_registry_path().exists()
+    assert not queues_registry_path().exists()
 
 
 def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Path) -> None:
@@ -490,7 +490,7 @@ def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Pa
         result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
     assert result.exit_code == 0, result.output
     mock_apply.assert_called_once()
-    assert not watchdog_cmd.queues_registry_path().exists()
+    assert not queues_registry_path().exists()
 
 
 # ---------------------------------------------------------------------------

@@ -17,10 +17,10 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from claude_task_runner.cli._helpers import resolve_per_queue_config
-from claude_task_runner.cli.watchdog_cmd import queues_registry_path, register_queue
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import install as cron_install
+from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
 
 app = typer.Typer(no_args_is_help=False, invoke_without_command=False)
@@ -157,7 +157,7 @@ def install(
         console.print("  [dim](no visible diff — block already up to date)[/]")
     # The crontab line runs `watchdog tick` with no --queue, and a tick
     # manages only the queues in this registry.
-    registry = queues_registry_path()
+    registry = registry_mod.queues_registry_path()
     console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
     console.print(f"  {queue_path}")
     if not yes and not Confirm.ask("\nApply this change?", default=False):
@@ -168,7 +168,7 @@ def install(
     # leaves nothing changed. The other order could leave a cron line
     # whose ticks have no queue to manage.
     try:
-        register_queue(queue_path)
+        registry_mod.register_queue(queue_path)
     except OSError as exc:
         console.print(f"[bold red]watchdog registration failed:[/] {exc}")
         raise typer.Exit(code=2) from exc

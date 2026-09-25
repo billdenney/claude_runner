@@ -7,7 +7,8 @@ One tick:
 1. Load watchdog settings.
 2. Load watchdog state (recent restarts, backoff alerts).
 3. For each registered queue (``~/.claude_task_runner/queues.json``,
-   written by a cron ``install`` and by ``watchdog register``):
+   written by a cron ``install`` and by ``watchdog register``; see
+   :mod:`cron.registry`):
    read the PID file; ask :func:`cron.backoff.decide` whether to act.
 4. On RESTART verdict: spawn ``claude-task-runner supervisor start``
    detached.
@@ -24,8 +25,6 @@ Two more subcommands manage the registry that a tick walks:
 
 from __future__ import annotations
 
-import json
-import logging
 import shutil
 import subprocess
 import sys
@@ -36,83 +35,10 @@ import typer
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import backoff as backoff_mod
+from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
-logger = logging.getLogger(__name__)
-
-QUEUES_REGISTRY_FILENAME = "queues.json"
-"""Per-user registry of the queue directories that watchdog ticks manage.
-
-Format: ``{"queues": ["/path/to/queue1", "/path/to/queue2"]}``. A cron
-``install`` adds the queue directory it was invoked with, and
-``watchdog register`` adds one without re-running ``install``. A
-systemd ``install`` leaves the registry alone, because systemd restarts
-the unit's supervisor itself."""
-
 app = typer.Typer(no_args_is_help=True)
-
-
-def queues_registry_path() -> Path:
-    return Path.home() / ".claude_task_runner" / QUEUES_REGISTRY_FILENAME
-
-
-def _backup_broken_registry(path: Path) -> None:
-    """Preserve a corrupt registry as ``<name>.broken`` before it's lost.
-
-    Best-effort: a failure to back up must not crash the watchdog tick
-    (the registry is already unreadable; losing the backup is a smaller
-    problem than aborting the tick)."""
-    backup = path.with_suffix(path.suffix + ".broken")
-    try:
-        shutil.copy2(path, backup)
-    except OSError as exc:
-        logger.error("watchdog: could not back up corrupt registry to %s (%s)", backup, exc)
-    else:
-        logger.error("watchdog: backed up corrupt registry to %s", backup)
-
-
-def load_registered_queues() -> list[Path]:
-    path = queues_registry_path()
-    if not path.exists():
-        return []
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        # A corrupt registry would otherwise silently lose every queue
-        # registration. Loudly log it and stash the bad file alongside
-        # so the operator can recover it (rather than overwriting it on
-        # the next register).
-        logger.error("watchdog: corrupt queues registry at %s (%s)", path, exc)
-        _backup_broken_registry(path)
-        return []
-    if not isinstance(payload, dict):
-        logger.error("watchdog: queues registry at %s is not a JSON object", path)
-        _backup_broken_registry(path)
-        return []
-    raw = payload.get("queues", [])
-    if not isinstance(raw, list):
-        return []
-    return [Path(q) for q in raw if isinstance(q, str)]
-
-
-def register_queue(queue_dir: Path) -> None:
-    """Add ``queue_dir`` to the registry. Idempotent.
-
-    Raises :class:`NotADirectoryError` unless ``queue_dir`` is an
-    existing directory. A registered typo would otherwise be created by
-    the next tick's restart (:func:`_spawn_supervisor` makes the log
-    directory with ``parents=True``), and the supervisor started on that
-    empty queue would hold the per-user global lock."""
-    resolved = queue_dir.resolve()
-    if not resolved.is_dir():
-        raise NotADirectoryError(f"not an existing directory: {resolved}")
-    path = queues_registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = load_registered_queues()
-    if resolved in existing:
-        return
-    existing.append(resolved)
-    path.write_text(json.dumps({"queues": [str(q) for q in existing]}, indent=2) + "\n")
 
 
 def _supervisor_is_alive(queue_dir: Path) -> tuple[bool, int | None]:
@@ -172,7 +98,7 @@ def tick(
         sys.stdout.write(f"watchdog: bad state file ({exc}); resetting\n")
         state = backoff_mod.WatchdogState()
 
-    queues = load_registered_queues()
+    queues = registry_mod.load_registered_queues()
     if not queues:
         sys.stdout.write("watchdog: no queues registered; nothing to do\n")
         return
@@ -219,7 +145,7 @@ def register(
     this registry. ``watchdog queues`` lists what is registered.
     """
     try:
-        register_queue(queue_dir)
+        registry_mod.register_queue(queue_dir)
     except OSError as exc:
         print(f"register failed: {exc}", file=sys.stderr)
         raise typer.Exit(code=2) from exc
@@ -229,5 +155,5 @@ def register(
 @app.command("queues")
 def list_queues() -> None:
     """Print the registered queues, one per line."""
-    for q in load_registered_queues():
+    for q in registry_mod.load_registered_queues():
         print(q)

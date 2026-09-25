@@ -61,6 +61,23 @@ Breaking changes are called out in the version notes.
   say to run `supervisor start` after `install`. The runbook has a section
   for the empty-registry symptom. Docstrings that described a systemd timer
   running `watchdog tick` now say that nothing on the systemd path runs one.
+- **`doctor` no longer passes a cron watchdog that does not manage the
+  queue.** Its `watchdog_installed` check reported "cron watchdog detected"
+  whenever the crontab had the managed block, so it passed every cron
+  install that the fix above does not repair. With only the cron block
+  installed, it now PASSes only when `~/.claude_task_runner/queues.json`
+  lists the queue. Otherwise it WARNs and gives the
+  `claude-task-runner watchdog register --queue <queue>` to run. A corrupt
+  registry gets its own WARN. doctor reads the registry without side
+  effects, so the file is left as it is and no `queues.json.broken` copy is
+  made, as a watchdog tick would. A systemd unit still PASSes without the
+  registry being read. The registry code moved from `cli/watchdog_cmd.py`
+  to a new `cron/registry.py`, so doctor does not import from the CLI.
+  There, `read_registered_queues()` raises `RegistryError` on a corrupt
+  file, and the tick's `load_registered_queues()` keeps treating one as
+  empty. A registry whose `queues` value is not a list now counts as
+  corrupt too: the tick logs it and backs it up, where it used to be read
+  as empty with no trace.
 - **The docs no longer send operators to a `drift.log` that nothing
   writes.** `docs/architecture.md`'s per-queue tree listed
   `<queue>/.claude_task_runner/drift.log` ("parser drift + healthcheck
