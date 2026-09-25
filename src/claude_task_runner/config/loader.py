@@ -69,7 +69,10 @@ _RETIRED_KEYS: dict[tuple[str, ...], str] = {
         "[dispatch_pct.*] (ADR-0022)"
     ),
     ("plans",): "token budgets nothing read; see [claude].plan",
-    ("usage", "healthcheck_interval_s"): "scheduled a drift canary that was never built",
+    ("usage", "healthcheck_interval_s"): (
+        "was the period of a background /usage healthcheck that nothing ever "
+        "scheduled; `claude-task-runner usage healthcheck` runs one on demand"
+    ),
     ("usage", "suspicious_delta_pct"): (
         "tuned a utilization monotonicity check that nothing ever called"
     ),
