@@ -17,6 +17,8 @@ Subcommands:
                                     so the next dispatch starts on any
                                     available account (ADR-0024 escape hatch).
 * ``queue force-dispatch``        — bypass throttle gates and dispatch one task now.
+* ``queue template``              — print an annotated example Task YAML
+                                    (``--reference`` prints the field table).
 """
 
 from __future__ import annotations

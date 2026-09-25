@@ -21,8 +21,10 @@ Usage
 * As a library: :func:`refresh_oauth_token` returns the
   :class:`UsageReading` that proves the refresh succeeded.
 * As an operator preflight:
-  ``claude-task-runner usage refresh --queue ... --config ...`` —
-  refreshes every configured account, reports per-account status.
+  ``claude-task-runner usage --config <queue>/claude_runner.toml refresh``
+  refreshes every configured account and reports each one's status.
+  ``refresh`` itself takes no options. ``--config`` belongs to the
+  ``usage`` group, so it goes before the subcommand.
 """
 
 from __future__ import annotations

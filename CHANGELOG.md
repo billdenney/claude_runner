@@ -151,6 +151,35 @@ Breaking changes are called out in the version notes.
   allowlisted per file with a reason. These are `config init`,
   ADR-0030's `why-blocked`, and the two ADRs above. A companion test
   fails when an allowlist entry goes stale.
+- **Docstrings in the package gave CLI forms that fail.** The docstring
+  of `usage/oauth_refresh.py` ran `usage refresh` with `--queue` and
+  `--config` after the subcommand, which fails with
+  `No such option: --queue`. `refresh` takes no options, nothing on the
+  `usage` path takes `--queue`, and `--config` belongs to the `usage`
+  group, so it has to come first:
+  `claude-task-runner usage --config <queue>/claude_runner.toml refresh`.
+  The `usage_cmd.py` docstring now says so too. `cli/install_skills_cmd.py`
+  named an `uninstall-skills` command and `cli/install_cmd.py` a bare
+  `uninstall`; the commands are `install-skills uninstall` and
+  `install uninstall`. In `queue/schema.py`, the `note` of a `requires`
+  element was said to be reported by `why-blocked`, a `queue` subcommand
+  that was never built. Notes appear in `queue show`, in the task's
+  `readiness hold:` deferred reason, and in a refused
+  `queue force-dispatch`.
+- **`supervisor drain --help` no longer says systemd restarts a drained
+  supervisor.** It said the unit is `Restart=on-success`. The unit that
+  `claude-task-runner install` writes is `Restart=on-failure` with
+  `RestartPreventExitStatus=0`, so a supervisor that drains and exits 0
+  stays down. The help now says to run
+  `systemctl --user restart claude-task-runner` under systemd. It also
+  says the unit's `ExecStop` is `supervisor drain --no-wait` only when
+  `[supervisor].adopt_workers` is false. By default `ExecStop` is
+  `supervisor stop`, and the new supervisor adopts the running workers.
+- **Each CLI module docstring lists every subcommand of its group.**
+  `supervisor_cmd.py` listed `start | stop | status` without `drain`.
+  `usage_cmd.py` lacked `whoami` and `refresh`, `queue_cmd.py` lacked
+  `template`, `install_skills_cmd.py` lacked `list`, and
+  `watchdog_cmd.py` lacked `register` and `queues`.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
