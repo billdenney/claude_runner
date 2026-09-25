@@ -50,6 +50,45 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The cheat sheet's "Add a new plan" recipe now works.** Its last step
+  ran a `supervisor` subcommand that does not exist and failed with
+  `No such command 'restart'`. Reading the code showed the recipe was
+  wrong in more places than that. `[claude].plan` and `[plans.*]` are
+  schema-validated but read by no runtime code, so changing them needs
+  neither a reload nor a restart. What does matter is the account switch
+  (`[claude].config_dir` or `[[accounts]]`), and that needs a real
+  restart: `supervisor drain` then `supervisor start` (or the cron
+  watchdog), or `systemctl --user restart claude-task-runner` under
+  systemd. A SIGHUP reload is not enough, because the `/usage` poller is
+  built once at `supervisor start`. After a reload the supervisor would
+  dispatch through the new account while throttling on the old one's
+  utilization. Step 1 used `claude --config-dir`, a flag `claude` does
+  not have, and now uses `CLAUDE_CONFIG_DIR=<dir> claude /login`. The
+  cheat sheet's `load_settings` snippet also gained the
+  `from pathlib import Path` it needed to run.
+- **The same defect in four more docs.** `docs/runbook.md` and
+  `docs/first-time-setup.md` passed `--status` to `queue list`. The
+  option belongs to `queue states`, where it is repeatable
+  (`--status running --status failed`). A comma-joined value, which
+  `docs/first-time-setup.md` also used, matches no status and prints
+  nothing. ADR-0010 and ADR-0014 describe `effort list`, `config show`
+  and `config validate` subcommands that were never built. Both ADRs are
+  append-only, so each gets a dated update that says so and names what
+  to use instead.
+- **A docs-vs-CLI gate so that cannot recur.**
+  `tests/unit/test_docs_cli_refs.py` walks the real typer command tree
+  (`typer.main.get_command(app)`) for every `claude-task-runner ...`
+  invocation in a code span or fenced block. It covers `docs/**/*.md`,
+  `README.md`, `CHANGELOG.md` and the skills' `SKILL.md` files, plus
+  every code span led by a top-level group, such as `sidecar answer`.
+  It fails on an unknown command, subcommand or option, and it checks
+  each option against the command it follows, as click does. The walker
+  has known-answer tests, including the original bug. It is also
+  enumerated over the whole tree, so it cannot reject a real command or
+  option. Docs that name a command only to say it was never built are
+  allowlisted per file with a reason. These are `config init`,
+  ADR-0030's `why-blocked`, and the two ADRs above. A companion test
+  fails when an allowlist entry goes stale.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and

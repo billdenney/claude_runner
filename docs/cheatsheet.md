@@ -185,34 +185,58 @@ and `supervisor/state_machine` carries the project's highest coverage.
 
 ## Add a new plan
 
-Plans live under `[plans.*]` in the package defaults TOML. Each entry
-declares `five_hour_tokens` and `weekly_tokens`. Anthropic announces
-a new tier, you want to calibrate against it:
+`[claude].plan` and the `[plans.*]` token budgets are schema-validated
+but **no runtime code reads them**. The throttle compares the
+utilization *percentages* that `claude /usage` reports against
+`[dispatch_pct.*]`, and those percentages are already relative to the
+account's tier. A new tier therefore needs no `[plans.*]` entry, and
+editing `plan` or `[plans.*]` needs neither a reload nor a restart.
 
-1. Authenticate against the new account: `claude --config-dir
-   ~/.claude_<tier>` then `claude /login`.
-2. Capture a few real `/usage` readings via the supervisor's
-   `claude-task-runner usage` command to discover the actual budget
-   ceiling.
-3. Add an entry to `[plans.*]` in the per-queue or package TOML:
+What matters is which account the supervisor dispatches through and
+polls. When the new tier is a different login:
+
+1. Log in under its own config dir:
+   `CLAUDE_CONFIG_DIR=~/.claude_<tier> claude /login`.
+2. Point the queue at it in `<queue>/claude_runner.toml`, either through
+   the legacy single-account `[claude].config_dir` or through that
+   account's `config_dir` in its `[[accounts]]` block:
 
    ```toml
-   [plans.<tier>]
-   five_hour_tokens = <observed 5h cap>
-   weekly_tokens    = <observed weekly cap>
-
    [claude]
-   plan       = "<tier>"
    config_dir = "~/.claude_<tier>"
    ```
 
-4. Restart the supervisor: `claude-task-runner supervisor restart`.
+3. From the queue directory, run `claude-task-runner doctor`. Its
+   `accounts` check confirms each configured `config_dir` exists and
+   is logged in.
+4. Restart the supervisor. A SIGHUP reload (`kill -HUP` the PID in
+   `<queue>/.claude_task_runner/supervisor.pid`) is **not** enough here.
+   It re-reads `claude_runner.toml`, so the next dispatch uses the new
+   account, but the `/usage` poller is built once at `supervisor start`,
+   so throttling would keep reading the old account's utilization.
+
+   ```sh
+   claude-task-runner supervisor drain   # no new dispatches; exits once in-flight tasks finish
+   claude-task-runner supervisor start   # or let the cron watchdog restart it on its next tick
+   ```
+
+   Under the systemd unit, use `systemctl --user restart claude-task-runner`
+   instead. Its `ExecStop` keeps in-flight tasks: the new supervisor
+   adopts them, or they drain first when `[supervisor].adopt_workers` is
+   off. A drain on its own is not enough under systemd. The unit is
+   `Restart=on-failure`, so a supervisor that exits cleanly after a
+   drain stays down.
+
+SIGHUP *is* enough to retune `[dispatch_pct.*]` for the new tier. The
+policy is resolved from the reloaded settings on every tick.
 
 ## Where each setting lives in the schema
 
 For type-checking your TOML overrides locally:
 
 ```python
+from pathlib import Path
+
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.config.loader import load_settings
 print(load_settings(Path("path/to/queue/claude_runner.toml")))
