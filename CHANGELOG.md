@@ -180,6 +180,29 @@ Breaking changes are called out in the version notes.
   `usage_cmd.py` lacked `whoami` and `refresh`, `queue_cmd.py` lacked
   `template`, `install_skills_cmd.py` lacked `list`, and
   `watchdog_cmd.py` lacked `register` and `queues`.
+- **The CLI gate now covers the package's scripts, Python sources and CLI
+  module docstrings.** `tests/unit/test_docs_cli_refs.py` also walks
+  every invocation in the shell scripts under `src/claude_task_runner`
+  (the skills' helpers and `cron/watchdog.sh`), and in every string
+  literal, docstring and f-string in `src/claude_task_runner/**/*.py`.
+  A small lexer splits each script into code, which is checked word by
+  word like a fenced block, and prose: comments, quoted strings and
+  heredoc bodies. A heredoc fed to `python` is parsed as Python, so the
+  argv list with which `fetch_all.sh` runs `sidecar show` is checked
+  too. Prose is checked in code spans, and a bare `claude-task-runner`
+  in prose counts only when the next word is a top-level group or an
+  option. So English such as "claude-task-runner not on PATH" is not
+  read as a command, while an echo telling the operator to run a
+  missing subcommand still fails. A second test fails when a CLI
+  module's docstring leaves out a subcommand of its group. The walker
+  also no longer reads a placeholder followed by a path, such as
+  `<queue>/claude_runner.toml`, as a `<` redirection. That misreading
+  ended the walk early, so the words after the placeholder went
+  unchecked. Run against the sources as they were before these fixes,
+  the new tests fail on the `--queue` preflight, the `why-blocked` note
+  and the five incomplete subcommand lists, and on nothing else. The
+  `Restart=` claim and the bare `uninstall` are not invocations the gate
+  can check.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
