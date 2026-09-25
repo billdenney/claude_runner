@@ -1,4 +1,9 @@
-"""``claude-task-runner install-skills`` and ``uninstall-skills``.
+"""``claude-task-runner install-skills`` — install, list and remove the skills.
+
+* ``install-skills`` (no subcommand) — symlink or copy every packaged
+  skill into ``~/.claude/skills/``.
+* ``install-skills list``      — show which packaged skills are installed.
+* ``install-skills uninstall`` — remove the packaged skills.
 
 Skills are markdown files inside the package
 (``src/claude_task_runner/skills/<name>/SKILL.md``). To activate them

@@ -1,5 +1,5 @@
-"""``claude-task-runner install`` and ``uninstall`` — wire up the
-watchdog (systemd or cron) with operator confirmation.
+"""``claude-task-runner install`` and ``install uninstall`` — wire up
+or remove the watchdog (systemd or cron) with operator confirmation.
 
 Per ADR-0014, every cutoff is configurable, but the *interactive*
 nature of install (TTY confirmation, ``crontab -`` invocation,

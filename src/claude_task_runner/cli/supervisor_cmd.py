@@ -1,8 +1,10 @@
-"""``claude-task-runner supervisor start | stop | status`` subcommands.
+"""``claude-task-runner supervisor start | stop | drain | status`` subcommands.
 
 Thin CLI surface around :mod:`supervisor.daemon` and the persisted
 :class:`SupervisorSnapshot` / PID file. ``start`` blocks; ``stop``
-asks the supervisor to exit; ``status`` is read-only.
+asks the supervisor to exit; ``drain`` stops new dispatches and lets
+the supervisor exit once its in-flight tasks finish; ``status`` is
+read-only.
 """
 
 from __future__ import annotations
@@ -376,12 +378,22 @@ def drain(
     supervisor started afterwards re-reads ``supervisor.json`` and
     picks up the queue without double-dispatching anything.
 
-    Combined with the systemd unit's ``ExecStop=... drain`` directive
-    and ``Restart=on-success``, this gives near-zero-downtime
-    supervisor restarts with zero lost work. The drain window is
-    bounded by the longest in-flight task (typically minutes for
-    extraction work; up to ``[task_caps].max_duration_s_per_task``
-    for the hard cap).
+    A drained supervisor exits 0, and under systemd it stays down. The
+    unit is ``Restart=on-failure`` with ``RestartPreventExitStatus=0``,
+    so systemd restarts the supervisor only when it fails, never after
+    a clean exit. To restart under systemd without losing work, run
+    ``systemctl --user restart claude-task-runner`` instead of
+    ``drain``. It runs the unit's ``ExecStop`` and then starts a new
+    supervisor. ``ExecStop`` is ``supervisor drain --no-wait`` only
+    when ``[supervisor].adopt_workers`` is false. By default it is
+    ``supervisor stop``, and the new supervisor adopts the running
+    workers (ADR-0025). Without systemd, follow ``drain`` with
+    ``supervisor start``, or let the cron watchdog restart it. The
+    watchdog manages only the queues that ``watchdog queues`` lists.
+
+    The drain window is bounded by the longest in-flight task
+    (typically minutes for extraction work; up to
+    ``[task_caps].max_duration_s_per_task`` for the hard cap).
 
     Exit codes:
       0  supervisor exited cleanly (or --no-wait and signal delivered)
