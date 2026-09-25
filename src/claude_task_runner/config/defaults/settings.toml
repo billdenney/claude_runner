@@ -424,6 +424,48 @@ format = "text"
 working_dir_template = ""
 
 # ---------------------------------------------------------------------------
+# Worktree reclamation (ADR-0034)
+#
+# A queue whose pre-dispatch hook creates one git worktree per task
+# (ADR-0013) accumulates them forever: the runner never removes a worktree
+# on its own, because one can hold the only copy of unpushed work
+# (ADR-0020 / ADR-0032). `claude-task-runner worktree reclaim --queue <dir>`
+# (a dry run unless given --apply) removes a task's worktree only when ALL
+# of these hold:
+#
+#   1. the task's state says `completed`, and no dispatch thread holds it
+#      (a finished run's post-dispatch hook still runs inside the worktree);
+#   2. the worktree has `branch_template` checked out, and that branch is an
+#      ancestor of `<remote>/<parent_branch>` right after a fetch;
+#   3. `git status --porcelain` is empty, except for untracked paths under
+#      `discardable_untracked`, which are discarded with `--force`.
+#
+# The local branch is then deleted with `git branch -d` (never -D). Also
+# kept: the repository's main worktree, a locked worktree, a working_dir
+# shared by several tasks, and any worktree whose task is not `completed`.
+#
+#   periodic        also run the reclaim from the supervisor every
+#                   `interval_s` (first pass on the first tick), at most
+#                   `max_per_pass` removals per pass. Gates only the
+#                   supervisor step; the CLI always works.
+#   lock_file       flock shared with the pre-dispatch hook, relative to the
+#                   queue dir. Taken around the fetch and each removal so a
+#                   concurrent `git worktree add` waits instead of failing.
+#                   The nlmixr2lib hook uses ".run/setup_worktree.lock".
+# ---------------------------------------------------------------------------
+[worktree_reclaim]
+periodic              = false
+interval_s            = 3600
+max_per_pass          = 20
+remote                = "origin"
+parent_branch         = "main"
+branch_template       = "claude/{task_id}"
+discardable_untracked = ["tests/testthat/_problems/"]
+lock_file             = ""
+lock_timeout_s        = 60
+git_timeout_s         = 300
+
+# ---------------------------------------------------------------------------
 # Dispatch-time sandbox scope (`--add-dir` propagation)
 #
 # Claude Code sandboxes each session to its `cwd` by default. Reading or

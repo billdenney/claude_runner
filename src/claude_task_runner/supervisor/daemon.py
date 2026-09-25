@@ -39,6 +39,7 @@ from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
     Settings,
+    WorktreeReclaimSettings,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
@@ -65,6 +66,7 @@ from claude_task_runner.usage.drift import (
 )
 from claude_task_runner.usage.models import UsageReading
 from claude_task_runner.usage.source import UsageSource
+from claude_task_runner.worktree import reclaim as reclaim_mod
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,83 @@ class TickFailureCounters:
     dispatch_total: int = 0
     dispatch_consecutive: int = 0
     dispatch_outage: bool = False
+    worktree_reclaim_total: int = 0
+    """Periodic worktree-reclaim passes (ADR-0034) that raised."""
+
+
+def worktree_reclaim_due(
+    settings: WorktreeReclaimSettings,
+    *,
+    last_run_at: datetime | None,
+    now: datetime,
+    draining: bool,
+) -> bool:
+    """Whether the periodic worktree-reclaim pass (ADR-0034) should run now.
+
+    Never when ``[worktree_reclaim].periodic`` is off, and never in drain
+    mode (the operator's intent there is "finish what is running and exit").
+    Otherwise on the first tick, then once every ``interval_s``.
+    """
+    if not settings.periodic or draining:
+        return False
+    if last_run_at is None:
+        return True
+    return (now - last_run_at).total_seconds() >= settings.interval_s
+
+
+def run_worktree_reclaim(
+    *,
+    queue_dir: Path,
+    settings: WorktreeReclaimSettings,
+    in_flight_task_ids: set[str],
+    notify_callback: Callable[[str, str], None] | None = None,
+    event_callback: Callable[[str, dict[str, object]], None] | None = None,
+) -> reclaim_mod.ReclaimReport:
+    """Run one periodic reclaim pass, bounded by ``max_per_pass`` removals.
+
+    Each removal becomes a ``worktree_reclaimed`` event. A failed fetch is
+    one warning notification; a failed probe or removal is a warning plus a
+    ``worktree_reclaim_failed`` event. Worktrees that are merely kept (not
+    completed, not merged, dirty...) are logged at DEBUG only: on a live
+    queue most worktrees are kept on most passes.
+    """
+    report = reclaim_mod.reclaim_worktrees(
+        queue_dir,
+        settings,
+        apply=True,
+        in_flight_task_ids=in_flight_task_ids,
+        limit=settings.max_per_pass,
+    )
+    for error in report.errors:
+        logger.warning("worktree reclaim: %s", error)
+        if notify_callback is not None:
+            notify_callback("warning", f"worktree reclaim: {error}")
+    for result in report.results:
+        if result.outcome is reclaim_mod.Outcome.RECLAIMED:
+            if event_callback is not None:
+                event_callback("worktree_reclaimed", result.to_json())
+            if result.branch_deleted is False:
+                logger.warning("worktree reclaim, task %s: %s", result.task_id, result.detail)
+        elif (
+            result.outcome is reclaim_mod.Outcome.FAILED
+            or result.reason is reclaim_mod.KeepReason.GIT_ERROR
+        ):
+            logger.warning("worktree reclaim failed for task %s: %s", result.task_id, result.detail)
+            if notify_callback is not None:
+                notify_callback(
+                    "warning", f"worktree reclaim failed for task {result.task_id}: {result.detail}"
+                )
+            if event_callback is not None:
+                event_callback("worktree_reclaim_failed", result.to_json())
+        else:
+            logger.debug(
+                "worktree reclaim, task %s: %s (%s)",
+                result.task_id,
+                result.outcome.value,
+                result.detail,
+            )
+    logger.info("worktree reclaim: %s", report.summary())
+    return report
 
 
 # After this many *consecutive* ``tick_dispatch`` failures the daemon
@@ -690,6 +769,7 @@ def start_daemon(
                 )
 
             ticks = 0
+            last_worktree_reclaim_at: datetime | None = None
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -911,6 +991,39 @@ def start_daemon(
                         )
                     tick_failures.dispatch_consecutive = 0
                     tick_failures.dispatch_outage = False
+
+                # Periodic worktree reclaim (ADR-0034), opt-in through
+                # [worktree_reclaim].periodic. Runs AFTER tick_dispatch has
+                # reaped the slot map: the dispatcher writes `completed`
+                # before its post-dispatch hook runs inside the worktree, so
+                # a task whose thread is still alive stays in
+                # ``in_flight_slots`` and is kept. Synchronous, and bounded
+                # by ``max_per_pass`` removals so a backlog cannot stall the
+                # loop; the CLI is the tool for a bulk first reclaim.
+                reclaim_now = clk.now()
+                if worktree_reclaim_due(
+                    settings.worktree_reclaim,
+                    last_run_at=last_worktree_reclaim_at,
+                    now=reclaim_now,
+                    draining=drain_flag["draining"],
+                ):
+                    # Stamped first, so a pass that raises still waits a
+                    # full interval instead of retrying every tick.
+                    last_worktree_reclaim_at = reclaim_now
+                    try:
+                        run_worktree_reclaim(
+                            queue_dir=queue_dir,
+                            settings=settings.worktree_reclaim,
+                            in_flight_task_ids=set(in_flight_slots.keys()),
+                            notify_callback=notify_callback,
+                            event_callback=event_callback,
+                        )
+                    except Exception:
+                        tick_failures.worktree_reclaim_total += 1
+                        logger.exception(
+                            "worktree reclaim pass failed (total=%d)",
+                            tick_failures.worktree_reclaim_total,
+                        )
 
                 # Drain-complete check: once every dispatch thread has
                 # finished, exit cleanly. Done AFTER tick_dispatch so the

@@ -11,6 +11,24 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
+  (ADR-0034).** A queue whose pre-dispatch hook creates one git worktree per
+  task accumulated them forever. On 2026-09-25 the nlmixr2lib queue had 305
+  of them holding 36 GB, and 244 belonged to tasks that were long finished
+  and merged. A worktree is removed only when its task is `completed` and not
+  in flight, and its branch is checked out there and is an ancestor of
+  `<remote>/<parent_branch>` after a fetch. Its `git status` must also be
+  clean, except for untracked paths in `discardable_untracked` (default
+  `tests/testthat/_problems/`), which are discarded with `--force`. The local
+  branch goes with `git branch -d`, never `-D`. The command is a dry run
+  unless given `--apply`. It lists every kept worktree with the condition it
+  failed, and it takes the hook's `flock` around the fetch and each removal
+  when `lock_file` is set.
+- **Opt-in periodic reclaim from the supervisor.** With
+  `[worktree_reclaim].periodic = true`, the supervisor runs the same pass on
+  its first tick and every `interval_s` after that, at most `max_per_pass`
+  removals at a time and never during drain. Removals are emitted as
+  `worktree_reclaimed` events; failures raise a warning notification.
 - **`merge_branches.sh` aborts on same-path collisions.** Two branches that each add a
   file at the same path under `inst/modeldb/` or `vignettes/articles/` with
   different content cannot both survive `-X theirs`; the survey now lists them and
