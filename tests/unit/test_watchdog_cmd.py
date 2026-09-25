@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 
 from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.watchdog_cmd import _spawn_supervisor, app
+from claude_task_runner.cron.backoff import load_state, watchdog_state_path
 from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
@@ -164,6 +165,130 @@ class TestTickCommand:
         assert "spawned supervisor" in result.stdout
 
 
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Replace ``_spawn_supervisor`` with a recorder, so nothing real is spawned."""
+    spawned: list[Path] = []
+
+    def _record(queue_dir: Path, config: Path | None = None) -> int:
+        spawned.append(queue_dir)
+        return 4242
+
+    monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _record)
+    return spawned
+
+
+def _skipped_line(queue: Path) -> str:
+    """The ERROR line a tick writes to watchdog.log for a queue it skips, after the timestamp."""
+    return (
+        f" watchdog: ERROR queue={queue} is not an existing directory, so its "
+        "supervisor was not restarted and the directory was not created. If the "
+        "queue moved, register its new path. If it is gone for good, run: "
+        f"claude-task-runner watchdog unregister --queue {queue}\n"
+    )
+
+
+class TestTickSkipsMissingQueue:
+    """A registered queue whose directory was later deleted, moved or replaced.
+
+    ``register_queue`` checks the path only when it registers it. The tick
+    used to approve a restart anyway, and ``_spawn_supervisor`` recreated the
+    directory with ``parents=True``. The supervisor started on that empty
+    queue held the per-user global lock, so the real queue's supervisor
+    failed with "another supervisor is already running"."""
+
+    def test_deleted_queue_is_not_restarted_or_recreated(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert not queue.exists()
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+        assert "verdict=" not in result.stdout
+        # The skip takes no slot in the restart history that every queue shares.
+        assert load_state(watchdog_state_path()).recent_restarts == []
+        # The entry stays: a queue on an unmounted filesystem comes back by itself.
+        assert load_registered_queues() == [queue.resolve()]
+
+    def test_path_replaced_by_a_file_is_skipped(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        queue.write_text("not a queue\n", encoding="utf-8")
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert queue.read_text(encoding="utf-8") == "not a queue\n"
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+
+    def test_missing_queue_does_not_starve_a_live_one(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both supervisors are down, and the missing queue is listed first.
+
+        Every queue shares one restart cooldown. The missing queue used to take
+        the restart, which left the real queue in cooldown on every tick."""
+        gone = isolated_home / "gone"
+        real = isolated_home / "real"
+        gone.mkdir()
+        real.mkdir()
+        register_queue(gone)
+        register_queue(real)
+        gone.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == [real.resolve()]
+        assert result.stdout.count(_skipped_line(gone.resolve())) == 1
+        assert f"watchdog queue={real.resolve()} alive=False pid=None verdict=restart" in (
+            result.stdout
+        )
+        assert len(load_state(watchdog_state_path()).recent_restarts) == 1
+
+    def test_dry_run_reports_the_missing_queue(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+        assert "verdict=" not in result.stdout
+
+
 class TestSpawnSupervisor:
     """Direct tests of ``_spawn_supervisor`` argv construction."""
 
@@ -225,3 +350,33 @@ class TestSpawnSupervisor:
         assert pid == 7
         argv = mock_popen.call_args.args[0]
         assert "--config" not in argv
+
+    def test_spawn_does_not_recreate_a_missing_queue(self, tmp_path: Path) -> None:
+        """The last guard if the queue disappears after the tick checked it.
+
+        It used to make ``<queue>/.claude_task_runner`` with ``parents=True``,
+        which recreated the deleted queue before starting a supervisor on it."""
+        queue = tmp_path / "gone"
+
+        mock_popen = self._popen_capturing_argv(7)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+            pytest.raises(FileNotFoundError, match=str(queue / ".claude_task_runner")),
+        ):
+            _spawn_supervisor(queue, None)
+        assert not queue.exists()
+        mock_popen.assert_not_called()
+
+    def test_spawn_creates_the_log_dir_of_a_fresh_queue(self, tmp_path: Path) -> None:
+        """A queue that has never run has no ``.claude_task_runner/`` yet."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+
+        mock_popen = self._popen_capturing_argv(7)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+        ):
+            assert _spawn_supervisor(queue, None) == 7
+        assert (queue / ".claude_task_runner" / "supervisor.log").is_file()
