@@ -61,6 +61,53 @@ Breaking changes are called out in the version notes.
   say to run `supervisor start` after `install`. The runbook has a section
   for the empty-registry symptom. Docstrings that described a systemd timer
   running `watchdog tick` now say that nothing on the systemd path runs one.
+- **The docs no longer send operators to a `drift.log` that nothing
+  writes.** `docs/architecture.md`'s per-queue tree listed
+  `<queue>/.claude_task_runner/drift.log` ("parser drift + healthcheck
+  results"), `docs/cheatsheet.md` said to `tail -F` it for drift and
+  capture failures, and the runbook's drift symptom said it "has recent
+  entries". No commit has ever written it, and the periodic runtime
+  healthcheck whose results it was to hold was never built. The same
+  symptom line said a desktop notification fires. None does: the
+  `[notify]` backends were deleted as dead config on 2026-06-13, and
+  `supervisor start` wires no notifier, so a `Notify` action is only an
+  INFO log line. The docs now name the evidence that does exist.
+  `supervisor status` shows state `error_drift` and a `Last drift:` line,
+  from `last_drift_message` in `supervisor.json`. The supervisor log has
+  one `notify[error]: parser drift: ...` line. With the TTY usage source,
+  the capture that failed to parse is the newest `usage_captures/<ts>.cap`.
+  The architecture doc and cheat sheet also said the `EmitEvent` actions
+  (`drift_detected`, `state_transition`, `usage_capture_error`, ...)
+  reach the supervisor log. They are logged at DEBUG only, below the
+  default INFO, so a usage capture that times out leaves no trace at INFO.
+  A new "Supervisor log and drift evidence" section in the architecture
+  doc says so, and says where the log goes: journald under the systemd
+  unit, and `<queue>/.claude_task_runner/supervisor.log` only when the cron
+  watchdog started the supervisor.
+- **The rest of the on-disk layout matches the code.** `banner.txt` is
+  gone from the per-queue tree: nothing ever wrote it either, and its only
+  source was the deleted `[notify].file_path`. `watchdog.log` moves to the
+  global tree, because `cron/watchdog.sh` writes
+  `~/.claude_task_runner/watchdog.log`, and the runbook's crash-loop and
+  watchdog-install steps now give its full path, with the `journalctl`
+  equivalent under systemd. The global tree gains `queues.json`,
+  `watchdog_state.json` and the `usage_captures/` that the `usage` CLI
+  commands write. The per-queue tree gains `state/.corrupt/` (ADR-0028)
+  and `force_dispatch/`. The cheat sheet's supervisor-log row pointed only
+  at `supervisor.log`, which does not exist under the systemd unit.
+- **A docs-vs-code gate for the on-disk layout.**
+  `tests/unit/test_docs_disk_layout.py` parses both trees in
+  `docs/architecture.md` and fails on any entry whose name no code spells
+  out. A name counts when it appears in a string literal in a `.py` file
+  under `src/claude_task_runner/` (docstrings excluded), or in a value or
+  code line of a `.sh` or `.toml` file there (comments excluded).
+  `skills/` is not searched. Templated names are split at their
+  placeholders, so `request-NNN.json` needs both `request-` and `.json`.
+  Run against the old tree, it reports exactly `drift.log` and
+  `banner.txt`. Known-answer tests pin the parser, and a missing section,
+  an empty tree, or an entry that is not a single path fails the gate
+  instead of dropping out of it. It checks names, not placement, so it
+  would not have caught `watchdog.log` in the wrong tree.
 - **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
   (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
   `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,
