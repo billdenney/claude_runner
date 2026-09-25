@@ -7,6 +7,8 @@ PATH lookups are deterministic regardless of the developer's machine.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -14,17 +16,34 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.install_cmd import (
     _detect_init_system,
     _supervisor_command,
     _watchdog_script_path,
     app,
 )
+from claude_task_runner.cli.watchdog_cmd import load_registered_queues
 
 
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect ``Path.home()`` for every test in this file.
+
+    A cron ``install`` registers its queue in
+    ``~/.claude_task_runner/queues.json``, so without this the tests
+    would write into the developer's real watchdog registry. The home
+    is a subdirectory so it never coincides with a test's queue dir
+    (the tests below pass ``tmp_path`` itself as ``--queue``)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +322,70 @@ def test_install_cron_empty_diff_branch(runner: CliRunner, tmp_path: Path) -> No
         result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
     assert result.exit_code == 0
     assert "up to date" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `install` — cron branch registers the queue with the watchdog
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _cron_install_patched(backup_path: Path) -> Iterator[MagicMock]:
+    """Patch out the crontab I/O of the cron branch; yield the ``apply_plan`` mock."""
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_install_plan",
+            return_value=_cron_plan_mock(),
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.backup_crontab",
+            return_value=backup_path,
+        ),
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as mock_apply,
+    ):
+        yield mock_apply
+
+
+def test_install_cron_registers_queue_with_watchdog(runner: CliRunner, tmp_path: Path) -> None:
+    """Regression: a cron install must register its queue with the watchdog.
+
+    The crontab line runs ``watchdog.sh``, which runs ``watchdog tick``
+    with no ``--queue``; ``tick`` manages only the queues listed in
+    ``~/.claude_task_runner/queues.json``. ``install`` used to leave that
+    registry untouched, so until the operator also ran ``watchdog
+    register`` every tick logged "no queues registered; nothing to do"
+    and a dead supervisor was never restarted."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_cron_install_then_tick_manages_the_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """End to end: the tick the crontab line runs sees the installed queue.
+
+    Before the fix this tick printed "no queues registered; nothing to
+    do". With no supervisor running, it must now decide to restart one
+    for the queue ``install`` was given."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        installed = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert installed.exit_code == 0, installed.output
+
+    ticked = runner.invoke(watchdog_cmd.app, ["tick", "--dry-run"])
+    assert ticked.exit_code == 0, ticked.output
+    assert "no queues registered" not in ticked.stdout
+    assert f"watchdog queue={queue.resolve()} alive=False pid=None verdict=restart" in (
+        ticked.stdout
+    )
 
 
 # ---------------------------------------------------------------------------
