@@ -666,3 +666,12 @@ Breaking changes are called out in the version notes.
   describing the `_compute_effective_bands` pipeline and the points
   where `time_of_day` and `pacing` plug in.
 - `docs/decisions/README.md` indexes ADRs 0015 and 0016.
+### Changed
+
+- **The default worker model is `claude-opus-5-5`.** `Task.model`,
+  `queue add --model` and the packaged `[effort_levels]` / `[ema.priors]`
+  defaults now name Opus 5.5 (operator directive 2026-09-24). The
+  `claude-opus-5` entries stay so queues with in-flight task YAMLs keep
+  dispatching. Opus 5.5 needs Claude Code 2.1.280 or newer on the dispatch
+  host; an older CLI fails every dispatch with
+  `400 ... does not support this model`.
