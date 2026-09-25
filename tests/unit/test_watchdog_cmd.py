@@ -63,6 +63,29 @@ class TestRegistry:
         path.write_text("{not json")
         assert load_registered_queues() == []
 
+    def test_register_rejects_missing_directory(self, isolated_home: Path) -> None:
+        """A tick would create a registered-but-missing queue dir on restart."""
+        missing = isolated_home / "no-such-queue"
+        with pytest.raises(NotADirectoryError, match="not an existing directory"):
+            register_queue(missing)
+        assert not queues_registry_path().exists()
+        assert not missing.exists()
+
+    def test_register_rejects_a_file(self, isolated_home: Path) -> None:
+        not_a_dir = isolated_home / "queue.txt"
+        not_a_dir.write_text("", encoding="utf-8")
+        with pytest.raises(NotADirectoryError, match="not an existing directory"):
+            register_queue(not_a_dir)
+        assert not queues_registry_path().exists()
+
+    def test_rejected_register_keeps_existing_entries(self, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        with pytest.raises(NotADirectoryError):
+            register_queue(isolated_home / "typo")
+        assert load_registered_queues() == [queue.resolve()]
+
 
 class TestRegisterCommand:
     def test_register_via_cli(self, runner: CliRunner, isolated_home: Path) -> None:
@@ -72,6 +95,17 @@ class TestRegisterCommand:
         assert result.exit_code == 0
         assert str(queue) in result.stdout
         assert load_registered_queues() == [queue.resolve()]
+
+    def test_register_missing_directory_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        missing = isolated_home / "no-such-queue"
+        result = runner.invoke(app, ["register", "--queue", str(missing)])
+        assert result.exit_code == 2
+        expected = f"register failed: not an existing directory: {missing.resolve()}"
+        assert expected in result.stderr
+        assert "registered:" not in result.stdout
+        assert not queues_registry_path().exists()
 
 
 class TestQueuesCommand:

@@ -388,6 +388,111 @@ def test_cron_install_then_tick_manages_the_queue(runner: CliRunner, tmp_path: P
     )
 
 
+def test_install_cron_shows_registration_before_confirming(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The y/N prompt covers the registry write as well as the crontab diff."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(queue)], input="y\n")
+    assert result.exit_code == 0, result.output
+    shown = result.stdout.index("Will register this queue with the watchdog")
+    assert shown < result.stdout.index("Apply this change?")
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_install_cron_abort_does_not_register(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["--queue", str(queue)], input="n\n")
+    assert result.exit_code == 1
+    mock_apply.assert_not_called()
+    assert not watchdog_cmd.queues_registry_path().exists()
+
+
+def test_install_cron_rerun_registers_queue_once(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    for _ in range(2):
+        with _cron_install_patched(tmp_path / "bk.txt"):
+            result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+        assert result.exit_code == 0, result.output
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_install_cron_registry_write_failure_leaves_crontab_untouched(
+    runner: CliRunner, tmp_path: Path, isolated_home: Path
+) -> None:
+    """A registry that cannot be written aborts before the crontab changes.
+
+    Here ``~/.claude_task_runner`` is a file, so creating the registry
+    fails with a real ``FileExistsError``. Installing the cron line
+    anyway would recreate the bug: a watchdog with no queue to manage."""
+    (isolated_home / ".claude_task_runner").write_text("", encoding="utf-8")
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_install_plan",
+            return_value=_cron_plan_mock(),
+        ),
+        patch("claude_task_runner.cli.install_cmd.cron_install.backup_crontab") as mock_backup,
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as mock_apply,
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 2
+    assert "watchdog registration failed" in result.stdout
+    mock_backup.assert_not_called()
+    mock_apply.assert_not_called()
+
+
+def test_install_cron_missing_queue_dir_is_not_registered(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """A typo'd ``--queue`` must fail, not become a registry entry.
+
+    The next tick's restart would create the directory and start a
+    supervisor on an empty queue."""
+    missing = tmp_path / "no-such-queue"
+    with _cron_install_patched(tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(missing)])
+    assert result.exit_code == 2
+    assert "watchdog registration failed" in result.stdout
+    assert "not an existing directory" in result.stdout
+    mock_apply.assert_not_called()
+    assert not missing.exists()
+    assert not watchdog_cmd.queues_registry_path().exists()
+
+
+def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """systemd restarts its own unit; the cron watchdog's registry stays empty."""
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="systemd",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.systemd_mod.build_install_plan",
+            return_value=_systemd_plan_mock(unit_path=tmp_path / "ctr.service"),
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
+        patch(
+            "claude_task_runner.cli.install_cmd.shutil.which",
+            return_value="/usr/local/bin/claude-task-runner",
+        ),
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    assert not watchdog_cmd.queues_registry_path().exists()
+
+
 # ---------------------------------------------------------------------------
 # `uninstall`
 # ---------------------------------------------------------------------------

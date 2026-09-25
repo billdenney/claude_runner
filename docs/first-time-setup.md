@@ -162,19 +162,42 @@ the CLI and adds the explicit per-task knob.
 claude-task-runner install
 ```
 
-Auto-detects systemd-user vs cron; prompts for confirmation. After
-install, the watchdog kicks the supervisor on boot and restarts it after
-a crash (exponential backoff per ADR-0002).
+Run it from the queue directory, or pass `--queue <path>`. It auto-detects
+systemd-user vs cron and asks for confirmation before writing anything.
+
+- **systemd:** writes a `--user` unit that runs `supervisor start` for this
+  queue, starts it now, and restarts it after a crash. A clean exit
+  (`supervisor stop`, or a `drain` once in-flight tasks finish) leaves it
+  stopped.
+- **cron:** adds a crontab line that runs `claude-task-runner watchdog tick`
+  every minute, and registers this queue in
+  `~/.claude_task_runner/queues.json`. A tick restarts the supervisor of each
+  registered queue that is not running, however it stopped, and backs off
+  exponentially after repeated crashes (ADR-0002). A tick manages only the
+  registered queues, which `claude-task-runner watchdog queues` lists.
 
 ## 6. Start the supervisor
+
+With a watchdog installed there is nothing to run. systemd started the
+supervisor in step 5, and cron's next tick starts it within a minute.
+Check it with:
+
+```sh
+claude-task-runner supervisor status
+```
+
+If a cron watchdog has not started it after a minute,
+`~/.claude_task_runner/watchdog.log` says why.
+
+Without a watchdog, start the supervisor yourself:
 
 ```sh
 claude-task-runner supervisor start
 ```
 
-This is foreground by default — the supervisor logs to stderr. To run
-detached, use the watchdog (already installed in step 5) and check
-liveness with `claude-task-runner supervisor status`.
+This runs in the foreground and logs to stderr. Only one supervisor runs
+per user, so once a watchdog has started one, this command fails with
+`another supervisor is already running`.
 
 ## 7. Watch the queue drain
 

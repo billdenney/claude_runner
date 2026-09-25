@@ -242,6 +242,11 @@ polls. When the new tier is a different login:
    claude-task-runner supervisor start   # or let the cron watchdog restart it on its next tick
    ```
 
+   The cron watchdog restarts only the queues that
+   `claude-task-runner watchdog queues` lists. A cron `install` registers
+   its queue. If yours is missing, add it with
+   `claude-task-runner watchdog register --queue <queue>`.
+
    Under the systemd unit, use `systemctl --user restart claude-task-runner`
    instead. Its `ExecStop` keeps in-flight tasks: the new supervisor
    adopts them, or they drain first when `[supervisor].adopt_workers` is

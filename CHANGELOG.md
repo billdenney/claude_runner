@@ -35,6 +35,32 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **A cron `install` now registers its queue, so the cron watchdog restarts
+  the supervisor.** The crontab line runs `watchdog.sh`, which runs
+  `claude-task-runner watchdog tick` with no `--queue`, and a tick manages
+  only the queues listed in `~/.claude_task_runner/queues.json`. Nothing but
+  `watchdog register` wrote that file, and no doc mentioned that command.
+  Its `--help` even said `install` called it. So after a cron install every
+  tick logged `watchdog: no queues registered; nothing to do`, and a dead
+  supervisor stayed dead. `install` now registers `--queue` once you confirm,
+  and before it touches the crontab, so a failed registry write leaves
+  nothing changed. The confirmation lists the registry change under the
+  crontab diff. The systemd path registers nothing: systemd restarts its own
+  unit, and a registered queue would let a cron tick restart a supervisor
+  that the unit left stopped on purpose. Registering a path that is not an
+  existing directory is now an error. Without that check, the next tick's
+  restart would create a mistyped queue directory and start a supervisor on
+  it, which would hold the per-user global lock. Tests pin the path from
+  `install` to the tick's `verdict=restart`.
+
+  **Existing cron installs still have an empty registry.** Run
+  `claude-task-runner watchdog register --queue <queue>`, or re-run
+  `install`. `claude-task-runner watchdog queues` lists what is registered.
+  Because the next tick now starts the supervisor within a minute of a cron
+  install, `docs/first-time-setup.md` and the README quick start no longer
+  say to run `supervisor start` after `install`. The runbook has a section
+  for the empty-registry symptom. Docstrings that described a systemd timer
+  running `watchdog tick` now say that nothing on the systemd path runs one.
 - **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
   (`MAX_YAML_DEPTH = 64`).** Both loaders recurse once per nesting level.
   `CSafeLoader` overflows the C stack and segfaults at about 26,000 levels,

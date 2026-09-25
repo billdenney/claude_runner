@@ -1,11 +1,13 @@
 """``claude-task-runner watchdog tick`` — internal entry-point for the
-cron line / systemd timer.
+crontab line that a cron ``install`` adds. The systemd install runs no
+tick: systemd restarts its unit itself.
 
 One tick:
 
 1. Load watchdog settings.
 2. Load watchdog state (recent restarts, backoff alerts).
-3. For each registered queue (``~/.claude_task_runner/queues.json``):
+3. For each registered queue (``~/.claude_task_runner/queues.json``,
+   written by a cron ``install`` and by ``watchdog register``):
    read the PID file; ask :func:`cron.backoff.decide` whether to act.
 4. On RESTART verdict: spawn ``claude-task-runner supervisor start``
    detached.
@@ -33,11 +35,13 @@ from claude_task_runner.supervisor import pidfile as pidfile_mod
 logger = logging.getLogger(__name__)
 
 QUEUES_REGISTRY_FILENAME = "queues.json"
-"""Per-host registry of queue directories the watchdog should manage.
+"""Per-user registry of the queue directories that watchdog ticks manage.
 
-Format: ``{"queues": ["/path/to/queue1", "/path/to/queue2"]}``. The
-``install`` subcommand auto-adds the queue directory it was invoked
-with."""
+Format: ``{"queues": ["/path/to/queue1", "/path/to/queue2"]}``. A cron
+``install`` adds the queue directory it was invoked with, and
+``watchdog register`` adds one without re-running ``install``. A
+systemd ``install`` leaves the registry alone, because systemd restarts
+the unit's supervisor itself."""
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -86,11 +90,19 @@ def load_registered_queues() -> list[Path]:
 
 
 def register_queue(queue_dir: Path) -> None:
-    """Add ``queue_dir`` to the registry. Idempotent."""
+    """Add ``queue_dir`` to the registry. Idempotent.
+
+    Raises :class:`NotADirectoryError` unless ``queue_dir`` is an
+    existing directory. A registered typo would otherwise be created by
+    the next tick's restart (:func:`_spawn_supervisor` makes the log
+    directory with ``parents=True``), and the supervisor started on that
+    empty queue would hold the per-user global lock."""
+    resolved = queue_dir.resolve()
+    if not resolved.is_dir():
+        raise NotADirectoryError(f"not an existing directory: {resolved}")
     path = queues_registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_registered_queues()
-    resolved = queue_dir.resolve()
     if resolved in existing:
         return
     existing.append(resolved)
@@ -194,12 +206,17 @@ def register(
     *,
     queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory to register."),
 ) -> None:
-    """Register a queue with the watchdog so future ticks manage it.
+    """Register a queue with the cron watchdog so its ticks manage it.
 
-    Called automatically by ``install``; expose explicitly so operators
-    can add queues without re-running install.
+    A cron ``install`` registers its ``--queue`` itself; this registers
+    one without re-running ``install``. The systemd unit does not read
+    this registry. ``watchdog queues`` lists what is registered.
     """
-    register_queue(queue_dir)
+    try:
+        register_queue(queue_dir)
+    except OSError as exc:
+        print(f"register failed: {exc}", file=sys.stderr)
+        raise typer.Exit(code=2) from exc
     print(f"registered: {queue_dir.resolve()}")
 
 

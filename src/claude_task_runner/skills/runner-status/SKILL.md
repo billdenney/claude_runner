@@ -122,6 +122,9 @@ file exists (stale vs missing), then suggest:
 
 - `claude-task-runner watchdog tick` to trigger an immediate watchdog
   evaluation.
+- `claude-task-runner watchdog queues` to check that a cron watchdog
+  manages this queue. A tick restarts only the queues it lists; if this
+  one is missing, `claude-task-runner watchdog register --queue <queue>`.
 - `claude-task-runner install` if no watchdog is configured.
 - `claude-task-runner supervisor start` to manually start in
   foreground.

@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli.watchdog_cmd import queues_registry_path, register_queue
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import install as cron_install
@@ -89,6 +90,15 @@ def install(
     Auto-detects which init system to use based on
     ``[supervisor].preferred_init_system`` (default ``auto``). Shows
     the proposed change and asks for confirmation before writing.
+
+    systemd: writes a ``--user`` unit that runs the supervisor for
+    ``--queue`` and restarts it when it fails.
+
+    cron: adds a crontab line that runs ``watchdog tick`` every minute
+    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``.
+    A tick restarts the supervisor of each registered queue that is not
+    running, even one stopped with ``supervisor stop`` or ``drain``,
+    and backs off after repeated crashes.
     """
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
@@ -105,6 +115,12 @@ def install(
     )
 
     if init_system == "systemd":
+        # No watchdog registration here: systemd restarts the unit
+        # itself, and nothing on this path runs `watchdog tick`.
+        # Registering would only matter if a cron block were also
+        # installed, and then the tick would restart a supervisor that
+        # `Restart=on-failure` deliberately left stopped, outside the
+        # unit's control.
         sd_plan = systemd_mod.build_install_plan(
             supervisor_command=_supervisor_command(queue_path, resolved_config),
             queue_dir=queue_path,
@@ -139,9 +155,24 @@ def install(
             console.print(f"  [{color}]{line}[/]")
     else:
         console.print("  [dim](no visible diff — block already up to date)[/]")
+    # The crontab line runs `watchdog tick` with no --queue, and a tick
+    # manages only the queues in this registry.
+    registry = queues_registry_path()
+    console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
+    console.print(f"  {queue_path}")
     if not yes and not Confirm.ask("\nApply this change?", default=False):
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
+
+    # Register before touching the crontab, so a failed registry write
+    # leaves nothing changed. The other order could leave a cron line
+    # whose ticks have no queue to manage.
+    try:
+        register_queue(queue_path)
+    except OSError as exc:
+        console.print(f"[bold red]watchdog registration failed:[/] {exc}")
+        raise typer.Exit(code=2) from exc
+    console.print(f"[green]Registered {queue_path} with the watchdog.[/]")
 
     backup = cron_install.backup_crontab(cron_plan.existing_text, clock=RealClock())
     console.print(f"[dim]Backed up existing crontab to {backup}[/]")
