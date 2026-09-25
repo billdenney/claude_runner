@@ -102,7 +102,8 @@ Breaking changes are called out in the version notes.
   schedules the wakeup after a 5-hour reset; that path is unchanged.
   `in_eow_push_window` served the end-of-week push that ADR-0022 removed.
   `crossed_reset`, `crossed_reset_5h` and `crossed_reset_weekly` were the reset
-  detection for `usage.drift.validate_monotonicity`, which nothing calls.
+  detection for `usage.drift.validate_monotonicity`, which nothing called and
+  which is now removed along with `[usage].suspicious_delta_pct`.
   `time_until_reset_s` had no caller, and the module's `FIVE_HOUR_LENGTH_S` and
   `SEVEN_DAY_LENGTH_S` duplicated `throttle.decision.FIVE_HOUR_LENGTH_S` and
   `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
