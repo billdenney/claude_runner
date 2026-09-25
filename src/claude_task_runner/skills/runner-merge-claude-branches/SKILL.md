@@ -47,7 +47,10 @@ bash /home/bill/.claude/skills/runner-merge-claude-branches/merge_branches.sh \
     --branch-name "merge-all-claude-branches-$(date +%F)"
 ```
 
-That single command runs the entire end-to-end pipeline. `--exclude-ref`
+That single command runs the entire end-to-end pipeline. The survey aborts
+(exit 4) when two branches add a file at the same path with different content,
+because `-X theirs` would silently keep only the last one; reletter one branch's
+files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
 (repeatable) leaves out a branch the pattern matches -- a WIP checkpoint, or a
 branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;

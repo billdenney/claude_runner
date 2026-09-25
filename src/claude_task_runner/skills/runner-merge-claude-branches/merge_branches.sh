@@ -232,6 +232,36 @@ for br in "${UNMERGED[@]}"; do
   printf "      %-65s  ahead=%s  files=%s  %s\n" "${br#origin/}" "$ahead" "$files" "${subj:0:60}"
 done
 
+# Same-path collision check. Two branches that each ADD a file at the same
+# path with different content cannot both survive `-X theirs`: the later merge
+# silently replaces the earlier one and a whole model disappears (2026-09-24:
+# Wang_2019_tacrolimus.R was added for two different papers). Abort so the
+# operator can reletter one branch's files (<Author>_<Year>a_ / <Year>b_, the
+# Hansson 2013a/b precedent) or pass --exclude-ref for one of them. Runs before
+# the dry-run exit so a dry run reports collisions too.
+declare -A ADDED_BY
+for br in "${UNMERGED[@]}"; do
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    ADDED_BY["$p"]+="$br "
+  done < <(git diff --name-only --diff-filter=A "$BASE...$br" -- inst/modeldb vignettes/articles 2>/dev/null)
+done
+collisions=0
+for p in "${!ADDED_BY[@]}"; do
+  read -r -a brs <<< "${ADDED_BY[$p]}"
+  (( ${#brs[@]} < 2 )) && continue
+  nblobs=$(for b in "${brs[@]}"; do git rev-parse "$b:$p"; done | sort -u | wc -l)
+  if (( nblobs > 1 )); then
+    (( collisions == 0 )) && echo "ERROR: the same new path is added with different content by more than one branch:" >&2
+    echo "    $p  <-  ${brs[*]}" >&2
+    collisions=$((collisions + 1))
+  fi
+done
+if (( collisions > 0 )); then
+  echo "    -X theirs would keep only the last one merged. Reletter one branch's files or --exclude-ref one of them, then re-run." >&2
+  exit 4
+fi
+
 if (( DRY_RUN )); then
   echo
   echo "==> Dry-run; stopping before worktree creation."

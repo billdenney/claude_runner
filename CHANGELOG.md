@@ -11,6 +11,12 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`merge_branches.sh` aborts on same-path collisions.** Two branches that each add a
+  file at the same path under `inst/modeldb/` or `vignettes/articles/` with
+  different content cannot both survive `-X theirs`; the survey now lists them and
+  exits 4 (dry runs included) so one branch can be relettered or excluded. On
+  2026-09-24 two different papers had both been added as `Wang_2019_tacrolimus`
+  and one model silently vanished.
 - **`merge_branches.sh --exclude-ref <ref>`** (repeatable) leaves a branch out of a
   consolidation even though `--pattern` matches it, printing each exclusion in
   the survey; a WIP task checkpoint or a branch with its own PR no longer forces
