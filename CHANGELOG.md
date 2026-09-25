@@ -38,10 +38,13 @@ Breaking changes are called out in the version notes.
 - **Six empty packages, the `ui` extra and the Jinja2 task-templates
   promise.** `events/`, `logs/`, `metrics/`, `notify/`, `templates/` and `ui/`
   each held only an empty `__init__.py` from the initial commit, and nothing
-  imported them. The `ui` extra installed `textual`, which nothing imports.
-  The install line in the README and CI is now `pip install -e '.[dev]'`;
-  an old `.[dev,ui]` still installs, and pip and uv only warn that the extra
-  is gone. `docs/architecture.md` no longer tells operators to drop Jinja2
+  imported them. The `ui` extra installed `textual` for a terminal UI that was
+  never built, and nothing imports `textual`. The install lines in the README,
+  `docs/first-time-setup.md` and CI now use `.[dev]`. An old `.[dev,ui]`
+  still installs, and pip and uv only warn that the extra is gone.
+  `docs/first-time-setup.md` also no longer says the `dev` extras carry the
+  doctor's dependencies; the doctor needs none of them.
+  `docs/architecture.md` no longer tells operators to drop Jinja2
   task templates into a `templates/` directory. Nothing reads one, Jinja2 is
   not a dependency, and ADR-0023 rejected a template engine. The wheel's
   `force-include` entry for `templates/` goes with the package.
