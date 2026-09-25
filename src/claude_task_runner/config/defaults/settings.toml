@@ -106,8 +106,6 @@ capture_post_ready_pad_ms   = 1500      # delay after "shortcuts" before /usage
 capture_post_data_pad_ms    = 4000      # delay after 2nd Resets so OAuth response lands
 capture_rotation_count      = 200       # raw .cap files retained
 poll_interval_s             = 60        # supervisor ticks
-healthcheck_interval_s      = 3600      # standalone drift canary
-suspicious_delta_pct        = 50        # flag if util jumps > N points between polls
 drift_recovery_clean_polls  = 3         # consecutive clean polls to leave ErrorDrift
 
 # ---------------------------------------------------------------------------

@@ -12,9 +12,8 @@ Two flavors of "time until reset":
   available; falls back to ``last_known_reset + window_length`` when the
   reset string couldn't be parsed (graceful degrade per ADR-0008).
 * :func:`crossed_reset` — detects whether a reset boundary was crossed
-  between two consecutive readings. Distinguishes the legitimate
-  "utilization went down because the window reset" case from the
-  monotonicity drift in :mod:`usage.drift`.
+  between two consecutive readings, i.e. whether utilization may
+  legitimately have gone down.
 
 Pure module. All datetime work goes through the injected :class:`Clock`.
 """

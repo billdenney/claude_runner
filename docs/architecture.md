@@ -155,8 +155,11 @@ These properties are never violated; tests and assertions enforce them.
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs.
-3. **Usage utilization is monotonically non-decreasing within a window** —
-   any decrease without a detected reset is `UsageFormatDrift`.
+3. *(Retired 2026-09-25.)* This slot said a utilization decrease without a
+   detected reset is `UsageFormatDrift`. Nothing ever enforced that: the check
+   was written but never called, and it has been removed. Each reading is used
+   as reported. The slot keeps its number because code comments cite these
+   invariants by number.
 4. **No new dispatch when 5h utilization ≥ no-dispatch threshold** —
    regardless of EMA prediction; this is the safety net.
 5. **Every behavior-affecting cutoff is a setting** — no magic numbers for

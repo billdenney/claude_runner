@@ -60,8 +60,6 @@ class UsageSettings(_StrictModel):
     capture_post_data_pad_ms: int = Field(ge=0)
     capture_rotation_count: int = Field(ge=0)
     poll_interval_s: float = Field(gt=0)
-    healthcheck_interval_s: float = Field(gt=0)
-    suspicious_delta_pct: int = Field(ge=0, le=100)
     drift_recovery_clean_polls: int = Field(ge=1)
     api_timeout_s: float = Field(default=10.0, gt=0)
     """Per-request timeout for the API usage source (seconds).

@@ -69,6 +69,10 @@ _RETIRED_KEYS: dict[tuple[str, ...], str] = {
         "[dispatch_pct.*] (ADR-0022)"
     ),
     ("plans",): "token budgets nothing read; see [claude].plan",
+    ("usage", "healthcheck_interval_s"): "scheduled a drift canary that was never built",
+    ("usage", "suspicious_delta_pct"): (
+        "tuned a utilization monotonicity check that nothing ever called"
+    ),
 }
 """Queue-TOML keys removed from the schema because no code ever read them.
 
