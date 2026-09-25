@@ -41,10 +41,6 @@ ROOTS: dict[str, type[BaseModel]] = {
 """The two files an operator writes, and the model each one loads into."""
 
 KNOWN_UNREAD: dict[str, str] = {
-    "SessionSettings.resume_fail_fast_s": (
-        "ADR-0005's fast resume fall-through was never built; runner.dispatcher "
-        "only names runner.session.fall_through_to_fresh 'for static analysis'"
-    ),
     "Settings.ema": "no runtime code reads settings.ema; runner/ema.py is reached only from tests",
     "EMASettings.alpha": "a parameter of runner.ema.update_bucket, which nothing calls",
     "EMAPrior.tokens": "read by a computed getattr in runner.ema, reached only from tests",

@@ -42,6 +42,10 @@ RETIRED_KEYS = {
         "says it is gone."
     ),
     "plans": "Never read; removed with claude.plan, and documented alongside it.",
+    "session.resume_fail_fast_s": (
+        "Never read; removed 2026-09-25. ADR-0005 records the fall-through it "
+        "was meant to time, and its dated update says that was never built."
+    ),
 }
 """Tables and fields that no longer exist but which docs may still name.
 

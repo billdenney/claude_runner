@@ -248,8 +248,7 @@ duration_s                  = 300
 # Session resume
 # ---------------------------------------------------------------------------
 [session]
-max_resume_attempts         = 3
-resume_fail_fast_s          = 5
+max_resume_attempts         = 3         # every --resume counts; at the cap, dispatch fresh
 
 # ---------------------------------------------------------------------------
 # Failure classifier (extensible via TOML)

@@ -92,7 +92,6 @@ class EMASettings(_StrictModel):
 
 class SessionSettings(_StrictModel):
     max_resume_attempts: int = Field(ge=0)
-    resume_fail_fast_s: float = Field(gt=0)
 
 
 class FailureClassifierSettings(_StrictModel):

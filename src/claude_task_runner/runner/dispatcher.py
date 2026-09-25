@@ -59,7 +59,6 @@ from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
     HookSettings,
-    SessionSettings,
     TaskCapsSettings,
 )
 from claude_task_runner.queue.schema import (
@@ -83,7 +82,6 @@ from claude_task_runner.runner import terminal_gate as terminal_gate_mod
 from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
-    fall_through_to_fresh,
 )
 from claude_task_runner.runner.stream import (
     StreamSummary,
@@ -1204,7 +1202,6 @@ def dispatch(
     queue_dir: Path,
     clock: Clock,
     settings_caps: TaskCapsSettings,
-    settings_session: SessionSettings,
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     settings_dispatch: DispatchSettings | None = None,
@@ -1758,11 +1755,6 @@ def dispatch(
             post.timed_out,
             post.stderr.strip(),
         )
-
-    # If we just attempted a RESUME and it errored quickly, the
-    # supervisor's next tick will see resume_attempts incremented and
-    # plan FRESH next time. Captured here for telemetry.
-    _ = (settings_session, fall_through_to_fresh)  # referenced for static analysis
 
     return DispatchOutcome(
         run_record=run_record,

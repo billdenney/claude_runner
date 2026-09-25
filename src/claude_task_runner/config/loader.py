@@ -73,6 +73,11 @@ _RETIRED_KEYS: dict[tuple[str, ...], str] = {
     ("usage", "suspicious_delta_pct"): (
         "tuned a utilization monotonicity check that nothing ever called"
     ),
+    ("session", "resume_fail_fast_s"): (
+        "timed a fast fall-through from a failed --resume that was never built; "
+        "a resume is retried until [session].max_resume_attempts, then goes fresh "
+        "(ADR-0005)"
+    ),
 }
 """Queue-TOML keys removed from the schema because no code ever read them.
 
