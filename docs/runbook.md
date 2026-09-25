@@ -155,7 +155,9 @@ its queue there, so the cron watchdog it installed has nothing to manage.
 `watchdog: ERROR queue=<path> is not an existing directory, so its supervisor
 was not restarted and the directory was not created`.
 `claude-task-runner watchdog queues` prints a warning about the same path on
-stderr.
+stderr. With the cron watchdog installed, `claude-task-runner doctor` warns
+under `watchdog_installed` and prints the `unregister` command for each such
+path.
 
 **Cause:** the queue is registered with the cron watchdog (by `install` or
 `watchdog register`), and its directory was later deleted, moved or replaced

@@ -4,6 +4,7 @@ The registry the tick walks is tested in ``test_cron_registry.py``."""
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -380,6 +381,34 @@ class TestTickSkipsMissingQueue:
             result.stdout
         )
         assert len(load_state(watchdog_state_path()).recent_restarts) == 1
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
+    def test_queue_behind_an_unsearchable_directory_does_not_end_the_tick(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Path.is_dir raises PermissionError here on Python 3.12 and 3.13.
+
+        Raised in the loop, it would end the tick before the queues after it."""
+        locked = isolated_home / "locked"
+        hidden = locked / "q"
+        real = isolated_home / "real"
+        hidden.mkdir(parents=True)
+        real.mkdir()
+        register_queue(hidden)
+        register_queue(real)
+        spawned = _record_spawns(monkeypatch)
+        locked.chmod(0o000)
+        try:
+            result = runner.invoke(app, ["tick"])
+        finally:
+            locked.chmod(0o700)
+
+        assert result.exit_code == 0, result.output
+        assert spawned == [real.resolve()]
+        assert result.stdout.count(_skipped_line(hidden.resolve())) == 1
 
     def test_dry_run_reports_the_missing_queue(
         self,

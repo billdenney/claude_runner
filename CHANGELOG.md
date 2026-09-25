@@ -56,9 +56,12 @@ Breaking changes are called out in the version notes.
   still one path per line. `_spawn_supervisor` no longer passes
   `parents=True`, so a queue deleted between the check and the spawn is not
   recreated either. `queues.json` is now written to a temporary file and
-  renamed into place, so a tick never reads half a registry. The runbook has
-  a section for the symptom, including how to stop a supervisor that an
-  older version already started on a recreated queue.
+  renamed into place, so a tick never reads half a registry. With only the
+  cron block installed, `doctor`'s `watchdog_installed` check now WARNs about
+  every registered path that is not an existing directory and prints the
+  `claude-task-runner watchdog unregister --queue <path>` for each. The
+  runbook has a section for the symptom, including how to stop a supervisor
+  that an older version already started on a recreated queue.
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
   `claude-task-runner watchdog tick` with no `--queue`, and a tick manages
