@@ -43,10 +43,16 @@ bash /home/bill/.claude/skills/runner-merge-claude-branches/merge_branches.sh \
     --repo /home/bill/github/nlmixr2/nlmixr2lib \
     --base origin/main \
     --pattern 'origin/claude/*' \
+    --exclude-ref origin/claude/<wip-task-branch> \
     --branch-name "merge-all-claude-branches-$(date +%F)"
 ```
 
-That single command runs the entire end-to-end pipeline. The flags
+That single command runs the entire end-to-end pipeline. The survey aborts
+(exit 4) when two branches add a file at the same path with different content,
+because `-X theirs` would silently keep only the last one; reletter one branch's
+files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
+(repeatable) leaves out a branch the pattern matches -- a WIP checkpoint, or a
+branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;
 override per repo.
 
