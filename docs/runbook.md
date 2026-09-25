@@ -115,11 +115,35 @@ come back.
    queue (see the next section if it does not). Stop the supervisor with
    `claude-task-runner supervisor stop`. The first tick after it exits
    restarts it, and `~/.claude_task_runner/watchdog.log` shows
-   `verdict=restart`. Under systemd,
-   `systemctl --user status claude-task-runner` shows the unit active,
-   and `journalctl --user -u claude-task-runner` has its log. systemd
-   restarts the supervisor 30s after a crash, but not after a clean exit
-   such as `supervisor stop`.
+   `verdict=restart`.
+
+   Under systemd, `systemctl --user status claude-task-runner` shows the
+   unit active. To test the restart, crash only the supervisor:
+
+   ```sh
+   systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner
+   ```
+
+   On systemd older than 252, spell the option `--kill-who=main`, or run
+   `kill -KILL <pid>` with the PID that
+   `claude-task-runner supervisor status --queue <queue>` prints. About
+   30s later (`RestartSec=30`) the unit is active again with a new main
+   PID, and `journalctl --user -u claude-task-runner` shows
+   `Main process exited, code=killed, status=9/KILL`, then
+   `Scheduled restart job`. In-flight `claude` workers keep running
+   (`KillMode=process`). With `[supervisor].adopt_workers` on, the
+   default, the new supervisor adopts them. systemd also logs
+   `Found left-over process` for each one, which is expected.
+
+   Do not test with `kill <pid>` or `supervisor stop`. Both send SIGTERM,
+   the supervisor exits 0, and `RestartPreventExitStatus=0` leaves it
+   down. `systemctl --user status` then shows the unit
+   `failed (Result: exit-code)`: its ExecStop (`supervisor stop`, or
+   `supervisor drain --no-wait` with adoption off) runs after the
+   supervisor has gone and exits 1. Nothing crashed. Start it again with
+   `systemctl --user start claude-task-runner`. Do not drop
+   `--kill-whom=main` either: the default, `all`, also SIGKILLs every
+   in-flight `claude` worker in the unit's cgroup.
 
 ## Cron watchdog installed, but the supervisor stays down
 
