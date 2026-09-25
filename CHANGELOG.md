@@ -110,6 +110,31 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Under systemd, a supervisor that exits cleanly now leaves the unit
+  `inactive (dead)` instead of `failed`.** systemd runs the unit's
+  `ExecStop` even when the supervisor has already exited on its own: after
+  `kill <pid>`, `claude-task-runner supervisor stop`, a drain, or on
+  reaching the STOPPED state. By then the supervisor has removed its PID
+  file, so the `ExecStop` command (`supervisor stop`, or
+  `supervisor drain --no-wait` when `[supervisor].adopt_workers` is off)
+  printed `No PID file` and exited 1. systemd logged
+  `Failed with result 'exit-code'` and left the unit
+  `failed (Result: exit-code)`, so
+  `systemctl --user is-failed claude-task-runner` reported true after every
+  clean stop. The supervisor was not restarted, because
+  `RestartPreventExitStatus=0` matched its exit 0. The same exit 1 also
+  made `Restart=on-failure` restart a supervisor killed by a signal that
+  systemd counts as clean (SIGHUP, SIGINT, SIGTERM or SIGPIPE). That
+  restart came from the failed `ExecStop`, not from how the supervisor
+  exited. The generated unit now writes `ExecStop=-...`, and the `-` tells
+  systemd to ignore the command's exit status. `ExecStart` has no prefix,
+  so a supervisor that fails still counts as failed, and a crash (a
+  SIGKILL, for example) still restarts it after `RestartSec`. This was
+  checked on systemd 255 by running the generated unit text as transient
+  user units, with the real `supervisor stop` and `supervisor drain` as
+  `ExecStop`. A unit installed before this change keeps its old `ExecStop`
+  until you re-run `claude-task-runner install`.
+
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
   `claude-task-runner watchdog tick` with no `--queue`, and a tick manages
