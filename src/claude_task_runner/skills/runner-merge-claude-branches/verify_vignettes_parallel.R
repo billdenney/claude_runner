@@ -23,6 +23,8 @@
 #                                           # (see build_description_libpath below); the gate
 #                                           # then sees every package installed on the machine,
 #                                           # which can hide a missing CI dependency.
+#     --only a,b,c                          # restrict to these vignettes (see the note at the
+#                                           # call site); unknown names exit 2
 #     --skip-install                        # skip remotes::install_local (worker process loads
 #                                           # via library(); needed when modeldb has changed)
 #
@@ -150,6 +152,28 @@ if (DESC_LIB) {
 
 rmds <- sort(list.files(file.path(WORKTREE, "vignettes/articles"),
                         pattern = "\\.Rmd$", full.names = TRUE))
+
+# --only restricts the run to named vignettes (comma-separated, with or without
+# the .Rmd suffix). Use it ONLY when the change under test cannot affect the
+# rest: the registers are inputs to every render, so a branch that renames or
+# retires a canonical, or edits R/conventions.R, still needs the full set. An
+# incremental round that merely ADDS models (no removed register lines, no
+# modified shared files) is the case this is for. Unknown names are a hard
+# error rather than a silent no-op -- a typo must not look like a pass.
+ONLY <- get_arg("--only", "")
+if (nzchar(ONLY)) {
+  want <- trimws(strsplit(ONLY, ",")[[1]])
+  want <- sub("\\.Rmd$", "", want[nzchar(want)])
+  have <- sub("\\.Rmd$", "", basename(rmds))
+  missing <- setdiff(want, have)
+  if (length(missing)) {
+    cat(sprintf("--only names %d vignette(s) not present under vignettes/articles: %s\n",
+                length(missing), paste(missing, collapse = ", ")))
+    quit(status = 2L, save = "no")
+  }
+  rmds <- rmds[have %in% want]
+  cat(sprintf("--- --only: restricted to %d of %d vignettes ---\n", length(rmds), length(have)))
+}
 if (!length(rmds)) {
   cat("no vignettes found under vignettes/articles/; nothing to validate\n")
   quit(status = 0L, save = "no")

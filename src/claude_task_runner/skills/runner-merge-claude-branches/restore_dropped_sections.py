@@ -33,7 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-HEADER_RE = re.compile(r"^### ([A-Za-z0-9_]+)")
+HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
+NAME_RE = re.compile(r"^[A-Za-z0-9_<>]+$")
 SECTION_RE = re.compile(r"^## +(.*?)\s*$")
 
 
@@ -42,9 +43,14 @@ def git(args: list[str], cwd: Path) -> str:
     return out.stdout if out.returncode == 0 else ""
 
 
-def blocks(text: str) -> dict[str, tuple[str, str]]:
-    """Map canonical name -> (parent ``## section`` title, full block text)."""
-    found: dict[str, tuple[str, str]] = {}
+def blocks(text: str) -> dict[str, tuple[str, str, str]]:
+    """Map every canonical name -> (parent ``## section``, block text, owning name).
+
+    A multi-name header (``### fm_a, fm_b, fm_c``) contributes one entry per
+    name so that "is this canonical present?" is answered correctly; the
+    owning name is the first, which is what insertion keys on.
+    """
+    found: dict[str, tuple[str, str, str]] = {}
     section = ""
     lines = text.splitlines(keepends=True)
     i = 0
@@ -64,7 +70,14 @@ def blocks(text: str) -> dict[str, tuple[str, str]]:
             lines[i].startswith("### ") or lines[i].startswith("## ") or lines[i].startswith("# ")
         ):
             i += 1
-        found[hdr.group(1)] = (section, "".join(lines[start:i]).rstrip("\n") + "\n")
+        names = [n.strip() for n in hdr.group(1).split(",")]
+        names = [n for n in names if NAME_RE.match(n)]
+        block = "".join(lines[start:i]).rstrip("\n") + "\n"
+        for nm in names:
+            # Key every name a multi-name header declares, so presence checks
+            # answer correctly for `### fm_a, fm_b, fm_c`. The first name owns
+            # the block for insertion purposes.
+            found.setdefault(nm, (section, block, names[0]))
     return found
 
 
@@ -138,22 +151,131 @@ def main() -> int:
         ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/claude/"], repo
     ).split()
 
-    restored: list[tuple[str, str, str]] = []
+    # ---- MERGE-SET GATE -----------------------------------------------------
+    # Two filters, both required. Without them this script resurrects blocks
+    # that were deliberately removed, which is worse than the loss it repairs.
+    #
+    # (a) ANCESTRY. Only branches actually folded into this consolidation may
+    #     contribute. The pattern also matches branches from earlier rounds and
+    #     branches pushed after the survey; neither is part of this merge.
+    #
+    # (b) FORK POINT. Only blocks the branch ADDED count. Comparing against the
+    #     CURRENT base is not enough: when main RENAMES a canonical, every
+    #     branch cut before the rename still carries the old spelling in its
+    #     copy of the file. That name is absent from the current base (renamed
+    #     away) and absent from the merge result (correctly dropped), so the
+    #     old test restored it. Comparing against the branch's own merge-base
+    #     shows it was inherited, not added, and skips it.
+    #
+    #     Measured 2026-09-12 on an 80-branch round: of 31 blocks "restored",
+    #     20 were such rename zombies (CONMED_RTV_AUC_12h, viralLoad, ooc1..4,
+    #     pappBa/pappAb, 13 more camelCase PD outputs). Every one had its
+    #     renamed successor already present in the merge result.
+    # (c) DELIBERATE REMOVAL ON THE CONSOLIDATION BRANCH. A reconciliation
+    #     commit on the branch may rename or retire a canonical after the
+    #     merges land (e.g. applying an operator naming ruling that post-dates
+    #     the branch). The name is then genuinely "added by a folded branch and
+    #     absent from the result", and must still not be restored or every
+    #     re-run undoes the rename.
+    #
+    #     Tested by comparing PARSED BLOCK SETS across each NON-MERGE commit on
+    #     the branch: a name present in a commit's parent and absent in the
+    #     commit itself was removed by that commit. Two things this gets right
+    #     that simpler tests do not:
+    #
+    #       - Not a diff scan for removed `### ` lines. union_merge_lines.py
+    #         rewrites the file wholesale, so a diff reads every MOVED header as
+    #         a removal; an earlier draft mislabelled 526 blocks that way.
+    #         Comparing parsed sets is immune to moves.
+    #       - Only NON-MERGE commits count. A name can also disappear at a later
+    #         MERGE (branch A adds it, branch B is folded in afterwards and
+    #         -X theirs takes B's copy) -- that is the real loss this script
+    #         exists to repair, and must not be mistaken for a deliberate one.
+    #         Testing "present at any merge commit" gets this backwards.
+    deliberately_removed: set[str] = set()
+    for sha in git(
+        ["rev-list", "--no-merges", f"{args.base}..{args.branch}", "--", args.file], repo
+    ).split():
+        after = blocks(git(["show", f"{sha}:{args.file}"], repo))
+        before = blocks(git(["show", f"{sha}^:{args.file}"], repo))
+        deliberately_removed.update(set(before) - set(after))
+
+    in_merge_set = []
     for ref in refs:
+        rc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ref, args.branch],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+        ).returncode
+        if rc == 0:
+            in_merge_set.append(ref)
+    skipped_refs = len(refs) - len(in_merge_set)
+
+    restored: list[tuple[str, str, str]] = []
+    inherited = 0
+    deliberate = 0
+    lost_names: list[tuple[str, str, str]] = []
+    for ref in in_merge_set:
         text = git(["show", f"{ref}:{args.file}"], repo)
         if not text:
             continue
-        for name, (section, block) in blocks(text).items():
+        fork = git(["merge-base", args.base, ref], repo).strip()
+        fork_blocks = blocks(git(["show", f"{fork}:{args.file}"], repo)) if fork else {}
+        for name, (section, block, owner) in blocks(text).items():
             if name in base_blocks or name in merged_blocks:
+                continue
+            if name in deliberately_removed:
+                # Present in the file at some merge commit on this branch and
+                # absent now: a repair commit removed it on purpose (a rename
+                # or a retirement), so restoring it would undo that.
+                deliberate += 1
+                continue
+            if name in fork_blocks:
+                # Inherited from the branch's own starting point, not added by
+                # it -- main has since renamed or removed it. Not a merge loss.
+                inherited += 1
                 continue
             if any(name == r[0] for r in restored):
                 continue
+            if owner != name and owner in merged_blocks:
+                # The branch added this name to a header that SURVIVED under a
+                # different name, so the block is present but the name was
+                # dropped from its header list. Re-inserting the block would
+                # duplicate it; the repair is a header edit, so report only.
+                lost_names.append((name, owner, ref))
+                continue
             restored.append((name, section, block))
-            merged_blocks[name] = (section, block)
+            merged_blocks[name] = (section, block, owner)
 
+    if skipped_refs:
+        print(
+            f"# merge-set gate: {len(in_merge_set)} branch(es) are ancestors of "
+            f"{args.branch}; skipped {skipped_refs} matching the pattern but not merged"
+        )
+    if deliberate:
+        print(
+            f"# merge-set gate: skipped {deliberate} block(s) removed by a non-merge commit "
+            f"ON {args.branch} itself (deliberate rename/retire) -- NOT merge losses"
+        )
+    if inherited:
+        print(
+            f"# merge-set gate: skipped {inherited} block(s) present at a branch's own "
+            f"fork point (inherited, then renamed/removed on {args.base}) -- NOT merge losses"
+        )
+    for name, owner, ref in lost_names:
+        print(
+            f"# HEADER-NAME LOST (repair by hand, not a block insert): '{name}' was added to "
+            f"the '### {owner}, ...' header by {ref} and is missing from the merged header"
+        )
+    if lost_names:
+        print(
+            f"# {len(lost_names)} multi-name header entry(ies) need a manual union; "
+            f"buildModelDb() will fail on these until fixed"
+        )
     if not restored:
         print(f"# no dropped canonicals in {args.file}")
-        return 0
+        return 1 if (args.check and lost_names) else 0
 
     print(f"# {len(restored)} canonical(s) dropped by the merge and missing from {args.file}:")
     for name, section, _ in restored:
