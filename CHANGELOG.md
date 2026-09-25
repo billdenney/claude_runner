@@ -135,6 +135,24 @@ Breaking changes are called out in the version notes.
   `ExecStop`. A unit installed before this change keeps its old `ExecStop`
   until you re-run `claude-task-runner install`.
 
+- **The runbook gives a safe way to test the systemd restart.** Step 3 of
+  "Cron / systemd watchdog not installed" said systemd restarts the
+  supervisor after a crash but gave no way to check it, and the obvious
+  tests mislead. `kill <pid>` and `supervisor stop` send SIGTERM; the
+  supervisor exits 0 and `RestartPreventExitStatus=0` leaves it down. The
+  unit also shows `failed (Result: exit-code)`, because its ExecStop runs
+  after the supervisor has gone and exits 1.
+  `systemctl --user kill --signal=KILL` does crash it, but its default
+  `--kill-whom=all` also SIGKILLs every in-flight `claude` worker in the
+  unit's cgroup. The step now uses
+  `systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner`
+  (`--kill-who=main` before systemd 252, or `kill -KILL` on the PID from
+  `supervisor status`), and says what the restart looks like in the
+  journal. The behaviour was checked on
+  systemd 255 with transient units that use the unit's settings: SIGKILL
+  of the main process restarted it with the workers alive, and the
+  default form killed them.
+
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
   `claude-task-runner watchdog tick` with no `--queue`, and a tick manages
