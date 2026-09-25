@@ -220,7 +220,10 @@ Breaking changes are called out in the version notes.
   the new tests fail on the `--queue` preflight, the `why-blocked` note
   and the five incomplete subcommand lists, and on nothing else. The
   `Restart=` claim and the bare `uninstall` are not invocations the gate
-  can check.
+  can check. Once `claude-task-runner worktree` existed, the gate also
+  caught two docstring spans in `worktree/reclaim.py` that named git's
+  own worktree removal without the `git` prefix, so they read as a
+  subcommand of that group. They now say `git worktree remove`.
 - **Docs no longer advertise two config keys that make the config
   unloadable.** `docs/runbook.md` ("Sidecars piling up", step 3) told
   operators to set `[sidecar].unanswered_auto_recommended_s`, and
