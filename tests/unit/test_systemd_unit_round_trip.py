@@ -90,14 +90,20 @@ class TestExecStartRoundTrip:
         """The ``supervisor start`` parser accepts the unit's flags.
 
         ``start`` blocks on the daemon loop, so we patch ``start_daemon``
-        (and the settings load it depends on) to no-ops. A clean exit 0
-        proves Typer parsed AND routed every flag — a stray flag would
-        have produced exit code 2 before the body ever ran.
+        (and the settings load it depends on) to no-ops. ``_QUEUE`` does
+        not exist here, so the check that ``--queue`` is an existing
+        directory is patched to accept it. A clean exit 0 proves Typer
+        parsed AND routed every flag — a stray flag would have produced
+        exit code 2 before the body ever ran.
         """
         text = build_unit_text(supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE))
         argv = _argv_after_supervisor(_exec_line(text, "ExecStart"))
 
         with (
+            patch(
+                "claude_task_runner.cli.supervisor_cmd.require_queue_option",
+                return_value=Path(_QUEUE),
+            ) as require_queue_option,
             patch("claude_task_runner.cli.supervisor_cmd.load_settings"),
             patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
             patch("claude_task_runner.cli.supervisor_cmd.queue_runtime_dir"),
@@ -111,6 +117,7 @@ class TestExecStartRoundTrip:
         assert result.exit_code == 0, result.output
         # The daemon was actually invoked — proves routing, not just parsing.
         assert start_daemon.called
+        assert require_queue_option.call_args.args[0] == Path(_QUEUE)
 
 
 class TestExecStopDrainRoundTrip:

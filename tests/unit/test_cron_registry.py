@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import re
 from pathlib import Path
 
@@ -358,3 +359,19 @@ class TestRegistryWrites:
             unregister_queue(keep)
         assert queues_registry_path().read_text(encoding="utf-8") == before
         assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
+def test_register_rejects_a_queue_behind_an_unsearchable_directory(isolated_home: Path) -> None:
+    """Refused like a missing directory, as the tick would skip it, not a PermissionError."""
+    locked = isolated_home / "locked"
+    queue = locked / "q"
+    queue.mkdir(parents=True)
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(NotADirectoryError) as excinfo:
+            register_queue(queue)
+    finally:
+        locked.chmod(0o700)
+    assert str(excinfo.value) == f"not an existing directory: {queue.resolve()}"
+    assert not queues_registry_path().exists()

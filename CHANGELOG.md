@@ -62,6 +62,26 @@ Breaking changes are called out in the version notes.
   `claude-task-runner watchdog unregister --queue <path>` for each. The
   runbook has a section for the symptom, including how to stop a supervisor
   that an older version already started on a recreated queue.
+- **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
+  refuse a `--queue` that is not an existing directory.** They used to
+  create it, because `queue_runtime_dir()` and `todo_dir()` make their
+  directories with `parents=True`. A mistyped or deleted `--queue` became an
+  empty queue, and a `supervisor start` on it held the per-user
+  `global.lock`, so the real queue's supervisor failed with
+  `another supervisor is already running`. Each command now exits 2 with
+  `--queue is not an existing directory: <path>` before it loads settings,
+  shows a plan or writes anything. `queue force-dispatch --json` prints that
+  as `{"ok": false, "error": ...}`. `install` checks before it detects the
+  init system. Its cron branch used to show the crontab diff and ask to
+  confirm before failing to register the queue, and its systemd branch wrote
+  and started a unit whose `WorkingDirectory=` did not exist. The watchdog
+  spawns `supervisor start`, so the check there also covers a queue deleted
+  between a tick's check and the spawn. All of them, and
+  `watchdog register`, use `queue.store.require_queue_dir()`. Like the tick,
+  it treats a path it cannot examine, such as one under a directory the user
+  may not search, as missing instead of raising `PermissionError`. `--queue`
+  still defaults to the current directory, and the documented setup creates
+  the queue directory first, so neither is affected.
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
   `claude-task-runner watchdog tick` with no `--queue`, and a tick manages

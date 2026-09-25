@@ -16,7 +16,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import install as cron_install
@@ -103,10 +103,12 @@ def install(
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
 
-    queue_path = queue_dir.resolve()
+    console = Console()
+    # Before any plan is shown: a queue that is not there would be recreated,
+    # by the unit's supervisor under systemd or by the next tick under cron.
+    queue_path = require_queue_option(queue_dir, console)
     resolved_config = resolve_per_queue_config(config, queue_path)
     settings = load_settings(resolved_config)
-    console = Console()
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
     console.print(

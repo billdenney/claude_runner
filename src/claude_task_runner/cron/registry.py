@@ -29,6 +29,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from claude_task_runner.queue.store import require_queue_dir
+
 logger = logging.getLogger(__name__)
 
 QUEUES_REGISTRY_FILENAME = "queues.json"
@@ -129,14 +131,12 @@ def register_queue(queue_dir: Path) -> None:
     """Add ``queue_dir`` to the registry. Idempotent.
 
     Raises :class:`NotADirectoryError` unless ``queue_dir`` is an
-    existing directory. A registered typo would otherwise be created by
-    the next tick's restart, which makes the queue's log directory with
-    ``parents=True``, and the supervisor started on that empty queue
-    would hold the per-user global lock. The tick checks each path
-    again, because a registered queue can be deleted or moved later."""
-    resolved = queue_dir.resolve()
-    if not resolved.is_dir():
-        raise NotADirectoryError(f"not an existing directory: {resolved}")
+    existing directory (see :func:`require_queue_dir`). A registered typo
+    would otherwise be created by the next tick's restart, and the
+    supervisor started on that empty queue would hold the per-user
+    global lock. The tick checks each path again, because a registered
+    queue can be deleted or moved later."""
+    resolved = require_queue_dir(queue_dir)
     existing = load_registered_queues()
     if resolved in existing:
         return

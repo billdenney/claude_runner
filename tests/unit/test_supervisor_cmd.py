@@ -418,3 +418,44 @@ def test_drain_systemd_unit_execstop_argv_is_accepted_by_drain_cli(
         f"output: {result.output!r}"
     )
     assert "No such option" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# start
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["missing", "a-file"])
+def test_start_refuses_a_queue_that_is_not_a_directory(
+    runner: CliRunner, tmp_path: Path, kind: str
+) -> None:
+    """``queue_runtime_dir`` used to create a mistyped or deleted ``--queue``.
+
+    The supervisor started on that empty queue held the per-user global
+    lock, so the real queue's supervisor failed with "another supervisor is
+    already running"."""
+    queue = tmp_path / "no-such-queue"
+    if kind == "a-file":
+        queue.write_text("", encoding="utf-8")
+    with patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as mock_start:
+        result = runner.invoke(app, ["start", "--queue", str(queue)])
+    assert result.exit_code == 2
+    assert result.stdout == f"--queue is not an existing directory: {queue.resolve()}\n"
+    mock_start.assert_not_called()
+    if kind == "missing":
+        assert not queue.exists()
+    else:
+        assert queue.read_text(encoding="utf-8") == ""
+
+
+def test_start_runs_the_daemon_on_an_existing_queue(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "q"
+    queue.mkdir()
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
+        patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as mock_start,
+    ):
+        result = runner.invoke(app, ["start", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    mock_start.assert_called_once()
+    assert mock_start.call_args.kwargs["queue_dir"] == queue.resolve()
