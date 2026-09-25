@@ -60,7 +60,7 @@ read the exception with `journalctl --user -u claude-task-runner`.
 ## Task `possibly_hung` for hours
 
 **Symptom:** A task's state shows `possibly_hung` and last_heartbeat is
-N hours old. EMA suggests it should have completed by now.
+N hours old.
 
 **Steps:**
 1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl` —
@@ -111,9 +111,122 @@ come back.
 1. `claude-task-runner doctor` shows whether watchdog is installed.
 2. `claude-task-runner install` auto-detects systemd vs cron, shows the
    proposed change, asks for confirmation. Accept it.
-3. Verify: kill the supervisor manually; within ~60s (cron) or ~30s
-   (systemd) it should restart. Check `~/.claude_task_runner/watchdog.log`
-   (cron) or `journalctl --user -u claude-task-runner` (systemd).
+3. Verify. Under cron, `claude-task-runner watchdog queues` must list the
+   queue (see the next section if it does not). Stop the supervisor with
+   `claude-task-runner supervisor stop`. The first tick after it exits
+   restarts it, and `~/.claude_task_runner/watchdog.log` shows
+   `verdict=restart`.
+
+   Under systemd, `systemctl --user status claude-task-runner` shows the
+   unit active. To test the restart, crash only the supervisor:
+
+   ```sh
+   systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner
+   ```
+
+   On systemd older than 252, spell the option `--kill-who=main`, or run
+   `kill -KILL <pid>` with the PID that
+   `claude-task-runner supervisor status --queue <queue>` prints. About
+   30s later (`RestartSec=30`) the unit is active again with a new main
+   PID, and `journalctl --user -u claude-task-runner` shows
+   `Main process exited, code=killed, status=9/KILL`, then
+   `Scheduled restart job`. In-flight `claude` workers keep running
+   (`KillMode=process`). With `[supervisor].adopt_workers` on, the
+   default, the new supervisor adopts them. systemd also logs
+   `Found left-over process` for each one, which is expected.
+
+   Do not test with `kill <pid>` or `supervisor stop`. Both send SIGTERM,
+   the supervisor exits 0, and `RestartPreventExitStatus=0` leaves it
+   down, so `systemctl --user status` shows the unit `inactive (dead)`.
+   A unit whose `ExecStop=` line has no leading `-` (see
+   `systemctl --user cat claude-task-runner`) was installed before that
+   prefix was added, and it shows `failed (Result: exit-code)` instead.
+   Its ExecStop (`supervisor stop`, or `supervisor drain --no-wait` with
+   adoption off) runs after the supervisor has gone and exits 1, and
+   without the `-` systemd records that as a failure. Nothing crashed.
+   Re-run `claude-task-runner install` to get the current unit. Start the
+   supervisor again with `systemctl --user start claude-task-runner`. Do
+   not drop `--kill-whom=main` either: the default, `all`, also SIGKILLs
+   every in-flight `claude` worker in the unit's cgroup.
+
+## Cron watchdog installed, but the supervisor stays down
+
+**Symptom:** `crontab -l` shows the `# BEGIN claude_task_runner` block,
+yet a stopped supervisor never comes back. Run in the queue directory,
+`claude-task-runner doctor` warns under `watchdog_installed` that the
+registry does not list the queue. With an empty registry, every tick in
+`~/.claude_task_runner/watchdog.log` logs
+`watchdog: no queues registered; nothing to do`.
+
+**Cause:** a tick manages only the queues listed in
+`~/.claude_task_runner/queues.json`. An older `install` did not register
+its queue there, so the cron watchdog it installed has nothing to manage.
+
+**Steps:**
+1. `claude-task-runner watchdog queues` lists the registered queues. Here
+   it prints nothing.
+2. Register the queue:
+
+   ```sh
+   claude-task-runner watchdog register --queue <queue>
+   ```
+
+   Re-running `claude-task-runner install --queue <queue>` also works,
+   because `install` now registers its queue.
+3. The next tick, within a minute, starts the supervisor. `watchdog.log`
+   shows `verdict=restart`, then `spawned supervisor`, and
+   `claude-task-runner supervisor status` shows it alive.
+
+## A registered queue was deleted or moved
+
+**Symptom:** every minute, `~/.claude_task_runner/watchdog.log` gets a line
+`watchdog: ERROR queue=<path> is not an existing directory, so its supervisor
+was not restarted and the directory was not created`.
+`claude-task-runner watchdog queues` prints a warning about the same path on
+stderr. With the cron watchdog installed, `claude-task-runner doctor` warns
+under `watchdog_installed` and prints the `unregister` command for each such
+path.
+
+**Cause:** the queue is registered with the cron watchdog (by `install` or
+`watchdog register`), and its directory was later deleted, moved or replaced
+by a file, or it sits on a filesystem that is not mounted. A tick skips that
+path but keeps it registered, so a queue whose filesystem comes back is
+managed again with no action. Before this was fixed, the tick recreated the
+directory and started a supervisor on the empty queue. That supervisor held
+the per-user `global.lock`, so the real queue's supervisor failed with
+`another supervisor is already running`.
+
+**Steps:**
+1. `claude-task-runner watchdog queues` lists the registered queues and
+   warns about each one that is not an existing directory.
+2. If the queue moved, register the new path and drop the old one:
+
+   ```sh
+   claude-task-runner watchdog register --queue <new-path>
+   claude-task-runner watchdog unregister --queue <old-path>
+   ```
+
+3. If it is gone for good, drop it:
+
+   ```sh
+   claude-task-runner watchdog unregister --queue <path>
+   ```
+
+   The directory need not exist. `unregister` prints `not registered:` and
+   exits 0 when the queue is not listed. It exits 2 and leaves the file as
+   it was when `queues.json` is corrupt: fix or remove the file, then
+   register the queues you still want.
+4. If its filesystem is not mounted, mount it. The next tick manages the
+   queue again.
+5. An older version may already have recreated the directory and started a
+   supervisor on it, which still holds the lock. The real queue's
+   `another supervisor is already running (...); pid=<pid>` error names that
+   supervisor, and `ps -o args= -p <pid>` shows its `--queue`. If that is
+   the recreated queue, unregister it first, since the next tick would
+   otherwise restart it. Then stop it with
+   `claude-task-runner supervisor stop --queue <path>`, and delete the
+   directory once you have checked that it holds only an empty `todo/` and
+   `.claude_task_runner/`.
 
 ## Task worktrees filling the disk
 

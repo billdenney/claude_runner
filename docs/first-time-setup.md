@@ -51,6 +51,10 @@ cd /path/to/my_queue
 
 This directory becomes the queue's root. Tasks live under `todo/<id>.yaml`;
 state lives under `.claude_task_runner/` (auto-created on first dispatch).
+Create the directory first: `queue add`, `queue force-dispatch`,
+`supervisor start` and `install` exit 2 with
+`--queue is not an existing directory` rather than create a queue from a
+mistyped or deleted path.
 
 ## 3. Write a minimal `claude_runner.toml`
 
@@ -66,7 +70,6 @@ A working minimum:
 # claude_runner.toml — minimal queue config
 
 [claude]
-plan = "max20x"     # or "max5x" | "pro" | "team_standard" | "team_premium"
 # config_dir = ""   # CLAUDE_CONFIG_DIR override. Empty (default) = ~/.claude.
                     # Set to e.g. "/home/bill/.claude_personal" if `claude
                     # /login` for the dispatching account was run under a
@@ -76,7 +79,7 @@ plan = "max20x"     # or "max5x" | "pro" | "team_standard" | "team_premium"
 
 [concurrency]
 max_concurrency     = 2
-initial_concurrency = 1   # cap until the EMA has warmed up
+initial_concurrency = 1   # cap until a first task completes in this queue
 
 [hooks]
 # Pre-dispatch: create the worktree (or any other per-task setup).
@@ -88,8 +91,10 @@ post_dispatch_command  = ""
 post_dispatch_timeout_s = 60
 ```
 
-That's enough. Plan-derived 5h/weekly throttle thresholds and EMA priors
-come from the defaults.
+That's enough. The 5h and weekly throttle thresholds (`[dispatch_pct.*]`)
+and every other setting come from the defaults. There is no plan setting:
+the throttle works from the utilization percentages `claude /usage`
+reports, which are already relative to the account's tier.
 
 If your pre-dispatch hook creates a git worktree per task, the runner will not
 remove those worktrees on its own. `claude-task-runner worktree reclaim`
@@ -162,19 +167,42 @@ the CLI and adds the explicit per-task knob.
 claude-task-runner install
 ```
 
-Auto-detects systemd-user vs cron; prompts for confirmation. After
-install, the watchdog kicks the supervisor on boot and restarts it after
-a crash (exponential backoff per ADR-0002).
+Run it from the queue directory, or pass `--queue <path>`. It auto-detects
+systemd-user vs cron and asks for confirmation before writing anything.
+
+- **systemd:** writes a `--user` unit that runs `supervisor start` for this
+  queue, starts it now, and restarts it after a crash. A clean exit
+  (`supervisor stop`, or a `drain` once in-flight tasks finish) leaves it
+  stopped.
+- **cron:** adds a crontab line that runs `claude-task-runner watchdog tick`
+  every minute, and registers this queue in
+  `~/.claude_task_runner/queues.json`. A tick restarts the supervisor of each
+  registered queue that is not running, however it stopped, and backs off
+  exponentially after repeated crashes (ADR-0002). A tick manages only the
+  registered queues, which `claude-task-runner watchdog queues` lists.
 
 ## 6. Start the supervisor
+
+With a watchdog installed there is nothing to run. systemd started the
+supervisor in step 5, and cron's next tick starts it within a minute.
+Check it with:
+
+```sh
+claude-task-runner supervisor status
+```
+
+If a cron watchdog has not started it after a minute,
+`~/.claude_task_runner/watchdog.log` says why.
+
+Without a watchdog, start the supervisor yourself:
 
 ```sh
 claude-task-runner supervisor start
 ```
 
-This is foreground by default — the supervisor logs to stderr. To run
-detached, use the watchdog (already installed in step 5) and check
-liveness with `claude-task-runner supervisor status`.
+This runs in the foreground and logs to stderr. Only one supervisor runs
+per user, so once a watchdog has started one, this command fails with
+`another supervisor is already running`.
 
 ## 7. Watch the queue drain
 

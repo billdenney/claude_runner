@@ -60,8 +60,8 @@ all at once.
 
 - **Allowed tools** — comma-separated list. Default omits the flag,
   giving the dispatch the runner-default toolset.
-- **Tags** — free-form labels. Useful for cohort grouping
-  (`ema-cohort:foo` overrides the EMA bucket key).
+- **Tags** — free-form labels. `queue list` reports them; the runner
+  attaches no meaning to them.
 - **`--weekly-critical`** — set if the user says it must complete
   before the weekly window resets.
 - **`--add-dir <dir>`** (repeatable) — extra absolute directories the

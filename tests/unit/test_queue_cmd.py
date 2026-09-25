@@ -209,6 +209,26 @@ class TestShow:
 
 
 class TestAdd:
+    @pytest.mark.parametrize("kind", ["missing", "a-file"])
+    def test_queue_that_is_not_a_directory_is_rejected(
+        self, runner: CliRunner, tmp_path: Path, kind: str
+    ) -> None:
+        """``todo_dir`` makes ``<queue>/todo`` with ``parents=True``, so a
+        mistyped ``--queue`` used to come back as a new queue holding the task."""
+        queue = tmp_path / "no-such-queue"
+        if kind == "a-file":
+            queue.write_text("", encoding="utf-8")
+        result = runner.invoke(
+            app,
+            ["add", "--queue", str(queue), "--id", "t1", "--title", "T", "--prompt", "p"],
+        )
+        assert result.exit_code == 2
+        assert result.stdout == f"--queue is not an existing directory: {queue.resolve()}\n"
+        if kind == "missing":
+            assert not queue.exists()
+        else:
+            assert queue.read_text(encoding="utf-8") == ""
+
     def test_basic_add(self, runner: CliRunner, queue_dir: Path) -> None:
         result = runner.invoke(
             app,

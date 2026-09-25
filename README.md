@@ -3,9 +3,9 @@
 Window-aware task runner for Claude Code.
 
 Runs a queue of tasks against `claude` while proactively tracking the 5-hour
-and 7-day usage windows. Throttles dispatch via EMA-driven concurrency,
-schedules window-start wakeups via a long-running supervisor, and survives
-reboots via a cron or systemd watchdog.
+and 7-day usage windows. Throttles dispatch against the utilization that
+`/usage` reports, schedules window-start wakeups via a long-running
+supervisor, and survives reboots via a cron or systemd watchdog.
 
 ## Why this exists
 
@@ -15,12 +15,14 @@ no visibility into utilization until it crashes into the wall. This module:
 - **Parses `claude /usage`** robustly with version-aware drift detection,
   so "is the parser broken?" is never silently confused with "is utilization
   zero?"
-- **Throttles dispatch** in three bands (full / slowdown / stop) keyed off
-  EMA-predicted post-dispatch utilization, all cutoffs configurable via TOML.
+- **Throttles dispatch** from the utilization `/usage` reports: three 5-hour
+  bands (full / slowdown / stop) with separate day and night cutoffs, plus a
+  weekly target line, all configurable via TOML (`[dispatch_pct.*]`).
 - **Schedules the next 5-hour window** automatically — the supervisor wakes
   up shortly after each reset and resumes draining the queue.
-- **Resumes mid-task** via `claude --resume <session_id>` with automatic
-  fallback to fresh restart on resume failure.
+- **Resumes mid-task** via `claude --resume <session_id>`, falling back to a
+  fresh restart when the session is gone or `[session].max_resume_attempts`
+  resumes have been tried.
 - **Survives crashes** via a cron-installed (or systemd `--user`) watchdog
   that restarts the supervisor with exponential backoff.
 
@@ -37,8 +39,11 @@ pip install -e '.[dev,ui]'
 # (see docs/first-time-setup.md for the template)
 claude-task-runner queue add  # interactive; repeat per task
 claude-task-runner install    # auto-detects systemd vs cron, asks confirmation
-claude-task-runner supervisor start
+claude-task-runner supervisor status  # the watchdog starts it: systemd now, cron within a minute
 ```
+
+Without a watchdog, run `claude-task-runner supervisor start` instead of
+`install`. It runs in the foreground.
 
 For a step-by-step walkthrough from an empty directory, see
 [`docs/first-time-setup.md`](docs/first-time-setup.md).

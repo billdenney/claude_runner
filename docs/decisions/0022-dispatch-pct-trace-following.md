@@ -285,3 +285,15 @@ schema are migrated outside this PR:
 that scans every resolved account's `runner-account.toml` for a
 `[throttle.*]` block and FAILs with the migration message. The
 operator's first post-merge `doctor` run is the migration checklist.
+
+## Update (2026-09-25)
+
+The "Token budgets" section above described budgets that no runtime code
+ever read. Nothing consumed `[claude].plan` or the `[plans.*]` token
+counts, before or after this ADR: the decision rule compares the
+utilization percentages `/usage` reports, which are already relative to
+the account's tier, against `[dispatch_pct.*]`. The budgets were staged
+in May 2026 for ADR-0011's EMA formula, which divided predicted tokens
+by them, and that formula was never built either. Both keys have been
+removed, and the loader rejects a queue TOML that still sets them with a
+message saying to delete them. Deleting them changes nothing.

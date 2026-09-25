@@ -509,7 +509,6 @@ def dispatch_synchronously(
         queue_dir=queue_dir,
         clock=clock,
         settings_caps=settings.task_caps,
-        settings_session=settings.session,
         settings_hooks=settings.hooks,
         settings_failure_classifier=settings.failure_classifier,
         claude_executable=claude_executable,

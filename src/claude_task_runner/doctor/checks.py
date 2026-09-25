@@ -5,8 +5,8 @@ Each check is a small, pure-ish function that returns a
 FAIL / WARN per check. Exit code is non-zero on any FAIL.
 
 Checks are deliberately isolated so they survive partial failures:
-a corrupt ``ema.json`` shouldn't prevent the binary-existence check
-from running.
+a corrupt ``supervisor.json`` shouldn't prevent the binary-existence
+check from running.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from claude_task_runner.config.loader import (
     per_account_toml_path,
 )
 from claude_task_runner.config.schema import Settings
+from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -37,8 +38,6 @@ from claude_task_runner.queue.store import (
     load_task,
     queue_runtime_dir,
 )
-from claude_task_runner.runner import ema as ema_mod
-from claude_task_runner.runner.ema import EMAFileError
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
@@ -979,31 +978,6 @@ def check_supervisor_state(settings: Settings, queue_dir: Path) -> CheckResult:
     )
 
 
-def check_ema(_settings: Settings, queue_dir: Path) -> CheckResult:
-    """``ema.json`` parses cleanly (or doesn't exist yet)."""
-    path = queue_dir / ".claude_task_runner" / ema_mod.EMA_FILE_NAME
-    if not path.exists():
-        return CheckResult(
-            name="ema",
-            status=CheckStatus.PASS,
-            detail="no ema.json yet (cold start)",
-        )
-    try:
-        ema = ema_mod.load(path)
-    except EMAFileError as exc:
-        return CheckResult(
-            name="ema",
-            status=CheckStatus.FAIL,
-            detail=str(exc),
-            remediation=f"Remove or fix {path}",
-        )
-    return CheckResult(
-        name="ema",
-        status=CheckStatus.PASS,
-        detail=f"{len(ema.buckets)} task-type buckets",
-    )
-
-
 def check_skills_installed(_settings: Settings) -> CheckResult:
     """Skills should be present in ``~/.claude/skills/``."""
     from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES
@@ -1108,8 +1082,70 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
     )
 
 
-def check_watchdog_installed(settings: Settings) -> CheckResult:
-    """Either a systemd unit or a cron managed-block should exist."""
+def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
+    """PASS only when the cron watchdog's registry lists ``queue_dir``
+    and every registered path is an existing directory.
+
+    The crontab line runs ``watchdog tick`` with no ``--queue``, and a
+    tick manages only the queues in the registry. A cron watchdog that an
+    older ``install`` set up has an empty registry, and without this
+    check doctor passed it while no tick ever restarted the supervisor.
+    A registered queue that was later deleted or moved stays registered,
+    and every tick skips it with an ERROR line, so it is reported here
+    too. Reads the registry without side effects, so a corrupt file is
+    reported instead of being backed up and treated as empty."""
+    queue = queue_dir.resolve()
+    registry = registry_mod.queues_registry_path()
+    register = f"claude-task-runner watchdog register --queue {queue}"
+    try:
+        registered = registry_mod.read_registered_queues()
+    except registry_mod.RegistryError as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"cron watchdog detected, but its queue registry is unreadable: {exc}",
+            remediation=f"Fix or remove {registry}, then run `{register}`.",
+        )
+    problems: list[str] = []
+    fixes: list[str] = []
+    if queue not in registered:
+        problems.append(f"{registry} does not list this queue, so no tick restarts its supervisor")
+        fixes.append(f"Run `{register}`, or re-run `claude-task-runner install --queue {queue}`.")
+    # os.path.isdir is False where Path.is_dir raises (a parent that
+    # denies access), as in the tick, so one such path cannot end doctor.
+    missing = [q for q in registered if not os.path.isdir(q)]
+    if missing:
+        if len(missing) == 1:
+            problems.append(
+                f"registered queue {missing[0]} is not an existing directory, "
+                "so every tick skips it"
+            )
+        else:
+            problems.append(
+                f"{len(missing)} registered queues are not existing directories, "
+                f"so every tick skips them: {', '.join(str(q) for q in missing)}"
+            )
+        fixes.append("Register a queue that moved at its new path. Drop one that is gone for good:")
+        fixes.extend(f"  claude-task-runner watchdog unregister --queue {q}" for q in missing)
+    if not problems:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.PASS,
+            detail="cron watchdog detected; this queue is registered",
+        )
+    return CheckResult(
+        name="watchdog_installed",
+        status=CheckStatus.WARN,
+        detail="cron watchdog detected, but " + "; and ".join(problems),
+        remediation="\n".join(fixes),
+    )
+
+
+def check_watchdog_installed(settings: Settings, queue_dir: Path) -> CheckResult:
+    """A systemd unit, or a cron managed-block that lists this queue, should exist.
+
+    With the cron block, every queue the registry lists should also
+    still be an existing directory."""
     systemd_present = systemd_mod.systemd_unit_path().exists()
 
     # Try to read the crontab non-destructively. ``crontab_l`` already
@@ -1133,13 +1169,14 @@ def check_watchdog_installed(settings: Settings) -> CheckResult:
         cron_probe_error = f"{type(exc).__name__}: {exc}"
         logger.debug("unexpected error probing crontab: %s", exc)
 
-    if systemd_present or cron_present:
-        kind = "systemd" if systemd_present else "cron"
+    if systemd_present:
         return CheckResult(
             name="watchdog_installed",
             status=CheckStatus.PASS,
-            detail=f"{kind} watchdog detected",
+            detail="systemd watchdog detected",
         )
+    if cron_present:
+        return _cron_watchdog_result(queue_dir)
 
     preferred = settings.supervisor.preferred_init_system
 
@@ -1210,9 +1247,8 @@ def all_checks(
         lambda: check_state_yamls(settings, queue_dir),
         lambda: check_orphaned_sessions(settings, queue_dir),
         lambda: check_supervisor_state(settings, queue_dir),
-        lambda: check_ema(settings, queue_dir),
         lambda: check_skills_installed(settings),
-        lambda: check_watchdog_installed(settings),
+        lambda: check_watchdog_installed(settings, queue_dir),
     ]
     if check_api_usage:
         checks.append(lambda: check_api_usage_source(settings))

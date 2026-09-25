@@ -1,7 +1,8 @@
 """Exponential backoff state for the watchdog.
 
-The watchdog runs every minute (cron) or on-demand (systemd
-``Restart=on-failure``) and decides whether to restart the supervisor.
+The watchdog tick runs every minute from cron and decides whether to
+restart the supervisor. (A systemd install runs no tick; the unit's
+``Restart=on-failure`` restarts the supervisor instead.)
 If the supervisor crashes immediately after each restart, naive policy
 would loop forever burning CPU and log volume. We protect with:
 
@@ -91,8 +92,9 @@ class WatchdogDecision:
         For RESTART verdict, this includes the new restart timestamp.
     next_check_at
         Suggested time for the next watchdog tick. ``None`` means
-        "default cadence". For COOLDOWN/BACKOFF this gives the cron/
-        systemd timer a hint about when waiting is over.
+        "default cadence". For COOLDOWN/BACKOFF it says when waiting
+        is over. ``watchdog tick`` does not read it; cron runs the
+        tick every minute regardless.
     detail
         Human-readable explanation logged by the watchdog (and
         included in the BACKOFF notification message).

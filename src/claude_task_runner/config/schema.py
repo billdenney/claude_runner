@@ -60,8 +60,6 @@ class UsageSettings(_StrictModel):
     capture_post_data_pad_ms: int = Field(ge=0)
     capture_rotation_count: int = Field(ge=0)
     poll_interval_s: float = Field(gt=0)
-    healthcheck_interval_s: float = Field(gt=0)
-    suspicious_delta_pct: int = Field(ge=0, le=100)
     drift_recovery_clean_polls: int = Field(ge=1)
     api_timeout_s: float = Field(default=10.0, gt=0)
     """Per-request timeout for the API usage source (seconds).
@@ -80,21 +78,8 @@ class ConcurrencySettings(_StrictModel):
     initial_concurrency: int = Field(ge=1)
 
 
-class EMAPrior(_StrictModel):
-    tokens: int = Field(gt=0)
-    duration_s: float = Field(gt=0)
-
-
-class EMASettings(_StrictModel):
-    alpha: float = Field(gt=0.0, le=1.0)
-    prior_warmup_samples: int = Field(ge=0)
-    runtime_p90_multiplier: float = Field(gt=0)
-    priors: dict[str, dict[str, EMAPrior]] = Field(default_factory=dict)
-
-
 class SessionSettings(_StrictModel):
     max_resume_attempts: int = Field(ge=0)
-    resume_fail_fast_s: float = Field(gt=0)
 
 
 class FailureClassifierSettings(_StrictModel):
@@ -491,15 +476,10 @@ class ClaudeSettings(_StrictModel):
     compatibility. When both are present, ``[[accounts]]`` wins and this
     field is ignored. Empty string means "use claude's default"
     (``~/.claude``).
-
-    ``plan`` selects an entry from the top-level ``[plans.*]`` table so
-    the loader can pull the 5h and weekly token caps for that plan.
-    Empty string means "no auto-tune; use the explicit budgets."
     """
 
     executable: str = "claude"
     config_dir: str = ""
-    plan: str = ""
 
 
 class AccountSettings(_StrictModel):
@@ -836,17 +816,6 @@ class DispatchSettings(_StrictModel):
     fresh)."""
 
 
-class PlanSettings(_StrictModel):
-    """Per-plan token budgets.
-
-    ADR-0022 simplified this block to token caps only; dispatch shape
-    lives in ``[dispatch_pct.*]`` which the operator sets directly.
-    """
-
-    five_hour_tokens: int = Field(gt=0)
-    weekly_tokens: int = Field(gt=0)
-
-
 class Settings(_StrictModel):
     """Root settings model — the merged effective configuration."""
 
@@ -856,7 +825,6 @@ class Settings(_StrictModel):
     """ADR-0022 ``[dispatch_pct.*]`` tree. Variant-C trace-following
     dispatch policy."""
     concurrency: ConcurrencySettings
-    ema: EMASettings
     effort_levels: dict[str, list[str]]
     session: SessionSettings
     failure_classifier: FailureClassifierSettings
@@ -876,7 +844,6 @@ class Settings(_StrictModel):
     worktree_reclaim: WorktreeReclaimSettings = Field(default_factory=WorktreeReclaimSettings)
     """``[worktree_reclaim]`` block — reclaiming finished tasks' git
     worktrees (ADR-0034). Defaulted so pre-existing TOMLs keep parsing."""
-    plans: dict[str, PlanSettings] = Field(default_factory=dict)
     accounts: list[AccountSettings] = Field(default_factory=list)
     """One or more Claude accounts the supervisor may dispatch through.
 

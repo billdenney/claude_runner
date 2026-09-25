@@ -7,6 +7,8 @@ PATH lookups are deterministic regardless of the developer's machine.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -14,17 +16,38 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.install_cmd import (
     _detect_init_system,
     _supervisor_command,
     _watchdog_script_path,
     app,
 )
+from claude_task_runner.cron.registry import (
+    load_registered_queues,
+    queues_registry_path,
+    register_queue,
+)
 
 
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect ``Path.home()`` for every test in this file.
+
+    A cron ``install`` registers its queue in
+    ``~/.claude_task_runner/queues.json``, so without this the tests
+    would write into the developer's real watchdog registry. The home
+    is a subdirectory so it never coincides with a test's queue dir
+    (the tests below pass ``tmp_path`` itself as ``--queue``)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +329,192 @@ def test_install_cron_empty_diff_branch(runner: CliRunner, tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# `install` — cron branch registers the queue with the watchdog
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _cron_install_patched(backup_path: Path) -> Iterator[MagicMock]:
+    """Patch out the crontab I/O of the cron branch; yield the ``apply_plan`` mock."""
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_install_plan",
+            return_value=_cron_plan_mock(),
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.backup_crontab",
+            return_value=backup_path,
+        ),
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as mock_apply,
+    ):
+        yield mock_apply
+
+
+def test_install_cron_registers_queue_with_watchdog(runner: CliRunner, tmp_path: Path) -> None:
+    """Regression: a cron install must register its queue with the watchdog.
+
+    The crontab line runs ``watchdog.sh``, which runs ``watchdog tick``
+    with no ``--queue``; ``tick`` manages only the queues listed in
+    ``~/.claude_task_runner/queues.json``. ``install`` used to leave that
+    registry untouched, so until the operator also ran ``watchdog
+    register`` every tick logged "no queues registered; nothing to do"
+    and a dead supervisor was never restarted."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_cron_install_then_tick_manages_the_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """End to end: the tick the crontab line runs sees the installed queue.
+
+    Before the fix this tick printed "no queues registered; nothing to
+    do". With no supervisor running, it must now decide to restart one
+    for the queue ``install`` was given."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        installed = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert installed.exit_code == 0, installed.output
+
+    ticked = runner.invoke(watchdog_cmd.app, ["tick", "--dry-run"])
+    assert ticked.exit_code == 0, ticked.output
+    assert "no queues registered" not in ticked.stdout
+    assert f"watchdog queue={queue.resolve()} alive=False pid=None verdict=restart" in (
+        ticked.stdout
+    )
+
+
+def test_install_cron_shows_registration_before_confirming(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The y/N prompt covers the registry write as well as the crontab diff."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(queue)], input="y\n")
+    assert result.exit_code == 0, result.output
+    shown = result.stdout.index("Will register this queue with the watchdog")
+    assert shown < result.stdout.index("Apply this change?")
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_install_cron_abort_does_not_register(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["--queue", str(queue)], input="n\n")
+    assert result.exit_code == 1
+    mock_apply.assert_not_called()
+    assert not queues_registry_path().exists()
+
+
+def test_install_cron_rerun_registers_queue_once(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    for _ in range(2):
+        with _cron_install_patched(tmp_path / "bk.txt"):
+            result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+        assert result.exit_code == 0, result.output
+    assert load_registered_queues() == [queue.resolve()]
+
+
+def test_install_cron_registry_write_failure_leaves_crontab_untouched(
+    runner: CliRunner, tmp_path: Path, isolated_home: Path
+) -> None:
+    """A registry that cannot be written aborts before the crontab changes.
+
+    Here ``~/.claude_task_runner`` is a file, so creating the registry
+    fails with a real ``FileExistsError``. Installing the cron line
+    anyway would recreate the bug: a watchdog with no queue to manage."""
+    (isolated_home / ".claude_task_runner").write_text("", encoding="utf-8")
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_install_plan",
+            return_value=_cron_plan_mock(),
+        ),
+        patch("claude_task_runner.cli.install_cmd.cron_install.backup_crontab") as mock_backup,
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as mock_apply,
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 2
+    assert "watchdog registration failed" in result.stdout
+    mock_backup.assert_not_called()
+    mock_apply.assert_not_called()
+
+
+@pytest.mark.parametrize("init_system", ["systemd", "cron"])
+def test_install_missing_queue_dir_fails_before_any_change(
+    runner: CliRunner, tmp_path: Path, init_system: str
+) -> None:
+    """A typo'd ``--queue`` fails before any plan is shown or written.
+
+    The cron branch used to show its diff, ask to confirm, and only then
+    fail to register the queue. The systemd branch wrote and started a unit
+    for it. Registered, the next tick's restart would create the directory
+    and start a supervisor on an empty queue, which would hold the per-user
+    global lock."""
+    missing = tmp_path / "no-such-queue"
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value=init_system,
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.build_install_plan") as sd_plan,
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as sd_apply,
+        patch("claude_task_runner.cli.install_cmd.cron_install.build_install_plan") as cron_plan,
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as cron_apply,
+        patch(
+            "claude_task_runner.cli.install_cmd.shutil.which",
+            return_value="/usr/local/bin/claude-task-runner",
+        ),
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(missing)])
+    assert result.exit_code == 2
+    assert result.stdout == f"--queue is not an existing directory: {missing.resolve()}\n"
+    for mock in (sd_plan, sd_apply, cron_plan, cron_apply):
+        mock.assert_not_called()
+    assert not missing.exists()
+    assert not queues_registry_path().exists()
+
+
+def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """systemd restarts its own unit; the cron watchdog's registry stays empty."""
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="systemd",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.systemd_mod.build_install_plan",
+            return_value=_systemd_plan_mock(unit_path=tmp_path / "ctr.service"),
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
+        patch(
+            "claude_task_runner.cli.install_cmd.shutil.which",
+            return_value="/usr/local/bin/claude-task-runner",
+        ),
+    ):
+        result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    assert not queues_registry_path().exists()
+
+
+# ---------------------------------------------------------------------------
 # `uninstall`
 # ---------------------------------------------------------------------------
 
@@ -499,3 +708,140 @@ def test_uninstall_cron_apply_failure(runner: CliRunner, tmp_path: Path) -> None
         result = runner.invoke(app, ["uninstall", "--yes"])
     assert result.exit_code == 2
     assert "cron uninstall failed" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `uninstall` — the watchdog registry it leaves behind
+# ---------------------------------------------------------------------------
+
+
+def _block_plan() -> Any:
+    return MagicMock(
+        block_existed=True,
+        diff_lines=["- * * * * /watchdog.sh"],
+        existing_text="* * * * * /watchdog.sh\n",
+    )
+
+
+@contextmanager
+def _cron_uninstall_patched(plan: Any, backup_path: Path) -> Iterator[MagicMock]:
+    """Patch out the crontab I/O of ``uninstall``; yield the ``apply_plan`` mock."""
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_uninstall_plan",
+            return_value=plan,
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.backup_crontab",
+            return_value=backup_path,
+        ),
+        patch("claude_task_runner.cli.install_cmd.cron_install.apply_plan") as mock_apply,
+    ):
+        yield mock_apply
+
+
+def _registered(tmp_path: Path, *names: str) -> list[Path]:
+    queues = [tmp_path / name for name in names]
+    for q in queues:
+        q.mkdir()
+        register_queue(q)
+    return [q.resolve() for q in queues]
+
+
+def test_uninstall_lists_the_queues_the_registry_still_holds(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """A later cron install would manage them again, even one deleted since."""
+    queues = _registered(tmp_path, "a", "b")
+    queues[1].rmdir()
+    with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    assert result.stdout.splitlines()[-4:] == [
+        "crontab block removed.",
+        f"{queues_registry_path()} still lists 2 queues, and a later cron install "
+        "manages every queue it lists. To drop one:",
+        f"  claude-task-runner watchdog unregister --queue {queues[0]}",
+        f"  claude-task-runner watchdog unregister --queue {queues[1]}",
+    ]
+    # Listed, not removed.
+    assert load_registered_queues() == queues
+
+
+def test_uninstall_without_a_cron_block_lists_the_registry(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    (queue,) = _registered(tmp_path, "a")
+    with _cron_uninstall_patched(MagicMock(block_existed=False), tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-2:] == [
+        f"{queues_registry_path()} still lists 1 queue, and a later cron install "
+        "manages every queue it lists. To drop one:",
+        f"  claude-task-runner watchdog unregister --queue {queue}",
+    ]
+
+
+def test_uninstall_that_keeps_the_cron_block_does_not_list_the_registry(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The watchdog still runs, so its queues are in use, not left behind."""
+    _registered(tmp_path, "a")
+    with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt") as mock_apply:
+        result = runner.invoke(app, ["uninstall"], input="n\n")
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_not_called()
+    assert "still lists" not in result.stdout
+
+
+def test_uninstall_without_crontab_access_does_not_list_the_registry(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Whether a cron watchdog still runs is unknown, so nothing is said about its queues."""
+    from claude_task_runner.cron.install import CrontabError
+
+    _registered(tmp_path, "a")
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="cron",
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd.cron_install.build_uninstall_plan",
+            side_effect=CrontabError("not installed"),
+        ),
+    ):
+        result = runner.invoke(app, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "still lists" not in result.stdout
+
+
+def test_uninstall_with_an_empty_registry_says_nothing_about_it(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "crontab block removed."
+    assert not queues_registry_path().exists()
+
+
+def test_uninstall_reports_a_corrupt_registry_and_leaves_it(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    last = result.stdout.splitlines()[-1]
+    assert last.startswith(f"warning: corrupt queues registry at {registry} (")
+    assert last.endswith("); uninstall left it as it is.")
+    assert registry.read_text(encoding="utf-8") == "{not json"
+    assert sorted(p.name for p in registry.parent.iterdir()) == ["queues.json"]

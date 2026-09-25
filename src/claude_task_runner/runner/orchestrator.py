@@ -974,7 +974,6 @@ def _dispatch_one_safely(
             queue_dir=queue_dir,
             clock=clock,
             settings_caps=settings.task_caps,
-            settings_session=settings.session,
             settings_hooks=settings.hooks,
             settings_failure_classifier=settings.failure_classifier,
             settings_dispatch=settings.dispatch,

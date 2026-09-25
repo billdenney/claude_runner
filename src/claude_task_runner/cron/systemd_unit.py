@@ -7,9 +7,10 @@ machine.
 
 The supervisor runs as a long-lived ``simple`` service with
 ``Restart=on-failure``. Systemd handles backoff, exit-code tracking,
-and signals — we don't need our :mod:`cron.backoff` module under
-systemd, but it's still consulted by the watchdog timer for
-parity-of-policy if operators have BOTH installed.
+and signals, so we don't need our :mod:`cron.backoff` module under
+systemd. Nothing on the systemd path runs ``watchdog tick``, and a
+systemd ``install`` does not register its queue with the cron
+watchdog.
 
 When operators have neither systemd-as-PID-1 nor ``systemctl --user``
 working (e.g. inside Docker without a tmpfiles.d setup), we fall back
@@ -163,7 +164,8 @@ def build_unit_text(
       (SIGUSR1) and ``TimeoutStopSec`` stays generous (default 14400s =
       4h, matching ``[task_caps].max_duration_s_per_task``) so the
       graceful drain can finish the longest in-flight task before exit.
-      This is the historical PR-11 wiring, preserved bit-for-bit.
+      This is the historical PR-11 wiring, unchanged except for the
+      ``-`` prefix described below.
 
     In both cases ``KillMode=process`` keeps systemd from signalling the
     dispatched ``claude`` subprocesses if it ever escalates to SIGKILL
@@ -171,6 +173,18 @@ def build_unit_text(
     the surviving workers aren't killed on supervisor stop, and harmless
     for the drain path. Operators can override ``timeout_stop_sec``
     explicitly; when left ``None`` it defaults per the mode above.
+
+    Also in both cases, ``ExecStop`` carries systemd's ``-`` prefix, so
+    systemd ignores its exit status. systemd runs ExecStop even when the
+    supervisor has already exited on its own (``supervisor stop``, a
+    finished drain, or the STOPPED state). By then the supervisor has
+    removed its PID file, so ``supervisor stop`` and ``supervisor drain``
+    exit 1. Without the prefix, that exit 1 would leave the unit
+    ``failed (Result: exit-code)`` after every clean exit. It would also
+    make ``Restart=on-failure`` restart a supervisor that died of a
+    signal systemd counts as clean (SIGHUP, SIGINT, SIGTERM or SIGPIPE).
+    The restart would come from the failed ExecStop, not from how the
+    supervisor exited.
 
     For ``systemctl restart``, systemd runs ExecStop, waits for the main
     PID to exit, then starts the unit again. ``Restart=on-failure``
@@ -207,7 +221,11 @@ def build_unit_text(
         "Environment=PATH=%h/.local/bin:/usr/local/sbin:"
         "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
         f"ExecStart={supervisor_command}\n"
-        f"ExecStop={stop_command}\n"
+        # `-`: systemd ignores ExecStop's exit status (see docstring).
+        # After a clean exit the supervisor has removed its PID file, so
+        # ExecStop still runs and exits 1 ("No PID file"). Without the
+        # prefix that marks the unit failed after every clean exit.
+        f"ExecStop=-{stop_command}\n"
         f"WorkingDirectory={queue_dir}\n"
         # Stop wiring (see docstring): KillMode=process so dispatched
         # claude subprocesses are never signalled on supervisor stop —

@@ -19,7 +19,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.observability import configure_logging
@@ -241,7 +241,7 @@ def start(
       and the previous config stays active.
     """
     console = Console()
-    queue_path = queue_dir.resolve()
+    queue_path = require_queue_option(queue_dir, console)
     settings = load_settings(resolve_per_queue_config(config, queue_path))
     # Re-apply logging settings now that the queue's [logging] block has
     # been read. The CLI entry point's early configure runs before Typer

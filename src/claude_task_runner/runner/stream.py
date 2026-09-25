@@ -7,7 +7,7 @@ consumes those lines as they're produced to:
 1. Capture the ``session_id`` from the first ``system/init`` event so
    that subsequent attempts can ``--resume`` mid-task across rate-limit
    windows (ADR-0005).
-2. Update :class:`TokenUsage` aggregates for cap and EMA tracking.
+2. Update :class:`TokenUsage` aggregates for the per-task token cap.
 3. Emit timestamps so :mod:`runner.heartbeat` can flag silence.
 4. Surface the final ``result`` event's ``stop_reason`` and accumulated
    ``cost_usd`` for the :class:`RunRecord`.

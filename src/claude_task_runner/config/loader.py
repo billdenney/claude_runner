@@ -62,6 +62,83 @@ def _reject_legacy_throttle(payload: dict[str, Any], source: str) -> None:
         raise ConfigError(f"{source}: {_LEGACY_THROTTLE_MIGRATION_MSG}")
 
 
+_RETIRED_KEYS: dict[tuple[str, ...], str] = {
+    ("claude", "plan"): (
+        "selected a [plans.*] token budget, and nothing read those; the throttle "
+        "compares the utilization percentages /usage reports against "
+        "[dispatch_pct.*] (ADR-0022)"
+    ),
+    ("plans",): "token budgets nothing read; see [claude].plan",
+    ("usage", "healthcheck_interval_s"): (
+        "was the period of a background /usage healthcheck that nothing ever "
+        "scheduled; `claude-task-runner usage healthcheck` runs one on demand"
+    ),
+    ("usage", "suspicious_delta_pct"): (
+        "tuned a utilization monotonicity check that nothing ever called"
+    ),
+    ("session", "resume_fail_fast_s"): (
+        "timed a fast fall-through from a failed --resume that was never built; "
+        "a resume is retried until [session].max_resume_attempts, then goes fresh "
+        "(ADR-0005)"
+    ),
+    ("ema",): (
+        "the per-task-type EMA (ADR-0011) was never wired into dispatch and has "
+        "been removed; concurrency comes from [concurrency] and each account's "
+        "max_concurrency, throttled by [dispatch_pct.*]"
+    ),
+}
+"""Queue-TOML keys removed from the schema because no code ever read them.
+
+Maps each key's path to why it went. A one-segment path is a whole
+table. Every key here was inert while it existed, so deleting it from a
+TOML changes nothing, which is the one thing the operator needs to hear.
+"""
+
+
+def _retired_key_shown(path: tuple[str, ...]) -> str:
+    """``("claude", "plan")`` as an operator writes it: ``[claude].plan``.
+
+    A whole table shows as ``[plans.*]``, covering ``[plans]`` and every
+    ``[plans.<name>]`` sub-table.
+    """
+    if len(path) == 1:
+        return f"[{path[0]}.*]"
+    return f"[{'.'.join(path[:-1])}].{path[-1]}"
+
+
+def _has_path(payload: dict[str, Any], path: tuple[str, ...]) -> bool:
+    """Whether ``payload`` sets ``path``. A scalar where a table belongs
+    stops the walk: that is a type error for schema validation to report."""
+    node: Any = payload
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+
+def _reject_retired_keys(payload: dict[str, Any], source: str) -> None:
+    """Raise :class:`ConfigError` naming every retired key ``payload`` sets.
+
+    ``extra="forbid"`` would reject these keys anyway, but one at a time
+    and without saying that deleting them is safe. This names every
+    retired key in the file at once, with the reason it went. Called on
+    the queue TOML before defaults are merged, like
+    :func:`_reject_legacy_throttle`. The per-account TOML never accepted
+    any of these keys, so it needs no such check.
+    """
+    found = [
+        f"  {_retired_key_shown(path)}: {reason}"
+        for path, reason in _RETIRED_KEYS.items()
+        if _has_path(payload, path)
+    ]
+    if found:
+        raise ConfigError(
+            f"{source}: delete these retired settings. No code ever read them, "
+            "so removing them changes nothing:\n" + "\n".join(found)
+        )
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: nested dicts merge, scalars and lists overwrite."""
     out = dict(base)
@@ -91,7 +168,8 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
     Raises
     ------
     ConfigError
-        If the per-queue TOML doesn't exist, fails to parse, or the merged
+        If the per-queue TOML doesn't exist, fails to parse, sets a retired
+        key (``[throttle.*]`` or one in ``_RETIRED_KEYS``), or the merged
         settings fail schema validation.
     """
     merged = load_defaults()
@@ -105,6 +183,7 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
         except tomllib.TOMLDecodeError as exc:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
+        _reject_retired_keys(override, str(per_queue_toml))
         merged = _deep_merge(merged, override)
 
     try:

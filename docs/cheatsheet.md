@@ -166,6 +166,23 @@ of `origin/main` after a fetch, and `git status` is clean apart from
 `interval_s`, and set `[worktree_reclaim].lock_file` to your pre-dispatch
 hook's flock. See ADR-0034 and the runbook.
 
+### Change which queues the cron watchdog manages
+
+```sh
+claude-task-runner watchdog queues                       # one path per line; stderr warns about a missing one
+claude-task-runner watchdog register --queue <queue>     # add a queue (the directory must exist)
+claude-task-runner watchdog unregister --queue <queue>   # drop a queue (the directory need not exist)
+```
+
+A tick skips a registered queue that is not an existing directory and logs an
+`ERROR` line to `~/.claude_task_runner/watchdog.log` each minute. It keeps the
+entry, so a queue on a filesystem that was not mounted is managed again once it
+is. `claude-task-runner install uninstall` removes the crontab block but leaves
+`~/.claude_task_runner/queues.json`, so a later cron `install` manages every
+queue still listed. It prints those queues, each with the `unregister` command
+that drops it. See the runbook's
+[A registered queue was deleted or moved](runbook.md#a-registered-queue-was-deleted-or-moved).
+
 ### Stale branch cleanup
 
 ```sh
@@ -211,12 +228,14 @@ there needs tests of its own to hold the total above the gate.
 
 ## Add a new plan
 
-`[claude].plan` and the `[plans.*]` token budgets are schema-validated
-but **no runtime code reads them**. The throttle compares the
-utilization *percentages* that `claude /usage` reports against
-`[dispatch_pct.*]`, and those percentages are already relative to the
-account's tier. A new tier therefore needs no `[plans.*]` entry, and
-editing `plan` or `[plans.*]` needs neither a reload nor a restart.
+There is no plan setting. The throttle compares the utilization
+*percentages* that `claude /usage` reports against `[dispatch_pct.*]`,
+and those percentages are already relative to the account's tier, so a
+new tier needs no configuration of its own. `[claude].plan` and the
+`[plans.*]` token budgets were removed on 2026-09-25 because no runtime
+code ever read them. A `claude_runner.toml` that still sets either one
+fails to load with a message saying to delete it, and deleting it
+changes nothing.
 
 What matters is which account the supervisor dispatches through and
 polls. When the new tier is a different login:
@@ -245,6 +264,11 @@ polls. When the new tier is a different login:
    claude-task-runner supervisor drain   # no new dispatches; exits once in-flight tasks finish
    claude-task-runner supervisor start   # or let the cron watchdog restart it on its next tick
    ```
+
+   The cron watchdog restarts only the queues that
+   `claude-task-runner watchdog queues` lists. A cron `install` registers
+   its queue. If yours is missing, add it with
+   `claude-task-runner watchdog register --queue <queue>`.
 
    Under the systemd unit, use `systemctl --user restart claude-task-runner`
    instead. Its `ExecStop` keeps in-flight tasks: the new supervisor

@@ -1,7 +1,7 @@
 # ADR-0011: EMA-driven concurrency tuning (re-enabled)
 
 - **Date:** 2026-05-03
-- **Status:** accepted
+- **Status:** deprecated; never implemented (see the 2026-09-25 update)
 
 ## Context
 
@@ -54,3 +54,26 @@ EMA values persist to `<queue>/.claude_task_runner/ema.json`.
 
 High. Setting `[concurrency].max_concurrency = 1` and ignoring the EMA
 predictions is functionally equivalent to disabling EMA.
+
+## Update (2026-09-25)
+
+This decision was never implemented, and its code has been removed.
+`runner/ema.py` held the EMA and the blended predictions and was
+unit-tested, but no production code ever called `update_bucket`, so no
+queue ever wrote an `ema.json`. The dispatch-time formula above was not
+wired either. The predictions' only caller, `runner/runtime_stats.py`,
+was an end-of-week-push fitness check that nothing called, and ADR-0022
+removed the end-of-week push. The formula's denominator, the plan token
+budgets (`[claude].plan` and `[plans.*]`), was never read.
+
+Removed: the `[ema]` settings table (`alpha`, `prior_warmup_samples`,
+`runtime_p90_multiplier` and the `[ema.priors.*]` tables),
+`runner/ema.py`, `runner/runtime_stats.py` and the doctor's `ema` check.
+The loader rejects a queue TOML that still has an `[ema]` table, with a
+message saying to delete it. Deleting it changes nothing.
+
+Concurrency comes from `[concurrency]`: `initial_concurrency` until a
+first task completes in the queue, then `max_concurrency`. Each account's
+`runner-account.toml` caps its own share with `max_concurrency`. The
+ADR-0022 `[dispatch_pct.*]` policy throttles all of it from the
+utilization `/usage` reports.
