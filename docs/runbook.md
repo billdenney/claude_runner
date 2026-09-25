@@ -102,9 +102,10 @@ come back.
    `claude-task-runner supervisor stop`. The first tick after it exits
    restarts it, and `~/.claude_task_runner/watchdog.log` shows
    `verdict=restart`. Under systemd,
-   `systemctl --user status claude-task-runner` shows the unit active.
-   systemd restarts the supervisor 30s after a crash, but not after a
-   clean exit such as `supervisor stop`.
+   `systemctl --user status claude-task-runner` shows the unit active,
+   and `journalctl --user -u claude-task-runner` has its log. systemd
+   restarts the supervisor 30s after a crash, but not after a clean exit
+   such as `supervisor stop`.
 
 ## Cron watchdog installed, but the supervisor stays down
 
