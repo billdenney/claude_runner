@@ -2,14 +2,13 @@
 
 Every check is exercised across its PASS / WARN / FAIL branches. The
 checks that touch the filesystem (queue layout, state YAMLs,
-supervisor state, EMA) are tested with real tmp_path scaffolding; the
+supervisor state) are tested with real tmp_path scaffolding; the
 two that touch external state (``check_claude_binary`` PATH lookup,
 ``check_global_lock`` PID liveness) are mocked.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,7 +29,6 @@ from claude_task_runner.doctor.checks import (
     check_account_sudo,
     check_accounts,
     check_claude_binary,
-    check_ema,
     check_global_lock,
     check_legacy_claude_config_dir,
     check_legacy_runner_dir,
@@ -891,37 +889,6 @@ def test_check_supervisor_state_corrupt(settings: Settings, queue_dir: Path) -> 
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text("not json", encoding="utf-8")
     result = check_supervisor_state(settings, queue_dir)
-    assert result.status == CheckStatus.FAIL
-
-
-# ---------------------------------------------------------------------------
-# check_ema
-# ---------------------------------------------------------------------------
-
-
-def test_check_ema_no_file(settings: Settings, queue_dir: Path) -> None:
-    result = check_ema(settings, queue_dir)
-    assert result.status == CheckStatus.PASS
-    assert "cold start" in result.detail
-
-
-def test_check_ema_valid_file(settings: Settings, queue_dir: Path) -> None:
-    from claude_task_runner.runner.ema import EMA_FILE_NAME
-
-    ema_path = queue_dir / ".claude_task_runner" / EMA_FILE_NAME
-    ema_path.parent.mkdir(parents=True, exist_ok=True)
-    ema_path.write_text(json.dumps({"schema_version": 2, "buckets": {}}), encoding="utf-8")
-    result = check_ema(settings, queue_dir)
-    assert result.status == CheckStatus.PASS
-
-
-def test_check_ema_corrupt(settings: Settings, queue_dir: Path) -> None:
-    from claude_task_runner.runner.ema import EMA_FILE_NAME
-
-    ema_path = queue_dir / ".claude_task_runner" / EMA_FILE_NAME
-    ema_path.parent.mkdir(parents=True, exist_ok=True)
-    ema_path.write_text("not json", encoding="utf-8")
-    result = check_ema(settings, queue_dir)
     assert result.status == CheckStatus.FAIL
 
 

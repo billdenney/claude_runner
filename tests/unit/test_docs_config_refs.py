@@ -22,12 +22,13 @@ from typing import Any, get_args, get_origin
 import pytest
 from pydantic import BaseModel
 
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.config.schema import Settings
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 DOCS_DIR = REPO_ROOT / "docs"
 
-RETIRED_TABLES = {
+RETIRED_KEYS = {
     "throttle": (
         "ADR-0022 replaced [throttle.*] with [dispatch_pct.*]. Docs reference "
         "it deliberately: superseded ADRs 0015/0016 record it as history and "
@@ -35,13 +36,42 @@ RETIRED_TABLES = {
         "config.loader._reject_legacy_throttle hard-errors on the key, so an "
         "operator cannot silently resurrect it."
     ),
+    "claude.plan": (
+        "Never read by any runtime code; removed 2026-09-25. ADR-0022 records "
+        "the design that named it, and the cheat sheet's 'Add a new plan' "
+        "says it is gone."
+    ),
+    "plans": "Never read; removed with claude.plan, and documented alongside it.",
+    "session.resume_fail_fast_s": (
+        "Never read; removed 2026-09-25. ADR-0005 records the fall-through it "
+        "was meant to time, and its dated update says that was never built."
+    ),
+    "ema": (
+        "Never wired into dispatch; removed 2026-09-25. ADR-0011 (deprecated) "
+        "records the design, and its dated update says the table is gone."
+    ),
 }
-"""Tables that no longer exist but which docs may still name.
+"""Tables and fields that no longer exist but which docs may still name.
 
-Add an entry ONLY for a table that docs describe as retired/historical.
-A table an operator might still be told to *set* does not belong here --
-that is the bug this test exists to catch.
+A dotted entry covers itself and everything under it: ``"throttle"`` is
+the whole ``[throttle.*]`` tree, ``"claude.plan"`` one field. Add an
+entry ONLY for a key that docs describe as retired/historical. A key an
+operator might still be told to *set* does not belong here -- that is
+the bug this test exists to catch. Every entry must also be rejected by
+a loader guard that names it (checked below), so an operator who follows
+a stale mention gets told to delete the key.
 """
+
+
+def _is_retired(path: str) -> bool:
+    return any(path == key or path.startswith(f"{key}.") for key in RETIRED_KEYS)
+
+
+def _retired_shown(key: str) -> str:
+    """How the loader's messages write a retired key: ``[claude].plan``, ``[plans.*]``."""
+    table, _, field = key.rpartition(".")
+    return f"[{table}].{field}" if table else f"[{field}.*]"
+
 
 _PLACEHOLDER = re.compile(r"^(?:\*|<[^>]*>|\.\.\.|N|NNN)$")
 """A doc placeholder segment (``<model>``, ``*``). Unverifiable, so it
@@ -51,12 +81,13 @@ _INLINE_REF = re.compile(r"\[([a-z_][\w.]*)\]\.([a-z_][\w.<>]*)")
 """``[table].field`` written in prose -- the shape of both real bugs."""
 
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
-_SPAN_REF = re.compile(r"^\[\[?([a-z_][\w.]*?)(?:\.\*)?\]?\](?:\.([a-z_][\w.<>]*))?$")
+_SPAN_REF = re.compile(r"^\[\[?([a-z_][\w.<>]*?)(?:\.\*)?\]?\](?:\.([a-z_][\w.<>]*))?$")
 """A whole code span that is a config reference: `[queue]`,
-`[hooks].pre_dispatch_command`, `[ema.priors.<model>.<effort>]`."""
+`[hooks].pre_dispatch_command`, `[[accounts]]`, `[dispatch_pct.*]`,
+`[dispatch_pct.<band>]`."""
 
 _FENCE = re.compile(r"^```+\s*([a-zA-Z0-9_-]*)\s*$")
-_TOML_TABLE = re.compile(r"^\[\[?([a-z_][\w.]*)\]?\]$")
+_TOML_TABLE = re.compile(r"^\[\[?([a-z_][\w.<>]*)\]?\]$")
 _TOML_KEY = re.compile(r"^([a-z_][\w]*)\s*=")
 
 
@@ -149,6 +180,14 @@ def _doc_files() -> list[Path]:
     return sorted(DOCS_DIR.rglob("*.md"))
 
 
+class _Leaf(BaseModel):
+    depth: int
+
+
+class _ByTwoKeys(BaseModel):
+    table: dict[str, dict[str, _Leaf]]
+
+
 class TestSchemaWalker:
     """The matcher itself -- a broken checker would pass everything."""
 
@@ -162,15 +201,30 @@ class TestSchemaWalker:
         assert _is_known("accounts.config_dir")
 
     def test_resolves_through_nested_dict_keys(self) -> None:
-        # priors is dict[str, dict[str, EMAPrior]]: two operator-chosen keys.
-        assert _is_known("ema.priors.opus.high.duration_s")
+        # No live table nests two operator-chosen keys since [ema.priors]
+        # went, so a stand-in model keeps this branch covered.
+        assert _matches(_ByTwoKeys, ("table", "opus", "high", "depth"))
+        assert not _matches(_ByTwoKeys, ("table", "opus", "high", "nope"))
+
+    def test_resolves_through_a_dict_of_lists(self) -> None:
+        # effort_levels is dict[str, list[str]]: the model name is the key.
+        assert _is_known("effort_levels.claude-opus-5-5")
 
     def test_placeholder_segment_terminates(self) -> None:
-        assert _is_known("ema.priors.<model>.<effort>")
+        # dispatch_pct is a model, not a dict: only the placeholder rule
+        # lets "<band>" through.
+        assert _is_known("dispatch_pct.<band>.fivehr_stop_pct")
+        assert not _is_known("dispatch_pct.band.fivehr_stop_pct")
 
     def test_rejects_deleted_table(self) -> None:
         assert not _is_known("sidecar.unanswered_auto_recommended_s")
         assert not _is_known("notify.channels")
+        assert not _is_known("plans.max20x.weekly_tokens")
+        assert not _is_known("ema.priors.<model>.<effort>")
+
+    def test_rejects_deleted_field_on_real_table(self) -> None:
+        assert _is_known("claude.config_dir")
+        assert not _is_known("claude.plan")
 
     def test_rejects_unknown_field_on_real_table(self) -> None:
         assert not _is_known("queue.no_such_field")
@@ -196,6 +250,19 @@ class TestDocRefExtraction:
         assert (2, "dispatch_pct.week") in refs
         assert (3, "dispatch_pct.week.eow_time_switch") in refs
 
+    def test_extracts_a_table_with_placeholder_segments(self) -> None:
+        # docs/architecture.md said "edit `[ema.priors.<model>.<effort>]`";
+        # until 2026-09-25 this shape was not extracted, so the gate could
+        # not have flagged it once [ema] was gone.
+        assert _iter_doc_refs("edit `[ema.priors.<model>.<effort>]` per queue") == [
+            (1, "ema.priors.<model>.<effort>")
+        ]
+        block = "```toml\n[plans.<tier>]\nweekly_tokens = 1\n```"
+        assert _iter_doc_refs(block) == [(2, "plans.<tier>"), (3, "plans.<tier>.weekly_tokens")]
+
+    def test_extracts_an_array_of_tables(self) -> None:
+        assert _iter_doc_refs("one `[[accounts]]` block per login") == [(1, "accounts")]
+
     def test_ignores_non_toml_fence(self) -> None:
         assert _iter_doc_refs("```bash\n[notify].channels\n```") == []
 
@@ -214,7 +281,7 @@ class TestDocsMatchSchema:
     def test_every_config_reference_exists(self, doc: Path) -> None:
         bad: list[str] = []
         for lineno, path in _iter_doc_refs(doc.read_text()):
-            if path.split(".")[0] in RETIRED_TABLES or _is_known(path):
+            if _is_retired(path) or _is_known(path):
                 continue
             table, _, field = path.partition(".")
             shown = f"[{table}].{field}" if field else f"[{table}]"
@@ -225,6 +292,34 @@ class TestDocsMatchSchema:
             "following these would get a config that refuses to load.\n"
             + "\n".join(bad)
             + "\nFix the docs, add the field to config/schema.py, or -- only "
-            "for a table docs describe as retired -- add it to "
-            "RETIRED_TABLES in this file."
+            "for a key docs describe as retired -- add it to "
+            "RETIRED_KEYS in this file."
         )
+
+
+class TestRetiredKeys:
+    def test_an_entry_covers_itself_and_what_is_under_it(self) -> None:
+        assert _is_retired("throttle")
+        assert _is_retired("throttle.five_hour.band_slowdown_max_pct")
+        assert _is_retired("claude.plan")
+        assert not _is_retired("claude.config_dir")
+        assert not _is_retired("claude")
+        # A prefix match on whole segments only.
+        assert not _is_retired("plansx")
+        assert not _is_retired("claude.planned")
+
+    def test_shown_like_the_loader_messages(self) -> None:
+        assert _retired_shown("throttle") == "[throttle.*]"
+        assert _retired_shown("claude.plan") == "[claude].plan"
+
+    @pytest.mark.parametrize("key", sorted(RETIRED_KEYS))
+    def test_the_loader_rejects_it_by_name(self, key: str, tmp_path: Path) -> None:
+        # Docs may keep naming a retired key only because an operator who
+        # follows a stale mention is told to delete it. A plain
+        # extra="forbid" rejection would not name it as [table].field, so
+        # this fails unless a dedicated guard fired.
+        table, _, field = key.rpartition(".")
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(f"[{table}]\n{field} = 1\n" if table else f"[{field}]\n")
+        with pytest.raises(ConfigError, match=re.escape(_retired_shown(key))):
+            load_settings(toml)

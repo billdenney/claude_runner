@@ -11,7 +11,6 @@ from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.runner.session import (
     CONTINUATION_PROMPT,
     ResumeStrategy,
-    fall_through_to_fresh,
     plan_next_spawn,
     session_jsonl_exists,
 )
@@ -27,8 +26,8 @@ def task() -> Task:
     )
 
 
-def _settings(*, max_attempts: int = 3, fail_fast: float = 5) -> SessionSettings:
-    return SessionSettings(max_resume_attempts=max_attempts, resume_fail_fast_s=fail_fast)
+def _settings(*, max_attempts: int = 3) -> SessionSettings:
+    return SessionSettings(max_resume_attempts=max_attempts)
 
 
 @pytest.fixture
@@ -118,38 +117,3 @@ class TestPlanNextSpawn:
             extra_args=["--debug"],
         )
         assert plan.extra_args == ["--debug"]
-
-
-class TestFallThrough:
-    def test_resume_becomes_fresh(self) -> None:
-        plan = (
-            fall_through_to_fresh.__wrapped__
-            if hasattr(fall_through_to_fresh, "__wrapped__")
-            else fall_through_to_fresh
-        )
-        # Manually construct a RESUME plan
-        from claude_task_runner.runner.session import SpawnPlan
-
-        resume = SpawnPlan(
-            strategy=ResumeStrategy.RESUME,
-            session_id="sess-abc",
-            prompt=CONTINUATION_PROMPT,
-            extra_args=["--model", "claude-opus-4-7"],
-        )
-        fresh = plan(resume, "ORIGINAL")
-        assert fresh.strategy is ResumeStrategy.FRESH
-        assert fresh.session_id is None
-        assert fresh.prompt == "ORIGINAL"
-        assert fresh.extra_args == ["--model", "claude-opus-4-7"]
-
-    def test_fresh_passes_through(self) -> None:
-        from claude_task_runner.runner.session import SpawnPlan
-
-        original = SpawnPlan(
-            strategy=ResumeStrategy.FRESH,
-            session_id=None,
-            prompt="P",
-            extra_args=[],
-        )
-        result = fall_through_to_fresh(original, "different")
-        assert result is original

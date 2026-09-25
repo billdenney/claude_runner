@@ -70,7 +70,6 @@ A working minimum:
 # claude_runner.toml — minimal queue config
 
 [claude]
-plan = "max20x"     # or "max5x" | "pro" | "team_standard" | "team_premium"
 # config_dir = ""   # CLAUDE_CONFIG_DIR override. Empty (default) = ~/.claude.
                     # Set to e.g. "/home/bill/.claude_personal" if `claude
                     # /login` for the dispatching account was run under a
@@ -80,7 +79,7 @@ plan = "max20x"     # or "max5x" | "pro" | "team_standard" | "team_premium"
 
 [concurrency]
 max_concurrency     = 2
-initial_concurrency = 1   # cap until the EMA has warmed up
+initial_concurrency = 1   # cap until a first task completes in this queue
 
 [hooks]
 # Pre-dispatch: create the worktree (or any other per-task setup).
@@ -92,8 +91,10 @@ post_dispatch_command  = ""
 post_dispatch_timeout_s = 60
 ```
 
-That's enough. Plan-derived 5h/weekly throttle thresholds and EMA priors
-come from the defaults.
+That's enough. The 5h and weekly throttle thresholds (`[dispatch_pct.*]`)
+and every other setting come from the defaults. There is no plan setting:
+the throttle works from the utilization percentages `claude /usage`
+reports, which are already relative to the account's tier.
 
 If your pre-dispatch hook creates a git worktree per task, the runner will not
 remove those worktrees on its own. `claude-task-runner worktree reclaim`

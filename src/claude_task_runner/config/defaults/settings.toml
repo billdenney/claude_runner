@@ -14,13 +14,6 @@ config_dir = ""        # LEGACY single-account alias; superseded by [[accounts]]
                        # emits a WARN). Operators with a bare [claude] block
                        # keep working: the loader synthesises a single account
                        # named "default" from this field.
-plan       = "max20x"  # Claude plan: "max20x" | "max5x" | "pro" |
-                       # "team_standard" | "team_premium".
-                       # Determines the 5h:weekly token ratio used to derive
-                       # default throttle thresholds. Operator can still
-                       # override `[throttle.*]` fields explicitly below.
-                       # If empty / unrecognised, the explicit `[throttle.*]`
-                       # values are used as-is (no auto-tuning).
 
 # ---------------------------------------------------------------------------
 # Claude accounts (multi-account dispatch)
@@ -113,8 +106,6 @@ capture_post_ready_pad_ms   = 1500      # delay after "shortcuts" before /usage
 capture_post_data_pad_ms    = 4000      # delay after 2nd Resets so OAuth response lands
 capture_rotation_count      = 200       # raw .cap files retained
 poll_interval_s             = 60        # supervisor ticks
-healthcheck_interval_s      = 3600      # standalone drift canary
-suspicious_delta_pct        = 50        # flag if util jumps > N points between polls
 drift_recovery_clean_polls  = 3         # consecutive clean polls to leave ErrorDrift
 
 # ---------------------------------------------------------------------------
@@ -153,125 +144,11 @@ eow_pct         = 95          # target % at week reset
 eow_time_switch = "40h"       # length of EOW segment (~2 nights)
 
 # ---------------------------------------------------------------------------
-# Plan-specific token budgets
-#
-# When `[claude].plan` is one of the keys below, the loader uses the
-# plan's `five_hour_tokens` and `weekly_tokens` as the source of truth
-# for the supervisor's window budgets. Dispatch shape lives entirely in
-# `[dispatch_pct.*]` (ADR-0022); plans no longer carry band hints.
-#
-# Rows are approximate ceilings observed on each plan; verify against
-# `claude /usage` for the target account before relying on them.
-# ---------------------------------------------------------------------------
-[plans.max20x]
-five_hour_tokens = 99_000_000
-weekly_tokens    = 798_841_951
-
-[plans.max5x]
-five_hour_tokens = 24_750_000     # ~1/4 of Max20x
-weekly_tokens    = 199_710_488
-
-[plans.pro]
-five_hour_tokens = 4_950_000      # ~1/20 of Max20x
-weekly_tokens    = 39_942_098
-
-[plans.team_standard]
-# Team Standard: operator-noted ratio 1.25 x Pro.
-five_hour_tokens = 6_187_500
-weekly_tokens    = 49_927_622
-
-[plans.team_premium]
-# Team Premium: operator-noted ratio 6.25 x Pro.
-five_hour_tokens = 30_937_500
-weekly_tokens    = 249_638_112
-
-# ---------------------------------------------------------------------------
-# Concurrency / EMA
+# Concurrency
 # ---------------------------------------------------------------------------
 [concurrency]
 max_concurrency             = 2
 initial_concurrency         = 1
-
-[ema]
-alpha                       = 0.3
-prior_warmup_samples        = 3
-runtime_p90_multiplier      = 1.5
-
-# Conservative cold-start priors per (model, effort). Override per queue.
-[ema.priors."claude-opus-5".low]
-tokens                      = 1_500_000
-duration_s                  = 600
-
-[ema.priors."claude-opus-5".medium]
-tokens                      = 2_500_000
-duration_s                  = 1200
-
-[ema.priors."claude-opus-5".high]
-tokens                      = 3_000_000
-duration_s                  = 1800
-
-[ema.priors."claude-opus-5".max]
-tokens                      = 6_000_000
-duration_s                  = 3600
-
-[ema.priors."claude-opus-5".extra_high]
-tokens                      = 10_000_000
-duration_s                  = 7200
-
-# Opus 5.5 (the default model since 2026-09-24): priors copied from claude-opus-5;
-# over-estimating only makes the dispatcher pace more conservatively until the
-# EMA converges on the real figures.
-[ema.priors."claude-opus-5-5".low]
-tokens                      = 1_500_000
-duration_s                  = 600
-
-[ema.priors."claude-opus-5-5".medium]
-tokens                      = 2_500_000
-duration_s                  = 1200
-
-[ema.priors."claude-opus-5-5".high]
-tokens                      = 3_000_000
-duration_s                  = 1800
-
-[ema.priors."claude-opus-5-5".max]
-tokens                      = 6_000_000
-duration_s                  = 3600
-
-[ema.priors."claude-opus-5-5".extra_high]
-tokens                      = 10_000_000
-duration_s                  = 7200
-
-[ema.priors."claude-sonnet-5".medium]
-tokens                      = 1_000_000
-duration_s                  = 600
-
-[ema.priors."claude-opus-4-7".low]
-tokens                      = 1_500_000
-duration_s                  = 600
-
-[ema.priors."claude-opus-4-7".medium]
-tokens                      = 2_500_000
-duration_s                  = 1200
-
-[ema.priors."claude-opus-4-7".high]
-tokens                      = 3_000_000
-duration_s                  = 1800
-
-[ema.priors."claude-opus-4-7".max]
-tokens                      = 6_000_000
-duration_s                  = 3600
-
-[ema.priors."claude-opus-4-7".extra_high]
-tokens                      = 10_000_000
-duration_s                  = 7200
-
-[ema.priors."claude-sonnet-4-6".medium]
-tokens                      = 1_000_000
-duration_s                  = 600
-
-[ema.priors."claude-haiku-4-5".medium]
-tokens                      = 500_000
-duration_s                  = 300
 
 # ---------------------------------------------------------------------------
 # Effort levels per model (varies; updated as Anthropic adds/removes levels)
@@ -290,8 +167,7 @@ duration_s                  = 300
 # Session resume
 # ---------------------------------------------------------------------------
 [session]
-max_resume_attempts         = 3
-resume_fail_fast_s          = 5
+max_resume_attempts         = 3         # every --resume counts; at the cap, dispatch fresh
 
 # ---------------------------------------------------------------------------
 # Failure classifier (extensible via TOML)
