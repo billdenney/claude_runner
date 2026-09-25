@@ -145,6 +145,23 @@ mapping table below is the migration recipe.
 Run `claude-task-runner doctor` to list any TOML still carrying a
 legacy block.
 
+### Reclaim finished tasks' worktrees
+
+```sh
+# Dry run: list every task worktree as would / keep (with the reason) / FAIL
+claude-task-runner worktree reclaim --queue <queue>
+
+# Remove the completed, merged, clean ones (and their local branches, git branch -d)
+claude-task-runner worktree reclaim --queue <queue> --apply
+```
+
+A worktree goes only when its task is `completed`, its branch is an ancestor
+of `origin/main` after a fetch, and `git status` is clean apart from
+`[worktree_reclaim].discardable_untracked`. Set
+`[worktree_reclaim].periodic = true` to have the supervisor do this every
+`interval_s`, and set `[worktree_reclaim].lock_file` to your pre-dispatch
+hook's flock. See ADR-0034 and the runbook.
+
 ### Stale branch cleanup
 
 ```sh

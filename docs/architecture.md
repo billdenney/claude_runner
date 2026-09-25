@@ -7,27 +7,27 @@ introduces a new on-disk file MUST update this document in the same PR.
 ## Component map
 
 ```
-+----------------------------------------------------------------+
-|                        CLI (cli/)                              |
-|   typer-based entry; dispatches to subcommands per concern     |
-+--+------+----------+-----------+---------+--------+------------+
-   |      |          |           |         |        |
-   v      v          v           v         v        v
-+-----+ +------+ +--------+ +--------+ +-------+ +-------+
-|usage| |queue | |runner  | |sup-    | |cron / | |doctor |
-|     | |      | |        | |ervisor | |systemd| |       |
-+-----+ +------+ +--------+ +--------+ +-------+ +-------+
-   |      |          |           |
-   |      |          v           |
-   |      |      +------+        |
-   |      |      | EMA  |        |
-   |      |      +------+        |
-   |      |                      |
-   v      v                      v
-+----------------+      +-------------------+
-| YAML state     |      | UsageSource       |
-| (queue/store)  |      | (usage/source)    |
-+----------------+      +-------------------+
++--------------------------------------------------------------------+
+|                        CLI (cli/)                                  |
+|   typer-based entry; dispatches to subcommands per concern         |
++--+------+----------+-----------+---------+--------+----------+-----+
+   |      |          |           |         |        |          |
+   v      v          v           v         v        v          v
++-----+ +------+ +--------+ +--------+ +-------+ +-------+ +--------+
+|usage| |queue | |runner  | |sup-    | |cron / | |doctor | |worktree|
+|     | |      | |        | |ervisor | |systemd| |       | |reclaim |
++-----+ +------+ +--------+ +--------+ +-------+ +-------+ +--------+
+   |      |          |           |                             |
+   |      |          v           |                             |
+   |      |      +------+        |                             |
+   |      |      | EMA  |        |                             |
+   |      |      +------+        |                             |
+   |      |                      |                             |
+   v      v                      v                             v
++----------------+      +-------------------+         +---------------+
+| YAML state     |      | UsageSource       |         | git: per-task |
+| (queue/store)  |      | (usage/source)    |         | worktrees     |
++----------------+      +-------------------+         +---------------+
                                  |
                                  v
                          +-------------+
@@ -71,6 +71,13 @@ introduces a new on-disk file MUST update this document in the same PR.
 9. On task failure: `runner.retry` classifies the error
    (environmental | operator | task | unknown). Environmental → auto-retry.
    Other → surface to operator.
+10. After the task's branch has been merged into the parent branch (e.g. by
+    the `runner-merge-claude-branches` consolidation), `worktree.reclaim`
+    removes the task's worktree and local branch (ADR-0034). It runs from
+    `claude-task-runner worktree reclaim` on demand, or from the supervisor
+    loop every `[worktree_reclaim].interval_s` when
+    `[worktree_reclaim].periodic` is on. The runner still never *creates* a
+    worktree; that stays the pre-dispatch hook's job (ADR-0013).
 
 ## State machine summary
 
@@ -172,6 +179,11 @@ These properties are never violated; tests and assertions enforce them.
    requires `usage.drift_recovery_clean_polls` consecutive clean readings to recover.
 8. **Atomic writes for state files** — every YAML/JSON state write is via
    tempfile + `os.replace` to prevent torn reads.
+9. **A task worktree is removed only when nothing in it can be lost** — the
+   task is `completed` and not in flight, its branch is an ancestor of
+   `<remote>/<parent_branch>` right after a fetch, and `git status` is clean
+   apart from allow-listed untracked paths. The branch goes with
+   `git branch -d`, never `-D`. See ADR-0034.
 
 ## Extension points
 
@@ -181,6 +193,9 @@ Operators extend behavior without code changes:
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.
+- **Worktree reclamation**: `[worktree_reclaim]` sets the branch template,
+  parent branch, disposable untracked paths, the hook's lock file, and the
+  opt-in periodic supervisor pass (ADR-0034).
 - **EMA priors per (model, effort)**: edit `[ema.priors.<model>.<effort>]`.
 - **Task templates**: drop Jinja2 templates into
   `~/.claude_task_runner/templates/` or per-queue `templates/`.
