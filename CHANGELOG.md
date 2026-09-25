@@ -33,6 +33,21 @@ Breaking changes are called out in the version notes.
   `%` directives, which `SafeLoader` accepted. The runner's own writers never
   emit any of these, and no file in that queue parses differently.
 
+### Removed
+
+- **The unused `supervisor/window.py` module and its tests.** No module
+  imported it, at module level or inside a function, so neither the CLI nor
+  the supervisor daemon nor the runner could reach it. Its contents either
+  live elsewhere or belonged to removed behavior. `schedule_window_start_wakeup`
+  duplicated `throttle.decision._next_5h_reset_wakeup`, which is what actually
+  schedules the wakeup after a 5-hour reset; that path is unchanged.
+  `in_eow_push_window` served the end-of-week push that ADR-0022 removed.
+  `crossed_reset`, `crossed_reset_5h` and `crossed_reset_weekly` were the reset
+  detection for `usage.drift.validate_monotonicity`, which nothing calls.
+  `time_until_reset_s` had no caller, and the module's `FIVE_HOUR_LENGTH_S` and
+  `SEVEN_DAY_LENGTH_S` duplicated `throttle.decision.FIVE_HOUR_LENGTH_S` and
+  `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
+
 ### Fixed
 
 - **A deeply nested queue YAML is now a `QueueSchemaError` instead of a crash
