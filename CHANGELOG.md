@@ -133,15 +133,17 @@ Breaking changes are called out in the version notes.
   checked on systemd 255 by running the generated unit text as transient
   user units, with the real `supervisor stop` and `supervisor drain` as
   `ExecStop`. A unit installed before this change keeps its old `ExecStop`
-  until you re-run `claude-task-runner install`.
+  until you re-run `claude-task-runner install`. Step 3 of the runbook's
+  "Cron / systemd watchdog not installed" now describes both kinds of unit.
 
 - **The runbook gives a safe way to test the systemd restart.** Step 3 of
   "Cron / systemd watchdog not installed" said systemd restarts the
   supervisor after a crash but gave no way to check it, and the obvious
   tests mislead. `kill <pid>` and `supervisor stop` send SIGTERM; the
-  supervisor exits 0 and `RestartPreventExitStatus=0` leaves it down. The
-  unit also shows `failed (Result: exit-code)`, because its ExecStop runs
-  after the supervisor has gone and exits 1.
+  supervisor exits 0 and `RestartPreventExitStatus=0` leaves it down. A
+  unit installed before the ExecStop fix above also shows
+  `failed (Result: exit-code)`, because its ExecStop runs after the
+  supervisor has gone and exits 1.
   `systemctl --user kill --signal=KILL` does crash it, but its default
   `--kill-whom=all` also SIGKILLs every in-flight `claude` worker in the
   unit's cgroup. The step now uses
