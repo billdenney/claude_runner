@@ -150,7 +150,7 @@ Global (cross-queue):
 ~/.claude_task_runner/
 ├── global.lock                     # fcntl lock; single supervisor across queues
 ├── queues.json                     # queues the cron watchdog manages
-│                                   #   (`watchdog register`)
+│                                   #   (cron `install`, `watchdog register`)
 ├── watchdog_state.json             # cron watchdog restart history + backoff
 ├── watchdog.log                    # cron watchdog output (watchdog.sh)
 ├── usage_captures/<ts>.cap         # raw PTY captures from the `usage` CLI

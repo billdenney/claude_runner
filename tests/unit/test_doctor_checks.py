@@ -9,6 +9,8 @@ two that touch external state (``check_claude_binary`` PATH lookup,
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +19,7 @@ import pytest
 
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import AccountSettings, Settings
+from claude_task_runner.cron.registry import queues_registry_path, register_queue
 from claude_task_runner.doctor.checks import (
     CheckStatus,
     _current_username,
@@ -926,19 +929,21 @@ def test_check_skills_installed_some_missing(settings: Settings, tmp_path: Path)
 # ---------------------------------------------------------------------------
 
 
-def test_check_watchdog_systemd_present(settings: Settings, tmp_path: Path) -> None:
+def test_check_watchdog_systemd_present(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
     fake_unit = tmp_path / "claude-task-runner.service"
     fake_unit.write_text("[Unit]\n", encoding="utf-8")
     with patch(
         "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
         return_value=fake_unit,
     ):
-        result = check_watchdog_installed(settings)
+        result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.PASS
-    assert "systemd" in result.detail
+    assert result.detail == "systemd watchdog detected"
 
 
-def test_check_watchdog_none(settings: Settings, tmp_path: Path) -> None:
+def test_check_watchdog_none(settings: Settings, tmp_path: Path, queue_dir: Path) -> None:
     """No systemd unit and an empty crontab (legitimate 'no crontab') →
     WARN reporting that no watchdog is installed at all."""
     with (
@@ -951,7 +956,7 @@ def test_check_watchdog_none(settings: Settings, tmp_path: Path) -> None:
             return_value="",  # crontab_l's legitimate "no crontab" signal
         ),
     ):
-        result = check_watchdog_installed(settings)
+        result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.WARN
     assert "no watchdog" in result.detail
     # The legitimate-empty case must NOT mention a probe failure.
@@ -959,7 +964,7 @@ def test_check_watchdog_none(settings: Settings, tmp_path: Path) -> None:
 
 
 def test_check_watchdog_crontab_error_distinguished_from_missing(
-    settings: Settings, tmp_path: Path
+    settings: Settings, tmp_path: Path, queue_dir: Path
 ) -> None:
     """A CrontabError (operational failure reading the crontab) must NOT be
     reported as 'no watchdog detected' (audit finding): the check can't
@@ -978,7 +983,7 @@ def test_check_watchdog_crontab_error_distinguished_from_missing(
             side_effect=CrontabError("'crontab' not found on PATH"),
         ),
     ):
-        result = check_watchdog_installed(settings)
+        result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.WARN
     # Distinguishing detail: an inspection failure, not a clean "not installed".
     assert "could not inspect crontab" in result.detail
@@ -989,26 +994,115 @@ def test_check_watchdog_crontab_error_distinguished_from_missing(
     assert result.remediation != ""
 
 
-def test_check_watchdog_cron_present(settings: Settings, tmp_path: Path) -> None:
-    """systemd absent; cron has the managed block → PASS (cron).
+CRONTAB_WITH_BLOCK = "# BEGIN claude_task_runner\n* * * * * /bin/true\n# END claude_task_runner\n"
+"""A crontab holding the managed block. The markers use underscores per
+BEGIN_MARKER / END_MARKER in cron/install.py."""
 
-    The markers use underscores per BEGIN_MARKER / END_MARKER in
-    cron/install.py — # BEGIN claude_task_runner / # END claude_task_runner.
-    """
-    crontab_content = "# BEGIN claude_task_runner\n* * * * * /bin/true\n# END claude_task_runner\n"
+
+@pytest.fixture
+def watchdog_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An isolated ``~`` so the cron checks read a test registry, never the real one."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@contextmanager
+def _watchdog_probes(unit_path: Path, crontab: str = CRONTAB_WITH_BLOCK) -> Iterator[None]:
+    """Point the systemd probe at ``unit_path`` and make ``crontab -l`` print ``crontab``."""
     with (
         patch(
             "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
-            return_value=tmp_path / "nonexistent.service",
+            return_value=unit_path,
         ),
-        patch(
-            "claude_task_runner.cron.install.crontab_l",
-            return_value=crontab_content,
-        ),
+        patch("claude_task_runner.cron.install.crontab_l", return_value=crontab),
     ):
-        result = check_watchdog_installed(settings)
+        yield
+
+
+def test_check_watchdog_cron_present_and_queue_registered(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """systemd absent; cron has the managed block and lists this queue → PASS (cron)."""
+    register_queue(queue_dir)
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.PASS
-    assert "cron" in result.detail
+    assert result.detail == "cron watchdog detected; this queue is registered"
+
+
+def test_check_watchdog_cron_present_but_queue_unregistered(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """Regression: a cron block with an empty registry used to PASS.
+
+    Before ``install`` registered its queue, every cron install looked
+    like this, and no tick ever restarted the supervisor."""
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    queue = queue_dir.resolve()
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"cron watchdog detected, but {queues_registry_path()} does not list this queue, "
+        "so no tick restarts its supervisor"
+    )
+    assert result.remediation == (
+        f"Run `claude-task-runner watchdog register --queue {queue}`, "
+        f"or re-run `claude-task-runner install --queue {queue}`."
+    )
+
+
+def test_check_watchdog_cron_registry_lists_other_queues_only(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    other = tmp_path / "other-queue"
+    other.mkdir()
+    register_queue(other)
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert "does not list this queue" in result.detail
+
+
+def test_check_watchdog_cron_corrupt_registry_reported_without_side_effects(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """A corrupt registry is reported as unreadable, not as "not registered".
+
+    doctor reads it with the strict reader: the file stays as it was and
+    no ``queues.json.broken`` copy appears, unlike a watchdog tick."""
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert result.detail.startswith(
+        f"cron watchdog detected, but its queue registry is unreadable: "
+        f"corrupt queues registry at {registry}"
+    )
+    assert result.remediation == (
+        f"Fix or remove {registry}, then run "
+        f"`claude-task-runner watchdog register --queue {queue_dir.resolve()}`."
+    )
+    assert registry.read_text(encoding="utf-8") == "{not json"
+    assert sorted(p.name for p in registry.parent.iterdir()) == ["queues.json"]
+
+
+def test_check_watchdog_systemd_unit_skips_the_cron_registry(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """systemd restarts its own unit, so the cron registry is not consulted."""
+    fake_unit = tmp_path / "claude-task-runner.service"
+    fake_unit.write_text("[Unit]\n", encoding="utf-8")
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    with _watchdog_probes(fake_unit):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert result.detail == "systemd watchdog detected"
 
 
 # ---------------------------------------------------------------------------

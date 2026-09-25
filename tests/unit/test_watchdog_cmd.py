@@ -1,4 +1,6 @@
-"""Tests for cli.watchdog_cmd — registry + tick decision wiring."""
+"""Tests for cli.watchdog_cmd — its subcommands and the tick's decision wiring.
+
+The registry the tick walks is tested in ``test_cron_registry.py``."""
 
 from __future__ import annotations
 
@@ -9,9 +11,8 @@ import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.cli import watchdog_cmd
-from claude_task_runner.cli.watchdog_cmd import (
-    _spawn_supervisor,
-    app,
+from claude_task_runner.cli.watchdog_cmd import _spawn_supervisor, app
+from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
     register_queue,
@@ -31,39 +32,6 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-class TestRegistry:
-    def test_register_and_load(self, isolated_home: Path) -> None:
-        queue = isolated_home / "queue1"
-        queue.mkdir()
-        register_queue(queue)
-        out = load_registered_queues()
-        assert out == [queue.resolve()]
-
-    def test_register_idempotent(self, isolated_home: Path) -> None:
-        queue = isolated_home / "queue1"
-        queue.mkdir()
-        register_queue(queue)
-        register_queue(queue)
-        register_queue(queue)
-        assert len(load_registered_queues()) == 1
-
-    def test_register_multiple_queues(self, isolated_home: Path) -> None:
-        for name in ("a", "b", "c"):
-            (isolated_home / name).mkdir()
-            register_queue(isolated_home / name)
-        out = load_registered_queues()
-        assert len(out) == 3
-
-    def test_load_missing_returns_empty(self, isolated_home: Path) -> None:
-        assert load_registered_queues() == []
-
-    def test_load_corrupt_returns_empty(self, isolated_home: Path) -> None:
-        path = queues_registry_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{not json")
-        assert load_registered_queues() == []
-
-
 class TestRegisterCommand:
     def test_register_via_cli(self, runner: CliRunner, isolated_home: Path) -> None:
         queue = isolated_home / "q"
@@ -72,6 +40,17 @@ class TestRegisterCommand:
         assert result.exit_code == 0
         assert str(queue) in result.stdout
         assert load_registered_queues() == [queue.resolve()]
+
+    def test_register_missing_directory_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        missing = isolated_home / "no-such-queue"
+        result = runner.invoke(app, ["register", "--queue", str(missing)])
+        assert result.exit_code == 2
+        expected = f"register failed: not an existing directory: {missing.resolve()}"
+        assert expected in result.stderr
+        assert "registered:" not in result.stdout
+        assert not queues_registry_path().exists()
 
 
 class TestQueuesCommand:
@@ -246,59 +225,3 @@ class TestSpawnSupervisor:
         assert pid == 7
         argv = mock_popen.call_args.args[0]
         assert "--config" not in argv
-
-
-class TestCorruptRegistryBackup:
-    """Audit finding 2: a corrupt registry must be logged + backed up,
-    not silently reset to empty."""
-
-    def test_corrupt_json_logs_and_backs_up(
-        self,
-        isolated_home: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        path = queues_registry_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{not json", encoding="utf-8")
-
-        with caplog.at_level("ERROR", logger="claude_task_runner.cli.watchdog_cmd"):
-            out = load_registered_queues()
-
-        assert out == []
-        # A .broken backup must be written alongside the original.
-        backup = path.with_suffix(path.suffix + ".broken")
-        assert backup.exists()
-        assert backup.read_text(encoding="utf-8") == "{not json"
-        # And the failure must be logged at ERROR with the path.
-        assert any(
-            record.levelname == "ERROR" and str(path) in record.getMessage()
-            for record in caplog.records
-        ), caplog.text
-
-    def test_non_object_payload_logs_and_backs_up(
-        self,
-        isolated_home: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A syntactically-valid JSON that isn't an object (e.g. a list)
-        is also corruption — same treatment."""
-        path = queues_registry_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('["not", "a", "dict"]', encoding="utf-8")
-
-        with caplog.at_level("ERROR", logger="claude_task_runner.cli.watchdog_cmd"):
-            out = load_registered_queues()
-
-        assert out == []
-        backup = path.with_suffix(path.suffix + ".broken")
-        assert backup.exists()
-        assert any(record.levelname == "ERROR" for record in caplog.records), caplog.text
-
-    def test_valid_registry_not_backed_up(self, isolated_home: Path) -> None:
-        """A well-formed registry must NOT trigger a .broken backup."""
-        queue = isolated_home / "q"
-        queue.mkdir()
-        register_queue(queue)
-        backup = queues_registry_path().with_suffix(queues_registry_path().suffix + ".broken")
-        assert load_registered_queues() == [queue.resolve()]
-        assert not backup.exists()

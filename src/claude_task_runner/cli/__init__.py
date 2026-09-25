@@ -80,7 +80,7 @@ app.add_typer(
 app.add_typer(
     watchdog_cmd.app,
     name="watchdog",
-    help="Watchdog tick (cron / systemd entry-point) and queue registration.",
+    help="Watchdog tick (the cron entry-point) and queue registration.",
 )
 app.add_typer(
     doctor_cmd.app,
