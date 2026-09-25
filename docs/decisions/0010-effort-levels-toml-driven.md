@@ -46,3 +46,12 @@ listing the accepted set.
 ## Reversibility
 
 High. Switching to a hardcoded enum is a code change only.
+
+## Update (2026-09-25)
+
+The `effort list` subcommand in the Decision section was never built;
+the CLI has no `effort` group. The accepted set for each model is the
+`[effort_levels]` table (package defaults in
+`config/defaults/settings.toml`, overridable per queue), and
+`claude-task-runner queue add` rejects a mismatched pair with an
+`UnknownEffortLevel` error that lists the accepted set.
