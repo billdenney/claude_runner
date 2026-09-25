@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Watchdog: invoked every minute by cron (or via a systemd timer).
+# Watchdog: invoked every minute by the crontab line that a cron
+# `claude-task-runner install` adds. The systemd install does not use
+# it; systemd restarts its unit itself.
 #
 # Delegates all logic to `claude-task-runner watchdog tick`, which:
-#   1. Reads supervisor.pid for each registered queue.
+#   1. Reads supervisor.pid for each queue registered in
+#      ~/.claude_task_runner/queues.json (a cron install registers its
+#      --queue; `claude-task-runner watchdog register` adds one).
 #   2. If supervisor is dead AND backoff allows (cron.backoff.decide):
 #      restarts via `claude-task-runner supervisor start --queue ...`.
 #   3. Logs to ~/.claude_task_runner/watchdog.log.

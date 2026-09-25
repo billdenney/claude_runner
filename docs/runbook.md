@@ -111,9 +111,43 @@ come back.
 1. `claude-task-runner doctor` shows whether watchdog is installed.
 2. `claude-task-runner install` auto-detects systemd vs cron, shows the
    proposed change, asks for confirmation. Accept it.
-3. Verify: kill the supervisor manually; within ~60s (cron) or ~30s
-   (systemd) it should restart. Check `~/.claude_task_runner/watchdog.log`
-   (cron) or `journalctl --user -u claude-task-runner` (systemd).
+3. Verify. Under cron, `claude-task-runner watchdog queues` must list the
+   queue (see the next section if it does not). Stop the supervisor with
+   `claude-task-runner supervisor stop`. The first tick after it exits
+   restarts it, and `~/.claude_task_runner/watchdog.log` shows
+   `verdict=restart`. Under systemd,
+   `systemctl --user status claude-task-runner` shows the unit active,
+   and `journalctl --user -u claude-task-runner` has its log. systemd
+   restarts the supervisor 30s after a crash, but not after a clean exit
+   such as `supervisor stop`.
+
+## Cron watchdog installed, but the supervisor stays down
+
+**Symptom:** `crontab -l` shows the `# BEGIN claude_task_runner` block,
+yet a stopped supervisor never comes back. Run in the queue directory,
+`claude-task-runner doctor` warns under `watchdog_installed` that the
+registry does not list the queue. With an empty registry, every tick in
+`~/.claude_task_runner/watchdog.log` logs
+`watchdog: no queues registered; nothing to do`.
+
+**Cause:** a tick manages only the queues listed in
+`~/.claude_task_runner/queues.json`. An older `install` did not register
+its queue there, so the cron watchdog it installed has nothing to manage.
+
+**Steps:**
+1. `claude-task-runner watchdog queues` lists the registered queues. Here
+   it prints nothing.
+2. Register the queue:
+
+   ```sh
+   claude-task-runner watchdog register --queue <queue>
+   ```
+
+   Re-running `claude-task-runner install --queue <queue>` also works,
+   because `install` now registers its queue.
+3. The next tick, within a minute, starts the supervisor. `watchdog.log`
+   shows `verdict=restart`, then `spawned supervisor`, and
+   `claude-task-runner supervisor status` shows it alive.
 
 ## Task worktrees filling the disk
 

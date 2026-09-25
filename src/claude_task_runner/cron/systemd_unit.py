@@ -7,9 +7,10 @@ machine.
 
 The supervisor runs as a long-lived ``simple`` service with
 ``Restart=on-failure``. Systemd handles backoff, exit-code tracking,
-and signals — we don't need our :mod:`cron.backoff` module under
-systemd, but it's still consulted by the watchdog timer for
-parity-of-policy if operators have BOTH installed.
+and signals, so we don't need our :mod:`cron.backoff` module under
+systemd. Nothing on the systemd path runs ``watchdog tick``, and a
+systemd ``install`` does not register its queue with the cron
+watchdog.
 
 When operators have neither systemd-as-PID-1 nor ``systemctl --user``
 working (e.g. inside Docker without a tmpfiles.d setup), we fall back
