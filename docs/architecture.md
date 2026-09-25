@@ -239,8 +239,6 @@ Operators extend behavior without code changes:
   parent branch, disposable untracked paths, the hook's lock file, and the
   opt-in periodic supervisor pass (ADR-0034).
 - **EMA priors per (model, effort)**: edit `[ema.priors.<model>.<effort>]`.
-- **Task templates**: drop Jinja2 templates into
-  `~/.claude_task_runner/templates/` or per-queue `templates/`.
 
 ## Anti-patterns (do NOT do these)
 

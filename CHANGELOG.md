@@ -33,6 +33,19 @@ Breaking changes are called out in the version notes.
   `%` directives, which `SafeLoader` accepted. The runner's own writers never
   emit any of these, and no file in that queue parses differently.
 
+### Removed
+
+- **Six empty packages, the `ui` extra and the Jinja2 task-templates
+  promise.** `events/`, `logs/`, `metrics/`, `notify/`, `templates/` and `ui/`
+  each held only an empty `__init__.py` from the initial commit, and nothing
+  imported them. The `ui` extra installed `textual`, which nothing imports.
+  The install line in the README and CI is now `pip install -e '.[dev]'`;
+  an old `.[dev,ui]` still installs, and pip and uv only warn that the extra
+  is gone. `docs/architecture.md` no longer tells operators to drop Jinja2
+  task templates into a `templates/` directory. Nothing reads one, Jinja2 is
+  not a dependency, and ADR-0023 rejected a template engine. The wheel's
+  `force-include` entry for `templates/` goes with the package.
+
 ### Fixed
 
 - **The docs no longer send operators to a `drift.log` that nothing

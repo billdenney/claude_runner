@@ -27,7 +27,7 @@ no visibility into utilization until it crashes into the wall. This module:
 ## Install
 
 ```sh
-pip install -e '.[dev,ui]'
+pip install -e '.[dev]'
 ```
 
 ## Quick start
