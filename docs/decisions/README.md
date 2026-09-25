@@ -41,6 +41,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0031 | Sidecar openness is accounted per QUESTION, not per file | accepted | 2026-08-20 |
 | 0032 | A committed-but-unpushed branch is not `completed` | accepted | 2026-08-20 |
 | 0033 | A terminal close writes its own dispatch gate | accepted | 2026-09-04 |
+| 0034 | Reclaim the worktrees of finished tasks | accepted | 2026-09-25 |
 
 ## Template
 

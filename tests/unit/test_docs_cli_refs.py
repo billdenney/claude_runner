@@ -346,7 +346,8 @@ class TestCliWalker:
     def test_rejects_fake_top_level_group(self) -> None:
         assert _check(("config", "init")) == (
             "no such command 'config' under 'claude-task-runner' (it has: account, "
-            "doctor, install, install-skills, queue, sidecar, supervisor, usage, watchdog)"
+            "doctor, install, install-skills, queue, sidecar, supervisor, usage, watchdog, "
+            "worktree)"
         )
 
     def test_rejects_fake_option(self) -> None:

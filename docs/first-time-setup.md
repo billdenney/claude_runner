@@ -91,6 +91,13 @@ post_dispatch_timeout_s = 60
 That's enough. Plan-derived 5h/weekly throttle thresholds and EMA priors
 come from the defaults.
 
+If your pre-dispatch hook creates a git worktree per task, the runner will not
+remove those worktrees on its own. `claude-task-runner worktree reclaim`
+removes the ones whose task is `completed` and already merged. To have the
+supervisor do that periodically, add a `[worktree_reclaim]` block. Set
+`periodic = true`, and point `lock_file` at the flock your hook takes. See
+ADR-0034 and the "Task worktrees filling the disk" section of the runbook.
+
 ## 4. Add a task
 
 The skill way (recommended — picks effort and tools interactively):
