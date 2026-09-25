@@ -27,6 +27,7 @@ from claude_task_runner.config.loader import (
     per_account_toml_path,
 )
 from claude_task_runner.config.schema import Settings
+from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -1108,8 +1109,46 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
     )
 
 
-def check_watchdog_installed(settings: Settings) -> CheckResult:
-    """Either a systemd unit or a cron managed-block should exist."""
+def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
+    """PASS only when the cron watchdog's registry lists ``queue_dir``.
+
+    The crontab line runs ``watchdog tick`` with no ``--queue``, and a
+    tick manages only the queues in the registry. A cron watchdog that an
+    older ``install`` set up has an empty registry, and without this
+    check doctor passed it while no tick ever restarted the supervisor.
+    Reads the registry without side effects, so a corrupt file is
+    reported instead of being backed up and treated as empty."""
+    queue = queue_dir.resolve()
+    registry = registry_mod.queues_registry_path()
+    register = f"claude-task-runner watchdog register --queue {queue}"
+    try:
+        registered = registry_mod.read_registered_queues()
+    except registry_mod.RegistryError as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"cron watchdog detected, but its queue registry is unreadable: {exc}",
+            remediation=f"Fix or remove {registry}, then run `{register}`.",
+        )
+    if queue in registered:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.PASS,
+            detail="cron watchdog detected; this queue is registered",
+        )
+    return CheckResult(
+        name="watchdog_installed",
+        status=CheckStatus.WARN,
+        detail=(
+            f"cron watchdog detected, but {registry} does not list this queue, "
+            "so no tick restarts its supervisor"
+        ),
+        remediation=f"Run `{register}`, or re-run `claude-task-runner install --queue {queue}`.",
+    )
+
+
+def check_watchdog_installed(settings: Settings, queue_dir: Path) -> CheckResult:
+    """A systemd unit, or a cron managed-block that lists this queue, should exist."""
     systemd_present = systemd_mod.systemd_unit_path().exists()
 
     # Try to read the crontab non-destructively. ``crontab_l`` already
@@ -1133,13 +1172,14 @@ def check_watchdog_installed(settings: Settings) -> CheckResult:
         cron_probe_error = f"{type(exc).__name__}: {exc}"
         logger.debug("unexpected error probing crontab: %s", exc)
 
-    if systemd_present or cron_present:
-        kind = "systemd" if systemd_present else "cron"
+    if systemd_present:
         return CheckResult(
             name="watchdog_installed",
             status=CheckStatus.PASS,
-            detail=f"{kind} watchdog detected",
+            detail="systemd watchdog detected",
         )
+    if cron_present:
+        return _cron_watchdog_result(queue_dir)
 
     preferred = settings.supervisor.preferred_init_system
 
@@ -1212,7 +1252,7 @@ def all_checks(
         lambda: check_supervisor_state(settings, queue_dir),
         lambda: check_ema(settings, queue_dir),
         lambda: check_skills_installed(settings),
-        lambda: check_watchdog_installed(settings),
+        lambda: check_watchdog_installed(settings, queue_dir),
     ]
     if check_api_usage:
         checks.append(lambda: check_api_usage_source(settings))

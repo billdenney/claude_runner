@@ -37,8 +37,11 @@ pip install -e '.[dev]'
 # (see docs/first-time-setup.md for the template)
 claude-task-runner queue add  # interactive; repeat per task
 claude-task-runner install    # auto-detects systemd vs cron, asks confirmation
-claude-task-runner supervisor start
+claude-task-runner supervisor status  # the watchdog starts it: systemd now, cron within a minute
 ```
+
+Without a watchdog, run `claude-task-runner supervisor start` instead of
+`install`. It runs in the foreground.
 
 For a step-by-step walkthrough from an empty directory, see
 [`docs/first-time-setup.md`](docs/first-time-setup.md).

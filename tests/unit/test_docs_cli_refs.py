@@ -1052,13 +1052,15 @@ class TestSourcesMatchCli:
         assert "src/claude_task_runner/cli/supervisor_cmd.py" in modules
 
     def test_scan_finds_the_watchdog_invocations(self) -> None:
-        # Guards against a shell scanner that silently finds nothing: the two
+        # Guards against a shell scanner that silently finds nothing: the four
         # comment spans, `command -v`, and the real call, in order.
         assert _mentions_in(PACKAGE_DIR / "cron" / "watchdog.sh") == [
-            Mention(4, ("watchdog", "tick")),
-            Mention(7, ("supervisor", "start", "--queue", "...")),
-            Mention(26, ()),
-            Mention(31, ("watchdog", "tick")),
+            Mention(3, ("install",)),
+            Mention(6, ("watchdog", "tick")),
+            Mention(9, ("watchdog", "register")),
+            Mention(11, ("supervisor", "start", "--queue", "...")),
+            Mention(30, ()),
+            Mention(35, ("watchdog", "tick")),
         ]
 
     def test_scan_finds_the_fetch_all_invocations(self) -> None:
