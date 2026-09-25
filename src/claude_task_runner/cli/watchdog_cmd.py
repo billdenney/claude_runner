@@ -9,22 +9,28 @@ One tick:
 3. For each registered queue (``~/.claude_task_runner/queues.json``,
    written by a cron ``install`` and by ``watchdog register``; see
    :mod:`cron.registry`):
-   read the PID file; ask :func:`cron.backoff.decide` whether to act.
+   skip it with an ERROR line if it is not an existing directory (it was
+   deleted or moved after it was registered); otherwise read the PID
+   file and ask :func:`cron.backoff.decide` whether to act.
 4. On RESTART verdict: spawn ``claude-task-runner supervisor start``
    detached.
 
 Output is structured logs to stdout (the cron wrapper redirects to
 ``~/.claude_task_runner/watchdog.log``).
 
-Two more subcommands manage the registry that a tick walks:
+Three more subcommands manage the registry that a tick walks:
 
-* ``watchdog register`` — add a queue (``--queue``, default the current
+* ``watchdog register``   — add a queue (``--queue``, default the current
   directory).
-* ``watchdog queues``   — print the registered queues, one per line.
+* ``watchdog unregister`` — remove a queue (``--queue``, default the
+  current directory). The directory need not exist.
+* ``watchdog queues``     — print the registered queues, one per line,
+  and warn on stderr about each one that is not an existing directory.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -61,7 +67,10 @@ def _spawn_supervisor(queue_dir: Path, config: Path | None = None) -> int:
     if exe is None:
         raise RuntimeError("claude-task-runner not on PATH")
     log_dir = queue_dir / ".claude_task_runner"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # No parents=True: a queue deleted after the tick checked it must stay
+    # deleted, not come back as an empty queue whose supervisor would take
+    # the per-user global lock.
+    log_dir.mkdir(exist_ok=True)
     log_path = log_dir / "supervisor.log"
     log_fh = open(log_path, "ab")  # noqa: SIM115 — handed to subprocess
     cmd = [exe, "supervisor", "start", "--queue", str(queue_dir)]
@@ -105,6 +114,20 @@ def tick(
 
     new_state = state
     for queue_dir in queues:
+        ts = clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Checked before decide(): every queue shares one restart history,
+        # so a skipped queue must not take a restart from the others.
+        # os.path.isdir is False where Path.is_dir raises (a parent that
+        # denies access), so one such path cannot end the tick early.
+        if not os.path.isdir(queue_dir):
+            sys.stdout.write(
+                f"{ts} watchdog: ERROR queue={queue_dir} is not an existing directory, "
+                "so its supervisor was not restarted and the directory was not created. "
+                "If the queue moved, register its new path. If it is gone for good, run: "
+                f"claude-task-runner watchdog unregister --queue {queue_dir}\n"
+            )
+            continue
+
         alive, pid = _supervisor_is_alive(queue_dir)
         decision = backoff_mod.decide(
             state=new_state,
@@ -114,7 +137,6 @@ def tick(
         )
         new_state = decision.new_state
 
-        ts = clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         sys.stdout.write(
             f"{ts} watchdog queue={queue_dir} alive={alive} pid={pid} "
             f"verdict={decision.verdict.value} detail={decision.detail!r}\n"
@@ -152,8 +174,42 @@ def register(
     print(f"registered: {queue_dir.resolve()}")
 
 
+@app.command("unregister")
+def unregister(
+    *,
+    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory to unregister."),
+) -> None:
+    """Stop the cron watchdog from managing a queue. Idempotent.
+
+    The directory need not exist, so a queue that was deleted or moved
+    can be dropped; a tick skips such a queue but keeps it registered.
+    A queue that is not registered is reported and left alone (exit 0).
+    A corrupt registry is an error (exit 2) and is left as it was.
+    ``install uninstall`` does not change the registry.
+    """
+    try:
+        removed = registry_mod.unregister_queue(queue_dir)
+    except (registry_mod.RegistryError, OSError) as exc:
+        print(f"unregister failed: {exc}", file=sys.stderr)
+        raise typer.Exit(code=2) from exc
+    for q in removed:
+        print(f"unregistered: {q}")
+    if not removed:
+        print(f"not registered: {queue_dir.resolve()}")
+
+
 @app.command("queues")
 def list_queues() -> None:
-    """Print the registered queues, one per line."""
+    """Print the registered queues, one per line.
+
+    Warns on stderr about each one that is not an existing directory,
+    which a tick skips. Stdout stays one path per line.
+    """
     for q in registry_mod.load_registered_queues():
         print(q)
+        if not os.path.isdir(q):
+            print(
+                f"warning: {q} is not an existing directory, so the watchdog skips it. "
+                f"To stop managing it, run: claude-task-runner watchdog unregister --queue {q}",
+                file=sys.stderr,
+            )

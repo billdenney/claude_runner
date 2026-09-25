@@ -4,6 +4,7 @@ The registry the tick walks is tested in ``test_cron_registry.py``."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -54,6 +55,95 @@ class TestRegisterCommand:
         assert not queues_registry_path().exists()
 
 
+class TestUnregisterCommand:
+    def test_unregister_a_deleted_queue(self, runner: CliRunner, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        keep = isolated_home / "keep"
+        queue.mkdir()
+        keep.mkdir()
+        register_queue(queue)
+        register_queue(keep)
+        queue.rmdir()
+
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"unregistered: {queue.resolve()}\n"
+        assert result.stderr == ""
+        assert load_registered_queues() == [keep.resolve()]
+        assert not queue.exists()
+
+    def test_unregister_defaults_to_the_current_directory(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        monkeypatch.chdir(queue)
+        result = runner.invoke(app, ["unregister"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"unregistered: {queue.resolve()}\n"
+        assert load_registered_queues() == []
+
+    def test_unregister_is_idempotent(self, runner: CliRunner, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        assert runner.invoke(app, ["unregister", "--queue", str(queue)]).exit_code == 0
+
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"not registered: {queue.resolve()}\n"
+        assert load_registered_queues() == []
+
+    def test_unregister_with_no_registry(self, runner: CliRunner, isolated_home: Path) -> None:
+        missing = isolated_home / "never-registered"
+        result = runner.invoke(app, ["unregister", "--queue", str(missing)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"not registered: {missing.resolve()}\n"
+        assert not queues_registry_path().exists()
+
+    def test_unregister_corrupt_registry_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        registry = queues_registry_path()
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{not json", encoding="utf-8")
+
+        result = runner.invoke(app, ["unregister", "--queue", str(isolated_home / "q")])
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr.startswith(
+            f"unregister failed: corrupt queues registry at {registry} ("
+        )
+        assert registry.read_text(encoding="utf-8") == "{not json"
+        assert sorted(p.name for p in registry.parent.iterdir()) == ["queues.json"]
+
+    def test_unregister_write_failure_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+
+        def _deny(_src: object, _dst: object) -> None:
+            raise PermissionError(13, "Permission denied", str(queues_registry_path()))
+
+        monkeypatch.setattr(watchdog_cmd.registry_mod.os, "replace", _deny)
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 2
+        assert result.stderr == (
+            f"unregister failed: [Errno 13] Permission denied: '{queues_registry_path()}'\n"
+        )
+        assert "unregistered:" not in result.stdout
+        assert load_registered_queues() == [queue.resolve()]
+        # The temporary file the failed rename left is cleaned up.
+        assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+
 class TestQueuesCommand:
     def test_queues_lists_registered(self, runner: CliRunner, isolated_home: Path) -> None:
         for name in ("a", "b"):
@@ -63,6 +153,28 @@ class TestQueuesCommand:
         assert result.exit_code == 0
         assert "a" in result.stdout
         assert "b" in result.stdout
+
+    def test_queues_warns_about_a_missing_queue_on_stderr(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """Stdout stays one path per line, so a script reading it is unaffected."""
+        gone = isolated_home / "gone"
+        live = isolated_home / "live"
+        gone.mkdir()
+        live.mkdir()
+        register_queue(gone)
+        register_queue(live)
+        gone.rmdir()
+
+        result = runner.invoke(app, ["queues"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{gone.resolve()}\n{live.resolve()}\n"
+        assert result.stderr == (
+            f"warning: {gone.resolve()} is not an existing directory, so the watchdog "
+            "skips it. To stop managing it, run: claude-task-runner watchdog unregister "
+            f"--queue {gone.resolve()}\n"
+        )
 
 
 class TestTickCommand:
@@ -288,6 +400,39 @@ class TestTickSkipsMissingQueue:
         assert result.stdout.count(_skipped_line(queue.resolve())) == 1
         assert "verdict=" not in result.stdout
 
+    def test_queue_deleted_after_the_check_is_not_recreated(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The queue disappears between the tick's check and the spawn."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        real_spawn = watchdog_cmd._spawn_supervisor
+
+        def _delete_then_spawn(queue_dir: Path, config: Path | None = None) -> int:
+            queue_dir.rmdir()
+            return real_spawn(queue_dir, config)
+
+        popen = MagicMock()
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _delete_then_spawn)
+        monkeypatch.setattr(watchdog_cmd.subprocess, "Popen", popen)
+        with patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"):
+            result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert not queue.exists()
+        popen.assert_not_called()
+        log_dir = queue.resolve() / ".claude_task_runner"
+        assert (
+            f" watchdog: spawn failed for {queue.resolve()}: "
+            f"[Errno 2] No such file or directory: '{log_dir}'\n"
+        ) in result.stdout
+        # A failed restart still counts toward crash-loop backoff, as before.
+        assert len(load_state(watchdog_state_path()).recent_restarts) == 1
+
 
 class TestSpawnSupervisor:
     """Direct tests of ``_spawn_supervisor`` argv construction."""
@@ -362,11 +507,21 @@ class TestSpawnSupervisor:
         with (
             patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
             patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
-            pytest.raises(FileNotFoundError, match=str(queue / ".claude_task_runner")),
+            pytest.raises(FileNotFoundError, match=re.escape(str(queue / ".claude_task_runner"))),
         ):
             _spawn_supervisor(queue, None)
         assert not queue.exists()
         mock_popen.assert_not_called()
+
+    def test_spawn_without_the_cli_on_path(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value=None),
+            pytest.raises(RuntimeError, match=r"^claude-task-runner not on PATH$"),
+        ):
+            _spawn_supervisor(queue, None)
+        assert list(queue.iterdir()) == []
 
     def test_spawn_creates_the_log_dir_of_a_fresh_queue(self, tmp_path: Path) -> None:
         """A queue that has never run has no ``.claude_task_runner/`` yet."""

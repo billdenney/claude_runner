@@ -35,6 +35,30 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **A cron watchdog tick no longer recreates a registered queue that was
+  deleted or moved.** `register_queue` rejects a path that is not a
+  directory, but only when it registers it. For a queue that was later
+  deleted, moved or replaced by a file, every tick found no live supervisor
+  and approved a restart, and `_spawn_supervisor` made
+  `<queue>/.claude_task_runner` with `parents=True`, which recreated the
+  queue directory. The supervisor started on that empty queue held the
+  per-user `global.lock`, so the operator's real queue failed with
+  `another supervisor is already running`. Every queue shares one restart
+  history in `watchdog_state.json`, so a missing queue listed first also took
+  the restart and left the real queue in cooldown on every tick. A tick now
+  checks each registered path before it decides anything. For a path that is
+  not an existing directory it writes
+  `watchdog: ERROR queue=<path> is not an existing directory, ...` to
+  `~/.claude_task_runner/watchdog.log`, with the command that unregisters it,
+  and records no restart. The entry stays registered, so a queue on a
+  filesystem that was not mounted is managed again once it is.
+  `watchdog queues` warns on stderr about each such path, and its stdout is
+  still one path per line. `_spawn_supervisor` no longer passes
+  `parents=True`, so a queue deleted between the check and the spawn is not
+  recreated either. `queues.json` is now written to a temporary file and
+  renamed into place, so a tick never reads half a registry. The runbook has
+  a section for the symptom, including how to stop a supervisor that an
+  older version already started on a recreated queue.
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
   `claude-task-runner watchdog tick` with no `--queue`, and a tick manages
@@ -140,6 +164,19 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`claude-task-runner watchdog unregister --queue <queue>` drops a queue
+  from the cron watchdog's registry.** Removing an entry from
+  `~/.claude_task_runner/queues.json` used to mean editing the file by hand;
+  `install uninstall` removes the crontab block and leaves the registry
+  alone. `unregister` works whether or not the directory still exists. It
+  matches an entry both as written and as resolved, so a path copied from
+  `watchdog queues` or `watchdog.log` removes its entry even when a symlink
+  on it has changed since. It is idempotent: for a queue that is not listed
+  it prints `not registered: <path>` and exits 0. A corrupt registry makes
+  it exit 2 and is left as it was. The tick's lenient reader would treat
+  that file as empty, and rewriting it would drop every other queue.
+  `--queue` defaults to the current directory, as it does for
+  `watchdog register`.
 - **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
   (ADR-0034).** A queue whose pre-dispatch hook creates one git worktree per
   task accumulated them forever. On 2026-09-25 the nlmixr2lib queue had 305

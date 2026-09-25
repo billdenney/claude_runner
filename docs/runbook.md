@@ -149,6 +149,55 @@ its queue there, so the cron watchdog it installed has nothing to manage.
    shows `verdict=restart`, then `spawned supervisor`, and
    `claude-task-runner supervisor status` shows it alive.
 
+## A registered queue was deleted or moved
+
+**Symptom:** every minute, `~/.claude_task_runner/watchdog.log` gets a line
+`watchdog: ERROR queue=<path> is not an existing directory, so its supervisor
+was not restarted and the directory was not created`.
+`claude-task-runner watchdog queues` prints a warning about the same path on
+stderr.
+
+**Cause:** the queue is registered with the cron watchdog (by `install` or
+`watchdog register`), and its directory was later deleted, moved or replaced
+by a file, or it sits on a filesystem that is not mounted. A tick skips that
+path but keeps it registered, so a queue whose filesystem comes back is
+managed again with no action. Before this was fixed, the tick recreated the
+directory and started a supervisor on the empty queue. That supervisor held
+the per-user `global.lock`, so the real queue's supervisor failed with
+`another supervisor is already running`.
+
+**Steps:**
+1. `claude-task-runner watchdog queues` lists the registered queues and
+   warns about each one that is not an existing directory.
+2. If the queue moved, register the new path and drop the old one:
+
+   ```sh
+   claude-task-runner watchdog register --queue <new-path>
+   claude-task-runner watchdog unregister --queue <old-path>
+   ```
+
+3. If it is gone for good, drop it:
+
+   ```sh
+   claude-task-runner watchdog unregister --queue <path>
+   ```
+
+   The directory need not exist. `unregister` prints `not registered:` and
+   exits 0 when the queue is not listed. It exits 2 and leaves the file as
+   it was when `queues.json` is corrupt: fix or remove the file, then
+   register the queues you still want.
+4. If its filesystem is not mounted, mount it. The next tick manages the
+   queue again.
+5. An older version may already have recreated the directory and started a
+   supervisor on it, which still holds the lock. The real queue's
+   `another supervisor is already running (...); pid=<pid>` error names that
+   supervisor, and `ps -o args= -p <pid>` shows its `--queue`. If that is
+   the recreated queue, unregister it first, since the next tick would
+   otherwise restart it. Then stop it with
+   `claude-task-runner supervisor stop --queue <path>`, and delete the
+   directory once you have checked that it holds only an empty `todo/` and
+   `.claude_task_runner/`.
+
 ## Task worktrees filling the disk
 
 **Symptom:** the repository's `.claude/worktrees/` holds hundreds of

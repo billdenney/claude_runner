@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron.registry import (
     RegistryError,
     load_registered_queues,
     queues_registry_path,
     read_registered_queues,
     register_queue,
+    unregister_queue,
 )
 
 
@@ -203,3 +207,154 @@ class TestReadRegisteredQueues:
         with caplog.at_level("ERROR", logger="claude_task_runner.cron.registry"):
             assert load_registered_queues() == []
         assert "could not back up corrupt registry" in caplog.text
+
+
+def _write_registry_file(entries: list[str]) -> Path:
+    """Write ``queues.json`` by hand, the way an operator or an old version might have."""
+    path = queues_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"queues": entries}), encoding="utf-8")
+    return path
+
+
+class TestUnregisterQueue:
+    def test_removes_only_that_queue(self, isolated_home: Path) -> None:
+        queues = [isolated_home / name for name in ("a", "b", "c")]
+        for q in queues:
+            q.mkdir()
+            register_queue(q)
+        assert unregister_queue(queues[1]) == [queues[1].resolve()]
+        assert load_registered_queues() == [queues[0].resolve(), queues[2].resolve()]
+
+    def test_second_call_is_a_no_op(self, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        assert unregister_queue(queue) == [queue.resolve()]
+        before = queues_registry_path().read_text(encoding="utf-8")
+        assert unregister_queue(queue) == []
+        assert queues_registry_path().read_text(encoding="utf-8") == before
+        assert load_registered_queues() == []
+
+    def test_without_a_registry_writes_nothing(self, isolated_home: Path) -> None:
+        assert unregister_queue(isolated_home / "q") == []
+        assert not queues_registry_path().parent.exists()
+
+    def test_queue_that_no_longer_exists(self, isolated_home: Path) -> None:
+        """The main use: drop a queue that was deleted after it was registered."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        assert unregister_queue(queue) == [queue.resolve()]
+        assert load_registered_queues() == []
+        assert not queue.exists()
+
+    def test_relative_path_is_made_absolute(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        monkeypatch.chdir(isolated_home)
+        assert unregister_queue(Path("q")) == [queue.resolve()]
+        assert load_registered_queues() == []
+
+    def test_entry_whose_symlink_changed_matches_as_written(self, isolated_home: Path) -> None:
+        """The entry no longer resolves to itself, yet the path the operator
+        copies from ``watchdog queues`` must still remove it."""
+        real = isolated_home / "real"
+        (real / "q").mkdir(parents=True)
+        link = isolated_home / "link"
+        link.symlink_to(real, target_is_directory=True)
+        entry = link / "q"
+        _write_registry_file([str(entry)])
+        assert entry.resolve() != entry
+        assert unregister_queue(entry) == [entry]
+        assert read_registered_queues() == []
+
+    def test_resolved_form_matches_a_symlinked_argument(self, isolated_home: Path) -> None:
+        real = isolated_home / "real"
+        (real / "q").mkdir(parents=True)
+        link = isolated_home / "link"
+        link.symlink_to(real, target_is_directory=True)
+        register_queue(real / "q")
+        assert unregister_queue(link / "q") == [(real / "q").resolve()]
+        assert read_registered_queues() == []
+
+    def test_duplicate_entries_all_go(self, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        other = isolated_home / "other"
+        _write_registry_file([str(queue), str(other), str(queue)])
+        assert unregister_queue(queue) == [queue, queue]
+        assert read_registered_queues() == [other]
+
+    @pytest.mark.parametrize("payload", CORRUPT_PAYLOADS.values(), ids=CORRUPT_PAYLOADS.keys())
+    def test_corrupt_registry_raises_and_is_left_alone(self, payload: str) -> None:
+        """The lenient reader would call it empty, and rewriting that drops every queue."""
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True)
+        path.write_text(payload, encoding="utf-8")
+        with pytest.raises(RegistryError, match=re.escape(str(path))):
+            unregister_queue(Path("/some/queue"))
+        assert path.read_text(encoding="utf-8") == payload
+        assert sorted(p.name for p in path.parent.iterdir()) == ["queues.json"]
+
+
+class TestRegistryWrites:
+    """``register_queue`` and ``unregister_queue`` share one writer."""
+
+    def test_file_format(self, isolated_home: Path) -> None:
+        for name in ("a", "b"):
+            (isolated_home / name).mkdir()
+            register_queue(isolated_home / name)
+        unregister_queue(isolated_home / "a")
+        expected = {"queues": [str((isolated_home / "b").resolve())]}
+        assert queues_registry_path().read_text(encoding="utf-8") == (
+            json.dumps(expected, indent=2) + "\n"
+        )
+
+    def test_no_temporary_file_is_left_behind(self, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        unregister_queue(queue)
+        assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+    def test_failed_write_changes_nothing(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A full disk mid-write keeps the old registry and removes the temporary file."""
+        keep = isolated_home / "keep"
+        keep.mkdir()
+        register_queue(keep)
+        before = queues_registry_path().read_text(encoding="utf-8")
+        new = isolated_home / "new"
+        new.mkdir()
+
+        def _disk_full(_fd: int) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(registry_mod.os, "fsync", _disk_full)
+        with pytest.raises(OSError, match="No space left on device"):
+            register_queue(new)
+        assert queues_registry_path().read_text(encoding="utf-8") == before
+        assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+    def test_unwritable_registry_directory_changes_nothing(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The temporary file cannot even be created, so there is nothing to clean up."""
+        keep = isolated_home / "keep"
+        keep.mkdir()
+        register_queue(keep)
+        before = queues_registry_path().read_text(encoding="utf-8")
+
+        def _denied(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(registry_mod.tempfile, "NamedTemporaryFile", _denied)
+        with pytest.raises(PermissionError, match="Permission denied"):
+            unregister_queue(keep)
+        assert queues_registry_path().read_text(encoding="utf-8") == before
+        assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
