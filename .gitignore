@@ -50,3 +50,6 @@ Thumbs.db
 # housekeeping pass's fast-forward of the default branch — silently declines
 # to act. Scoped to worktrees/ so tracked .claude/ config stays tracked.
 .claude/worktrees/
+
+# local git worktrees used by the merge/skill workflows
+.worktrees/
