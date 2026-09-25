@@ -5,6 +5,12 @@
 * ``healthcheck`` — capture+parse; exit non-zero on drift / timeout.
 * ``capture`` — capture only; save the raw .cap to a path.
 * ``parse-file`` — parse a previously-saved .cap and print the result.
+* ``whoami`` — show which account the configured ``config_dir`` reads.
+* ``refresh`` — refresh the OAuth token of every configured account.
+
+``--config`` belongs to the ``usage`` group, not to its subcommands, so
+it goes before the subcommand:
+``claude-task-runner usage --config <queue>/claude_runner.toml refresh``.
 """
 
 from __future__ import annotations
