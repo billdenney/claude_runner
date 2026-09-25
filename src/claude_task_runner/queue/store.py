@@ -5,6 +5,8 @@
 * ``write_state_atomic(state, path)`` — write a TaskState atomically.
 * ``list_pending(queue_dir)`` — enumerate pending task YAMLs in ``todo/``.
 * ``list_states(queue_dir)`` — enumerate ``.claude_task_runner/state/*.yaml``.
+* ``require_queue_dir(queue_dir)`` — refuse a queue directory that is not
+  there, before the helpers that create subdirectories recreate it.
 
 Atomic writes use ``tempfile.NamedTemporaryFile`` + ``os.replace`` so
 concurrent reads always see a complete file (key invariant 8 in
@@ -64,6 +66,35 @@ class QueueIOError(OSError):
 
 class QueueSchemaError(ValueError):
     """A YAML file does not validate against the v2 schema."""
+
+
+def require_queue_dir(queue_dir: Path) -> Path:
+    """Return ``queue_dir`` resolved; raise unless it is an existing directory.
+
+    :func:`queue_runtime_dir` and :func:`todo_dir` create their
+    directories with ``parents=True``, so they would create a queue
+    directory that is not there too. Call this first wherever the queue
+    directory comes from an operator or from the watchdog registry, since
+    it may be mistyped, deleted or moved. A supervisor started on such a
+    recreated, empty queue holds the per-user global lock, and the real
+    queue's supervisor then fails with "another supervisor is already
+    running".
+
+    Uses :func:`os.path.isdir`, as the watchdog tick does, so a path that
+    cannot be examined, such as one under a directory the user may not
+    search, counts as missing rather than raising
+    :class:`PermissionError`.
+
+    Raises
+    ------
+    NotADirectoryError
+        ``queue_dir`` is missing, is not a directory, or cannot be
+        examined.
+    """
+    resolved = queue_dir.resolve()
+    if not os.path.isdir(resolved):
+        raise NotADirectoryError(f"not an existing directory: {resolved}")
+    return resolved
 
 
 def queue_runtime_dir(queue_dir: Path) -> Path:

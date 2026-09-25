@@ -834,6 +834,25 @@ class TestForceDispatchCLI:
 
         assert _poll_until_running(queue_dir, "t1", wait_seconds=0) is False
 
+    @pytest.mark.parametrize("as_json", [False, True], ids=["human", "json"])
+    def test_queue_that_is_not_a_directory_is_rejected(
+        self, tmp_path: Path, runner_cli: CliRunner, as_json: bool
+    ) -> None:
+        """``queue_runtime_dir`` used to create a mistyped ``--queue`` before
+        the missing task was even noticed."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        missing = tmp_path / "no-such-queue"
+        args = ["force-dispatch", "t1", "--queue", str(missing)]
+        result = runner_cli.invoke(app, [*args, "--json"] if as_json else args)
+        assert result.exit_code == 2
+        message = f"--queue is not an existing directory: {missing.resolve()}"
+        if as_json:
+            assert json.loads(result.stdout) == {"ok": False, "error": message}
+        else:
+            assert result.stdout == f"{message}\n"
+        assert not missing.exists()
+
     def test_missing_task_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
         """Without --json, missing task prints a red error to stdout."""
         from claude_task_runner.cli.queue_cmd import app

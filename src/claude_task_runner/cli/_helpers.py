@@ -2,14 +2,21 @@
 
 The helpers here are intentionally CLI-coupled — they bridge typer
 options (``--queue`` and ``--config``) into the pure config loaders in
-:mod:`claude_task_runner.config.loader`. Keeping them out of
+:mod:`claude_task_runner.config.loader` and the queue store in
+:mod:`claude_task_runner.queue.store`. Keeping them out of
 ``config/loader.py`` avoids pulling queue-dir-aware path logic into a
 module that is otherwise a pure settings + per-account loader.
 """
 
 from __future__ import annotations
 
+import json as _json
 from pathlib import Path
+
+import typer
+from rich.console import Console
+
+from claude_task_runner.queue.store import require_queue_dir
 
 PER_QUEUE_CONFIG_NAME = "claude_runner.toml"
 """Conventional filename for a per-queue runner config sitting at
@@ -55,3 +62,26 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
     if candidate.is_file():
         return candidate
     return None
+
+
+def require_queue_option(queue_dir: Path, console: Console, *, json: bool = False) -> Path:
+    """Resolve ``--queue`` for a command that writes under it, or exit 2.
+
+    See :func:`~claude_task_runner.queue.store.require_queue_dir`: the
+    helpers that create the queue's subdirectories would recreate a
+    mistyped, deleted or moved ``--queue`` as an empty queue.
+
+    The error is one line on ``console``, printed without Rich markup so
+    a ``[`` in the path stays as typed, and without wrapping. With
+    ``json`` it goes to stdout as ``{"ok": false, "error": ...}``, the
+    shape ``queue force-dispatch --json`` uses for its other errors.
+    """
+    try:
+        return require_queue_dir(queue_dir)
+    except NotADirectoryError as exc:
+        message = f"--queue is {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": message}))
+        else:
+            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2) from exc

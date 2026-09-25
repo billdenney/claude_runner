@@ -32,7 +32,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.queue.schema import Task
@@ -450,7 +450,7 @@ def add_task(
     Skills (``/runner-add-task``) drive this with operator answers.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console)
     settings = load_settings(resolve_per_queue_config(config, qd))
 
     if not _ID_RE.match(task_id):
@@ -806,7 +806,7 @@ def force_dispatch(
     synchronous path.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
     queue_runtime_dir(qd)
 
