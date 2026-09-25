@@ -88,6 +88,26 @@ class TestList:
         payload = json.loads(result.stdout)
         assert any("error" in t for t in payload["tasks"])
 
+    def test_deeply_nested_task_is_an_error_row(
+        self, runner: CliRunner, queue_dir: Path, yaml_backend: str
+    ) -> None:
+        """A 1,000-level task (a 2 KB file) used to crash ``queue list``
+        with an uncaught RecursionError under SafeLoader, hiding every
+        other task. It is now an error row like any unparseable YAML."""
+        _seed_task(queue_dir, "001-ok")
+        deep = todo_dir(queue_dir) / "002-deep.yaml"
+        deep.write_text(
+            "id: 002-deep\ntitle: T\nprompt: P\ntags: " + "[" * 1000 + "]" * 1000 + "\n"
+        )
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json"])
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["tasks"]
+        assert [row["id"] for row in rows] == ["001-ok", "002-deep"]
+        assert "error" not in rows[0]
+        assert rows[1]["error"].endswith(
+            "found a node nested more than 64 levels deep (MAX_YAML_DEPTH)"
+        )
+
     def test_order_by_dispatch_high_first(self, runner: CliRunner, queue_dir: Path) -> None:
         """With --order-by-dispatch, priority high precedes normal even when
         the high task's id sorts alphabetically last."""

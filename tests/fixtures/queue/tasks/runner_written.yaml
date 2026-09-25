@@ -1,0 +1,49 @@
+schema_version: 2
+id: 042-smith_2021_examplumab
+title: 'Extract Smith 2021 examplumab: two-compartment TMDD model'
+prompt: "Use the /extract-literature-model skill on the paper below.\n\n# Source files\n\
+  \nLead PDF:        `inputs/smith_2021.pdf`\nSupplements:     (none)\n\n# Notes\n\
+  \n- Keys like `CL: 1.5 L/h` and \"quoted: text\" must survive as-is.\n- Non-ASCII:\
+  \ M\xE9ni\xE8re, \u4E2D\u6587, \U0001F600, and a tab\there.\n- YAML look-alikes:\
+  \ yes, no, ~, null, 0o17, 1_000, 2026-05-03, .inf\n  (indented continuation line)\n\
+  - A long line: abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\n"
+working_dir: /srv/queue/worktrees/042-smith_2021_examplumab
+model: claude-opus-5-5
+effort: high
+priority: high
+depends_on:
+- 041-smith_2020_examplumab
+requires:
+- kind: file
+  path: inputs/smith_2021.pdf
+  note: lead PDF
+- kind: sidecar_response
+  path: null
+  note: null
+allowed_tools:
+- Read
+- Edit
+- Write
+- Bash
+- Grep
+- Glob
+- WebFetch
+tags:
+- popPK
+- 'yes'
+- 'null'
+- '1.0'
+- 0o17
+- '2026-05-03'
+- '~'
+weekly_critical: true
+weekly_deferrable: false
+force_dispatch_in_eow: true
+max_tokens_override: 2000000
+max_duration_s_override: 5400.5
+deliverable_paths:
+- inst/modeldb/specificDrugs/Smith_2021_examplumab.R
+- vignettes/articles/Smith_2021_examplumab.Rmd
+additional_dirs:
+- /srv/shared/pdfs
+account: work
