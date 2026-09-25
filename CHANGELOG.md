@@ -50,6 +50,15 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The ADR index lists ADR-0033.** `docs/decisions/README.md` stopped
+  at 0032: ADR-0033 (a terminal close writes its own dispatch gate)
+  landed on 2026-09-04 without its row, and only a sentence of prose
+  asked for one. `tests/unit/test_docs_adr_index.py` now fails when an
+  ADR file has no index row, a row has no ADR file, a number is used
+  twice (two branches can each claim the next free number), or a file
+  under `docs/decisions/` is not named `NNNN-<slug>.md` and so would
+  escape those checks. Known-answer tests pin the row parser, and a row
+  it cannot read fails the gate rather than dropping out of it.
 - **README and the cheat sheet quote the coverage gate CI enforces
   (90%).** CI raised `--cov-fail-under` from 75 to 90 on 2026-05-16, but
   the "pipeline that CI runs" in `README.md` still ran
