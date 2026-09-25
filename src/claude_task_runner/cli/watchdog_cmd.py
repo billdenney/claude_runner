@@ -14,6 +14,12 @@ One tick:
 
 Output is structured logs to stdout (the cron wrapper redirects to
 ``~/.claude_task_runner/watchdog.log``).
+
+Two more subcommands manage the registry that a tick walks:
+
+* ``watchdog register`` — add a queue (``--queue``, default the current
+  directory).
+* ``watchdog queues``   — print the registered queues, one per line.
 """
 
 from __future__ import annotations

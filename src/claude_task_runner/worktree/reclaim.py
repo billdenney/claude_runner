@@ -19,7 +19,7 @@ module removes a worktree only when it can PROVE nothing is lost:
 3. ``git status --porcelain`` is empty, apart from untracked paths the
    operator declared disposable (``discardable_untracked``). Those are
    removed with ``git worktree remove --force``; nothing else ever is.
-   Ignored files do not count as work (git's own ``worktree remove`` deletes
+   Ignored files do not count as work (``git worktree remove`` deletes
    them too), except a declared ``deliverable_paths`` entry inside the
    worktree: the task's own output is never discarded as build debris.
 
@@ -542,7 +542,7 @@ class _Candidate:
     """The path as git registered it (symlinks resolved)."""
     repo_root: Path
     """The repository's main worktree (or bare dir): where repo-level
-    commands -- fetch, ``worktree remove``, ``branch -d`` -- run."""
+    commands -- ``git fetch``, ``git worktree remove``, ``git branch -d`` -- run."""
     deliverables: tuple[str, ...] = ()
 
 
