@@ -380,17 +380,16 @@ class TestTickCommand:
         runner: CliRunner,
         isolated_home: Path,
         monkeypatch: pytest.MonkeyPatch,
+        live_worker_pid: int,
     ) -> None:
         queue = isolated_home / "q"
         (queue / ".claude_task_runner").mkdir(parents=True)
         register_queue(queue)
 
-        # Pretend the supervisor is alive (use the test's own PID so
-        # is_pid_alive returns True).
-        import os
-
+        # A live child stands in for the supervisor. The test's own pid
+        # would not: is_pid_alive refuses the caller's own pid.
         pid_path = queue / ".claude_task_runner" / "supervisor.pid"
-        pid_path.write_text(f"{os.getpid()}\n")
+        pid_path.write_text(f"{live_worker_pid}\n")
 
         def _explode(_qd: Path) -> int:
             raise AssertionError("alive supervisor should not be respawned")

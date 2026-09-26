@@ -14,6 +14,10 @@ from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import Settings
 
+# Blocks and fails any signal a test sends to a process it did not start.
+# pytester runs that gate in a subprocess for tests/unit/test_signal_gate.py.
+pytest_plugins = ["pytester", "signal_gate"]
+
 # The signals supervisor.daemon.start_daemon installs handlers for.
 _DAEMON_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
 

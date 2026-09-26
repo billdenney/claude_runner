@@ -120,16 +120,34 @@ class TestReadExistingPid:
 
 
 class TestIsPidAlive:
-    def test_self(self) -> None:
-        assert is_pid_alive(os.getpid()) is True
+    def test_live_child(self, live_worker_pid: int) -> None:
+        assert is_pid_alive(live_worker_pid) is True
 
-    def test_init_pid(self) -> None:
-        # PID 1 always exists (init / systemd).
-        assert is_pid_alive(1) is True
+    @pytest.mark.parametrize(
+        ("pid", "hazard"),
+        [
+            (1, "pid 1 is init, and process group 1 is every process the user owns"),
+            (0, "pid 0 means this process's own process group"),
+            (-1, "a negative pid is a process group, and -1 is every process the user owns"),
+        ],
+    )
+    def test_refuses_a_pid_no_supervisor_can_have(
+        self, pid: int, hazard: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Probing pid 1 fails with EPERM, which used to read as a live
+        supervisor, so ``supervisor stop`` would go on to signal init."""
+        with caplog.at_level("ERROR", logger="claude_task_runner.process_signals"):
+            assert is_pid_alive(pid) is False
+        assert [r.getMessage() for r in caplog.records] == [
+            f"refusing to probe pid {pid}: {hazard}"
+        ]
 
-    def test_invalid_pid(self) -> None:
-        assert is_pid_alive(0) is False
-        assert is_pid_alive(-1) is False
+    def test_refuses_the_callers_own_pid(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("ERROR", logger="claude_task_runner.process_signals"):
+            assert is_pid_alive(os.getpid()) is False
+        assert [r.getMessage() for r in caplog.records] == [
+            f"refusing to probe pid {os.getpid()}: it is this process"
+        ]
 
     def test_implausibly_large_pid(self) -> None:
         # pid_max on Linux is typically 4194304; 9999999 is comfortably beyond.

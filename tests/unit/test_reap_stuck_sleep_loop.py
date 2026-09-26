@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from signal_gate import SignalGate
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
@@ -394,15 +395,15 @@ def test_detect_descendant_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     fake_proc = tmp_path / "proc"
     fake_proc.mkdir()
     (fake_proc / "self").mkdir()
-    for i in range(501):
+    for i in range(9000, 9501):
         nxt = i + 1
-        _seed_proc(fake_proc, i, children=[nxt] if nxt <= 500 else [], cmdline="bash -c :")
+        _seed_proc(fake_proc, i, children=[nxt] if nxt <= 9500 else [], cmdline="bash -c :")
 
     from claude_task_runner.supervisor import reconcile_silent as rs
 
     monkeypatch.setattr(rs, "_PROC_ROOT", fake_proc)
     # Innocent chain never matches; the cap stops the walk after 10 nodes.
-    assert _detect_stuck_sleep_loop(0, max_descendants=10) is None
+    assert _detect_stuck_sleep_loop(9000, max_descendants=10) is None
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +901,7 @@ def _spawn_detached_worker(marker: Path, pidfile: Path) -> int:
 
 @_LINUX_ONLY
 @pytest.mark.slow
-def test_integration_real_marker_wait_killed(tmp_path: Path) -> None:
+def test_integration_real_marker_wait_killed(tmp_path: Path, signal_gate: SignalGate) -> None:
     """End-to-end: a real ``while ! [ -e <never> ]; do sleep 1; done``
     marker-wait running as a descendant of a fake ``claude`` worker, with
     a stale heartbeat + fresh dispatcher_alive, is detected by the REAL
@@ -909,6 +910,9 @@ def test_integration_real_marker_wait_killed(tmp_path: Path) -> None:
     marker = tmp_path / "never_appears"
     pidfile = tmp_path / "worker.pid"
     pid = _spawn_detached_worker(marker, pidfile)
+    # The launcher double-forks, so init adopts the worker and the gate cannot
+    # see that this test started it.
+    signal_gate.allow(pid)
     try:
         # Give the loop child + its first `sleep` time to register.
         time.sleep(0.4)

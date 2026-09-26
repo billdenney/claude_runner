@@ -117,7 +117,7 @@ def _live_supervisor(
         patch(
             "claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", side_effect=alive
         ) as alive_mock,
-        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill,
+        patch("claude_task_runner.process_signals.os.kill") as kill,
         patch("time.monotonic", clock.monotonic),
         patch("time.sleep", clock.sleep),
     ):
@@ -139,7 +139,7 @@ def _signals_nothing() -> Iterator[MagicMock]:
     Yields the ``os.kill`` mock.
     """
     with (
-        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill,
+        patch("claude_task_runner.process_signals.os.kill") as kill,
         patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", _unreachable),
         patch("time.sleep", _unreachable),
     ):
@@ -253,7 +253,7 @@ def test_stop_happy_path_sends_sigterm(runner: CliRunner, queue_dir: Path) -> No
     pid_path.write_text("12345\n", encoding="utf-8")
     with (
         patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
-        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as mock_kill,
+        patch("claude_task_runner.process_signals.os.kill") as mock_kill,
     ):
         result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
     assert result.exit_code == 0
@@ -269,7 +269,7 @@ def test_stop_process_disappeared(runner: CliRunner, queue_dir: Path) -> None:
     with (
         patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
         patch(
-            "claude_task_runner.cli.supervisor_cmd.os.kill",
+            "claude_task_runner.process_signals.os.kill",
             side_effect=ProcessLookupError(),
         ),
     ):
@@ -282,11 +282,11 @@ def test_stop_permission_error(runner: CliRunner, queue_dir: Path) -> None:
     """If the operator can't signal the target PID (different user),
     exit 2 (not 1 — 2 indicates an environmental problem)."""
     pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
-    pid_path.write_text("1\n", encoding="utf-8")  # init
+    pid_path.write_text("424242\n", encoding="utf-8")  # another user's process
     with (
         patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", return_value=True),
         patch(
-            "claude_task_runner.cli.supervisor_cmd.os.kill",
+            "claude_task_runner.process_signals.os.kill",
             side_effect=PermissionError("operation not permitted"),
         ),
     ):

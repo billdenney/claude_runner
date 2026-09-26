@@ -54,6 +54,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO
 
+from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
     DispatchSettings,
@@ -522,11 +523,17 @@ def _pid_alive(pid: int) -> bool:
     we just can't signal it. Any other ``OSError`` is conservatively
     treated as alive so the adopt monitor doesn't finalize a worker
     prematurely on a transient probe failure (ADR-0025).
+
+    A pid no worker can have, 1 or less or this process's own, is refused
+    by :mod:`claude_task_runner.process_signals` and reported dead: probing
+    pid 1 fails with EPERM, which would otherwise read as a live worker
+    and lead the reapers to signal its process group, every process the
+    user owns.
     """
-    if pid <= 0:
-        return False
     try:
-        os.kill(pid, 0)
+        process_signals.kill(pid, 0)
+    except process_signals.UnsafeSignalTarget:
+        return False
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -801,9 +808,13 @@ def _signal_group_by_pid(pid: int, sig: int) -> None:
     genuinely failed signal-send surfaces in the journal. This is the
     shared core of both the owned-path :func:`_signal_group` and the
     adopted-path terminate (ADR-0025).
+
+    Raises :class:`~claude_task_runner.process_signals.UnsafeSignalTarget`,
+    having sent nothing, when ``pid`` or its group is one the runner must
+    never signal: pid 1's group is every process the user owns.
     """
     try:
-        os.killpg(os.getpgid(pid), sig)
+        process_signals.signal_group_of(pid, sig)
     except ProcessLookupError:
         # Group already gone; nothing to signal.
         pass
@@ -864,6 +875,10 @@ def _terminate(process: subprocess.Popen[str]) -> None:
        raise — the signal-send genuinely failed.
     5. ``process.wait(timeout=2)``. ``TimeoutExpired`` ⇒ log ERROR and
        raise — the kernel did not reap the parent.
+
+    A group the runner must never signal (1 or less, or the supervisor's
+    own, as when a worker was started without its own session) raises
+    :class:`TerminateFailed` at step 2, with nothing sent.
     """
     try:
         pgid = os.getpgid(process.pid)
@@ -871,9 +886,11 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         return  # parent already gone
 
     try:
-        os.killpg(pgid, signal.SIGTERM)
+        process_signals.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return  # group vanished between getpgid and killpg
+    except process_signals.UnsafeSignalTarget as exc:
+        raise TerminateFailed(f"task pid {process.pid}: {exc}") from exc
     except OSError as exc:
         logger.warning(
             "SIGTERM to PG %d (task pid %d) failed: %s; falling through to SIGKILL",
@@ -889,7 +906,7 @@ def _terminate(process: subprocess.Popen[str]) -> None:
         pass
 
     try:
-        os.killpg(pgid, signal.SIGKILL)
+        process_signals.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         return  # raced its own exit between the wait timeout and the kill
     except OSError as exc:
@@ -938,6 +955,10 @@ def _terminate_by_pid(
     A worker that's still alive at that point is in
     ``TASK_UNINTERRUPTIBLE`` (D-state); we log ERROR so the supervisor
     can pick up the leak from the journal.
+
+    A ``pid`` the runner must never signal raises
+    :class:`~claude_task_runner.process_signals.UnsafeSignalTarget` from
+    the first step, before anything is sent or polled.
     """
     _signal_group_by_pid(pid, signal.SIGTERM)
     deadline = 5.0

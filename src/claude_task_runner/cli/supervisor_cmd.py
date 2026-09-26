@@ -12,7 +12,6 @@ from __future__ import annotations
 import json as _json
 import logging
 import math
-import os
 import signal
 import time
 from collections.abc import Callable
@@ -21,6 +20,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
     require_queue_option,
@@ -333,9 +333,17 @@ def _pid_to_signal(queue_path: Path, console: Console) -> int:
 
 
 def _send_signal(pid: int, signum: signal.Signals, console: Console) -> None:
-    """Send ``signum`` to ``pid``. Exits 1 if it is gone, 2 if not allowed."""
+    """Send ``signum`` to ``pid``. Exits 1 if it is gone, 2 if not allowed.
+
+    A PID of 1 or less, or this command's own, is refused by
+    :mod:`claude_task_runner.process_signals` without signalling, and
+    exits 2 too.
+    """
     try:
-        os.kill(pid, signum)
+        process_signals.kill(pid, signum)
+    except process_signals.UnsafeSignalTarget as exc:
+        _say(console, str(exc), "bold red")
+        raise typer.Exit(code=2) from exc
     except ProcessLookupError as exc:
         _say(console, f"PID {pid} disappeared before {signum.name}", "yellow")
         raise typer.Exit(code=1) from exc
@@ -556,7 +564,7 @@ def drain(
          or a PID that is not alive
       2  --queue is not an existing directory, the settings for the
          default --timeout did not load, or signal delivery rejected
-         (permission)
+         (permission) or refused (a PID of 1 or less, or this command's own)
       4  --wait timed out (the supervisor is still draining)
     """
     console = Console()

@@ -49,7 +49,11 @@ _PROMPT_S = 5.0
 # How long a test watches for a tick that must not happen.
 _WATCH_S = 1.5
 
-pytestmark = pytest.mark.usefixtures("harmless_signal_handlers", "private_global_lock")
+pytestmark = [
+    pytest.mark.usefixtures("harmless_signal_handlers", "private_global_lock"),
+    # These tests wake the daemon by signalling this process on purpose.
+    pytest.mark.allow_self_signal,
+]
 
 
 def _queue(tmp_path: Path) -> Path:

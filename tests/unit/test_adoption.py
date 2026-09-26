@@ -313,14 +313,14 @@ def _snapshot() -> SupervisorSnapshot:
     return SupervisorSnapshot(state=SupervisorState.IDLE, since=_NOW)
 
 
-def test_reconcile_orphans_shields_adopted_ids(queue_dir: Path) -> None:
+def test_reconcile_orphans_shields_adopted_ids(queue_dir: Path, live_worker_pid: int) -> None:
     """``reconcile_orphans`` must NOT demote a task whose id is in
     ``adopted_ids`` — that task has a live worker + monitor thread."""
     # Two running orphans; one is "adopted", one is not.
     _seed_running(
         queue_dir,
         "200-adopted",
-        pid=1,
+        pid=live_worker_pid,
         log_path=_make_log(queue_dir, "200-adopted"),
         started_at=_NOW,
         last_heartbeat_at=_NOW,
@@ -342,13 +342,15 @@ def test_reconcile_orphans_shields_adopted_ids(queue_dir: Path) -> None:
     assert load_state(state_path_for(queue_dir, "201-plain")).status == "failed"
 
 
-def test_reconcile_orphans_demotes_all_when_no_adopted(queue_dir: Path) -> None:
+def test_reconcile_orphans_demotes_all_when_no_adopted(
+    queue_dir: Path, live_worker_pid: int
+) -> None:
     """Default (no adopted_ids): every running orphan is demoted — the
     historical behaviour is preserved bit-for-bit."""
     _seed_running(
         queue_dir,
         "300-a",
-        pid=1,
+        pid=live_worker_pid,
         log_path=_make_log(queue_dir, "300-a"),
         started_at=_NOW,
         last_heartbeat_at=_NOW,

@@ -168,6 +168,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import TaskState
@@ -637,7 +638,16 @@ def _detect_stuck_sleep_loop(
     On match, INFO-logs the detection (with the matched rule name) so the
     operator sees the correlation in journald immediately. The caller is
     responsible for the actual terminate / state transition.
+
+    A ``pid`` the runner must never signal (1 or less, or the
+    supervisor's own) raises
+    :class:`~claude_task_runner.process_signals.UnsafeSignalTarget` before
+    the walk. Every process descends from pid 1, so a walk from there
+    matches any stuck loop on the machine, and on 2026-09-26 the caller's
+    terminate then signalled process group 1: every process the user
+    owns.
     """
+    process_signals.refuse_unsafe_pid(pid, "scan the process tree of")
     if not _PROC_ROOT.exists():
         # Non-Linux (macOS test runner, container with /proc masked, etc.).
         # The detector is a Linux-only optimisation; the duration cap
@@ -1456,10 +1466,16 @@ def _default_sigterm(pid: int) -> bool:
     (``sigtermed=True``) from a could-not-signal demotion
     (``sigtermed=False`` — pid may still be running and need a manual
     ``kill``).
+
+    A pid the runner must never signal is refused, logged at ERROR by
+    :mod:`claude_task_runner.process_signals`, and returns ``False`` with
+    nothing sent.
     """
     try:
-        os.kill(pid, signal.SIGTERM)
+        process_signals.kill(pid, signal.SIGTERM)
         return True
+    except process_signals.UnsafeSignalTarget:
+        return False
     except ProcessLookupError:
         # ESRCH — pid is genuinely gone; the only known-dead case.
         return False

@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, NamedTuple
 
+from claude_task_runner import process_signals
+
 GLOBAL_LOCK_FILENAME = "global.lock"
 """Stored under ``~/.claude_task_runner/`` so it's per-user, not
 per-queue. A user with multiple queues still gets a single
@@ -125,11 +127,18 @@ def read_existing_pid(path: Path) -> int | None:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Cheap liveness check via ``os.kill(pid, 0)``."""
-    if pid <= 0:
-        return False
+    """Cheap liveness check via a signal-0 probe.
+
+    A pid no supervisor can have, 1 or less or the caller's own, is
+    refused by :mod:`claude_task_runner.process_signals`, logged at ERROR
+    and reported dead. Probing pid 1 fails with EPERM, so a PID file
+    holding ``1`` used to read as a live supervisor, and ``supervisor
+    stop`` would then signal init.
+    """
     try:
-        os.kill(pid, 0)
+        process_signals.kill(pid, 0)
+    except process_signals.UnsafeSignalTarget:
+        return False
     except ProcessLookupError:
         return False
     except PermissionError:

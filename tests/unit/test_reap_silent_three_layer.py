@@ -66,6 +66,10 @@ def _settings(
         heartbeat_silence_alert_s=alert,
         heartbeat_silence_kill_s=kill,
         zombie_verify_fs_activity_window_s=fs_window,
+        # These tests seed pids they did not start (2, 5, 1234, ...) and grade
+        # the silence layers; a stuck-sleep-loop scan from such a pid walks some
+        # other process's tree. test_reap_stuck_sleep_loop.py covers that path.
+        bash_poll_antipattern_kill=False,
     )
 
 
@@ -274,7 +278,9 @@ def test_dispatcher_alive_predates_started_treated_as_none(tmp_path: Path) -> No
     assert results[0].silence_s == 1000.0
 
 
-def test_legacy_state_yaml_without_dispatcher_alive_at(tmp_path: Path) -> None:
+def test_legacy_state_yaml_without_dispatcher_alive_at(
+    tmp_path: Path, live_worker_pid: int
+) -> None:
     """Pre-Layer-2 state YAMLs don't carry dispatcher_alive_at. The
     reaper falls back to the last_heartbeat_at-only path so an upgrade
     doesn't reap every running task."""
@@ -287,7 +293,7 @@ def test_legacy_state_yaml_without_dispatcher_alive_at(tmp_path: Path) -> None:
         started_at=started,
         last_heartbeat_at=fresh_hb,
         dispatcher_alive_at=None,  # legacy
-        pid=1,
+        pid=live_worker_pid,
         working_dir=None,
     )
 
@@ -581,7 +587,9 @@ def test_fs_check_skipped_when_function_raises(tmp_path: Path) -> None:
     assert results[0].verdict is HeartbeatVerdict.SILENT
 
 
-def test_fs_check_not_invoked_when_dispatcher_alive_fresh(tmp_path: Path) -> None:
+def test_fs_check_not_invoked_when_dispatcher_alive_fresh(
+    tmp_path: Path, live_worker_pid: int
+) -> None:
     """Layer 3 must be gated on the Layer-2 short-circuit failing.
     When ``dispatcher_alive_at`` is fresh, the reaper returns HEALTHY
     without ever running the filesystem walk — zero FS overhead in
@@ -598,7 +606,7 @@ def test_fs_check_not_invoked_when_dispatcher_alive_fresh(tmp_path: Path) -> Non
         started_at=started,
         last_heartbeat_at=stale_hb,
         dispatcher_alive_at=fresh_alive,
-        pid=1,
+        pid=live_worker_pid,
         working_dir=work,
     )
 
@@ -705,7 +713,7 @@ def test_latest_mtime_handles_max_depth(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dispatcher_alive_wins_even_when_fs_is_stale(tmp_path: Path) -> None:
+def test_dispatcher_alive_wins_even_when_fs_is_stale(tmp_path: Path, live_worker_pid: int) -> None:
     """If the cheap signal (dispatcher_alive_at fresh) says HEALTHY,
     no FS walk happens — even when the worktree mtime would have been
     stale. Proves the layered order: cheap signals first."""
@@ -721,7 +729,7 @@ def test_dispatcher_alive_wins_even_when_fs_is_stale(tmp_path: Path) -> None:
         started_at=started,
         last_heartbeat_at=stale_hb,
         dispatcher_alive_at=fresh_alive,
-        pid=1,
+        pid=live_worker_pid,
         working_dir=work,
     )
 

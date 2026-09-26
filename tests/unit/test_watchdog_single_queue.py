@@ -65,12 +65,14 @@ def _pid_path(queue: Path) -> Path:
 class Supervisors:
     """Stands in for the supervisors that ``_spawn_supervisor`` starts.
 
-    A started supervisor takes the real per-user lock and writes this
-    process's PID, a live one, to its queue's pid file. A spawn while the
-    lock is held exits at once without writing a pid file, as
-    ``supervisor start`` does."""
+    A started supervisor takes the real per-user lock and writes ``pid``, a
+    live child of this test, to its queue's pid file. Not this process's own
+    PID: ``is_pid_alive`` refuses the caller's own. A spawn while the lock is
+    held exits at once without writing a pid file, as ``supervisor start``
+    does."""
 
-    def __init__(self) -> None:
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
         self._running: dict[Path, ExitStack] = {}
         self.spawns: list[Path] = []
 
@@ -78,7 +80,7 @@ class Supervisors:
         stack = ExitStack()
         stack.enter_context(acquire_global_lock())
         self._running[queue] = stack
-        _pid_path(queue).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        _pid_path(queue).write_text(f"{self._pid}\n", encoding="utf-8")
 
     def crash(self, queue: Path) -> None:
         """Release the lock and leave a stale pid file, as a SIGKILL or OOM kill does."""
@@ -101,8 +103,8 @@ class Supervisors:
 
 
 @pytest.fixture
-def supervisors(monkeypatch: pytest.MonkeyPatch) -> Iterator[Supervisors]:
-    sups = Supervisors()
+def supervisors(monkeypatch: pytest.MonkeyPatch, live_worker_pid: int) -> Iterator[Supervisors]:
+    sups = Supervisors(live_worker_pid)
     monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", sups.spawn)
     yield sups
     sups.close()

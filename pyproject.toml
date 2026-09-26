@@ -109,6 +109,7 @@ testpaths = ["tests"]
 markers = [
     "live: tests that spawn the real `claude` binary (require CTR_RUN_LIVE_TESTS=1)",
     "slow: tests that take >1s",
+    "allow_self_signal: the test signals its own process on purpose (see tests/signal_gate.py)",
 ]
 filterwarnings = [
     "error",

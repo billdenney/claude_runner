@@ -252,13 +252,15 @@ def test_state_yaml_not_in_in_flight_is_skipped(tmp_path: Path) -> None:
     assert load_state(state_path_for(qd, "t-out-of-scope")).status == "running"
 
 
-def test_only_in_flight_tasks_evaluated(tmp_path: Path) -> None:
+def test_only_in_flight_tasks_evaluated(tmp_path: Path, live_worker_pid: int) -> None:
     """Two state YAMLs, one in the in-flight set and one not. Only the
     in-flight one is graded — even though both have stale heartbeats."""
     qd = _queue(tmp_path)
     started = _now() - timedelta(seconds=3600)
     stale_hb = _now() - timedelta(seconds=1500)
-    _seed_running(qd, "t-tracked", started_at=started, last_heartbeat_at=stale_hb, pid=1)
+    _seed_running(
+        qd, "t-tracked", started_at=started, last_heartbeat_at=stale_hb, pid=live_worker_pid
+    )
     _seed_running(qd, "t-untracked", started_at=started, last_heartbeat_at=stale_hb, pid=2)
 
     calls: list[int] = []
@@ -276,7 +278,7 @@ def test_only_in_flight_tasks_evaluated(tmp_path: Path) -> None:
     )
 
     assert {r.task_id for r in results} == {"t-tracked"}
-    assert calls == [1]
+    assert calls == [live_worker_pid]
     assert load_state(state_path_for(qd, "t-tracked")).status == "failed"
     assert load_state(state_path_for(qd, "t-untracked")).status == "running"
 
@@ -516,7 +518,7 @@ def test_silent_without_kill_threshold_marks_only(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_two_tick_progression(tmp_path: Path) -> None:
+def test_two_tick_progression(tmp_path: Path, live_worker_pid: int) -> None:
     """First tick: fresh heartbeat → HEALTHY → no change.
     Advance the clock past the alert threshold.
     Second tick: same state YAML, but silence is now stale → SILENT.
@@ -527,7 +529,9 @@ def test_two_tick_progression(tmp_path: Path) -> None:
     qd = _queue(tmp_path)
     started = datetime(2026, 6, 12, 11, 0, tzinfo=UTC)
     fresh_hb = datetime(2026, 6, 12, 11, 55, tzinfo=UTC)
-    _seed_running(qd, "t-progress", started_at=started, last_heartbeat_at=fresh_hb, pid=1)
+    _seed_running(
+        qd, "t-progress", started_at=started, last_heartbeat_at=fresh_hb, pid=live_worker_pid
+    )
 
     clock = FakeClock(datetime(2026, 6, 12, 11, 56, tzinfo=UTC))  # +1min, healthy
     settings = _settings(alert=300, kill=0)

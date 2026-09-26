@@ -270,7 +270,9 @@ def test_healthy_running_left_alone(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stale_prior_heartbeat_does_not_inflate_silence(tmp_path: Path) -> None:
+def test_stale_prior_heartbeat_does_not_inflate_silence(
+    tmp_path: Path, live_worker_pid: int
+) -> None:
     """A last_heartbeat_at that's older than last_started_at is from
     a PREVIOUS run (the dispatcher's finalization write). Naively
     passing it into evaluate() would compute silence from that stale
@@ -282,7 +284,9 @@ def test_stale_prior_heartbeat_does_not_inflate_silence(tmp_path: Path) -> None:
     # Current attempt started 60s ago; PREVIOUS run finished 1 day ago.
     started = _now() - timedelta(seconds=60)
     stale_hb = _now() - timedelta(days=1)
-    _seed_running(qd, "t-stale-hb", started_at=started, last_heartbeat_at=stale_hb, pid=1)
+    _seed_running(
+        qd, "t-stale-hb", started_at=started, last_heartbeat_at=stale_hb, pid=live_worker_pid
+    )
 
     results = reconcile_silent_orphans(
         qd,
@@ -343,10 +347,10 @@ def test_running_without_started_at_skipped(tmp_path: Path) -> None:
     assert load_state(state_path_for(qd, "t-orphan")).status == "running"
 
 
-def test_unparseable_state_file_skipped(tmp_path: Path) -> None:
+def test_unparseable_state_file_skipped(tmp_path: Path, live_worker_pid: int) -> None:
     qd = _queue(tmp_path)
     started = _now() - timedelta(seconds=1000)
-    _seed_running(qd, "t-good", started_at=started, pid=1)
+    _seed_running(qd, "t-good", started_at=started, pid=live_worker_pid)
 
     bad = qd / ".claude_task_runner" / "state" / "bad.yaml"
     bad.write_text("not yaml: ][", encoding="utf-8")
@@ -368,9 +372,11 @@ def test_unparseable_state_file_skipped(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_mixed_verdicts_in_one_pass(tmp_path: Path) -> None:
+def test_mixed_verdicts_in_one_pass(tmp_path: Path, live_worker_pid: int) -> None:
     qd = _queue(tmp_path)
-    _seed_running(qd, "t-fresh", started_at=_now() - timedelta(seconds=60), pid=1)  # HEALTHY
+    _seed_running(
+        qd, "t-fresh", started_at=_now() - timedelta(seconds=60), pid=live_worker_pid
+    )  # HEALTHY
     _seed_running(qd, "t-silent", started_at=_now() - timedelta(seconds=500), pid=2)  # SILENT
     _seed_running(qd, "t-kill", started_at=_now() - timedelta(seconds=1500), pid=3)  # KILL
 
