@@ -30,7 +30,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-app = typer.Typer(no_args_is_help=False, invoke_without_command=False)
+app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
 
 
 OPERATOR_SKILL_NAMES = (

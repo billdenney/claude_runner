@@ -44,7 +44,7 @@ from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 def _supervisor_is_alive(queue_dir: Path) -> tuple[bool, int | None]:

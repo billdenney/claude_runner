@@ -23,7 +23,7 @@ from claude_task_runner.cron import install as cron_install
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
 
-app = typer.Typer(no_args_is_help=False, invoke_without_command=False)
+app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
 
 
 def _watchdog_script_path() -> Path:
