@@ -612,16 +612,29 @@ def check_global_lock(_settings: Settings) -> CheckResult:
 
 
 def check_queue_layout(_settings: Settings, queue_dir: Path) -> CheckResult:
-    """The queue's ``todo/`` and ``.claude_task_runner/`` are valid."""
+    """The queue's ``todo/`` and ``.claude_task_runner/`` are valid.
+
+    A ``queue_dir`` that is not an existing directory FAILs, and
+    :func:`all_checks` then leaves out the checks that read the queue's
+    files. Uses :func:`os.path.isdir`, like
+    :func:`~claude_task_runner.queue.store.require_queue_dir`, so a file
+    or a path that cannot be examined counts as missing.
+    """
     todo = queue_dir / "todo"
     runtime = queue_dir / ".claude_task_runner"
     missing: list[str] = []
-    if not queue_dir.exists():
+    if not os.path.isdir(queue_dir):
         return CheckResult(
             name="queue_layout",
             status=CheckStatus.FAIL,
-            detail=f"queue dir not found: {queue_dir}",
-            remediation=f"mkdir -p {queue_dir}/todo",
+            detail=(
+                f"queue dir is not an existing directory: {queue_dir}; "
+                "the checks that read the queue did not run"
+            ),
+            remediation=(
+                "Check --queue (it defaults to the current directory). "
+                f"To start a new queue there: mkdir -p {queue_dir}/todo"
+            ),
         )
     if not todo.exists():
         missing.append("todo/")
@@ -1229,6 +1242,12 @@ def all_checks(
     call per account; the doctor CLI exposes ``--check-api-usage`` to
     opt in. Useful before flipping ``[usage].source`` to
     ``"api_then_tty"``.
+
+    When ``queue_dir`` is not an existing directory, the checks that read
+    the queue's files are left out: ``queue_layout`` already FAILs for
+    it, and they would only raise on the missing directory. They used to
+    create it instead, through the store's directory helpers, and report
+    an empty queue.
     """
     checks: list[Callable[[], CheckResult]] = [
         lambda: check_claude_binary(settings),
@@ -1240,13 +1259,18 @@ def all_checks(
         lambda: check_queue_perms_for_linux_users(settings, queue_dir),
         lambda: check_global_lock(settings),
         lambda: check_queue_layout(settings, queue_dir),
-        lambda: check_legacy_runner_dir(settings, queue_dir),
-        lambda: check_task_yamls(settings, queue_dir),
-        lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
-        lambda: check_working_dir_template(settings, queue_dir),
-        lambda: check_state_yamls(settings, queue_dir),
-        lambda: check_orphaned_sessions(settings, queue_dir),
-        lambda: check_supervisor_state(settings, queue_dir),
+    ]
+    if os.path.isdir(queue_dir):
+        checks += [
+            lambda: check_legacy_runner_dir(settings, queue_dir),
+            lambda: check_task_yamls(settings, queue_dir),
+            lambda: check_task_paths(settings, queue_dir, enabled=check_paths),
+            lambda: check_working_dir_template(settings, queue_dir),
+            lambda: check_state_yamls(settings, queue_dir),
+            lambda: check_orphaned_sessions(settings, queue_dir),
+            lambda: check_supervisor_state(settings, queue_dir),
+        ]
+    checks += [
         lambda: check_skills_installed(settings),
         lambda: check_watchdog_installed(settings, queue_dir),
     ]

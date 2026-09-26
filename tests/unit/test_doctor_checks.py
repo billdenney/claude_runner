@@ -588,9 +588,31 @@ def test_check_global_lock_live(settings: Settings, tmp_path: Path) -> None:
 
 
 def test_check_queue_layout_missing_queue_dir(settings: Settings, tmp_path: Path) -> None:
-    result = check_queue_layout(settings, tmp_path / "nope")
+    missing = tmp_path / "nope"
+    result = check_queue_layout(settings, missing)
     assert result.status == CheckStatus.FAIL
-    assert "not found" in result.detail
+    assert result.detail == (
+        f"queue dir is not an existing directory: {missing}; "
+        "the checks that read the queue did not run"
+    )
+    assert result.remediation == (
+        "Check --queue (it defaults to the current directory). "
+        f"To start a new queue there: mkdir -p {missing}/todo"
+    )
+    assert not missing.exists()
+
+
+def test_check_queue_layout_file_is_not_a_queue(settings: Settings, tmp_path: Path) -> None:
+    """A file passed the old ``exists()`` test, and making its runtime dir raised."""
+    path = tmp_path / "q"
+    path.write_text("")
+    result = check_queue_layout(settings, path)
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == (
+        f"queue dir is not an existing directory: {path}; "
+        "the checks that read the queue did not run"
+    )
+    assert path.read_text() == ""
 
 
 def test_check_queue_layout_happy_path(settings: Settings, queue_dir: Path) -> None:
@@ -1222,6 +1244,56 @@ def test_all_checks_returns_runnable_callables(settings: Settings, queue_dir: Pa
         names.add(result.name)
     # The legacy-runner-dir surface (ADR-0007) is wired into the battery.
     assert "legacy_runner_dir" in names
+
+
+_QUEUE_CHECKS = [
+    "legacy_runner_dir",
+    "task_yamls",
+    "task_paths",
+    "working_dir_template",
+    "state_yamls",
+    "orphaned_sessions",
+    "supervisor_state",
+]
+"""The checks that read the queue's files, in battery order."""
+
+
+def test_all_checks_missing_queue_leaves_out_the_queue_checks(
+    settings: Settings, tmp_path: Path, watchdog_home: Path
+) -> None:
+    """queue_layout FAILs, the rest still run, and nothing is created.
+
+    The queue checks used to run anyway: ``task_yamls`` created
+    ``<queue>/todo/`` and ``state_yamls`` created
+    ``<queue>/.claude_task_runner/``, so a second ``doctor`` passed
+    ``queue_layout`` on a queue that had never existed."""
+    gone = tmp_path / "gone"
+    results = [fn() for fn in all_checks(settings, gone / "q")]
+    assert [r.name for r in results] == [
+        "claude_binary",
+        "accounts",
+        "legacy_claude_config_dir",
+        "account_policies",
+        "dispatch_pct_legacy",
+        "account_sudo",
+        "queue_perms_multi_user",
+        "global_lock",
+        "queue_layout",
+        "skills_installed",
+        "watchdog_installed",
+    ]
+    assert results[8].status is CheckStatus.FAIL
+    assert not gone.exists()
+
+
+def test_all_checks_existing_queue_runs_the_queue_checks(
+    settings: Settings, queue_dir: Path, tmp_path: Path, watchdog_home: Path
+) -> None:
+    """The contrast to the test above: the same battery plus the queue checks."""
+    present = [fn().name for fn in all_checks(settings, queue_dir)]
+    missing = [fn().name for fn in all_checks(settings, tmp_path / "gone")]
+    assert present[9:16] == _QUEUE_CHECKS
+    assert [name for name in present if name not in _QUEUE_CHECKS] == missing
 
 
 def test_all_checks_can_disable_paths_check(settings: Settings, queue_dir: Path) -> None:

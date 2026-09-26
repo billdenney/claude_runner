@@ -6,7 +6,8 @@
 * ``list_pending(queue_dir)`` — enumerate pending task YAMLs in ``todo/``.
 * ``list_states(queue_dir)`` — enumerate ``.claude_task_runner/state/*.yaml``.
 * ``require_queue_dir(queue_dir)`` — refuse a queue directory that is not
-  there, before the helpers that create subdirectories recreate it.
+  there. The helpers that create the queue's subdirectories never create
+  the queue directory itself.
 
 Atomic writes use ``tempfile.NamedTemporaryFile`` + ``os.replace`` so
 concurrent reads always see a complete file (key invariant 8 in
@@ -71,14 +72,15 @@ class QueueSchemaError(ValueError):
 def require_queue_dir(queue_dir: Path) -> Path:
     """Return ``queue_dir`` resolved; raise unless it is an existing directory.
 
-    :func:`queue_runtime_dir` and :func:`todo_dir` create their
-    directories with ``parents=True``, so they would create a queue
-    directory that is not there too. Call this first wherever the queue
-    directory comes from an operator or from the watchdog registry, since
-    it may be mistyped, deleted or moved. A supervisor started on such a
-    recreated, empty queue holds the per-user global lock, and the real
-    queue's supervisor then fails with "another supervisor is already
-    running".
+    Call this first wherever the queue directory comes from an operator
+    or from the watchdog registry, since it may be mistyped, deleted or
+    moved. :func:`queue_runtime_dir` and :func:`todo_dir` refuse such a
+    directory too, but with a bare :class:`FileNotFoundError` from deep
+    inside the command. Other code still creates the queue directory
+    along with a subdirectory of its own, and a supervisor started on
+    such a recreated, empty queue holds the per-user global lock; the
+    real queue's supervisor then fails with "another supervisor is
+    already running".
 
     Uses :func:`os.path.isdir`, as the watchdog tick does, so a path that
     cannot be examined, such as one under a directory the user may not
@@ -98,9 +100,16 @@ def require_queue_dir(queue_dir: Path) -> Path:
 
 
 def queue_runtime_dir(queue_dir: Path) -> Path:
-    """Resolve ``<queue>/.claude_task_runner/`` and ensure it exists."""
+    """Resolve ``<queue>/.claude_task_runner/`` and ensure it exists.
+
+    Creates the runtime directory and its subdirectories, never the
+    queue directory itself: a missing ``queue_dir`` raises
+    :class:`FileNotFoundError`. With ``parents=True`` every reader, such
+    as ``queue states`` given a mistyped ``--queue``, created the queue
+    and then reported it empty.
+    """
     runtime = queue_dir / ".claude_task_runner"
-    runtime.mkdir(parents=True, exist_ok=True)
+    runtime.mkdir(exist_ok=True)
     (runtime / "state").mkdir(exist_ok=True)
     (runtime / "sidecar").mkdir(exist_ok=True)
     (runtime / "logs").mkdir(exist_ok=True)
@@ -108,9 +117,13 @@ def queue_runtime_dir(queue_dir: Path) -> Path:
 
 
 def todo_dir(queue_dir: Path) -> Path:
-    """Resolve ``<queue>/todo/`` and ensure it exists."""
+    """Resolve ``<queue>/todo/`` and ensure it exists.
+
+    Like :func:`queue_runtime_dir`, never creates the queue directory
+    itself: a missing ``queue_dir`` raises :class:`FileNotFoundError`.
+    """
     todo = queue_dir / "todo"
-    todo.mkdir(parents=True, exist_ok=True)
+    todo.mkdir(exist_ok=True)
     return todo
 
 

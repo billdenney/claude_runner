@@ -308,6 +308,7 @@ def test_other_terminal_statuses_still_skipped(queue_dir: Path) -> None:
     ]:
         # Fresh queue per status so no cross-contamination.
         sub = queue_dir / f"q-{status}"
+        sub.mkdir()
         queue_runtime_dir(sub).mkdir(parents=True, exist_ok=True)
         (sub / "todo").mkdir(parents=True, exist_ok=True)
         task = _make_task(f"t-{status}")
@@ -614,6 +615,7 @@ def test_unmet_requirement_blocks_dispatch_from_every_resume_status(
     the candidate set no matter which status it is resuming from — including
     awaiting_sidecar with every request answered."""
     sub = queue_dir / f"q-{status}"
+    sub.mkdir()
     queue_runtime_dir(sub).mkdir(parents=True, exist_ok=True)
     (sub / "todo").mkdir(parents=True, exist_ok=True)
     task = _requires_task_in_status(sub, f"t-{status}", status)
@@ -631,6 +633,7 @@ def test_satisfied_requirement_admits_from_every_resume_status(
     door. With the file present, every one of those statuses dispatches —
     proving the block above is the requirement and not the status."""
     sub = queue_dir / f"q-{status}"
+    sub.mkdir()
     queue_runtime_dir(sub).mkdir(parents=True, exist_ok=True)
     (sub / "todo").mkdir(parents=True, exist_ok=True)
     task = _requires_task_in_status(sub, f"t-{status}", status)

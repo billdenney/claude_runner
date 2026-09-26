@@ -28,7 +28,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    require_queue_option,
+    resolve_per_queue_config,
+)
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import account_in_flight_count
@@ -108,7 +112,7 @@ def list_accounts(
     interactively without it for a human-readable summary.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
     accounts = resolve_accounts(settings)
     snapshot = _snapshot(settings, qd)
@@ -213,7 +217,7 @@ def pause_account(
     operator can use ``queue states`` and SIGTERM if needed).
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
     changed, message = _update_paused(qd, settings, name, paused=True)
     if json:
@@ -236,7 +240,7 @@ def resume_account(
 ) -> None:
     """Reverse ``account pause <name>``; the dispatcher includes it again."""
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
     changed, message = _update_paused(qd, settings, name, paused=False)
     if json:

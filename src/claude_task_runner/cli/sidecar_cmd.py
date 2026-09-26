@@ -24,7 +24,7 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, require_queue_option
 from claude_task_runner.queue.schema import (
     SidecarAnswer,
     SidecarResponse,
@@ -74,7 +74,7 @@ def list_sidecars(
     JSON output is the contract the ``/runner-answer-sidecar`` skill
     relies on; humans get a one-line-per-sidecar summary.
     """
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, Console(stderr=True), json=json)
     items: list[dict[str, object]] = []
     for item in open_sidecars(qd):
         row: dict[str, object] = {
@@ -180,7 +180,7 @@ def show_sidecar(
     """Print the full content of one sidecar request."""
     from claude_task_runner.queue.sidecar import request_path
 
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, Console(stderr=True), json=json)
     path = request_path(qd, task_id, sequence)
     if not path.exists():
         sys.stderr.write(f"sidecar not found: {path}\n")
@@ -259,6 +259,7 @@ def answer_sidecar(
     str | list[str]}`` objects). The ``/runner-answer-sidecar`` skill
     builds this list from operator clicks and invokes us.
     """
+    qd = require_queue_option(queue_dir, Console(stderr=True))
     if (answers_json is None) == (answers_file is None):
         sys.stderr.write("supply exactly one of --answers / --answers-file\n")
         raise typer.Exit(code=2)
@@ -296,7 +297,6 @@ def answer_sidecar(
             )
         )
 
-    qd = queue_dir.resolve()
     if merge:
         answers = _merge_existing_answers(qd, task_id, sequence, answers)
     supplied = [a.id for a in answers]
