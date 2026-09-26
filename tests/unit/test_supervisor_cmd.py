@@ -393,12 +393,13 @@ def test_an_unreadable_pid_file_is_reported(
 
 
 @pytest.mark.parametrize("command", ["stop", "drain"])
-@pytest.mark.parametrize("name", ["q[abc]", "q[/]x"])
-def test_a_bracket_in_the_queue_path_is_printed_as_typed(
+@pytest.mark.parametrize("name", ["q[abc]", "q[/]x", "q:b:x"])
+def test_the_queue_path_is_printed_as_typed(
     runner: CliRunner, tmp_path: Path, command: str, name: str
 ) -> None:
     """Printed as Rich markup, ``[abc]`` was dropped from the path and
-    ``[/]`` raised ``MarkupError``."""
+    ``[/]`` raised ``MarkupError``. Without ``emoji=False``, ``:b:``
+    printed as an emoji even with markup off."""
     queue = tmp_path / name
     queue.mkdir(parents=True)  # q[/]x is q[ holding ]x
     with _signals_nothing():

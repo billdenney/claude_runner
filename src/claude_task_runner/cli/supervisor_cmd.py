@@ -291,10 +291,11 @@ def _say(console: Console, message: str, style: str) -> None:
 
     Rich markup would drop a ``[word]`` from a queue path or from a config
     table name such as ``[supervisor]``, and a ``[/]`` in a path raised
-    ``MarkupError``. Printed as
-    :func:`~claude_task_runner.cli._helpers.require_queue_option` prints.
+    ``MarkupError``. Rich replaces emoji codes such as ``:b:`` even without
+    markup, so without ``emoji=False`` a queue at ``/data/a:b:c`` printed
+    with an emoji in place of ``:b:``.
     """
-    console.print(message, style=style, markup=False, highlight=False, soft_wrap=True)
+    console.print(message, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
 
 
 def _pid_to_signal(queue_path: Path, console: Console) -> int:
