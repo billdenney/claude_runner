@@ -16,6 +16,7 @@ ineligible until the operator answers those too.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -23,6 +24,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     SidecarAnswer,
@@ -43,12 +45,17 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import orchestrator as orchestrator_mod
 from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
-from claude_task_runner.runner.orchestrator import (
-    _dispatch_blocked_task_ids,
-    _eligible_candidates,
-)
+from claude_task_runner.runner.orchestrator import _dispatch_blocked_task_ids
 
 from ._sidecar_files import write_request
+
+# These tests cover the selector's status, sidecar and readiness branches.
+# Every task they queue uses the Task defaults, which the package-default
+# [effort_levels] accepts. test_orchestrator_effort_gate.py covers the
+# effort gate itself.
+_eligible_candidates = functools.partial(
+    orchestrator_mod._eligible_candidates, effort_levels=load_defaults()["effort_levels"]
+)
 
 
 def _write_task_yaml(queue_dir: Path, task: Task) -> Path:

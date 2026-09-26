@@ -9,6 +9,17 @@ Public surface:
 * :func:`validate_effort` — raise :class:`UnknownEffortLevel` if the
   given ``(model, effort)`` is not in the configured set, including a
   model with no configured set at all.
+* :func:`hold_reason` / :func:`is_hold_reason` — the ``deferred_reason``
+  the supervisor writes when it parks a task whose pair fails
+  :func:`validate_effort`, and the test for one it wrote.
+
+The task schema cannot run :func:`validate_effort`, because the accepted
+sets come from the merged settings, which ``queue.store.load_task`` never
+sees. So each place that has the settings in hand checks the pair itself:
+``queue add`` before it writes a task, the supervisor's candidate
+selector before it dispatches one (parking a mismatched task as
+``deferred``, see :func:`hold_reason`), both force-dispatch paths, the
+doctor's ``task_yamls`` check and ``queue list``.
 """
 
 from __future__ import annotations
@@ -28,7 +39,7 @@ class UnknownEffortLevel(ValueError):
         if accepted is None:
             super().__init__(
                 f"model {model!r} has no effort levels configured; "
-                f"add a [effort_levels.{model!r}] entry to "
+                f'add "{model}" = [<levels>] under [effort_levels] in '
                 "claude_runner.toml or use a configured model"
             )
         else:
@@ -54,3 +65,22 @@ def validate_effort(
     accepted = effort_levels[model]
     if effort not in accepted:
         raise UnknownEffortLevel(model, effort, accepted=accepted)
+
+
+HOLD_REASON_PREFIX = "invalid effort: "
+"""Prefix of the ``deferred_reason`` the supervisor writes when it parks a
+task whose ``(model, effort)`` pair fails :func:`validate_effort`.
+
+The supervisor un-parks only a task whose reason carries this prefix, so a
+pre-dispatch hook's deferral, a readiness hold and an operator's manual
+park are never cleared by the effort check."""
+
+
+def hold_reason(exc: UnknownEffortLevel) -> str:
+    """Format ``exc`` into the ``deferred_reason`` the supervisor writes."""
+    return HOLD_REASON_PREFIX + str(exc)
+
+
+def is_hold_reason(reason: str | None) -> bool:
+    """True iff ``reason`` is a ``deferred_reason`` :func:`hold_reason` wrote."""
+    return reason is not None and reason.startswith(HOLD_REASON_PREFIX)

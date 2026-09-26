@@ -17,9 +17,8 @@ subcommand or option that the CLI would reject. It checks two shapes:
 
 * ``claude-task-runner ...`` inside a code span or a fenced block.
 * A code span that starts with a top-level group and a command word,
-  such as ``sidecar answer``. The CHANGELOG and the ADRs mostly name
-  commands this way. ADR-0030's unbuilt ``queue why-blocked`` is one
-  example.
+  such as ``sidecar answer``. The ADRs mostly name commands this way.
+  ADR-0030's unbuilt ``queue why-blocked`` is one example.
 
 The package's own sources get the same walk, because operators and
 agents copy commands from them too. The docstring of
@@ -554,7 +553,6 @@ def _doc_files() -> list[Path]:
     """The operator- and agent-facing markdown that names CLI commands."""
     return [
         REPO_ROOT / "README.md",
-        REPO_ROOT / "CHANGELOG.md",
         *sorted((REPO_ROOT / "docs").rglob("*.md")),
         *sorted((REPO_ROOT / "src" / "claude_task_runner" / "skills").glob("*/SKILL.md")),
     ]
@@ -774,7 +772,7 @@ class TestInvocationExtraction:
         assert _iter_mentions(text) == [Mention(4, ("supervisor", "restart"))]
 
     def test_quote_before_program_closes_the_invocation(self) -> None:
-        # Quoted from a click error message in the CHANGELOG.
+        # The shape of a click usage error message.
         text = "```\nTry 'claude-task-runner supervisor drain --help' for help.\n```"
         assert _iter_mentions(text) == [Mention(2, ("supervisor", "drain", "--help"))]
 

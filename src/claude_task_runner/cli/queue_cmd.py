@@ -38,7 +38,7 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -137,9 +137,33 @@ def template(
     typer.echo(field_reference() if reference else task_template())
 
 
+def _effort_error(task: Task, effort_levels: dict[str, list[str]]) -> str | None:
+    """Why ``[effort_levels]`` rejects ``task``'s (model, effort) pair, or ``None``.
+
+    The task schema cannot check the pair, since the accepted sets live in
+    the settings (ADR-0010). The supervisor parks a task that fails this
+    as ``deferred`` instead of dispatching it.
+    """
+    try:
+        validate_effort(task.model, task.effort, effort_levels)
+    except UnknownEffortLevel as exc:
+        return str(exc)
+    return None
+
+
 @app.command("list")
 def list_tasks(
     *,
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "Per-queue claude_runner.toml whose [effort_levels] each task's "
+            "(model, effort) is checked against. Defaults to "
+            "<queue>/claude_runner.toml when present, else the package defaults."
+        ),
+    ),
     queue_dir: Path = typer.Option(
         Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
     ),
@@ -153,7 +177,13 @@ def list_tasks(
         ),
     ),
 ) -> None:
-    """List pending tasks in ``<queue>/todo/`` (Task YAMLs)."""
+    """List pending tasks in ``<queue>/todo/`` (Task YAMLs).
+
+    Each parsed task's row carries ``effort_error``: ``null`` when the
+    queue's ``[effort_levels]`` accepts its (model, effort) pair, else the
+    reason it does not. The supervisor parks such a task as ``deferred``
+    instead of dispatching it (ADR-0010).
+    """
     from claude_task_runner.runner.orchestrator import (
         planned_dispatch_order,
         priority_sort_key,
@@ -162,6 +192,15 @@ def list_tasks(
     console = Console()
     out: list[dict[str, object]] = []
     qd = require_queue_option(queue_dir, console, json=json)
+    try:
+        settings = load_settings(resolve_per_queue_config(config, qd))
+    except ConfigError as exc:
+        message = f"cannot load the queue's settings to check effort levels: {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": message}))
+        else:
+            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2) from exc
 
     if order_by_dispatch:
         ordered_tasks = planned_dispatch_order(qd)
@@ -190,6 +229,7 @@ def list_tasks(
                     "tags": task.tags,
                     "depends_on": task.depends_on,
                     "path": str(path),
+                    "effort_error": _effort_error(task, settings.effort_levels),
                 }
             )
     else:
@@ -217,6 +257,7 @@ def list_tasks(
                     "tags": task.tags,
                     "depends_on": task.depends_on,
                     "path": str(path),
+                    "effort_error": _effort_error(task, settings.effort_levels),
                 }
             )
 
@@ -238,6 +279,14 @@ def list_tasks(
             f"priority={item['priority']})[/]"
         )
         console.print(f"  {item['title']}")
+        if item["effort_error"] is not None:
+            console.print(
+                f"  invalid effort: {item['effort_error']}",
+                style="red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
 
 
 @app.command("states")
@@ -480,7 +529,15 @@ def add_task(
     try:
         validate_effort(model, effort, settings.effort_levels)
     except UnknownEffortLevel as exc:
-        console.print(f"[bold red]invalid effort:[/] {exc}")
+        # No markup: Rich would swallow the "[effort_levels]" in the message
+        # as a style tag.
+        console.print(
+            f"invalid effort: {exc}",
+            style="bold red",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
         raise typer.Exit(code=2) from exc
 
     target = task_path_for(qd, task_id)
@@ -807,7 +864,8 @@ def force_dispatch(
     Exits non-zero if the task YAML is missing from ``todo/``, if its
     current status is not dispatchable (``running``,
     ``awaiting_sidecar``, ``completed``, ``failed_circuit_breaker``,
-    ``weekly_paused``), or if the pre-dispatch hook fails during the
+    ``weekly_paused``), if the queue's ``[effort_levels]`` rejects its
+    (model, effort) pair, or if the pre-dispatch hook fails during the
     synchronous path.
     """
     console = Console()
@@ -824,7 +882,7 @@ def force_dispatch(
             console.print(f"[bold red]{msg}[/]")
         raise typer.Exit(code=2)
     try:
-        load_task(task_path)
+        task = load_task(task_path)
     except (QueueIOError, QueueSchemaError) as exc:
         msg = f"task YAML invalid: {exc}"
         if json:
@@ -846,6 +904,18 @@ def force_dispatch(
             print(_json.dumps({"ok": False, "error": msg, "status": current_status}))
         else:
             console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2)
+
+    # ADR-0010. Checked here as well as by both force paths so that, with a
+    # supervisor running, the operator hears about it now instead of the
+    # supervisor quietly dropping the request on its next tick.
+    effort_error = _effort_error(task, settings.effort_levels)
+    if effort_error is not None:
+        msg = f"task {task_id} has an invalid effort: {effort_error}"
+        if json:
+            print(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=2)
 
     if _supervisor_is_alive(qd):
