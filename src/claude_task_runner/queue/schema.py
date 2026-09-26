@@ -238,8 +238,6 @@ class Task(_StrictBase):
     week closes."""
     weekly_deferrable: bool = False
     """OK to skip until next weekly window; deprioritized in EOW push."""
-    force_dispatch_in_eow: bool = False
-    """Override the EOW-runtime safety guard for this specific task."""
     max_tokens_override: int | None = Field(default=None, ge=1)
     """Per-task override of ``[task_caps].max_tokens_per_task``."""
     max_duration_s_override: float | None = Field(default=None, gt=0)

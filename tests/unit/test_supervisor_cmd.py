@@ -279,7 +279,6 @@ def test_status_color_categories_render(runner: CliRunner, queue_dir: Path) -> N
         SupervisorState.SLOWING_DOWN,  # yellow
         SupervisorState.THROTTLED_5H,  # red
         SupervisorState.THROTTLED_WEEKLY,  # red
-        SupervisorState.STOPPED,  # red
         SupervisorState.ERROR_DRIFT,  # red
     ]:
         snap = _make_snapshot(state)

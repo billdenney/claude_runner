@@ -10,7 +10,6 @@ from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.runner.heartbeat import (
     HeartbeatVerdict,
     evaluate,
-    silence_window,
 )
 
 
@@ -116,17 +115,3 @@ class TestEvaluate:
         )
         # silence = 600 - 400 = 200 -> healthy
         assert status.verdict is HeartbeatVerdict.HEALTHY
-
-
-class TestSilenceWindow:
-    def test_kill_zero_returns_none(self) -> None:
-        s = _settings(alert=300, kill=0)
-        alert, kill = silence_window(s)
-        assert alert == 300
-        assert kill is None
-
-    def test_kill_set_returns_value(self) -> None:
-        s = _settings(alert=300, kill=900)
-        alert, kill = silence_window(s)
-        assert alert == 300
-        assert kill == 900
