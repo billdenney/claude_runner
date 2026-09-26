@@ -184,7 +184,10 @@ systemd-user vs cron and asks for confirmation before writing anything.
   exponentially after repeated crashes (ADR-0002). While another supervisor
   holds the per-user lock, such as one a previous `install` started for
   another queue, a tick starts none; `install` says how to hand over.
-  `claude-task-runner watchdog queues` shows the registered queue.
+  `claude-task-runner watchdog queues` shows the registered queue. A tick
+  takes the queue's `[watchdog]` settings from the config `install --config`
+  recorded, else from `<queue>/claude_runner.toml`, and starts the
+  supervisor with the same file.
 
 ## 6. Start the supervisor
 

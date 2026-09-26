@@ -171,11 +171,15 @@ hook's flock. See ADR-0034 and the runbook.
 ```sh
 claude-task-runner watchdog queues                       # one path per line; the last is the managed queue
 claude-task-runner watchdog register --queue <queue>     # manage this queue instead (the directory must exist)
+claude-task-runner watchdog register --queue <queue> --config <toml>   # ...and record the TOML ticks use for it
 claude-task-runner watchdog unregister --queue <queue>   # drop a queue (the directory need not exist)
 ```
 
 One supervisor runs per user, so the cron watchdog manages one queue.
-`register` replaces it, as a cron `install` does. When the old queue's
+`register` replaces it, as a cron `install` does. A tick takes the queue's
+`[watchdog]` settings from the config `--config` recorded, else from
+`<queue>/claude_runner.toml`, and starts the supervisor with the same file;
+registering again without `--config` drops the recorded one. When the old queue's
 supervisor still holds the per-user lock, `register` says so: until that one
 exits, every tick logs `verdict=locked` and starts nothing. Hand over with
 `claude-task-runner supervisor drain --queue <old-queue>`. A `queues.json`

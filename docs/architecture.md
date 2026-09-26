@@ -151,7 +151,8 @@ Global (cross-queue):
 ├── queues.json                     # the one queue the cron watchdog
 │                                   #   manages (replaced by cron `install`
 │                                   #   and `watchdog register`, removed by
-│                                   #   `watchdog unregister`)
+│                                   #   `watchdog unregister`), and the
+│                                   #   config their `--config` recorded
 ├── watchdog_state.json             # cron watchdog restart history + backoff
 │                                   #   for the queue it manages
 ├── watchdog.log                    # cron watchdog output (watchdog.sh)
