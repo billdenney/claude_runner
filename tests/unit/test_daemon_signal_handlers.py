@@ -212,6 +212,28 @@ def test_handlers_are_left_alone_without_install_signal_handlers(
     assert _handlers() == stand_ins
 
 
+def test_a_handler_installed_outside_python_is_not_put_back(
+    tmp_path: Path, stand_ins: dict[int, _StandIn], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``signal.getsignal`` returns None for a handler that C code
+    installed, and ``signal.signal`` cannot install None, so the daemon's
+    handler stays for that signal. The other three are put back."""
+    real_getsignal = signal.getsignal
+
+    def getsignal(signum: int) -> object:
+        return None if signum == signal.SIGHUP else real_getsignal(signum)
+
+    monkeypatch.setattr(signal, "getsignal", getsignal)
+
+    _run(tmp_path, source=FakeUsageSource([_reading()]))
+
+    after = {signum: real_getsignal(signum) for signum in _DAEMON_SIGNALS}
+    assert _names({signal.SIGHUP: after.pop(signal.SIGHUP)}) == {
+        "SIGHUP": _DAEMON_HANDLERS["SIGHUP"]
+    }
+    assert after == {signum: stand_ins[signum] for signum in after}
+
+
 @pytest.mark.parametrize("signum", _DAEMON_SIGNALS, ids=lambda s: signal.Signals(s).name)
 def test_the_conftest_guard_fails_a_test_that_leaks_a_handler(
     pytester: pytest.Pytester, signum: int
