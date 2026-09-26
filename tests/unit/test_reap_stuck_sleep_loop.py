@@ -71,6 +71,7 @@ from claude_task_runner.supervisor.reconcile_silent import (
     _LOOP_KEYWORD_RE,
     _STUCK_SLEEP_LOOP_FALLBACK_RE,
     STUCK_SLEEP_LOOP_STOP_REASON,
+    ReapResult,
     _detect_stuck_sleep_loop,
     _match_stuck_sleep_loop_argv,
     reap_silent_orphans_tick,
@@ -587,6 +588,82 @@ def test_skipped_when_silence_below_kill_threshold(tmp_path: Path) -> None:
     )
     assert results == []
     assert calls == []
+
+
+def test_skipped_when_silence_exactly_at_kill_threshold(tmp_path: Path) -> None:
+    """The agent-silence gate is strict: silence of exactly
+    ``stuck_sleep_loop_kill_threshold_s`` does not run the detector, even
+    though a matching loop is there to find."""
+    qd = _queue(tmp_path)
+    _seed(
+        qd,
+        "t-at-threshold",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=600),
+        dispatcher_alive_at=_now() - timedelta(seconds=10),
+        pid=88,
+    )
+    before = load_state(state_path_for(qd, "t-at-threshold"))
+
+    detector, calls = _record_detector(return_match=(1, "argv"))
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-at-threshold"},
+        settings=_settings(alert=300, stuck_threshold=600),
+        clock=FakeClock(_now()),
+        stuck_loop_detect_fn=detector,
+        terminate_fn=lambda _p: True,
+    )
+    assert results == []
+    assert calls == []
+    assert load_state(state_path_for(qd, "t-at-threshold")) == before
+
+
+def test_fires_one_second_past_kill_threshold(tmp_path: Path) -> None:
+    """One second past ``stuck_sleep_loop_kill_threshold_s`` the detector
+    runs and the matching loop is killed."""
+    qd = _queue(tmp_path)
+    _seed(
+        qd,
+        "t-past-threshold",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=601),
+        dispatcher_alive_at=_now() - timedelta(seconds=10),
+        pid=88,
+    )
+
+    argv = "bash -c while ! [ -e /tmp/marker ]; do sleep 5; done"
+    detector, calls = _record_detector(return_match=(99999, argv))
+    term_calls: list[int] = []
+
+    def terminate_stub(p: int) -> bool:
+        term_calls.append(p)
+        return True
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-past-threshold"},
+        settings=_settings(alert=300, stuck_threshold=600),
+        clock=FakeClock(_now()),
+        stuck_loop_detect_fn=detector,
+        terminate_fn=terminate_stub,
+    )
+    assert calls == [88]
+    assert term_calls == [88]
+    assert results == [
+        ReapResult(
+            task_id="t-past-threshold",
+            verdict=HeartbeatVerdict.KILL,
+            silence_s=601.0,
+            pid=88,
+            sigtermed=True,
+            stuck_loop_bash_pid=99999,
+            stuck_loop_matched_argv=argv,
+        )
+    ]
+    reloaded = load_state(state_path_for(qd, "t-past-threshold"))
+    assert reloaded.status == "failed"
+    assert reloaded.stop_reason == STUCK_SLEEP_LOOP_STOP_REASON
 
 
 def test_skipped_when_dispatcher_also_stale(tmp_path: Path) -> None:
