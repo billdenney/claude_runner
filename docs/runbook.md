@@ -62,8 +62,16 @@ the start limit, and `systemctl --user start claude-task-runner` starts the
 supervisor again.
 
 **Steps:**
-1. Watchdog backoff should have engaged after `crash_loop_threshold`
-   crashes — verify in `watchdog.log` that exponential backoff is active.
+1. Check that the watchdog is backing off. It counts the restarts since
+   the supervisor last stayed up `min(10 × restart_cooldown_s,
+   restart_backoff_max_s)`, 300 s by default. After
+   `[watchdog].crash_loop_threshold` of them (5 by default), ticks log
+   `verdict=backoff` with `backing off until <time>`. The wait from one
+   restart to the next doubles, from twice the cooldown up to
+   `[watchdog].restart_backoff_max_s` (600 s by default). So a supervisor
+   that dies on every start is restarted about six times an hour, not every
+   minute. Once it stays up 300 s, the count starts over. Nothing sends a
+   notification; `watchdog.log` is the record.
 2. Read `supervisor.log` for the failing exception. Common causes:
    - Disk full → `usage_captures/` rotation hadn't run; clear old captures.
    - Settings TOML invalid → `claude-task-runner doctor` (loads the TOML
@@ -152,8 +160,12 @@ come back.
    `Main process exited, code=killed, status=9/KILL`, then
    `Scheduled restart job`. In-flight `claude` workers keep running
    (`KillMode=process`). With `[supervisor].adopt_workers` on, the
-   default, the new supervisor adopts them. systemd also logs
-   `Found left-over process` for each one, which is expected.
+   default, the new supervisor adopts them. A worker that finished
+   while no supervisor ran is recorded from its log instead. The
+   supervisor logs `recorded exited worker for task <id> from its log`,
+   and the task gets that run's status, `completed` for a success.
+   systemd also logs `Found left-over process` for each one still
+   running, which is expected.
 
    Do not test with `kill <pid>` or `supervisor stop`. Both send SIGTERM,
    the supervisor exits 0, and `RestartPreventExitStatus=0` leaves it
@@ -215,7 +227,8 @@ alone needs no restart, and `install` does not ask for one.
 
    With `[supervisor].adopt_workers` on, the default, the old queue's
    in-flight workers keep running, but no supervisor follows them until
-   one runs for that queue again.
+   one runs for that queue again. That supervisor records each worker
+   that finished in the meantime from its log.
 
 ## A systemd stop killed in-flight tasks (adoption off)
 
@@ -315,7 +328,8 @@ hand, or the systemd unit's.
    `claude-task-runner supervisor stop --queue <old-queue>` exits sooner.
    With `[supervisor].adopt_workers` on, the default, the old queue's
    in-flight workers then keep running, but nothing reaps them until a
-   supervisor runs for that queue again.
+   supervisor runs for that queue again. That supervisor records each
+   worker that finished in the meantime from its log.
 3. If the holder is the systemd unit's supervisor, both the unit and the
    cron watchdog are installed. `claude-task-runner install uninstall`
    offers to remove each; keep the one you want.

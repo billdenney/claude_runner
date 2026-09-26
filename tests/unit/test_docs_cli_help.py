@@ -16,7 +16,7 @@ found on 2026-09-25, ten help texts in nine commands were affected.
 
 Every ``typer.Typer`` in ``cli/`` now passes ``rich_markup_mode=None``, so
 click prints help as written, in its plain format. This module checks
-four things:
+five things:
 
 * Every command's ``--help``, rendered through the real entry point,
   contains every bracketed token of its source help text.
@@ -36,6 +36,14 @@ four things:
   ``[default: (current directory)]``. The label changes only the help, so
   ``TestQueueDefault`` checks that every ``--queue`` still defaults to the
   directory the command runs in.
+* Every group whose app registers a callback with a docstring prints that
+  docstring as its help. Typer prints ``add_typer``'s ``help=`` in its
+  place. When this was found on 2026-09-26, ``cli/__init__.py`` passed a
+  one-line ``help=`` to all four such groups. So ``install --help`` hid
+  what its systemd and cron installs do, and ``usage --help`` hid that
+  ``usage`` with no subcommand runs ``render``. They now pass
+  ``short_help=``, the line the root listing prints, and
+  ``TestGroupHelp`` pins those lines.
 
 Rich markup in ``console.print`` output is separate and still renders;
 ``TestConsoleMarkup`` pins that.
@@ -126,13 +134,19 @@ def _help_texts(node: Any) -> list[str]:
     """The help text that ``node``'s ``--help`` shows, as written in the source.
 
     That is the command's help up to any form feed (click drops the rest),
-    its epilog, and the help of each parameter that is not hidden.
+    its epilog, the help of each parameter that is not hidden, and the
+    ``short_help`` of each subcommand that it lists. Click lists a
+    ``short_help`` whole; a subcommand without one is listed with the start
+    of its help, which may be cut short, so that is left out.
     """
     texts = [(node.help or "").partition("\f")[0], node.epilog or ""]
     texts.extend(
         getattr(param, "help", None) or ""
         for param in node.params
         if not getattr(param, "hidden", False)
+    )
+    texts.extend(
+        sub.short_help or "" for sub in getattr(node, "commands", {}).values() if not sub.hidden
     )
     return texts
 
@@ -229,6 +243,52 @@ def _parsed_queue(command: Any) -> Any:
     return ctx.params[_queue_option(command).name]
 
 
+def _group_docstrings(
+    root: typer.Typer = app, prefix: tuple[str, ...] = ()
+) -> dict[tuple[str, ...], str]:
+    """The callback docstring of each group in ``root``'s tree that has one.
+
+    Keyed by command path. Typer gives the group the docstring of its
+    app's callback as its help text, unless ``add_typer`` passes ``help=``.
+    """
+    docstrings: dict[tuple[str, ...], str] = {}
+    for group in root.registered_groups:
+        sub_app = group.typer_instance
+        assert sub_app is not None, group.name
+        path = (*prefix, str(group.name))
+        registered = sub_app.registered_callback
+        callback = registered.callback if registered is not None else None
+        docstring = inspect.getdoc(callback) if callback is not None else None
+        if docstring:
+            docstrings[path] = docstring
+        docstrings.update(_group_docstrings(sub_app, path))
+    return docstrings
+
+
+def _one_line_paragraphs(text: str) -> list[str]:
+    """The paragraphs of ``text``, each joined onto one line.
+
+    Click re-wraps each paragraph to the terminal, so this is what help
+    text and its rendering have in common at any width. A ``\\b`` marker
+    line is dropped, as click drops it.
+    """
+    paragraphs = []
+    for lines in _paragraphs(text):
+        kept = [line for line in lines if line.strip() != _NO_REWRAP]
+        paragraphs.append(" ".join(" ".join(kept).split()))
+    return paragraphs
+
+
+def _page_paragraphs(path: tuple[str, ...], root: typer.Typer = app) -> list[str]:
+    """The help text that ``path``'s rendered ``--help`` prints above its
+    options, as one-line paragraphs."""
+    output = _ANSI.sub("", _render_help(root, path))
+    above_options, found, _ = output.partition("\nOptions:\n")
+    assert found, output
+    _usage, _, text = above_options.partition("\n\n")
+    return _one_line_paragraphs(text)
+
+
 def _demo_command(
     wait: Annotated[
         bool, typer.Option(help="Wait up to ``[task_caps].max_duration_s_per_task``.")
@@ -274,6 +334,29 @@ def _demo_app(mode: MarkupMode, command: Callable[..., None] = _demo_command) ->
     demo = typer.Typer(rich_markup_mode=mode)
     demo.command()(command)
     return demo
+
+
+def _demo_group_callback() -> None:
+    """Summarise the demo group.
+
+    Its second paragraph runs over two lines, which click joins and
+    wraps again to fit the terminal.
+
+    \b
+    Exit codes:
+      0  clean
+      1  drift
+    """
+
+
+def _demo_group(**add_typer: Any) -> typer.Typer:
+    """A root app with one group, ``demo``, whose callback is
+    ``_demo_group_callback``. ``add_typer`` goes to ``add_typer``."""
+    group = typer.Typer(rich_markup_mode=None)
+    group.callback()(_demo_group_callback)
+    root = typer.Typer(rich_markup_mode=None)
+    root.add_typer(group, name="demo", **add_typer)
+    return root
 
 
 class TestChecker:
@@ -488,6 +571,76 @@ class TestQueueDefault:
         command = _node(path)
         assert _queue_option(command).show_default == CWD_DEFAULT_LABEL
         assert _parsed_queue(command) == tmp_path.resolve()
+
+
+class TestGroupHelp:
+    """A group whose app has a callback prints the callback's docstring.
+
+    Typer prints ``add_typer``'s ``help=`` in place of the docstring, so
+    ``cli/__init__.py`` gives these groups ``short_help=``, the line the
+    root listing prints, and no ``help=``.
+    """
+
+    def test_reads_the_page_of_a_callback_docstring(self) -> None:
+        demo = _demo_group(short_help="One line.")
+        docstring = inspect.getdoc(_demo_group_callback) or ""
+        assert _group_docstrings(demo) == {("demo",): docstring}
+        paragraphs = [
+            "Summarise the demo group.",
+            "Its second paragraph runs over two lines, which click joins and wraps again "
+            "to fit the terminal.",
+            "Exit codes: 0 clean 1 drift",
+        ]
+        assert _page_paragraphs(("demo",), demo) == paragraphs
+        assert _one_line_paragraphs(docstring) == paragraphs
+
+    def test_reads_the_page_of_an_add_typer_help(self) -> None:
+        # The shape of the defect: typer puts add_typer's help= before the
+        # callback's docstring.
+        demo = _demo_group(help="One line.")
+        assert _page_paragraphs(("demo",), demo) == ["One line."]
+        assert _node(("demo",), typer.main.get_command(demo)).help == "One line."
+
+    def test_finds_the_groups_with_callback_docstrings(self) -> None:
+        # Guards the parametrised gate below against a walk that finds nothing.
+        assert set(_group_docstrings()) == {
+            ("doctor",),
+            ("install",),
+            ("install-skills",),
+            ("usage",),
+        }
+
+    @pytest.mark.parametrize("path", sorted(_group_docstrings()), ids=_path_id)
+    def test_page_prints_the_callback_docstring(self, path: tuple[str, ...]) -> None:
+        docstring = _group_docstrings()[path]
+        assert _node(path).help == docstring, (
+            f"`claude-task-runner {_path_id(path)} --help` does not print the docstring "
+            "of its app's callback. add_typer's help= replaces it; for the root "
+            "listing's line, pass short_help= instead."
+        )
+        assert _page_paragraphs(path) == _one_line_paragraphs(docstring.partition("\f")[0])
+
+    def test_usage_page_says_what_no_subcommand_does(self) -> None:
+        assert _page_paragraphs(("usage",)) == [
+            "Usage capture, parse, and drift check.",
+            "With no subcommand, runs ``render``.",
+        ]
+
+    def test_root_listing_prints_the_short_help(self) -> None:
+        short_help = {path: _node(path).short_help for path in _group_docstrings()}
+        assert short_help == {
+            ("doctor",): "Self-diagnostic battery (pass/warn/fail per check).",
+            ("install",): (
+                "Install the watchdog for one queue (systemd preferred, cron fallback). "
+                "Installing it for another queue replaces the first."
+            ),
+            ("install-skills",): "Install the task-runner skills into ~/.claude/skills/.",
+            ("usage",): "Usage capture, parse, and drift check.",
+        }
+        # The bracket and layout gates read these lines too.
+        assert set(short_help.values()) <= set(_help_texts(CLI))
+        listing = _squash(_render_help(app, ()))
+        assert [text for text in short_help.values() if _squash(text) not in listing] == []
 
 
 class TestConsoleMarkup:
