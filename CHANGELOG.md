@@ -94,6 +94,21 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **Ten helpers that nothing in production called.** `runner.readiness.is_ready`
+  wrapped the live `unmet_requirements`. In `queue.sidecar`, `write_request` and
+  `next_sequence` duplicated what the agent does itself under the
+  `agent-stop-and-ask` skill, and `read_response` and `outstanding_question_ids`
+  duplicated the live readers, which work on raw payloads.
+  `runner.effort_levels` lost `accepted_efforts` and `accepted_models`, since
+  `queue add` calls `validate_effort`. `UnknownModel` went with them: only
+  `accepted_efforts` raised it, so the `unknown model:` branch in `queue add`
+  could never run. `queue add` still reports an unknown model as `invalid
+  effort: model ... has no effort levels configured`.
+  `runner.heartbeat.silence_window`, `runner.session.claude_session_jsonl` and
+  `cli.queue_cmd._emit` had no caller at all. Tests now write sidecar requests
+  with a helper under `tests/unit/`, and the task-template drift guard moved
+  into its test.
+
 - **Six empty packages, the `ui` extra and the Jinja2 task-templates
   promise.** `events/`, `logs/`, `metrics/`, `notify/`, `templates/` and `ui/`
   each held only an empty `__init__.py` from the initial commit, and nothing

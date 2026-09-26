@@ -158,8 +158,8 @@ initial_concurrency         = 1
 "claude-opus-5"     = ["low", "medium", "high", "max", "extra_high"]
 "claude-sonnet-5"   = ["low", "medium", "high"]
 "claude-haiku-4-5"  = ["low", "medium", "high"]
-# Previous-generation models retained so queues with in-flight task YAMLs
-# that still name them keep dispatching instead of raising UnknownModel.
+# Previous-generation models retained so `queue add` keeps accepting task
+# YAMLs that still name them.
 "claude-opus-4-7"   = ["low", "medium", "high", "max", "extra_high"]
 "claude-sonnet-4-6" = ["low", "medium", "high"]
 
