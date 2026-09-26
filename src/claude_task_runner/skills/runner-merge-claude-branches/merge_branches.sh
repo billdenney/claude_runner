@@ -2,17 +2,21 @@
 # Consolidate per-task claude/* branches into one review-ready branch.
 #
 # End-to-end orchestrator for /runner-merge-claude-branches. Runs:
-#   1. Pre-flight survey (which branches have unmerged commits)
+#   1. Pre-flight survey (which branches have unmerged commits; stops if two
+#      branches add one path with different content)
 #   2. Worktree creation off the configured base
 #   3. Sequential merge with -X theirs
-#   3b. Resurrected-path guard (re-remove files the base deleted that a
-#       stale branch brought back via -X theirs)
-#   4. R-side registry regeneration (buildModelDb + document)
-#   5. Union-merge of covariate-columns.md (recovers the annotations
-#      -X theirs would have lost)
-#   6. devtools::check pre-push gate
-#   7. Parallel vignette validation pre-push gate
-#   8. Push branch + print PR title/body
+#   4. Resurrected-path guard (re-remove files the base deleted that a
+#      stale branch brought back via -X theirs)
+#   5. Register repairs: union-merge of covariate-columns.md (recovers the
+#      annotations -X theirs would have lost), dedup of duplicate canonical
+#      headers, restore of dropped canonical blocks, then the contribution
+#      verifier
+#   6. Union-merge of NEWS.md
+#   7. R-side registry regeneration (buildModelDb + document)
+#   8. devtools::check pre-push gate
+#   9. Parallel vignette validation pre-push gate
+#  10. Push branch + print PR title/body
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -23,14 +27,13 @@
 #   --pattern <glob>        Refspec pattern for source branches
 #                           (default: origin/claude/*).
 #   --extra-ref <refname>   Additional fully-qualified ref to include
-#   --exclude-ref <refname> Fully-qualified ref to leave out even though the
-#                           pattern matches it (repeatable), e.g. a WIP task
-#                           branch: --exclude-ref origin/claude/oasweep_PMC6813168.
 #                           (repeatable). Use for hand-picked feature
 #                           branches that don't match --pattern, e.g.
 #                           --extra-ref origin/add-Fiedler-Kelly_2019_fremanezumab.
-#                           Flows through to union_merge_lines.py and
-#                           verify_branch_contributions.sh.
+#                           Flows through to every repair and verify step.
+#   --exclude-ref <refname> Fully-qualified ref to leave out even though the
+#                           pattern matches it (repeatable), e.g. a WIP task
+#                           branch: --exclude-ref origin/claude/oasweep_PMC6813168.
 #   --branch-name <name>    New consolidation branch name
 #                           (default: merge-all-claude-branches-<YYYY-MM-DD>).
 #   --forbid-path <path>    Repo-relative path that must NOT come back if the
@@ -43,11 +46,18 @@
 #   --union-file <path>     Structured markdown file requiring union merge
 #                           (default: inst/references/covariate-columns.md).
 #                           Pass "" to disable the union step.
-#   --skip-r-regen          Skip step 4 (buildModelDb / document). Use when
+#   --register-file <path>  Another '### CANONICAL' register that -X theirs
+#                           can gut; it gets the restore, a per-## section
+#                           dedup and the verifier (repeatable). Defaults:
+#                           inst/references/compartment-names.md and
+#                           inst/references/parameter-names.md.
+#   --no-register-files     Clear the register list, defaults included; a
+#                           later --register-file adds to the emptied list.
+#   --skip-r-regen          Skip step 7 (buildModelDb / document). Use when
 #                           merging into a repo that doesn't have these.
-#   --skip-check            Skip step 6 (devtools::check). Use for fast
+#   --skip-check            Skip step 8 (devtools::check). Use for fast
 #                           iteration; the operator runs check separately.
-#   --skip-vignettes        Skip step 7 (parallel vignette validation).
+#   --skip-vignettes        Skip step 9 (parallel vignette validation).
 #                           Use only when iterating; not recommended for
 #                           the final pre-push run because pkgdown CI's
 #                           sequential vignette build will surface the
@@ -57,21 +67,35 @@
 #   --vignette-timeout <S>  Per-vignette wall-clock ceiling in seconds
 #                           (default: 900). Increase if you have a model
 #                           that legitimately needs >15 minutes.
-#   --skip-push             Don't push the branch (steps 1-7 only).
+#   --skip-push             Don't push the branch (steps 1-9 only).
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
+#                           Required when stdin is not a terminal, as in an
+#                           agent's shell: without it the script stops at the
+#                           prompt with exit 3 instead of merging.
 #   -h, --help              Show this help.
 #
 # Exit codes:
-#   0  success
-#   2  bad args
-#   3  pre-flight failure (no unmerged branches, dirty worktree, etc.)
-#   4  merge failed
-#   5  union-merge or verification failed
+#   0  success; also a completed --dry-run, no unmerged branches, or the
+#      operator answering no at the prompt
+#   1  an unexpected command failure
+#   2  bad arguments: an unknown flag, a flag missing its value, or a
+#      non-numeric --vignette-jobs / --vignette-timeout
+#   3  pre-flight failure: --repo is not a git working tree, python3 missing,
+#      Rscript missing while an R step is enabled, git fetch failed, --base or
+#      an --extra-ref does not resolve, no branch matched, a survey diff
+#      failed (no merge base, or a shallow clone), no --yes without a
+#      terminal, or the worktree already exists
+#   4  nothing merged: two branches add one path with different content (the
+#      survey stops before merging), or every merge failed
+#   5  a repair or verification step failed: a union-merge, dedup or restore
+#      script failed, duplicate canonical headers survived dedup, the
+#      verifier could not run, or the R registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
-#   8  parallel vignette validation failed (one or more Rmd did not render)
+#   8  parallel vignette validation failed, or the validator could not run
 set -euo pipefail
+trap 'echo "ERROR: unexpected failure (exit $?) at line $LINENO" >&2; exit 1' ERR
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -104,21 +128,34 @@ EXCLUDE_REFS=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,60p' "$0" | sed 's/^# \?//'
+  # The whole header comment, however long it grows.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+}
+
+die() {  # <exit code> <message>
+  local code=$1
+  shift
+  echo "ERROR: $*" >&2
+  exit "$code"
+}
+
+need_value() {
+  [[ $# -ge 2 ]] || die 2 "$1 needs a value"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo) REPO="$2"; shift 2 ;;
-    --base) BASE="$2"; shift 2 ;;
-    --pattern) PATTERN="$2"; shift 2 ;;
-    --extra-ref) EXTRA_REFS+=("$2"); shift 2 ;;
-    --exclude-ref) EXCLUDE_REFS+=("$2"); shift 2 ;;
-    --branch-name) BRANCH_NAME="$2"; shift 2 ;;
-    --union-file) UNION_FILE="$2"; shift 2 ;;
-    --register-file) REGISTER_FILES+=("$2"); shift 2 ;;
+    --repo) need_value "$@"; REPO="$2"; shift 2 ;;
+    --base) need_value "$@"; BASE="$2"; shift 2 ;;
+    --pattern) need_value "$@"; PATTERN="$2"; shift 2 ;;
+    --extra-ref) need_value "$@"; EXTRA_REFS+=("$2"); shift 2 ;;
+    --exclude-ref) need_value "$@"; EXCLUDE_REFS+=("$2"); shift 2 ;;
+    --branch-name) need_value "$@"; BRANCH_NAME="$2"; shift 2 ;;
+    --union-file) need_value "$@"; UNION_FILE="$2"; shift 2 ;;
+    --register-file) need_value "$@"; REGISTER_FILES+=("$2"); shift 2 ;;
     --no-register-files) REGISTER_FILES=(); shift ;;
     --forbid-path)
+      need_value "$@"
       if [[ -z "$2" ]]; then FORBID_PATHS=(); else
         if [[ "${FORBID_PATHS[*]}" == "inst/modeldb.qs2" ]]; then FORBID_PATHS=(); fi
         FORBID_PATHS+=("$2")
@@ -126,8 +163,8 @@ while [[ $# -gt 0 ]]; do
     --skip-r-regen) SKIP_R_REGEN=1; shift ;;
     --skip-check) SKIP_CHECK=1; shift ;;
     --skip-vignettes) SKIP_VIGNETTES=1; shift ;;
-    --vignette-jobs) VIGNETTE_JOBS="$2"; shift 2 ;;
-    --vignette-timeout) VIGNETTE_TIMEOUT="$2"; shift 2 ;;
+    --vignette-jobs) need_value "$@"; VIGNETTE_JOBS="$2"; shift 2 ;;
+    --vignette-timeout) need_value "$@"; VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
@@ -145,22 +182,28 @@ if [[ -z "$VIGNETTE_JOBS" ]]; then
   fi
   [[ "$VIGNETTE_JOBS" -lt 1 ]] && VIGNETTE_JOBS=1
 fi
+[[ "$VIGNETTE_JOBS" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-jobs must be a positive integer, not '$VIGNETTE_JOBS'"
+[[ "$VIGNETTE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-timeout must be a positive integer, not '$VIGNETTE_TIMEOUT'"
 
 if [[ -z "$BRANCH_NAME" ]]; then
   BRANCH_NAME="merge-all-claude-branches-$(date -u +%F)"
 fi
 
-cd "$REPO"
+cd "$REPO" 2>/dev/null || die 3 "--repo $REPO is not a directory"
+# Absolute from here on: the helpers get --repo "$REPO" after the script has
+# moved into the worktree, where a relative path would point somewhere else.
+REPO="$(pwd)"
 
 # Repo sanity.
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "ERROR: $REPO is not a git working tree." >&2
-  exit 3
-fi
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 3 "$REPO is not a git working tree."
 
 # Fetch so origin refs are current.
 echo "==> Fetching $BASE / source refs (--prune)"
-git fetch origin --prune 2>&1 | tail -5
+git fetch origin --prune 2>&1 | tail -5 || die 3 "git fetch origin --prune failed"
+
+# A --base that does not resolve would make every branch "0 ahead" and end the
+# run with "nothing to do".
+git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
 
 # Survey.
 echo
@@ -169,9 +212,12 @@ echo "    base = $(git rev-parse --short "$BASE")"
 
 # Expand pattern to a concrete list of branches under refs/remotes/,
 # then append any --extra-ref entries.
-mapfile -t ALL_MATCHES < <(
-  git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN" 2>/dev/null | sort -u
-)
+matches=$(git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN") \
+  || die 3 "git for-each-ref failed for --pattern '$PATTERN'"
+ALL_MATCHES=()
+while IFS= read -r m; do
+  if [[ -n "$m" ]]; then ALL_MATCHES+=("$m"); fi
+done < <(printf '%s\n' "$matches" | sort -u)
 # Drop any --exclude-ref entries (a WIP task branch, a branch with its own PR).
 # Each exclusion is printed so the survey shows what was left out on purpose;
 # an exclusion that matched nothing is a warning, not an error, because the
@@ -185,22 +231,20 @@ for ex in "${EXCLUDE_REFS[@]:-}"; do
   done
   if (( dropped )); then
     echo "    excluding $ex (--exclude-ref)"
-    ALL_MATCHES=("${kept[@]:-}")
+    # Not ("${kept[@]:-}"): with everything excluded that leaves one empty
+    # entry, which the survey would count as the branch "".
+    ALL_MATCHES=()
+    if (( ${#kept[@]} )); then ALL_MATCHES=("${kept[@]}"); fi
   else
     echo "WARNING: --exclude-ref '$ex' matched no candidate branch" >&2
   fi
 done
 if [[ ${#ALL_MATCHES[@]} -eq 0 && ${#EXTRA_REFS[@]} -eq 0 ]]; then
-  echo "ERROR: no branches matched refspec '$PATTERN' under refs/remotes/ and no --extra-ref supplied" >&2
-  exit 3
+  die 3 "no branches matched refspec '$PATTERN' under refs/remotes/ (after any --exclude-ref) and no --extra-ref supplied"
 fi
 for er in "${EXTRA_REFS[@]:-}"; do
   [[ -z "$er" ]] && continue
-  # Verify the ref exists.
-  if ! git rev-parse --verify "$er" >/dev/null 2>&1; then
-    echo "ERROR: --extra-ref '$er' does not exist" >&2
-    exit 3
-  fi
+  git rev-parse --verify --quiet "$er^{commit}" >/dev/null || die 3 "--extra-ref '$er' does not exist"
   # Avoid duplicates if it's already in the pattern matches.
   in_pattern=0
   for m in "${ALL_MATCHES[@]:-}"; do
@@ -210,11 +254,17 @@ for er in "${EXTRA_REFS[@]:-}"; do
     ALL_MATCHES+=("$er")
   fi
 done
+# The same hand-picked refs for every repair and verify step: a step that
+# skips them repairs nothing those branches lost.
+EXTRA_REF_ARGS=()
+for er in "${EXTRA_REFS[@]:-}"; do
+  if [[ -n "$er" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$er"); fi
+done
 
 UNMERGED=()
 for br in "${ALL_MATCHES[@]}"; do
-  ahead=$(git rev-list --count "$BASE..$br" 2>/dev/null || echo 0)
-  if [[ "$ahead" != "0" && -n "$ahead" ]]; then
+  ahead=$(git rev-list --count "$BASE..$br") || die 3 "cannot count the commits $br has beyond $BASE"
+  if [[ "$ahead" != "0" ]]; then
     UNMERGED+=("$br")
   fi
 done
@@ -224,10 +274,23 @@ if [[ ${#UNMERGED[@]} -eq 0 ]]; then
   exit 0
 fi
 
+# What a branch changed since it forked from the base (three dots), not the
+# difference between the two tips: a branch cut from an older main would
+# otherwise count main's later changes as its own files.
+# Called as $(branch_diff ...) || exit $?, so die's exit code survives the
+# subshell instead of tripping the ERR trap.
+branch_diff() {  # <branch> <diff filter, or ""> [path ...]
+  local br=$1 filter=$2
+  shift 2
+  git diff --name-only ${filter:+"--diff-filter=$filter"} "$BASE...$br" -- "$@" \
+    || die 3 "cannot diff $br against its merge base with $BASE (no merge base, or a shallow clone?)"
+}
+
 echo "    found ${#UNMERGED[@]} unmerged branch(es):"
 for br in "${UNMERGED[@]}"; do
   ahead=$(git rev-list --count "$BASE..$br")
-  files=$(git diff --name-only "$BASE..$br" | wc -l)
+  changed=$(branch_diff "$br" "") || exit $?
+  files=$(printf '%s\n' "$changed" | grep -c . || true)
   subj=$(git log -1 --format='%s' "$br")
   printf "      %-65s  ahead=%s  files=%s  %s\n" "${br#origin/}" "$ahead" "$files" "${subj:0:60}"
 done
@@ -241,10 +304,13 @@ done
 # the dry-run exit so a dry run reports collisions too.
 declare -A ADDED_BY
 for br in "${UNMERGED[@]}"; do
+  # A diff that fails must stop the survey: skipping the branch would let its
+  # collision through unchecked.
+  added=$(branch_diff "$br" A inst/modeldb vignettes/articles) || exit $?
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     ADDED_BY["$p"]+="$br "
-  done < <(git diff --name-only --diff-filter=A "$BASE...$br" -- inst/modeldb vignettes/articles 2>/dev/null)
+  done <<< "$added"
 done
 collisions=0
 for p in "${!ADDED_BY[@]}"; do
@@ -268,10 +334,20 @@ if (( DRY_RUN )); then
   exit 0
 fi
 
+# The repair steps are all python3 scripts, and the R steps need Rscript.
+# Checked before anything is created, rather than after the merges.
+[[ -n "$PYTHON3" ]] || die 3 "python3 is not on PATH; the union-merge, dedup, restore and verify steps need it."
+if (( ! SKIP_R_REGEN || ! SKIP_CHECK || ! SKIP_VIGNETTES )) && ! command -v Rscript >/dev/null 2>&1; then
+  die 3 "Rscript is not on PATH. Install R, or pass --skip-r-regen, --skip-check and --skip-vignettes and run those steps elsewhere."
+fi
+
 # Confirm.
 if (( ! ASSUME_YES )); then
+  # Without a terminal, read gets EOF: the run used to end right here with
+  # exit 1 and no message, since bash prints no prompt when stdin is not a tty.
+  [[ -t 0 ]] || die 3 "stdin is not a terminal, so nobody can confirm merging ${#UNMERGED[@]} branches. Re-run with --yes to proceed without the prompt."
   echo
-  read -r -p "Proceed creating worktree and merging ${#UNMERGED[@]} branches? [y/N] " ans
+  read -r -p "Proceed creating worktree and merging ${#UNMERGED[@]} branches? [y/N] " ans || ans=""
   case "$ans" in
     y|Y|yes|YES) ;;
     *) echo "Aborted by operator."; exit 0 ;;
@@ -283,9 +359,9 @@ WT_REL=".worktrees/${BRANCH_NAME}"
 WT_ABS="$REPO/$WT_REL"
 if [[ -d "$WT_ABS" ]]; then
   echo "ERROR: worktree already exists at $WT_ABS" >&2
-  echo "  Remove via:"
-  echo "    git -C $REPO worktree remove --force $WT_REL"
-  echo "    git -C $REPO branch -D $BRANCH_NAME"
+  echo "  Remove via:" >&2
+  echo "    git -C $REPO worktree remove --force $WT_REL" >&2
+  echo "    git -C $REPO branch -D $BRANCH_NAME" >&2
   exit 3
 fi
 
@@ -311,8 +387,8 @@ git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 # shared bookkeeping files, and every one of those is rebuilt or
 # repaired downstream:
 #   * binary registry blobs (data/modeldb.rda, inst/modeldb.qs2),
-#     man/*.Rd, and the _pkgdown.yml navbar  -> regenerated in step 5;
-#   * covariate-columns.md structured lines                -> union-merged in step 6.
+#     man/*.Rd, and the _pkgdown.yml navbar  -> regenerated in step 7;
+#   * covariate-columns.md structured lines                -> union-merged in step 5.
 # New model .R / vignette .Rmd files live at unique paths, so a 3-way
 # merge keeps every prior branch's additions untouched. `-X theirs`
 # only changes how CONFLICTING hunks resolve (incoming side wins),
@@ -460,10 +536,9 @@ if [[ -n "$UNION_FILE" ]]; then
       --pattern "$PATTERN"
       --file "$UNION_FILE"
     )
-    for er in "${EXTRA_REFS[@]:-}"; do
-      [[ -n "$er" ]] && union_args+=( --extra-ref "$er" )
-    done
-    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}"
+    union_args+=("${EXTRA_REF_ARGS[@]}")
+    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" \
+      || die 5 "union_merge_lines.py failed on $UNION_FILE"
     if git diff --quiet -- "$UNION_FILE"; then
       echo "    no diff after union-merge (nothing was lost from -X theirs)."
     else
@@ -493,8 +568,8 @@ fi
 if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
   echo
   echo "==> Deduping duplicate canonical headers in $UNION_FILE"
-  PYTHON3="${PYTHON3:-$(command -v python3)}"
-  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global "$UNION_FILE"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global "$UNION_FILE" \
+    || die 5 "dedup_canonical_headers.py failed on $UNION_FILE"
   if ! git diff --quiet -- "$UNION_FILE"; then
     git add "$UNION_FILE"
     git commit -m "Dedup duplicate canonical headers in $UNION_FILE
@@ -507,16 +582,10 @@ Collapse each to a single entry, unioning example .R filenames." >/dev/null
     echo "    no duplicate canonical headers."
   fi
   if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global --check "$UNION_FILE"; then
-    echo "ERROR: duplicate canonical headers remain in $UNION_FILE after dedup." >&2
-    exit 1
+    die 5 "duplicate canonical headers remain in $UNION_FILE after dedup."
   fi
 fi
 
-# Verify no per-branch contributions were lost. The verifier may
-# legitimately exit non-zero (e.g. a brand-new section header the
-# union-merger does not relocate; see SAPS_II in the 2026-05-20
-# consolidation). With `set -e` active a non-zero exit would abort the
-# whole run, so we tolerate it here: a failed verdict is surfaced as a
 # Dedup the OTHER register files too. The step above only sweeps $UNION_FILE,
 # so duplicates -X theirs creates in compartment-names.md / parameter-names.md
 # survive -- and buildModelDb() calls checkModelConventions(), which treats a
@@ -527,20 +596,20 @@ fi
 # PER-SECTION scope here, deliberately NOT --global: in compartment-names.md
 # the same token is legitimately both a compartment and a metabolite suffix
 # (8 such pairs on main), so whole-file uniqueness would delete real entries.
-for reg in inst/references/compartment-names.md inst/references/parameter-names.md; do
-  [[ -f "$reg" ]] || continue
+for reg in "${REGISTER_FILES[@]:-}"; do
+  [[ -n "$reg" && -f "$reg" ]] || continue
   [[ "$reg" == "$UNION_FILE" ]] && continue
   echo
   echo "==> Deduping duplicate canonical headers in $reg (per-section)"
-  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$reg"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$reg" \
+    || die 5 "dedup_canonical_headers.py failed on $reg"
   if ! git diff --quiet -- "$reg"; then
     git add "$reg"
     git commit -m "Dedup duplicate canonical headers in $reg" >/dev/null
     echo "    committed dedup of $reg"
   fi
   if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$reg"; then
-    echo "ERROR: duplicate canonicals remain in $reg after dedup." >&2
-    exit 9
+    die 5 "duplicate canonicals remain in $reg after dedup."
   fi
 done
 
@@ -566,9 +635,11 @@ if (( ${#RESTORE_TARGETS[@]} )); then
       --base "$BASE"
       --pattern "$PATTERN"
       --file "$rf"
+      "${EXTRA_REF_ARGS[@]}"
     )
     echo "    -- $rf"
-    "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}"
+    "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}" \
+      || die 5 "restore_dropped_sections.py failed on $rf"
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
       git commit -m "Restore canonical blocks dropped by -X theirs in $rf" >/dev/null
@@ -580,41 +651,48 @@ if (( ${#RESTORE_TARGETS[@]} )); then
   # register which is globally unique and deduped with --global above.
   for rf in "${REGISTER_FILES[@]:-}"; do
     [[ -n "$rf" && -f "$rf" ]] || continue
-    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$rf" >/dev/null || true
+    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$rf" >/dev/null \
+      || die 5 "dedup_canonical_headers.py failed on $rf"
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
       git commit -m "Dedup duplicate canonical headers in $rf" >/dev/null
       echo "    deduped headers in $rf"
     fi
     if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$rf" >/dev/null; then
-      echo "ERROR: duplicate canonical headers remain in $rf after dedup." >&2
-      exit 6
+      die 5 "duplicate canonical headers remain in $rf after dedup."
     fi
   done
 fi
 
-# WARNING for the operator to reconcile covariate-columns.md by hand
-# before opening the PR, rather than killing the pipeline outright.
+# Verify no per-branch contributions were lost. The verifier may
+# legitimately report losses (exit 1; e.g. a brand-new section header the
+# union-merger does not relocate; see SAPS_II in the 2026-05-20
+# consolidation), so that verdict is surfaced as a WARNING for the operator
+# to reconcile by hand before opening the PR, rather than killing the
+# pipeline outright. Any other non-zero exit means the verifier could not
+# run at all, and carrying on would ship an unverified merge.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
 for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
-verify_args=(
-  --repo "$REPO"
-  --branch "$BRANCH_NAME"
-  --base "$BASE"
-  --pattern "$PATTERN"
-  --file "$vf"
-)
-for er in "${EXTRA_REFS[@]:-}"; do
-  [[ -n "$er" ]] && verify_args+=( --extra-ref "$er" )
-done
-if ! "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}"; then
-  echo "WARNING: verifier reported missing contributions in $vf."
-  echo "         Reconcile by hand before opening the PR (the union-merger does"
-  echo "         not relocate brand-new section headers, and neither it nor"
-  echo "         restore_dropped_sections.py unions two branches' competing"
-  echo "         entries for the SAME canonical -- see the placement report)."
-fi
+  verify_args=(
+    --repo "$REPO"
+    --branch "$BRANCH_NAME"
+    --base "$BASE"
+    --pattern "$PATTERN"
+    --file "$vf"
+    "${EXTRA_REF_ARGS[@]}"
+  )
+  verify_rc=0
+  "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}" || verify_rc=$?
+  if (( verify_rc == 1 )); then
+    echo "WARNING: verifier reported missing contributions in $vf."
+    echo "         Reconcile by hand before opening the PR (the union-merger does"
+    echo "         not relocate brand-new section headers, and neither it nor"
+    echo "         restore_dropped_sections.py unions two branches' competing"
+    echo "         entries for the SAME canonical -- see the placement report)."
+  elif (( verify_rc != 0 )); then
+    die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
+  fi
 done
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
@@ -629,7 +707,8 @@ if [[ -f NEWS.md ]]; then
   echo
   echo "==> Union-merging NEWS.md"
   "$PYTHON3" "$SCRIPT_DIR/union_merge_news.py" \
-    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN"
+    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN" \
+    "${EXTRA_REF_ARGS[@]}" || die 5 "union_merge_news.py failed on NEWS.md"
   if ! git diff --quiet -- NEWS.md; then
     git add NEWS.md
     git commit -m "Union-merge NEWS.md across all folded branches" >/dev/null
@@ -642,11 +721,7 @@ if (( ! SKIP_R_REGEN )); then
   echo
   PRE_REGEN_DIRTY="$(git status --porcelain)"
   echo "==> Regenerating registry artifacts (Rscript)"
-  if ! command -v Rscript >/dev/null 2>&1; then
-    echo "ERROR: Rscript not found in PATH. Pass --skip-r-regen if you'll do it later." >&2
-    exit 5
-  fi
-  Rscript -e '
+  if ! Rscript -e '
     suppressPackageStartupMessages(library(devtools))
     cat("--- load_all ---\n")
     load_all(".", quiet = TRUE)
@@ -659,7 +734,9 @@ if (( ! SKIP_R_REGEN )); then
     cat("--- document ---\n")
     document()
     cat("--- done ---\n")
-  ' 2>&1 | tail -10
+  ' 2>&1 | tail -10; then
+    die 5 "the registry regeneration failed (its last output is above). The worktree is left at $WT_ABS"
+  fi
 
   # Stage whatever the regen actually WROTE, not a hardcoded artifact list.
   #
@@ -696,9 +773,9 @@ if (( ! SKIP_CHECK )); then
   if Rscript -e 'devtools::check(error_on = "error", args = "--no-build-vignettes")' 2>&1 | tail -20; then
     echo "    check passed"
   else
-    echo "ERROR: devtools::check failed. The worktree is left in place at"
-    echo "  $WT_ABS"
-    echo "Fix the failures, re-run check, and push manually when green."
+    echo "ERROR: devtools::check failed. The worktree is left in place at" >&2
+    echo "  $WT_ABS" >&2
+    echo "Fix the failures, re-run check, and push manually when green." >&2
     exit 6
   fi
 fi
@@ -707,38 +784,51 @@ fi
 #
 # Why this exists: devtools::check runs with --no-build-vignettes (the
 # CarlssonPetri segfault is the on-disk reason), so vignette
-# evaluation is NOT covered by step 6. pkgdown's CI runs vignettes
+# evaluation is NOT covered by step 8. pkgdown's CI runs vignettes
 # sequentially and ABORTS on the first failure, so after a large
 # merge it surfaces broken vignettes one at a time across many cycles
 # — a 14-failure consolidation can take 14 CI iterations to drain.
 # A local parallel pass (callr-isolated, continues-on-failure) finds
 # them all in one shot. This is a HARD GATE: a failed vignette
 # blocks push.
+#
+# The gate is the validator's own exit status (0 only when every vignette
+# rendered, or there were none) plus the per-file results. It used to be the
+# results alone, with the pipeline as a bare `if` condition, so an Rscript
+# that was missing or died before writing a line -- a failed install, a
+# missing package -- left no "ok":false to find and the run went on to push.
 if (( ! SKIP_VIGNETTES )); then
   echo
   echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
   echo "    jobs=$VIGNETTE_JOBS  timeout=${VIGNETTE_TIMEOUT}s/vignette"
   VIGNETTE_RESULTS="${WT_ABS}/.vignette_results.jsonl"
-  if Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \
+  VIGNETTE_LOG="${WT_ABS}/.vignette_build.log"
+  rm -f "$VIGNETTE_RESULTS"  # never judge this run by an earlier run's results
+  vignette_rc=0
+  Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \
        --worktree "$WT_ABS" \
        --jobs "$VIGNETTE_JOBS" \
        --timeout "$VIGNETTE_TIMEOUT" \
-       --results "$VIGNETTE_RESULTS" 2>&1 | tee "${WT_ABS}/.vignette_build.log" \
-       | grep -E '^\[FAIL|^SUMMARY|^FAILURES'; then
-    : # rendered cleanly; summary already emitted
-  fi
-  if grep -q '"ok":false' "$VIGNETTE_RESULTS" 2>/dev/null; then
+       --results "$VIGNETTE_RESULTS" 2>&1 | tee "$VIGNETTE_LOG" \
+       | { grep -E '^\[FAIL|^SUMMARY|^FAILURES' || true; } || vignette_rc=$?
+  if (( vignette_rc != 0 )) || grep -q '"ok":false' "$VIGNETTE_RESULTS" 2>/dev/null; then
     echo
-    echo "ERROR: at least one vignette failed to render. Worktree at"
-    echo "  $WT_ABS"
-    echo "Full log:    $WT_ABS/.vignette_build.log"
-    echo "Per-file JSONL: $VIGNETTE_RESULTS"
-    echo
-    echo "Fix the failing vignettes (or the underlying model .R files),"
-    echo "re-run validation, and push manually when green:"
-    echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\"
-    echo "    --worktree $WT_ABS \\"
-    echo "    --jobs $VIGNETTE_JOBS"
+    if [[ -s "$VIGNETTE_RESULTS" ]]; then
+      echo "ERROR: at least one vignette failed to render (validator exit $vignette_rc). Worktree at" >&2
+    else
+      echo "ERROR: the vignette validator exited $vignette_rc without recording a result. Its last lines:" >&2
+      tail -n 5 "$VIGNETTE_LOG" | sed 's/^/    /' >&2
+      echo "Worktree at" >&2
+    fi
+    echo "  $WT_ABS" >&2
+    echo "Full log:    $VIGNETTE_LOG" >&2
+    echo "Per-file JSONL: $VIGNETTE_RESULTS" >&2
+    echo >&2
+    echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
+    echo "validator's setup), re-run validation, and push manually when green:" >&2
+    echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\" >&2
+    echo "    --worktree $WT_ABS \\" >&2
+    echo "    --jobs $VIGNETTE_JOBS" >&2
     exit 8
   fi
   echo "    all vignettes rendered cleanly"
