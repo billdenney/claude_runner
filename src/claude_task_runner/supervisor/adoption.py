@@ -228,8 +228,8 @@ def finalize_exited_workers(
     :func:`runner.dispatcher.finalize_exited_worker`. A log that ends in a
     terminal ``result`` event is finalized as the adoption monitor would
     have finalized it: a RunRecord, the completed/failed classification,
-    the output gate and the recheck guard. A log without one is left
-    alone. That worker crashed, and the silent-orphan reaper and
+    the owned path's gates, the recheck guard and the post-dispatch hook.
+    A log without one is left alone. That worker crashed, and the silent-orphan reaper and
     ``reconcile_orphans`` handle it as before.
 
     Must run before :func:`supervisor.reconcile_silent.reconcile_silent_orphans`.
@@ -291,6 +291,8 @@ def finalize_exited_workers(
                 state=state,
                 queue_dir=queue_dir,
                 clock=clock,
+                settings_dispatch=settings.dispatch,
+                settings_hooks=settings.hooks,
                 settings_failure_classifier=settings.failure_classifier,
                 account=prior_accounts.get(state.task_id) or state.session_host_account(),
             )
@@ -374,6 +376,8 @@ def _adopt_one_safely(
             queue_dir=queue_dir,
             clock=clock,
             settings_caps=settings.task_caps,
+            settings_dispatch=settings.dispatch,
+            settings_hooks=settings.hooks,
             settings_failure_classifier=settings.failure_classifier,
             account=account,
         )

@@ -909,36 +909,27 @@ def test_install_systemd_drain_unit_waits_for_the_duration_cap(
     assert f"  TimeoutStopSec={timeout}\n" in result.stdout
 
 
-@pytest.mark.parametrize(
-    ("cap", "reason"),
-    [
-        ("18446744073709", "18446744073709.0 is longer than systemd accepts (18446744073708 s)"),
-        (
-            "1e-07",
-            "1e-07 rounds to 0 at systemd's resolution of one microsecond, "
-            "and systemd reads TimeoutStopSec=0 as no timeout",
-        ),
-    ],
-)
 def test_install_systemd_refuses_a_duration_cap_the_unit_cannot_carry(
-    runner: CliRunner, tmp_path: Path, isolated_home: Path, cap: str, reason: str
+    runner: CliRunner, tmp_path: Path, isolated_home: Path
 ) -> None:
-    """systemd would ignore the first and wait its own 90 s, and wait forever on the second.
+    """systemd would read the cap as no timeout and wait forever.
 
-    The message keeps ``[task_caps]``, which Rich markup would otherwise
-    take for a style tag and drop."""
-    result, mock_apply = _install_with_task_cap(runner, tmp_path, _drain_toml(cap))
+    A cap longer than systemd accepts no longer loads: the schema's
+    ten-year ceiling refuses it first. The message keeps ``[task_caps]``,
+    which Rich markup would otherwise take for a style tag and drop."""
+    result, mock_apply = _install_with_task_cap(runner, tmp_path, _drain_toml("1e-07"))
     assert result.exit_code == 2
     assert (
-        f"systemd install failed: [task_caps].max_duration_s_per_task = {reason}. "
-        "Nothing was written.\n"
+        "systemd install failed: [task_caps].max_duration_s_per_task = 1e-07 rounds to 0 "
+        "at systemd's resolution of one microsecond, and systemd reads TimeoutStopSec=0 "
+        "as no timeout. Nothing was written.\n"
     ) in result.stdout
     assert "Unit text:" not in result.stdout
     mock_apply.assert_not_called()
     assert not (isolated_home / ".config").exists()
 
 
-@pytest.mark.parametrize("cap", ["0", "1e-07", "28800", "18446744073709"])
+@pytest.mark.parametrize("cap", ["0", "1e-07", "28800", "315360000"])
 def test_install_systemd_fast_stop_unit_ignores_the_duration_cap(
     runner: CliRunner, tmp_path: Path, cap: str
 ) -> None:
@@ -956,22 +947,22 @@ def test_install_systemd_fast_stop_unit_ignores_the_duration_cap(
 def test_install_systemd_refuses_a_watchdog_value_systemd_cannot_parse(
     runner: CliRunner, tmp_path: Path, isolated_home: Path
 ) -> None:
-    """systemd would ignore the line and restart after its own 100 ms.
+    """systemd would ignore the line and fall back to its own default burst.
 
-    The schema accepts a span one second longer than systemd does. The
-    message keeps ``[watchdog]``, which Rich markup would otherwise take
-    for a style tag and drop."""
+    The schema puts no upper bound on the count, so it loads. The message
+    keeps ``[watchdog]``, which Rich markup would otherwise take for a style
+    tag and drop."""
     queue = tmp_path / "queue"
     queue.mkdir()
     (queue / "claude_runner.toml").write_text(
-        "[watchdog]\nrestart_cooldown_s = 18446744073709\n", encoding="utf-8"
+        "[watchdog]\ncrash_loop_threshold = 4294967296\n", encoding="utf-8"
     )
     with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 2
     assert (
-        "systemd install failed: [watchdog].restart_cooldown_s = 18446744073709.0 is longer "
-        "than systemd accepts (18446744073708 s). Nothing was written.\n"
+        "systemd install failed: [watchdog].crash_loop_threshold = 4294967296 is more "
+        "than systemd accepts (4294967295). Nothing was written.\n"
     ) in result.stdout
     assert "Unit text:" not in result.stdout
     mock_apply.assert_not_called()
@@ -979,25 +970,29 @@ def test_install_systemd_refuses_a_watchdog_value_systemd_cannot_parse(
 
 
 @pytest.mark.parametrize(
-    ("key", "value"),
+    ("table", "key", "value"),
     [
-        ("crash_loop_threshold", "0"),
+        ("watchdog", "crash_loop_threshold", "0"),
         # Not finite, so systemd could not parse it either.
-        ("restart_cooldown_s", "inf"),
+        ("watchdog", "restart_cooldown_s", "inf"),
+        # Past the schema's ten-year ceiling.
+        ("watchdog", "restart_cooldown_s", "315360001"),
+        # Past the ceiling, and longer than systemd accepts.
+        ("task_caps", "max_duration_s_per_task", "18446744073709"),
     ],
 )
-def test_install_systemd_invalid_watchdog_value_fails_before_writing(
-    runner: CliRunner, tmp_path: Path, key: str, value: str
+def test_install_systemd_value_the_schema_rejects_fails_before_writing(
+    runner: CliRunner, tmp_path: Path, table: str, key: str, value: str
 ) -> None:
     """A value the schema rejects stops ``install`` when the TOML loads."""
     queue = tmp_path / "queue"
     queue.mkdir()
-    (queue / "claude_runner.toml").write_text(f"[watchdog]\n{key} = {value}\n", encoding="utf-8")
+    (queue / "claude_runner.toml").write_text(f"[{table}]\n{key} = {value}\n", encoding="utf-8")
     with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 1
     assert isinstance(result.exception, ConfigError)
-    assert f"watchdog.{key}" in str(result.exception)
+    assert f"{table}.{key}" in str(result.exception)
     mock_apply.assert_not_called()
 
 

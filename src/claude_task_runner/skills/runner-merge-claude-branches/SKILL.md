@@ -54,7 +54,15 @@ files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
 (repeatable) leaves out a branch the pattern matches -- a WIP checkpoint, or a
 branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;
-override per repo.
+override per repo. `--extra-ref` (repeatable) adds a hand-picked branch the
+pattern does not match; it reaches every repair and verify step.
+
+From an agent's shell, which has no terminal, pass `--yes` once the operator
+has confirmed the scope (step 2): without it the script stops at its
+confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
+prints every flag and exit code. Each exit code has one meaning; the ones that
+stop a run partway are 5 (a repair or verification step failed, or the
+verifier could not run), 6 (`devtools::check`), 7 (push) and 8 (vignettes).
 
 ## Steps the skill follows
 
@@ -245,6 +253,17 @@ exists to repair. Repair, then regenerate.
      ratified. Each name is indexed separately, so a block that *gained* a
      name is not read as a different canonical with everything under it lost.
 
+   The verifier exits 1 when it finds losses, and `merge_branches.sh` turns
+   that into a WARNING to reconcile by hand. It exits 2 when it cannot run at
+   all: a `--base`, `--branch` or `--extra-ref` that does not resolve, no
+   worktree for the branch, a `--pattern` matching nothing, or no `python3`.
+   Each of those used to pass silently -- a verifier that checks nothing
+   reports everything present -- and `merge_branches.sh` now stops with exit 5
+   on them. The helpers it calls (`union_merge_lines.py`,
+   `restore_dropped_sections.py`, `union_merge_news.py`, the two delegated
+   verifiers and `dedup_canonical_headers.py`) apply the same rule: a missing
+   worktree, file argument or matching branch is an error, never a skip.
+
    **Known false positive.** The verifier splits a multi-name header such as
    `### CONMED_ATORVASTATIN_DOSE, CONMED_FLV_DOSE, ...` into separate names
    and then cannot find each as a standalone `###` entry, so it reports the
@@ -266,7 +285,8 @@ exists to repair. Repair, then regenerate.
    8b below does that — do not skip it.
 
 8b. **Parallel vignette validation pre-push gate** (HARD gate; exit
-    code 8 on any failure):
+    code 8 on any failure, including a validator that dies before
+    recording a result, e.g. on a failed install):
 
     ```bash
     Rscript verify_vignettes_parallel.R \
@@ -296,7 +316,7 @@ exists to repair. Repair, then regenerate.
     writes a JSON-lines report (`.vignette_results.jsonl` in the
     worktree). The orchestrator script (`merge_branches.sh`) runs this
     automatically before push; in that script's own step list it is
-    step 7 (the `--skip-vignettes` gate).
+    step 9 (the `--skip-vignettes` gate).
 
     **Why this gate exists.** pkgdown's CI vignette build runs
     sequentially and ABORTS on the first failure. After a 130-branch
@@ -485,7 +505,8 @@ branch adds a name), pass `--union-file <path>` to
 
 `merge_branches.sh --dry-run` runs steps 1-2 (survey + confirm
 scope) but stops before creating the worktree. Use this to see
-which branches would be folded in before committing to the merge.
+which branches would be folded in before committing to the merge,
+then run again with `--yes` once the operator agrees.
 
 ### Idempotence
 

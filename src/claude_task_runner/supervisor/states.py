@@ -116,11 +116,13 @@ class AccountState(BaseModel):
     ``claude-task-runner account pause/resume`` and gates the account
     out of the dispatch policy without stopping the supervisor.
 
-    The ``last_capture_at`` field is the timestamp of the most recent
-    ``claude /usage`` capture for this account; a future multi-account
-    usage source will use it to pick the most-overdue account each
-    tick. Defaults to ``None`` ("never captured") so cold-start
-    snapshots round-trip cleanly.
+    The ``last_capture_at`` field is when this account's usage was last
+    polled: the daemon stamps it after every tick attributed to the
+    account, including one whose capture failed. Each tick,
+    :class:`usage.multi_account_source.MultiAccountUsageSource` polls
+    the account with the oldest ``last_capture_at``, so the accounts
+    take turns. ``None`` ("never captured", the default, so cold-start
+    snapshots round-trip cleanly) counts as the oldest.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -182,21 +184,21 @@ class InFlightRecord(BaseModel):
 
 
 class SupervisorSnapshot(BaseModel):
-    """Persisted state for ``supervisor.json`` (schema v3).
+    """Persisted state for ``supervisor.json`` (schema :data:`SUPERVISOR_SCHEMA_VERSION`).
 
-    v3 introduces per-account state: every configured account has its
-    own :class:`AccountState` in ``accounts``, and in-flight tasks
-    carry an ``account`` attribution in ``in_flight``. The legacy
-    top-level fields (``state``, ``last_5h_util_pct``, ...) are kept
-    as a view onto whichever account was last captured — the state
-    machine reads them, and the daemon mirrors them from
-    ``accounts[<just_captured>]`` after each tick. Multi-account
-    callers consult ``accounts[*]`` directly.
+    The module docstring lists what each schema version changed. Since
+    v3, every configured account has its own :class:`AccountState` in
+    ``accounts``, and in-flight tasks carry an ``account`` attribution
+    in ``in_flight``. The legacy top-level fields (``state``,
+    ``last_5h_util_pct``, ...) are kept as a view onto whichever account
+    was last captured — the state machine reads them, and the daemon
+    mirrors them from ``accounts[<just_captured>]`` after each tick.
+    Multi-account callers consult ``accounts[*]`` directly.
 
-    v2 → v3 migration happens in :mod:`supervisor.persistence` at
-    load time; the legacy fields are wrapped into a single account
-    entry named ``"default"``. One-way migration — re-saving in v3
-    cannot be downgraded to v2.
+    :mod:`supervisor.persistence` migrates an older file one way at load
+    time; from v2, the legacy fields are wrapped into a single account
+    entry named ``"default"``. A re-saved file carries the current
+    version, which an older supervisor refuses to load.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

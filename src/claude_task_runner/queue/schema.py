@@ -114,7 +114,10 @@ class RunRecord(_StrictBase):
     stop_reason: str
     error: str | None = None
     usage: TokenUsage = Field(default_factory=TokenUsage)
-    cost_usd: float = Field(ge=0.0, default=0.0)
+    cost_usd: float | None = Field(ge=0.0, default=0.0)
+    """The cost claude reported on its ``result`` line. ``None`` (unknown)
+    when that cost was not a finite, non-negative number; the dispatcher
+    logs a warning naming it."""
     duration_s: float = Field(ge=0)
     resumed_from_session: str | None = None
     """If this run was started via ``claude --resume <id>``, the session id
@@ -360,6 +363,17 @@ class TaskState(_StrictBase):
     dispatch finalization. ``None`` on legacy state YAMLs, on tasks that
     have not been dispatched, on finalized tasks, and whenever adoption
     is disabled (the pipe-backed path records no log file)."""
+    pre_dispatch_sha: str | None = None
+    """``HEAD`` of the task's ``working_dir`` when the current attempt was
+    dispatched. The output-evidence gate (ADR-0020) counts a commit made
+    after it, and a supervisor that adopts or finalizes the attempt after a
+    restart (ADR-0025) reads it here, because the dispatch that took the
+    snapshot is gone.
+
+    Written with ``status="running"`` before the worker spawns and cleared
+    on dispatch finalization. ``None`` when the task has no
+    ``working_dir``, when the snapshot failed, on finalized tasks, and on
+    state YAMLs written before this field existed."""
     stop_reason: str | None = None
     error: str | None = None
     deferral_count: int = Field(ge=0, default=0)

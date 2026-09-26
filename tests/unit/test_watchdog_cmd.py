@@ -788,6 +788,15 @@ class TestTickSettingsSource:
                 "[type=greater_than_equal, input_value=0, input_type=int]; ",
                 id="fails-the-schema",
             ),
+            pytest.param(
+                '[dispatch_pct]\ntimezone = "Not/AZone"\n',
+                "Settings validation failed: 1 validation error for Settings; "
+                "dispatch_pct.timezone; Value error, [dispatch_pct].timezone = 'Not/AZone' "
+                "is not an IANA time zone name such as 'UTC' or 'America/New_York' (No time "
+                "zone found with key Not/AZone). Leave it empty for the system's local time. "
+                "[type=value_error, input_value='Not/AZone', input_type=str]; ",
+                id="unknown-timezone",
+            ),
         ],
     )
     def test_a_queue_config_that_does_not_load_fails_the_tick(

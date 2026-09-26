@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import (
     HookSettings,
     TaskCapsSettings,
@@ -43,6 +44,9 @@ from claude_task_runner.runner.dispatcher import (
 from claude_task_runner.runner.session import ResumeStrategy, SpawnPlan
 
 SHIM_PATH = Path(__file__).parent.parent / "fixtures" / "claude_shim" / "claude"
+
+_SETTINGS = load_settings(None)
+"""Package defaults; the adopted finalize requires the dispatch and hook settings."""
 
 
 @pytest.fixture
@@ -276,7 +280,12 @@ def test_exited_worker_finalize_matches_owned_finalize(
     write_state_atomic(running, state_path_for(queue_dir, task.id))
 
     exited = finalize_exited_worker(
-        task=task, state=running, queue_dir=queue_dir, clock=RealClock()
+        task=task,
+        state=running,
+        queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        clock=RealClock(),
     )
 
     assert exited is not None

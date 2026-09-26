@@ -7,7 +7,7 @@ complete file.
 Stored at ``<queue>/.claude_task_runner/supervisor.json`` per
 ``[supervisor].state_file``.
 
-Handles three one-way migrations at load time:
+Migrates an older file one way at load time, one version at a time:
 
 * v2 → v3: the legacy single-account top-level fields wrap into
   ``accounts["default"]`` and un-attributed ``in_flight_task_ids``

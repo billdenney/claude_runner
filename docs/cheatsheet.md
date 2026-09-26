@@ -354,9 +354,10 @@ from claude_task_runner.config.loader import load_settings
 print(load_settings(Path("path/to/queue/claude_runner.toml")))
 ```
 
-A schema mismatch (typo, wrong type, value out of range, or a number that
-is not finite, such as `inf` or `nan`) is caught at `load_settings` time
-with a Pydantic error pointing at the offending field.
+A schema mismatch (typo, wrong type, value out of range, a number that is
+not finite, such as `inf` or `nan`, a duration longer than ten years, or a
+`[dispatch_pct].timezone` this system does not know) is caught at
+`load_settings` time with a Pydantic error pointing at the offending field.
 
 ## Further reading
 
