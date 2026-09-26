@@ -11,6 +11,10 @@ dispatched through each account.
   that account.
 * **Throttled or drifting.** THROTTLED_5H, THROTTLED_WEEKLY and
   ERROR_DRIFT mean no new dispatch, on a single-account queue too.
+* **IDLE.** An account captured while nothing was pending goes IDLE,
+  which is dispatchable, but tasks that arrive before its next capture
+  run under the cap of that reading. Only an account never captured is
+  capped by its ``max_concurrency`` alone.
 
 The multi-account configuration mirrors a live two-account queue:
 ``personal`` allows 5 concurrent tasks, ``work`` allows 1, and the
@@ -40,9 +44,9 @@ from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.actions import Action, Notify
-from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
+from claude_task_runner.supervisor.daemon import PollResult, TickContext, run_one_tick
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
-from claude_task_runner.usage.drift import UsageFormatDrift
+from claude_task_runner.usage.drift import UsageCaptureTimeout, UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
 NOW = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
@@ -122,7 +126,7 @@ def _single_account_settings(tmp_path: Path) -> Settings:
 def _tick(
     snapshot: SupervisorSnapshot,
     settings: Settings,
-    reading: UsageReading | UsageFormatDrift,
+    reading: PollResult,
     clock: FakeClock,
     *,
     pending_count: int = PENDING,
@@ -357,3 +361,38 @@ class TestSingleAccountThrottled:
 
         assert snapshot.accounts["default"].state is SupervisorState.DISPATCHING
         assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"default": 4}
+
+
+class TestSingleAccountIdle:
+    """A single-account queue captures its account every tick, so a stale
+    IDLE lasts only while a capture fails: a failed capture leaves the
+    state as it was, and dispatch still runs that tick."""
+
+    @pytest.mark.parametrize(
+        ("idle_reading", "expected"),
+        [
+            (_reading(65, None), {}),
+            (_reading(10, None, weekly_pct=90), {}),
+            # Ramp: ceil(4 * (1 - (55 - 40) / (60 - 40))) = 1.
+            (_reading(55, None), {"default": 1}),
+        ],
+        ids=["throttled_5h", "throttled_weekly", "slowing_down"],
+    )
+    def test_idle_cap_holds_through_a_failed_capture(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        idle_reading: UsageReading,
+        expected: dict[str, int],
+    ) -> None:
+        """The queue is empty at the first capture, so the account goes
+        IDLE. Then eight tasks arrive and the next capture times out."""
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+
+        snapshot, _ = _tick(snapshot, settings, idle_reading, clock, pending_count=0)
+        snapshot, _ = _tick(snapshot, settings, UsageCaptureTimeout("slow"), clock)
+
+        assert snapshot.accounts["default"].state is SupervisorState.IDLE
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == expected

@@ -298,6 +298,41 @@ Breaking changes are called out in the version notes.
   56–59%. An account with `max_concurrency = 1` runs 1 until it stops. The
   queue-wide `[concurrency]` ceiling still bounds the total, whatever the
   throttle state.
+- **An account that goes `IDLE` no longer dispatches past its last
+  reading.** When nothing was pending or in flight at an account's
+  capture, the supervisor classified it `IDLE` without making a throttle
+  decision, so the account carried no dispatch cap. `IDLE` is
+  dispatchable, so until the account's next capture only its
+  `max_concurrency` capped it. Tasks that arrived in that time ran
+  through it even when its reading was over the 5h stop or above the
+  weekly trace, and in the slowdown band they ran past the ramp target.
+  On a multi-account queue the next capture is a full round-robin cycle
+  away. With `personal` (`max_concurrency = 5`) captured at 65% 5h on an
+  empty queue and then `work` (`max_concurrency = 1`) at 10% with eight
+  tasks pending, 4 tasks ran through `personal` and 1 through `work`. Now
+  only the 1 through `work` runs. A single-account queue captures its
+  account every tick. It was exposed only when tasks arrived between a
+  tick's queue count and its dispatch pass, or in a tick whose capture
+  failed, which leaves the state as it was. It then dispatched up to its
+  `max_concurrency` where the reading allowed none. The `IDLE` entry now
+  records the decision its reading calls for. An idle account whose
+  reading is throttled is capped at 0, one in the slowdown band at its
+  ramp target, and `account list` shows that cap. An account that has
+  never been captured still dispatches at its `max_concurrency`. `IDLE`
+  still sends no notice. The entry also records that decision's wakeup.
+  Before, an account that went idle after a throttle kept the throttle's
+  `Next wakeup` in `supervisor status`, long after it had passed.
+  Because the decision is now made on every clean reading, a
+  `[dispatch_pct]` `timezone` that is not an IANA name makes the
+  supervisor exit with a traceback at its first clean reading, even with
+  an empty queue. Before, it exited when the first task arrived. Nothing
+  checks that name at load.
+- **Entering `IDLE` now emits a `state_transition` event.** Every other
+  change of state on a clean reading emitted one, but the `IDLE` branch
+  returned before it. With `[logging].level = "DEBUG"`, the log showed an
+  account leave `idle` but never enter it. Staying `IDLE` emits nothing.
+  Entering `ERROR_DRIFT` still emits `drift_detected` or
+  `oauth_auth_expired` rather than `state_transition`.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
