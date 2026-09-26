@@ -690,8 +690,10 @@ def test_check_legacy_runner_dir_ignores_current_runtime_dir(
 # ---------------------------------------------------------------------------
 
 
-def _make_task(qd: Path, task_id: str) -> Task:
-    task = Task.model_validate({"id": task_id, "title": f"Task {task_id}", "prompt": "do thing"})
+def _make_task(qd: Path, task_id: str, **overrides: object) -> Task:
+    payload: dict[str, object] = {"id": task_id, "title": f"Task {task_id}", "prompt": "do thing"}
+    payload.update(overrides)
+    task = Task.model_validate(payload)
     write_task_atomic(task, task_path_for(qd, task_id))
     return task
 
@@ -718,6 +720,49 @@ def test_check_task_yamls_one_invalid(settings: Settings, queue_dir: Path) -> No
     result = check_task_yamls(settings, queue_dir)
     assert result.status == CheckStatus.FAIL
     assert "1 of 2" in result.detail
+
+
+def test_check_task_yamls_fails_on_an_effort_the_model_does_not_accept(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """ADR-0010: the schema cannot check the (model, effort) pair, so the
+    doctor does, against the queue's [effort_levels]."""
+    _make_task(queue_dir, "t1")
+    _make_task(queue_dir, "t2", model="claude-sonnet-4-6", effort="max")
+    result = check_task_yamls(settings, queue_dir)
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == "1 of 2 task YAMLs invalid"
+    assert result.remediation == (
+        "t2.yaml: invalid effort: effort 'max' not in accepted set for model "
+        "'claude-sonnet-4-6': ['high', 'low', 'medium']"
+    )
+
+
+def test_check_task_yamls_fails_on_a_model_missing_from_effort_levels(
+    settings: Settings, queue_dir: Path
+) -> None:
+    _make_task(queue_dir, "t1", model="claude-newmodel-99", effort="high")
+    result = check_task_yamls(settings, queue_dir)
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == "1 of 1 task YAMLs invalid"
+    assert result.remediation == (
+        "t1.yaml: invalid effort: model 'claude-newmodel-99' has no effort levels "
+        'configured; add "claude-newmodel-99" = [<levels>] under [effort_levels] in '
+        "claude_runner.toml or use a configured model"
+    )
+
+
+def test_check_task_yamls_uses_the_queue_effort_levels(settings: Settings, queue_dir: Path) -> None:
+    """A pair only the queue's own [effort_levels] accepts passes, and a
+    previous-generation pair the package defaults keep passes too."""
+    _make_task(queue_dir, "t1", model="claude-custom-1", effort="low")
+    _make_task(queue_dir, "t2", model="claude-opus-4-7", effort="extra_high")
+    queue_settings = settings.model_copy(
+        update={"effort_levels": {**settings.effort_levels, "claude-custom-1": ["low"]}}
+    )
+    result = check_task_yamls(queue_settings, queue_dir)
+    assert result.status == CheckStatus.PASS
+    assert result.detail == "2 valid task YAMLs in todo/"
 
 
 # ---------------------------------------------------------------------------

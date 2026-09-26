@@ -233,7 +233,34 @@ Breaking changes are called out in the version notes.
   success or `failed` with the result's stop reason for an error. A log
   with no `result` event is a crash, and is demoted as before. See the
   2026-09-26 amendment to ADR-0025.
-
+- **A task whose (model, effort) pair the queue's `[effort_levels]` rejects is
+  parked, not dispatched.** ADR-0010 said `Task.effort` was validated at load
+  time, but only `queue add` checked it: a hand-written or edited task YAML
+  naming an effort its model does not accept (`max` for `claude-sonnet-4-6`),
+  or a model missing from `[effort_levels]`, loaded and dispatched unchecked.
+  The task schema cannot check the pair, since the accepted sets live in the
+  merged settings, so the supervisor's candidate selector now does, against
+  the settings it runs with. A task that fails is set to `deferred` with
+  `deferred_reason: "invalid effort: <why>"` and one WARNING, like an ADR-0030
+  readiness hold: no attempt or run is recorded and the circuit breaker is
+  untouched. It goes back to `pending` on the first tick after its YAML is
+  fixed, or after the pair is added to `[effort_levels]` and the supervisor
+  gets SIGHUP. Only tasks the selector would dispatch are checked: a
+  completed, running or circuit-broken task is left alone when
+  `[effort_levels]` changes. The dispatch thread re-checks as a backstop, and
+  force-dispatch refuses the task on every path: the CLI exits 2 before it
+  dispatches or writes a request, and the supervisor drops a request already
+  written. `doctor`'s `task_yamls` check now FAILs on such a task, and each
+  `queue list` row carries `effort_error`, `null` when the pair is accepted.
+  `queue list` gained `--config`, which defaults to `<queue>/claude_runner.toml`
+  like `queue add`, and it exits 2 if that file does not load. The
+  previous-generation entries in the packaged `[effort_levels]` keep tasks
+  that name `claude-opus-4-7` or `claude-sonnet-4-6` dispatching, and a test
+  now fails if one is dropped. On 2026-09-26 every one of the 5,293 tasks on
+  the nlmixr2lib queue passed. The unknown-model message now shows the entry
+  to add (`"<model>" = [<levels>]` under `[effort_levels]`); the old
+  `[effort_levels.'<model>']` hint named a sub-table the schema rejects, and
+  `queue add` printed it through Rich markup, which dropped it entirely.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
