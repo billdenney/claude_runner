@@ -62,6 +62,17 @@ def _seed_state(
     return state
 
 
+# One ``deferred_reason`` of each kind the runner writes (ADR-0030, ADR-0010
+# and ADR-0026), in the form each writer gives it.
+READINESS_HOLD = "readiness hold: missing file: /q/papers/x_trimmed.md (the trimmed input)"
+EFFORT_HOLD = (
+    "invalid effort: effort 'max' not in accepted set for model 'claude-sonnet-4-6': "
+    "['high', 'low', 'medium']"
+)
+HOOK_DEFERRAL = "pre-dispatch hook deferred (exit 1): DEFERRED: awaiting trim for PMID_19660004.pdf"
+NEXT_ELIGIBLE_AT = datetime(2026, 9, 26, 12, 15, tzinfo=UTC)
+
+
 class TestList:
     def test_empty(self, runner: CliRunner, queue_dir: Path) -> None:
         result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json"])
@@ -262,6 +273,130 @@ class TestStates:
         payload = json.loads(result.stdout)
         assert len(payload["states"]) == 3
 
+    def test_human_output_prints_why_a_task_is_deferred(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """Under each ``deferred`` task: its reason, then ``next_eligible_at``
+        when it is set, then the ``error`` a task keeps from an earlier run.
+        Nothing under any other status, not even the reason a task keeps
+        after it dispatches from ``deferred``."""
+        _seed_state(
+            queue_dir,
+            "001",
+            status="completed",
+            deferred_reason=HOOK_DEFERRAL,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        _seed_state(
+            queue_dir, "002", status="deferred", deferred_reason=READINESS_HOLD, error="boom"
+        )
+        _seed_state(queue_dir, "003", status="deferred", deferred_reason=EFFORT_HOLD)
+        _seed_state(
+            queue_dir,
+            "004",
+            status="deferred",
+            deferred_reason=HOOK_DEFERRAL,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "001  completed",
+            "002  deferred",
+            "  deferred_reason: readiness hold: missing file: /q/papers/x_trimmed.md "
+            "(the trimmed input)",
+            "  error: boom",
+            "003  deferred",
+            "  deferred_reason: invalid effort: effort 'max' not in accepted set for model "
+            "'claude-sonnet-4-6': ['high', 'low', 'medium']",
+            "004  deferred",
+            "  deferred_reason: pre-dispatch hook deferred (exit 1): DEFERRED: awaiting trim "
+            "for PMID_19660004.pdf",
+            "  next_eligible_at: 2026-09-26T12:15:00Z",
+        ]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            pytest.param(
+                "invalid effort: model 'claude-newmodel-99' has no effort levels configured; "
+                'add "claude-newmodel-99" = [<levels>] under [effort_levels] in '
+                "claude_runner.toml or use a configured model",
+                id="markup-drops-a-tag",
+            ),
+            pytest.param(
+                "pre-dispatch hook deferred (exit 1): [/] closes nothing",
+                id="markup-raises-on-a-closing-tag",
+            ),
+            pytest.param("hand-parked: [bold]not bold[/bold]", id="markup-styles"),
+            pytest.param(
+                "readiness hold: missing file: /data/a:b:c.md (:ok:)",
+                id="emoji-codes",
+            ),
+        ],
+    )
+    def test_human_output_prints_the_reason_as_written(
+        self, runner: CliRunner, queue_dir: Path, reason: str
+    ) -> None:
+        """Through Rich markup the first reason loses ``[effort_levels]``, the
+        second raises MarkupError and the third loses both tags. Emoji codes
+        turn the fourth's ``:b:`` and ``:ok:`` into symbols even with markup
+        off."""
+        _seed_state(queue_dir, "001", status="deferred", deferred_reason=reason)
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == ["001  deferred", f"  deferred_reason: {reason}"]
+
+    def test_human_output_indents_a_multi_line_reason(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """A hook's stderr can run to several lines. Each line after the first
+        is indented, so none reads as another task's row."""
+        _seed_state(
+            queue_dir,
+            "001",
+            status="deferred",
+            deferred_reason=f"{HOOK_DEFERRAL}\nrun acquire.sh\nthen wait",
+        )
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "001  deferred",
+            "  deferred_reason: pre-dispatch hook deferred (exit 1): DEFERRED: awaiting trim "
+            "for PMID_19660004.pdf",
+            "    run acquire.sh",
+            "    then wait",
+        ]
+
+    @pytest.mark.parametrize("reason", [None, "", " \n "])
+    def test_human_output_says_when_no_reason_was_recorded(
+        self, runner: CliRunner, queue_dir: Path, reason: str | None
+    ) -> None:
+        """A task parked by hand may have no reason. The line says so instead
+        of printing ``None`` or a blank."""
+        _seed_state(queue_dir, "001", status="deferred", deferred_reason=reason)
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == ["001  deferred", "  deferred_reason: (none recorded)"]
+
+    def test_json_output_carries_the_deferral_fields(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        _seed_state(
+            queue_dir,
+            "001",
+            status="deferred",
+            deferred_reason=EFFORT_HOLD,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir), "--json"])
+        assert result.exit_code == 0, result.output
+        [row] = json.loads(result.stdout)["states"]
+        assert (row["deferred_reason"], row["next_eligible_at"]) == (
+            EFFORT_HOLD,
+            "2026-09-26T12:15:00Z",
+        )
+
 
 class TestShow:
     def test_full_payload(self, runner: CliRunner, queue_dir: Path) -> None:
@@ -295,6 +430,69 @@ class TestShow:
         payload = json.loads(result.stdout)
         assert payload["task"] is None
         assert payload["state"] is None
+
+    def test_human_output_prints_why_a_task_is_deferred(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        _seed_task(queue_dir, "007-foo")
+        _seed_state(
+            queue_dir,
+            "007-foo",
+            status="deferred",
+            deferred_reason=HOOK_DEFERRAL,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        result = runner.invoke(app, ["show", "007-foo", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "007-foo",
+            "  title: Task 007-foo",
+            "  model: claude-opus-4-7  effort: medium",
+            "  status: deferred  attempts: 0",
+            "  session_id: None",
+            "  deferred_reason: pre-dispatch hook deferred (exit 1): DEFERRED: awaiting trim "
+            "for PMID_19660004.pdf",
+            "  next_eligible_at: 2026-09-26T12:15:00Z",
+        ]
+
+    def test_human_output_keeps_an_effort_holds_brackets(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        _seed_task(queue_dir, "007-foo", model="claude-sonnet-4-6", effort="max")
+        _seed_state(queue_dir, "007-foo", status="deferred", deferred_reason=EFFORT_HOLD)
+        result = runner.invoke(app, ["show", "007-foo", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "007-foo",
+            "  title: Task 007-foo",
+            "  model: claude-sonnet-4-6  effort: max",
+            "  status: deferred  attempts: 0",
+            "  session_id: None",
+            "  deferred_reason: invalid effort: effort 'max' not in accepted set for model "
+            "'claude-sonnet-4-6': ['high', 'low', 'medium']",
+        ]
+
+    def test_human_output_ignores_the_reason_a_completed_task_kept(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        _seed_task(queue_dir, "007-foo")
+        _seed_state(
+            queue_dir,
+            "007-foo",
+            status="completed",
+            attempts=1,
+            deferred_reason=HOOK_DEFERRAL,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        result = runner.invoke(app, ["show", "007-foo", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "007-foo",
+            "  title: Task 007-foo",
+            "  model: claude-opus-4-7  effort: medium",
+            "  status: completed  attempts: 1",
+            "  session_id: None",
+        ]
 
 
 class TestAdd:
