@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.config.loader import load_settings
-from claude_task_runner.config.schema import WatchdogSettings
+from claude_task_runner.config.schema import TaskCapsSettings, WatchdogSettings
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
     _SYSTEMD_MAX_WHOLE_SECONDS,
@@ -36,6 +36,9 @@ _START = (
 
 _DEFAULTS = load_settings(None).watchdog
 """The package's ``[watchdog]`` defaults: 30 s, 600 s and 5."""
+
+_CAPS = load_settings(None).task_caps
+"""The package's ``[task_caps]`` defaults: ``max_duration_s_per_task`` is 14400 s."""
 
 _UNIT_BEFORE_WATCHDOG = """\
 [Unit]
@@ -66,6 +69,35 @@ WantedBy=default.target
 ``[watchdog]``, when RestartSec, StartLimitBurst and
 StartLimitIntervalSec were hardcoded. Captured from that code."""
 
+_DRAIN_UNIT_BEFORE_TASK_CAPS = """\
+[Unit]
+Description=Claude Code task-runner supervisor
+After=default.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=TERM=xterm-256color
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml
+ExecStop=-/usr/local/bin/claude-task-runner supervisor drain --queue /q --config /q/claude_runner.toml --no-wait
+WorkingDirectory=/q
+KillMode=process
+TimeoutStopSec=14400
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+"""The unit ``build_unit_text`` wrote for ``_START`` with adoption off
+before it read ``[task_caps]``, when ``TimeoutStopSec`` was 14400 whatever
+the cap. Captured from that code."""
+
 
 def _only_line(text: str, key: str) -> str:
     """Return the unit's single ``<key>=`` line."""
@@ -85,6 +117,7 @@ class TestBuildUnitText:
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
         )
         assert "[Unit]" in text
         assert "[Service]" in text
@@ -99,6 +132,7 @@ class TestBuildUnitText:
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
         )
         # Exit status 0 is a clean stop or finished drain; no relaunch loop.
         assert "RestartPreventExitStatus=0" in text
@@ -108,7 +142,11 @@ class TestBuildUnitText:
         so systemctl stop/restart goes through the graceful-drain path
         (the historical PR-11 wiring, plus the ``-`` prefix)."""
         text = build_unit_text(
-            supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS, adopt_workers=False
+            supervisor_command=_START,
+            queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
+            task_caps=_CAPS,
+            adopt_workers=False,
         )
         # Same binary path as ExecStart so the operator's pipx install is
         # honoured, the same --queue / --config so drain targets the right
@@ -122,7 +160,9 @@ class TestBuildUnitText:
         """ADR-0025: with adoption ON (the default), ExecStop runs
         ``supervisor stop`` (a SIGTERM) so the daemon's fast stop trips —
         the supervisor exits promptly and file-backed workers survive."""
-        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS)
+        text = build_unit_text(
+            supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS, task_caps=_CAPS
+        )
         assert _only_line(text, "ExecStop") == (
             "ExecStop=-/usr/local/bin/claude-task-runner supervisor stop "
             "--queue /q --config /q/claude_runner.toml"
@@ -143,6 +183,7 @@ class TestBuildUnitText:
                 supervisor_command=_START,
                 queue_dir=Path("/q"),
                 watchdog=_DEFAULTS,
+                task_caps=_CAPS,
                 adopt_workers=adopt,
             )
             assert _only_line(text, "ExecStart") == f"ExecStart={_START}"
@@ -158,6 +199,7 @@ class TestBuildUnitText:
                 supervisor_command="x",
                 queue_dir=Path("/q"),
                 watchdog=_DEFAULTS,
+                task_caps=_CAPS,
                 adopt_workers=adopt,
             )
             assert "KillMode=process" in text
@@ -166,30 +208,23 @@ class TestBuildUnitText:
         """ADR-0025: with adoption ON (default) the supervisor fast-stops,
         so TimeoutStopSec drops to a short 30s bound instead of the 4h
         drain ceiling — a `systemctl restart` is near-instant."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS)
-        assert "TimeoutStopSec=30" in text
+        text = build_unit_text(
+            supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS, task_caps=_CAPS
+        )
+        assert _only_line(text, "TimeoutStopSec") == "TimeoutStopSec=30"
 
     def test_timeout_stop_sec_default_matches_max_task_duration_when_adoption_off(self) -> None:
-        """With adoption OFF, TimeoutStopSec=14400 (4h) matches the default
-        [task_caps].max_duration_s_per_task so drain has time to finish
-        the longest plausibly-allowed task."""
+        """With adoption OFF, TimeoutStopSec is [task_caps].max_duration_s_per_task,
+        14400 s (4h) by default, so the drain has time to finish the
+        longest task the cap allows."""
         text = build_unit_text(
-            supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS, adopt_workers=False
+            supervisor_command="x",
+            queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
+            task_caps=_CAPS,
+            adopt_workers=False,
         )
-        assert "TimeoutStopSec=14400" in text
-
-    def test_timeout_stop_sec_customizable(self) -> None:
-        """An explicit timeout_stop_sec overrides the per-mode default in
-        both modes."""
-        for adopt in (True, False):
-            text = build_unit_text(
-                supervisor_command="x",
-                queue_dir=Path("/q"),
-                watchdog=_DEFAULTS,
-                timeout_stop_sec=1800,
-                adopt_workers=adopt,
-            )
-            assert "TimeoutStopSec=1800" in text
+        assert _only_line(text, "TimeoutStopSec") == "TimeoutStopSec=14400"
 
     def test_clean_stop_exit_does_not_restart(self) -> None:
         """RestartPreventExitStatus=0 — a clean stop/drain-exit means the
@@ -197,7 +232,9 @@ class TestBuildUnitText:
         sequence handles the eventual fresh-start when needed
         (``systemctl restart`` runs stop then start; ``stop`` alone
         leaves it stopped). Restart=on-failure only fires for crashes."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS)
+        text = build_unit_text(
+            supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS, task_caps=_CAPS
+        )
         assert "Restart=on-failure" in text
         assert "RestartPreventExitStatus=0" in text
 
@@ -211,7 +248,9 @@ _UNIT_LINE_OF = {
 
 
 def _unit(watchdog: WatchdogSettings) -> str:
-    return build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), watchdog=watchdog)
+    return build_unit_text(
+        supervisor_command=_START, queue_dir=Path("/q"), watchdog=watchdog, task_caps=_CAPS
+    )
 
 
 class TestRestartPolicyFromWatchdog:
@@ -289,7 +328,132 @@ class TestRestartPolicyFromWatchdog:
         )
 
 
+def _task_caps(**overrides: object) -> TaskCapsSettings:
+    """The package defaults with ``overrides``, validated like a TOML."""
+    return TaskCapsSettings.model_validate({**_CAPS.model_dump(), **overrides})
+
+
+def _unvalidated_caps(max_duration_s_per_task: float) -> TaskCapsSettings:
+    """The package defaults with a cap the schema is not asked about, such as ``inf``."""
+    return TaskCapsSettings.model_construct(
+        **{**_CAPS.model_dump(), "max_duration_s_per_task": max_duration_s_per_task}
+    )
+
+
+def _drain_unit(task_caps: TaskCapsSettings) -> str:
+    return build_unit_text(
+        supervisor_command=_START,
+        queue_dir=Path("/q"),
+        watchdog=_DEFAULTS,
+        task_caps=task_caps,
+        adopt_workers=False,
+    )
+
+
+class TestDrainStopTimeout:
+    """With adoption off, a stop waits for in-flight tasks as long as
+    ``[task_caps].max_duration_s_per_task`` lets them run."""
+
+    def test_package_defaults_reproduce_the_hardcoded_unit(self) -> None:
+        """A queue that sets no cap gets the same unit as before, byte for byte."""
+        assert _drain_unit(_CAPS) == _DRAIN_UNIT_BEFORE_TASK_CAPS
+
+    @pytest.mark.parametrize(
+        ("cap", "written"),
+        [
+            (14400, "14400"),
+            (28800, "28800"),
+            # No cap: the stop waits for as long as the tasks run.
+            (0, "infinity"),
+            (3600.5, "3600.5"),
+            # Rounded to systemd's resolution of one microsecond.
+            (30.1234567, "30.123457"),
+            # Python writes this as 1e-05, which systemd rejects.
+            (1e-5, "0.00001"),
+            (_SYSTEMD_MAX_WHOLE_SECONDS + 0.5, "18446744073708.5"),
+        ],
+    )
+    def test_the_cap_is_the_timeout(self, cap: float, written: str) -> None:
+        text = _drain_unit(_task_caps(max_duration_s_per_task=cap))
+        assert _only_line(text, "TimeoutStopSec") == f"TimeoutStopSec={written}"
+
+    def test_only_the_duration_cap_reaches_the_unit(self) -> None:
+        """Each ``[task_caps]`` key but the duration cap leaves the unit as it
+        was, and the cap changes its TimeoutStopSec line and nothing else.
+
+        Walks the schema, so a key added to ``[task_caps]`` later is checked
+        here too."""
+        before = _drain_unit(_CAPS).splitlines()
+        seen = []
+        for key, default in _CAPS.model_dump().items():
+            other = (not default) if isinstance(default, bool) else default * 2 + 1
+            after = _drain_unit(_task_caps(**{key: other})).splitlines()
+            changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
+            if key == "max_duration_s_per_task":
+                assert changed == [("TimeoutStopSec=14400", "TimeoutStopSec=28801")], key
+            else:
+                assert changed == [], key
+            seen.append(key)
+        assert seen == list(TaskCapsSettings.model_fields)
+
+    def test_a_cap_longer_than_systemd_accepts_is_refused(self) -> None:
+        """systemd would ignore the line and wait its own ``DefaultTimeoutStopSec=``, 90 s."""
+        with pytest.raises(UnitSettingError) as excinfo:
+            _drain_unit(_task_caps(max_duration_s_per_task=float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)))
+        assert str(excinfo.value) == (
+            "[task_caps].max_duration_s_per_task = 18446744073709.0 is longer than systemd "
+            "accepts (18446744073708 s)"
+        )
+
+    def test_an_infinite_cap_is_refused(self) -> None:
+        """No limit is spelled 0; ``inf`` is not a span systemd can parse."""
+        with pytest.raises(UnitSettingError) as excinfo:
+            _drain_unit(_unvalidated_caps(float("inf")))
+        assert str(excinfo.value) == (
+            "[task_caps].max_duration_s_per_task = inf is not a finite number of seconds"
+        )
+
+    def test_a_cap_under_half_a_microsecond_is_refused(self) -> None:
+        """It would be written as ``TimeoutStopSec=0``, which systemd 255 reads
+        as no timeout at all (``TimeoutStopUSec=infinity``), not a short one."""
+        with pytest.raises(UnitSettingError) as excinfo:
+            _drain_unit(_task_caps(max_duration_s_per_task=1e-7))
+        assert str(excinfo.value) == (
+            "[task_caps].max_duration_s_per_task = 1e-07 rounds to 0 at systemd's resolution "
+            "of one microsecond, and systemd reads TimeoutStopSec=0 as no timeout"
+        )
+
+    @pytest.mark.parametrize(
+        "cap", [0, 1e-7, 28800, float(_SYSTEMD_MAX_WHOLE_SECONDS + 1), float("inf")]
+    )
+    def test_the_fast_stop_unit_ignores_the_cap(self, cap: float) -> None:
+        """With adoption on, a stop leaves the workers running (ADR-0025), so
+        the unit waits a fixed 30 s, and no cap is refused."""
+        text = build_unit_text(
+            supervisor_command=_START,
+            queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
+            task_caps=_unvalidated_caps(cap),
+        )
+        assert text == _UNIT_BEFORE_WATCHDOG
+
+
 _SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
+
+
+def _timespan_microseconds(systemd_analyze: str, span: str) -> Decimal:
+    """The microseconds ``systemd-analyze timespan`` reads ``span`` as."""
+    proc = subprocess.run(
+        [systemd_analyze, "timespan", span],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    match = re.search(r"(?:μs|us): (\d+)", proc.stdout)
+    assert match is not None, proc.stdout
+    return Decimal(match.group(1))
 
 
 def _verify(unit_dir: Path, text: str) -> str:
@@ -363,8 +527,42 @@ class TestSystemdParsesTheUnit:
             supervisor_command=f"/bin/true supervisor start --queue {queue}",
             queue_dir=queue,
             watchdog=_watchdog(**overrides),
+            task_caps=_CAPS,
         )
         assert _verify(verify_dir, text) == ""
+
+    @pytest.mark.parametrize(
+        "cap",
+        [14400, 28800, 0, 3600.5, 1e-5, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5],
+        ids=["default", "longer", "no-cap", "fractional", "tiny", "longest"],
+    )
+    def test_systemd_parses_the_drain_unit(self, verify_dir: Path, cap: float) -> None:
+        queue = verify_dir / "q"
+        queue.mkdir()
+        text = build_unit_text(
+            supervisor_command=f"/bin/true supervisor start --queue {queue}",
+            queue_dir=queue,
+            watchdog=_DEFAULTS,
+            task_caps=_task_caps(max_duration_s_per_task=cap),
+            adopt_workers=False,
+        )
+        assert _verify(verify_dir, text) == ""
+
+    @pytest.mark.parametrize("cap", [28800, 30.1234567, 1e-5, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5])
+    def test_systemd_reads_the_cap_as_the_timeout(self, systemd_analyze: str, cap: float) -> None:
+        """To within half a microsecond, systemd's resolution."""
+        line = _only_line(_drain_unit(_task_caps(max_duration_s_per_task=cap)), "TimeoutStopSec")
+        written = line.removeprefix("TimeoutStopSec=")
+        microseconds = _timespan_microseconds(systemd_analyze, written)
+        assert microseconds == Decimal(written) * 1_000_000
+        assert abs(microseconds - Decimal(repr(cap)) * 1_000_000) <= Decimal("0.5")
+
+    def test_systemd_reads_no_cap_as_no_timeout(self, systemd_analyze: str) -> None:
+        line = _only_line(_drain_unit(_task_caps(max_duration_s_per_task=0)), "TimeoutStopSec")
+        # USEC_INFINITY, which systemd prints as "infinity".
+        assert _timespan_microseconds(
+            systemd_analyze, line.removeprefix("TimeoutStopSec=")
+        ) == Decimal(2**64 - 1)
 
     @pytest.mark.parametrize(
         "seconds", [30, 0.25, 30.1234567, 1e-5, 1e-7, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5]
@@ -373,17 +571,7 @@ class TestSystemdParsesTheUnit:
         """To within half a microsecond, systemd's resolution."""
         line = _only_line(_unit(_watchdog(restart_cooldown_s=seconds)), "RestartSec")
         written = line.removeprefix("RestartSec=")
-        proc = subprocess.run(
-            [systemd_analyze, "timespan", written],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        assert proc.returncode == 0, proc.stderr
-        match = re.search(r"(?:μs|us): (\d+)", proc.stdout)
-        assert match is not None, proc.stdout
-        microseconds = Decimal(match.group(1))
+        microseconds = _timespan_microseconds(systemd_analyze, written)
         assert microseconds == Decimal(written) * 1_000_000
         assert abs(microseconds - Decimal(repr(seconds)) * 1_000_000) <= Decimal("0.5")
 
@@ -409,6 +597,7 @@ class TestBuildInstallPlan:
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=tmp_path / f"{UNIT_NAME}.service",
         )
         assert plan.unit_path.name == f"{UNIT_NAME}.service"
@@ -423,6 +612,7 @@ class TestBuildInstallPlan:
             supervisor_command="/usr/bin/x",
             queue_dir=Path("/q"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=path,
         )
         assert plan.block_existed is True
@@ -432,6 +622,7 @@ class TestBuildInstallPlan:
             supervisor_command=_START,
             queue_dir=Path("/q"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=tmp_path / f"{UNIT_NAME}.service",
         )
         assert plan.existing_text is None
@@ -443,6 +634,7 @@ class TestBuildInstallPlan:
             supervisor_command=_START,
             queue_dir=Path("/q"),
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=path,
         )
         assert plan.existing_text == _UNIT_BEFORE_WATCHDOG
@@ -465,6 +657,7 @@ class TestApplyPlan:
             supervisor_command="/usr/bin/x",
             queue_dir=tmp_path,
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=unit_path,
         )
         binary = self._make_fake_systemctl(tmp_path)
@@ -478,6 +671,7 @@ class TestApplyPlan:
             supervisor_command="/usr/bin/x",
             queue_dir=tmp_path,
             watchdog=_DEFAULTS,
+            task_caps=_CAPS,
             unit_path=unit_path,
         )
         binary = self._make_fake_systemctl(tmp_path, fail=True)
@@ -568,6 +762,7 @@ def test_unit_text_includes_term_and_path_environment() -> None:
         supervisor_command="/usr/bin/claude-task-runner supervisor start",
         queue_dir=Path("/home/bill/queue"),
         watchdog=_DEFAULTS,
+        task_caps=_CAPS,
     )
     assert "Environment=TERM=" in text
     assert "Environment=PATH=" in text
@@ -580,12 +775,14 @@ def _unit_for(
     *,
     watchdog: WatchdogSettings,
     exe: str = "/usr/local/bin/claude-task-runner",
+    task_caps: TaskCapsSettings = _CAPS,
     adopt_workers: bool = True,
 ) -> str:
     return build_unit_text(
         supervisor_command=f"{exe} supervisor start --queue {queue}",
         queue_dir=Path(queue),
         watchdog=watchdog,
+        task_caps=task_caps,
         adopt_workers=adopt_workers,
     )
 
@@ -642,6 +839,21 @@ class TestChangedStartDirectives:
         """Verified on systemd 255: a changed ExecStop runs at the next stop."""
         old = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=True)
         new = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=False)
+        assert old != new
+        assert changed_start_directives(old, new) == []
+
+    def test_stop_timeout_applies_at_the_next_stop(self) -> None:
+        """Verified on systemd 255: a reloaded TimeoutStopSec times the next stop.
+
+        A throwaway unit started with 60 and reloaded with 3 stopped in 3 s;
+        one reloaded from 3 to 8 took 8 s."""
+        old = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=False)
+        new = _unit_for(
+            "/q",
+            watchdog=_DEFAULTS,
+            task_caps=_task_caps(max_duration_s_per_task=28800),
+            adopt_workers=False,
+        )
         assert old != new
         assert changed_start_directives(old, new) == []
 

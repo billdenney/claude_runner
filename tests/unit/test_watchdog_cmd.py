@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.install_cmd import _watchdog_script_path
 from claude_task_runner.cli.watchdog_cmd import _spawn_supervisor, app
+from claude_task_runner.clock import FakeClock
 from claude_task_runner.cron.backoff import (
     WatchdogState,
     load_state,
@@ -116,6 +117,66 @@ class TestRegisterCommand:
             "so the watchdog starts this queue's supervisor once it exits. To hand over now, "
             f"run: claude-task-runner supervisor drain --queue {a.resolve()}",
         ]
+
+    def test_register_records_the_config(self, runner: CliRunner, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        toml = isolated_home / "cfg" / "b.toml"
+        toml.parent.mkdir()
+        toml.write_text("[watchdog]\ncrash_loop_threshold = 7\n", encoding="utf-8")
+        result = runner.invoke(app, ["register", "--queue", str(queue), "--config", str(toml)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {queue.resolve()}\nconfig: {toml}\n"
+        assert json.loads(queues_registry_path().read_text(encoding="utf-8")) == {
+            "queues": [str(queue.resolve())],
+            "configs": {str(queue.resolve()): str(toml)},
+        }
+
+    def test_register_records_a_relative_config_as_absolute(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tick runs in cron's working directory, not the one register ran in."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        work = isolated_home / "work"
+        work.mkdir()
+        (work / "rel.toml").write_text("", encoding="utf-8")
+        monkeypatch.chdir(work)
+        result = runner.invoke(app, ["register", "--queue", str(queue), "--config", "rel.toml"])
+        assert result.exit_code == 0, result.output
+        registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+        assert registry["configs"] == {str(queue.resolve()): str(Path.cwd() / "rel.toml")}
+
+    def test_register_without_config_drops_a_recorded_one(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        toml = isolated_home / "b.toml"
+        toml.write_text("", encoding="utf-8")
+        register_queue(queue, config=toml)
+        result = runner.invoke(app, ["register", "--queue", str(queue)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {queue.resolve()}\n"
+        assert json.loads(queues_registry_path().read_text(encoding="utf-8")) == {
+            "queues": [str(queue.resolve())]
+        }
+
+    @pytest.mark.parametrize("given", [True, False], ids=["with-config", "queue-toml"])
+    def test_register_refuses_a_config_that_does_not_load(
+        self, runner: CliRunner, isolated_home: Path, given: bool
+    ) -> None:
+        """Every tick would fail on it, so nothing is registered."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        toml = (isolated_home / "b.toml") if given else (queue / "claude_runner.toml")
+        toml.write_text("[watchdog\n", encoding="utf-8")
+        args = ["register", "--queue", str(queue)] + (["--config", str(toml)] if given else [])
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert result.stderr.startswith(f"register failed: Invalid TOML in {toml}: ")
+        assert result.stdout == ""
+        assert not queues_registry_path().exists()
 
 
 def _write_older_registry(queues: list[Path]) -> None:
@@ -568,47 +629,249 @@ class TestTickSkipsMissingQueue:
         assert len(load_state(watchdog_state_path()).recent_restarts) == 1
 
 
+_T0 = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
+
+
+def _freeze_tick_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Give the tick a clock stopped at ``_T0``, so waits in its log are exact."""
+    clock = FakeClock(_T0)
+    monkeypatch.setattr(watchdog_cmd, "RealClock", lambda: clock)
+    return clock
+
+
+def _record_spawn_configs(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, Path | None]]:
+    """Like ``_record_spawns``, but keep the ``--config`` each spawn was given."""
+    spawned: list[tuple[Path, Path | None]] = []
+
+    def _record(queue_dir: Path, config: Path | None = None) -> int:
+        spawned.append((queue_dir, config))
+        return 4242
+
+    monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _record)
+    return spawned
+
+
+def _toml(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _approved(queue: Path, threshold: int) -> str:
+    """The tick's log line for a first restart approved under ``threshold``."""
+    return (
+        f" watchdog queue={queue} alive=False pid=None verdict=restart "
+        f"detail='restart approved (recent count: 1 of threshold {threshold})'\n"
+    )
+
+
+def _config_error(queue: Path, config: Path) -> str:
+    """The start of the tick's ERROR line for a config that does not load."""
+    return (
+        f" watchdog: ERROR queue={queue} config={config} does not load, so its "
+        "supervisor was not checked or restarted: "
+    )
+
+
 class TestTickSettingsSource:
-    """Where a tick's ``[watchdog]`` settings come from.
+    """Where a tick's ``[watchdog]`` settings come from: the managed queue's config.
 
-    These pin the current behaviour, a known gap: the crontab's tick
-    loads no queue's ``claude_runner.toml``, so a queue's ``[watchdog]``
-    table does not reach the cron watchdog. (The systemd unit takes it
-    at ``install``.) The follow-up that makes the tick load the queue's
-    config changes these."""
+    In order: the tick's ``--config``; the config recorded by
+    ``install --config`` or ``watchdog register --config``;
+    ``<queue>/claude_runner.toml``; the package defaults. The supervisor
+    a tick starts gets the same file. The threshold in the tick's log
+    line shows which ``[watchdog]`` decided."""
 
-    def test_tick_ignores_the_queue_toml_watchdog_table(
-        self, runner: CliRunner, isolated_home: Path
+    def test_tick_uses_the_queue_toml_watchdog_table(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A 999 s cooldown in the queue's TOML does not stop a restart
-        60 s after the last one; the package default of 30 s decides."""
+        """A 999 s cooldown in the queue's TOML holds a restart 60 s after the last.
+
+        Before, the tick loaded no queue's TOML, so the package default
+        of 30 s decided and the restart went ahead."""
+        _freeze_tick_clock(monkeypatch)
         queue = isolated_home / "q"
-        (queue / ".claude_task_runner").mkdir(parents=True)
-        (queue / "claude_runner.toml").write_text(
-            "[watchdog]\nrestart_cooldown_s = 999\n", encoding="utf-8"
-        )
+        _toml(queue / "claude_runner.toml", "[watchdog]\nrestart_cooldown_s = 999\n")
         register_queue(queue)
-        last_restart = datetime.now(UTC) - timedelta(seconds=60)
-        # Named for the queue, as a tick writes it; a history for no queue is dropped.
         write_state_atomic(
-            WatchdogState(queue=queue.resolve(), recent_restarts=[last_restart]),
+            WatchdogState(queue=queue.resolve(), recent_restarts=[_T0 - timedelta(seconds=60)]),
             watchdog_state_path(),
         )
+        spawned = _record_spawn_configs(monkeypatch)
 
-        result = runner.invoke(app, ["tick", "--dry-run"])
+        result = runner.invoke(app, ["tick"])
 
         assert result.exit_code == 0, result.output
         assert (
-            f"watchdog queue={queue.resolve()} alive=False pid=None verdict=restart "
-            "detail='restart approved (recent count: 2 of threshold 5)'\n"
+            f"watchdog queue={queue.resolve()} alive=False pid=None verdict=cooldown "
+            "detail='cooldown: last restart 60s ago, need 999.0s'\n"
         ) in result.stdout
+        assert spawned == []
+
+    def test_supervisor_gets_the_queue_toml_it_was_decided_with(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        toml = _toml(queue / "claude_runner.toml", "[watchdog]\ncrash_loop_threshold = 9\n")
+        register_queue(queue)
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert _approved(queue.resolve(), 9) in result.stdout
+        assert spawned == [(queue.resolve(), toml.resolve())]
+        assert (
+            f" watchdog: spawned supervisor for {queue.resolve()} as pid=4242 "
+            f"with --config {toml.resolve()}\n"
+        ) in result.stdout
+
+    def test_recorded_config_wins_over_the_queue_toml(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        _toml(queue / "claude_runner.toml", "[watchdog]\ncrash_loop_threshold = 9\n")
+        recorded = _toml(isolated_home / "cfg" / "b.toml", "[watchdog]\ncrash_loop_threshold = 7\n")
+        register_queue(queue, config=recorded)
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert _approved(queue.resolve(), 7) in result.stdout
+        assert spawned == [(queue.resolve(), recorded)]
+
+    def test_tick_config_wins_over_the_recorded_config(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        recorded = _toml(isolated_home / "cfg" / "b.toml", "[watchdog]\ncrash_loop_threshold = 7\n")
+        explicit = _toml(isolated_home / "cfg" / "c.toml", "[watchdog]\ncrash_loop_threshold = 3\n")
+        register_queue(queue, config=recorded)
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick", "--config", str(explicit)])
+
+        assert result.exit_code == 0, result.output
+        assert _approved(queue.resolve(), 3) in result.stdout
+        assert spawned == [(queue.resolve(), explicit)]
+
+    def test_no_config_anywhere_uses_the_package_defaults(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert _approved(queue.resolve(), 5) in result.stdout
+        assert spawned == [(queue.resolve(), None)]
+        assert f" watchdog: spawned supervisor for {queue.resolve()} as pid=4242\n" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("text", "error"),
+        [
+            pytest.param(
+                "[watchdog\n",
+                "Invalid TOML in {toml}: Expected ']' at the end of a table declaration "
+                "(at line 1, column 10)\n",
+                id="not-toml",
+            ),
+            pytest.param(
+                "[watchdog]\ncrash_loop_threshold = 0\n",
+                "Settings validation failed: 1 validation error for Settings; "
+                "watchdog.crash_loop_threshold; Input should be greater than or equal to 1 "
+                "[type=greater_than_equal, input_value=0, input_type=int]; ",
+                id="fails-the-schema",
+            ),
+        ],
+    )
+    def test_a_queue_config_that_does_not_load_fails_the_tick(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        text: str,
+        error: str,
+    ) -> None:
+        """Loud, on one log line, and no restart: the supervisor would fail on it too."""
+        queue = isolated_home / "q"
+        toml = _toml(queue / "claude_runner.toml", text)
+        register_queue(queue)
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 1
+        line = _config_error(queue.resolve(), toml.resolve()) + error.format(toml=toml.resolve())
+        assert line in result.stdout
+        assert result.stdout.count("\n") == 1
+        assert "verdict=" not in result.stdout
+        assert spawned == []
+        # The state is still saved, for this queue, with no restart counted.
+        state = load_state(watchdog_state_path())
+        assert state.queue == queue.resolve()
+        assert state.recent_restarts == []
+
+    def test_a_recorded_config_that_is_gone_fails_the_tick(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tick does not fall back to the queue's own TOML or to the defaults."""
+        queue = isolated_home / "q"
+        _toml(queue / "claude_runner.toml", "")
+        recorded = _toml(isolated_home / "cfg" / "b.toml", "")
+        register_queue(queue, config=recorded)
+        recorded.unlink()
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 1
+        assert (
+            _config_error(queue.resolve(), recorded) + f"Settings file not found: {recorded}\n"
+        ) in result.stdout
+        assert spawned == []
+
+    def test_a_bad_config_is_reported_while_the_supervisor_runs(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """The next restart would fail, so the tick says so now."""
+        queue = isolated_home / "q"
+        toml = _toml(queue / "claude_runner.toml", "[watchdog\n")
+        (queue / ".claude_task_runner").mkdir()
+        (queue / ".claude_task_runner" / "supervisor.pid").write_text(f"{os.getpid()}\n")
+        register_queue(queue)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 1
+        assert _config_error(queue.resolve(), toml.resolve()) in result.stdout
+        assert "verdict=" not in result.stdout
+
+    def test_dry_run_with_a_bad_config_saves_no_state(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        queue = isolated_home / "q"
+        _toml(queue / "claude_runner.toml", "[watchdog\n")
+        register_queue(queue)
+
+        result = runner.invoke(app, ["tick", "--dry-run"])
+
+        assert result.exit_code == 1
+        assert not watchdog_state_path().exists()
 
     def test_watchdog_sh_runs_tick_with_no_config(self, isolated_home: Path) -> None:
         """The script the crontab line runs passes the tick no ``--config``.
 
-        Runs the packaged ``watchdog.sh`` with a stand-in
-        ``claude-task-runner`` first on its PATH that prints its argv,
-        which the script appends to ``watchdog.log``."""
+        The tick finds the managed queue's config itself (see above), so
+        the crontab line never needs to change with it. Runs the packaged
+        ``watchdog.sh`` with a stand-in ``claude-task-runner`` first on its
+        PATH that prints its argv, which the script appends to
+        ``watchdog.log``."""
         bin_dir = isolated_home / ".local" / "bin"
         bin_dir.mkdir(parents=True)
         stand_in = bin_dir / "claude-task-runner"

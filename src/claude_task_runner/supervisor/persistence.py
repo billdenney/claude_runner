@@ -21,6 +21,9 @@ Handles three one-way migrations at load time:
   level and inside every ``accounts[*]``). Nothing ever entered
   ``stopped`` (``supervisor stop`` sends SIGTERM), so only a hand-edited
   file can carry it. Wakeups and in-flight tasks are untouched.
+* v5 → v6: only the version changes. The new ``target_concurrency``
+  field starts as ``None`` (no cap beyond ``max_concurrency``) until each
+  account's next throttle decision sets it.
 """
 
 from __future__ import annotations
@@ -170,6 +173,17 @@ def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v5_to_v6(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v5 supervisor.json payload to v6.
+
+    v6 only adds the optional ``target_concurrency`` field, which a v5
+    file lacks and so loads as ``None``. Nothing else changes meaning.
+    """
+    migrated = dict(payload)
+    migrated["schema_version"] = 6
+    return migrated
+
+
 def load(path: Path) -> SupervisorSnapshot | None:
     """Read a persisted snapshot, or ``None`` if the file doesn't exist.
 
@@ -177,8 +191,8 @@ def load(path: Path) -> SupervisorSnapshot | None:
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
 
-    An older file is migrated one way (v2 → v3 → v4 → v5) before it is
-    validated; the module docstring describes each step.
+    An older file is migrated one way (v2 → v3 → v4 → v5 → v6) before it
+    is validated; the module docstring describes each step.
     """
     if not path.exists():
         return None
@@ -203,6 +217,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if sv == 4:
         payload = _migrate_v4_to_v5(payload)
         sv = 5
+    if sv == 5:
+        payload = _migrate_v5_to_v6(payload)
+        sv = 6
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"

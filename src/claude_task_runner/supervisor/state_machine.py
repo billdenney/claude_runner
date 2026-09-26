@@ -75,12 +75,21 @@ def _entry(
     snapshot: SupervisorSnapshot,
     clock: Clock,
     reading: UsageReading | None,
+    target_concurrency: int | None,
     consecutive_clean_polls: int | None = None,
     last_drift_message: str | None = None,
     scheduled_wakeup_at: object = ...,  # sentinel: unset means keep
 ) -> SupervisorSnapshot:
-    """Build a new snapshot with ``state`` and ``since=clock.now()``."""
-    update: dict[str, object] = {"state": state, "since": clock.now()}
+    """Build a new snapshot with ``state`` and ``since=clock.now()``.
+
+    ``target_concurrency`` is required so that no entry can carry an old
+    state's dispatch cap into the new state.
+    """
+    update: dict[str, object] = {
+        "state": state,
+        "since": clock.now(),
+        "target_concurrency": target_concurrency,
+    }
     if reading is not None:
         update["last_5h_util_pct"] = reading.five_hour.utilization_pct
         update["last_weekly_util_pct"] = reading.seven_day.utilization_pct
@@ -101,9 +110,15 @@ def _emit_state_specific_events(
     decision: Decision,
     *,
     previous_state: SupervisorState,
+    previous_target: int | None,
     actions: list[Action],
 ) -> None:
-    """Append per-transition Notify / EmitEvent actions for the new state."""
+    """Append per-transition Notify / EmitEvent actions for the new state.
+
+    SLOWING_DOWN notifies on entry and again whenever its target
+    concurrency changes, because dispatch applies that number: the last
+    notice always names the cap in force.
+    """
     new_state = decision.state
 
     if new_state is SupervisorState.THROTTLED_WEEKLY and previous_state is not new_state:
@@ -132,7 +147,9 @@ def _emit_state_specific_events(
             )
         )
 
-    if new_state is SupervisorState.SLOWING_DOWN and previous_state is not new_state:
+    if new_state is SupervisorState.SLOWING_DOWN and (
+        previous_state is not new_state or previous_target != decision.target_concurrency
+    ):
         actions.append(Notify(level="info", message=decision.message))
 
 
@@ -169,6 +186,7 @@ def step(
                 snapshot=snapshot,
                 clock=clock,
                 reading=None,
+                target_concurrency=None,
                 consecutive_clean_polls=0,
                 last_drift_message=str(inp.reading),
             )
@@ -215,6 +233,7 @@ def step(
                 snapshot=snapshot,
                 clock=clock,
                 reading=None,
+                target_concurrency=None,
                 consecutive_clean_polls=0,
                 last_drift_message=str(inp.reading),
             )
@@ -271,6 +290,7 @@ def step(
             snapshot=snapshot,
             clock=clock,
             reading=reading,
+            target_concurrency=None,
             consecutive_clean_polls=0,
             last_drift_message="",
         )
@@ -291,6 +311,7 @@ def step(
         snapshot=snapshot,
         clock=clock,
         reading=reading,
+        target_concurrency=decision.target_concurrency,
         consecutive_clean_polls=0,
         last_drift_message="",
         scheduled_wakeup_at=decision.wakeup_at,
@@ -299,6 +320,7 @@ def step(
     _emit_state_specific_events(
         decision,
         previous_state=snapshot.state,
+        previous_target=snapshot.target_concurrency,
         actions=actions,
     )
 
