@@ -271,6 +271,31 @@ Breaking changes are called out in the version notes.
   `tests/unit/test_cli_missing_queue.py` runs every command that takes
   `--queue` against a missing path. It checks that nothing is created and
   pins the exit code and message, so a command added later is covered.
+- **`/runner-status`'s `snapshot.sh` no longer reports a wrong queue as an
+  idle, empty one, or sidecars it could not list as none.** It never checked
+  that its queue (`--queue`, or the working directory without it) was a
+  queue, and it replaced a failed `claude-task-runner sidecar list` with an
+  empty listing. So a mistyped `--queue`, or a run from the wrong directory,
+  printed supervisor NOT RUNNING, `supervisor.json` missing, 0 todo and no
+  open sidecars, and exited 0. In an existing directory that was not a
+  queue, `sidecar list` also created `.claude_task_runner/`. The script now
+  exits 2 before printing anything unless the queue is an existing directory
+  with a `todo/` subdirectory, the test `worktree reclaim` applies. Its
+  stderr names the path and whether it came from `--queue` or the working
+  directory. When the open sidecars cannot be listed, because
+  `claude-task-runner` is not on PATH, `sidecar list` exits non-zero, or it
+  prints something other than a listing, the **Open sidecars** line reads
+  "could not list" with the reason and the last 20 lines the command
+  printed, and the script exits 1 after the report. For a queue whose
+  supervisor has never run, the **Queue counts** table keeps its header,
+  which was printed only when the state directory existed. The
+  runner-status skill says what each exit code means.
+  `tests/unit/test_snapshot_script.py` runs the script against a missing
+  path, a directory without `todo/`, a `todo` that is a file, a queue with
+  only `todo/` (the whole report, pinned), the real CLI with an open request,
+  and a stubbed CLI that fails, prints no listing, or is not on PATH. Each
+  run gets its own PATH, so which `claude-task-runner` is installed makes no
+  difference. The per-account tests' queues now have a `todo/`.
 - **A single-account queue now stops dispatching while throttled or
   drifting.** Its usage source names no account, so each reading updated
   only the top-level snapshot, and `accounts["default"]` stayed in the

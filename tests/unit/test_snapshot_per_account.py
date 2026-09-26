@@ -1,12 +1,13 @@
 """Behavioral tests for the runner-status snapshot.sh per-account block.
 
 Exercises the bundled ``snapshot.sh`` against a fixture queue dir whose
-``supervisor.json`` carries a v3 ``accounts`` map. The script's earlier
-sections (supervisor liveness, supervisor.json fields, queue counts,
-sidecars) are not the focus of this file — they're covered indirectly
-via the e2e integration test. This file pins the per-account state
-section's columns + rows + escape behaviour explicitly so a future
-schema change to ``accounts`` doesn't silently drift the table format.
+``supervisor.json`` carries a v3 ``accounts`` map. This file pins the
+per-account state section's columns + rows + escape behaviour explicitly
+so a future schema change to ``accounts`` doesn't silently drift the table
+format. ``test_snapshot_script.py`` pins the queue check, the whole report
+for a queue whose supervisor has never run, and the open-sidecars section.
+Nothing pins the supervisor liveness lines for a live or stale PID file,
+or the supervisor.json fields table.
 """
 
 from __future__ import annotations
@@ -26,6 +27,13 @@ def snapshot_script() -> Path:
     return _packaged_skill_dir("runner-status") / "snapshot.sh"
 
 
+def _make_queue(tmp_path: Path) -> Path:
+    """Create a queue directory, with the ``todo/`` that marks it as one."""
+    queue = tmp_path / "q"
+    (queue / "todo").mkdir(parents=True)
+    return queue
+
+
 def _seed_supervisor_json(queue: Path, payload: dict) -> Path:
     runtime = queue / ".claude_task_runner"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -38,10 +46,11 @@ def _run_snapshot(script: Path, queue: Path) -> str:
     """Run snapshot.sh against ``queue`` and return its stdout.
 
     stderr is folded in so a failed step shows up in test-failure output
-    rather than being silently swallowed. We don't ``check=True`` because
-    the script can legitimately exit non-zero on environment edges (e.g.
-    ``set -u`` tripping on a missing tool) — let the assertions on
-    stdout report what actually broke.
+    rather than being silently swallowed. We don't ``check=True``: the
+    script exits 1 after the report when it cannot list the open sidecars,
+    which depends on the ``claude-task-runner`` on PATH, and this file pins
+    only the per-account table. ``test_snapshot_script.py`` pins the exit
+    codes.
     """
     proc = subprocess.run(
         ["bash", str(script), "--queue", str(queue)],
@@ -79,8 +88,7 @@ def test_per_account_table_renders_each_account(
     tmp_path: Path,
     snapshot_script: Path,
 ) -> None:
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     _seed_supervisor_json(
         queue,
         _v3_accounts_payload(
@@ -156,8 +164,7 @@ def test_target_column_shows_the_throttle_target(tmp_path: Path, snapshot_script
     """The column after in-flight is ``target_concurrency``: the ramp for
     a slowing-down account, "—" where no decision has set one (a v5 file,
     or an idle account)."""
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     payload = _v3_accounts_payload(
         accounts={
             "personal": {
@@ -195,8 +202,7 @@ def test_target_column_shows_the_throttle_target(tmp_path: Path, snapshot_script
 
 
 def test_paused_account_shows_yes_marker(tmp_path: Path, snapshot_script: Path) -> None:
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     _seed_supervisor_json(
         queue,
         _v3_accounts_payload(
@@ -228,8 +234,7 @@ def test_drift_message_surfaced_as_list_below_table(tmp_path: Path, snapshot_scr
     """A non-empty ``last_drift_message`` shows up as a bulleted entry
     below the table rather than inlined as a column — keeps the table
     readable when drift strings are long or contain pipes."""
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     drift_msg = "parse failure: unexpected token '|' in window header on line 3"
     _seed_supervisor_json(
         queue,
@@ -265,8 +270,7 @@ def test_drift_message_surfaced_as_list_below_table(tmp_path: Path, snapshot_scr
 def test_missing_accounts_map_soft_fails(tmp_path: Path, snapshot_script: Path) -> None:
     """A v2-shaped (or pre-tick v3) supervisor.json with no `accounts`
     key must render a soft marker, not abort the entire script."""
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     _seed_supervisor_json(
         queue,
         {
@@ -297,8 +301,7 @@ def test_missing_accounts_map_soft_fails(tmp_path: Path, snapshot_script: Path) 
 def test_missing_supervisor_json_skips_per_account_section_gracefully(
     tmp_path: Path, snapshot_script: Path
 ) -> None:
-    queue = tmp_path / "q"
-    queue.mkdir()
+    queue = _make_queue(tmp_path)
     # Ensure the runtime dir exists but supervisor.json does NOT.
     (queue / ".claude_task_runner").mkdir()
     out = _run_snapshot(snapshot_script, queue)

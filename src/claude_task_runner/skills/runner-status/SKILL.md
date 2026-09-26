@@ -42,6 +42,18 @@ throttled, "—" when no decision has set one. Multi-account queues
 see one row per configured `[[accounts]]` block; single-account
 queues see a single `default` row that tracks the top-level fields.
 
+The script's exit code says whether the report can be trusted:
+
+- **2, no report:** the queue does not exist or has no `todo/`
+  subdirectory, usually a mistyped `--queue` or a working directory
+  that is not the queue. The reason and the path are on stderr. Tell
+  the user which path was tried and ask for the queue's path. Never
+  describe it as an idle or empty queue.
+- **1, report printed:** the open sidecars could not be listed. The
+  **Open sidecars** line reads "could not list" and gives the reason.
+  Say the open sidecars are unknown, never "no open sidecars".
+- **0:** every section of the report was gathered.
+
 This is the **default invocation** when the user says
 `/runner-status` or "queue status" — produces the same output shape
 every time so snapshots can be compared across time.
