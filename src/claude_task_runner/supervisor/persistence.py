@@ -7,7 +7,7 @@ complete file.
 Stored at ``<queue>/.claude_task_runner/supervisor.json`` per
 ``[supervisor].state_file``.
 
-Handles two one-way migrations at load time:
+Handles three one-way migrations at load time:
 
 * v2 → v3: the legacy single-account top-level fields wrap into
   ``accounts["default"]`` and un-attributed ``in_flight_task_ids``
@@ -17,6 +17,10 @@ Handles two one-way migrations at load time:
   and inside every ``accounts[*]``) and ``scheduled_wakeup_at``
   clears so the next tick recomputes wakeups against the new
   trace-following curve. In-flight tasks survive verbatim.
+* v4 → v5: a persisted ``state="stopped"`` rewrites to ``"idle"`` (top
+  level and inside every ``accounts[*]``). Nothing ever entered
+  ``stopped`` (``supervisor stop`` sends SIGTERM), so only a hand-edited
+  file can carry it. Wakeups and in-flight tasks are untouched.
 """
 
 from __future__ import annotations
@@ -101,23 +105,27 @@ is rewritten to ``idle`` so the next tick reclassifies under the new
 trace-following rule."""
 
 
-def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade a v3 supervisor.json payload to v4 semantics (ADR-0022).
+_DROPPED_STATES_V5 = frozenset({"stopped"})
+"""Removed because nothing ever entered it: ``supervisor stop`` sends
+SIGTERM, and the ``request_stop`` helper that set it had no caller."""
 
-    Rewrites any ``state == "paused_weekly" | "end_of_week_push"`` to
-    ``"idle"`` — both at the top level and inside every
-    ``accounts[*]`` entry — and clears ``scheduled_wakeup_at`` (both
-    top-level and per-account) so the next tick recomputes wakeups
-    against the new curve. In-flight task records are preserved
+
+def _rewrite_dropped_states(
+    payload: dict[str, Any], dropped: frozenset[str], *, clear_wakeups: bool
+) -> dict[str, Any]:
+    """Rewrite any ``state`` in ``dropped`` to ``"idle"``.
+
+    Applies at the top level and inside every ``accounts[*]`` entry. With
+    ``clear_wakeups``, also clears every ``scheduled_wakeup_at`` so the
+    next tick recomputes them. In-flight task records are preserved
     verbatim: state migrations never kill running tasks.
     """
     migrated = dict(payload)
-    migrated["schema_version"] = 4
-
     top_state = migrated.get("state")
-    if isinstance(top_state, str) and top_state in _DROPPED_STATES_V4:
+    if isinstance(top_state, str) and top_state in dropped:
         migrated["state"] = SupervisorState.IDLE.value
-    migrated["scheduled_wakeup_at"] = None
+    if clear_wakeups:
+        migrated["scheduled_wakeup_at"] = None
 
     accounts = migrated.get("accounts")
     if isinstance(accounts, dict):
@@ -128,11 +136,37 @@ def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             acct_copy = dict(acct)
             acct_state = acct_copy.get("state")
-            if isinstance(acct_state, str) and acct_state in _DROPPED_STATES_V4:
+            if isinstance(acct_state, str) and acct_state in dropped:
                 acct_copy["state"] = SupervisorState.IDLE.value
-            acct_copy["scheduled_wakeup_at"] = None
+            if clear_wakeups:
+                acct_copy["scheduled_wakeup_at"] = None
             new_accounts[name] = acct_copy
         migrated["accounts"] = new_accounts
+    return migrated
+
+
+def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v3 supervisor.json payload to v4 semantics (ADR-0022).
+
+    Rewrites any ``state == "paused_weekly" | "end_of_week_push"`` to
+    ``"idle"`` — both at the top level and inside every
+    ``accounts[*]`` entry — and clears ``scheduled_wakeup_at`` (both
+    top-level and per-account) so the next tick recomputes wakeups
+    against the new curve.
+    """
+    migrated = _rewrite_dropped_states(payload, _DROPPED_STATES_V4, clear_wakeups=True)
+    migrated["schema_version"] = 4
+    return migrated
+
+
+def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v4 supervisor.json payload to v5: ``stopped`` becomes ``idle``.
+
+    Wakeups are kept: a ``stopped`` snapshot never had one, and no other
+    state changed meaning.
+    """
+    migrated = _rewrite_dropped_states(payload, _DROPPED_STATES_V5, clear_wakeups=False)
+    migrated["schema_version"] = 5
     return migrated
 
 
@@ -143,11 +177,8 @@ def load(path: Path) -> SupervisorSnapshot | None:
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
 
-    Performs a one-way v2 → v3 migration when an older file is
-    encountered: the single-account top-level fields are folded into
-    ``accounts["default"]``, and the un-attributed
-    ``in_flight_task_ids`` becomes attributed ``in_flight`` records
-    with ``account="default"``.
+    An older file is migrated one way (v2 → v3 → v4 → v5) before it is
+    validated; the module docstring describes each step.
     """
     if not path.exists():
         return None
@@ -169,6 +200,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if sv == 3:
         payload = _migrate_v3_to_v4(payload)
         sv = 4
+    if sv == 4:
+        payload = _migrate_v4_to_v5(payload)
+        sv = 5
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"

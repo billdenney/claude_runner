@@ -284,8 +284,8 @@ def build_unit_text(
 
     Also in both cases, ``ExecStop`` carries systemd's ``-`` prefix, so
     systemd ignores its exit status. systemd runs ExecStop even when the
-    supervisor has already exited on its own (``supervisor stop``, a
-    finished drain, or the STOPPED state). By then the supervisor has
+    supervisor has already exited on its own (``supervisor stop`` or a
+    finished drain). By then the supervisor has
     removed its PID file, so ``supervisor stop`` and ``supervisor drain``
     exit 1. Without the prefix, that exit 1 would leave the unit
     ``failed (Result: exit-code)`` after every clean exit. It would also
@@ -345,8 +345,8 @@ def build_unit_text(
         f"TimeoutStopSec={effective_timeout}\n"
         "Restart=on-failure\n"
         f"RestartSec={restart_sec}\n"
-        # Don't restart when supervisor exits cleanly (e.g., STOPPED state
-        # or a successful drain/fast-stop).
+        # Don't restart when supervisor exits cleanly (a successful drain
+        # or fast-stop).
         "RestartPreventExitStatus=0\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"
