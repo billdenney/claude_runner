@@ -213,8 +213,57 @@ Breaking changes are called out in the version notes.
   it dispatches exactly as before. `queue template` no longer lists it, and the
   `runner-add-task` skill no longer names it as an example.
 
+- **Stream-parser fields that nothing read.** `runner.stream` filled
+  `AssistantMessageEvent.text_excerpt` and `usage_delta`, `ResultEvent.subtype`
+  and `duration_ms`, `StreamSummary.event_count`, and a `raw` copy of the
+  parsed line on all four event types. Nothing outside the parser read any of
+  them. The dispatcher reads only the summary: the session id, the running
+  usage, the skipped-line counts, and the final result's stop reason, error
+  flag, cost and usage. `_extract_assistant_text`, which existed only to fill
+  `text_excerpt`, goes too. With the default `adopt_workers = true`, every
+  attempt's full stream is already on disk in
+  `.claude_task_runner/logs/<task>/attempt-N.stream.jsonl`. The parser still
+  yields the same events, so the heartbeat is unchanged, and a result line's
+  `subtype` still stands in for a missing `stop_reason` or `is_error`. A
+  result line whose `duration_ms` is not a number no longer raises out of the
+  parser. The dead-code gate had allowlisted four of these fields. It could
+  not see `duration_ms` or `raw`, because vulture matches names across the
+  whole package: `ResultEvent(duration_ms=duration_ms)` reads a local of the
+  same name. The drift canary's usage check moves from each event's
+  `usage_delta` to the running `StreamSummary.cumulative_usage`, checked
+  exactly after each assistant message, which is the total the per-task token
+  cap reads.
+
 ### Fixed
 
+- **A task whose (model, effort) pair the queue's `[effort_levels]` rejects is
+  parked, not dispatched.** ADR-0010 said `Task.effort` was validated at load
+  time, but only `queue add` checked it: a hand-written or edited task YAML
+  naming an effort its model does not accept (`max` for `claude-sonnet-4-6`),
+  or a model missing from `[effort_levels]`, loaded and dispatched unchecked.
+  The task schema cannot check the pair, since the accepted sets live in the
+  merged settings, so the supervisor's candidate selector now does, against
+  the settings it runs with. A task that fails is set to `deferred` with
+  `deferred_reason: "invalid effort: <why>"` and one WARNING, like an ADR-0030
+  readiness hold: no attempt or run is recorded and the circuit breaker is
+  untouched. It goes back to `pending` on the first tick after its YAML is
+  fixed, or after the pair is added to `[effort_levels]` and the supervisor
+  gets SIGHUP. Only tasks the selector would dispatch are checked: a
+  completed, running or circuit-broken task is left alone when
+  `[effort_levels]` changes. The dispatch thread re-checks as a backstop, and
+  force-dispatch refuses the task on every path: the CLI exits 2 before it
+  dispatches or writes a request, and the supervisor drops a request already
+  written. `doctor`'s `task_yamls` check now FAILs on such a task, and each
+  `queue list` row carries `effort_error`, `null` when the pair is accepted.
+  `queue list` gained `--config`, which defaults to `<queue>/claude_runner.toml`
+  like `queue add`, and it exits 2 if that file does not load. The
+  previous-generation entries in the packaged `[effort_levels]` keep tasks
+  that name `claude-opus-4-7` or `claude-sonnet-4-6` dispatching, and a test
+  now fails if one is dropped. On 2026-09-26 every one of the 5,293 tasks on
+  the nlmixr2lib queue passed. The unknown-model message now shows the entry
+  to add (`"<model>" = [<levels>]` under `[effort_levels]`); the old
+  `[effort_levels.'<model>']` hint named a sub-table the schema rejects, and
+  `queue add` printed it through Rich markup, which dropped it entirely.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
@@ -425,6 +474,35 @@ Breaking changes are called out in the version notes.
   whether the unit is active. `cron/systemd_unit.py` sorts every directive
   the unit writes into those two groups, and a test fails when a new
   directive is in neither. The runbook has a section for the symptom.
+- **With `[supervisor].adopt_workers` off, a systemd stop now waits as long
+  as `[task_caps].max_duration_s_per_task` lets a task run.** The unit's
+  `ExecStop` drains, and `systemctl --user stop` or `restart` waits
+  `TimeoutStopSec` for the in-flight tasks, then SIGKILLs the supervisor.
+  `install` wrote `TimeoutStopSec=14400` whatever the cap, so with a cap of
+  28800, or 0 (no limit), a stop killed at 4 h tasks that the cap let run
+  longer, and the next supervisor dispatched them again. `install` now
+  writes the cap, and `infinity` for 0. The default cap is 14400, so a queue
+  that does not set it gets the same unit as before, byte for byte, and a
+  test pins that. The timeout has no margin over the cap: an attempt in
+  flight when a stop begins started before it, so its cap runs out first.
+  It does not cover time outside the cap: a pre-dispatch hook still running
+  when the stop began, the post-dispatch hook, the wait until the dispatcher
+  notices a spent cap (it checks when the agent emits an event), or a task's
+  `max_duration_s_override` above the queue's cap. A cap the unit cannot
+  carry stops `install` with exit 2 before anything is written: one longer
+  than 18,446,744,073,708 s, `inf`, or one under half a microsecond, which
+  would be written as `0`, and systemd reads `TimeoutStopSec=0` as no
+  timeout. With adoption on, the default, the unit keeps its fixed 30 s and
+  does not read the cap. On systemd 255, throwaway units showed that a
+  reloaded `TimeoutStopSec` times the next stop without a restart: one
+  started with 60 and reloaded with 3 stopped in 3 s, one reloaded from 3
+  to 8 in 8 s. So re-running `install` after changing the cap is enough, and
+  `install` asks nothing more when only the cap changed. The same units
+  showed that systemd sends the supervisor SIGTERM as soon as `ExecStop`
+  returns. `build_unit_text` and `build_install_plan` now require a
+  `task_caps` argument, and `build_unit_text` no longer takes
+  `timeout_stop_sec`, which only a test passed. The runbook has a section
+  for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
