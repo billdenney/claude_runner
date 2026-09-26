@@ -236,8 +236,6 @@ Operators extend behavior without code changes:
 - **Worktree reclamation**: `[worktree_reclaim]` sets the branch template,
   parent branch, disposable untracked paths, the hook's lock file, and the
   opt-in periodic supervisor pass (ADR-0034).
-- **Task templates**: drop Jinja2 templates into
-  `~/.claude_task_runner/templates/` or per-queue `templates/`.
 
 ## Anti-patterns (do NOT do these)
 
