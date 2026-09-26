@@ -9,21 +9,17 @@ Properties (also enforced by property tests):
 * No I/O, no global state — pure function of its inputs.
 * Recovery from :class:`states.SupervisorState.ERROR_DRIFT` requires
   ``[usage].drift_recovery_clean_polls`` consecutive clean readings.
-* :class:`states.SupervisorState.STOPPED` is sticky — only
-  :func:`request_resume` moves out of it.
 * In-flight tasks are NEVER killed by state transitions; the dispatch
   decision only gates NEW dispatches.
 
 The dispatch math lives in :mod:`claude_task_runner.throttle`. This
 module is a thin translator from the throttle package's
 :class:`Decision` into a ``(snapshot, actions)`` tuple plus the
-non-decision concerns (STOPPED stickiness, IDLE classification,
-ERROR_DRIFT routing).
+non-decision concerns (IDLE classification, ERROR_DRIFT routing).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 from claude_task_runner.clock import Clock
@@ -152,10 +148,6 @@ def step(
     """
     snapshot = inp.snapshot
     actions: list[Action] = []
-
-    # STOPPED is sticky — only :func:`request_resume` clears it.
-    if snapshot.state is SupervisorState.STOPPED:
-        return snapshot, [MonitorInFlight()]
 
     # PR 14: auth-expired routes to ERROR_DRIFT.
     #
@@ -332,34 +324,3 @@ def step(
         )
 
     return new_snap, actions
-
-
-def request_stop(snapshot: SupervisorSnapshot, *, clock: Clock) -> SupervisorSnapshot:
-    """Operator-issued stop: transition to STOPPED. Sticky."""
-    return _entry(
-        SupervisorState.STOPPED,
-        snapshot=snapshot,
-        clock=clock,
-        reading=None,
-        scheduled_wakeup_at=None,
-    )
-
-
-def request_resume(snapshot: SupervisorSnapshot, *, clock: Clock) -> SupervisorSnapshot:
-    """Operator-issued resume: leave STOPPED, return to IDLE."""
-    if snapshot.state is not SupervisorState.STOPPED:
-        return snapshot
-    return _entry(
-        SupervisorState.IDLE,
-        snapshot=snapshot,
-        clock=clock,
-        reading=None,
-        consecutive_clean_polls=0,
-        last_drift_message="",
-    )
-
-
-def all_states() -> Iterable[SupervisorState]:
-    """Convenience iterator over every defined state — used in tests
-    and dashboards to verify exhaustive handling."""
-    return list(SupervisorState)

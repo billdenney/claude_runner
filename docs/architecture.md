@@ -85,7 +85,6 @@ States in `supervisor/states.py`:
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
 - `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
-- `Stopped` — operator-issued stop.
 
 The state machine itself (`supervisor/state_machine.py`) is a thin
 wrapper that translates the result of `throttle.decision.decide()`
