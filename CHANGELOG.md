@@ -205,6 +205,37 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
+  config, and a cron `install --config` is recorded.** The crontab line runs
+  `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
+  loaded only the package defaults. A queue's `restart_cooldown_s`,
+  `restart_backoff_max_s` and `crash_loop_threshold` therefore did nothing
+  under cron. `install --config` was dropped: the registry kept only the
+  queue's path, and the restarted `supervisor start` ran without `--config`,
+  so it found only `<queue>/claude_runner.toml`. `install --config` and a new
+  `claude-task-runner watchdog register --config <toml>` now record the file,
+  made absolute, in `~/.claude_task_runner/queues.json`. It goes in a
+  `configs` map keyed by queue, and `queues` stays a list of paths, so an
+  older reader still finds the queue. A tick picks the managed queue's
+  config in this order:
+  1. the tick's own `--config`;
+  2. the recorded config;
+  3. `<queue>/claude_runner.toml`, if it exists;
+  4. the package defaults.
+
+  It decides with that config's `[watchdog]`, and a restart passes the same
+  file to `supervisor start --config`. The log line for a restart names it.
+  Registering again without `--config` drops the recorded config, and
+  unregistering the queue drops it too. `register` refuses a config that
+  does not load, whether given with `--config` or found in the queue, since
+  every tick would fail on it. When the queue's config does not load at tick
+  time (bad TOML, a schema error, or a recorded file that is gone), the tick
+  logs one `ERROR` line naming the file and the error. It neither checks
+  nor restarts the supervisor, falls back to no other config, saves its
+  state and exits 1. A supervisor started with that file would fail the same
+  way. The runbook has a section for that line. The tests that pinned the
+  old behaviour now assert the new one: a 999 s cooldown in the queue's TOML
+  holds a restart 60 s after the last one.
 - **Commands that read a queue no longer create a `--queue` that does not
   exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
   `account list` and `account resume` created `<queue>/todo/` or
@@ -298,10 +329,8 @@ Breaking changes are called out in the version notes.
   argument and no longer take `restart_sec_s`, `start_limit_burst` or
   `start_limit_interval_s`.
 
-  **The cron watchdog still ignores a queue's `[watchdog]`.** `watchdog.sh`
-  runs `watchdog tick` with no `--config`, so the tick uses the package
-  defaults, and a cron `install --config` is not recorded. Tests pin both
-  until a follow-up makes the tick load the managed queue's config.
+  The cron watchdog reads a queue's `[watchdog]` as well; see the entry on
+  the cron watchdog above.
 - **A relative `install --config` now reaches the systemd unit as the file
   `install` checked.** `install --config rel.toml` loaded `rel.toml` from
   the directory it ran in, but wrote `--config rel.toml` into the unit's
