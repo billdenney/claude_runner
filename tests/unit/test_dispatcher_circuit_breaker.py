@@ -37,9 +37,6 @@ def when() -> datetime:
 @pytest.fixture
 def settings_threshold_3() -> FailureClassifierSettings:
     return FailureClassifierSettings(
-        environmental_patterns=[],
-        operator_patterns=[],
-        task_patterns=[],
         failure_circuit_breaker_threshold=3,
     )
 

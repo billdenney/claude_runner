@@ -85,9 +85,6 @@ def deferral_hook_result() -> HookResult:
 @pytest.fixture
 def settings_threshold_5() -> FailureClassifierSettings:
     return FailureClassifierSettings(
-        environmental_patterns=[],
-        operator_patterns=[],
-        task_patterns=[],
         failure_circuit_breaker_threshold=5,
     )
 
@@ -211,9 +208,6 @@ class TestPreDispatchHookDeferral:
         """``next_eligible_at`` = now + configured cooldown — the
         orchestrator skips the parked task until then."""
         settings = FailureClassifierSettings(
-            environmental_patterns=[],
-            operator_patterns=[],
-            task_patterns=[],
             failure_circuit_breaker_threshold=3,
             deferral_recheck_cooldown_s=60.0,
         )

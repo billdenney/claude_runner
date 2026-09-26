@@ -170,38 +170,10 @@ initial_concurrency         = 1
 max_resume_attempts         = 3         # every --resume counts; at the cap, dispatch fresh
 
 # ---------------------------------------------------------------------------
-# Failure classifier (extensible via TOML)
+# Failure handling. The table is still named for ADR-0012's classifier,
+# whose pattern lists were retired; it now holds the circuit breakers.
 # ---------------------------------------------------------------------------
 [failure_classifier]
-environmental_patterns = [
-    "you've hit your limit",
-    "hit your org",
-    "monthly usage limit",
-    "api returned http 5",
-    "is_error=true",
-    "stream-json reported",
-    "TimeoutExpired",
-    "timed out",
-    "ConnectionError",
-    "ECONNRESET",
-    "connection reset",
-    "connection refused",
-    # ADR-0024: cross-account session resume. The orchestrator avoids
-    # this case proactively via session affinity, but a state YAML
-    # written before that fix (or any other transient reason the
-    # session isn't on the resuming account) can still surface here.
-    # The fix is to clear session_id (queue restart-fresh) and dispatch
-    # fresh; auto-retry buys the next tick where the orchestrator
-    # picks the affined account or the operator's restart-fresh lands.
-    "No conversation found with session ID",
-]
-operator_patterns = [
-    "Operator: defer",
-    "Abort: only the abstract",
-    "permanently",
-    "operator-deferred",
-]
-task_patterns = []
 failure_circuit_breaker_threshold = 3
 # ADR-0027: give up (failed_circuit_breaker, stop_reason sidecar_refile_loop)
 # after this many consecutive sidecar re-files with no commit in between.
