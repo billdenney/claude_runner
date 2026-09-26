@@ -16,7 +16,11 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    require_queue_option,
+    resolve_per_queue_config,
+)
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import install as cron_install
@@ -82,6 +86,7 @@ def install(
         Path.cwd,
         "--queue",
         help="Queue directory the supervisor should manage.",
+        show_default=CWD_DEFAULT_LABEL,
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the y/N confirmation."),
 ) -> None:

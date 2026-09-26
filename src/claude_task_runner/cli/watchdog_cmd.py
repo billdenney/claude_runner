@@ -47,6 +47,7 @@ from pathlib import Path
 
 import typer
 
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.cron import backoff as backoff_mod
@@ -210,7 +211,9 @@ def _probe_global_lock(ts: str) -> pidfile_mod.GlobalLockProbe:
 @app.command("register")
 def register(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory to register."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory to register.", show_default=CWD_DEFAULT_LABEL
+    ),
 ) -> None:
     """Register a queue with the cron watchdog so its ticks manage it.
 
@@ -229,7 +232,9 @@ def register(
 @app.command("unregister")
 def unregister(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory to unregister."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory to unregister.", show_default=CWD_DEFAULT_LABEL
+    ),
 ) -> None:
     """Stop the cron watchdog from managing a queue. Idempotent.
 
