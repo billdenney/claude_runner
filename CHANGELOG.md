@@ -194,6 +194,28 @@ Breaking changes are called out in the version notes.
   `systemctl --user cat claude-task-runner` shows a relative `--config`,
   re-run `claude-task-runner install` from the directory that path is
   relative to.
+- **A systemd `install` no longer claims it started a unit that keeps
+  running the old command.** `install` rewrites the unit file, reloads
+  systemd and runs `systemctl --user enable --now claude-task-runner`, which
+  starts a stopped unit but does not restart a running one. So
+  `install --queue B` over a unit running A's supervisor printed
+  `systemd unit installed and started.`, while A's supervisor went on
+  running with its old command, and holding the per-user lock, until the
+  unit next restarted. On systemd 255, a throwaway unit kept its main
+  process and old command through a rewrite, `daemon-reload` and
+  `enable --now`. When the unit is active and the new text changes a
+  directive that systemd applies only when it starts the service
+  (`ExecStart`, `WorkingDirectory`, `Environment`, `Type`, `StandardOutput`
+  or `StandardError`), `install` now says so before the y/N prompt, names
+  the queue the unit is running, and gives the commands that switch: drain
+  the old queue's supervisor, then `systemctl --user start`, or
+  `systemctl --user restart` at once. It then prints
+  `systemd unit installed.` without "and started". A change to the restart
+  policy or to `ExecStop` alone applies at the reload, as the same
+  throwaway unit showed, so it prints nothing new and does not ask systemd
+  whether the unit is active. `cron/systemd_unit.py` sorts every directive
+  the unit writes into those two groups, and a test fails when a new
+  directive is in neither. The runbook has a section for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a

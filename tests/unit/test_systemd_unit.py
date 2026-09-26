@@ -15,14 +15,19 @@ from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
     _SYSTEMD_MAX_WHOLE_SECONDS,
+    RELOADED_DIRECTIVES,
+    START_DIRECTIVES,
     UNIT_NAME,
     SystemdError,
     UnitSettingError,
     apply_plan,
     build_install_plan,
     build_unit_text,
+    changed_start_directives,
     is_systemd_user_available,
+    is_unit_active,
     uninstall,
+    unit_queue,
 )
 
 _START = (
@@ -422,6 +427,26 @@ class TestBuildInstallPlan:
         )
         assert plan.block_existed is True
 
+    def test_existing_text_is_none_without_a_unit(self, tmp_path: Path) -> None:
+        plan = build_install_plan(
+            supervisor_command=_START,
+            queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
+            unit_path=tmp_path / f"{UNIT_NAME}.service",
+        )
+        assert plan.existing_text is None
+
+    def test_existing_text_is_the_units_text(self, tmp_path: Path) -> None:
+        path = tmp_path / f"{UNIT_NAME}.service"
+        path.write_text(_UNIT_BEFORE_WATCHDOG, encoding="utf-8")
+        plan = build_install_plan(
+            supervisor_command=_START,
+            queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
+            unit_path=path,
+        )
+        assert plan.existing_text == _UNIT_BEFORE_WATCHDOG
+
 
 class TestApplyPlan:
     def _make_fake_systemctl(self, tmp_path: Path, *, fail: bool = False) -> Path:
@@ -548,3 +573,127 @@ def test_unit_text_includes_term_and_path_environment() -> None:
     assert "Environment=PATH=" in text
     # PATH must include the user's local bin so pipx-installed Claude resolves.
     assert "%h/.local/bin" in text or "/.local/bin" in text
+
+
+def _unit_for(
+    queue: str,
+    *,
+    watchdog: WatchdogSettings,
+    exe: str = "/usr/local/bin/claude-task-runner",
+    adopt_workers: bool = True,
+) -> str:
+    return build_unit_text(
+        supervisor_command=f"{exe} supervisor start --queue {queue}",
+        queue_dir=Path(queue),
+        watchdog=watchdog,
+        adopt_workers=adopt_workers,
+    )
+
+
+class TestDirectiveClassification:
+    """Whether a running supervisor sees a changed line depends on the directive."""
+
+    def test_the_sets_do_not_overlap(self) -> None:
+        assert not START_DIRECTIVES & RELOADED_DIRECTIVES
+
+    @pytest.mark.parametrize("adopt_workers", [True, False])
+    def test_every_directive_the_unit_writes_is_classified(self, adopt_workers: bool) -> None:
+        """A directive added to build_unit_text must be placed in one set."""
+        text = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=adopt_workers)
+        keys = {
+            line.partition("=")[0]
+            for line in text.splitlines()
+            if "=" in line and not line.startswith("[")
+        }
+        assert keys == START_DIRECTIVES | RELOADED_DIRECTIVES
+
+
+class TestChangedStartDirectives:
+    def test_no_old_unit(self) -> None:
+        assert changed_start_directives(None, _unit_for("/q", watchdog=_DEFAULTS)) == []
+
+    def test_same_unit(self) -> None:
+        text = _unit_for("/q", watchdog=_DEFAULTS)
+        assert changed_start_directives(text, text) == []
+
+    def test_another_queue(self) -> None:
+        old = _unit_for("/a", watchdog=_DEFAULTS)
+        new = _unit_for("/b", watchdog=_DEFAULTS)
+        assert changed_start_directives(old, new) == ["ExecStart", "WorkingDirectory"]
+
+    def test_another_executable(self) -> None:
+        old = _unit_for("/q", exe="/old/venv/bin/claude-task-runner", watchdog=_DEFAULTS)
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        assert changed_start_directives(old, new) == ["ExecStart"]
+
+    def test_restart_policy_applies_at_reload(self) -> None:
+        """Verified on systemd 255: RestartSec and StartLimit* apply without a restart."""
+        old = _unit_for("/q", watchdog=_DEFAULTS)
+        new = _unit_for(
+            "/q",
+            watchdog=_watchdog(
+                restart_cooldown_s=7, restart_backoff_max_s=700, crash_loop_threshold=9
+            ),
+        )
+        assert old != new
+        assert changed_start_directives(old, new) == []
+
+    def test_stop_wiring_applies_at_the_next_stop(self) -> None:
+        """Verified on systemd 255: a changed ExecStop runs at the next stop."""
+        old = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=True)
+        new = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=False)
+        assert old != new
+        assert changed_start_directives(old, new) == []
+
+    def test_a_hand_edited_environment(self) -> None:
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        old = new.replace("Environment=TERM=xterm-256color", "Environment=TERM=dumb")
+        assert changed_start_directives(old, new) == ["Environment"]
+
+    def test_a_directive_the_old_unit_lacked(self) -> None:
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        old = "\n".join(ln for ln in new.splitlines() if not ln.startswith("StandardError="))
+        assert changed_start_directives(old, new) == ["StandardError"]
+
+    def test_comments_and_sections_are_not_directives(self) -> None:
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        old = "# ExecStart=/elsewhere\n; WorkingDirectory=/elsewhere\n" + new
+        assert changed_start_directives(old, new) == []
+
+
+class TestUnitQueue:
+    def test_the_working_directory(self) -> None:
+        assert unit_queue(_unit_for("/some/queue", watchdog=_DEFAULTS)) == Path("/some/queue")
+
+    def test_a_unit_without_one(self) -> None:
+        assert unit_queue("[Unit]\nDescription=Old\n") is None
+
+
+def _fake_systemctl(tmp_path: Path, output: str, code: int) -> str:
+    """A systemctl that answers ``--user is-active`` for this unit, and fails otherwise."""
+    path = tmp_path / "systemctl"
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'[ "$*" = "--user is-active {UNIT_NAME}.service" ] || exit 99\n'
+        f"echo {output}\n"
+        f"exit {code}\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return str(path)
+
+
+class TestIsUnitActive:
+    def test_active(self, tmp_path: Path) -> None:
+        assert is_unit_active(_fake_systemctl(tmp_path, "active", 0)) is True
+
+    @pytest.mark.parametrize(
+        ("output", "code"),
+        [("inactive", 3), ("failed", 3), ("activating", 3), ("active", 1)],
+    )
+    def test_anything_else(self, tmp_path: Path, output: str, code: int) -> None:
+        """A unit about to restart after a crash starts its next process afresh."""
+        assert is_unit_active(_fake_systemctl(tmp_path, output, code)) is False
+
+    def test_missing_systemctl(self) -> None:
+        assert is_unit_active("this-doesnt-exist-12345") is False

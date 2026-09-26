@@ -44,6 +44,36 @@ _SYSTEMD_MAX_UNSIGNED = 2**32 - 1
 """The largest ``StartLimitBurst=`` systemd accepts; one more is
 "Failed to parse unsigned value"."""
 
+START_DIRECTIVES = frozenset(
+    {"Type", "Environment", "ExecStart", "WorkingDirectory", "StandardOutput", "StandardError"}
+)
+"""The unit's directives that systemd applies only when it starts the
+service's main process. A running supervisor keeps the values it started
+with: neither ``daemon-reload`` nor ``systemctl --user enable --now`` on
+an active unit changes them. Checked on systemd 255 for ``ExecStart``."""
+
+RELOADED_DIRECTIVES = frozenset(
+    {
+        "Description",
+        "After",
+        "StartLimitIntervalSec",
+        "StartLimitBurst",
+        "ExecStop",
+        "KillMode",
+        "TimeoutStopSec",
+        "Restart",
+        "RestartSec",
+        "RestartPreventExitStatus",
+        "WantedBy",
+    }
+)
+"""The unit's other directives. systemd reads them from the reloaded unit
+when it next stops the service or decides whether to restart it, so a
+``daemon-reload`` applies them to a running supervisor. Checked on
+systemd 255 for ``RestartSec``, ``StartLimitBurst``,
+``StartLimitIntervalSec`` and ``ExecStop``. Every directive that
+:func:`build_unit_text` writes is in exactly one of these two sets."""
+
 
 class SystemdError(RuntimeError):
     """Failure to interact with ``systemctl --user``."""
@@ -74,12 +104,16 @@ class SystemdInstallPlan:
         will run after confirming.
     block_existed
         Whether a unit with this name already exists at ``unit_path``.
+    existing_text
+        That unit's text, or ``None`` when there is none. Compare it
+        with ``unit_text`` through :func:`changed_start_directives`.
     """
 
     unit_path: Path
     unit_text: str
     enable_command: list[str]
     block_existed: bool
+    existing_text: str | None = None
 
 
 def is_systemd_user_available(systemctl_executable: str = "systemctl") -> bool:
@@ -358,12 +392,61 @@ def build_install_plan(
         "--now",
         f"{UNIT_NAME}.service",
     ]
+    existing_text = target.read_text() if target.exists() else None
     return SystemdInstallPlan(
         unit_path=target,
         unit_text=unit_text,
         enable_command=enable_command,
-        block_existed=target.exists(),
+        block_existed=existing_text is not None,
+        existing_text=existing_text,
     )
+
+
+def _directive_values(unit_text: str) -> dict[str, list[str]]:
+    """Map each directive in ``unit_text`` to its values, in file order."""
+    values: dict[str, list[str]] = {}
+    for line in unit_text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not line.startswith(("#", ";", "[")):
+            values.setdefault(key.strip(), []).append(value.strip())
+    return values
+
+
+def changed_start_directives(old_text: str | None, new_text: str) -> list[str]:
+    """Return the :data:`START_DIRECTIVES` whose values differ, sorted.
+
+    ``old_text`` is the unit as it was, ``None`` when there was none.
+    When the unit is active, a change to these reaches its supervisor
+    only when the unit next starts; ``install`` says so. Other changes
+    apply at ``daemon-reload`` (see :data:`RELOADED_DIRECTIVES`)."""
+    if old_text is None:
+        return []
+    old, new = _directive_values(old_text), _directive_values(new_text)
+    return sorted(k for k in START_DIRECTIVES if old.get(k, []) != new.get(k, []))
+
+
+def unit_queue(unit_text: str) -> Path | None:
+    """Return the queue a unit runs: its ``WorkingDirectory=``, if it has one."""
+    values = _directive_values(unit_text).get("WorkingDirectory")
+    return Path(values[-1]) if values else None
+
+
+def is_unit_active(systemctl_executable: str = "systemctl") -> bool:
+    """Whether the unit's service is running, per ``systemctl --user is-active``.
+
+    Only ``active`` counts. A unit that systemd is about to restart after
+    a crash starts its next process from the reloaded unit anyway. False
+    when ``systemctl`` is not on PATH, which :func:`apply_plan` then
+    reports."""
+    if shutil.which(systemctl_executable) is None:
+        return False
+    proc = subprocess.run(
+        [systemctl_executable, "--user", "is-active", f"{UNIT_NAME}.service"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "active"
 
 
 def apply_plan(
@@ -377,6 +460,10 @@ def apply_plan(
     ``daemon_reload=True`` is the safe default — required when an
     existing unit text was changed. Tests can disable it to avoid the
     side effect.
+
+    ``enable --now`` starts a stopped unit but does not restart an active
+    one, so a running supervisor keeps any :data:`START_DIRECTIVES` it
+    started with until the unit restarts.
     """
     plan.unit_path.parent.mkdir(parents=True, exist_ok=True)
     plan.unit_path.write_text(plan.unit_text)

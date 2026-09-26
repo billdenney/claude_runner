@@ -159,6 +159,45 @@ come back.
    not drop `--kill-whom=main` either: the default, `all`, also SIGKILLs
    every in-flight `claude` worker in the unit's cgroup.
 
+## A systemd `install` left the old supervisor running
+
+**Symptom:** after `claude-task-runner install --queue <new>` under systemd,
+`claude-task-runner supervisor status --queue <new>` shows no supervisor,
+while `systemctl --user status claude-task-runner` shows the unit active with
+a main process still running `supervisor start --queue <old>`. `install`
+printed a note that the running unit keeps its supervisor, and
+`systemd unit installed.` An older `install` printed
+`systemd unit installed and started.` instead.
+
+**Cause:** `install` rewrites the unit file, reloads systemd and runs
+`systemctl --user enable --now claude-task-runner`. That starts a stopped
+unit but does not restart a running one. systemd applies `ExecStart=`,
+`WorkingDirectory=` and `Environment=` only when it starts the service, so
+the running supervisor keeps its old queue and command until the unit
+restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
+`StartLimitIntervalSec=`) and `ExecStop=` apply at the reload, so a changed
+`[watchdog]` alone needs no restart, and `install` does not ask for one.
+
+**Steps:**
+1. To let the old queue's in-flight tasks finish first, drain its
+   supervisor, then start the unit. A drained supervisor exits 0, which the
+   unit does not restart.
+
+   ```sh
+   claude-task-runner supervisor drain --queue <old>
+   systemctl --user start claude-task-runner
+   ```
+
+2. Or switch at once:
+
+   ```sh
+   systemctl --user restart claude-task-runner
+   ```
+
+   With `[supervisor].adopt_workers` on, the default, the old queue's
+   in-flight workers keep running, but no supervisor follows them until
+   one runs for that queue again.
+
 ## Cron watchdog installed, but the supervisor stays down
 
 **Symptom:** `crontab -l` shows the `# BEGIN claude_task_runner` block,

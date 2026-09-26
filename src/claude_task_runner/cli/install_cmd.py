@@ -100,7 +100,10 @@ def install(
     the proposed change and asks for confirmation before writing.
 
     systemd: writes a ``--user`` unit that runs the supervisor for
-    ``--queue`` and restarts it when it fails. The queue's
+    ``--queue`` and restarts it when it fails. A unit that is already
+    running keeps its supervisor, so when the new unit would start it
+    differently, such as for another queue, ``install`` says so and how
+    to restart it. The queue's
     ``[watchdog]`` sets the unit's restart policy, so re-run ``install``
     after changing it.
 
@@ -164,6 +167,17 @@ def install(
         for line in sd_plan.unit_text.splitlines():
             console.print(f"  {line}")
         console.print(f"\n[bold]Then run:[/] {' '.join(sd_plan.enable_command)}\n")
+        # Asked only when the new unit would start the supervisor
+        # differently, so an unchanged or policy-only install asks nothing.
+        changed = systemd_mod.changed_start_directives(sd_plan.existing_text, sd_plan.unit_text)
+        running = bool(changed) and systemd_mod.is_unit_active()
+        if running:
+            console.print(
+                _running_unit_note(sd_plan.existing_text, changed, queue_path) + "\n",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
         if not yes and not Confirm.ask("Apply this change?", default=False):
             console.print("[yellow]Aborted.[/]")
             raise typer.Exit(code=1)
@@ -172,7 +186,14 @@ def install(
         except systemd_mod.SystemdError as exc:
             console.print(f"[bold red]systemd install failed:[/] {exc}")
             raise typer.Exit(code=2) from exc
-        console.print("[green]systemd unit installed and started.[/]")
+        if running:
+            console.print(
+                "[green]systemd unit installed.[/] Its running supervisor keeps the old "
+                "command until the unit restarts (see above).",
+                soft_wrap=True,
+            )
+        else:
+            console.print("[green]systemd unit installed and started.[/]")
         return
 
     # cron path
@@ -212,6 +233,34 @@ def install(
         console.print(f"[bold red]crontab install failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab updated.[/]")
+
+
+def _running_unit_note(existing_text: str | None, changed: list[str], queue: Path) -> str:
+    """Say that the active unit keeps its supervisor on the old command.
+
+    ``systemctl --user enable --now`` does not restart an active unit,
+    and systemd applies ``changed`` only when it next starts the service.
+    Switching queues, a drain first lets the old queue's in-flight tasks
+    finish; the drained supervisor exits 0, which the unit does not
+    restart, so it is started by hand."""
+    what = ", ".join(changed)
+    old = systemd_mod.unit_queue(existing_text) if existing_text is not None else None
+    if old is not None and old != queue:
+        return (
+            f"The unit is running the supervisor for {old}. Installing does not restart it, "
+            f"and systemd applies the new {what} only when the unit next starts, so that "
+            "supervisor keeps running until then.\n"
+            "To let its in-flight tasks finish, then switch, run:\n"
+            f"  claude-task-runner supervisor drain --queue {old}\n"
+            "  systemctl --user start claude-task-runner\n"
+            "To switch at once, run:\n"
+            "  systemctl --user restart claude-task-runner"
+        )
+    return (
+        "The unit is running. Installing does not restart it, and systemd applies the new "
+        f"{what} only when the unit next starts. To apply it now, run:\n"
+        "  systemctl --user restart claude-task-runner"
+    )
 
 
 @app.command("uninstall")

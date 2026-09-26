@@ -173,7 +173,8 @@ systemd-user vs cron and asks for confirmation before writing anything.
 - **systemd:** writes a `--user` unit that runs `supervisor start` for this
   queue, starts it now, and restarts it after a crash. A clean exit
   (`supervisor stop`, or a `drain` once in-flight tasks finish) leaves it
-  stopped.
+  stopped. If the unit is already running, for example for another queue,
+  `install` rewrites it but does not restart it, and says how to.
 - **cron:** adds a crontab line that runs `claude-task-runner watchdog tick`
   every minute, and registers this queue in
   `~/.claude_task_runner/queues.json`. A tick restarts the supervisor of each

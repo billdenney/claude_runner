@@ -24,7 +24,9 @@ from claude_task_runner.cli.install_cmd import (
     _watchdog_script_path,
     app,
 )
-from claude_task_runner.config.loader import ConfigError
+from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.schema import WatchdogSettings
+from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
@@ -133,6 +135,7 @@ def _systemd_plan_mock(*, block_existed: bool = False, unit_path: Path | None = 
         unit_path=unit_path or Path("/tmp/test.service"),
         unit_text="[Unit]\nDescription=test\n",
         enable_command=["systemctl", "--user", "enable", "--now", "claude-task-runner.service"],
+        existing_text=None,
     )
 
 
@@ -228,6 +231,160 @@ def test_install_systemd_apply_failure(runner: CliRunner, tmp_path: Path) -> Non
         result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
     assert result.exit_code == 2
     assert "systemd install failed" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `install` — systemd branch, with the unit already running
+# ---------------------------------------------------------------------------
+
+_EXE = "/usr/local/bin/claude-task-runner"
+
+
+def _write_installed_unit(
+    queue: Path,
+    *,
+    exe: str = _EXE,
+    config: Path | None = None,
+    watchdog: WatchdogSettings | None = None,
+) -> None:
+    """Write the unit an earlier ``install --queue <queue>`` would have written."""
+    command = f"{exe} supervisor start --queue {queue}"
+    if config is not None:
+        command += f" --config {config}"
+    path = systemd_mod.systemd_unit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        systemd_mod.build_unit_text(
+            supervisor_command=command,
+            queue_dir=queue,
+            watchdog=watchdog if watchdog is not None else load_settings(None).watchdog,
+        ),
+        encoding="utf-8",
+    )
+
+
+@contextmanager
+def _systemd_install(*, active: bool | None) -> Iterator[MagicMock]:
+    """Patch out the systemd branch's I/O; yield the ``apply_plan`` mock.
+
+    ``active`` is what ``is_unit_active`` answers; with ``None`` any
+    question to systemd fails the test."""
+
+    def _is_active(*_args: object, **_kwargs: object) -> bool:
+        if active is None:
+            raise AssertionError("asked systemd whether the unit is active")
+        return active
+
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="systemd",
+        ),
+        patch("claude_task_runner.cli.install_cmd.shutil.which", return_value=_EXE),
+        patch(
+            "claude_task_runner.cli.install_cmd.systemd_mod.is_unit_active",
+            side_effect=_is_active,
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
+    ):
+        yield mock_apply
+
+
+def test_install_systemd_says_the_running_unit_keeps_the_old_queue(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``enable --now`` does not restart an active unit; systemd 255 keeps the old process.
+
+    install used to print "systemd unit installed and started." while the
+    old queue's supervisor went on running and holding the per-user lock."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=True) as mock_apply:
+        result = runner.invoke(app, ["--queue", str(new)], input="y\n")
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    lines = result.stdout.splitlines()
+    note = lines.index(
+        f"The unit is running the supervisor for {old.resolve()}. Installing does not restart "
+        "it, and systemd applies the new ExecStart, WorkingDirectory only when the unit next "
+        "starts, so that supervisor keeps running until then."
+    )
+    assert lines[note + 1 : note + 7] == [
+        "To let its in-flight tasks finish, then switch, run:",
+        f"  claude-task-runner supervisor drain --queue {old.resolve()}",
+        "  systemctl --user start claude-task-runner",
+        "To switch at once, run:",
+        "  systemctl --user restart claude-task-runner",
+        "",
+    ]
+    assert note < next(i for i, line in enumerate(lines) if "Apply this change?" in line)
+    # The answer to the prompt is not echoed, so the prompt shares the last line.
+    assert lines[-1].endswith(
+        "? [y/n] (n): systemd unit installed. Its running supervisor keeps the old command "
+        "until the unit restarts (see above)."
+    )
+
+
+def test_install_systemd_says_to_restart_for_a_new_command(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Same queue, another executable, as after reinstalling into a new venv."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    _write_installed_unit(queue.resolve(), exe="/old/venv/bin/claude-task-runner")
+    with _systemd_install(active=True):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    note = lines.index(
+        "The unit is running. Installing does not restart it, and systemd applies the new "
+        "ExecStart only when the unit next starts. To apply it now, run:"
+    )
+    assert lines[note + 1] == "  systemctl --user restart claude-task-runner"
+
+
+def test_install_systemd_policy_change_needs_no_restart(runner: CliRunner, tmp_path: Path) -> None:
+    """systemd 255 applies RestartSec and StartLimit* at daemon-reload, so nothing is asked."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = queue.resolve() / "claude_runner.toml"
+    config.write_text("[watchdog]\nrestart_cooldown_s = 7\n", encoding="utf-8")
+    # Installed before the TOML changed: the same command, the old policy.
+    _write_installed_unit(queue.resolve(), config=config)
+    with _systemd_install(active=None):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
+
+
+def test_install_systemd_stopped_unit_starts_with_the_new_unit(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=False):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    assert "The unit is running" not in result.stdout
+    assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
+
+
+def test_install_systemd_abort_after_the_running_unit_note(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=True) as mock_apply:
+        result = runner.invoke(app, ["--queue", str(new)], input="n\n")
+    assert result.exit_code == 1
+    mock_apply.assert_not_called()
+    assert f"The unit is running the supervisor for {old.resolve()}." in result.stdout
 
 
 # ---------------------------------------------------------------------------
