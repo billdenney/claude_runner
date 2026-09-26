@@ -122,6 +122,17 @@ Breaking changes are called out in the version notes.
   task templates into a `templates/` directory. Nothing reads one, Jinja2 is
   not a dependency, and ADR-0023 rejected a template engine. The wheel's
   `force-include` entry for `templates/` goes with the package.
+- **The `stopped` supervisor state, which nothing ever entered.** Only
+  `state_machine.request_stop` set it, and nothing called that function:
+  `supervisor stop` sends SIGTERM. `request_stop`, `request_resume` and
+  `all_states` go with the state, as do its sticky branch in `step()` and the
+  daemon loop's exit check. `supervisor.json` is now schema version 5. On load,
+  an older file that says `stopped`, at the top level or for an account,
+  becomes `idle`, the same way v4 retired `paused_weekly` and
+  `end_of_week_push`. Only a hand-edited file could say `stopped`. A runner
+  from before this change refuses a v5 file. To downgrade, set
+  `schema_version` back to 4; nothing else in the format changed.
+
 - **The unused `supervisor/window.py` module and its tests.** No module
   imported it, at module level or inside a function, so neither the CLI nor
   the supervisor daemon nor the runner could reach it. Its contents either
