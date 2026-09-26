@@ -69,6 +69,10 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("cron/backoff.py", "next_check_at"): (
         "WatchdogDecision field; its docstring says `watchdog tick` does not read it"
     ),
+    ("cron/systemd_unit.py", "RELOADED_DIRECTIVES"): (
+        "the directives START_DIRECTIVES leaves out; test_systemd_unit.py checks that "
+        "every directive build_unit_text writes is in exactly one set"
+    ),
     # --- Dead; each names what removes it or decides its fate --------------
     ("throttle/decision.py", "target_concurrency"): (
         "ADR-0022's slowdown ramp, which dispatch ignores; its card decides wire or remove"
