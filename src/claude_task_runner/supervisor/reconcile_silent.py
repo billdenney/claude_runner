@@ -792,7 +792,7 @@ def reap_silent_orphans_tick(
 ) -> list[ReapResult]:
     """Per-tick steady-state pass over live in-flight tasks.
 
-    Called from :func:`supervisor.daemon.run_forever`'s tick loop,
+    Called from :func:`supervisor.daemon.start_daemon`'s tick loop,
     alongside the orchestrator's reap+dispatch. Covers the silent-but-
     alive case: the dispatcher's in-process loop is blocked on a
     stdout read (the subprocess emits no events) so its own kill

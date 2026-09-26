@@ -834,3 +834,60 @@ class TestRetiredTaskKeys:
         path = self._write(tmp_path, "force_dispatch_in_eow_typo: true\n")
         with pytest.raises(QueueSchemaError, match="force_dispatch_in_eow_typo"):
             load_task(path)
+
+
+class TestRetiredEffortSpellings:
+    """``extra_high`` became ``xhigh``, the claude CLI's name for it (ADR-0010).
+
+    The CLI ignores an ``--effort`` it does not know and runs at its default,
+    so a task YAML written before the rename is read with the new name."""
+
+    def _write(self, tmp_path: Path, effort: str) -> Path:
+        path = tmp_path / "t1.yaml"
+        path.write_text(f"id: t1\ntitle: T\nprompt: p\neffort: {effort}\n", encoding="utf-8")
+        return path
+
+    def test_old_spelling_loads_as_the_new_one_with_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = self._write(tmp_path, "extra_high")
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.queue.store"):
+            first = load_task(path)
+            second = load_task(path)  # the orchestrator reloads every tick
+        assert first.effort == second.effort == "xhigh"
+        assert [r.getMessage() for r in caplog.records] == [
+            f"{path}: reading effort 'extra_high' as 'xhigh', the claude CLI's name; "
+            "update the file"
+        ]
+        # The file is read, never rewritten.
+        assert "effort: extra_high\n" in path.read_text(encoding="utf-8")
+
+    def test_each_file_is_warned_about(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for name in ("a", "b"):
+            (tmp_path / name).mkdir()
+        paths = [self._write(tmp_path / name, "extra_high") for name in ("a", "b")]
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.queue.store"):
+            for p in paths:
+                load_task(p)
+        assert [r.getMessage().split(":")[0] for r in caplog.records] == [str(p) for p in paths]
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", "EXTRA_HIGH"])
+    def test_other_efforts_load_unchanged_and_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, effort: str
+    ) -> None:
+        """Only the exact old spelling is renamed. The effort gate is
+        case-sensitive, so ``EXTRA_HIGH`` stays as written and is parked."""
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.queue.store"):
+            task = load_task(self._write(tmp_path, effort))
+        assert task.effort == effort
+        assert caplog.records == []
+
+    def test_the_model_itself_keeps_the_spelling(self) -> None:
+        """Only the loader renames; a Task built in code keeps what it is given,
+        and the effort gate refuses it with a pointer to the new name."""
+        task = Task.model_validate(
+            {"id": "t1", "title": "T", "prompt": "p", "effort": "extra_high"}
+        )
+        assert task.effort == "extra_high"

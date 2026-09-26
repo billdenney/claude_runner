@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from claude_task_runner.config.loader import (
     load_settings,
 )
 from claude_task_runner.config.schema import Settings, WorktreeReclaimSettings
+from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
 
 
 class TestDeepMerge:
@@ -209,6 +211,70 @@ class TestRetiredKeys:
     def test_the_defaults_set_no_retired_key(self) -> None:
         defaults = load_defaults()
         assert [path for path in _RETIRED_KEYS if _has_path(defaults, path)] == []
+
+
+class TestRetiredEffortSpellings:
+    """``extra_high`` became ``xhigh``, the claude CLI's name (ADR-0010).
+
+    The CLI ignores an ``--effort`` it does not know and runs at its default,
+    so a queue TOML's [effort_levels] is read with the new name. The busy
+    nlmixr2lib queue's TOML listed ``extra_high`` for claude-opus-5 and
+    claude-opus-5-5 when this was written."""
+
+    def _toml(self, tmp_path: Path, body: str) -> Path:
+        path = tmp_path / "claude_runner.toml"
+        path.write_text("[effort_levels]\n" + body, encoding="utf-8")
+        return path
+
+    def test_old_spelling_is_read_as_the_new_one(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        toml = self._toml(
+            tmp_path,
+            '"claude-opus-5-5" = ["low", "medium", "high", "max", "extra_high"]\n'
+            '"claude-opus-5" = ["high", "extra_high", "xhigh"]\n'
+            '"claude-sonnet-5" = ["low"]\n',
+        )
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.config.loader"):
+            settings = load_settings(toml)
+            load_settings(toml)  # SIGHUP re-reads the file: warned once per process
+        assert settings.effort_levels["claude-opus-5-5"] == [
+            "low",
+            "medium",
+            "high",
+            "max",
+            "xhigh",
+        ]
+        assert settings.effort_levels["claude-opus-5"] == ["high", "xhigh"]  # no duplicate
+        assert settings.effort_levels["claude-sonnet-5"] == ["low"]
+        assert [r.getMessage() for r in caplog.records] == [
+            f"{toml}: reading [effort_levels] 'extra_high' as 'xhigh', the claude CLI's name, "
+            "for 'claude-opus-5-5', 'claude-opus-5'; update the file to the new name"
+        ]
+
+    def test_file_without_old_spelling_logs_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        toml = self._toml(tmp_path, '"claude-opus-5-5" = ["high", "xhigh"]\n')
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.config.loader"):
+            settings = load_settings(toml)
+        assert settings.effort_levels["claude-opus-5-5"] == ["high", "xhigh"]
+        assert caplog.records == []
+
+    def test_a_malformed_table_is_left_for_the_schema(self, tmp_path: Path) -> None:
+        """The rename skips what it cannot read; the schema still refuses it."""
+        toml = self._toml(tmp_path, '"claude-opus-5-5" = "extra_high"\n')
+        with pytest.raises(ConfigError, match="effort_levels"):
+            load_settings(toml)
+
+    def test_the_defaults_use_only_current_names(self) -> None:
+        """The packaged table never needs the rename, and each new name is a
+        level it actually lists."""
+        levels = {
+            level for accepted in load_defaults()["effort_levels"].values() for level in accepted
+        }
+        assert levels.isdisjoint(RETIRED_EFFORT_LEVELS)
+        assert set(RETIRED_EFFORT_LEVELS.values()) <= levels
 
 
 class TestWorktreeReclaimSettings:
