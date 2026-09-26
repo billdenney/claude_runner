@@ -139,6 +139,95 @@ class TestList:
         # No dispatch_rank field when the flag is off.
         assert all("dispatch_rank" not in t for t in payload["tasks"])
 
+    @pytest.mark.parametrize("order_flags", [[], ["--order-by-dispatch"]])
+    def test_effort_error_is_null_for_an_accepted_pair(
+        self, runner: CliRunner, queue_dir: Path, order_flags: list[str]
+    ) -> None:
+        """Present on every parsed row, so a consumer can tell "checked and
+        accepted" from a runner too old to check."""
+        _seed_task(queue_dir, "001-a")
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json", *order_flags])
+        assert result.exit_code == 0, result.output
+        [row] = json.loads(result.stdout)["tasks"]
+        assert row["effort_error"] is None
+
+    @pytest.mark.parametrize("order_flags", [[], ["--order-by-dispatch"]])
+    def test_effort_error_names_a_rejected_pair(
+        self, runner: CliRunner, queue_dir: Path, order_flags: list[str]
+    ) -> None:
+        """ADR-0010: the row keeps the task's fields and says why the
+        supervisor will park it instead of dispatching it."""
+        _seed_task(queue_dir, "001-bad", model="claude-sonnet-4-6", effort="max")
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json", *order_flags])
+        assert result.exit_code == 0, result.output
+        [row] = json.loads(result.stdout)["tasks"]
+        assert (row["id"], row["model"], row["effort"]) == ("001-bad", "claude-sonnet-4-6", "max")
+        assert row["effort_error"] == (
+            "effort 'max' not in accepted set for model 'claude-sonnet-4-6': "
+            "['high', 'low', 'medium']"
+        )
+
+    def test_human_output_prints_the_effort_error(self, runner: CliRunner, queue_dir: Path) -> None:
+        """Printed without Rich markup, so the accepted set's brackets and a
+        [effort_levels] hint survive."""
+        _seed_task(queue_dir, "001-new", model="claude-newmodel-99", effort="high")
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines()[2] == (
+            "  invalid effort: model 'claude-newmodel-99' has no effort levels configured; "
+            'add "claude-newmodel-99" = [<levels>] under [effort_levels] in '
+            "claude_runner.toml or use a configured model"
+        )
+
+    def test_effort_levels_come_from_the_queue_toml(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """Like ``queue add``, ``<queue>/claude_runner.toml`` is found without
+        ``--config``, and its [effort_levels] entries merge over the defaults."""
+        _seed_task(queue_dir, "001-custom", model="claude-custom-1", effort="low")
+        _seed_task(queue_dir, "002-old", model="claude-opus-4-7", effort="max")
+        (queue_dir / "claude_runner.toml").write_text(
+            '[effort_levels]\n"claude-custom-1" = ["low"]\n', encoding="utf-8"
+        )
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir), "--json"])
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.stdout)["tasks"]
+        assert [(r["id"], r["effort_error"]) for r in rows] == [
+            ("001-custom", None),
+            ("002-old", None),
+        ]
+
+    def test_explicit_config_wins(self, runner: CliRunner, queue_dir: Path, tmp_path: Path) -> None:
+        _seed_task(queue_dir, "001-custom", model="claude-custom-1", effort="low")
+        config = tmp_path / "other.toml"
+        config.write_text('[effort_levels]\n"claude-custom-1" = ["low"]\n', encoding="utf-8")
+        result = runner.invoke(
+            app, ["list", "--queue", str(queue_dir), "--config", str(config), "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        [row] = json.loads(result.stdout)["tasks"]
+        assert row["effort_error"] is None
+
+    @pytest.mark.parametrize("as_json", [True, False])
+    def test_unloadable_config_exits_2(
+        self, runner: CliRunner, queue_dir: Path, tmp_path: Path, as_json: bool
+    ) -> None:
+        """No silent fallback to the package defaults: those could accept a
+        pair the queue's own table rejects, or reject one it accepts."""
+        _seed_task(queue_dir, "001-a")
+        missing = tmp_path / "missing.toml"
+        args = ["list", "--queue", str(queue_dir), "--config", str(missing)]
+        result = runner.invoke(app, [*args, "--json"] if as_json else args)
+        assert result.exit_code == 2
+        message = (
+            "cannot load the queue's settings to check effort levels: "
+            f"Settings file not found: {missing}"
+        )
+        if as_json:
+            assert json.loads(result.stdout) == {"ok": False, "error": message}
+        else:
+            assert " ".join(result.stdout.split()) == message
+
 
 class TestStates:
     def test_filter_by_status(self, runner: CliRunner, queue_dir: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.clock import FakeClock, RealClock
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -55,6 +57,7 @@ def _make_settings(*, initial: int = 1, max_c: int = 2) -> Any:
         ),
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         claude=SimpleNamespace(executable="claude", config_dir=""),
@@ -419,6 +422,7 @@ def _make_multi_account_settings(*, max_c: int = 2) -> Any:
         concurrency=SimpleNamespace(initial_concurrency=1, max_concurrency=max_c),
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         claude=SimpleNamespace(executable="claude", config_dir=""),
@@ -1074,3 +1078,121 @@ class TestForceDispatchReadinessGate:
                 settings=_make_settings(),
                 clock=RealClock(),
             )
+
+
+SONNET_MAX_ERROR = (
+    "effort 'max' not in accepted set for model 'claude-sonnet-4-6': ['high', 'low', 'medium']"
+)
+
+
+class TestForceDispatchEffortGate:
+    """Force overrides the THROTTLE, not the task's configuration (ADR-0010).
+
+    A (model, effort) pair the queue's [effort_levels] rejects is an authoring
+    error to fix. Every force path refuses it and says why: the CLI before it
+    writes a request, the supervisor's tick_consume when it reads one, and the
+    synchronous path before it spawns.
+    """
+
+    def test_tick_consume_refuses_and_drops_the_request(
+        self, queue_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _make_task(queue_dir, "t1", model="claude-sonnet-4-6", effort="max")
+        _seed_state(queue_dir, "t1", "pending")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+
+        with (
+            patch.object(fd_mod, "_spawn_dispatch_thread") as spawn,
+            caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.force_dispatch"),
+        ):
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+
+        assert n == 0
+        spawn.assert_not_called()
+        assert fd_mod.list_requests(queue_dir) == []
+        assert [r.getMessage() for r in caplog.records] == [
+            f"force-dispatch t1: invalid effort ({SONNET_MAX_ERROR}); dropping request — "
+            "force overrides the throttle, not the task's configuration"
+        ]
+
+    def test_tick_consume_checks_the_settings_it_is_handed(self, queue_dir: Path) -> None:
+        """A pair only the queue's own [effort_levels] accepts is forced."""
+        _make_task(queue_dir, "t1", model="claude-custom-1", effort="low")
+        _seed_state(queue_dir, "t1", "pending")
+        fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
+        settings = _make_settings()
+        settings.effort_levels = {"claude-custom-1": ["low"]}
+
+        with patch.object(fd_mod, "_spawn_dispatch_thread") as spawn:
+            n = fd_mod.tick_consume(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+
+        assert n == 1
+        spawn.assert_called_once()
+
+    def test_dispatch_synchronously_raises_naming_the_error(self, queue_dir: Path) -> None:
+        _make_task(queue_dir, "t1", model="claude-sonnet-4-6", effort="max")
+        _seed_state(queue_dir, "t1", "pending")
+
+        with (
+            patch.object(fd_mod.dispatcher_mod, "dispatch") as dispatch,
+            pytest.raises(fd_mod.ForceDispatchError) as exc_info,
+        ):
+            fd_mod.dispatch_synchronously(
+                task_id="t1",
+                queue_dir=queue_dir,
+                settings=_make_settings(),
+                clock=RealClock(),
+            )
+
+        assert str(exc_info.value) == f"task t1 has an invalid effort: {SONNET_MAX_ERROR}"
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize("supervisor_alive", [False, True])
+    def test_cli_refuses_before_dispatching_or_writing_a_request(
+        self, queue_dir: Path, supervisor_alive: bool
+    ) -> None:
+        """With a supervisor running the CLI would otherwise report ``ok`` and
+        leave the supervisor to drop the request out of the operator's sight."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1", model="claude-sonnet-4-6", effort="max")
+        with (
+            patch(
+                "claude_task_runner.cli.queue_cmd._supervisor_is_alive",
+                return_value=supervisor_alive,
+            ),
+            patch("claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously") as sync,
+        ):
+            result = CliRunner().invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), "--json"]
+            )
+
+        assert result.exit_code == 2, result.stdout
+        assert json.loads(result.stdout) == {
+            "ok": False,
+            "error": f"task t1 has an invalid effort: {SONNET_MAX_ERROR}",
+        }
+        sync.assert_not_called()
+        assert fd_mod.list_requests(queue_dir) == []
+
+    def test_cli_human_output_keeps_the_accepted_set(self, queue_dir: Path) -> None:
+        """Printed without Rich markup, so no bracketed text is swallowed."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1", model="claude-sonnet-4-6", effort="max")
+        result = CliRunner().invoke(app, ["force-dispatch", "t1", "--queue", str(queue_dir)])
+
+        assert result.exit_code == 2
+        assert " ".join(result.stdout.split()) == (
+            f"task t1 has an invalid effort: {SONNET_MAX_ERROR}"
+        )

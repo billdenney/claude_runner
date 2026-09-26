@@ -74,10 +74,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
         "every directive build_unit_text writes is in exactly one set"
     ),
     # --- Dead; each names what removes it or decides its fate --------------
-    ("runner/stream.py", "text_excerpt"): "unread stream-parse output",
-    ("runner/stream.py", "usage_delta"): "unread stream-parse output",
-    ("runner/stream.py", "subtype"): "unread stream-parse output",
-    ("runner/stream.py", "event_count"): "unread stream-parse output",
 }
 """vulture findings that may stay, keyed by (path under the package, name)."""
 
