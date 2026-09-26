@@ -53,9 +53,10 @@ class UnitSettingError(ValueError):
     """A ``[watchdog]`` value that systemd cannot parse.
 
     systemd ignores a unit line it cannot parse, with only a journal
-    warning, and falls back to its own default (``RestartSec=100ms``,
-    ``StartLimitBurst=5``). So such a value is refused before the unit
-    is written."""
+    warning, and falls back to its own default: ``RestartSec=100ms``,
+    and the manager's ``DefaultStartLimitBurst=`` (5) and
+    ``DefaultStartLimitIntervalSec=`` (10 s) unless configured
+    otherwise. So such a value is refused before the unit is written."""
 
 
 @dataclass(frozen=True)
@@ -206,7 +207,8 @@ def build_unit_text(
     /home/bill/queue``).
 
     The restart policy comes from ``watchdog``, the queue's
-    ``[watchdog]`` table, which the cron watchdog's backoff also reads:
+    ``[watchdog]`` table (the settings :mod:`cron.backoff` takes for the
+    cron watchdog):
 
     * ``RestartSec`` is ``restart_cooldown_s``: how long systemd waits
       after a crash before it restarts the supervisor.
