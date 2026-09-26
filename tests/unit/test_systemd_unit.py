@@ -16,6 +16,17 @@ from claude_task_runner.cron.systemd_unit import (
     uninstall,
 )
 
+_START = (
+    "/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml"
+)
+
+
+def _only_line(text: str, key: str) -> str:
+    """Return the unit's single ``<key>=`` line."""
+    lines = [ln for ln in text.splitlines() if ln.startswith(f"{key}=")]
+    assert len(lines) == 1, f"expected exactly one {key}= line, got {lines!r}"
+    return lines[0]
+
 
 class TestBuildUnitText:
     def test_includes_required_sections(self) -> None:
@@ -58,36 +69,44 @@ class TestBuildUnitText:
     def test_includes_drain_execstop_when_adoption_off(self) -> None:
         """With adoption OFF, ExecStop runs ``supervisor drain --no-wait``
         so systemctl stop/restart goes through the graceful-drain path
-        (the historical PR-11 wiring, preserved bit-for-bit)."""
-        text = build_unit_text(
-            supervisor_command="/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml",
-            queue_dir=Path("/q"),
-            adopt_workers=False,
+        (the historical PR-11 wiring, plus the ``-`` prefix)."""
+        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), adopt_workers=False)
+        # Same binary path as ExecStart so the operator's pipx install is
+        # honoured, the same --queue / --config so drain targets the right
+        # state file, and the `-` prefix so systemd ignores its exit status.
+        assert _only_line(text, "ExecStop") == (
+            "ExecStop=-/usr/local/bin/claude-task-runner supervisor drain "
+            "--queue /q --config /q/claude_runner.toml --no-wait"
         )
-        assert "ExecStop=" in text
-        assert "supervisor drain" in text
-        assert "--no-wait" in text
-        # Same binary path as ExecStart so the operator's pipx install
-        # is honoured.
-        assert "ExecStop=/usr/local/bin/claude-task-runner supervisor drain" in text
-        # Same --queue / --config so drain targets the right state file.
-        assert "--queue /q" in text
-        assert "--config /q/claude_runner.toml" in text
 
     def test_includes_fast_stop_execstop_when_adoption_on(self) -> None:
         """ADR-0025: with adoption ON (the default), ExecStop runs
         ``supervisor stop`` (a SIGTERM) so the daemon's fast stop trips —
         the supervisor exits promptly and file-backed workers survive."""
-        text = build_unit_text(
-            supervisor_command="/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml",
-            queue_dir=Path("/q"),
+        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"))
+        assert _only_line(text, "ExecStop") == (
+            "ExecStop=-/usr/local/bin/claude-task-runner supervisor stop "
+            "--queue /q --config /q/claude_runner.toml"
         )
-        assert "ExecStop=/usr/local/bin/claude-task-runner supervisor stop" in text
         # Fast stop does NOT drain.
         assert "supervisor drain" not in text
         assert "--no-wait" not in text
-        assert "--queue /q" in text
-        assert "--config /q/claude_runner.toml" in text
+
+    def test_only_execstop_ignores_its_exit_status(self) -> None:
+        """ExecStop carries systemd's ``-`` prefix in both modes: after a
+        clean exit the supervisor has removed its PID file, so ExecStop
+        exits 1, and without the prefix the unit would end
+        ``failed (Result: exit-code)``. ExecStart stays unprefixed so a
+        supervisor that fails still counts as failed for
+        ``Restart=on-failure``."""
+        for adopt in (True, False):
+            text = build_unit_text(
+                supervisor_command=_START, queue_dir=Path("/q"), adopt_workers=adopt
+            )
+            assert _only_line(text, "ExecStart") == f"ExecStart={_START}"
+            assert _only_line(text, "ExecStop").startswith(
+                "ExecStop=-/usr/local/bin/claude-task-runner supervisor "
+            )
 
     def test_kill_mode_process(self) -> None:
         """KillMode=process so dispatched claude subprocesses survive

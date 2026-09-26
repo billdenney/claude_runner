@@ -6,7 +6,9 @@
 # Delegates all logic to `claude-task-runner watchdog tick`, which:
 #   1. Reads supervisor.pid for each queue registered in
 #      ~/.claude_task_runner/queues.json (a cron install registers its
-#      --queue; `claude-task-runner watchdog register` adds one).
+#      --queue; `claude-task-runner watchdog register` adds one and
+#      `claude-task-runner watchdog unregister` removes one). A registered
+#      path that is not an existing directory is skipped with an ERROR line.
 #   2. If supervisor is dead AND backoff allows (cron.backoff.decide):
 #      restarts via `claude-task-runner supervisor start --queue ...`.
 #   3. Logs to ~/.claude_task_runner/watchdog.log.

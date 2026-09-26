@@ -39,7 +39,7 @@ from claude_task_runner.supervisor.states import (
     SupervisorState,
 )
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 def _snapshot(settings: Settings, queue_dir: Path) -> SupervisorSnapshot | None:

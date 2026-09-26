@@ -150,7 +150,9 @@ Global (cross-queue):
 ~/.claude_task_runner/
 ├── global.lock                     # fcntl lock; single supervisor across queues
 ├── queues.json                     # queues the cron watchdog manages
-│                                   #   (cron `install`, `watchdog register`)
+│                                   #   (added by cron `install` and
+│                                   #   `watchdog register`, removed by
+│                                   #   `watchdog unregister`)
 ├── watchdog_state.json             # cron watchdog restart history + backoff
 ├── watchdog.log                    # cron watchdog output (watchdog.sh)
 ├── usage_captures/<ts>.cap         # raw PTY captures from the `usage` CLI
@@ -234,8 +236,6 @@ Operators extend behavior without code changes:
 - **Worktree reclamation**: `[worktree_reclaim]` sets the branch template,
   parent branch, disposable untracked paths, the hook's lock file, and the
   opt-in periodic supervisor pass (ADR-0034).
-- **Task templates**: drop Jinja2 templates into
-  `~/.claude_task_runner/templates/` or per-queue `templates/`.
 
 ## Anti-patterns (do NOT do these)
 

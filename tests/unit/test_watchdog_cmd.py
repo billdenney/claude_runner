@@ -4,6 +4,8 @@ The registry the tick walks is tested in ``test_cron_registry.py``."""
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,7 +17,12 @@ from typer.testing import CliRunner
 from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.install_cmd import _watchdog_script_path
 from claude_task_runner.cli.watchdog_cmd import _spawn_supervisor, app
-from claude_task_runner.cron.backoff import WatchdogState, watchdog_state_path, write_state_atomic
+from claude_task_runner.cron.backoff import (
+    WatchdogState,
+    load_state,
+    watchdog_state_path,
+    write_state_atomic,
+)
 from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
@@ -57,6 +64,95 @@ class TestRegisterCommand:
         assert not queues_registry_path().exists()
 
 
+class TestUnregisterCommand:
+    def test_unregister_a_deleted_queue(self, runner: CliRunner, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        keep = isolated_home / "keep"
+        queue.mkdir()
+        keep.mkdir()
+        register_queue(queue)
+        register_queue(keep)
+        queue.rmdir()
+
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"unregistered: {queue.resolve()}\n"
+        assert result.stderr == ""
+        assert load_registered_queues() == [keep.resolve()]
+        assert not queue.exists()
+
+    def test_unregister_defaults_to_the_current_directory(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        monkeypatch.chdir(queue)
+        result = runner.invoke(app, ["unregister"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"unregistered: {queue.resolve()}\n"
+        assert load_registered_queues() == []
+
+    def test_unregister_is_idempotent(self, runner: CliRunner, isolated_home: Path) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        assert runner.invoke(app, ["unregister", "--queue", str(queue)]).exit_code == 0
+
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"not registered: {queue.resolve()}\n"
+        assert load_registered_queues() == []
+
+    def test_unregister_with_no_registry(self, runner: CliRunner, isolated_home: Path) -> None:
+        missing = isolated_home / "never-registered"
+        result = runner.invoke(app, ["unregister", "--queue", str(missing)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"not registered: {missing.resolve()}\n"
+        assert not queues_registry_path().exists()
+
+    def test_unregister_corrupt_registry_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        registry = queues_registry_path()
+        registry.parent.mkdir(parents=True)
+        registry.write_text("{not json", encoding="utf-8")
+
+        result = runner.invoke(app, ["unregister", "--queue", str(isolated_home / "q")])
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr.startswith(
+            f"unregister failed: corrupt queues registry at {registry} ("
+        )
+        assert registry.read_text(encoding="utf-8") == "{not json"
+        assert sorted(p.name for p in registry.parent.iterdir()) == ["queues.json"]
+
+    def test_unregister_write_failure_fails_loudly(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+
+        def _deny(_src: object, _dst: object) -> None:
+            raise PermissionError(13, "Permission denied", str(queues_registry_path()))
+
+        monkeypatch.setattr(watchdog_cmd.registry_mod.os, "replace", _deny)
+        result = runner.invoke(app, ["unregister", "--queue", str(queue)])
+
+        assert result.exit_code == 2
+        assert result.stderr == (
+            f"unregister failed: [Errno 13] Permission denied: '{queues_registry_path()}'\n"
+        )
+        assert "unregistered:" not in result.stdout
+        assert load_registered_queues() == [queue.resolve()]
+        # The temporary file the failed rename left is cleaned up.
+        assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+
 class TestQueuesCommand:
     def test_queues_lists_registered(self, runner: CliRunner, isolated_home: Path) -> None:
         for name in ("a", "b"):
@@ -66,6 +162,28 @@ class TestQueuesCommand:
         assert result.exit_code == 0
         assert "a" in result.stdout
         assert "b" in result.stdout
+
+    def test_queues_warns_about_a_missing_queue_on_stderr(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """Stdout stays one path per line, so a script reading it is unaffected."""
+        gone = isolated_home / "gone"
+        live = isolated_home / "live"
+        gone.mkdir()
+        live.mkdir()
+        register_queue(gone)
+        register_queue(live)
+        gone.rmdir()
+
+        result = runner.invoke(app, ["queues"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{gone.resolve()}\n{live.resolve()}\n"
+        assert result.stderr == (
+            f"warning: {gone.resolve()} is not an existing directory, so the watchdog "
+            "skips it. To stop managing it, run: claude-task-runner watchdog unregister "
+            f"--queue {gone.resolve()}\n"
+        )
 
 
 class TestTickCommand:
@@ -166,6 +284,191 @@ class TestTickCommand:
         # The config Path the operator passed must be forwarded verbatim.
         assert spawned["config"] == config_path
         assert "spawned supervisor" in result.stdout
+
+
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Replace ``_spawn_supervisor`` with a recorder, so nothing real is spawned."""
+    spawned: list[Path] = []
+
+    def _record(queue_dir: Path, config: Path | None = None) -> int:
+        spawned.append(queue_dir)
+        return 4242
+
+    monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _record)
+    return spawned
+
+
+def _skipped_line(queue: Path) -> str:
+    """The ERROR line a tick writes to watchdog.log for a queue it skips, after the timestamp."""
+    return (
+        f" watchdog: ERROR queue={queue} is not an existing directory, so its "
+        "supervisor was not restarted and the directory was not created. If the "
+        "queue moved, register its new path. If it is gone for good, run: "
+        f"claude-task-runner watchdog unregister --queue {queue}\n"
+    )
+
+
+class TestTickSkipsMissingQueue:
+    """A registered queue whose directory was later deleted, moved or replaced.
+
+    ``register_queue`` checks the path only when it registers it. The tick
+    used to approve a restart anyway, and ``_spawn_supervisor`` recreated the
+    directory with ``parents=True``. The supervisor started on that empty
+    queue held the per-user global lock, so the real queue's supervisor
+    failed with "another supervisor is already running"."""
+
+    def test_deleted_queue_is_not_restarted_or_recreated(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert not queue.exists()
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+        assert "verdict=" not in result.stdout
+        # The skip takes no slot in the restart history that every queue shares.
+        assert load_state(watchdog_state_path()).recent_restarts == []
+        # The entry stays: a queue on an unmounted filesystem comes back by itself.
+        assert load_registered_queues() == [queue.resolve()]
+
+    def test_path_replaced_by_a_file_is_skipped(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        queue.write_text("not a queue\n", encoding="utf-8")
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert queue.read_text(encoding="utf-8") == "not a queue\n"
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+
+    def test_missing_queue_does_not_starve_a_live_one(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both supervisors are down, and the missing queue is listed first.
+
+        Every queue shares one restart cooldown. The missing queue used to take
+        the restart, which left the real queue in cooldown on every tick."""
+        gone = isolated_home / "gone"
+        real = isolated_home / "real"
+        gone.mkdir()
+        real.mkdir()
+        register_queue(gone)
+        register_queue(real)
+        gone.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == [real.resolve()]
+        assert result.stdout.count(_skipped_line(gone.resolve())) == 1
+        assert f"watchdog queue={real.resolve()} alive=False pid=None verdict=restart" in (
+            result.stdout
+        )
+        assert len(load_state(watchdog_state_path()).recent_restarts) == 1
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
+    def test_queue_behind_an_unsearchable_directory_does_not_end_the_tick(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Path.is_dir raises PermissionError here on Python 3.12 and 3.13.
+
+        Raised in the loop, it would end the tick before the queues after it."""
+        locked = isolated_home / "locked"
+        hidden = locked / "q"
+        real = isolated_home / "real"
+        hidden.mkdir(parents=True)
+        real.mkdir()
+        register_queue(hidden)
+        register_queue(real)
+        spawned = _record_spawns(monkeypatch)
+        locked.chmod(0o000)
+        try:
+            result = runner.invoke(app, ["tick"])
+        finally:
+            locked.chmod(0o700)
+
+        assert result.exit_code == 0, result.output
+        assert spawned == [real.resolve()]
+        assert result.stdout.count(_skipped_line(hidden.resolve())) == 1
+
+    def test_dry_run_reports_the_missing_queue(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        queue.rmdir()
+        spawned = _record_spawns(monkeypatch)
+
+        result = runner.invoke(app, ["tick", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert spawned == []
+        assert result.stdout.count(_skipped_line(queue.resolve())) == 1
+        assert "verdict=" not in result.stdout
+
+    def test_queue_deleted_after_the_check_is_not_recreated(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The queue disappears between the tick's check and the spawn."""
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        real_spawn = watchdog_cmd._spawn_supervisor
+
+        def _delete_then_spawn(queue_dir: Path, config: Path | None = None) -> int:
+            queue_dir.rmdir()
+            return real_spawn(queue_dir, config)
+
+        popen = MagicMock()
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _delete_then_spawn)
+        monkeypatch.setattr(watchdog_cmd.subprocess, "Popen", popen)
+        with patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"):
+            result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert not queue.exists()
+        popen.assert_not_called()
+        log_dir = queue.resolve() / ".claude_task_runner"
+        assert (
+            f" watchdog: spawn failed for {queue.resolve()}: "
+            f"[Errno 2] No such file or directory: '{log_dir}'\n"
+        ) in result.stdout
+        # A failed restart still counts toward crash-loop backoff, as before.
+        assert len(load_state(watchdog_state_path()).recent_restarts) == 1
 
 
 class TestTickSettingsSource:
@@ -284,3 +587,43 @@ class TestSpawnSupervisor:
         assert pid == 7
         argv = mock_popen.call_args.args[0]
         assert "--config" not in argv
+
+    def test_spawn_does_not_recreate_a_missing_queue(self, tmp_path: Path) -> None:
+        """The last guard if the queue disappears after the tick checked it.
+
+        It used to make ``<queue>/.claude_task_runner`` with ``parents=True``,
+        which recreated the deleted queue before starting a supervisor on it."""
+        queue = tmp_path / "gone"
+
+        mock_popen = self._popen_capturing_argv(7)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+            pytest.raises(FileNotFoundError, match=re.escape(str(queue / ".claude_task_runner"))),
+        ):
+            _spawn_supervisor(queue, None)
+        assert not queue.exists()
+        mock_popen.assert_not_called()
+
+    def test_spawn_without_the_cli_on_path(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value=None),
+            pytest.raises(RuntimeError, match=r"^claude-task-runner not on PATH$"),
+        ):
+            _spawn_supervisor(queue, None)
+        assert list(queue.iterdir()) == []
+
+    def test_spawn_creates_the_log_dir_of_a_fresh_queue(self, tmp_path: Path) -> None:
+        """A queue that has never run has no ``.claude_task_runner/`` yet."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+
+        mock_popen = self._popen_capturing_argv(7)
+        with (
+            patch.object(watchdog_cmd.shutil, "which", return_value="/usr/bin/claude-task-runner"),
+            patch.object(watchdog_cmd.subprocess, "Popen", mock_popen),
+        ):
+            assert _spawn_supervisor(queue, None) == 7
+        assert (queue / ".claude_task_runner" / "supervisor.log").is_file()

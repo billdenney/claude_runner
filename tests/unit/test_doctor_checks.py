@@ -9,6 +9,7 @@ two that touch external state (``check_claude_binary`` PATH lookup,
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -1103,6 +1104,103 @@ def test_check_watchdog_systemd_unit_skips_the_cron_registry(
         result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.PASS
     assert result.detail == "systemd watchdog detected"
+
+
+UNREGISTER_HEADER = "Register a queue that moved at its new path. Drop one that is gone for good:"
+
+
+def test_check_watchdog_cron_registered_queue_was_deleted(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """A queue deleted after it was registered stays registered, and every tick skips it."""
+    register_queue(queue_dir)
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    register_queue(gone)
+    gone.rmdir()
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"cron watchdog detected, but registered queue {gone.resolve()} is not an "
+        "existing directory, so every tick skips it"
+    )
+    assert result.remediation == (
+        f"{UNREGISTER_HEADER}\n  claude-task-runner watchdog unregister --queue {gone.resolve()}"
+    )
+
+
+def test_check_watchdog_cron_lists_every_missing_queue(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    register_queue(queue_dir)
+    gone = tmp_path / "gone"
+    now_a_file = tmp_path / "now-a-file"
+    for q in (gone, now_a_file):
+        q.mkdir()
+        register_queue(q)
+        q.rmdir()
+    now_a_file.write_text("", encoding="utf-8")
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        "cron watchdog detected, but 2 registered queues are not existing directories, "
+        f"so every tick skips them: {gone.resolve()}, {now_a_file.resolve()}"
+    )
+    assert result.remediation.splitlines() == [
+        UNREGISTER_HEADER,
+        f"  claude-task-runner watchdog unregister --queue {gone.resolve()}",
+        f"  claude-task-runner watchdog unregister --queue {now_a_file.resolve()}",
+    ]
+
+
+def test_check_watchdog_cron_unregistered_queue_and_a_missing_one(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """Both problems are reported, the one about this queue first."""
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    register_queue(gone)
+    gone.rmdir()
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    queue = queue_dir.resolve()
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"cron watchdog detected, but {queues_registry_path()} does not list this queue, "
+        f"so no tick restarts its supervisor; and registered queue {gone.resolve()} is not "
+        "an existing directory, so every tick skips it"
+    )
+    assert result.remediation.splitlines() == [
+        f"Run `claude-task-runner watchdog register --queue {queue}`, "
+        f"or re-run `claude-task-runner install --queue {queue}`.",
+        UNREGISTER_HEADER,
+        f"  claude-task-runner watchdog unregister --queue {gone.resolve()}",
+    ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
+def test_check_watchdog_cron_queue_behind_an_unsearchable_directory(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """Path.is_dir raises PermissionError here on Python 3.12 and 3.13; doctor must not."""
+    register_queue(queue_dir)
+    locked = tmp_path / "locked"
+    hidden = locked / "q"
+    hidden.mkdir(parents=True)
+    register_queue(hidden)
+    locked.chmod(0o000)
+    try:
+        with _watchdog_probes(tmp_path / "nonexistent.service"):
+            result = check_watchdog_installed(settings, queue_dir)
+    finally:
+        locked.chmod(0o700)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"cron watchdog detected, but registered queue {hidden.resolve()} is not an "
+        "existing directory, so every tick skips it"
+    )
 
 
 # ---------------------------------------------------------------------------

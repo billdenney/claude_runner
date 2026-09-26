@@ -32,7 +32,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.queue.schema import Task
@@ -58,7 +58,7 @@ from claude_task_runner.runner.effort_levels import (
 )
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -450,7 +450,7 @@ def add_task(
     Skills (``/runner-add-task``) drive this with operator answers.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console)
     settings = load_settings(resolve_per_queue_config(config, qd))
 
     if not _ID_RE.match(task_id):
@@ -789,6 +789,7 @@ def force_dispatch(
 
     Behavior depends on whether the supervisor is running:
 
+    \b
     * **Supervisor running.** Writes a request file under
       ``<queue>/.claude_task_runner/force_dispatch/<task_id>.req``;
       the supervisor consumes it on the next tick (typically <30 s).
@@ -806,7 +807,7 @@ def force_dispatch(
     synchronous path.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
     queue_runtime_dir(qd)
 

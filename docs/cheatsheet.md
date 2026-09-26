@@ -166,6 +166,23 @@ of `origin/main` after a fetch, and `git status` is clean apart from
 `interval_s`, and set `[worktree_reclaim].lock_file` to your pre-dispatch
 hook's flock. See ADR-0034 and the runbook.
 
+### Change which queues the cron watchdog manages
+
+```sh
+claude-task-runner watchdog queues                       # one path per line; stderr warns about a missing one
+claude-task-runner watchdog register --queue <queue>     # add a queue (the directory must exist)
+claude-task-runner watchdog unregister --queue <queue>   # drop a queue (the directory need not exist)
+```
+
+A tick skips a registered queue that is not an existing directory and logs an
+`ERROR` line to `~/.claude_task_runner/watchdog.log` each minute. It keeps the
+entry, so a queue on a filesystem that was not mounted is managed again once it
+is. `claude-task-runner install uninstall` removes the crontab block but leaves
+`~/.claude_task_runner/queues.json`, so a later cron `install` manages every
+queue still listed. It prints those queues, each with the `unregister` command
+that drops it. See the runbook's
+[A registered queue was deleted or moved](runbook.md#a-registered-queue-was-deleted-or-moved).
+
 ### Stale branch cleanup
 
 ```sh

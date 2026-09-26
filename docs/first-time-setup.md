@@ -7,12 +7,12 @@ subcommand referenced in older docs (see ADR-0017).
 ## 1. Install the package
 
 ```sh
-pip install -e '/path/to/claude_task_runner[dev,ui]'
+pip install -e '/path/to/claude_task_runner[dev]'
 which claude-task-runner   # verify on PATH
 ```
 
-The `dev` extras include `pytest` and the doctor's check dependencies; the
-`ui` extras include the optional terminal UI.
+The `dev` extras add the test and lint tools (`pytest`, `ruff`, `mypy`,
+`pre-commit`). The runner and the doctor need none of them.
 
 Then install the skills into `~/.claude/skills/`:
 
@@ -51,6 +51,10 @@ cd /path/to/my_queue
 
 This directory becomes the queue's root. Tasks live under `todo/<id>.yaml`;
 state lives under `.claude_task_runner/` (auto-created on first dispatch).
+Create the directory first: `queue add`, `queue force-dispatch`,
+`supervisor start` and `install` exit 2 with
+`--queue is not an existing directory` rather than create a queue from a
+mistyped or deleted path.
 
 ## 3. Write a minimal `claude_runner.toml`
 

@@ -1083,13 +1083,16 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
 
 
 def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
-    """PASS only when the cron watchdog's registry lists ``queue_dir``.
+    """PASS only when the cron watchdog's registry lists ``queue_dir``
+    and every registered path is an existing directory.
 
     The crontab line runs ``watchdog tick`` with no ``--queue``, and a
     tick manages only the queues in the registry. A cron watchdog that an
     older ``install`` set up has an empty registry, and without this
     check doctor passed it while no tick ever restarted the supervisor.
-    Reads the registry without side effects, so a corrupt file is
+    A registered queue that was later deleted or moved stays registered,
+    and every tick skips it with an ERROR line, so it is reported here
+    too. Reads the registry without side effects, so a corrupt file is
     reported instead of being backed up and treated as empty."""
     queue = queue_dir.resolve()
     registry = registry_mod.queues_registry_path()
@@ -1103,7 +1106,28 @@ def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
             detail=f"cron watchdog detected, but its queue registry is unreadable: {exc}",
             remediation=f"Fix or remove {registry}, then run `{register}`.",
         )
-    if queue in registered:
+    problems: list[str] = []
+    fixes: list[str] = []
+    if queue not in registered:
+        problems.append(f"{registry} does not list this queue, so no tick restarts its supervisor")
+        fixes.append(f"Run `{register}`, or re-run `claude-task-runner install --queue {queue}`.")
+    # os.path.isdir is False where Path.is_dir raises (a parent that
+    # denies access), as in the tick, so one such path cannot end doctor.
+    missing = [q for q in registered if not os.path.isdir(q)]
+    if missing:
+        if len(missing) == 1:
+            problems.append(
+                f"registered queue {missing[0]} is not an existing directory, "
+                "so every tick skips it"
+            )
+        else:
+            problems.append(
+                f"{len(missing)} registered queues are not existing directories, "
+                f"so every tick skips them: {', '.join(str(q) for q in missing)}"
+            )
+        fixes.append("Register a queue that moved at its new path. Drop one that is gone for good:")
+        fixes.extend(f"  claude-task-runner watchdog unregister --queue {q}" for q in missing)
+    if not problems:
         return CheckResult(
             name="watchdog_installed",
             status=CheckStatus.PASS,
@@ -1112,16 +1136,16 @@ def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
     return CheckResult(
         name="watchdog_installed",
         status=CheckStatus.WARN,
-        detail=(
-            f"cron watchdog detected, but {registry} does not list this queue, "
-            "so no tick restarts its supervisor"
-        ),
-        remediation=f"Run `{register}`, or re-run `claude-task-runner install --queue {queue}`.",
+        detail="cron watchdog detected, but " + "; and ".join(problems),
+        remediation="\n".join(fixes),
     )
 
 
 def check_watchdog_installed(settings: Settings, queue_dir: Path) -> CheckResult:
-    """A systemd unit, or a cron managed-block that lists this queue, should exist."""
+    """A systemd unit, or a cron managed-block that lists this queue, should exist.
+
+    With the cron block, every queue the registry lists should also
+    still be an existing directory."""
     systemd_present = systemd_mod.systemd_unit_path().exists()
 
     # Try to read the crontab non-destructively. ``crontab_l`` already

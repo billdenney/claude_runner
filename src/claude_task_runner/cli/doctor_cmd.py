@@ -17,7 +17,7 @@ from claude_task_runner.cli._helpers import resolve_per_queue_config
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.doctor.checks import CheckStatus, all_checks
 
-app = typer.Typer(no_args_is_help=False, invoke_without_command=False)
+app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
 
 
 _STATUS_COLOR = {

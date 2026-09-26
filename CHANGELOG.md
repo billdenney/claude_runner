@@ -94,6 +94,19 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **Six empty packages, the `ui` extra and the Jinja2 task-templates
+  promise.** `events/`, `logs/`, `metrics/`, `notify/`, `templates/` and `ui/`
+  each held only an empty `__init__.py` from the initial commit, and nothing
+  imported them. The `ui` extra installed `textual` for a terminal UI that was
+  never built, and nothing imports `textual`. The install lines in the README,
+  `docs/first-time-setup.md` and CI now use `.[dev]`. An old `.[dev,ui]`
+  still installs, and pip and uv only warn that the extra is gone.
+  `docs/first-time-setup.md` also no longer says the `dev` extras carry the
+  doctor's dependencies; the doctor needs none of them.
+  `docs/architecture.md` no longer tells operators to drop Jinja2
+  task templates into a `templates/` directory. Nothing reads one, Jinja2 is
+  not a dependency, and ADR-0023 rejected a template engine. The wheel's
+  `force-include` entry for `templates/` goes with the package.
 - **The unused `supervisor/window.py` module and its tests.** No module
   imported it, at module level or inside a function, so neither the CLI nor
   the supervisor daemon nor the runner could reach it. Its contents either
@@ -109,6 +122,118 @@ Breaking changes are called out in the version notes.
   `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
 
 ### Fixed
+
+- **`--help` no longer drops bracketed words such as `[queue]` and
+  `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
+  every help string as Rich console markup. Rich takes `[` followed by a
+  lowercase letter as the start of a style tag and deletes the tag, so ten
+  help texts in nine commands lost text. `supervisor drain --help` showed
+  `[task_caps].max_duration_s_per_task` as `.max_duration_s_per_task`,
+  `queue restart-fresh --help` showed `[[accounts]]` as `[]`, and
+  `sidecar answer --help` showed `list[str]` as `list`. Every `typer.Typer`
+  in `cli/` now passes `rich_markup_mode=None`, so help prints exactly as
+  written. It is now in click's plain format rather than Rich panels, and
+  usage errors print as click's plain `Error:` lines. `console.print`
+  output keeps its colours. Click re-wraps help paragraphs, so the two
+  "Exit codes:" tables and the bullet lists in `supervisor start` and
+  `queue force-dispatch` now open with click's `\b` no-rewrap line.
+  `tests/unit/test_docs_cli_help.py` renders every command's `--help`. It
+  fails when a bracketed token in the help text is missing from the output,
+  when any `typer.Typer` in the tree uses a markup mode, or when a laid-out
+  paragraph has no `\b`. Known-answer tests pin the checker: under the old
+  mode it reports exactly the tokens Rich drops, both on a demo app and on
+  the real CLI.
+- **A cron watchdog tick no longer recreates a registered queue that was
+  deleted or moved.** `register_queue` rejects a path that is not a
+  directory, but only when it registers it. For a queue that was later
+  deleted, moved or replaced by a file, every tick found no live supervisor
+  and approved a restart, and `_spawn_supervisor` made
+  `<queue>/.claude_task_runner` with `parents=True`, which recreated the
+  queue directory. The supervisor started on that empty queue held the
+  per-user `global.lock`, so the operator's real queue failed with
+  `another supervisor is already running`. Every queue shares one restart
+  history in `watchdog_state.json`, so a missing queue listed first also took
+  the restart and left the real queue in cooldown on every tick. A tick now
+  checks each registered path before it decides anything. For a path that is
+  not an existing directory it writes
+  `watchdog: ERROR queue=<path> is not an existing directory, ...` to
+  `~/.claude_task_runner/watchdog.log`, with the command that unregisters it,
+  and records no restart. The entry stays registered, so a queue on a
+  filesystem that was not mounted is managed again once it is.
+  `watchdog queues` warns on stderr about each such path, and its stdout is
+  still one path per line. `_spawn_supervisor` no longer passes
+  `parents=True`, so a queue deleted between the check and the spawn is not
+  recreated either. `queues.json` is now written to a temporary file and
+  renamed into place, so a tick never reads half a registry. With only the
+  cron block installed, `doctor`'s `watchdog_installed` check now WARNs about
+  every registered path that is not an existing directory and prints the
+  `claude-task-runner watchdog unregister --queue <path>` for each. The
+  runbook has a section for the symptom, including how to stop a supervisor
+  that an older version already started on a recreated queue.
+- **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
+  refuse a `--queue` that is not an existing directory.** They used to
+  create it, because `queue_runtime_dir()` and `todo_dir()` make their
+  directories with `parents=True`. A mistyped or deleted `--queue` became an
+  empty queue, and a `supervisor start` on it held the per-user
+  `global.lock`, so the real queue's supervisor failed with
+  `another supervisor is already running`. Each command now exits 2 with
+  `--queue is not an existing directory: <path>` before it loads settings,
+  shows a plan or writes anything. `queue force-dispatch --json` prints that
+  as `{"ok": false, "error": ...}`. `install` checks before it detects the
+  init system. Its cron branch used to show the crontab diff and ask to
+  confirm before failing to register the queue, and its systemd branch wrote
+  and started a unit whose `WorkingDirectory=` did not exist. The watchdog
+  spawns `supervisor start`, so the check there also covers a queue deleted
+  between a tick's check and the spawn. All of them, and
+  `watchdog register`, use `queue.store.require_queue_dir()`. Like the tick,
+  it treats a path it cannot examine, such as one under a directory the user
+  may not search, as missing instead of raising `PermissionError`. `--queue`
+  still defaults to the current directory, and the documented setup creates
+  the queue directory first, so neither is affected.
+- **Under systemd, a supervisor that exits cleanly now leaves the unit
+  `inactive (dead)` instead of `failed`.** systemd runs the unit's
+  `ExecStop` even when the supervisor has already exited on its own: after
+  `kill <pid>`, `claude-task-runner supervisor stop`, a drain, or on
+  reaching the STOPPED state. By then the supervisor has removed its PID
+  file, so the `ExecStop` command (`supervisor stop`, or
+  `supervisor drain --no-wait` when `[supervisor].adopt_workers` is off)
+  printed `No PID file` and exited 1. systemd logged
+  `Failed with result 'exit-code'` and left the unit
+  `failed (Result: exit-code)`, so
+  `systemctl --user is-failed claude-task-runner` reported true after every
+  clean stop. The supervisor was not restarted, because
+  `RestartPreventExitStatus=0` matched its exit 0. The same exit 1 also
+  made `Restart=on-failure` restart a supervisor killed by a signal that
+  systemd counts as clean (SIGHUP, SIGINT, SIGTERM or SIGPIPE). That
+  restart came from the failed `ExecStop`, not from how the supervisor
+  exited. The generated unit now writes `ExecStop=-...`, and the `-` tells
+  systemd to ignore the command's exit status. `ExecStart` has no prefix,
+  so a supervisor that fails still counts as failed, and a crash (a
+  SIGKILL, for example) still restarts it after `RestartSec`. This was
+  checked on systemd 255 by running the generated unit text as transient
+  user units, with the real `supervisor stop` and `supervisor drain` as
+  `ExecStop`. A unit installed before this change keeps its old `ExecStop`
+  until you re-run `claude-task-runner install`. Step 3 of the runbook's
+  "Cron / systemd watchdog not installed" now describes both kinds of unit.
+
+- **The runbook gives a safe way to test the systemd restart.** Step 3 of
+  "Cron / systemd watchdog not installed" said systemd restarts the
+  supervisor after a crash but gave no way to check it, and the obvious
+  tests mislead. `kill <pid>` and `supervisor stop` send SIGTERM; the
+  supervisor exits 0 and `RestartPreventExitStatus=0` leaves it down. A
+  unit installed before the ExecStop fix above also shows
+  `failed (Result: exit-code)`, because its ExecStop runs after the
+  supervisor has gone and exits 1.
+  `systemctl --user kill --signal=KILL` does crash it, but its default
+  `--kill-whom=all` also SIGKILLs every in-flight `claude` worker in the
+  unit's cgroup. The step now uses
+  `systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner`
+  (`--kill-who=main` before systemd 252, or `kill -KILL` on the PID from
+  `supervisor status`), and says what the restart looks like in the
+  journal. The behaviour was checked on
+  systemd 255 with transient units that use the unit's settings: SIGKILL
+  of the main process restarted it with the workers alive, and the
+  default form killed them.
 
 - **A cron `install` now registers its queue, so the cron watchdog restarts
   the supervisor.** The crontab line runs `watchdog.sh`, which runs
@@ -215,6 +340,25 @@ Breaking changes are called out in the version notes.
 
 ### Added
 
+- **`claude-task-runner watchdog unregister --queue <queue>` drops a queue
+  from the cron watchdog's registry.** Removing an entry from
+  `~/.claude_task_runner/queues.json` used to mean editing the file by hand;
+  `install uninstall` removes the crontab block and leaves the registry
+  alone. `unregister` works whether or not the directory still exists. It
+  matches an entry both as written and as resolved, so a path copied from
+  `watchdog queues` or `watchdog.log` removes its entry even when a symlink
+  on it has changed since. It is idempotent: for a queue that is not listed
+  it prints `not registered: <path>` and exits 0. A corrupt registry makes
+  it exit 2 and is left as it was. The tick's lenient reader would treat
+  that file as empty, and rewriting it would drop every other queue.
+  `--queue` defaults to the current directory, as it does for
+  `watchdog register`. `install uninstall` still leaves the registry alone,
+  but once no cron block is installed it prints the queues the registry
+  still lists, each with the `unregister` command that drops it, because a
+  later cron `install` would manage all of them again. It stays silent when
+  the operator keeps the cron block, since the watchdog is still using those
+  queues, and when `crontab -l` cannot be read. A corrupt registry gets a
+  warning and is left as it is.
 - **`claude-task-runner worktree reclaim` removes finished tasks' worktrees
   (ADR-0034).** A queue whose pre-dispatch hook creates one git worktree per
   task accumulated them forever. On 2026-09-25 the nlmixr2lib queue had 305
