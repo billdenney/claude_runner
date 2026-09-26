@@ -152,6 +152,43 @@ def test_per_account_table_renders_each_account(
     assert "2026-06-09T16:00:30+00:00" in out
 
 
+def test_target_column_shows_the_throttle_target(tmp_path: Path, snapshot_script: Path) -> None:
+    """The column after in-flight is ``target_concurrency``: the ramp for
+    a slowing-down account, "—" where no decision has set one (a v5 file,
+    or an idle account)."""
+    queue = tmp_path / "q"
+    queue.mkdir()
+    payload = _v3_accounts_payload(
+        accounts={
+            "personal": {
+                "state": "slowing_down",
+                "since": "2026-06-09T10:00:00+00:00",
+                "last_5h_util_pct": 55,
+                "last_weekly_util_pct": 5,
+                "target_concurrency": 2,
+            },
+            "work": {
+                "state": "idle",
+                "since": "2026-06-09T10:00:00+00:00",
+                "last_5h_util_pct": 10,
+                "last_weekly_util_pct": 5,
+            },
+        },
+        in_flight=[
+            {"task_id": "t-001", "account": "personal", "started_at": "2026-06-09T11:00:00+00:00"},
+            {"task_id": "t-002", "account": "personal", "started_at": "2026-06-09T11:30:00+00:00"},
+        ],
+    )
+    payload["schema_version"] = 6
+    _seed_supervisor_json(queue, payload)
+
+    out = _run_snapshot(snapshot_script, queue)
+
+    assert "| in-flight | target |" in out
+    assert "| personal | `slowing_down` | 55% | 5% |  | 2 | 2 |" in out
+    assert "| work | `idle` | 10% | 5% |  | 0 | — |" in out
+
+
 # ---------------------------------------------------------------------------
 # Paused account
 # ---------------------------------------------------------------------------

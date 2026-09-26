@@ -237,7 +237,10 @@ class TestMigrationV3ToV4:
 
 
 class TestMigrationV4ToV5:
-    """``stopped`` rewrites to ``idle``; nothing else in the file changes."""
+    """``stopped`` rewrites to ``idle``; nothing else in the file changes.
+
+    A loaded file continues through v5 -> v6, so it arrives at v6.
+    """
 
     def _write(self, queue_dir: Path, payload: dict) -> Path:
         path = supervisor_state_path(queue_dir)
@@ -269,7 +272,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 5
+        assert snap.schema_version == 6
         assert snap.state is SupervisorState.IDLE
         assert snap.accounts["a"].state is SupervisorState.IDLE
         # Other states, their wakeups and in-flight tasks are untouched.
@@ -287,7 +290,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 5
+        assert snap.schema_version == 6
         assert snap.state is SupervisorState.DISPATCHING
         assert snap.scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
 
@@ -296,7 +299,7 @@ class TestMigrationV4ToV5:
         v3 = {"schema_version": 3, "state": "stopped", "since": "2026-09-25T12:00:00+00:00"}
         snap = load(self._write(queue_dir, v3))
         assert snap is not None
-        assert snap.schema_version == 5
+        assert snap.schema_version == 6
         assert snap.state is SupervisorState.IDLE
 
     def test_malformed_account_entry_still_fails_loud(self, queue_dir: Path) -> None:
@@ -311,7 +314,76 @@ class TestMigrationV4ToV5:
         with pytest.raises(SupervisorPersistenceError, match="accounts"):
             load(self._write(queue_dir, v4))
 
-    def test_written_snapshot_is_v5(self, queue_dir: Path) -> None:
+
+class TestMigrationV5ToV6:
+    """v6 adds ``target_concurrency``; a v5 file loads with it unset."""
+
+    def _write(self, queue_dir: Path, payload: dict) -> Path:
+        path = supervisor_state_path(queue_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_v5_loads_with_no_target(self, queue_dir: Path) -> None:
+        v5 = {
+            "schema_version": 5,
+            "state": "slowing_down",
+            "since": "2026-09-25T12:00:00+00:00",
+            "last_5h_util_pct": 55,
+            "scheduled_wakeup_at": "2026-09-25T17:05:00+00:00",
+            "accounts": {
+                "a": {
+                    "state": "slowing_down",
+                    "since": "2026-09-25T12:00:00+00:00",
+                    "last_5h_util_pct": 55,
+                    "scheduled_wakeup_at": "2026-09-25T17:05:00+00:00",
+                },
+            },
+        }
+        snap = load(self._write(queue_dir, v5))
+        assert snap is not None
+        assert snap.schema_version == 6
+        assert snap.target_concurrency is None
+        assert snap.accounts["a"].target_concurrency is None
+        # Nothing else changes meaning, so nothing else is rewritten.
+        assert snap.state is SupervisorState.SLOWING_DOWN
+        assert snap.accounts["a"].state is SupervisorState.SLOWING_DOWN
+        assert snap.accounts["a"].last_5h_util_pct == 55
+        assert snap.accounts["a"].scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
+
+    def test_target_round_trips(self, queue_dir: Path) -> None:
+        path = supervisor_state_path(queue_dir)
+        snap = initial_snapshot(
+            since=datetime(2026, 9, 25, 12, 0, tzinfo=UTC), account_names=["a"]
+        ).model_copy(update={"target_concurrency": 2})
+        snap = snap.model_copy(
+            update={
+                "accounts": {"a": snap.accounts["a"].model_copy(update={"target_concurrency": 2})}
+            }
+        )
+        write_atomic(snap, path)
+        loaded = load(path)
+        assert loaded is not None
+        assert loaded.target_concurrency == 2
+        assert loaded.accounts["a"].target_concurrency == 2
+
+    def test_negative_target_fails_loud(self, queue_dir: Path) -> None:
+        v6 = {
+            "schema_version": 6,
+            "state": "slowing_down",
+            "since": "2026-09-25T12:00:00+00:00",
+            "accounts": {
+                "a": {
+                    "state": "slowing_down",
+                    "since": "2026-09-25T12:00:00+00:00",
+                    "target_concurrency": -1,
+                },
+            },
+        }
+        with pytest.raises(SupervisorPersistenceError, match="target_concurrency"):
+            load(self._write(queue_dir, v6))
+
+    def test_written_snapshot_is_v6(self, queue_dir: Path) -> None:
         path = supervisor_state_path(queue_dir)
         write_atomic(initial_snapshot(since=datetime(2026, 9, 25, 12, 0, tzinfo=UTC)), path)
-        assert json.loads(path.read_text())["schema_version"] == 5
+        assert json.loads(path.read_text())["schema_version"] == 6

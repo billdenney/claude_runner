@@ -15,9 +15,11 @@ no visibility into utilization until it crashes into the wall. This module:
 - **Parses `claude /usage`** robustly with version-aware drift detection,
   so "is the parser broken?" is never silently confused with "is utilization
   zero?"
-- **Throttles dispatch** from the utilization `/usage` reports: three 5-hour
-  bands (full / slowdown / stop) with separate day and night cutoffs, plus a
-  weekly target line, all configurable via TOML (`[dispatch_pct.*]`).
+- **Throttles dispatch** per account from the utilization `/usage` reports:
+  three 5-hour bands (full / slowdown / stop) with separate day and night
+  cutoffs, plus a weekly target line, all configurable via TOML
+  (`[dispatch_pct.*]`). In the slowdown band an account's concurrency falls
+  linearly from its `max_concurrency` towards zero at the stop cutoff.
 - **Schedules the next 5-hour window** automatically — the supervisor wakes
   up shortly after each reset and resumes draining the queue.
 - **Resumes mid-task** via `claude --resume <session_id>`, falling back to a

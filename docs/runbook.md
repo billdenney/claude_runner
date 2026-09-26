@@ -41,7 +41,13 @@ sequence variant.
 in a short window. `<queue>/.claude_task_runner/supervisor.log` ends with the
 same exception each time.
 
-This section covers the cron watchdog. Under the systemd unit, systemd
+This section covers the cron watchdog. Each tick takes the managed queue's
+`[watchdog]` settings from the config that `install --config` or
+`claude-task-runner watchdog register --config` recorded for it, else from
+`<queue>/claude_runner.toml`, else the package defaults, and starts the
+supervisor with the same file. A change applies from the next tick.
+
+Under the systemd unit, systemd
 restarts the supervisor itself (`Restart=on-failure`), `RestartSec` after
 each crash, and stops once it has started the unit more than
 `StartLimitBurst` times within `StartLimitIntervalSec`. `install` writes
@@ -183,8 +189,9 @@ unit but does not restart a running one. systemd applies `ExecStart=`,
 `WorkingDirectory=` and `Environment=` only when it starts the service, so
 the running supervisor keeps its old queue and command until the unit
 restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
-`StartLimitIntervalSec=`) and `ExecStop=` apply at the reload, so a changed
-`[watchdog]` alone needs no restart, and `install` does not ask for one.
+`StartLimitIntervalSec=`), `ExecStop=` and `TimeoutStopSec=` apply at the
+reload, so a changed `[watchdog]` or `[task_caps].max_duration_s_per_task`
+alone needs no restart, and `install` does not ask for one.
 
 **Steps:**
 1. To let the old queue's in-flight tasks finish first, drain its
@@ -206,6 +213,41 @@ restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
    in-flight workers keep running, but no supervisor follows them until
    one runs for that queue again. That supervisor records each worker
    that finished in the meantime from its log.
+
+## A systemd stop killed in-flight tasks (adoption off)
+
+**Symptom:** with `[supervisor].adopt_workers = false`,
+`systemctl --user stop` or `restart claude-task-runner` ends with
+`State 'stop-sigterm' timed out. Killing.` and
+`Main process exited, code=killed, status=9/KILL` in
+`journalctl --user -u claude-task-runner`, and the tasks that were running
+are dispatched again by the next supervisor.
+
+**Cause:** with adoption off, the unit's `ExecStop` drains. The supervisor
+dispatches nothing new and exits once its in-flight tasks finish. systemd
+waits `TimeoutStopSec` for that, then SIGKILLs the supervisor. `install`
+sets `TimeoutStopSec` to `[task_caps].max_duration_s_per_task`, the longest
+a task may run, and to `infinity` when the cap is 0. A unit installed
+before that change waits 14400 s whatever the cap. The timeout does not
+cover a task whose `max_duration_s_override` is above the queue's cap, or
+the time the pre- and post-dispatch hooks take.
+
+**Steps:**
+1. `systemctl --user show -p TimeoutStopUSec claude-task-runner` shows
+   what the next stop waits.
+2. After changing the cap, re-run `claude-task-runner install`. It rewrites
+   the unit and reloads systemd, and the next stop waits the new timeout.
+   The running supervisor needs no restart.
+3. With a cap of 0, a stop waits until every in-flight task finishes. To
+   end one sooner, kill only the supervisor; its tasks are dispatched again
+   by the next one:
+
+   ```sh
+   systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner
+   ```
+
+   With `[supervisor].adopt_workers` on, the default, a stop does not wait
+   for tasks: the workers keep running and the next supervisor adopts them.
 
 ## Cron watchdog installed, but the supervisor stays down
 
@@ -325,6 +367,36 @@ the per-user `global.lock`, so the real queue's supervisor failed with
    `claude-task-runner supervisor stop --queue <path>`, and delete the
    directory once you have checked that it holds only an empty `todo/` and
    `.claude_task_runner/`.
+
+## Cron watchdog logs that the queue's config does not load
+
+**Symptom:** every minute, `~/.claude_task_runner/watchdog.log` has
+`watchdog: ERROR queue=<queue> config=<toml> does not load, so its supervisor
+was not checked or restarted:` followed by the error, and
+`claude-task-runner watchdog tick` exits 1.
+
+**Cause:** the managed queue's config fails to load. The TOML may not
+parse, or it sets a value the schema rejects, or the config that
+`install --config` or `watchdog register --config` recorded was moved or
+deleted. A supervisor started with that file would fail to load it too, so
+the tick leaves the supervisor alone, running or not. It does not fall
+back to another config.
+
+**Steps:**
+1. The ERROR line names the file and the error.
+2. Fix the file. Nothing needs re-running: the next tick loads it again.
+   To check at once, run `claude-task-runner watchdog tick --dry-run`. It
+   loads the same file, decides, starts nothing and saves no state, and it
+   exits 0 once the file loads.
+3. If a recorded config moved, record its new path:
+
+   ```sh
+   claude-task-runner watchdog register --queue <queue> --config <toml>
+   ```
+
+   Without `--config`, `register` drops the recorded config, and ticks go
+   back to `<queue>/claude_runner.toml`. `register` refuses a config that
+   does not load.
 
 ## Task worktrees filling the disk
 

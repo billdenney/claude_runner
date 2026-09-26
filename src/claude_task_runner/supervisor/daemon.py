@@ -147,10 +147,18 @@ def run_one_tick(
         4. Copies the resulting top-level state back into
            ``snapshot.accounts[<account>]``.
 
-        Without per-account attribution (single-account / cold
-        start), the queue-wide concurrency cap is used.
+        A single-account queue's usage source does not name the account,
+        so its poll results are attributed to the only configured
+        account (:func:`_sole_account`). Dispatch gates on the
+        per-account state, so without this the account stayed in the IDLE
+        it was seeded with and a throttled queue kept dispatching.
+
+        A poll result that still has no account (several accounts
+        configured, but a source that does not name them) updates only
+        the top-level fields, with a policy carrying the queue-wide
+        concurrency cap.
     """
-    account_name = _reading_account(ctx.poll_result)
+    account_name = _reading_account(ctx.poll_result) or _sole_account(ctx.settings)
     focused = _focus_on_account(snapshot, account_name)
 
     account_policy = _resolve_account_policy(ctx, account_name)
@@ -177,12 +185,13 @@ def run_one_tick(
 def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> AccountPolicy:
     """Pick the :class:`AccountPolicy` to compose into the ResolvedPolicy.
 
-    When the reading is attributed and the operator declared a policy
-    for that account, return it verbatim. Otherwise synthesise a
-    policy that carries the queue-wide ``[concurrency].max_concurrency``
-    so ``ResolvedPolicy.max_concurrency`` reflects the operator's
-    setting rather than the per-account default of 1. ADR-0022 requires
-    ``max_concurrency`` never to be implicit.
+    When the reading is attributed and the account's policy was resolved,
+    return it verbatim: its ``max_concurrency`` is the cap
+    :func:`runner.account_dispatch.choose_account` applies, so the
+    decision's ramp scales the number dispatch really uses. Otherwise
+    synthesise a policy that carries the queue-wide
+    ``[concurrency].max_concurrency`` rather than the per-account default
+    of 1. ADR-0022 requires ``max_concurrency`` never to be implicit.
     """
     if account_name is not None:
         explicit = ctx.account_policies.get(account_name)
@@ -198,12 +207,25 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
 def _reading_account(poll_result: object) -> str | None:
     """Extract the account name from a ``UsageReading`` or attributed exception.
 
-    Returns ``None`` for legacy single-account flows (reading has no
-    account, or the poll yielded an exception with no ``.account``
-    attribute) so callers fall back to the un-attributed code path.
+    Returns ``None`` when the reading has no account, or the poll yielded
+    an exception with no ``.account`` attribute. A single-account
+    source produces both; :func:`run_one_tick` then falls back to
+    :func:`_sole_account`.
     """
     name = getattr(poll_result, "account", None)
     return name if isinstance(name, str) and name else None
+
+
+def _sole_account(settings: Settings) -> str | None:
+    """Return the only configured account's name, or ``None`` if there are several.
+
+    With one ``[[accounts]]`` entry (or the legacy ``[claude].config_dir``
+    alias, which becomes ``"default"``) the supervisor polls usage with a
+    source that returns readings and errors with no account name. They
+    can only belong to that one account.
+    """
+    accounts = settings.accounts
+    return accounts[0].name if len(accounts) == 1 else None
 
 
 def _focus_on_account(
@@ -212,8 +234,8 @@ def _focus_on_account(
 ) -> SupervisorSnapshot:
     """Return a snapshot whose top-level fields mirror ``accounts[name]``.
 
-    No-op when ``account_name`` is None (single-account flow) or the
-    name is not in ``snapshot.accounts`` (defensive — covers a race
+    No-op when ``account_name`` is None (no account could be named) or
+    the name is not in ``snapshot.accounts`` (defensive — covers a race
     where the supervisor's accounts list was reduced mid-tick).
 
     The state machine reads the top-level fields; mirroring lets it
@@ -235,6 +257,7 @@ def _focus_on_account(
             "scheduled_wakeup_at": acct.scheduled_wakeup_at,
             "consecutive_clean_polls": acct.consecutive_clean_polls,
             "last_drift_message": acct.last_drift_message,
+            "target_concurrency": acct.target_concurrency,
         }
     )
 
@@ -251,8 +274,8 @@ def _propagate_to_account(
     :class:`MultiAccountUsageSource` round-robin picker advances past
     this account on the next tick.
 
-    No-op when ``account_name`` is None — keeps single-account flow
-    bit-for-bit identical.
+    No-op when ``account_name`` is None or not in ``snapshot.accounts``:
+    the tick then updates only the top-level fields.
     """
     if account_name is None:
         return snapshot
@@ -270,6 +293,7 @@ def _propagate_to_account(
             "scheduled_wakeup_at": snapshot.scheduled_wakeup_at,
             "consecutive_clean_polls": snapshot.consecutive_clean_polls,
             "last_drift_message": snapshot.last_drift_message,
+            "target_concurrency": snapshot.target_concurrency,
             "last_capture_at": clock.now(),
         }
     )
