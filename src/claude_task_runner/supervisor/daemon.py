@@ -51,6 +51,7 @@ from claude_task_runner.config.schema import (
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -594,6 +595,30 @@ def _signal_handlers_installed(handlers: Mapping[int, SignalHandler]) -> Iterato
                 signal.signal(signum, old)
 
 
+WORKER_START_WAIT_S = 10.0
+"""Longest a stopping :func:`start_daemon` waits for dispatch threads that
+have started a worker but not yet recorded its pid (:mod:`runner.spawn_gate`).
+
+That window is one ``Popen`` and one state write, so it normally lasts
+milliseconds. The bound matters only when the write stalls on a slow disk,
+and it keeps the exit well inside the systemd unit's ``TimeoutStopSec``."""
+
+
+def _wait_for_worker_starts(gate: SpawnGate) -> None:
+    """Close ``gate``, wait for the workers being started, and log any that
+    still have no pid on record when the wait ends."""
+    starting = gate.close(WORKER_START_WAIT_S)
+    if starting:
+        logger.error(
+            "supervisor exiting with %d worker(s) still starting after %g s and "
+            "no pid on record: %s. The next supervisor cannot adopt them and will "
+            "dispatch these tasks again; check each for a second claude process",
+            len(starting),
+            WORKER_START_WAIT_S,
+            starting,
+        )
+
+
 def start_daemon(
     *,
     queue_dir: Path,
@@ -637,9 +662,11 @@ def start_daemon(
       before anything is dispatched. In-flight workers are NOT killed
       (architectural invariant 2). With ``[supervisor].adopt_workers``
       on, the process exits without joining the dispatch threads and
-      the next supervisor adopts the workers (ADR-0025). With it off,
-      the interpreter joins the threads at exit, so each in-flight
-      attempt finishes first.
+      the next supervisor adopts the workers (ADR-0025). It waits only
+      for a thread that has started a worker to record its pid, for at
+      most :data:`WORKER_START_WAIT_S` (see :mod:`runner.spawn_gate`).
+      With it off, the interpreter joins the threads at exit, so each
+      in-flight attempt finishes first.
     * ``SIGUSR1`` — drain: stop dispatching, keep ticking, and exit once
       no task is in flight. It ends the sleep like a stop, so the first
       drain tick runs at once. Later drain ticks keep the poll interval.
@@ -678,9 +705,11 @@ def start_daemon(
         # finishes its usage poll first. With adoption on (ADR-0025) the
         # dispatch threads are daemons, so the process then exits WITHOUT
         # joining them and the file-backed workers survive for the next
-        # supervisor to adopt. With adoption off the threads are
-        # non-daemon, so the interpreter joins them at exit and each
-        # in-flight attempt finishes first (the historical behaviour).
+        # supervisor to adopt; it waits only for a worker being started to
+        # have its pid on record (runner.spawn_gate). With adoption off
+        # the threads are non-daemon, so the interpreter joins them at
+        # exit and each in-flight attempt finishes first (the historical
+        # behaviour).
         if settings.supervisor.adopt_workers:
             logger.info(
                 "supervisor caught signal %s; fast stop (adopt_workers on — "
@@ -738,6 +767,9 @@ def start_daemon(
     # ``account`` field is the source of truth for
     # :class:`InFlightRecord` rebuilds each tick.
     in_flight_slots: dict[str, DispatchSlot] = {}
+    # Every dispatch thread this run starts holds this gate while it starts
+    # a worker; the exit below waits for them (runner.spawn_gate).
+    spawn_gate = SpawnGate()
 
     # The handlers go in before the lock is taken, so a stop during startup
     # still reaches the loop's first check, and come out after it is
@@ -1020,6 +1052,7 @@ def start_daemon(
                             clock=clk,
                             in_flight_slots=in_flight_slots,
                             claude_executable=settings.claude.executable,
+                            spawn_gate=spawn_gate,
                         )
                     except Exception:
                         # Keep the loop alive, but tally the failure so a
@@ -1125,6 +1158,7 @@ def start_daemon(
                         draining=drain_flag["draining"],
                         notify_callback=notify_callback,
                         event_callback=event_callback,
+                        spawn_gate=spawn_gate,
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
@@ -1247,6 +1281,10 @@ def start_daemon(
                 )
                 ticks += 1
         finally:
+            # Before the lock goes, let every dispatch thread that has started
+            # a worker record its pid, or the next supervisor could neither
+            # adopt that worker nor see it, and would dispatch its task again.
+            _wait_for_worker_starts(spawn_gate)
             pidfile_mod.clear_pid_file(pid_path)
 
     return handle

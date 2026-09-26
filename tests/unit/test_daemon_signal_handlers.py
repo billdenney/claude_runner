@@ -28,6 +28,7 @@ from claude_task_runner.usage.models import UsageReading, WindowReading
 from claude_task_runner.usage.source import FakeUsageSource
 
 pytest_plugins = ["pytester"]
+pytestmark = pytest.mark.usefixtures("private_global_lock")
 
 _DAEMON_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
 
@@ -66,14 +67,6 @@ def stand_ins() -> Iterator[dict[int, _StandIn]]:
     for signum, previous in saved.items():
         if previous is not None:
             signal.signal(signum, previous)
-
-
-@pytest.fixture(autouse=True)
-def _private_global_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Take the host-wide supervisor lock in ``tmp_path``, so a supervisor
-    running on this host does not block the test."""
-    lock = tmp_path / "global.lock"
-    monkeypatch.setattr(pidfile_mod, "global_lock_path", lambda: lock)
 
 
 def _handlers(signals: tuple[int, ...] = _DAEMON_SIGNALS) -> dict[int, object]:

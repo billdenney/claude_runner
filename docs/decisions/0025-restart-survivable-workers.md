@@ -93,6 +93,22 @@ Make workers survive a supervisor restart and let a fresh supervisor
      > but a TTY capture that runs into its `[usage]` capture timeouts
      > can take longer than `TimeoutStopSec`. SIGHUP still waits for the
      > next scheduled tick.
+     >
+     > The slow sleep had hidden a race in "exits without joining worker
+     > threads". A dispatch thread starts its worker with `Popen` and only
+     > then records the pid and log path in the task's state. An exit
+     > between the two leaves a worker that the next supervisor can
+     > neither adopt nor see, so it demotes the task and dispatches it
+     > again, and two workers run it. Now each dispatch thread holds a
+     > `runner.spawn_gate.SpawnGate` from just before it opens the log
+     > files until the pid is on record. Before it releases the supervisor
+     > lock, a stopping supervisor closes the gate and waits for the
+     > threads inside, for at most `supervisor.daemon.WORKER_START_WAIT_S`
+     > (10 s), and logs an error naming any task still inside. A daemon
+     > thread that reaches the gate after that starts nothing; its task
+     > stays `running` with no pid, and the next supervisor demotes it and
+     > dispatches it once. A thread still in its pre-dispatch hook at exit
+     > is not waited for, and the hook's process outlives it.
 
 Net: `systemctl restart` becomes near-instant *and* loses no in-flight
 work.

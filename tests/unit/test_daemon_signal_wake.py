@@ -20,7 +20,7 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -49,38 +49,7 @@ _PROMPT_S = 5.0
 # How long a test watches for a tick that must not happen.
 _WATCH_S = 1.5
 
-_HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
-
-
-def _ignore(_signum: int, _frame: object) -> None:
-    """Stands in for pytest's handlers during a test; see the fixture below."""
-
-
-@pytest.fixture(autouse=True)
-def _harmless_handlers_around_the_daemon() -> Iterator[None]:
-    """``start_daemon`` puts back the handlers it found when it returns. Make
-    those harmless for the test: a signal that a test's thread sends after
-    the daemon has returned, which only a regression would do, then fails
-    the test instead of ending the pytest run. Put pytest's back after."""
-    saved = {signum: signal.getsignal(signum) for signum in _HANDLED_SIGNALS}
-    for signum in _HANDLED_SIGNALS:
-        signal.signal(signum, _ignore)
-    yield
-    for signum, handler in saved.items():
-        # None: a handler installed outside Python, which cannot be put back.
-        if handler is not None:
-            signal.signal(signum, handler)
-
-
-@pytest.fixture(autouse=True)
-def _private_global_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Take the host-wide supervisor lock in ``tmp_path``, so a supervisor
-    running on this host does not block the test."""
-    lock = tmp_path / "global.lock"
-    monkeypatch.setattr(
-        "claude_task_runner.supervisor.pidfile.global_lock_path",
-        lambda: lock,
-    )
+pytestmark = pytest.mark.usefixtures("harmless_signal_handlers", "private_global_lock")
 
 
 def _queue(tmp_path: Path) -> Path:
