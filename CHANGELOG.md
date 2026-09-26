@@ -146,6 +146,32 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Commands that read a queue no longer create a `--queue` that does not
+  exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
+  `account list` and `account resume` created `<queue>/todo/` or
+  `<queue>/.claude_task_runner/` and exited 0 as if the queue were empty, so
+  a mistyped, deleted or moved `--queue` looked like a queue with nothing in
+  it. `queue show`, `queue restart-fresh`, `queue backfill-working-dir`,
+  `sidecar show`, `sidecar answer` and `doctor` created it too.
+  `account pause` wrote a `supervisor.json` into the new tree, and
+  `sidecar answer --allow-partial` wrote its response there. Each of these
+  commands except `doctor` now exits 2 with
+  `--queue is not an existing directory: <path>` before it reads anything,
+  as `queue add`, `queue force-dispatch`, `supervisor start` and `install`
+  already did. With `--json` the error is `{"ok": false, "error": ...}` on
+  stdout, and the `sidecar` commands print the plain form on stderr, where
+  their other errors go. `doctor` still runs. Its `queue_layout` check FAILs,
+  now also when `--queue` is a file, which used to crash it, and the seven
+  checks that read the queue's files are left out. It exits 1, and its
+  `--json` keeps its shape. `supervisor stop` and `drain` only read the PID
+  file and are unchanged. Underneath, `queue_runtime_dir()` and `todo_dir()`
+  no longer pass `parents=True`. They create the queue's subdirectories but
+  never the queue directory, so any other caller that reaches them with a
+  missing queue gets `FileNotFoundError` instead of an empty queue.
+  `tests/unit/test_cli_missing_queue.py` runs every command that takes
+  `--queue` against a missing path. It checks that nothing is created and
+  pins the exit code and message, so a command added later is covered.
+
 - **The systemd unit now takes its restart policy from the queue's
   `[watchdog]`.** `install` wrote `RestartSec=30`, `StartLimitBurst=5` and
   `StartLimitIntervalSec=600` into the unit whatever the queue's

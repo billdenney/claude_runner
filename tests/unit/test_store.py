@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import errno
+import inspect
 import io
 import logging
 import os
@@ -18,6 +19,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, ValidationError
 
+from claude_task_runner.queue import store as store_mod
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     ReadinessRequirement,
@@ -646,7 +648,7 @@ NOT_A_QUEUE_DIR: dict[str, Callable[[Path], Path]] = {
 
 
 class TestRequireQueueDir:
-    """The check that keeps ``queue_runtime_dir`` / ``todo_dir`` from creating a queue."""
+    """The check that turns a ``--queue`` that is not a directory into a clear error."""
 
     def test_existing_directory_is_returned_resolved(self, tmp_path: Path) -> None:
         queue = tmp_path / "q"
@@ -693,6 +695,82 @@ class TestRequireQueueDir:
         finally:
             locked.chmod(0o700)
         assert str(excinfo.value) == f"not an existing directory: {queue.resolve()}"
+
+
+_QUEUE_DIR_EXTRA_ARGS: dict[str, tuple[str, ...]] = {
+    "state_path_for": ("t1",),
+    "task_path_for": ("t1",),
+}
+"""What the store functions that take more than ``queue_dir`` get after it."""
+
+
+def _queue_dir_functions() -> dict[str, Callable[..., Any]]:
+    """Every public ``queue.store`` function whose first parameter is ``queue_dir``."""
+    return {
+        name: fn
+        for name, fn in inspect.getmembers(store_mod, inspect.isfunction)
+        if fn.__module__ == store_mod.__name__
+        and not name.startswith("_")
+        and next(iter(inspect.signature(fn).parameters), None) == "queue_dir"
+    }
+
+
+class TestNeverCreatesTheQueue:
+    """No store function creates a queue directory that is not there.
+
+    :func:`queue_runtime_dir` and :func:`todo_dir` used to pass
+    ``parents=True``, so every reader recreated a mistyped, deleted or
+    moved queue and then reported it empty. The functions are enumerated,
+    so one added later is covered.
+    """
+
+    def test_finds_the_queue_dir_functions(self) -> None:
+        # Equality, so that a new function is looked at: it may need
+        # arguments in _QUEUE_DIR_EXTRA_ARGS.
+        assert set(_queue_dir_functions()) == {
+            "list_pending_tasks",
+            "list_state_files",
+            "queue_runtime_dir",
+            "require_queue_dir",
+            "state_dir",
+            "state_path_for",
+            "task_path_for",
+            "todo_dir",
+        }
+
+    @pytest.mark.parametrize("name", sorted(_queue_dir_functions()))
+    @pytest.mark.parametrize("make", NOT_A_QUEUE_DIR.values(), ids=NOT_A_QUEUE_DIR.keys())
+    def test_raises_and_creates_nothing(
+        self, tmp_path: Path, make: Callable[[Path], Path], name: str
+    ) -> None:
+        base = tmp_path / "base"
+        base.mkdir()
+        path = make(base)
+        before = sorted(p.name for p in base.iterdir())
+        fn = _queue_dir_functions()[name]
+        # mkdir under a file fails with ENOTDIR, under a missing directory
+        # or a dangling symlink with ENOENT; require_queue_dir says so itself.
+        expected = (
+            NotADirectoryError
+            if name == "require_queue_dir" or path.is_file()
+            else FileNotFoundError
+        )
+        with pytest.raises(expected):
+            result = fn(path, *_QUEUE_DIR_EXTRA_ARGS.get(name, ()))
+            if inspect.isgenerator(result):
+                list(result)
+        assert sorted(p.name for p in base.iterdir()) == before
+
+    def test_existing_queue_gets_its_subdirectories(self, queue_dir: Path) -> None:
+        todo_dir(queue_dir)
+        queue_runtime_dir(queue_dir)
+        assert sorted(p.relative_to(queue_dir).as_posix() for p in queue_dir.rglob("*")) == [
+            ".claude_task_runner",
+            ".claude_task_runner/logs",
+            ".claude_task_runner/sidecar",
+            ".claude_task_runner/state",
+            "todo",
+        ]
 
 
 class TestRetiredTaskKeys:

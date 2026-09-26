@@ -9,16 +9,21 @@ matched". ``account pause`` went further and wrote ``supervisor.json`` into
 the new tree, and ``sidecar answer --allow-partial`` wrote a response file.
 
 This gate walks the CLI, so a command added later is covered as soon as it
-takes ``--queue``: :data:`ARGV` must name it, and its run against a missing
-queue must create nothing. A command that is not fixed yet goes in
-:data:`CREATES_MISSING_QUEUE` with the reason, and a staleness test fails
-once the entry is no longer needed.
+takes ``--queue``: :data:`ARGV` must name it, its run against a missing
+queue must create nothing, and :data:`OUTCOMES` pins what it prints and
+its exit code. The outcome matters as much as the directory: the store no
+longer creates a missing queue, so a command that lost its up-front check
+would still leave the queue missing, but exit 1 with a traceback. A command
+that is not fixed yet goes in :data:`CREATES_MISSING_QUEUE` with the
+reason, and a staleness test fails once the entry is no longer needed.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import patch
 
 import pytest
@@ -72,13 +77,95 @@ Enough to get past the command's own argument checks, so that only the
 queue can stop it: the most damaging form where there is a choice, such
 as ``--allow-partial`` for ``sidecar answer``, which then writes."""
 
-MAY_SUCCEED: dict[tuple[str, ...], str] = {
-    ("watchdog", "unregister"): (
-        "Removes a registry entry and never reads the queue. The directory "
-        "need not exist, so a queue that was deleted or moved can be dropped."
+
+class Outcome(NamedTuple):
+    """How a command run against a missing ``--queue`` ends.
+
+    ``{queue}`` in ``stdout`` and ``stderr`` stands for the missing path,
+    resolved. With ``exact`` False, ``stdout`` need only appear in the
+    output, for ``doctor``, whose other checks depend on the machine.
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str = ""
+    exact: bool = True
+
+
+REFUSED = "--queue is not an existing directory: {queue}\n"
+"""What :func:`claude_task_runner.cli._helpers.require_queue_option` prints."""
+
+NO_PID_FILE = "No PID file at {queue}/.claude_task_runner/supervisor.pid\n"
+
+OUTCOMES: dict[tuple[str, ...], Outcome] = {
+    ("account", "list"): Outcome(2, REFUSED),
+    ("account", "pause"): Outcome(2, REFUSED),
+    ("account", "resume"): Outcome(2, REFUSED),
+    # A diagnostic: the queue_layout check FAILs, the checks that do not
+    # read the queue still run, and the ones that do are left out.
+    ("doctor",): Outcome(
+        1,
+        "  FAIL queue_layout: queue dir is not an existing directory: {queue}; "
+        "the checks that read the queue did not run\n"
+        "      Check --queue (it defaults to the current directory). "
+        "To start a new queue there: mkdir -p {queue}/todo\n",
+        exact=False,
+    ),
+    ("install",): Outcome(2, REFUSED),
+    ("queue", "add"): Outcome(2, REFUSED),
+    ("queue", "backfill-working-dir"): Outcome(2, REFUSED),
+    ("queue", "force-dispatch"): Outcome(2, REFUSED),
+    ("queue", "list"): Outcome(2, REFUSED),
+    ("queue", "restart-fresh"): Outcome(2, REFUSED),
+    ("queue", "show"): Outcome(2, REFUSED),
+    ("queue", "states"): Outcome(2, REFUSED),
+    # The sidecar commands print their errors on stderr.
+    ("sidecar", "answer"): Outcome(2, "", REFUSED),
+    ("sidecar", "list"): Outcome(2, "", REFUSED),
+    ("sidecar", "show"): Outcome(2, "", REFUSED),
+    # stop and drain only read the PID file, and never create anything.
+    ("supervisor", "drain"): Outcome(1, NO_PID_FILE),
+    ("supervisor", "start"): Outcome(2, REFUSED),
+    ("supervisor", "status"): Outcome(2, REFUSED),
+    ("supervisor", "stop"): Outcome(1, NO_PID_FILE),
+    ("watchdog", "register"): Outcome(
+        2, "", "register failed: not an existing directory: {queue}\n"
+    ),
+    # Removes a registry entry and never reads the queue. The directory
+    # need not exist, so a queue that was deleted or moved can be dropped.
+    ("watchdog", "unregister"): Outcome(0, "not registered: {queue}\n"),
+    ("worktree", "reclaim"): Outcome(
+        2, "", "error: {queue} is not a queue directory: it has no todo/ subdirectory\n"
     ),
 }
-"""Commands that may exit 0 on a missing ``--queue``, each with why."""
+"""How each ``--queue`` command ends when the queue is missing."""
+
+JSON_OUTCOMES: dict[tuple[str, ...], tuple[int, dict[str, object]]] = {
+    **{
+        path: (2, {"ok": False, "error": REFUSED.rstrip()})
+        for path in [
+            ("account", "list"),
+            ("account", "pause"),
+            ("account", "resume"),
+            ("queue", "backfill-working-dir"),
+            ("queue", "force-dispatch"),
+            ("queue", "list"),
+            ("queue", "restart-fresh"),
+            ("queue", "show"),
+            ("queue", "states"),
+            ("sidecar", "list"),
+            ("sidecar", "show"),
+            ("supervisor", "status"),
+        ]
+    },
+    ("worktree", "reclaim"): (
+        2,
+        {"ok": False, "error": "{queue} is not a queue directory: it has no todo/ subdirectory"},
+    ),
+}
+"""The JSON on stdout of each ``--queue`` command with ``--json``, but
+``doctor``, whose JSON keeps its usual shape; see
+:meth:`TestMissingQueue.test_doctor_json_keeps_its_shape`."""
 
 CREATES_MISSING_QUEUE: dict[tuple[str, ...], str] = {}
 """Commands not fixed yet, each with why. A missing ``--queue`` is created
@@ -104,18 +191,18 @@ def _node(path: tuple[str, ...]) -> Any:
     return node
 
 
-def _takes_queue(command: Any) -> bool:
-    return any("--queue" in param.opts for param in command.params)
+def _takes(command: Any, option: str) -> bool:
+    return any(option in param.opts for param in command.params)
 
 
 def _queue_paths() -> list[tuple[str, ...]]:
     """Every command path whose command takes ``--queue``."""
-    return [path for path in _command_paths() if path and _takes_queue(_node(path))]
+    return [path for path in _command_paths() if path and _takes(_node(path), "--queue")]
 
 
-def _argv(path: tuple[str, ...], queue: Path, config: Path) -> list[str]:
+def _argv(path: tuple[str, ...], queue: Path, config: Path, *extra: str) -> list[str]:
     rest = [config.as_posix() if arg == CONFIG else arg for arg in ARGV[path]]
-    return [*path, *rest, "--queue", queue.as_posix()]
+    return [*path, *rest, *extra, "--queue", queue.as_posix()]
 
 
 def _config(tmp_path: Path) -> Path:
@@ -150,15 +237,26 @@ _SIDE_EFFECTS = (
 supervisor loop, a ``claude`` run, a crontab or systemd change."""
 
 
-def _run(path: tuple[str, ...], queue: Path, tmp_path: Path) -> Any:
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+"""An ANSI escape sequence, in case the environment forces colour."""
+
+
+def _run(path: tuple[str, ...], queue: Path, tmp_path: Path, *extra: str) -> Any:
     patches = [patch(target, _unreachable) for target in _SIDE_EFFECTS]
     for p in patches:
         p.start()
     try:
-        return CliRunner().invoke(app, _argv(path, queue, _config(tmp_path)))
+        # COLUMNS keeps Rich from wrapping a long path across lines.
+        return CliRunner().invoke(
+            app, _argv(path, queue, _config(tmp_path), *extra), env={"COLUMNS": "1000"}
+        )
     finally:
         for p in patches:
             p.stop()
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text)
 
 
 class TestInventory:
@@ -179,9 +277,12 @@ class TestInventory:
         argv = _argv(path, tmp_path / "q", _config(tmp_path))[len(path) :]
         command.make_context(command.name, argv)
 
-    @pytest.mark.parametrize("path", sorted(MAY_SUCCEED), ids=_path_id)
-    def test_may_succeed_entries_take_queue(self, path: tuple[str, ...]) -> None:
-        assert path in ARGV
+    def test_outcomes_name_every_queue_command(self) -> None:
+        assert set(OUTCOMES) == set(ARGV)
+
+    def test_json_outcomes_name_every_json_queue_command(self) -> None:
+        with_json = {path for path in ARGV if _takes(_node(path), "--json")}
+        assert set(JSON_OUTCOMES) == with_json - {("doctor",)}
 
 
 class TestMissingQueue:
@@ -194,8 +295,60 @@ class TestMissingQueue:
             f"`{_path_id(path)} --queue <missing>` created {sorted(gone.rglob('*'))}; "
             f"exit {result.exit_code}, output: {result.output!r}"
         )
-        if path not in MAY_SUCCEED:
-            assert result.exit_code != 0, result.output
+
+    @pytest.mark.parametrize("path", sorted(OUTCOMES), ids=_path_id)
+    def test_outcome(self, path: tuple[str, ...], tmp_path: Path) -> None:
+        queue = tmp_path / "gone" / "queue"
+        result = _run(path, queue, tmp_path)
+        expected = OUTCOMES[path]
+        stdout = expected.stdout.format(queue=queue.resolve())
+        stderr = expected.stderr.format(queue=queue.resolve())
+        assert result.exit_code == expected.exit_code, result.output
+        if expected.exact:
+            assert _plain(result.stdout) == stdout
+        else:
+            assert stdout in _plain(result.stdout)
+        assert _plain(result.stderr) == stderr
+
+    @pytest.mark.parametrize("path", sorted(JSON_OUTCOMES), ids=_path_id)
+    def test_json_outcome(self, path: tuple[str, ...], tmp_path: Path) -> None:
+        queue = tmp_path / "gone" / "queue"
+        result = _run(path, queue, tmp_path, "--json")
+        exit_code, payload = JSON_OUTCOMES[path]
+        error = str(payload["error"]).format(queue=queue.resolve())
+        assert result.exit_code == exit_code, result.output
+        assert json.loads(result.stdout) == {**payload, "error": error}
+        assert result.stderr == ""
+        assert not queue.parent.exists()
+
+    def test_doctor_json_keeps_its_shape(self, tmp_path: Path) -> None:
+        queue = tmp_path / "gone" / "queue"
+        result = _run(("doctor",), queue, tmp_path, "--json")
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.stdout)
+        assert payload["queue_dir"] == str(queue.resolve())
+        assert [r["name"] for r in payload["results"]] == [
+            "claude_binary",
+            "accounts",
+            "legacy_claude_config_dir",
+            "account_policies",
+            "dispatch_pct_legacy",
+            "account_sudo",
+            "queue_perms_multi_user",
+            "global_lock",
+            "queue_layout",
+            "skills_installed",
+            "watchdog_installed",
+        ]
+        assert payload["results"][8] == {
+            "name": "queue_layout",
+            "status": "fail",
+            "detail": f"queue dir is not an existing directory: {queue.resolve()}; "
+            "the checks that read the queue did not run",
+            "remediation": "Check --queue (it defaults to the current directory). "
+            f"To start a new queue there: mkdir -p {queue.resolve()}/todo",
+        }
+        assert not queue.parent.exists()
 
     def test_allowlist_entries_are_still_needed(self, tmp_path: Path) -> None:
         # A stale entry would let the command start creating the queue

@@ -51,10 +51,11 @@ cd /path/to/my_queue
 
 This directory becomes the queue's root. Tasks live under `todo/<id>.yaml`;
 state lives under `.claude_task_runner/` (auto-created on first dispatch).
-Create the directory first: `queue add`, `queue force-dispatch`,
-`supervisor start` and `install` exit 2 with
+Create the directory first. A command that reads or writes the queue, such
+as `queue add`, `queue list` or `supervisor start`, exits 2 with
 `--queue is not an existing directory` rather than create a queue from a
-mistyped or deleted path.
+mistyped or deleted path, or report it empty. `doctor` fails its
+`queue_layout` check instead.
 
 ## 3. Write a minimal `claude_runner.toml`
 
