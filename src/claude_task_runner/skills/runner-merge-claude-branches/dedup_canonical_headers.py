@@ -35,6 +35,8 @@ Modes:
   (default)   fix in place; print what was collapsed; exit 0.
   --check     report duplicates and exit 1 if any remain (a merge gate);
               exit 0 when clean. Makes no edits.
+Either mode exits 2, before touching any file, when a named file does not
+exist: a gate must not pass on a path it never read.
 
 Usage:
     python3 dedup_canonical_headers.py <file.md> [<file2.md> ...]
@@ -44,6 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from collections import defaultdict
@@ -167,14 +170,14 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     scope = "whole-file" if args.global_unique else "per-##-section"
+    missing = [path for path in args.files if not os.path.isfile(path)]
+    if missing:
+        sys.stderr.write(f"ERROR: (dedup) no such file: {', '.join(missing)}\n")
+        return 2
     any_dups = False
     for path in args.files:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-        except FileNotFoundError:
-            sys.stderr.write(f"# not present, skipping: {path}\n")
-            continue
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
         lines = text.split("\n")
         if args.check:
             dups = find_dups(lines, args.global_unique)

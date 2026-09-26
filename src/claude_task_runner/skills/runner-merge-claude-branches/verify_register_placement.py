@@ -27,7 +27,11 @@ union-merger (it rebuilds only Example-models LINES that already share a
 bucket) nor restore_dropped_sections.py (it restores only blocks that vanished
 ENTIRELY) repairs.
 
-Exit codes: 0 clean, 1 missing placements found, 2 bad args.
+Exit codes: 0 clean (or the merged file is not in the worktree), 1 missing
+placements found, 2 the check could not run: a bad argument, a --branch or
+--extra-ref that does not resolve, no worktree for --branch, no branch matching
+--pattern, or a crash. (--base is accepted for a uniform interface and unused:
+ancestry, not the base, decides which branches are checked.)
 """
 
 import argparse
@@ -35,6 +39,7 @@ import collections
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 R_FILE = re.compile(r"`([A-Za-z0-9_.\-]+\.R)`")
@@ -42,6 +47,22 @@ R_FILE = re.compile(r"`([A-Za-z0-9_.\-]+\.R)`")
 
 def git(args: list[str], repo: Path) -> str:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True).stdout
+
+
+def fail(message: str) -> int:
+    print(f"ERROR: (placement) {message}", file=sys.stderr)
+    return 2
+
+
+def resolves(repo: Path, ref: str) -> bool:
+    """True when ``ref`` names a commit in ``repo``."""
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
 def parse(text: str) -> dict[str, set[str]]:
@@ -85,11 +106,24 @@ def main() -> int:
     args = ap.parse_args()
 
     repo = Path(args.repo)
-    merged_path = repo / ".worktrees" / args.branch / args.file
-    if not merged_path.is_file():
-        print(f"    (placement) merged file absent at {merged_path}; skipping.")
-        return 0
-    merged = parse(merged_path.read_text(errors="replace"))
+    if not repo.is_dir():
+        return fail(f"--repo {repo} is not a directory")
+    # Resolve the branch ref FIRST, before anything can return early.
+    # `git merge-base --is-ancestor X <unresolvable>` just exits non-zero, which
+    # is indistinguishable from "not an ancestor" -- so a bad --branch would
+    # silently drop every branch and report a clean register. Fail loudly
+    # instead of passing vacuously.
+    if not resolves(repo, args.branch):
+        return fail(
+            f"--branch {args.branch!r} does not resolve to a commit in {repo};"
+            " refusing to report a vacuous pass."
+        )
+    for er in args.extra_ref:
+        if er and not resolves(repo, er):
+            return fail(f"--extra-ref {er!r} does not resolve to a commit in {repo}")
+    worktree = repo / ".worktrees" / args.branch
+    if not worktree.is_dir():
+        return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
 
     refs = [
         r
@@ -101,30 +135,23 @@ def main() -> int:
     for er in args.extra_ref:
         if er and er not in refs:
             refs.append(er)
+    if not refs:
+        return fail(
+            f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
+            " nothing to verify"
+        )
+
+    merged_path = worktree / args.file
+    if not merged_path.is_file():
+        print(f"    (placement) merged file absent at {merged_path}; skipping.")
+        return 0
+    merged = parse(merged_path.read_text(errors="replace"))
 
     # Only branches actually FOLDED IN may be checked.  The queue keeps pushing
     # while a consolidation runs, so the pattern also matches branches that
     # appeared after the survey and are not in this merge; holding the merge
     # responsible for their content would be a false positive.  Step 4 uses real
     # merges, so "folded in" == "is an ancestor of the consolidation branch".
-    # Resolve the branch ref FIRST. `git merge-base --is-ancestor X <unresolvable>`
-    # just exits non-zero, which is indistinguishable from "not an ancestor" --
-    # so a bad --branch would silently drop every branch and report a clean
-    # register. Fail loudly instead of passing vacuously.
-    probe = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{args.branch}^{{commit}}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    if probe.returncode != 0 or not probe.stdout.strip():
-        print(
-            f"ERROR: (placement) --branch {args.branch!r} does not resolve to a "
-            f"commit in {repo}; refusing to report a vacuous pass.",
-            file=sys.stderr,
-        )
-        return 2
-
     merged_refs = []
     skipped = 0
     for r in refs:
@@ -133,8 +160,10 @@ def main() -> int:
         )
         if rc.returncode == 0:
             merged_refs.append(r)
-        else:
+        elif rc.returncode == 1:
             skipped += 1
+        else:
+            return fail(f"git merge-base --is-ancestor {r} {args.branch} failed")
     refs = merged_refs
     if skipped:
         print(
@@ -181,4 +210,8 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        sys.exit(2)
+    except Exception:
+        # Exit 1 means "placements missing"; a crash must not read as that verdict.
+        traceback.print_exc()
         sys.exit(2)

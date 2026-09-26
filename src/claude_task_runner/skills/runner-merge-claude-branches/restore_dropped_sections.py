@@ -21,8 +21,14 @@ Idempotent: a canonical already present is left alone, so re-running is safe.
 
 Usage:
     restore_dropped_sections.py --repo REPO --branch BR --base origin/main \
-        --pattern 'origin/claude/*' --file inst/references/covariate-columns.md
+        --pattern 'origin/claude/*' [--extra-ref REF ...] \
+        --file inst/references/covariate-columns.md
     # add --check to report without writing (exit 1 if anything is missing)
+
+Exit codes: 0 done (or the file is not in the worktree); 1 with --check,
+something is missing; 2 it could not run: a bad argument, a --base, --branch or
+--extra-ref that does not resolve, no worktree with --branch checked out, no
+branch matching --pattern, or a crash.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ import argparse
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
@@ -41,6 +48,27 @@ SECTION_RE = re.compile(r"^## +(.*?)\s*$")
 def git(args: list[str], cwd: Path) -> str:
     out = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
     return out.stdout if out.returncode == 0 else ""
+
+
+def fail(message: str) -> int:
+    print(f"ERROR: (restore) {message}", file=sys.stderr)
+    return 2
+
+
+def resolves(repo: Path, ref: str) -> bool:
+    """True when ``ref`` names a commit in ``repo``."""
+    return bool(git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo).strip())
+
+
+def worktree_with(repo: Path, branch: str) -> Path | None:
+    """The worktree that has ``branch`` checked out, or None."""
+    cand: Path | None = None
+    for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
+        if line.startswith("worktree "):
+            cand = Path(line[len("worktree ") :])
+        elif line == f"branch refs/heads/{branch}":
+            return cand
+    return None
 
 
 def blocks(text: str) -> dict[str, tuple[str, str, str]]:
@@ -111,6 +139,12 @@ def main() -> int:
     )
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--pattern", default="origin/claude/*")
+    ap.add_argument(
+        "--extra-ref",
+        action="append",
+        default=[],
+        help="additional ref to include, e.g. a hand-picked branch outside --pattern (repeatable)",
+    )
     ap.add_argument("--file", required=True, help="repo-relative path to the register file")
     ap.add_argument(
         "--check", action="store_true", help="report only; exit 1 if anything is missing"
@@ -118,15 +152,26 @@ def main() -> int:
     args = ap.parse_args()
 
     repo = Path(args.repo)
-    worktree = Path(
-        git(["worktree", "list", "--porcelain"], repo).split("\n")[0].replace("worktree ", "")
-    )
-    for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
-        if line.startswith("worktree "):
-            cand = Path(line[len("worktree ") :])
-        elif line == f"branch refs/heads/{args.branch}":
-            worktree = cand
-            break
+    if not repo.is_dir():
+        return fail(f"--repo {repo} is not a directory")
+    named = [("--base", args.base), ("--branch", args.branch)]
+    named += [("--extra-ref", ref) for ref in args.extra_ref if ref]
+    for flag, ref in named:
+        if not resolves(repo, ref):
+            return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
+    # No fallback: guessing another worktree would read, and write, the wrong file.
+    worktree = worktree_with(repo, args.branch)
+    if worktree is None:
+        return fail(f"no worktree of {repo} has --branch {args.branch!r} checked out")
+
+    refs = git(
+        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
+    ).split()
+    for ref in args.extra_ref:
+        if ref and ref not in refs:
+            refs.append(ref)
+    if not refs:
+        return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
 
     target = worktree / args.file
     if not target.exists():
@@ -136,20 +181,6 @@ def main() -> int:
     base_blocks = blocks(git(["show", f"{args.base}:{args.file}"], repo))
     merged_text = target.read_text()
     merged_blocks = blocks(merged_text)
-
-    refs = [
-        r
-        for r in git(
-            [
-                "for-each-ref",
-                "--format=%(refname:short)",
-                f"refs/remotes/{args.pattern.replace('origin/', 'origin/', 1)}",
-            ],
-            repo,
-        ).split()
-    ] or git(
-        ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/claude/"], repo
-    ).split()
 
     # ---- MERGE-SET GATE -----------------------------------------------------
     # Two filters, both required. Without them this script resurrects blocks
@@ -292,4 +323,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # Exit 1 means "something is missing" under --check; a crash must not
+        # read as that verdict.
+        traceback.print_exc()
+        sys.exit(2)
