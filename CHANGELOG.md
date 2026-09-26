@@ -123,6 +123,15 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Skipped stream-json lines are recorded and logged, not dropped silently.**
+  The parser skips a malformed line, or an event of a type it does not know, so
+  one bad line cannot abort a run. But nothing looked at the count, and the
+  `StreamWarning` meant to report it was never issued. Each run's `RunRecord`
+  now carries `skipped_stream_lines`, and the dispatcher logs a warning naming
+  the unknown event types, since a non-zero count can mean Claude Code's stream
+  format has drifted. `StreamWarning` is gone. Run records written before this
+  read as 0.
+
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
