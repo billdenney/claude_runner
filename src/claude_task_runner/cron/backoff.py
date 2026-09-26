@@ -99,10 +99,14 @@ class WatchdogState(BaseModel):
     """The restarts since the supervisor last stayed up, oldest first,
     none older than 24 h (see :func:`decide`)."""
 
-    last_backoff_alerted_at: datetime | None = None
-    """When a crash-loop alert was last due, at most once every 10
-    minutes while backing off. Nothing sends one yet: the tick only logs
-    its BACKOFF verdict."""
+
+RETIRED_STATE_KEYS = frozenset({"last_backoff_alerted_at"})
+"""Keys a state file written by an older version may hold, which
+:func:`load_state` discards. ``last_backoff_alerted_at`` throttled, to
+one per 10 minutes, a crash-loop alert that nothing ever sent; the tick
+logs each BACKOFF verdict instead. Dropping the key keeps the restart
+history such a file holds, where ``extra="forbid"`` would reject the
+whole file and the tick would start the history empty."""
 
 
 @dataclass(frozen=True)
@@ -123,8 +127,8 @@ class WatchdogDecision:
         is over. ``watchdog tick`` does not read it; cron runs the
         tick every minute regardless.
     detail
-        Human-readable explanation logged by the watchdog (and
-        included in the BACKOFF notification message).
+        Human-readable explanation, which the tick logs with the
+        verdict.
     """
 
     verdict: WatchdogVerdict
@@ -160,6 +164,9 @@ def load_state(path: Path) -> WatchdogState:
         raise WatchdogStateError(
             f"{path}: schema_version={sv} does not match {CURRENT_SCHEMA_VERSION}"
         )
+    # Only here, at the file: code that builds a WatchdogState with a
+    # retired key is still rejected.
+    payload = {k: v for k, v in payload.items() if k not in RETIRED_STATE_KEYS}
     try:
         return WatchdogState.model_validate(payload)
     except ValidationError as exc:
@@ -263,9 +270,7 @@ def decide(
         if state.recent_restarts:
             up_s = (now - state.recent_restarts[-1]).total_seconds()
             if up_s >= stayed_up_s(settings):
-                new_state = state.model_copy(
-                    update={"recent_restarts": [], "last_backoff_alerted_at": None}
-                )
+                new_state = state.model_copy(update={"recent_restarts": []})
         return WatchdogDecision(
             verdict=WatchdogVerdict.SKIP,
             new_state=new_state,
@@ -299,17 +304,9 @@ def decide(
         last = state.recent_restarts[-1]
         wait_until = last + timedelta(seconds=backoff_s)
         if wait_until > now:
-            new_state = state
-            # Throttle alerts: only re-notify if 10 minutes since last alert.
-            should_alert = (
-                state.last_backoff_alerted_at is None
-                or (now - state.last_backoff_alerted_at).total_seconds() > 600
-            )
-            if should_alert:
-                new_state = new_state.model_copy(update={"last_backoff_alerted_at": now})
             return WatchdogDecision(
                 verdict=WatchdogVerdict.BACKOFF,
-                new_state=new_state,
+                new_state=state,
                 next_check_at=wait_until,
                 detail=(
                     f"crash loop: {len(state.recent_restarts)} restarts without the "
@@ -338,12 +335,7 @@ def decide(
 
     # OK to restart.
     new_restarts = [*state.recent_restarts, now]
-    new_state = state.model_copy(
-        update={
-            "recent_restarts": new_restarts,
-            "last_backoff_alerted_at": None,
-        }
-    )
+    new_state = state.model_copy(update={"recent_restarts": new_restarts})
     return WatchdogDecision(
         verdict=WatchdogVerdict.RESTART,
         new_state=new_state,

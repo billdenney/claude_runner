@@ -17,6 +17,7 @@ config dir.
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -29,6 +30,9 @@ from claude_task_runner.config.schema import (
     ResolvedAccount,
     Settings,
 )
+from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
@@ -148,6 +152,51 @@ def _reject_retired_keys(payload: dict[str, Any], source: str) -> None:
         )
 
 
+_warned_retired_effort_sources: set[str] = set()
+"""Queue TOMLs already warned about for a retired effort spelling. The
+supervisor re-reads its TOML on every SIGHUP, so each file is warned about
+once per process."""
+
+
+def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
+    """Rename retired spellings in ``payload``'s ``[effort_levels]`` in place.
+
+    Each old spelling in :data:`~claude_task_runner.runner.effort_levels.RETIRED_EFFORT_LEVELS`
+    (``extra_high``) becomes the name the ``claude`` CLI accepts (``xhigh``),
+    since the CLI ignores a name it does not know and runs at its default
+    effort. A list that then names a level twice keeps it once. Warns once
+    per file per process, naming the models to update. Called on the
+    queue TOML before defaults are merged; the packaged defaults use the
+    current names, which ``tests/unit/test_config.py`` checks.
+    Anything that is not a table of lists is left for the schema to reject.
+    """
+    table = payload.get("effort_levels")
+    if not isinstance(table, dict):
+        return
+    renamed_models: list[str] = []
+    for model, levels in table.items():
+        if not isinstance(levels, list) or not any(
+            isinstance(level, str) and level in RETIRED_EFFORT_LEVELS for level in levels
+        ):
+            continue
+        renamed = [
+            RETIRED_EFFORT_LEVELS.get(level, level) if isinstance(level, str) else level
+            for level in levels
+        ]
+        table[model] = list(dict.fromkeys(renamed))
+        renamed_models.append(model)
+    if renamed_models and source not in _warned_retired_effort_sources:
+        _warned_retired_effort_sources.add(source)
+        spellings = ", ".join(f"{old!r} as {new!r}" for old, new in RETIRED_EFFORT_LEVELS.items())
+        logger.warning(
+            "%s: reading [effort_levels] %s, the claude CLI's name, for %s; "
+            "update the file to the new name",
+            source,
+            spellings,
+            ", ".join(repr(model) for model in renamed_models),
+        )
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: nested dicts merge, scalars and lists overwrite."""
     out = dict(base)
@@ -193,6 +242,7 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
         _reject_retired_keys(override, str(per_queue_toml))
+        _rename_retired_effort_levels(override, str(per_queue_toml))
         merged = _deep_merge(merged, override)
 
     try:

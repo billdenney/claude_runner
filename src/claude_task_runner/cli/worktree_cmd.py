@@ -101,7 +101,7 @@ def reclaim(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Reclaim the git worktrees of completed, merged, clean tasks (ADR-0034).
+    """Reclaim the git worktrees of completed, merged, clean tasks.
 
     A worktree is removed only when ALL of these hold: the task's state says
     ``completed`` and the supervisor does not list it in flight; its branch
@@ -111,6 +111,8 @@ def reclaim(
     paths, which ``--force`` then discards. The local branch is deleted with
     ``git branch -d`` only. Every other worktree is listed with the reason it
     was kept.
+
+    See ADR-0034.
     """
     try:
         qd = reclaim_mod.require_queue_dir(queue_dir)
