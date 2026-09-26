@@ -190,9 +190,13 @@ def _stop_command_from(supervisor_command: str) -> str:
 
 
 # Short ExecStop timeout for the adoption fast-stop path (ADR-0025).
-# The supervisor exits in well under a second once it stops dispatching;
-# 30s is a generous bound that still lets `systemctl restart` be
-# near-instant instead of waiting out the drain's ceiling, the task cap.
+# A stop ends the supervisor's sleep between ticks within
+# `supervisor.daemon.SIGNAL_CHECK_INTERVAL_S` (0.5 s). A stop that arrives
+# during a tick waits for the tick's usage poll, about 8 s on the live
+# runner. A TTY capture that runs into its `[usage].capture_*` timeouts
+# can take longer than 30 s, and such a stop still ends in SIGKILL. 30 s
+# still lets `systemctl restart` be near-instant instead of waiting out
+# the drain's ceiling, the task cap.
 _ADOPT_TIMEOUT_STOP_SEC = 30
 
 

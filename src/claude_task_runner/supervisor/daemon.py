@@ -19,13 +19,15 @@ survivors that could NOT be adopted. With adoption off, every running
 orphan is demoted for a session-resume re-dispatch, as before.
 
 Driving a single tick is done by :func:`run_one_tick`, which is what
-tests exercise. The full daemon loop in :func:`run_forever` adds
+tests exercise. The full daemon loop in :func:`start_daemon` adds
 sleep / signal handling around it.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 import signal
 import time
 from collections.abc import Callable
@@ -348,6 +350,10 @@ def sleep_for_next_poll(
     If ``wakeup_at`` is set and is closer than ``poll_interval_s``, we
     sleep until then. Otherwise we sleep ``poll_interval_s``. Skewing
     later than the wakeup is fine — the next clean poll will reclassify.
+
+    ``sleep_fn`` does the sleeping. :func:`start_daemon` passes
+    :func:`sleep_until_woken`, so that a stop or drain signal ends the
+    sleep early.
     """
     now = clock.now()
     delay = float(poll_interval_s)
@@ -357,6 +363,52 @@ def sleep_for_next_poll(
             delay = min(delay, until)
     if delay > 0:
         sleep_fn(delay)
+
+
+SIGNAL_CHECK_INTERVAL_S = 0.5
+"""Longest :func:`sleep_until_woken` sleeps before it checks its flag again.
+
+It bounds how late the sleep between ticks sees a stop or drain signal
+(ADR-0025): :func:`start_daemon` sleeps with :func:`sleep_until_woken`."""
+
+
+def sleep_until_woken(
+    delay: float,
+    *,
+    woken: Callable[[], bool],
+    sleep_fn: Callable[[float], None] = time.sleep,
+    slice_s: float = SIGNAL_CHECK_INTERVAL_S,
+) -> None:
+    """Sleep ``delay`` seconds, or until ``woken()`` returns true.
+
+    Sleeps in slices of at most ``slice_s`` and calls ``woken()`` before
+    each one, so a flag that a signal handler sets ends the sleep within
+    one slice. A single ``time.sleep(delay)`` would not end early: when a
+    handler returns without raising, Python resumes the sleep (PEP 475).
+
+    The handler cannot wake a :class:`threading.Event` instead. Python
+    runs a handler in the main thread between two bytecodes, which can be
+    inside ``Event.wait`` while it holds the event's lock, and
+    ``Event.set`` in the handler then waits for that lock forever. A pipe
+    the handler writes to would wake the sleep at once, but it would
+    still need this loop: the handler runs only when the main thread
+    runs, and a signal the kernel delivers to another thread leaves the
+    main thread asleep in ``select`` until its timeout.
+
+    Raises :class:`ValueError` for a ``delay`` that ``time.sleep`` rejects
+    (negative, NaN or infinite; an infinite one would otherwise sleep
+    forever, a slice at a time) and for a ``slice_s`` that is not a
+    positive, finite number of seconds.
+    """
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError(f"delay must be a finite number of seconds >= 0, got {delay!r}")
+    if not (math.isfinite(slice_s) and slice_s > 0):
+        raise ValueError(f"slice_s must be a finite number of seconds > 0, got {slice_s!r}")
+    remaining = delay
+    while remaining > 0 and not woken():
+        step = min(remaining, slice_s)
+        sleep_fn(step)
+        remaining -= step
 
 
 @dataclass
@@ -545,13 +597,23 @@ def start_daemon(
 
     Signal handling (when ``install_signal_handlers=True``):
 
-    * ``SIGTERM`` / ``SIGINT`` — request a clean stop. In-flight
-      dispatch threads are NOT killed (architectural invariant 2);
-      the loop exits but threads finish their current attempt.
+    * ``SIGTERM`` / ``SIGINT`` — request a clean stop. A stop ends the
+      sleep between ticks within :data:`SIGNAL_CHECK_INTERVAL_S`. One
+      that arrives during a tick ends it once its usage poll returns,
+      before anything is dispatched. In-flight workers are NOT killed
+      (architectural invariant 2). With ``[supervisor].adopt_workers``
+      on, the process exits without joining the dispatch threads and
+      the next supervisor adopts the workers (ADR-0025). With it off,
+      the interpreter joins the threads at exit, so each in-flight
+      attempt finishes first.
+    * ``SIGUSR1`` — drain: stop dispatching, keep ticking, and exit once
+      no task is in flight. It ends the sleep like a stop, so the first
+      drain tick runs at once. Later drain ticks keep the poll interval.
     * ``SIGHUP`` — request a hot-reload of ``claude_runner.toml`` on
-      the next tick. Newly-added task YAMLs in ``todo/`` are picked
-      up automatically because the orchestrator rescans on every tick.
-      Malformed TOML is logged and the old config stays active.
+      the next tick. It does not end the sleep, so the reload waits for
+      the next scheduled tick. Newly-added task YAMLs in ``todo/`` are
+      picked up automatically because the orchestrator rescans on every
+      tick. Malformed TOML is logged and the old config stays active.
       In-flight tasks are unaffected.
     """
     clk = clock if clock is not None else RealClock()
@@ -569,15 +631,22 @@ def start_daemon(
     stop_flag = {"stop": False}
     reload_flag = {"pending": False}
     drain_flag = {"draining": False}
+    # Set by the stop and drain handlers so that sleep_until_woken ends
+    # the sleep between ticks; cleared at the top of each tick, which
+    # acts on the request. A handler only assigns to these dicts: it must
+    # not take a lock (see sleep_until_woken).
+    wake_flag = {"pending": False}
 
     def _on_signal(signum: int, _frame: object) -> None:
-        # SIGTERM / SIGINT request a stop. The loop breaks on the next
-        # iteration. With adoption on (ADR-0025) the dispatch threads are
-        # daemons, so the process exits promptly WITHOUT joining them and
-        # the file-backed workers survive for the next supervisor to
-        # adopt. With adoption off the threads are non-daemon, so the
-        # interpreter joins them at exit and each in-flight attempt
-        # finishes first (the historical behaviour).
+        # SIGTERM / SIGINT request a stop. The loop checks for it before a
+        # tick's dispatch phase and again before the sleep, and the sleep
+        # ends within SIGNAL_CHECK_INTERVAL_S. A tick already under way
+        # finishes its usage poll first. With adoption on (ADR-0025) the
+        # dispatch threads are daemons, so the process then exits WITHOUT
+        # joining them and the file-backed workers survive for the next
+        # supervisor to adopt. With adoption off the threads are
+        # non-daemon, so the interpreter joins them at exit and each
+        # in-flight attempt finishes first (the historical behaviour).
         if settings.supervisor.adopt_workers:
             logger.info(
                 "supervisor caught signal %s; fast stop (adopt_workers on — "
@@ -587,11 +656,15 @@ def start_daemon(
         else:
             logger.info("supervisor caught signal %s; stopping", signum)
         stop_flag["stop"] = True
+        wake_flag["pending"] = True
 
     def _on_sighup(_signum: int, _frame: object) -> None:
         # Defer the reload to the next tick — running reload work
         # inside the signal handler would be unsafe (re-entrant I/O,
-        # GIL surprises). The handler only flips a flag.
+        # GIL surprises). The handler only flips a flag. It leaves the
+        # sleep alone, so the reload waits for the next scheduled tick:
+        # nothing waits on a reload the way systemd waits on a stop, and
+        # an early tick would add a usage poll per SIGHUP.
         logger.info("supervisor caught SIGHUP; reload pending on next tick")
         reload_flag["pending"] = True
 
@@ -602,13 +675,16 @@ def start_daemon(
         # loop stops dispatching new tasks but keeps ticking so the
         # reaper sees in-flight completions. Once in_flight_slots is
         # empty, the loop exits cleanly. Idempotent — a second
-        # SIGUSR1 doesn't do anything new.
+        # SIGUSR1 doesn't do anything new. It ends the sleep, so the
+        # first drain tick runs at once; the ticks after it keep the
+        # poll interval, because each tick clears wake_flag.
         if not drain_flag["draining"]:
             logger.info(
                 "supervisor caught SIGUSR1; entering drain mode "
                 "(no new dispatches; exit when in_flight=0)"
             )
         drain_flag["draining"] = True
+        wake_flag["pending"] = True
 
     if install_signal_handlers:
         signal.signal(signal.SIGTERM, _on_signal)
@@ -797,6 +873,9 @@ def start_daemon(
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
+                # This tick answers every wake request made before it. One
+                # made during the tick ends the next sleep at once.
+                wake_flag["pending"] = False
 
                 if reload_flag["pending"]:
                     settings, prior_pending = _apply_sighup_reload(
@@ -833,6 +912,13 @@ def start_daemon(
                     event_callback=event_callback,
                 )
                 persist_mod.write_atomic(snapshot, state_path)
+
+                # A stop that arrived during the usage poll ends the tick
+                # here, before anything is dispatched. A new dispatch would
+                # start work that the exit then abandons mid-start
+                # (adoption on) or waits for (adoption off).
+                if stop_flag["stop"]:
+                    break
 
                 # Drain force-dispatch requests BEFORE the throttle gate so
                 # operator overrides land even when the state machine has
@@ -1060,11 +1146,20 @@ def start_daemon(
                     )
                     break
 
+                # A stop that arrived during the rest of the tick ends the
+                # loop without sleeping.
+                if stop_flag["stop"]:
+                    break
+
                 wakeup = next_wakeup(actions)
                 sleep_for_next_poll(
                     wakeup_at=wakeup,
                     poll_interval_s=settings.usage.poll_interval_s,
                     clock=clk,
+                    # Ends early when a stop or drain handler sets wake_flag.
+                    sleep_fn=functools.partial(
+                        sleep_until_woken, woken=lambda: wake_flag["pending"]
+                    ),
                 )
                 ticks += 1
         finally:
