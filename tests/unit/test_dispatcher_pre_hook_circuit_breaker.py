@@ -92,9 +92,6 @@ def deferred_hook_result() -> HookResult:
 @pytest.fixture
 def settings_threshold_5() -> FailureClassifierSettings:
     return FailureClassifierSettings(
-        environmental_patterns=["DEFERRED: "],
-        operator_patterns=[],
-        task_patterns=[],
         failure_circuit_breaker_threshold=5,
     )
 

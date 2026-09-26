@@ -228,7 +228,8 @@ These properties are never violated; tests and assertions enforce them.
 
 Operators extend behavior without code changes:
 
-- **Failure patterns**: edit `[failure_classifier]` in `claude_runner.toml`.
+- **Retry limit**: `[failure_classifier].failure_circuit_breaker_threshold`
+  caps how many runs in a row a task may fail before it stops being retried.
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.

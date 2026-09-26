@@ -86,6 +86,15 @@ _RETIRED_KEYS: dict[tuple[str, ...], str] = {
         "been removed; concurrency comes from [concurrency] and each account's "
         "max_concurrency, throttled by [dispatch_pct.*]"
     ),
+    ("failure_classifier", "environmental_patterns"): (
+        "matched failures for runner.retry.classify, which nothing ever called; "
+        "every failed run is retried until "
+        "[failure_classifier].failure_circuit_breaker_threshold (ADR-0012)"
+    ),
+    ("failure_classifier", "operator_patterns"): (
+        "see [failure_classifier].environmental_patterns"
+    ),
+    ("failure_classifier", "task_patterns"): ("see [failure_classifier].environmental_patterns"),
 }
 """Queue-TOML keys removed from the schema because no code ever read them.
 

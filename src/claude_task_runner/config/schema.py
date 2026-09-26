@@ -83,9 +83,6 @@ class SessionSettings(_StrictModel):
 
 
 class FailureClassifierSettings(_StrictModel):
-    environmental_patterns: list[str]
-    operator_patterns: list[str]
-    task_patterns: list[str]
     failure_circuit_breaker_threshold: int = Field(ge=1)
     deferral_recheck_cooldown_s: float = Field(default=900.0, ge=0)
     """Seconds a task parked in ``deferred`` (pre-dispatch hook exit
