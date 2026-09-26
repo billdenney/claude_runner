@@ -41,7 +41,13 @@ sequence variant.
 in a short window. `<queue>/.claude_task_runner/supervisor.log` ends with the
 same exception each time.
 
-This section covers the cron watchdog. Under the systemd unit, systemd
+This section covers the cron watchdog. Each tick takes the managed queue's
+`[watchdog]` settings from the config that `install --config` or
+`claude-task-runner watchdog register --config` recorded for it, else from
+`<queue>/claude_runner.toml`, else the package defaults, and starts the
+supervisor with the same file. A change applies from the next tick.
+
+Under the systemd unit, systemd
 restarts the supervisor itself (`Restart=on-failure`), `RestartSec` after
 each crash, and stops once it has started the unit more than
 `StartLimitBurst` times within `StartLimitIntervalSec`. `install` writes
@@ -319,6 +325,36 @@ the per-user `global.lock`, so the real queue's supervisor failed with
    `claude-task-runner supervisor stop --queue <path>`, and delete the
    directory once you have checked that it holds only an empty `todo/` and
    `.claude_task_runner/`.
+
+## Cron watchdog logs that the queue's config does not load
+
+**Symptom:** every minute, `~/.claude_task_runner/watchdog.log` has
+`watchdog: ERROR queue=<queue> config=<toml> does not load, so its supervisor
+was not checked or restarted:` followed by the error, and
+`claude-task-runner watchdog tick` exits 1.
+
+**Cause:** the managed queue's config fails to load. The TOML may not
+parse, or it sets a value the schema rejects, or the config that
+`install --config` or `watchdog register --config` recorded was moved or
+deleted. A supervisor started with that file would fail to load it too, so
+the tick leaves the supervisor alone, running or not. It does not fall
+back to another config.
+
+**Steps:**
+1. The ERROR line names the file and the error.
+2. Fix the file. Nothing needs re-running: the next tick loads it again.
+   To check at once, run `claude-task-runner watchdog tick --dry-run`. It
+   loads the same file, decides, starts nothing and saves no state, and it
+   exits 0 once the file loads.
+3. If a recorded config moved, record its new path:
+
+   ```sh
+   claude-task-runner watchdog register --queue <queue> --config <toml>
+   ```
+
+   Without `--config`, `register` drops the recorded config, and ticks go
+   back to `<queue>/claude_runner.toml`. `register` refuses a config that
+   does not load.
 
 ## Task worktrees filling the disk
 

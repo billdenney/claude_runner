@@ -13,13 +13,16 @@ import pytest
 
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron.registry import (
+    Registry,
     RegistryError,
     handover_note,
     ignored_queues,
     load_registered_queues,
+    load_registry,
     managed_queue,
     queues_registry_path,
     read_registered_queues,
+    read_registry,
     register_queue,
     unregister_queue,
 )
@@ -182,6 +185,9 @@ CORRUPT_PAYLOADS = {
     "not-json": "{not json",
     "not-an-object": '["not", "a", "dict"]',
     "queues-not-a-list": '{"queues": "/one/queue"}',
+    "configs-not-an-object": '{"queues": ["/q"], "configs": ["/c.toml"]}',
+    "config-not-a-string": '{"queues": ["/q"], "configs": {"/q": 7}}',
+    "config-not-absolute": '{"queues": ["/q"], "configs": {"/q": "c.toml"}}',
 }
 """Every way a readable ``queues.json`` can fail to hold a registry."""
 
@@ -426,6 +432,118 @@ class TestRegistryWrites:
             unregister_queue(keep)
         assert queues_registry_path().read_text(encoding="utf-8") == before
         assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
+
+
+def _registry_json() -> object:
+    return json.loads(queues_registry_path().read_text(encoding="utf-8"))
+
+
+class TestRecordedConfigs:
+    """The ``claude_runner.toml`` recorded for a queue by ``--config``."""
+
+    @pytest.fixture
+    def queue(self, isolated_home: Path) -> Path:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        return queue.resolve()
+
+    @pytest.fixture
+    def toml(self, isolated_home: Path) -> Path:
+        return isolated_home / "cfg" / "b.toml"
+
+    def test_register_records_it(self, queue: Path, toml: Path) -> None:
+        assert register_queue(queue, config=toml) == []
+        assert read_registry() == Registry(queues=[queue], configs={queue: toml})
+        assert queues_registry_path().read_text(encoding="utf-8") == (
+            json.dumps({"queues": [str(queue)], "configs": {str(queue): str(toml)}}, indent=2)
+            + "\n"
+        )
+
+    def test_a_relative_config_is_recorded_absolute(
+        self, queue: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(isolated_home)
+        register_queue(queue, config=Path("cfg/b.toml"))
+        assert read_registry().configs == {queue: Path.cwd() / "cfg" / "b.toml"}
+
+    def test_the_same_registration_again_writes_nothing(self, queue: Path, toml: Path) -> None:
+        register_queue(queue, config=toml)
+        path = queues_registry_path()
+        path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        assert register_queue(queue, config=toml) == []
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_another_config_for_the_same_queue_replaces_it(
+        self, queue: Path, toml: Path, isolated_home: Path
+    ) -> None:
+        register_queue(queue, config=toml)
+        other = isolated_home / "cfg" / "c.toml"
+        assert register_queue(queue, config=other) == []
+        assert read_registry().configs == {queue: other}
+
+    def test_registering_without_a_config_drops_it(self, queue: Path, toml: Path) -> None:
+        """The file goes back to the form it had before configs were recorded."""
+        register_queue(queue, config=toml)
+        assert register_queue(queue) == []
+        assert _registry_json() == {"queues": [str(queue)]}
+
+    def test_registering_another_queue_drops_it(
+        self, queue: Path, toml: Path, isolated_home: Path
+    ) -> None:
+        other = isolated_home / "other"
+        other.mkdir()
+        register_queue(queue, config=toml)
+        assert register_queue(other) == [queue]
+        assert _registry_json() == {"queues": [str(other.resolve())]}
+
+    def test_unregistering_drops_it(self, queue: Path, toml: Path) -> None:
+        register_queue(queue, config=toml)
+        assert unregister_queue(queue) == [queue]
+        assert _registry_json() == {"queues": []}
+
+    def test_unregistering_keeps_the_remaining_queues_config(
+        self, queue: Path, toml: Path, isolated_home: Path
+    ) -> None:
+        """An older list names several queues; only the removed one's config goes."""
+        other = isolated_home / "other"
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "queues": [str(other), str(queue)],
+                    "configs": {str(other): "/cfg/o.toml", str(queue): str(toml)},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert unregister_queue(other) == [other]
+        assert read_registry() == Registry(queues=[queue], configs={queue: toml})
+
+    def test_a_registry_without_configs_has_none(self, queue: Path) -> None:
+        _write_registry_file([str(queue)])
+        assert read_registry() == Registry(queues=[queue], configs={})
+
+    def test_a_config_for_an_unlisted_queue_is_read_but_not_kept(
+        self, queue: Path, isolated_home: Path
+    ) -> None:
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"queues": [str(queue)], "configs": {"/gone": "/cfg/g.toml"}}),
+            encoding="utf-8",
+        )
+        assert read_registry().configs == {Path("/gone"): Path("/cfg/g.toml")}
+        other = isolated_home / "other"
+        other.mkdir()
+        register_queue(other)
+        assert _registry_json() == {"queues": [str(other.resolve())]}
+
+    def test_the_lenient_reader_matches_the_strict_one(self, queue: Path, toml: Path) -> None:
+        register_queue(queue, config=toml)
+        assert load_registry() == read_registry()
+        assert load_registered_queues() == read_registered_queues() == [queue]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
