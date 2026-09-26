@@ -13,11 +13,21 @@ would loop forever burning CPU and log volume. We protect with:
   would hold back the restart once the lock frees.
 * A **cooldown**: after a restart, refuse another for
   ``[watchdog].restart_cooldown_s`` seconds (default 30s).
-* **Crash-loop detection**: if more than
-  ``[watchdog].crash_loop_threshold`` restarts happen within an
-  exponentially growing window, back off — sleep up to
-  ``[watchdog].restart_backoff_max_s`` (default 600s) before the next
-  attempt and emit a ``critical`` notification.
+* **Crash-loop backoff**: every restart since the supervisor last
+  stayed up counts. Once ``[watchdog].crash_loop_threshold`` of them
+  have piled up, each further restart waits twice as long as the one
+  before, from twice the cooldown up to
+  ``[watchdog].restart_backoff_max_s`` (default 600s), counted from the
+  last restart (BACKOFF). A tick that finds the supervisor up
+  min(10 x cooldown, restart_backoff_max_s) after its last restart, 300 s
+  with the defaults, clears the history. Restarts older than 24 h are
+  dropped as well.
+
+The history used to be a 300 s window. At the tick's cadence of one a
+minute, that window never held the threshold's five restarts, so a
+supervisor that died on every start was restarted every minute,
+indefinitely. The tick logs every verdict to ``watchdog.log``; nothing
+sends a notification.
 
 State persists to ``~/.claude_task_runner/watchdog_state.json``, which
 names the queue it belongs to. The file is small (a list of timestamps)
@@ -86,12 +96,13 @@ class WatchdogState(BaseModel):
     written before the field existed."""
 
     recent_restarts: list[datetime] = Field(default_factory=list)
-    """Restart timestamps within the analysis window. Older entries
-    are pruned on each tick."""
+    """The restarts since the supervisor last stayed up, oldest first,
+    none older than 24 h (see :func:`decide`)."""
 
     last_backoff_alerted_at: datetime | None = None
-    """Most recent time we emitted a crash-loop alert, so we don't
-    spam notifications when stuck in backoff."""
+    """When a crash-loop alert was last due, at most once every 10
+    minutes while backing off. Nothing sends one yet: the tick only logs
+    its BACKOFF verdict."""
 
 
 @dataclass(frozen=True)
@@ -175,21 +186,32 @@ def write_state_atomic(state: WatchdogState, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _prune(state: WatchdogState, *, now: datetime, window_s: float) -> WatchdogState:
-    """Drop restart timestamps older than ``now - window_s``."""
-    cutoff = now - timedelta(seconds=window_s)
+STALE_RESTART_AGE = timedelta(hours=24)
+"""Restarts older than this are forgotten.
+
+While no tick runs (cron removed, the machine off), the watchdog cannot
+see whether the supervisor stayed up, and a restart a day old says
+nothing about a crash loop now. A live crash loop restarts at least once
+every ``restart_backoff_max_s`` plus a tick, far more often than this."""
+
+
+def _forget_stale(state: WatchdogState, *, now: datetime) -> WatchdogState:
+    """Drop the restarts older than :data:`STALE_RESTART_AGE`."""
+    cutoff = now - STALE_RESTART_AGE
     kept = [t for t in state.recent_restarts if t > cutoff]
     if len(kept) == len(state.recent_restarts):
         return state
     return state.model_copy(update={"recent_restarts": kept})
 
 
-def _backoff_window_s(settings: WatchdogSettings) -> float:
-    """How far back to look for recent restarts when crash-counting.
+def stayed_up_s(settings: WatchdogSettings) -> float:
+    """How long the supervisor must be up after its last restart to end a crash loop.
 
-    Ten cooldowns is enough to capture a sustained crash loop while
-    aging out one-off blips. Capped at restart_backoff_max_s so the
-    window doesn't grow unboundedly with operator misconfiguration.
+    Ten cooldowns, capped at ``restart_backoff_max_s``: 300 s with the
+    defaults. A tick that finds the supervisor up at least this long
+    after its last restart clears the restart history, so the next crash
+    starts a fresh count. A supervisor that dies sooner, even one that a
+    tick found up in between, keeps adding to the count.
     """
     return min(
         settings.restart_cooldown_s * 10,
@@ -210,29 +232,43 @@ def decide(
 
     Decision tree:
 
-    1. Supervisor is alive → SKIP (no action).
+    1. Supervisor is alive → SKIP (no action). If it has been up
+       :func:`stayed_up_s` since its last restart, the restart history
+       is cleared: whatever crash loop there was is over.
     2. Supervisor is dead, but another process holds ``global.lock``
        (``lock_held``; ``lock_holder_pid`` is the PID the lock file
        records, if any) → LOCKED. A supervisor started now would exit
        at once, so no restart is counted: a crash-loop count made of
        those refusals would hold back the restart once the lock frees.
-    3. Supervisor is dead, last restart within ``restart_cooldown_s`` →
+    3. Supervisor is dead, and ``crash_loop_threshold`` or more restarts
+       since it last stayed up → BACKOFF until the last restart plus
+       ``restart_cooldown_s * 2 ** excess``, capped at
+       ``restart_backoff_max_s``, where ``excess`` counts the restarts
+       from the threshold on (1 at the threshold). The wait doubles with
+       each further restart.
+    4. Supervisor is dead, last restart within ``restart_cooldown_s`` →
        COOLDOWN (wait).
-    4. Supervisor is dead, recent restart count exceeds
-       ``crash_loop_threshold`` → BACKOFF (refuse + notify).
     5. Otherwise → RESTART.
+
+    Restarts older than :data:`STALE_RESTART_AGE` are dropped first.
 
     Caller is responsible for actually invoking the restart and for
     persisting :attr:`WatchdogDecision.new_state` afterward.
     """
     now = clock.now()
-    window_s = _backoff_window_s(settings)
-    pruned = _prune(state, now=now, window_s=window_s)
+    state = _forget_stale(state, now=now)
 
     if supervisor_alive:
+        new_state = state
+        if state.recent_restarts:
+            up_s = (now - state.recent_restarts[-1]).total_seconds()
+            if up_s >= stayed_up_s(settings):
+                new_state = state.model_copy(
+                    update={"recent_restarts": [], "last_backoff_alerted_at": None}
+                )
         return WatchdogDecision(
             verdict=WatchdogVerdict.SKIP,
-            new_state=pruned,
+            new_state=new_state,
             next_check_at=None,
             detail="supervisor alive",
         )
@@ -243,7 +279,7 @@ def decide(
             holder += f" (pid {lock_holder_pid})"
         return WatchdogDecision(
             verdict=WatchdogVerdict.LOCKED,
-            new_state=pruned,
+            new_state=state,
             next_check_at=None,
             detail=f"{holder} holds global.lock; starting none until it exits",
         )
@@ -252,22 +288,22 @@ def decide(
     # repeated restarts is itself the signature of a crash loop, so a
     # "we just restarted, give it a moment" cooldown alone isn't
     # sufficient.
-    if len(pruned.recent_restarts) >= settings.crash_loop_threshold:
+    if len(state.recent_restarts) >= settings.crash_loop_threshold:
         # Compute exponential backoff: each crash beyond the threshold
         # doubles the wait, up to ``restart_backoff_max_s``.
-        excess = len(pruned.recent_restarts) - settings.crash_loop_threshold + 1
+        excess = len(state.recent_restarts) - settings.crash_loop_threshold + 1
         backoff_s = min(
             settings.restart_cooldown_s * (2**excess),
             settings.restart_backoff_max_s,
         )
-        last = pruned.recent_restarts[-1]
+        last = state.recent_restarts[-1]
         wait_until = last + timedelta(seconds=backoff_s)
         if wait_until > now:
-            new_state = pruned
+            new_state = state
             # Throttle alerts: only re-notify if 10 minutes since last alert.
             should_alert = (
-                pruned.last_backoff_alerted_at is None
-                or (now - pruned.last_backoff_alerted_at).total_seconds() > 600
+                state.last_backoff_alerted_at is None
+                or (now - state.last_backoff_alerted_at).total_seconds() > 600
             )
             if should_alert:
                 new_state = new_state.model_copy(update={"last_backoff_alerted_at": now})
@@ -276,22 +312,23 @@ def decide(
                 new_state=new_state,
                 next_check_at=wait_until,
                 detail=(
-                    f"crash loop: {len(pruned.recent_restarts)} restarts "
-                    f"in window; backing off until {wait_until.isoformat()}"
+                    f"crash loop: {len(state.recent_restarts)} restarts without the "
+                    f"supervisor staying up {stayed_up_s(settings):g}s; backing off "
+                    f"until {wait_until.isoformat()}"
                 ),
             )
 
     # Below crash-loop threshold: enforce a short cooldown so rapid
     # double-fires (e.g., cron racing the supervisor's startup) don't
     # spawn duplicates.
-    if pruned.recent_restarts:
-        last = pruned.recent_restarts[-1]
+    if state.recent_restarts:
+        last = state.recent_restarts[-1]
         elapsed = (now - last).total_seconds()
         if elapsed < settings.restart_cooldown_s:
             wait_until = last + timedelta(seconds=settings.restart_cooldown_s)
             return WatchdogDecision(
                 verdict=WatchdogVerdict.COOLDOWN,
-                new_state=pruned,
+                new_state=state,
                 next_check_at=wait_until,
                 detail=(
                     f"cooldown: last restart {elapsed:.0f}s ago, "
@@ -300,8 +337,8 @@ def decide(
             )
 
     # OK to restart.
-    new_restarts = [*pruned.recent_restarts, now]
-    new_state = pruned.model_copy(
+    new_restarts = [*state.recent_restarts, now]
+    new_state = state.model_copy(
         update={
             "recent_restarts": new_restarts,
             "last_backoff_alerted_at": None,
