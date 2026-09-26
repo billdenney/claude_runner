@@ -55,8 +55,13 @@ re-dispatches (re-running the hook). Contrast ``failed`` (a real
 attempt that errored, counted toward the breaker)."""
 
 Effort = Annotated[str, Field(min_length=1)]
-"""Free-form string; validated against the per-model accepted set in
-``runner.effort_levels`` at task-load time. See ADR-0010."""
+"""Free-form string. The schema cannot check it, because the accepted set
+for each model is the merged settings' ``[effort_levels]``, which
+``load_task`` never sees. ``runner.effort_levels.validate_effort`` checks
+the (model, effort) pair wherever the settings are in hand: ``queue add``,
+the supervisor's candidate selector (which parks a mismatched task as
+``deferred`` instead of dispatching it), force-dispatch, ``doctor`` and
+``queue list``. See ADR-0010."""
 
 Priority = Literal["low", "normal", "high"]
 
@@ -209,10 +214,11 @@ class Task(_StrictBase):
     hook as ``$TASK_WORKING_DIR``). ``null`` lets the per-queue
     ``[queue].working_dir_template`` fill it, or means no worktree."""
     model: str = "claude-opus-5-5"
-    """Model id to dispatch with; must be one the runner config knows."""
+    """Model id to dispatch with; must have an entry in ``[effort_levels]``."""
     effort: Effort = "medium"
-    """Reasoning-effort level, validated against the per-model accepted set at
-    load time (commonly ``low`` / ``medium`` / ``high``)."""
+    """Reasoning-effort level; must be in the model's ``[effort_levels]`` set
+    (commonly ``low`` / ``medium`` / ``high``). The supervisor parks a task
+    whose pair is not as ``deferred`` instead of dispatching it."""
     priority: Priority = "normal"
     """Dispatch ordering within the eligible set: ``low`` | ``normal`` | ``high``."""
     depends_on: list[str] = Field(default_factory=list)

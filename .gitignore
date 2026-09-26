@@ -28,6 +28,12 @@ env/
 # lockfile (which would freeze the full transitive dependency graph).
 uv.lock
 
+# No changelog until the first release: nothing reads one before then, and
+# every parallel branch collided on it. At the first release, delete this
+# entry and tests/unit/test_no_changelog_before_release.py, and start
+# CHANGELOG.md from that version.
+CHANGELOG.md
+
 # Editor / IDE
 .vscode/
 .idea/
