@@ -205,6 +205,24 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`install-skills` and `install-skills uninstall` exit 2 when a skill
+  fails, not 0.** Each caught a skill's `OSError`, printed it, went on to the
+  next skill and then returned normally. With `~/.claude/skills` read-only,
+  the symlink probe fails, so `install-skills` falls back to copying, and
+  every copy was refused: nothing was installed, and the command exited 0.
+  Both still report every failure and carry on with the rest, then print
+  `Failed to install N of M skills.` (or `Failed to remove N of M skills.`)
+  and exit 2, the code the cron and systemd `install` uses for a failed
+  write. Exit 1 still means the prompt was declined. A skill skipped as
+  already present, without `--overwrite`, is not a failure, so a successful
+  install still exits 0. A package without its skills, such as a wheel built
+  without `skills/`, crashed `install-skills` with a `ModuleNotFoundError`
+  traceback and exit 1. It now prints `missing skill: …` and exits 2, as a
+  single missing skill directory already did. These lines print paths and
+  exception text without Rich markup, so a `[team]` in a path is no longer
+  dropped. `tests/unit/test_install_skills_cmd.py` pins the exit code and
+  output for a read-only `~/.claude/skills` (install and uninstall), a
+  failing copy, a failing unlink or rmtree, and a missing skills package.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
