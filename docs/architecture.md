@@ -132,7 +132,9 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │                               #   on the next supervisor tick
     ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
     │   ├── attempt-<N>.stream.jsonl  #   parsed stdout NDJSON stream (re-read
-    │   │                             #   on adoption to rebuild StreamSummary)
+    │   │                             #   on adoption to rebuild StreamSummary,
+    │   │                             #   and at startup for a worker that
+    │   │                             #   exited while no supervisor ran)
     │   └── attempt-<N>.stderr        #   paired stderr (error tail kept in state)
     ├── supervisor.json             # supervisor state machine snapshot; holds
     │                               #   last_drift_message while in ErrorDrift
@@ -201,7 +203,7 @@ These properties are never violated; tests and assertions enforce them.
    restart (verdict `locked`).
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
-   to live PIDs.
+   to live PIDs, and records a worker that exited in the meantime from its log.
 3. *(Retired 2026-09-25.)* This slot said a utilization decrease without a
    detected reset is `UsageFormatDrift`. Nothing ever enforced that: the check
    was written but never called, and it has been removed. Each reading is used

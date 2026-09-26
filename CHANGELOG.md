@@ -183,6 +183,25 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **A worker that finishes while no supervisor runs is recorded, not
+  re-run.** With `[supervisor].adopt_workers` on, a worker keeps running
+  when its supervisor stops, and the next supervisor adopts it. A worker
+  that finished in between, after the old supervisor exited and before the
+  new one started, was never read. Its task was still `running` with a dead
+  pid, so the startup sweep demoted it to `failed`
+  (`orphaned_by_supervisor_restart`, no run recorded), or, after a gap
+  longer than `[task_caps].heartbeat_silence_alert_s`, the silent-orphan
+  reaper parked it `possibly_hung`. A `failed` task is re-dispatched, so the
+  finished work would run again: on 2026-09-26 a planned restart did this
+  to a task whose work was already committed and pushed, and it was
+  finalized by hand. Startup now reads such a worker's stream log before
+  any other recovery pass. A log that ends in a `result` event is
+  finalized as an adopted worker's would be: one run record dated by the
+  log's last write, the session id from the log, and `completed` for a
+  success or `failed` with the result's stop reason for an error. A log
+  with no `result` event is a crash, and is demoted as before. See the
+  2026-09-26 amendment to ADR-0025.
+
 - **Commands that read a queue no longer create a `--queue` that does not
   exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
   `account list` and `account resume` created `<queue>/todo/` or

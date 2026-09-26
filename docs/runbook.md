@@ -146,8 +146,12 @@ come back.
    `Main process exited, code=killed, status=9/KILL`, then
    `Scheduled restart job`. In-flight `claude` workers keep running
    (`KillMode=process`). With `[supervisor].adopt_workers` on, the
-   default, the new supervisor adopts them. systemd also logs
-   `Found left-over process` for each one, which is expected.
+   default, the new supervisor adopts them. A worker that finished
+   while no supervisor ran is recorded from its log instead. The
+   supervisor logs `recorded exited worker for task <id> from its log`,
+   and the task gets that run's status, `completed` for a success.
+   systemd also logs `Found left-over process` for each one still
+   running, which is expected.
 
    Do not test with `kill <pid>` or `supervisor stop`. Both send SIGTERM,
    the supervisor exits 0, and `RestartPreventExitStatus=0` leaves it
@@ -200,7 +204,8 @@ restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
 
    With `[supervisor].adopt_workers` on, the default, the old queue's
    in-flight workers keep running, but no supervisor follows them until
-   one runs for that queue again.
+   one runs for that queue again. That supervisor records each worker
+   that finished in the meantime from its log.
 
 ## Cron watchdog installed, but the supervisor stays down
 
@@ -265,7 +270,8 @@ hand, or the systemd unit's.
    `claude-task-runner supervisor stop --queue <old-queue>` exits sooner.
    With `[supervisor].adopt_workers` on, the default, the old queue's
    in-flight workers then keep running, but nothing reaps them until a
-   supervisor runs for that queue again.
+   supervisor runs for that queue again. That supervisor records each
+   worker that finished in the meantime from its log.
 3. If the holder is the systemd unit's supervisor, both the unit and the
    cron watchdog are installed. `claude-task-runner install uninstall`
    offers to remove each; keep the one you want.

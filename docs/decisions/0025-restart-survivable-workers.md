@@ -95,3 +95,61 @@ work.
   conservative rollout.
 - **`KillMode=process` stays required** in the unit so systemd never
   signals the worker group on supervisor stop.
+
+## Amendment (2026-09-26) — workers that exit in the restart gap
+
+**What happened.** During a planned restart of the live supervisor, the old
+supervisor exited after `supervisor stop` while a file-backed worker kept
+running (`KillMode=process`). The worker finished 53 s later; its stream log
+ends in a `result` event, subtype success, and its work was committed and
+pushed. The new supervisor started 6 s after that. Its startup sweep found the
+task `running` with a dead pid and demoted it: status `failed`, stop_reason
+`orphaned_by_supervisor_restart`, no RunRecord, no session id. A `failed` task
+is re-dispatched, so finished work would have run again. It was finalized by
+hand from the log.
+
+**Why.** Decision 3 grouped a dead pid with SILENT and KILL survivors: "keep
+today's reaper behaviour". That behaviour was designed for pipe-backed
+workers, whose output dies with the supervisor that owned the pipe. A
+file-backed worker's log outlives both of them and says how the worker ended.
+The startup passes never read it.
+
+**Decision.** At startup, after the corrupt-state quarantine (ADR-0028) and
+before every other recovery pass, `supervisor.adoption.finalize_exited_workers`
+looks at each `running` task with a recorded pid that is dead and a log file
+that exists. When the log ends in a terminal `result` event, the attempt is
+finalized as the adoption monitor finalizes an adopted worker whose pid is
+gone (`runner.dispatcher.finalize_exited_worker`, through `_finalize_adopted`).
+It gets one RunRecord built from the result, the same completed/failed
+classification (the ADR-0020 output gate, an open sidecar's
+`awaiting_sidecar`), and the same recheck guard, so a concurrent writer's
+record is never clobbered. A log without a result event is left alone. That
+worker crashed or was killed, and the silent-orphan reaper and
+`reconcile_orphans` handle it as before.
+
+- **Ordering.** The pass must precede the silent-orphan reaper. A finished
+  worker's heartbeat is as stale as a hung one's: after a gap longer than
+  `[task_caps].heartbeat_silence_alert_s`, the reaper would park the task
+  `possibly_hung`; after a shorter one, `reconcile_orphans` demotes it.
+- **Times.** `finished_at` is the log's last write (its mtime, capped at now
+  and floored at the attempt's start), not the restart that found it, so
+  `duration_s` and `last_finished_at` exclude the supervisor's downtime.
+- **No caps.** Per-task caps stop a live worker. This one ended on its own,
+  and its result is the record of how.
+- **Account.** A first attempt's state records no account until it finalizes.
+  The run is recorded under the account in the previous supervisor's persisted
+  `in_flight` record for the task, when the queue still declares that
+  account, and otherwise under the state's session host account (ADR-0024).
+- **Kill switch.** `[supervisor].adopt_workers = false` turns this pass off
+  with the rest of this ADR.
+- **Per-tick passes are unchanged.** The per-tick silent reaper considers only
+  tasks with a live owner thread in this supervisor, a dispatch or adoption
+  monitor, and that thread finalizes from the log when the worker exits.
+  `reconcile_orphans` runs only at startup.
+
+**Consequences.** A worker that finishes in the restart gap is recorded as its
+log says, and a completed task is not re-dispatched. The finalize is the
+adopted path's, so it shares that path's differences from an owned run: no
+pre-dispatch SHA for the ADR-0020 commit check, so a commit alone does not
+count as output; no post-dispatch hook; no ADR-0027 re-file guard or ADR-0033
+terminal-close gate.
