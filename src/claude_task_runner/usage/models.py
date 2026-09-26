@@ -37,8 +37,8 @@ class ExtraWindow(BaseModel):
 
     The ``/usage`` panel shows a primary ``Current week (all models)``
     section plus optional per-model sections (e.g. ``Sonnet only``)
-    depending on the user's plan. We capture them here so cohort
-    reasoning can consume them later. The primary windows
+    depending on the user's plan. We capture them here, and the
+    ``usage`` command prints them. The primary windows
     :class:`UsageReading.seven_day` always remains the all-models view.
     """
 

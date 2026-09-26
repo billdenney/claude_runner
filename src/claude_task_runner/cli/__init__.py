@@ -49,7 +49,22 @@ app = typer.Typer(
     name="claude-task-runner",
     help="Window-aware task runner for Claude Code.",
     no_args_is_help=True,
+    rich_markup_mode=None,
 )
+r"""The root command. ``rich_markup_mode=None`` prints help text as written.
+
+Help text names config tables (``[queue]``, ``[[accounts]]``) and types
+(``list[str]``). Typer's default, ``"rich"``, parses help as Rich console
+markup, and Rich drops a lowercase ``[word]`` as a style tag:
+``supervisor drain --help`` printed ``[task_caps].max_duration_s_per_task``
+as ``.max_duration_s_per_task``. With ``None``, click prints help in its
+plain format and re-wraps each paragraph, so a paragraph whose line breaks
+matter (a list or a table) starts with a ``\b`` line. Typer applies the
+root's mode to every subcommand. Each sub-app sets ``None`` too, because a
+sub-app invoked on its own, as the unit tests do, uses its own.
+``console.print`` markup is separate and unaffected.
+``tests/unit/test_docs_cli_help.py`` gates all of this.
+"""
 app.add_typer(usage_cmd.app, name="usage", help="Usage capture, parse, and drift check.")
 app.add_typer(
     supervisor_cmd.app,

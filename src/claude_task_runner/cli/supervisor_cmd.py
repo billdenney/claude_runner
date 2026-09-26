@@ -19,7 +19,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.observability import configure_logging
@@ -40,7 +40,7 @@ from claude_task_runner.usage.source import (
     UsageSource,
 )
 
-app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,7 @@ def start(
     Signals (delivered with ``kill -<NAME> <pid>`` against the PID file
     at ``<queue>/.claude_task_runner/supervisor.pid``):
 
+    \b
     * ``SIGTERM`` / ``SIGINT`` — request a clean stop; in-flight
       dispatch threads finish their current attempt (architectural
       invariant 2: in-flight tasks are NOT killed when the supervisor
@@ -240,7 +241,7 @@ def start(
       and the previous config stays active.
     """
     console = Console()
-    queue_path = queue_dir.resolve()
+    queue_path = require_queue_option(queue_dir, console)
     settings = load_settings(resolve_per_queue_config(config, queue_path))
     # Re-apply logging settings now that the queue's [logging] block has
     # been read. The CLI entry point's early configure runs before Typer
@@ -395,6 +396,7 @@ def drain(
     (typically minutes for extraction work; up to
     ``[task_caps].max_duration_s_per_task`` for the hard cap).
 
+    \b
     Exit codes:
       0  supervisor exited cleanly (or --no-wait and signal delivered)
       1  no PID file / stale PID file

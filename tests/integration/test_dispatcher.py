@@ -20,7 +20,6 @@ from claude_task_runner.clock import RealClock
 from claude_task_runner.config.schema import (
     DispatchSettings,
     HookSettings,
-    SessionSettings,
     TaskCapsSettings,
 )
 from claude_task_runner.queue.schema import Task, TaskState
@@ -32,6 +31,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import (
     DispatchError,
+    DispatchOutcome,
     build_argv,
     dispatch,
 )
@@ -81,10 +81,6 @@ def _caps(
         heartbeat_silence_alert_s=alert,
         heartbeat_silence_kill_s=kill,
     )
-
-
-def _session() -> SessionSettings:
-    return SessionSettings(max_resume_attempts=3, resume_fail_fast_s=5)
 
 
 def _hooks(*, pre: str = "", post: str = "") -> HookSettings:
@@ -227,7 +223,6 @@ class TestDispatchSuccess:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -278,7 +273,6 @@ class TestDispatchSuccess:
                 queue_dir=queue_dir,
                 clock=RealClock(),
                 settings_caps=_caps(),
-                settings_session=_session(),
                 settings_hooks=_hooks(),
                 settings_dispatch=DispatchSettings(),
                 claude_executable=str(SHIM_PATH),
@@ -310,7 +304,6 @@ class TestDispatchSuccess:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -340,7 +333,6 @@ class TestDispatchSuccess:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -353,6 +345,80 @@ class TestDispatchSuccess:
         # monitor lock was the last one before completion).
         loaded = load_state(state_path_for(queue_dir, task.id))
         assert loaded.dispatcher_alive_at is not None
+
+
+class TestResumeAttemptCounting:
+    """Every ``--resume`` counts toward ``[session].max_resume_attempts``,
+    whatever its outcome, and a failed one is not retried fresh within the
+    same attempt (ADR-0005, 2026-09-25 update)."""
+
+    @staticmethod
+    def _dispatch(
+        task: Task, queue_dir: Path, state: TaskState, plan: SpawnPlan
+    ) -> DispatchOutcome:
+        return dispatch(
+            task=task,
+            state=state,
+            plan=plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+        )
+
+    @staticmethod
+    def _resume_plan() -> SpawnPlan:
+        return SpawnPlan(
+            strategy=ResumeStrategy.RESUME,
+            session_id="sess-prev",
+            prompt="Continue.",
+            extra_args=[],
+        )
+
+    def test_a_successful_resume_counts(
+        self,
+        queue_dir: Path,
+        task: Task,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-prev")
+        prior = TaskState(task_id=task.id, session_id="sess-prev", resume_attempts=1)
+        outcome = self._dispatch(task, queue_dir, prior, self._resume_plan())
+        assert outcome.new_state.status == "completed"
+        assert outcome.new_state.resume_attempts == 2
+
+    def test_a_failed_resume_counts_and_is_not_retried_fresh(
+        self,
+        queue_dir: Path,
+        task: Task,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        monkeypatch.setenv("SHIM_FAIL_FAST", "No conversation found with session ID: sess-prev")
+        prior = TaskState(task_id=task.id, session_id="sess-prev", resume_attempts=1)
+        outcome = self._dispatch(task, queue_dir, prior, self._resume_plan())
+        assert outcome.new_state.status == "failed"
+        assert outcome.new_state.resume_attempts == 2
+        # One run, and it is the resume: nothing re-spawned fresh inside it.
+        assert len(outcome.new_state.runs) == 1
+        assert outcome.run_record.resumed_from_session == "sess-prev"
+
+    def test_a_fresh_dispatch_leaves_the_count_alone(
+        self,
+        queue_dir: Path,
+        task: Task,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        monkeypatch.setenv("SHIM_SESSION_ID", "sess-new")
+        prior = TaskState(task_id=task.id, session_id="sess-prev", resume_attempts=3)
+        outcome = self._dispatch(task, queue_dir, prior, fresh_plan)
+        assert outcome.new_state.status == "completed"
+        assert outcome.new_state.resume_attempts == 3
+        assert outcome.run_record.resumed_from_session is None
 
 
 class TestDispatchError:
@@ -370,7 +436,6 @@ class TestDispatchError:
                 queue_dir=queue_dir,
                 clock=RealClock(),
                 settings_caps=_caps(),
-                settings_session=_session(),
                 settings_hooks=_hooks(),
                 claude_executable="this-binary-does-not-exist-1234",
             )
@@ -392,7 +457,6 @@ class TestDispatchError:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -420,7 +484,6 @@ class TestPreDispatchHook:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(pre="shell:exit 2"),
             claude_executable=str(SHIM_PATH),
         )
@@ -442,7 +505,6 @@ class TestPreDispatchHook:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(pre="true"),
             claude_executable=str(SHIM_PATH),
         )
@@ -464,7 +526,6 @@ class TestPostDispatchHook:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(post="false"),
             claude_executable=str(SHIM_PATH),
         )
@@ -515,7 +576,6 @@ class TestOutputEvidenceGate:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -555,7 +615,6 @@ class TestOutputEvidenceGate:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -605,7 +664,6 @@ class TestOutputGateSkippedWithoutWorkingDir:
                 queue_dir=queue_dir,
                 clock=RealClock(),
                 settings_caps=_caps(),
-                settings_session=_session(),
                 settings_hooks=_hooks(),
                 claude_executable=str(SHIM_PATH),
             )
@@ -649,7 +707,6 @@ class TestSpawnUsesNewSession:
                 queue_dir=queue_dir,
                 clock=RealClock(),
                 settings_caps=_caps(),
-                settings_session=_session(),
                 settings_hooks=_hooks(),
                 claude_executable=str(SHIM_PATH),
             )
@@ -702,7 +759,6 @@ class TestPidPersistFailureSurfaces:
                 queue_dir=queue_dir,
                 clock=RealClock(),
                 settings_caps=_caps(),
-                settings_session=_session(),
                 settings_hooks=_hooks(),
                 claude_executable=str(SHIM_PATH),
             )
@@ -760,7 +816,6 @@ class TestCapKillSigtermIgnoringSubprocess:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(max_duration=0.5),
-            settings_session=_session(),
             settings_hooks=_hooks(),
             claude_executable=str(SHIM_PATH),
         )
@@ -805,7 +860,6 @@ class TestPreDispatchHookExitCodeRouting:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(pre="shell:exit 1"),
             claude_executable=str(SHIM_PATH),
         )
@@ -831,7 +885,6 @@ class TestPreDispatchHookExitCodeRouting:
             queue_dir=queue_dir,
             clock=RealClock(),
             settings_caps=_caps(),
-            settings_session=_session(),
             settings_hooks=_hooks(pre="shell:exit 2"),
             claude_executable=str(SHIM_PATH),
         )

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "claude-task-runner"
 version = "0.1.0"
-description = "Window-aware task runner for Claude Code. Tracks 5-hour and 7-day usage windows, throttles dispatch with EMA-driven concurrency, schedules window-start wakeups via supervisor + cron/systemd watchdog."
+description = "Window-aware task runner for Claude Code. Tracks 5-hour and 7-day usage windows, throttles dispatch against the utilization /usage reports, schedules window-start wakeups via supervisor + cron/systemd watchdog."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

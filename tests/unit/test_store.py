@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import errno
 import io
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -36,6 +37,7 @@ from claude_task_runner.queue.store import (
     load_state,
     load_task,
     queue_runtime_dir,
+    require_queue_dir,
     state_path_for,
     task_path_for,
     todo_dir,
@@ -616,3 +618,77 @@ class TestLoaderDivergence:
         assert [hex(ord(ch)) for ch in title] == ["0xd83d", "0xde00"]
         with pytest.raises(UnicodeEncodeError):
             title.encode("utf-8")
+
+
+def _missing(base: Path) -> Path:
+    return base / "no-such-queue"
+
+
+def _a_file(base: Path) -> Path:
+    path = base / "queue.txt"
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def _dangling_symlink(base: Path) -> Path:
+    path = base / "link"
+    path.symlink_to(base / "gone", target_is_directory=True)
+    return path
+
+
+NOT_A_QUEUE_DIR: dict[str, Callable[[Path], Path]] = {
+    "missing": _missing,
+    "a-file": _a_file,
+    "dangling-symlink": _dangling_symlink,
+}
+"""Each way a ``--queue`` or a registered path can fail to be a directory."""
+
+
+class TestRequireQueueDir:
+    """The check that keeps ``queue_runtime_dir`` / ``todo_dir`` from creating a queue."""
+
+    def test_existing_directory_is_returned_resolved(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        assert require_queue_dir(queue) == queue.resolve()
+
+    def test_relative_path_is_resolved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "q").mkdir()
+        monkeypatch.chdir(tmp_path)
+        assert require_queue_dir(Path("q")) == (tmp_path / "q").resolve()
+
+    def test_symlink_to_a_directory_is_followed(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        assert require_queue_dir(link) == real.resolve()
+
+    @pytest.mark.parametrize("make", NOT_A_QUEUE_DIR.values(), ids=NOT_A_QUEUE_DIR.keys())
+    def test_not_a_directory_raises_and_creates_nothing(
+        self, tmp_path: Path, make: Callable[[Path], Path]
+    ) -> None:
+        base = tmp_path / "base"
+        base.mkdir()
+        path = make(base)
+        before = sorted(p.name for p in base.iterdir())
+        with pytest.raises(NotADirectoryError) as excinfo:
+            require_queue_dir(path)
+        assert str(excinfo.value) == f"not an existing directory: {path.resolve()}"
+        assert sorted(p.name for p in base.iterdir()) == before
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
+    def test_unsearchable_parent_counts_as_missing(self, tmp_path: Path) -> None:
+        """Path.is_dir would raise PermissionError here on Python 3.12 and 3.13."""
+        locked = tmp_path / "locked"
+        queue = locked / "q"
+        queue.mkdir(parents=True)
+        locked.chmod(0o000)
+        try:
+            with pytest.raises(NotADirectoryError) as excinfo:
+                require_queue_dir(queue)
+        finally:
+            locked.chmod(0o700)
+        assert str(excinfo.value) == f"not an existing directory: {queue.resolve()}"

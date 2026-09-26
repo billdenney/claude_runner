@@ -336,8 +336,12 @@ class TestLayoutMatchesCode:
         # Guards the check below: a parser that read one tree, or stopped
         # partway through one, would pass on less than the whole layout. The
         # first and last entry of each tree are the known answers.
-        paths = {path for _, path in _layout_entries(ARCHITECTURE.read_text())}
-        assert {"claude_runner.toml", "ema.json", "global.lock", "crontab.backup.<ts>"} <= paths
+        paths = [path for _, path in _layout_entries(ARCHITECTURE.read_text())]
+        assert {"claude_runner.toml", "global.lock", "crontab.backup.<ts>"} <= set(paths)
+        # The per-queue tree now ends with usage_captures/<ts>.cap (ema.json
+        # went with the EMA), and the global tree has an entry of that name
+        # too, so both copies must be read.
+        assert paths.count("usage_captures/<ts>.cap") == 2
 
     def test_every_layout_entry_is_named_in_code(self) -> None:
         missing = _missing(_layout_entries(ARCHITECTURE.read_text()), _code_strings())
