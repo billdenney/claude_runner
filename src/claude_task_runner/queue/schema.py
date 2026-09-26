@@ -114,7 +114,10 @@ class RunRecord(_StrictBase):
     stop_reason: str
     error: str | None = None
     usage: TokenUsage = Field(default_factory=TokenUsage)
-    cost_usd: float = Field(ge=0.0, default=0.0)
+    cost_usd: float | None = Field(ge=0.0, default=0.0)
+    """The cost claude reported on its ``result`` line. ``None`` (unknown)
+    when that cost was not a finite, non-negative number; the dispatcher
+    logs a warning naming it."""
     duration_s: float = Field(ge=0)
     resumed_from_session: str | None = None
     """If this run was started via ``claude --resume <id>``, the session id

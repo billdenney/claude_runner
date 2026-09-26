@@ -18,6 +18,7 @@ real subprocess.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -330,3 +331,39 @@ def test_repeated_persist_failures_escalate_to_error(
     assert len(errors) == n_events - (_HEARTBEAT_PERSIST_FAIL_ESCALATE_AFTER - 1)
     # The escalated records carry the per-dispatch failure count marker.
     assert all("failure" in r.getMessage() for r in errors)
+
+
+def _arriving_every(clock: FakeClock, seconds: float, lines: list[str]) -> Iterator[str]:
+    """Yield ``lines``, advancing ``clock`` by ``seconds`` before each one."""
+    for line in lines:
+        clock.advance(seconds)
+        yield line
+
+
+def test_quietly_skipped_events_never_tick_the_heartbeat() -> None:
+    """``tool_progress`` arrives while a tool runs, including periodic
+    heartbeats during a long Bash call, so it must not count as agent
+    activity: the stuck-sleep-loop reaper acts only while the heartbeat is
+    stale. One line arrives every 10 s and the persist interval is 1 s, so
+    each event that ticks the heartbeat persists it."""
+    clock = FakeClock(datetime(2026, 9, 26, 12, 0, tzinfo=UTC))
+    started = clock.now()
+    progress = (
+        '{"type":"tool_progress","tool_use_id":"toolu_1","tool_name":"Bash",'
+        '"parent_tool_use_id":null,"elapsed_time_seconds":10,"heartbeat":true}'
+    )
+    rate_limit = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}'
+    lines = [_system_init_line(), progress, rate_limit, progress, progress, _result_line()]
+    persists: list[datetime] = []
+
+    _dispatch_loop(
+        lines=_arriving_every(clock, 10, lines),
+        terminate=lambda: None,
+        settings_caps=_caps(persist_s=1.0),
+        clock=clock,
+        task=_task(),
+        started_at=started,
+        heartbeat_persist_fn=persists.append,
+    )
+
+    assert persists == [started + timedelta(seconds=10), started + timedelta(seconds=60)]
