@@ -215,18 +215,28 @@ def register(
         Path.cwd, "--queue", help="Queue directory to register.", show_default=CWD_DEFAULT_LABEL
     ),
 ) -> None:
-    """Register a queue with the cron watchdog so its ticks manage it.
+    """Make a queue the one the cron watchdog manages.
 
-    A cron ``install`` registers its ``--queue`` itself; this registers
-    one without re-running ``install``. The systemd unit does not read
-    this registry. ``watchdog queues`` lists what is registered.
+    One supervisor runs per user, so the watchdog manages one queue, as
+    the systemd unit runs one. This replaces the queue registered before
+    and prints each one it replaced. A cron ``install`` registers its
+    ``--queue`` the same way. While the replaced queue's supervisor still
+    holds the per-user lock, ticks start none; this says so, and how to
+    hand over. The systemd unit does not read this registry.
+    ``watchdog queues`` shows what is registered.
     """
     try:
-        registry_mod.register_queue(queue_dir)
+        replaced = registry_mod.register_queue(queue_dir)
     except OSError as exc:
         print(f"register failed: {exc}", file=sys.stderr)
         raise typer.Exit(code=2) from exc
-    print(f"registered: {queue_dir.resolve()}")
+    queue = queue_dir.resolve()
+    print(f"registered: {queue}")
+    for q in replaced:
+        print(f"replaced: {q}")
+    note = registry_mod.handover_note(queue, replaced)
+    if note is not None:
+        print(note)
 
 
 @app.command("unregister")

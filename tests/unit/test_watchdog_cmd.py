@@ -21,6 +21,7 @@ from claude_task_runner.cron.registry import (
     queues_registry_path,
     register_queue,
 )
+from claude_task_runner.supervisor.pidfile import acquire_global_lock
 
 
 @pytest.fixture
@@ -55,6 +56,58 @@ class TestRegisterCommand:
         assert expected in result.stderr
         assert "registered:" not in result.stdout
         assert not queues_registry_path().exists()
+
+    def test_register_replaces_the_registered_queue(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """One supervisor runs per user, so the watchdog manages one queue."""
+        a, b = isolated_home / "a", isolated_home / "b"
+        a.mkdir()
+        b.mkdir()
+        register_queue(a)
+        result = runner.invoke(app, ["register", "--queue", str(b)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {b.resolve()}\nreplaced: {a.resolve()}\n"
+        assert load_registered_queues() == [b.resolve()]
+
+    def test_register_the_registered_queue_again(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        result = runner.invoke(app, ["register", "--queue", str(queue)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {queue.resolve()}\n"
+
+    def test_register_collapses_an_older_list(self, runner: CliRunner, isolated_home: Path) -> None:
+        a, b, c = (isolated_home / name for name in ("a", "b", "c"))
+        c.mkdir()
+        _write_older_registry([a, b, a])
+        result = runner.invoke(app, ["register", "--queue", str(c)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {c.resolve()}\nreplaced: {a}\nreplaced: {b}\n"
+        assert load_registered_queues() == [c.resolve()]
+
+    def test_register_says_how_to_hand_over_from_the_running_supervisor(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """Ticks start none until the replaced queue's supervisor exits."""
+        a, b = isolated_home / "a", isolated_home / "b"
+        (a / ".claude_task_runner").mkdir(parents=True)
+        b.mkdir()
+        register_queue(a)
+        (a / ".claude_task_runner" / "supervisor.pid").write_text(f"{os.getpid()}\n")
+        with acquire_global_lock():
+            result = runner.invoke(app, ["register", "--queue", str(b)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            f"registered: {b.resolve()}",
+            f"replaced: {a.resolve()}",
+            f"The supervisor for {a.resolve()} (pid {os.getpid()}) still holds global.lock, "
+            "so the watchdog starts this queue's supervisor once it exits. To hand over now, "
+            f"run: claude-task-runner supervisor drain --queue {a.resolve()}",
+        ]
 
 
 def _write_older_registry(queues: list[Path]) -> None:
