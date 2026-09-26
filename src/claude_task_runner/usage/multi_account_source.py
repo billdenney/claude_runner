@@ -18,12 +18,12 @@ without breaking sibling captures.
 Scheduling
 ----------
 The source is driven by ``snapshot.accounts[*].last_capture_at``,
-which the daemon updates after each successful read. The picker
-sorts accounts by ``(last_capture_at or epoch)`` ascending and reads
-the head. This is a strict round-robin in steady state and a
-deterministic order on cold start (driven by the snapshot's account
-key order — which the daemon seeds from
-``settings.accounts``).
+which the daemon stamps after every tick attributed to an account,
+including one whose read failed, so a failing account does not hold
+the head. The picker sorts accounts by
+``(last_capture_at or epoch, name)`` ascending and reads the head.
+This is a strict round-robin in steady state. On cold start, and
+whenever two accounts tie, the order is alphabetical by account name.
 
 Backward compatibility
 ----------------------

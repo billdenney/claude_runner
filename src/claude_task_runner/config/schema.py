@@ -726,8 +726,10 @@ class AccountPolicy(_StrictModel):
     dir. The queue-side ``[[accounts]]`` block only references the
     config_dir; the loader reads the policy here separately.
 
-    Missing file → all defaults. Present-and-partial → unspecified
-    fields fall back to defaults.
+    Missing file → all defaults. A key the file leaves out keeps its
+    default: 1 for ``max_concurrency``, and ``None`` for each
+    ``[dispatch_pct.*]`` key, which :func:`throttle.policy.resolve`
+    fills from the queue's ``[dispatch_pct.*]``.
     """
 
     concurrency: AccountConcurrencyPolicy = Field(default_factory=AccountConcurrencyPolicy)
