@@ -354,18 +354,29 @@ def stop(
     queue_dir: Path = typer.Option(
         Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
     ),
-    timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for clean exit."),
 ) -> None:
-    """Send SIGTERM to the running supervisor.
+    """Send SIGTERM to the running supervisor, and return.
 
     Reads the PID from ``<queue>/.claude_task_runner/supervisor.pid``
-    and signals it. Does NOT wait for completion beyond ``timeout``.
+    and sends it one SIGTERM. Stop does not wait for the supervisor to
+    exit; ``supervisor status`` shows when it has.
 
     When ``[supervisor].adopt_workers`` is on (ADR-0025) this is the
     fast-stop path: the SIGTERM trips the daemon's fast-stop handler, so
-    the supervisor stops dispatching and exits promptly while file-backed
-    workers keep running for the next supervisor to adopt. The systemd
-    unit's ``ExecStop`` is wired here in that mode.
+    the supervisor stops dispatching and exits without waiting for its
+    workers, which keep running, file-backed, for the next supervisor to
+    adopt. The systemd unit's ``ExecStop`` is wired here in that mode, so
+    stop must return at once. With adoption off, the supervisor stops
+    dispatching too, but its process exits only once its in-flight tasks
+    finish.
+
+    \b
+    Exit codes:
+      0  SIGTERM sent
+      1  no supervisor to signal: no PID file, one that holds no PID,
+         or a PID that is not alive
+      2  --queue is not an existing directory, or signal delivery
+         rejected (permission)
     """
     _ = config  # accepted for ExecStop symmetry; stop needs no settings.
     console = Console()

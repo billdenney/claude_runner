@@ -272,17 +272,28 @@ def test_stop_permission_error(runner: CliRunner, queue_dir: Path) -> None:
     assert "not allowed" in result.stdout
 
 
-def test_stop_accepts_timeout_and_never_reads_it(runner: CliRunner, queue_dir: Path) -> None:
-    """Pins today: ``--timeout`` parses, but stop signals once and returns
-    without looking at the supervisor again."""
+def test_stop_signals_once_and_does_not_wait(runner: CliRunner, queue_dir: Path) -> None:
+    """The systemd unit's fast-stop ``ExecStop`` (ADR-0025) relies on this:
+    one SIGTERM, then return, even while the supervisor is still running."""
     clock = _FakeClock()
     with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, alive):
-        result = _invoke(runner, ["stop", "--queue", str(queue_dir), "--timeout", "5"])
+        result = _invoke(runner, ["stop", "--queue", str(queue_dir)])
     assert result.exit_code == 0, result.output
     assert _plain(result.stdout) == f"SIGTERM sent to PID {_PID}.\n"
     kill.assert_called_once_with(_PID, signal.SIGTERM)
     assert alive.call_count == 1
     assert clock.sleeps == []
+
+
+def test_stop_has_no_timeout_option(runner: CliRunner, queue_dir: Path) -> None:
+    """``--timeout`` was accepted from the first release and never read.
+    It is gone rather than implemented, since stop must not wait."""
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
+        result = _invoke(runner, ["stop", "--queue", str(queue_dir), "--timeout", "5"])
+    assert result.exit_code == 2
+    assert "No such option: --timeout" in _plain(result.output)
+    kill.assert_not_called()
 
 
 @pytest.mark.parametrize("command", ["stop", "drain"])

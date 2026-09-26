@@ -93,6 +93,16 @@ Breaking changes are called out in the version notes.
   told to delete it. It also now reads a bracketed reference with a
   `<placeholder>` segment, such as `[ema.priors.<model>.<effort>]`, which it
   used to skip.
+- **The `--timeout` option of `supervisor stop`, which stop never read
+  (breaking for a script that passes it).** It came with the first release,
+  with the help `Seconds to wait for clean exit.` and a docstring saying stop
+  does not wait beyond it, but stop sends one SIGTERM and returns without
+  waiting. Passing it is now a usage error: exit 2 with
+  `No such option: --timeout`. It was removed rather than made to wait
+  because the systemd unit's `ExecStop` runs `supervisor stop` to trip
+  ADR-0025's fast stop, and nothing in the runner passes the option.
+  `supervisor status` shows when the supervisor has exited. stop's docstring
+  now says it does not wait, and lists its exit codes.
 
 ### Changed
 
