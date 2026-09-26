@@ -87,7 +87,10 @@ throttle stack into two pictures the operator can hold in mind:
    at 40–43%, 4 at 44–47%, 3 at 48–51%, 2 at 52–55% and 1 at 56–59%.
    The ramp rounds up, so an account with `max_concurrency = 1` never
    slows down before it stops. Each account slows on its own 5h
-   reading; `account list` shows `in_flight=N/cap`.
+   reading; `account list` shows `in_flight=N/cap`. An account captured
+   while nothing was pending or in flight goes `IDLE` but keeps this
+   cap until its next capture, so tasks that arrive meanwhile cannot
+   run on an account whose last reading was throttled.
 4. The state machine emits Notify + EmitEvent on transitions; the
    payload of `throttled_weekly_entry` carries `observed_pct` and
    `target_pct` so the operator can audit the trace-following math.
@@ -103,8 +106,9 @@ claude-task-runner supervisor status --json
 ```
 
 The JSON snapshot includes `state`, `last_5h_util_pct`,
-`last_weekly_util_pct`, and `scheduled_wakeup_at` — the inputs and
-output of the most recent dispatch decision.
+`last_weekly_util_pct`, `target_concurrency` and `scheduled_wakeup_at` —
+the inputs and output of the most recent dispatch decision, `IDLE`
+included.
 
 On each transition the supervisor also emits `state_transition` /
 `throttled_5h_entry` / `throttled_weekly_entry` events whose payloads

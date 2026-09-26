@@ -54,7 +54,10 @@ class SupervisorState(StrEnum):
     """
 
     IDLE = "idle"
-    """No pending tasks; supervisor polls usage but takes no action."""
+    """Nothing was pending or in flight at the account's last capture;
+    supervisor polls usage but takes no action. Tasks that arrive before
+    the next capture dispatch under the cap that reading called for
+    (``target_concurrency``)."""
 
     DISPATCHING = "dispatching"
     """Predicted utilization < full-band threshold; full target concurrency."""
@@ -124,8 +127,11 @@ class AccountState(BaseModel):
     """How many tasks this account may run at once, from its last throttle
     decision (:attr:`throttle.decision.Decision.target_concurrency`): its
     ``max_concurrency`` while DISPATCHING, ADR-0022's linear ramp while
-    SLOWING_DOWN, 0 while throttled. ``None`` in IDLE and ERROR_DRIFT,
-    which make no decision, and before the first capture.
+    SLOWING_DOWN, 0 while throttled. IDLE records the same decision, since
+    tasks can arrive and dispatch before the account's next capture: an
+    account that goes idle while throttled keeps 0. ``None`` in
+    ERROR_DRIFT, which makes no decision, and before the first capture, so
+    only ``max_concurrency`` caps a cold-start IDLE account.
     :func:`runner.account_dispatch.choose_account` caps the account at
     this and at its ``max_concurrency``, whichever is lower."""
 
