@@ -63,7 +63,10 @@ def _root(
         help="Per-queue claude_runner.toml. Defaults to package settings.",
     ),
 ) -> None:
-    """If no subcommand given, behave like ``render``."""
+    """Usage capture, parse, and drift check.
+
+    With no subcommand, runs ``render``.
+    """
     settings = load_settings(config)
     ctx.ensure_object(dict)
     ctx.obj["settings"] = settings

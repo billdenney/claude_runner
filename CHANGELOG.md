@@ -183,6 +183,19 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`doctor`, `install`, `install-skills` and `usage` print their whole help
+  text for `--help`, not a one-liner.** `cli/__init__.py` passed each of these
+  groups a one-line `help=`, and typer prints that in place of the docstring
+  of the group's callback, where the detail is. So `install --help` hid what
+  its systemd and cron installs do, such as that a cron install replaces the
+  registered queue and that a running systemd unit keeps its supervisor until
+  it restarts. `usage --help` hid that `usage` with no subcommand runs
+  `render`, and its help now begins with the group's summary. The four
+  one-liners are passed as `short_help=`, which only the root listing
+  prints, so `claude-task-runner --help` lists the groups as before, except
+  that `install`'s line is no longer cut short.
+  `tests/unit/test_docs_cli_help.py` checks that every group whose callback
+  has a docstring prints it, and pins the listing's lines.
 - **`claude-task-runner usage` with no subcommand runs `render`, as intended,
   instead of crashing.** `docs/cheatsheet.md` gives bare `usage` for live
   utilization, but from v0.1.0 on it printed a `TypeError` traceback and exited
