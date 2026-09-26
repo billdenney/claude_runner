@@ -17,18 +17,18 @@ from claude_task_runner.queue.schema import (
 )
 from claude_task_runner.queue.sidecar import (
     list_open_sidecars,
-    next_sequence,
+    load_sidecar_payload,
     open_sidecars,
     read_request,
-    read_response,
     request_outstanding,
     request_path,
     response_path,
     sidecar_dir_for,
-    write_request,
     write_response,
 )
 from claude_task_runner.queue.store import QueueIOError, QueueSchemaError
+
+from ._sidecar_files import write_request
 
 
 @pytest.fixture
@@ -74,28 +74,6 @@ class TestPaths:
         assert d.is_dir()
 
 
-class TestSequence:
-    def test_first_sequence_is_one(self, queue_dir: Path) -> None:
-        assert next_sequence(queue_dir, "001-foo") == 1
-
-    def test_increments_past_existing(self, queue_dir: Path) -> None:
-        write_request(queue_dir, _request("001", sequence=1))
-        write_request(queue_dir, _request("001", sequence=2))
-        assert next_sequence(queue_dir, "001") == 3
-
-    def test_isolated_per_task(self, queue_dir: Path) -> None:
-        write_request(queue_dir, _request("001", sequence=1))
-        write_request(queue_dir, _request("001", sequence=2))
-        # Second task starts fresh.
-        assert next_sequence(queue_dir, "002") == 1
-
-    def test_handles_gaps(self, queue_dir: Path) -> None:
-        # Files 1, 3 exist; next should be 4 not 2 (no gap-filling).
-        write_request(queue_dir, _request("001", sequence=1))
-        write_request(queue_dir, _request("001", sequence=3))
-        assert next_sequence(queue_dir, "001") == 4
-
-
 class TestRoundTrip:
     def test_write_read_request(self, queue_dir: Path) -> None:
         req = _request("001", sequence=1)
@@ -114,7 +92,7 @@ class TestRoundTrip:
             notes="quick pick",
         )
         path = write_response(queue_dir, resp)
-        loaded = read_response(path)
+        loaded = SidecarResponse.model_validate(load_sidecar_payload(path))
         assert loaded == resp
         assert loaded.notes == "quick pick"
 
@@ -172,21 +150,21 @@ class TestErrors:
         with pytest.raises(QueueSchemaError):
             read_request(path)
 
-    def test_write_request_with_wrong_schema_version_rejected(self, queue_dir: Path) -> None:
-        # Construct via dict to force wrong version
-        when = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
-        bad = SidecarRequest.model_construct(
+    def test_write_response_with_wrong_schema_version_rejected(self, queue_dir: Path) -> None:
+        # model_construct skips validation, so the wrong version gets through
+        # to write_response's own guard.
+        bad = SidecarResponse.model_construct(
             schema_version=999,
             task_id="001",
             sequence=1,
-            created_at=when,
-            summary="s",
-            context="c",
-            questions=[],
-            state="pending",
+            responded_at=datetime(2026, 5, 3, 19, 0, tzinfo=UTC),
+            answers=[],
         )
-        with pytest.raises(QueueSchemaError, match="schema_version=999"):
-            write_request(queue_dir, bad)
+        with pytest.raises(
+            QueueSchemaError, match="refusing to write SidecarResponse with schema_version=999"
+        ):
+            write_response(queue_dir, bad)
+        assert not response_path(queue_dir, "001", 1).exists()
 
 
 def _three_question_request(task_id: str = "001", sequence: int = 1) -> SidecarRequest:
