@@ -12,6 +12,7 @@ from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron.backoff import (
     WATCHDOG_STATE_FILENAME,
+    WatchdogDecision,
     WatchdogState,
     WatchdogStateError,
     WatchdogVerdict,
@@ -142,6 +143,51 @@ class TestDecide:
         )
         assert out.verdict is WatchdogVerdict.BACKOFF
         assert out.new_state.last_backoff_alerted_at == clock.now()
+
+
+_T0 = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
+_CRON_TICK_S = 60.0
+"""The crontab line a cron ``install`` adds runs the tick every minute."""
+
+
+def _cron_ticks(
+    settings: WatchdogSettings, *, ticks: int, survive_s: float = 0.0
+) -> list[WatchdogDecision]:
+    """Drive :func:`decide` once per cron tick, carrying its state along.
+
+    The supervisor dies ``survive_s`` after each start the watchdog
+    approves (``0``: it never comes up), as a crash on startup does."""
+    state = WatchdogState()
+    started: datetime | None = None
+    decisions = []
+    for k in range(ticks):
+        now = _T0 + timedelta(seconds=k * _CRON_TICK_S)
+        alive = started is not None and (now - started).total_seconds() < survive_s
+        decision = decide(
+            state=state, supervisor_alive=alive, settings=settings, clock=FakeClock(now)
+        )
+        if decision.verdict is WatchdogVerdict.RESTART:
+            started = now
+        state = decision.new_state
+        decisions.append(decision)
+    return decisions
+
+
+def _restart_ticks(decisions: list[WatchdogDecision]) -> list[int]:
+    return [k for k, d in enumerate(decisions) if d.verdict is WatchdogVerdict.RESTART]
+
+
+class TestCronCadence:
+    """:func:`decide` at the cadence the crontab line runs the tick."""
+
+    def test_a_supervisor_that_never_comes_up_is_restarted_every_minute(self) -> None:
+        """Pins the current behaviour, the bug: the backoff never engages.
+
+        Restarts are counted over min(10 x cooldown, max) = 300 s, and a
+        timestamp exactly 300 s old is pruned. So at one tick a minute the
+        count before a decision is at most 4, below the threshold of 5."""
+        decisions = _cron_ticks(_settings(), ticks=120)
+        assert _restart_ticks(decisions) == list(range(120))
 
 
 class TestPersistence:
