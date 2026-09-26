@@ -75,9 +75,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ),
     ("runner/stream.py", "StreamWarning"): "removed by fix/surface-skipped-stream-lines",
     ("runner/stream.py", "skipped_lines"): "read once fix/surface-skipped-stream-lines lands",
-    ("supervisor/state_machine.py", "request_stop"): "removed by chore/retire-stopped-state",
-    ("supervisor/state_machine.py", "request_resume"): "removed by chore/retire-stopped-state",
-    ("supervisor/state_machine.py", "all_states"): "removed by chore/retire-stopped-state",
     ("throttle/decision.py", "target_concurrency"): (
         "ADR-0022's slowdown ramp, which dispatch ignores; its card decides wire or remove"
     ),
