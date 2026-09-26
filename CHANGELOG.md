@@ -236,6 +236,24 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`queue force-dispatch` refuses a task whose `requires` are unmet before it
+  writes a request, and says a request persists only while its file is
+  there.** With a supervisor running, the CLI wrote a request for such a task
+  and reported `ok`. The supervisor's next tick dropped the request with a
+  WARNING in its log, because force overrides the throttle, not a missing
+  input (ADR-0030). After `--wait-seconds` the CLI then said the supervisor
+  "may be honouring max_concurrency" and that "the request file persists", and
+  both claims were wrong. The CLI now runs the readiness check after its status
+  and effort checks, before either path, and exits 2 naming every unmet
+  element as `queue show` lists them; with `--json` the error also carries
+  them as an `unmet` list. Without a supervisor the in-process path already
+  refused the task, and now the CLI refuses it before that path starts. The
+  "still not running" note now checks for the request file first. If the file
+  is gone, the supervisor either dispatched the task, whose pre-dispatch hook
+  may still be running or may have deferred it, or dropped the request for
+  another reason, such as a status change. The note then says so and points
+  to `queue show <id>`. Both notes and the new error are printed without Rich
+  markup, so a `[` in a path is kept.
 - **A task whose (model, effort) pair the queue's `[effort_levels]` rejects is
   parked, not dispatched.** ADR-0010 said `Task.effort` was validated at load
   time, but only `queue add` checked it: a hand-written or edited task YAML
