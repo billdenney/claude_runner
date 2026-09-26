@@ -34,10 +34,13 @@ awaiting_sidecar / possibly_hung / failed_circuit_breaker), todo/
 count, open-sidecar list (task_id + sequence + the outstanding
 question ids), and a **per-account
 state table** sourced from supervisor.json's v3 `accounts` map
-(state, 5h/weekly util, paused, in-flight count, reset + wakeup
-times, last-capture timestamp). Multi-account queues see one row
-per configured `[[accounts]]` block; single-account queues see a
-single `default` row mirrored from the top-level fields.
+(state, 5h/weekly util, paused, in-flight count, throttle target,
+reset + wakeup times, last-capture timestamp). The target is the
+most tasks dispatch lets the account run (below its
+`max_concurrency`): the ADR-0022 ramp while `slowing_down`, 0 while
+throttled, "—" when no decision has set one. Multi-account queues
+see one row per configured `[[accounts]]` block; single-account
+queues see a single `default` row that tracks the top-level fields.
 
 This is the **default invocation** when the user says
 `/runner-status` or "queue status" — produces the same output shape
@@ -77,7 +80,9 @@ or recent failures), follow the prioritized triage flow below.
       `snapshot.scheduled_wakeup_at` if present.
 
    3. **5h throttle** — if `snapshot.state in ("throttled_5h",
-      "slowing_down")`: print 5h utilization + state.
+      "slowing_down")`: print 5h utilization + state. For each
+      `slowing_down` account, also give its target from the
+      per-account table ("personal slowing down, target 2").
 
    4. **Awaiting sidecars** — run
       `claude-task-runner queue states --status awaiting_sidecar

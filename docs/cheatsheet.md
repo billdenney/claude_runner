@@ -79,9 +79,20 @@ throttle stack into two pictures the operator can hold in mind:
 2. **Then 5h.** Pick day or night band by local time-of-day.
    Compare observed 5h utilization to the band's thresholds and
    classify as `DISPATCHING` / `SLOWING_DOWN` / `THROTTLED_5H`.
-3. The state machine emits Notify + EmitEvent on transitions; the
+3. **Cap the account.** The decision's `target_concurrency` caps the
+   account it was made for: its `max_concurrency` while
+   `DISPATCHING`, 0 while throttled, and while `SLOWING_DOWN`
+   `ceil(max_concurrency × (stop − observed) / (stop − slowdown))`.
+   With `max_concurrency = 5` and the 40/60 day band that is 5 tasks
+   at 40–43%, 4 at 44–47%, 3 at 48–51%, 2 at 52–55% and 1 at 56–59%.
+   The ramp rounds up, so an account with `max_concurrency = 1` never
+   slows down before it stops. Each account slows on its own 5h
+   reading; `account list` shows `in_flight=N/cap`.
+4. The state machine emits Notify + EmitEvent on transitions; the
    payload of `throttled_weekly_entry` carries `observed_pct` and
    `target_pct` so the operator can audit the trace-following math.
+   `SLOWING_DOWN` notifies `target concurrency=X/Y` on entry and again
+   whenever `X` changes.
 
 ## Common operator tasks
 

@@ -74,9 +74,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
         "every directive build_unit_text writes is in exactly one set"
     ),
     # --- Dead; each names what removes it or decides its fate --------------
-    ("throttle/decision.py", "target_concurrency"): (
-        "ADR-0022's slowdown ramp, which dispatch ignores; its card decides wire or remove"
-    ),
     ("runner/stream.py", "text_excerpt"): "unread stream-parse output",
     ("runner/stream.py", "usage_delta"): "unread stream-parse output",
     ("runner/stream.py", "subtype"): "unread stream-parse output",

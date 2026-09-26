@@ -297,3 +297,31 @@ in May 2026 for ADR-0011's EMA formula, which divided predicted tokens
 by them, and that formula was never built either. Both keys have been
 removed, and the loader rejects a queue TOML that still sets them with a
 message saying to delete them. Deleting them changes nothing.
+
+## Update (2026-09-26)
+
+The slowdown half of the "Decision rule" above was computed but never
+applied. `decide()` computed the linear ramp, and the supervisor
+announced it on entering `SLOWING_DOWN` (`target concurrency=X/Y`), but
+nothing read `Decision.target_concurrency`. Dispatch halved the
+queue-wide `[concurrency].max_concurrency` whenever the top-level state
+was `SLOWING_DOWN` instead. That was a placeholder from 2026-05-06, when
+the orchestrator was first wired, and predates this ADR. The top-level
+state mirrors the most recently captured account, so with several
+accounts the halving applied or not depending on capture order.
+
+The ramp now takes effect, per account. The state machine records each
+decision's `target_concurrency` on the account's state (`supervisor.json`
+schema v6). `runner.account_dispatch.choose_account` caps the account at
+its `max_concurrency` lowered to that target. The ramp scales the
+account's own `max_concurrency`, the cap dispatch already applied to it.
+The halving is gone. The queue-wide `[concurrency]` ceiling on total
+in-flight tasks remains, and it does not depend on throttle state. The
+supervisor repeats the `SLOWING_DOWN` notice whenever the target changes.
+
+The same investigation found that a single-account queue's readings,
+which name no account, never reached `accounts["default"]`. Since the
+per-account dispatch gate (2026-05-22), `THROTTLED_5H`,
+`THROTTLED_WEEKLY` and `ERROR_DRIFT` therefore did not stop a
+single-account queue from dispatching. Such readings now belong to the
+queue's only account.

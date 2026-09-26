@@ -7,9 +7,11 @@ throttled, unpinned with multiple candidates (util tie-breaks),
 pinned-at-capacity, unpinned with no eligible account.
 
 All accounts are equal priority — the dispatcher picks the least-
-utilized account with free capacity. There is no queue-wide cap;
+utilized account with free capacity. There is no queue-wide cap here;
 ``max_concurrency`` comes from each account's
-``<config_dir>/runner-account.toml`` via :class:`ResolvedAccount`.
+``<config_dir>/runner-account.toml`` via :class:`ResolvedAccount`, and
+the ``target_concurrency`` of the account's last throttle decision
+lowers it (the ADR-0022 ramp while SLOWING_DOWN).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from claude_task_runner.config.schema import (
 )
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.runner.account_dispatch import (
+    account_cap,
     account_in_flight_count,
     choose_account,
 )
@@ -41,6 +44,7 @@ def _state(
     util_5h: int = 0,
     util_weekly: int = 0,
     paused: bool = False,
+    target: int | None = None,
 ) -> AccountState:
     return AccountState(
         state=state,
@@ -48,6 +52,7 @@ def _state(
         last_5h_util_pct=util_5h,
         last_weekly_util_pct=util_weekly,
         paused=paused,
+        target_concurrency=target,
     )
 
 
@@ -280,6 +285,77 @@ class TestUnpinnedPolicy:
             in_flight=[],
         )
         assert choice.account == "personal"
+
+
+class TestThrottleTarget:
+    """An account's cap is its ``max_concurrency``, lowered to the
+    ``target_concurrency`` of its last throttle decision."""
+
+    @pytest.mark.parametrize(
+        ("max_concurrency", "target", "expected"),
+        [(5, None, 5), (5, 2, 2), (2, 5, 2), (5, 0, 0)],
+        ids=["no-target", "target-below-max", "max-below-target", "zero-target"],
+    )
+    def test_account_cap(self, max_concurrency: int, target: int | None, expected: int) -> None:
+        assert account_cap(_account("personal", cap=max_concurrency), _state(target=target)) == (
+            expected
+        )
+
+    def test_slowing_account_takes_tasks_below_its_target(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal", cap=5)},
+            account_states={"personal": _state(state=SupervisorState.SLOWING_DOWN, target=2)},
+            in_flight=_in_flight("personal", 1),
+        )
+        assert choice.account == "personal"
+
+    def test_slowing_account_at_its_target_is_skipped(self) -> None:
+        """At 2 of a target of 2 the account is full, although its
+        max_concurrency of 5 has room; the other account takes the task."""
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal", cap=5), "work": _account("work", cap=1)},
+            account_states={
+                "personal": _state(state=SupervisorState.SLOWING_DOWN, target=2),
+                "work": _state(util_5h=30, target=1),
+            },
+            in_flight=_in_flight("personal", 2),
+        )
+        assert choice.account == "work"
+
+    def test_decline_reason_names_in_flight_and_cap(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal", cap=5)},
+            account_states={"personal": _state(state=SupervisorState.SLOWING_DOWN, target=2)},
+            in_flight=_in_flight("personal", 2),
+        )
+        assert choice.account is None
+        assert choice.reason == "no eligible account: personal: at capacity (2/2)"
+
+    def test_pinned_task_obeys_the_target(self) -> None:
+        choice = choose_account(
+            task=_task(account="personal"),
+            accounts={"personal": _account("personal", cap=5)},
+            account_states={"personal": _state(state=SupervisorState.SLOWING_DOWN, target=2)},
+            in_flight=_in_flight("personal", 2),
+        )
+        assert choice.account is None
+        assert choice.reason == "pinned account 'personal' at capacity (2/2)"
+
+    def test_affined_task_obeys_the_target(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal", cap=5)},
+            account_states={"personal": _state(state=SupervisorState.SLOWING_DOWN, target=2)},
+            in_flight=_in_flight("personal", 2),
+            affined_account="personal",
+        )
+        assert choice.account is None
+        assert choice.reason == (
+            "session affinity blocks dispatch: host account 'personal' at capacity (2/2)"
+        )
 
 
 class TestInFlightCount:
