@@ -1016,22 +1016,62 @@ def check_supervisor_state(settings: Settings, queue_dir: Path) -> CheckResult:
 
 
 def check_skills_installed(_settings: Settings) -> CheckResult:
-    """Skills should be present in ``~/.claude/skills/``."""
-    from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES
+    """Every skill should be in ``~/.claude/skills/``, with its ``SKILL.md``.
 
-    target = Path.home() / ".claude" / "skills"
-    missing = [n for n in SKILL_NAMES if not (target / n).exists()]
-    if missing:
+    A symlink to nothing or a directory without a ``SKILL.md`` counts as
+    broken, not installed. A skill that cannot be checked, for instance
+    because ``~/.claude`` is not readable, is reported instead of raised,
+    so the rest of the doctor still runs.
+    """
+    from claude_task_runner.cli.install_skills_cmd import (
+        SKILL_NAMES,
+        SkillState,
+        skill_state,
+        skills_dir,
+    )
+
+    target = skills_dir()
+    found: dict[SkillState, list[str]] = {state: [] for state in SkillState}
+    unchecked: list[str] = []
+    for name in SKILL_NAMES:
+        try:
+            found[skill_state(target / name)].append(name)
+        except OSError as exc:
+            unchecked.append(f"  {name}: {exc}")
+    missing = found[SkillState.MISSING]
+    dangling = found[SkillState.DANGLING]
+    incomplete = found[SkillState.INCOMPLETE]
+    bad = len(missing) + len(dangling) + len(incomplete)
+    if not bad and not unchecked:
         return CheckResult(
             name="skills_installed",
-            status=CheckStatus.WARN,
-            detail=f"{len(missing)} of {len(SKILL_NAMES)} skills not installed",
-            remediation=(f"Run `claude-task-runner install-skills --yes`. Missing: {missing}"),
+            status=CheckStatus.PASS,
+            detail=f"all {len(SKILL_NAMES)} task-runner skills present at {target}",
         )
+    details: list[str] = []
+    remediation: list[str] = []
+    if bad:
+        details.append(f"{bad} of {len(SKILL_NAMES)} skills missing or broken")
+        # install-skills replaces a broken symlink by itself, but only
+        # --overwrite replaces something without a SKILL.md.
+        overwrite = " --overwrite" if incomplete else ""
+        remediation.append(f"Run `claude-task-runner install-skills --yes{overwrite}`.")
+        for label, names in (
+            ("Missing", missing),
+            ("Broken symlink", dangling),
+            ("No SKILL.md", incomplete),
+        ):
+            if names:
+                remediation.append(f"{label}: {', '.join(names)}")
+    if unchecked:
+        details.append(f"could not check {len(unchecked)} of {len(SKILL_NAMES)} skills")
+        remediation.append("Could not check these; fix the error, then re-run the doctor:")
+        remediation.extend(unchecked)
     return CheckResult(
         name="skills_installed",
-        status=CheckStatus.PASS,
-        detail=f"all {len(SKILL_NAMES)} task-runner skills present at {target}",
+        status=CheckStatus.WARN,
+        detail="; ".join(details),
+        remediation="\n".join(remediation),
     )
 
 

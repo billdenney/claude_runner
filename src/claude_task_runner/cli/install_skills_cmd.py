@@ -21,10 +21,14 @@ warrants a y/N prompt by default.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
+import stat
+from enum import StrEnum
 from importlib import resources
 from pathlib import Path
+from typing import assert_never
 
 import typer
 from rich.console import Console
@@ -65,11 +69,63 @@ loudly if a directory is missing rather than silently skipping.
 ``skills_installed`` check all iterate this union."""
 
 
-def _skills_target_dir() -> Path:
-    """Resolve ``~/.claude/skills/`` and ensure it exists."""
-    base = Path.home() / ".claude" / "skills"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+def skills_dir() -> Path:
+    """``~/.claude/skills/``. Only an install creates it."""
+    return Path.home() / ".claude" / "skills"
+
+
+class SkillState(StrEnum):
+    """What :func:`skill_state` finds at a skill's path in ``~/.claude/skills/``."""
+
+    MISSING = "missing"
+    """Nothing is there."""
+    SYMLINKED = "symlinked"
+    """A symlink to a directory with a ``SKILL.md``."""
+    COPIED = "copied"
+    """A directory with a ``SKILL.md``."""
+    DANGLING = "dangling"
+    """A symlink to nothing, as when its checkout was moved or deleted."""
+    INCOMPLETE = "incomplete"
+    """Something without a ``SKILL.md``, such as a copy that stopped partway."""
+
+
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+"""The errors that mean nothing is at a path: no entry, a file where a
+directory should be, or a symlink loop."""
+
+
+def _stat_if_present(path: Path, *, follow_symlinks: bool = True) -> os.stat_result | None:
+    """``path``'s stat, or None when nothing is there.
+
+    Any other error, such as a permission error, is raised: the path
+    could not be checked, which is not the same as absent. ``Path.exists()``
+    cannot tell the two apart: Python 3.11 to 3.13 raise the permission
+    error from it, and 3.14 returns False.
+    """
+    try:
+        return path.stat(follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS:
+            return None
+        raise
+
+
+def skill_state(path: Path) -> SkillState:
+    """Classify what is at ``path``, a skill's directory in ``~/.claude/skills/``.
+
+    Raises OSError when ``path`` cannot be checked, for instance when a
+    directory above it cannot be read.
+    """
+    entry = _stat_if_present(path, follow_symlinks=False)
+    if entry is None:
+        return SkillState.MISSING
+    is_link = stat.S_ISLNK(entry.st_mode)
+    if is_link and _stat_if_present(path) is None:
+        return SkillState.DANGLING
+    skill_md = _stat_if_present(path / "SKILL.md")
+    if skill_md is None or not stat.S_ISREG(skill_md.st_mode):
+        return SkillState.INCOMPLETE
+    return SkillState.SYMLINKED if is_link else SkillState.COPIED
 
 
 def _packaged_skill_dir(name: str) -> Path:
@@ -123,13 +179,25 @@ def _install_one(
     """Install one skill. Returns ``(installed, detail)``.
 
     ``installed=False`` means we skipped (already present and
-    overwrite=False).
+    overwrite=False). A symlink to nothing is replaced without
+    ``overwrite``, since there is nothing in it to keep. Raises OSError
+    when the install fails, including FileExistsError when something
+    without a ``SKILL.md`` is in the way and ``overwrite`` is False.
     """
     src = _packaged_skill_dir(name)
     dst = target_dir / name
 
-    if dst.exists() or dst.is_symlink():
+    replaced = ""
+    state = skill_state(dst)
+    if state is SkillState.DANGLING:
+        replaced = f", replacing a broken symlink to {os.readlink(dst)}"
+        dst.unlink()
+    elif state is not SkillState.MISSING:
         if not overwrite:
+            if state is SkillState.INCOMPLETE:
+                raise FileExistsError(
+                    f"{dst} has no SKILL.md; rerun with --overwrite to replace it"
+                )
             return False, f"already present at {dst}"
         if dst.is_symlink() or dst.is_file():
             dst.unlink()
@@ -138,9 +206,48 @@ def _install_one(
 
     if use_symlinks:
         dst.symlink_to(src)
-        return True, f"symlinked → {src}"
-    shutil.copytree(src, dst)
-    return True, f"copied from {src}"
+        return True, f"symlinked → {src}{replaced}"
+    try:
+        shutil.copytree(src, dst)
+    except FileExistsError:
+        # Something else created dst after the check above; not ours to remove.
+        raise
+    except OSError as exc:
+        _remove_partial_copy(dst, exc)
+        raise
+    return True, f"copied from {src}{replaced}"
+
+
+def _remove_partial_copy(dst: Path, exc: OSError) -> None:
+    """Remove what a failed copy left at ``dst``, so no later run takes it
+    for an install. If that fails too, raise an OSError naming both errors."""
+    try:
+        shutil.rmtree(dst)
+    except FileNotFoundError:
+        pass  # The copy failed before it created dst.
+    except OSError as cleanup_exc:
+        raise OSError(
+            f"{exc}; the partial copy at {dst} could not be removed: {cleanup_exc}"
+        ) from exc
+
+
+def _plan_note(dst: Path, *, overwrite: bool) -> str:
+    """What the install will find at ``dst``, for the line that lists it."""
+    try:
+        state = skill_state(dst)
+    except OSError as exc:
+        return f" (cannot check: {exc})"
+    if state is SkillState.MISSING:
+        return ""
+    if state is SkillState.SYMLINKED or state is SkillState.COPIED:
+        return " (exists)"
+    if state is SkillState.DANGLING:
+        return " (broken symlink, will be replaced)"
+    if state is SkillState.INCOMPLETE:
+        return (
+            " (no SKILL.md, will be replaced)" if overwrite else " (no SKILL.md, needs --overwrite)"
+        )
+    assert_never(state)  # pragma: no cover — mypy checks every state is handled above
 
 
 @app.callback(invoke_without_command=True)
@@ -169,7 +276,18 @@ def install_skills(
         return
 
     console = Console()
-    target = _skills_target_dir()
+    target = skills_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        console.print(
+            f"cannot create {target}: {exc}",
+            style="bold red",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        raise typer.Exit(code=2) from exc
     use_symlinks = (not copy) and _supports_symlinks(target)
 
     plan: list[tuple[str, Path]] = []
@@ -191,9 +309,12 @@ def install_skills(
         f"[bold]Skills target:[/] {target}    [dim]mode: {'symlink' if use_symlinks else 'copy'}[/]"
     )
     for name, src in plan:
-        dst = target / name
-        existing = "[yellow](exists)[/]" if dst.exists() else ""
-        console.print(f"  • {name}: [dim]{src}[/] {existing}")
+        console.print(
+            f"  • {name}: {src}{_plan_note(target / name, overwrite=overwrite)}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
 
     if not yes and not Confirm.ask("\nInstall these skills?", default=True):
         console.print("[yellow]Aborted.[/]")
@@ -220,11 +341,25 @@ def install_skills(
                 soft_wrap=True,
             )
             continue
-        marker = "[green]installed[/]" if installed else "[dim]skipped[/]"
-        console.print(f"  {marker} {name}: {detail}")
+        console.print(
+            f"  {'installed' if installed else 'skipped'} {name}: {detail}",
+            style="green" if installed else "dim",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
     if failed:
         console.print(f"[bold red]Failed to install {failed} of {len(plan)} skills.[/]")
         raise typer.Exit(code=2)
+
+
+_REMOVAL_KINDS = {
+    SkillState.SYMLINKED: "symlink",
+    SkillState.COPIED: "directory",
+    SkillState.DANGLING: "broken symlink",
+    SkillState.INCOMPLETE: "no SKILL.md",
+}
+"""How ``uninstall`` names each present state in the list it confirms."""
 
 
 @app.command("uninstall")
@@ -238,25 +373,48 @@ def uninstall_skills(
     that share a directory.
     """
     console = Console()
-    target = _skills_target_dir()
+    target = skills_dir()
 
-    present = [n for n in SKILL_NAMES if (target / n).exists() or (target / n).is_symlink()]
+    present: list[tuple[str, SkillState]] = []
+    unchecked = 0
+    for name in SKILL_NAMES:
+        try:
+            state = skill_state(target / name)
+        except OSError as exc:
+            unchecked += 1
+            console.print(
+                f"  cannot check {name}: {exc}",
+                style="bold red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+            continue
+        if state is not SkillState.MISSING:
+            present.append((name, state))
     if not present:
-        console.print(f"[dim]No task-runner skills found under {target}[/]")
+        if unchecked:
+            console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+            raise typer.Exit(code=2)
+        console.print(
+            f"No task-runner skills found under {target}",
+            style="dim",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
         return
 
     console.print(f"[bold]Will remove:[/] {target}")
-    for name in present:
-        path = target / name
-        kind = "symlink" if path.is_symlink() else "directory"
-        console.print(f"  • {name} ({kind})")
+    for name, state in present:
+        console.print(f"  • {name} ({_REMOVAL_KINDS[state]})")
 
     if not yes and not Confirm.ask("\nRemove?", default=False):
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
 
     failed = 0
-    for name in present:
+    for name, _state in present:
         path = target / name
         try:
             if path.is_symlink() or path.is_file():
@@ -276,19 +434,44 @@ def uninstall_skills(
         console.print(f"  [green]removed[/] {name}")
     if failed:
         console.print(f"[bold red]Failed to remove {failed} of {len(present)} skills.[/]")
+    if unchecked:
+        console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+    if failed or unchecked:
         raise typer.Exit(code=2)
+
+
+def _list_line(name: str, path: Path) -> tuple[str, str]:
+    """``install-skills list``'s line for the skill at ``path``, and its style.
+
+    Raises OSError when ``path`` cannot be checked.
+    """
+    state = skill_state(path)
+    if state is SkillState.SYMLINKED:
+        return f"  ✓ {name}: symlinked → {os.readlink(path)}", "green"
+    if state is SkillState.COPIED:
+        return f"  ✓ {name}: copied at {path}", "green"
+    if state is SkillState.MISSING:
+        return f"  ✗ {name}: not installed", "dim"
+    if state is SkillState.DANGLING:
+        return f"  ✗ {name}: broken symlink → {os.readlink(path)}, which does not exist", "red"
+    if state is SkillState.INCOMPLETE:
+        return f"  ✗ {name}: no SKILL.md in {path}", "red"
+    assert_never(state)  # pragma: no cover — mypy checks every state is handled above
 
 
 @app.command("list")
 def list_installed() -> None:
     """Show which task-runner skills are present in ``~/.claude/skills/``."""
     console = Console()
-    target = _skills_target_dir()
+    target = skills_dir()
+    unchecked = 0
     for name in SKILL_NAMES:
-        path = target / name
-        if path.is_symlink():
-            console.print(f"  [green]✓[/] {name}: symlinked → {os.readlink(path)}")
-        elif path.exists():
-            console.print(f"  [green]✓[/] {name}: copied at {path}")
-        else:
-            console.print(f"  [dim]✗[/] {name}: not installed")
+        try:
+            line, style = _list_line(name, target / name)
+        except OSError as exc:
+            unchecked += 1
+            line, style = f"  ? {name}: cannot check: {exc}", "bold red"
+        console.print(line, style=style, markup=False, highlight=False, soft_wrap=True)
+    if unchecked:
+        console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+        raise typer.Exit(code=2)
