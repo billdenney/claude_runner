@@ -9,6 +9,7 @@ import pytest
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.runner.caps import (
+    CapViolation,
     effective_duration_cap_s,
     effective_token_cap,
     evaluate_caps,
@@ -94,6 +95,17 @@ class TestEvaluate:
         )
         assert v is None
 
+    def test_token_cap_one_over_cap_breach(self) -> None:
+        s = _settings(max_tokens=1_000_000)
+        v = evaluate_caps(
+            settings=s,
+            task=_task(),
+            cumulative_tokens=1_000_001,
+            started_at=self._now(),
+            now=self._now() + timedelta(seconds=10),
+        )
+        assert v == CapViolation(which="tokens", observed=1_000_001.0, cap=1_000_000.0)
+
     def test_duration_cap_breach(self) -> None:
         s = _settings(max_duration=600)
         v = evaluate_caps(
@@ -107,6 +119,39 @@ class TestEvaluate:
         assert v.which == "duration"
         assert v.observed == 900.0
         assert v.cap == 600.0
+
+    def test_duration_cap_one_second_under_no_violation(self) -> None:
+        s = _settings(max_duration=600)
+        v = evaluate_caps(
+            settings=s,
+            task=_task(),
+            cumulative_tokens=0,
+            started_at=self._now(),
+            now=self._now() + timedelta(seconds=599),
+        )
+        assert v is None
+
+    def test_duration_cap_at_exactly_cap_no_violation(self) -> None:
+        s = _settings(max_duration=600)
+        v = evaluate_caps(
+            settings=s,
+            task=_task(),
+            cumulative_tokens=0,
+            started_at=self._now(),
+            now=self._now() + timedelta(seconds=600),
+        )
+        assert v is None
+
+    def test_duration_cap_one_second_over_breach(self) -> None:
+        s = _settings(max_duration=600)
+        v = evaluate_caps(
+            settings=s,
+            task=_task(),
+            cumulative_tokens=0,
+            started_at=self._now(),
+            now=self._now() + timedelta(seconds=601),
+        )
+        assert v == CapViolation(which="duration", observed=601.0, cap=600.0)
 
     def test_token_cap_takes_precedence_over_duration(self) -> None:
         s = _settings(max_tokens=1_000_000, max_duration=600)
