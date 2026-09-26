@@ -52,11 +52,13 @@ Rich markup in ``console.print`` output is separate and still renders;
 from __future__ import annotations
 
 import inspect
+import os
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Annotated, Any
+from unittest import mock
 
 import pytest
 import typer
@@ -164,8 +166,21 @@ def _squash(text: str) -> str:
     return "".join(_ANSI.sub("", text).split())
 
 
-def _render_help(root: typer.Typer, path: tuple[str, ...]) -> str:
-    result = CliRunner().invoke(root, [*path, "--help"])
+def _help_width(columns: int) -> int:
+    """The width click lays help out at in a terminal ``columns`` wide.
+
+    Asked of click outside its test runner, which lays help out 80
+    columns wide whatever the terminal. A real 80-column terminal gets 78.
+    """
+    with mock.patch.dict(os.environ, {"COLUMNS": str(columns)}):
+        ctx = CLI.make_context(CLI.name, [], resilient_parsing=True)
+        return int(ctx.make_formatter().width)
+
+
+def _render_help(root: typer.Typer, path: tuple[str, ...], columns: int | None = None) -> str:
+    """``path``'s ``--help``, laid out as in a terminal ``columns`` wide if given."""
+    extra = {} if columns is None else {"terminal_width": _help_width(columns)}
+    result = CliRunner().invoke(root, [*path, "--help"], **extra)
     assert result.exit_code == 0, result.output
     return result.output
 
@@ -289,6 +304,47 @@ def _page_paragraphs(path: tuple[str, ...], root: typer.Typer = app) -> list[str
     return _one_line_paragraphs(text)
 
 
+_LISTING_COLUMNS = 80
+"""The terminal width the listing checks render at. Click lays help out no
+wider in a wider terminal, so a row that fits here fits there too."""
+
+
+def _listing(path: tuple[str, ...], root: typer.Typer = app) -> dict[str, str]:
+    """The ``Commands:`` section of ``path``'s ``--help`` in an 80-column
+    terminal: each command's name, and its row's text on one line."""
+    output = _ANSI.sub("", _render_help(root, path, columns=_LISTING_COLUMNS))
+    _, found, section = output.partition("\nCommands:\n")
+    assert found, output
+    rows: dict[str, str] = {}
+    name = ""
+    for line in section.splitlines():
+        if line.startswith("  ") and not line.startswith("   "):
+            name, _, text = line.strip().partition(" ")
+            rows[name] = text.strip()
+        elif line.strip():
+            rows[name] = f"{rows[name]} {line.strip()}".strip()
+    return rows
+
+
+def _cut_short(root: typer.Typer = app) -> dict[tuple[str, ...], dict[str, str]]:
+    """The listing rows that end in ``...``, by group path and command name.
+
+    Click lists a command by the first sentence of its help. When that
+    sentence does not fit, click cuts it at a word and adds ``...``. A
+    ``short_help`` is listed whole instead, wrapped if need be.
+    """
+    tree = typer.main.get_command(root)
+    cut: dict[tuple[str, ...], dict[str, str]] = {}
+    for path in _command_paths(tree):
+        if getattr(_node(path, tree), "commands", None):
+            rows = {
+                name: text for name, text in _listing(path, root).items() if text.endswith("...")
+            }
+            if rows:
+                cut[path] = rows
+    return cut
+
+
 def _demo_command(
     wait: Annotated[
         bool, typer.Option(help="Wait up to ``[task_caps].max_duration_s_per_task``.")
@@ -356,6 +412,36 @@ def _demo_group(**add_typer: Any) -> typer.Typer:
     group.callback()(_demo_group_callback)
     root = typer.Typer(rich_markup_mode=None)
     root.add_typer(group, name="demo", **add_typer)
+    return root
+
+
+def _demo_long_command() -> None:
+    """Summarise what this demo command does, in more words than its row
+    in the listing has room for.
+    """
+
+
+def _demo_short_command() -> None:
+    """Summarise it briefly.
+
+    A second sentence, which the listing leaves out.
+    """
+
+
+_DEMO_SHORT_HELP = (
+    "A short help longer than the row has room for, which click wraps onto a second line."
+)
+
+
+def _demo_listing() -> typer.Typer:
+    """A root app with one group, ``demo``, that lists a first sentence too
+    long for its row, one that fits, and a ``short_help`` too long for it."""
+    group = typer.Typer(rich_markup_mode=None)
+    group.command("long")(_demo_long_command)
+    group.command("short")(_demo_short_command)
+    group.command("whole", short_help=_DEMO_SHORT_HELP)(_demo_short_command)
+    root = typer.Typer(rich_markup_mode=None)
+    root.add_typer(group, name="demo", help="Demo group.")
     return root
 
 
@@ -636,6 +722,61 @@ class TestGroupHelp:
         assert set(short_help.values()) <= set(_help_texts(CLI))
         listing = _squash(_render_help(app, ()))
         assert [text for text in short_help.values() if _squash(text) not in listing] == []
+
+
+class TestListing:
+    """The command listings that ``--help`` prints in an 80-column terminal."""
+
+    def test_lays_help_out_as_a_terminal_does(self) -> None:
+        # A terminal leaves two columns spare, up to 80 columns.
+        assert {columns: _help_width(columns) for columns in (60, 80, 120)} == {
+            60: 58,
+            80: 78,
+            120: 78,
+        }
+
+    def test_reads_a_listing(self) -> None:
+        demo = _demo_listing()
+        cut = "Summarise what this demo command does, in more words than its..."
+        assert _listing(("demo",), demo) == {
+            "long": cut,
+            "short": "Summarise it briefly.",
+            "whole": _DEMO_SHORT_HELP,
+        }
+        assert _cut_short(demo) == {("demo",): {"long": cut}}
+
+    def test_rows_cut_short_today(self) -> None:
+        assert _cut_short() == {
+            (): {
+                "account": "List configured accounts; pause/resume per-account...",
+                "watchdog": "Watchdog tick (the cron entry-point) and queue...",
+            },
+            ("account",): {
+                "list": "List configured accounts with their resolved policy and current...",
+                "resume": "Reverse ``account pause <name>``; the dispatcher includes it...",
+            },
+            ("install",): {
+                "uninstall": "Remove the watchdog installation (systemd unit AND/OR cron...",
+            },
+            ("install-skills",): {"list": "Show which task-runner skills are present in..."},
+            ("queue",): {
+                "backfill-working-dir": "Populate ``working_dir`` on tasks in ``todo/``...",
+                "force-dispatch": "Bypass throttle and priority; dispatch...",
+                "list": "List pending tasks in ``<queue>/todo/`` (Task...",
+                "restart-fresh": "Clear a task's ``session_id`` so the next...",
+                "template": "Print a complete, annotated example Task YAML --...",
+            },
+            ("usage",): {
+                "refresh": "Refresh OAuth tokens for every configured account...",
+                "whoami": "Show which Claude account this `[claude].config_dir` is...",
+            },
+            ("watchdog",): {
+                "tick": "One watchdog tick: examine the queue the watchdog manages...",
+            },
+            ("worktree",): {
+                "reclaim": "Reclaim the git worktrees of completed, merged, clean tasks...",
+            },
+        }
 
 
 class TestConsoleMarkup:
