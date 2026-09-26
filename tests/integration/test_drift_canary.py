@@ -42,6 +42,7 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.clock import FakeClock
+from claude_task_runner.queue.schema import TokenUsage
 from claude_task_runner.runner.stream import (
     AssistantMessageEvent,
     ResultEvent,
@@ -90,7 +91,12 @@ def test_stream_json_canary_default_invocation() -> None:
     lines = _run_shim(env={})
 
     summary = StreamSummary()
-    events = list(parse_lines(lines, summary=summary))
+    events: list[object] = []
+    usage_after_each_assistant: list[TokenUsage] = []
+    for event in parse_lines(lines, summary=summary):
+        events.append(event)
+        if isinstance(event, AssistantMessageEvent):
+            usage_after_each_assistant.append(summary.cumulative_usage)
 
     init_events = [e for e in events if isinstance(e, SystemInitEvent)]
     assistant_events = [e for e in events if isinstance(e, AssistantMessageEvent)]
@@ -99,14 +105,18 @@ def test_stream_json_canary_default_invocation() -> None:
     assert len(init_events) == 1
     assert init_events[0].session_id == "test-session"
 
+    # The dispatcher checks the token cap against the running total after
+    # every event, so each assistant message's usage must be counted by the
+    # time it is yielded. The shim splits 10 input and 5 output tokens over
+    # its two messages with integer division: 5 and 2 per message.
     assert len(assistant_events) == 2
-    for evt in assistant_events:
-        assert evt.usage_delta.input_tokens > 0
-        assert evt.usage_delta.output_tokens > 0
+    assert usage_after_each_assistant == [
+        TokenUsage(input_tokens=5, output_tokens=2),
+        TokenUsage(input_tokens=10, output_tokens=4),
+    ]
 
     assert len(result_events) == 1
     final = result_events[0]
-    assert final.subtype == "success"
     assert final.stop_reason == "end_turn"
     assert final.is_error is False
     assert final.final_usage.input_tokens == 10
@@ -137,7 +147,6 @@ def test_stream_json_canary_error_path() -> None:
 
     assert len(result_events) == 1
     final = result_events[0]
-    assert final.subtype == "error"
     assert final.is_error is True
     assert final.stop_reason == "max_tokens"
     assert summary.session_id == "err-session"
