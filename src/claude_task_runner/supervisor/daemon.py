@@ -354,8 +354,14 @@ def sleep_for_next_poll(
     """Sleep until the next poll tick.
 
     If ``wakeup_at`` is set and is closer than ``poll_interval_s``, we
-    sleep until then. Otherwise we sleep ``poll_interval_s``. Skewing
-    later than the wakeup is fine — the next clean poll will reclassify.
+    sleep until then. Otherwise we sleep ``poll_interval_s``.
+
+    A ``wakeup_at`` that is already due means the next poll is due: we
+    return without sleeping. The state machine never schedules a wakeup
+    less than one poll interval after its decision, so one that has
+    passed means this tick ran that long after deciding (a long worktree
+    reclaim, say, or a stalled disk), and a warning says the supervisor
+    is not keeping up with its poll interval.
 
     ``sleep_fn`` does the sleeping. :func:`start_daemon` passes
     :func:`sleep_until_woken`, so that a stop or drain signal ends the
@@ -365,8 +371,15 @@ def sleep_for_next_poll(
     delay = float(poll_interval_s)
     if wakeup_at is not None:
         until = (wakeup_at - now).total_seconds()
-        if until > 0:
-            delay = min(delay, until)
+        if until < 0:
+            logger.warning(
+                "supervisor is not keeping up with its poll interval: this tick "
+                "ended %.1f s after the wakeup it scheduled for %s; polling again "
+                "at once",
+                -until,
+                wakeup_at.isoformat(),
+            )
+        delay = min(delay, max(until, 0.0))
     if delay > 0:
         sleep_fn(delay)
 
