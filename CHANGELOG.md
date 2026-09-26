@@ -183,6 +183,31 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Commands that read a queue no longer create a `--queue` that does not
+  exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
+  `account list` and `account resume` created `<queue>/todo/` or
+  `<queue>/.claude_task_runner/` and exited 0 as if the queue were empty, so
+  a mistyped, deleted or moved `--queue` looked like a queue with nothing in
+  it. `queue show`, `queue restart-fresh`, `queue backfill-working-dir`,
+  `sidecar show`, `sidecar answer` and `doctor` created it too.
+  `account pause` wrote a `supervisor.json` into the new tree, and
+  `sidecar answer --allow-partial` wrote its response there. Each of these
+  commands except `doctor` now exits 2 with
+  `--queue is not an existing directory: <path>` before it reads anything,
+  as `queue add`, `queue force-dispatch`, `supervisor start` and `install`
+  already did. With `--json` the error is `{"ok": false, "error": ...}` on
+  stdout, and the `sidecar` commands print the plain form on stderr, where
+  their other errors go. `doctor` still runs. Its `queue_layout` check FAILs,
+  now also when `--queue` is a file, which used to crash it, and the seven
+  checks that read the queue's files are left out. It exits 1, and its
+  `--json` keeps its shape. `supervisor stop` and `drain` only read the PID
+  file and are unchanged. Underneath, `queue_runtime_dir()` and `todo_dir()`
+  no longer pass `parents=True`. They create the queue's subdirectories but
+  never the queue directory, so any other caller that reaches them with a
+  missing queue gets `FileNotFoundError` instead of an empty queue.
+  `tests/unit/test_cli_missing_queue.py` runs every command that takes
+  `--queue` against a missing path. It checks that nothing is created and
+  pins the exit code and message, so a command added later is covered.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
@@ -202,6 +227,14 @@ Breaking changes are called out in the version notes.
   a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
   script, and on a tracked file missing from the sdist. `hatchling` joins the
   `dev` extra so the test can build.
+- **`[project.urls]` now points at the real repository.** `Homepage` and
+  `Issues` named `github.com/billdenney/claude_task_runner`, but the
+  repository is `github.com/billdenney/claude_runner`. The old address returns
+  404 and does not redirect, so every built wheel's METADATA carried two dead
+  `Project-URL` links. `tests/unit/test_packaging.py` now fails when a GitHub
+  link in `[project.urls]` names any repository but the one `origin` points
+  to. It skips when the checkout has no `origin` remote or `origin` is not on
+  GitHub.
 - **Skipped stream-json lines are recorded and logged, not dropped silently.**
   The parser skips a malformed line, or an event of a type it does not know, so
   one bad line cannot abort a run. But nothing looked at the count, and the
