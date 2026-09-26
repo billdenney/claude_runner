@@ -181,6 +181,27 @@ Breaking changes are called out in the version notes.
   it dispatches exactly as before. `queue template` no longer lists it, and the
   `runner-add-task` skill no longer names it as an example.
 
+- **Stream-parser fields that nothing read.** `runner.stream` filled
+  `AssistantMessageEvent.text_excerpt` and `usage_delta`, `ResultEvent.subtype`
+  and `duration_ms`, `StreamSummary.event_count`, and a `raw` copy of the
+  parsed line on all four event types. Nothing outside the parser read any of
+  them. The dispatcher reads only the summary: the session id, the running
+  usage, the skipped-line counts, and the final result's stop reason, error
+  flag, cost and usage. `_extract_assistant_text`, which existed only to fill
+  `text_excerpt`, goes too. With the default `adopt_workers = true`, every
+  attempt's full stream is already on disk in
+  `.claude_task_runner/logs/<task>/attempt-N.stream.jsonl`. The parser still
+  yields the same events, so the heartbeat is unchanged, and a result line's
+  `subtype` still stands in for a missing `stop_reason` or `is_error`. A
+  result line whose `duration_ms` is not a number no longer raises out of the
+  parser. The dead-code gate had allowlisted four of these fields. It could
+  not see `duration_ms` or `raw`, because vulture matches names across the
+  whole package: `ResultEvent(duration_ms=duration_ms)` reads a local of the
+  same name. The drift canary's usage check moves from each event's
+  `usage_delta` to the running `StreamSummary.cumulative_usage`, checked
+  exactly after each assistant message, which is the total the per-task token
+  cap reads.
+
 ### Fixed
 
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no

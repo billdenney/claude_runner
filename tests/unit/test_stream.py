@@ -72,21 +72,6 @@ class TestParseLines:
         assert len(events) == 1
         assert isinstance(events[0], UserMessageEvent)
 
-    def test_assistant_text_excerpt(self) -> None:
-        events = list(parse_lines([SAMPLE_ASSISTANT]))
-        assert isinstance(events[0], AssistantMessageEvent)
-        assert events[0].text_excerpt == "Reading the file"
-
-    def test_assistant_text_truncated(self) -> None:
-        long_text = "x" * 500
-        line = (
-            f'{{"type": "assistant", "message": {{"content": '
-            f'[{{"type": "text", "text": "{long_text}"}}], "usage": {{}}}}}}'
-        )
-        events = list(parse_lines([line]))
-        assert isinstance(events[0], AssistantMessageEvent)
-        assert len(events[0].text_excerpt) == 200
-
     def test_cumulative_usage_sums(self) -> None:
         line1 = (
             '{"type": "assistant", "message": {"usage": {"input_tokens": 10, "output_tokens": 20}}}'
@@ -153,5 +138,6 @@ class TestParseLines:
         summary = StreamSummary()
         events = list(parse_lines([line], summary=summary))
         assert events == []
-        # We don't yield, but we count it as an event we saw (not skipped malformed).
-        assert summary.event_count == 1
+        # We don't yield it, but "system" is a known type, so it is not drift.
+        assert summary.skipped_lines == 0
+        assert summary.unknown_event_types == {}

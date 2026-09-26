@@ -77,10 +77,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("throttle/decision.py", "target_concurrency"): (
         "ADR-0022's slowdown ramp, which dispatch ignores; its card decides wire or remove"
     ),
-    ("runner/stream.py", "text_excerpt"): "unread stream-parse output",
-    ("runner/stream.py", "usage_delta"): "unread stream-parse output",
-    ("runner/stream.py", "subtype"): "unread stream-parse output",
-    ("runner/stream.py", "event_count"): "unread stream-parse output",
 }
 """vulture findings that may stay, keyed by (path under the package, name)."""
 
