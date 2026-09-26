@@ -68,7 +68,10 @@ jobs:
         # and pipx do, into a fresh venv, and runs the smoke script with that
         # venv's python from outside the checkout, so src/ cannot shadow
         # site-packages. See scripts/smoke_installed.py for what it checks.
-        if: matrix.python-version == '3.12'
+        # It runs on every Python in the matrix: the package reads its skills
+        # and default settings through importlib.resources on namespace
+        # packages, and 3.11 resolves a path in one with different code than
+        # 3.12 and 3.13 do.
         run: |
           python -m venv "$RUNNER_TEMP/wheel-venv"
           "$RUNNER_TEMP/wheel-venv/bin/pip" install .
