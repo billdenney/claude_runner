@@ -29,6 +29,7 @@ from claude_task_runner.cli.supervisor_cmd import (
     _count_pending,
     app,
 )
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -121,6 +122,28 @@ def _live_supervisor(
         patch("time.sleep", clock.sleep),
     ):
         yield kill, alive_mock
+
+
+def _unreachable(*_args: object, **_kwargs: object) -> object:
+    raise AssertionError("reached a step this command must stop before")
+
+
+@contextmanager
+def _signals_nothing() -> Iterator[MagicMock]:
+    """For a command that must stop before it looks for a live supervisor.
+
+    ``os.kill`` is a mock, and ``is_pid_alive`` and ``time.sleep`` raise,
+    so a regression fails at once. Patching ``os.kill`` alone is not
+    enough: ``is_pid_alive`` calls it too, so the mock made any PID look
+    alive, and a drain that got that far waited an hour for real.
+    Yields the ``os.kill`` mock.
+    """
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill,
+        patch("claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", _unreachable),
+        patch("time.sleep", _unreachable),
+    ):
+        yield kill
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -306,7 +329,7 @@ def test_stop_and_drain_refuse_a_queue_that_is_not_a_directory(
     queue = tmp_path / "no-such-queue"
     if kind == "a-file":
         queue.write_text("", encoding="utf-8")
-    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+    with _signals_nothing() as kill:
         result = _invoke(runner, [command, "--queue", str(queue)])
     assert result.exit_code == 2
     assert result.stdout == f"--queue is not an existing directory: {queue.resolve()}\n"
@@ -346,7 +369,7 @@ def test_a_pid_file_without_a_pid_is_reported(
     supervisor may be running with a PID file it has not finished writing."""
     pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
     pid_path.write_text(content, encoding="utf-8")
-    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+    with _signals_nothing() as kill:
         result = _invoke(runner, [command, "--queue", str(queue_dir)])
     assert result.exit_code == 1, result.output
     assert _plain(result.stdout) == f"PID file {pid_path} {detail}{_NOT_SIGNALLED}"
@@ -359,7 +382,7 @@ def test_an_unreadable_pid_file_is_reported(
 ) -> None:
     pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
     pid_path.mkdir()
-    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+    with _signals_nothing() as kill:
         result = _invoke(runner, [command, "--queue", str(queue_dir)])
     assert result.exit_code == 1, result.output
     assert _plain(result.stdout) == (
@@ -378,7 +401,8 @@ def test_a_bracket_in_the_queue_path_is_printed_as_typed(
     ``[/]`` raised ``MarkupError``."""
     queue = tmp_path / name
     queue.mkdir(parents=True)  # q[/]x is q[ holding ]x
-    result = _invoke(runner, [command, "--queue", str(queue)])
+    with _signals_nothing():
+        result = _invoke(runner, [command, "--queue", str(queue)])
     assert result.exit_code == 1, result.output
     pid_path = queue.resolve() / ".claude_task_runner" / "supervisor.pid"
     assert _plain(result.stdout) == f"No PID file at {pid_path}\n"
@@ -615,27 +639,104 @@ def test_drain_waits_until_the_supervisor_exits(runner: CliRunner, queue_dir: Pa
     assert result.exit_code == 0, result.output
     assert _plain(result.stdout) == (
         f"SIGUSR1 (drain) sent to PID {_PID}.\n"
-        f"Waiting up to 3600s for PID {_PID} to exit (polling every 2s)...\n"
+        f"Waiting up to 14640s for PID {_PID} to exit (polling every 2s)...\n"
         f"PID {_PID} exited; drain complete.\n"
     )
     kill.assert_called_once_with(_PID, signal.SIGUSR1)
     assert clock.sleeps == [2.0, 2.0, 2.0]
 
 
-def test_drain_gives_up_after_an_hour_by_default(runner: CliRunner, queue_dir: Path) -> None:
-    """Pins today: the default --timeout is 3600 s, whatever the queue's
-    task cap, and the message on giving up."""
+_STILL_DRAINING = (
+    "The supervisor keeps draining; re-run `supervisor drain` to wait again. "
+    "`supervisor stop` would not end the tasks it is waiting for: with "
+    "[supervisor].adopt_workers on, the next supervisor adopts them, and with it "
+    "off, the supervisor waits for them before it exits.\n"
+)
+"""The end of drain's message when its wait runs out. It used to say that
+``supervisor stop`` force-exits and that "in-flight tasks will be killed by
+systemd's KillMode", but the unit's ``KillMode=process`` never signals the
+workers, and with adoption off a stopped supervisor still waits for them."""
+
+
+def test_drain_waits_for_the_task_cap_by_default(runner: CliRunner, queue_dir: Path) -> None:
+    """It waited 3600 s whatever the cap, so with the package defaults a
+    drain whose last task ran to its 4 h cap gave up with exit 4 while
+    the supervisor was still draining. It now waits for the cap, both
+    hook timeouts and one supervisor tick."""
+    defaults = load_settings(None)
+    assert (
+        defaults.task_caps.max_duration_s_per_task,
+        defaults.hooks.pre_dispatch_timeout_s,
+        defaults.hooks.post_dispatch_timeout_s,
+        defaults.usage.poll_interval_s,
+    ) == (14400, 120, 60, 60)
     clock = _FakeClock()
-    with _live_supervisor(queue_dir, clock, exits_after=None):
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
         result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
     assert result.exit_code == 4, result.output
-    assert clock.sleeps == [2.0] * 1800
+    assert clock.sleeps == [2.0] * 7320
     assert _plain(result.stdout) == (
         f"SIGUSR1 (drain) sent to PID {_PID}.\n"
-        f"Waiting up to 3600s for PID {_PID} to exit (polling every 2s)...\n"
-        "Drain still in progress after 3600s. The supervisor will keep draining. "
-        "Re-run `supervisor drain` to wait further, or `supervisor stop` to "
-        "force-exit (in-flight tasks will be killed by systemd's KillMode).\n"
+        f"Waiting up to 14640s for PID {_PID} to exit (polling every 2s)...\n"
+        f"Drain still in progress after 14640s. {_STILL_DRAINING}"
+    )
+    kill.assert_called_once_with(_PID, signal.SIGUSR1)
+
+
+_QUEUE_SETTINGS = """\
+[task_caps]
+max_duration_s_per_task = 100
+
+[hooks]
+pre_dispatch_timeout_s = 10
+post_dispatch_timeout_s = 5
+
+[usage]
+poll_interval_s = 7
+"""
+"""Settings whose default drain wait is 10 + 100 + 5 + 7 = 122 s."""
+
+
+@pytest.mark.parametrize("where", ["queue", "--config"])
+def test_drain_default_wait_follows_the_queue_settings(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path, where: str
+) -> None:
+    """From ``<queue>/claude_runner.toml``, or from ``--config``, which wins."""
+    if where == "queue":
+        (queue_dir / "claude_runner.toml").write_text(_QUEUE_SETTINGS, encoding="utf-8")
+        extra: list[str] = []
+    else:
+        # A queue TOML with no cap, which --config overrides.
+        zero_cap = "[task_caps]\nmax_duration_s_per_task = 0\n"
+        (queue_dir / "claude_runner.toml").write_text(zero_cap, encoding="utf-8")
+        config = tmp_path / "elsewhere.toml"
+        config.write_text(_QUEUE_SETTINGS, encoding="utf-8")
+        extra = ["--config", str(config)]
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra])
+    assert result.exit_code == 4, result.output
+    assert clock.sleeps == [2.0] * 61
+    assert _plain(result.stdout) == (
+        f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+        f"Waiting up to 122s for PID {_PID} to exit (polling every 2s)...\n"
+        f"Drain still in progress after 122s. {_STILL_DRAINING}"
+    )
+
+
+def test_drain_waits_without_limit_when_the_cap_is_0(runner: CliRunner, queue_dir: Path) -> None:
+    (queue_dir / "claude_runner.toml").write_text(
+        "[task_caps]\nmax_duration_s_per_task = 0\n", encoding="utf-8"
+    )
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=30000.0):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 0, result.output
+    assert clock.sleeps == [2.0] * 15000
+    assert _plain(result.stdout) == (
+        f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+        f"Waiting with no time limit for PID {_PID} to exit (polling every 2s)...\n"
+        f"PID {_PID} exited; drain complete.\n"
     )
 
 
@@ -647,26 +748,90 @@ def test_drain_honours_an_explicit_timeout_and_poll(runner: CliRunner, queue_dir
         )
     assert result.exit_code == 4, result.output
     assert clock.sleeps == [3.0, 3.0, 3.0, 3.0]
-    assert f"Waiting up to 10s for PID {_PID} to exit (polling every 3s)...\n" in _plain(
+    assert _plain(result.stdout) == (
+        f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+        f"Waiting up to 10s for PID {_PID} to exit (polling every 3s)...\n"
+        f"Drain still in progress after 10s. {_STILL_DRAINING}"
+    )
+
+
+def test_drain_prints_a_fractional_poll(runner: CliRunner, queue_dir: Path) -> None:
+    """``{:.0f}`` printed ``--poll 0.5`` as "polling every 0s"."""
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None):
+        result = _invoke(
+            runner, ["drain", "--queue", str(queue_dir), "--timeout", "1", "--poll", "0.5"]
+        )
+    assert result.exit_code == 4, result.output
+    assert clock.sleeps == [0.5, 0.5]
+    assert f"Waiting up to 1s for PID {_PID} to exit (polling every 0.5s)...\n" in _plain(
         result.stdout
     )
 
 
-@pytest.mark.parametrize("wait", ["--wait", "--no-wait"])
+_BROKEN_TOML = "this is [not toml\n"
+
+
 @pytest.mark.parametrize("where", ["--config", "queue"])
-def test_drain_never_reads_the_config(
-    runner: CliRunner, queue_dir: Path, tmp_path: Path, wait: str, where: str
+@pytest.mark.parametrize("how", [["--no-wait"], ["--timeout", "10"]])
+def test_drain_reads_no_settings_without_the_default_wait(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path, where: str, how: list[str]
 ) -> None:
-    """Pins today: drain reads no settings, so a TOML that does not load,
-    passed or found in the queue, changes nothing."""
+    """``--no-wait``, which the adopt-off systemd unit's ``ExecStop``
+    runs, and an explicit ``--timeout`` never read the settings, so a
+    TOML that does not load changes nothing."""
     broken = tmp_path / "broken.toml" if where == "--config" else queue_dir / "claude_runner.toml"
-    broken.write_text("this is [not toml\n", encoding="utf-8")
+    broken.write_text(_BROKEN_TOML, encoding="utf-8")
     extra = ["--config", str(broken)] if where == "--config" else []
     clock = _FakeClock()
-    with _live_supervisor(queue_dir, clock, exits_after=1.0) as (kill, _):
-        result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra, wait])
-    assert result.exit_code == 0, result.output
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra, *how])
+    assert result.exit_code == (0 if how == ["--no-wait"] else 4), result.output
+    assert "cannot load" not in result.output
     kill.assert_called_once_with(_PID, signal.SIGUSR1)
+
+
+def _settings_error(path: Path) -> str:
+    """What ``load_settings`` raises for ``path``."""
+    with pytest.raises((ConfigError, OSError)) as exc_info:
+        load_settings(path)
+    return str(exc_info.value)
+
+
+@pytest.mark.parametrize("where", ["--config", "queue", "missing", "directory"])
+def test_waiting_drain_refuses_settings_that_do_not_load(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path, where: str
+) -> None:
+    """Refused with exit 2 before anything is signalled, since the
+    default wait needs the cap."""
+    config = queue_dir / "claude_runner.toml" if where == "queue" else tmp_path / "c.toml"
+    if where in ("--config", "queue"):
+        config.write_text(_BROKEN_TOML, encoding="utf-8")
+    elif where == "directory":
+        config.mkdir()
+    extra = [] if where == "queue" else ["--config", str(config)]
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra])
+    assert result.exit_code == 2, result.output
+    assert _plain(result.stdout) == (
+        f"cannot load the settings for the default --timeout: {_settings_error(config)}. "
+        "Pass --timeout <seconds>, or --no-wait, to drain without them.\n"
+    )
+    kill.assert_not_called()
+    assert clock.sleeps == []
+
+
+def test_drain_reports_no_supervisor_before_reading_settings(
+    runner: CliRunner, queue_dir: Path
+) -> None:
+    """With nothing to drain, a TOML that does not load does not matter."""
+    (queue_dir / "claude_runner.toml").write_text(_BROKEN_TOML, encoding="utf-8")
+    with _signals_nothing():
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 1, result.output
+    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    assert _plain(result.stdout) == f"No PID file at {pid_path}\n"
 
 
 def test_drain_stale_pid(runner: CliRunner, queue_dir: Path) -> None:

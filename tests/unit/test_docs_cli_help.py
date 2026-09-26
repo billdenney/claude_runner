@@ -308,8 +308,10 @@ class TestChecker:
         for sub_app in _typer_apps(app).values():
             monkeypatch.setattr(sub_app, "rich_markup_mode", "rich")
         assert _lost_tokens(app, ("supervisor", "drain")) == {
+            "[hooks]": (2, 0),
             "[supervisor]": (1, 0),
-            "[task_caps]": (1, 0),
+            "[task_caps]": (2, 0),
+            "[usage]": (2, 0),
         }
         assert _lost_tokens(app, ("queue", "restart-fresh")) == {"[accounts]": (1, 0)}
 
@@ -335,7 +337,7 @@ class TestHelpKeepsBrackets:
         # that silently finds nothing.
         assert ("supervisor", "drain") in _command_paths()
         assert _tokens(_help_texts(_node(("supervisor", "drain")))) == Counter(
-            {"[supervisor]": 1, "[task_caps]": 1}
+            {"[hooks]": 2, "[supervisor]": 1, "[task_caps]": 2, "[usage]": 2}
         )
 
     @pytest.mark.parametrize("path", _command_paths(), ids=_path_id)
@@ -373,11 +375,13 @@ class TestLayout:
         # Click honours the marker: drain's help prints its table row by row.
         assert (
             "\n  Exit codes:\n"
-            "    0  supervisor exited cleanly (or --no-wait and signal delivered)\n"
-            "    1  no PID file / stale PID file\n"
-            "    2  --queue is not an existing directory, or signal delivery\n"
-            "       rejected (permission)\n"
-            "    4  --wait timed out (supervisor still draining — re-run drain or stop)\n"
+            "    0  supervisor exited (or --no-wait and signal delivered)\n"
+            "    1  no supervisor to signal: no PID file, one that holds no PID,\n"
+            "       or a PID that is not alive\n"
+            "    2  --queue is not an existing directory, the settings for the\n"
+            "       default --timeout did not load, or signal delivery rejected\n"
+            "       (permission)\n"
+            "    4  --wait timed out (the supervisor is still draining)\n"
         ) in _render_help(app, ("supervisor", "drain"))
 
     @pytest.mark.parametrize("path", _command_paths(), ids=_path_id)
