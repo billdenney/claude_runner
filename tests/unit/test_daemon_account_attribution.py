@@ -38,6 +38,7 @@ from claude_task_runner.supervisor.states import (
 )
 from claude_task_runner.usage.drift import UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
+from claude_task_runner.usage.multi_account_source import MultiAccountSourceError
 
 
 def _reading(account: str | None, util_5h: int, util_7d: int) -> UsageReading:
@@ -121,6 +122,36 @@ def test_attributed_reading_stamps_last_capture_at() -> None:
     # Work's last_capture_at stays None so the multi-account picker
     # routes the next capture there.
     assert new_snap.accounts["work"].last_capture_at is None
+
+
+def test_attributed_failure_stamps_last_capture_at() -> None:
+    """A failed capture attributed to an account stamps it too.
+
+    The multi-account picker polls the account with the oldest
+    last_capture_at, so an account whose captures fail must move to the
+    back like one whose capture succeeded, or it would be polled every
+    tick while the others went stale.
+    """
+    settings = load_settings(None).model_copy(
+        update={
+            "accounts": [
+                AccountSettings(name="personal", config_dir=""),
+                AccountSettings(name="work", config_dir=""),
+            ]
+        }
+    )
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    failure = MultiAccountSourceError.wrap("work", UsageFormatDrift("simulated drift"))
+
+    new_snap, _ = run_one_tick(
+        _snapshot_with_two_accounts(),
+        TickContext(settings=settings, poll_result=failure, pending_count=0, in_flight_count=0),
+        clock,
+    )
+
+    assert new_snap.accounts["work"].state is SupervisorState.ERROR_DRIFT
+    assert new_snap.accounts["work"].last_capture_at == datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
+    assert new_snap.accounts["personal"].last_capture_at is None
 
 
 def test_attributed_reading_mirrors_top_level_for_state_machine_backcompat() -> None:

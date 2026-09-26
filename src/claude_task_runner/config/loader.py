@@ -267,8 +267,9 @@ def per_account_toml_path(config_dir: str) -> Path | None:
 def load_account_policy(config_dir: str) -> AccountPolicy:
     """Read ``<config_dir>/runner-account.toml`` and return the policy.
 
-    Missing file → all defaults (``max_concurrency=1`` and the
-    documented band defaults). Present but unparseable → ConfigError.
+    Missing file → all defaults: ``max_concurrency=1`` and no
+    ``[dispatch_pct.*]`` overrides, so :func:`throttle.policy.resolve`
+    uses the queue's values. Present but unparseable → ConfigError.
     Empty config_dir → defaults (used for the synthesised legacy
     ``"default"`` account before the operator declares an explicit
     config_dir).

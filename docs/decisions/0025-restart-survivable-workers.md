@@ -186,7 +186,22 @@ worker crashed or was killed, and the silent-orphan reaper and
 
 **Consequences.** A worker that finishes in the restart gap is recorded as its
 log says, and a completed task is not re-dispatched. The finalize is the
-adopted path's, so it shares that path's differences from an owned run: no
-pre-dispatch SHA for the ADR-0020 commit check, so a commit alone does not
-count as output; no post-dispatch hook; no ADR-0027 re-file guard or ADR-0033
-terminal-close gate.
+adopted path's, and it now runs the owned path's post-run steps too:
+
+- **The ADR-0020 output gate counts a commit.** The attempt's pre-dispatch
+  `HEAD` is recorded on the running state as `pre_dispatch_sha`, written
+  before the worker spawns and cleared at finalize. Before this, the adopted
+  finalize had no SHA to compare, so a worktree task whose only output was a
+  pushed commit failed `end_turn_no_output` and was re-dispatched.
+- **The ADR-0033 terminal-close gate and the ADR-0027 sidecar re-file guard
+  run.** Both need to know whether the run committed. A state written before
+  `pre_dispatch_sha` existed can't show that, so for such a state the two stay
+  off, as before, and a commit alone still does not count as output. Without
+  that exception, the terminal-close gate would take a committed, reported
+  run for a skip and write a block row.
+- **The post-dispatch hook runs**, whether or not the recheck guard stands
+  down, since the worker has exited either way. It runs best-effort: a hook
+  that fails, or cannot start, logs a warning and never fails the finalize.
+  On the owned path, a hook that could not start used to raise out of the
+  dispatch after the run was recorded. For a worker that exited in the
+  restart gap, the hook runs during startup, before the first tick.

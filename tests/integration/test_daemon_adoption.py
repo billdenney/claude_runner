@@ -23,6 +23,7 @@ thread doesn't run a real tail loop; ``_pid_alive`` is stubbed per test.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -361,3 +362,37 @@ def test_daemon_kill_switch_leaves_exited_worker_to_legacy_demotion(
     assert reloaded.stop_reason == ORPHAN_STOP_REASON
     assert reloaded.runs == []
     assert not [kind for kind, _ in events if kind == "exited_worker_finalized"]
+
+
+def test_daemon_gives_both_finalize_paths_the_dispatch_and_hook_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup hands the queue's ``[dispatch]`` and ``[hooks]`` settings to the
+    exited-worker finalize and to the adoption monitor. Both finalize through
+    the owned path's gates, which need them: the terminal-close gate reads
+    the block file, and the post-dispatch hook its command."""
+    qd = _queue(tmp_path)
+    _seed_running_filebacked(qd, "t-live")
+    _seed_exited(qd, "t-exited", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70))
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid != _EXITED_PID)
+    calls: dict[str, dict[str, object]] = {}
+    adopted = threading.Event()
+
+    def _record_exited(**kwargs: object) -> None:
+        calls["exited"] = kwargs
+
+    def _record_adopted(**kwargs: object) -> None:
+        calls["adopted"] = kwargs
+        adopted.set()
+
+    monkeypatch.setattr(dispatcher_mod, "finalize_exited_worker", _record_exited)
+    monkeypatch.setattr(dispatcher_mod, "adopt_worker", _record_adopted)
+    settings = _settings(adopt=True)
+
+    _run_daemon(qd, settings, monkeypatch)
+
+    assert adopted.wait(timeout=5), "the adoption monitor never called adopt_worker"
+    assert sorted(calls) == ["adopted", "exited"]
+    for path in ("exited", "adopted"):
+        assert calls[path]["settings_dispatch"] is settings.dispatch, path
+        assert calls[path]["settings_hooks"] is settings.hooks, path

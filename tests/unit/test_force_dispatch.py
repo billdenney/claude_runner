@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -958,28 +958,102 @@ class TestForceDispatchCLI:
         assert result.exit_code == 0
         assert "entered `running` status" in result.stdout
 
-    def test_supervised_timeout_human_output(self, queue_dir: Path, runner_cli: CliRunner) -> None:
-        """Supervised path with wait>0 but picked_up=False prints the yellow timeout note."""
+    def test_supervised_timeout_while_the_request_waits_for_a_slot(
+        self, queue_dir: Path, runner_cli: CliRunner
+    ) -> None:
+        """The request file is still there, so the note may say it persists.
+
+        The supervisor's tick during the wait leaves the request: its only
+        slot is taken and ``--over-limit`` was not given.
+        """
         from claude_task_runner.cli.queue_cmd import app
 
         _make_task(queue_dir, "t1")
+
+        def supervisor_tick(qd: Path, task_id: str, wait_seconds: float) -> bool:
+            fd_mod.tick_consume(
+                queue_dir=qd,
+                settings=_make_settings(max_c=1),
+                clock=RealClock(),
+                in_flight_slots={"other": _slot("other", threading.Thread(target=lambda: None))},
+            )
+            return False
+
         with (
             patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
-            patch("claude_task_runner.cli.queue_cmd._poll_until_running", return_value=False),
+            patch(
+                "claude_task_runner.cli.queue_cmd._poll_until_running",
+                side_effect=supervisor_tick,
+            ),
         ):
             result = runner_cli.invoke(
                 app,
-                [
-                    "force-dispatch",
-                    "t1",
-                    "--queue",
-                    str(queue_dir),
-                    "--wait-seconds",
-                    "1",
-                ],
+                ["force-dispatch", "t1", "--queue", str(queue_dir), "--wait-seconds", "1"],
+                # COLUMNS keeps Rich from wrapping the long request path.
+                env={"COLUMNS": "1000"},
             )
-        assert result.exit_code == 0
-        assert "still not running" in result.stdout
+
+        request = fd_mod.request_path(queue_dir.resolve(), "t1")
+        assert result.exit_code == 0, result.stdout
+        assert request.exists()
+        assert result.stdout == (
+            f"request written: {request}\n"
+            "supervisor will pick it up on the next tick (allow_over_limit=False).\n"
+            "task t1 still not running after 1.0s — the supervisor may be honouring "
+            "max_concurrency. The request file persists; the task will dispatch on the "
+            "next free slot.\n"
+        )
+
+    def test_supervised_timeout_after_the_supervisor_drops_the_request(
+        self, queue_dir: Path, runner_cli: CliRunner
+    ) -> None:
+        """The request file is gone, so the note must not say it persists.
+
+        The task was parked after the CLI checked its status, so the
+        supervisor's tick drops the request as no longer dispatchable, and
+        the task never reaches ``running``.
+        """
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+
+        def supervisor_tick(qd: Path, task_id: str, wait_seconds: float) -> bool:
+            write_state_atomic(
+                TaskState(task_id=task_id, status="deferred", deferred_reason="parked by hand"),
+                state_path_for(qd, task_id),
+            )
+            fd_mod.tick_consume(
+                queue_dir=qd,
+                settings=_make_settings(),
+                clock=RealClock(),
+                in_flight_slots={},
+            )
+            return False
+
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
+            patch(
+                "claude_task_runner.cli.queue_cmd._poll_until_running",
+                side_effect=supervisor_tick,
+            ),
+        ):
+            result = runner_cli.invoke(
+                app,
+                ["force-dispatch", "t1", "--queue", str(queue_dir), "--wait-seconds", "1"],
+                env={"COLUMNS": "1000"},
+            )
+
+        request = fd_mod.request_path(queue_dir.resolve(), "t1")
+        assert result.exit_code == 0, result.stdout
+        assert not request.exists()
+        assert result.stdout == (
+            f"request written: {request}\n"
+            "supervisor will pick it up on the next tick (allow_over_limit=False).\n"
+            "task t1 still not running after 1.0s, and its request file is gone: the "
+            "supervisor either dispatched the task (its pre-dispatch hook may still be "
+            "running, or may have deferred it) or dropped the request, logging a WARNING "
+            "that says why. Check `queue show t1`.\n"
+        )
 
     def test_poll_until_running_observes_terminal_status(self, queue_dir: Path) -> None:
         """A completed/failed/awaiting_sidecar state also returns True — the
@@ -1009,7 +1083,9 @@ class TestForceDispatchReadinessGate:
     A `requires` element says the file this run reads is not on disk. Forcing
     past one buys a worker that can only discover the gap, file a sidecar and
     exit — the dispatch/re-file loop the gate exists to prevent. So both
-    force paths enforce it, and both say which element is missing.
+    force paths enforce it, and both say which element is missing. The CLI
+    checks too, before it writes a request or dispatches, so the operator
+    hears it rather than the supervisor dropping the request unseen.
     """
 
     def test_tick_consume_refuses_task_with_unmet_requirement(self, queue_dir: Path) -> None:
@@ -1078,6 +1154,159 @@ class TestForceDispatchReadinessGate:
                 settings=_make_settings(),
                 clock=RealClock(),
             )
+
+    @pytest.mark.parametrize("supervisor_alive", [False, True])
+    def test_cli_refuses_before_dispatching_or_writing_a_request(
+        self, queue_dir: Path, supervisor_alive: bool
+    ) -> None:
+        """With a supervisor running the CLI used to write the request and
+        report ``ok``, leaving tick_consume to drop it with only a log line."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(
+            queue_dir,
+            "t1",
+            requires=[
+                {"kind": "file", "path": "inputs/a.md"},
+                {"kind": "file", "path": "inputs/b.md", "note": "trimmed paper"},
+            ],
+        )
+        with (
+            patch(
+                "claude_task_runner.cli.queue_cmd._supervisor_is_alive",
+                return_value=supervisor_alive,
+            ),
+            patch("claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously") as sync,
+        ):
+            # --wait-seconds 0: were the request written, the CLI would
+            # otherwise poll for the default 60 s before failing the test.
+            result = CliRunner().invoke(
+                app,
+                [
+                    "force-dispatch",
+                    "t1",
+                    "--queue",
+                    str(queue_dir),
+                    "--wait-seconds",
+                    "0",
+                    "--json",
+                ],
+            )
+
+        inputs = queue_dir.resolve() / "inputs"
+        unmet = [
+            f"missing file: {inputs / 'a.md'}",
+            f"missing file: {inputs / 'b.md'} (trimmed paper)",
+        ]
+        assert result.exit_code == 2, result.stdout
+        assert json.loads(result.stdout) == {
+            "ok": False,
+            "error": f"task t1 has 2 unmet readiness requirement(s): {unmet[0]}; {unmet[1]}",
+            "unmet": unmet,
+        }
+        sync.assert_not_called()
+        assert fd_mod.list_requests(queue_dir) == []
+
+    @pytest.mark.parametrize("supervisor_alive", [False, True])
+    def test_cli_human_output_keeps_a_bracketed_path(
+        self, queue_dir: Path, supervisor_alive: bool
+    ) -> None:
+        """Printed without Rich markup, which would drop the ``[draft]``."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/[draft]/a.md"}])
+        with (
+            patch(
+                "claude_task_runner.cli.queue_cmd._supervisor_is_alive",
+                return_value=supervisor_alive,
+            ),
+            patch("claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously") as sync,
+        ):
+            result = CliRunner().invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), "--wait-seconds", "0"]
+            )
+
+        missing = queue_dir.resolve() / "inputs" / "[draft]" / "a.md"
+        assert result.exit_code == 2
+        assert result.stdout == (
+            f"task t1 has 1 unmet readiness requirement(s): missing file: {missing}\n"
+        )
+        sync.assert_not_called()
+        assert fd_mod.list_requests(queue_dir) == []
+
+    def test_cli_writes_the_request_once_the_requirement_is_met(self, queue_dir: Path) -> None:
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/present.md"}])
+        target = queue_dir / "inputs" / "present.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("trimmed", encoding="utf-8")
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
+            patch("claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously") as sync,
+        ):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "force-dispatch",
+                    "t1",
+                    "--queue",
+                    str(queue_dir),
+                    "--wait-seconds",
+                    "0",
+                    "--json",
+                ],
+            )
+
+        request = fd_mod.request_path(queue_dir.resolve(), "t1")
+        assert result.exit_code == 0, result.stdout
+        assert json.loads(result.stdout) == {
+            "ok": True,
+            "mode": "supervised",
+            "request_path": str(request),
+            "running": False,
+            "allow_over_limit": False,
+        }
+        assert request.exists()
+        sync.assert_not_called()
+
+    def test_cli_dispatches_synchronously_once_the_requirement_is_met(
+        self, queue_dir: Path
+    ) -> None:
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1", requires=[{"kind": "file", "path": "inputs/present.md"}])
+        target = queue_dir / "inputs" / "present.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("trimmed", encoding="utf-8")
+        done = TaskState(task_id="t1", status="completed", attempts=1, stop_reason="end_turn")
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=False),
+            patch(
+                "claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously",
+                return_value=done,
+            ) as sync,
+        ):
+            result = CliRunner().invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), "--json"]
+            )
+
+        assert result.exit_code == 0, result.stdout
+        assert json.loads(result.stdout) == {
+            "ok": True,
+            "mode": "synchronous",
+            "status": "completed",
+            "attempts": 1,
+            "stop_reason": "end_turn",
+        }
+        sync.assert_called_once_with(
+            task_id="t1",
+            queue_dir=queue_dir.resolve(),
+            settings=ANY,
+            clock=ANY,
+            claude_executable="claude",
+        )
+        assert fd_mod.list_requests(queue_dir) == []
 
 
 SONNET_MAX_ERROR = (
