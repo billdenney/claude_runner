@@ -233,6 +233,7 @@ Breaking changes are called out in the version notes.
   success or `failed` with the result's stop reason for an error. A log
   with no `result` event is a crash, and is demoted as before. See the
   2026-09-26 amendment to ADR-0025.
+
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
