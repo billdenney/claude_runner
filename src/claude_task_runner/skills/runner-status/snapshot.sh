@@ -201,13 +201,36 @@ echo ""
 STATE_DIR="$QUEUE/.claude_task_runner/state"
 TODO_COUNT="$(find "$QUEUE/todo" -maxdepth 1 -name '*.yaml' -type f | wc -l)"
 
-# Status breakdown across state YAMLs (completed / failed / running / etc.).
+# Status breakdown across state YAMLs: a row for every task status, a row for
+# each status the runner does not know, and one for files that could not be
+# read or name no status, so the rows add up to the total. Pending, deferred
+# and weekly_paused tasks, and unreadable files, used to be counted in the
+# total and in no row.
+#
 # Runs without a state directory too, counting 0 of each: a queue whose
 # supervisor has never started has none yet, and the table header must still
 # come before the todo/*.yaml row, which used to be printed on its own.
 python3 - "$STATE_DIR" <<'PY'
-import os, sys, glob, re
+import glob
+import os
+import re
+import sys
 from collections import Counter
+
+# TaskStatus in queue/schema.py, in its order. The heredoc runs under plain
+# python3 and cannot import the package, so tests/unit/test_snapshot_script.py
+# seeds a state file for every TaskStatus and fails until each has its row.
+STATUSES = (
+    "pending",
+    "running",
+    "awaiting_sidecar",
+    "deferred",
+    "possibly_hung",
+    "completed",
+    "failed",
+    "failed_circuit_breaker",
+    "weekly_paused",
+)
 state_dir = sys.argv[1]
 counts = Counter()
 status_re = re.compile(r"^status:\s*(\S+)\s*$", re.M)
@@ -215,19 +238,21 @@ for p in glob.glob(os.path.join(state_dir, "*.yaml")):
     try:
         with open(p) as f:
             text = f.read(2000)
-        m = status_re.search(text)
-        if m:
-            counts[m.group(1)] += 1
-    except Exception:
-        counts["read_error"] += 1
+    except (OSError, ValueError):
+        text = ""
+    m = status_re.search(text)
+    # None counts the files that could not be read or name no status.
+    counts[m.group(1) if m else None] += 1
 print("**Queue counts**")
 print()
 print("| field | value |")
 print("|---|---|")
-for k in ("completed","failed","running","awaiting_sidecar","possibly_hung","failed_circuit_breaker"):
-    print(f"| state.{k} | {counts.get(k,0)} |")
-total_state = sum(counts.values())
-print(f"| state files (total) | {total_state} |")
+for k in STATUSES:
+    print(f"| state.{k} | {counts[k]} |")
+for k in sorted(k for k in counts if k is not None and k not in STATUSES):
+    print(f"| state.{k} (unknown status) | {counts[k]} |")
+print(f"| state files unreadable or without a status | {counts[None]} |")
+print(f"| state files (total) | {sum(counts.values())} |")
 PY
 echo "| todo/*.yaml | $TODO_COUNT |"
 echo ""

@@ -29,13 +29,20 @@ import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 from claude_task_runner.cli.install_skills_cmd import _packaged_skill_dir
-from claude_task_runner.queue.schema import SidecarOption, SidecarQuestion, SidecarRequest
+from claude_task_runner.queue.schema import (
+    SidecarOption,
+    SidecarQuestion,
+    SidecarRequest,
+    TaskStatus,
+)
 
 from ._cli_on_path import (
+    EMPTY_LISTING,
     LISTING_FAILURES,
     make_bin,
     real_cli,
@@ -142,12 +149,16 @@ FRESH_QUEUE_REPORT = """
 
 | field | value |
 |---|---|
-| state.completed | 0 |
-| state.failed | 0 |
+| state.pending | 0 |
 | state.running | 0 |
 | state.awaiting_sidecar | 0 |
+| state.deferred | 0 |
 | state.possibly_hung | 0 |
+| state.completed | 0 |
+| state.failed | 0 |
 | state.failed_circuit_breaker | 0 |
+| state.weekly_paused | 0 |
+| state files unreadable or without a status | 0 |
 | state files (total) | 0 |
 | todo/*.yaml | 2 |
 
@@ -174,6 +185,33 @@ def test_fresh_queue_gets_the_whole_report(pass_queue: bool, queue: Path, bin_di
     assert re.fullmatch(r"## Queue status — \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", stamp)
     assert report == FRESH_QUEUE_REPORT.format(runtime=queue / ".claude_task_runner")
     assert log.read_text() == sidecar_list_call(queue)
+
+
+def test_queue_counts_have_a_row_for_every_status_and_add_up(queue: Path, bin_dir: Path) -> None:
+    """One state file per TaskStatus, one with a status the runner does not
+    know, one naming no status, and a directory the glob matches but cannot
+    read: each lands in exactly one row, and the rows add up to the total.
+    The table used to have rows for six statuses only. A status added to
+    TaskStatus fails this until the table has its row."""
+    state_dir = queue / ".claude_task_runner" / "state"
+    state_dir.mkdir(parents=True)
+    statuses = get_args(TaskStatus)
+    for i, status in enumerate(statuses):
+        (state_dir / f"t-{i:03d}.yaml").write_text(f"task_id: t-{i:03d}\nstatus: {status}\n")
+    (state_dir / "t-900.yaml").write_text("task_id: t-900\nstatus: frobbed\n")
+    (state_dir / "t-901.yaml").write_text("task_id: t-901\n")
+    (state_dir / "t-902.yaml").mkdir()
+    (state_dir / "notes.txt").write_text("status: pending\n")
+    stub_cli(bin_dir, stdout=EMPTY_LISTING)
+    proc = _run(bin_dir, "--queue", str(queue), cwd=queue.parent)
+    assert (proc.returncode, proc.stderr) == (0, "")
+    rows = [line for line in proc.stdout.splitlines() if line.startswith("| state")]
+    assert rows == [
+        *(f"| state.{status} | 1 |" for status in statuses),
+        "| state.frobbed (unknown status) | 1 |",
+        "| state files unreadable or without a status | 2 |",
+        f"| state files (total) | {len(statuses) + 3} |",
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,10 @@ def run_script(
     )
 
 
+EMPTY_LISTING = '{"sidecars": [], "n_open": 0, "n_outstanding_questions": 0}\n'
+"""What ``sidecar list --json`` prints for a queue with no open sidecars."""
+
+
 def sidecar_list_call(queue: Path) -> str:
     """The call log after one ``sidecar list --queue <queue> --json``."""
     return f"sidecar\nlist\n--queue\n{queue}\n--json\n--\n"

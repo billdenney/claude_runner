@@ -41,6 +41,7 @@ from claude_task_runner.queue.sidecar import write_response
 from claude_task_runner.queue.store import queue_runtime_dir, todo_dir
 
 from ._cli_on_path import (
+    EMPTY_LISTING,
     LISTING_FAILURES,
     make_bin,
     real_cli,
@@ -51,8 +52,6 @@ from ._cli_on_path import (
 from ._sidecar_files import write_request
 
 FETCH_ALL = _packaged_skill_dir("runner-answer-sidecar") / "fetch_all.sh"
-
-EMPTY_LISTING = '{"sidecars": [], "n_open": 0, "n_outstanding_questions": 0}\n'
 
 
 @pytest.fixture

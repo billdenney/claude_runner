@@ -29,8 +29,9 @@ bash /home/bill/.claude/skills/runner-status/snapshot.sh --queue <CWD>
 The bundled `snapshot.sh` produces a markdown block with: supervisor
 process liveness (PID + etime + cmd), `supervisor.json` fields
 (state / 5h / weekly / in_flight / since / scheduled_wakeup / drift),
-state-file status breakdown (completed / failed / running /
-awaiting_sidecar / possibly_hung / failed_circuit_breaker), todo/
+state-file counts (a row for every task status, one for any status
+the runner does not know, and one for files it could not read or
+that name no status; the rows add up to the total), todo/
 count, open-sidecar list (task_id + sequence + the outstanding
 question ids), and a **per-account
 state table** sourced from supervisor.json's v3 `accounts` map
@@ -114,7 +115,38 @@ or recent failures), follow the prioritized triage flow below.
       `--status failed_circuit_breaker`. Report counts; if non-zero,
       offer the task IDs.
 
-   7. **Healthy summary** — if none of the above, one terse line:
+   7. **Deferred tasks** — run `claude-task-runner queue states
+      --status deferred --queue <CWD> --json` and report the count,
+      grouped by how each state's `deferred_reason` starts:
+
+      - `readiness hold:` — waiting on an unmet readiness requirement,
+        such as a file or a sidecar response (ADR-0030). The supervisor
+        checks it every tick and un-parks the task the first tick after
+        the requirement is met. Give the count and offer the task IDs.
+      - `invalid effort:` — the task's `(model, effort)` pair is not in
+        `[effort_levels]` (ADR-0010). It stays parked until the task
+        YAML is fixed, or the pair is added to the TOML and the
+        supervisor gets SIGHUP. This needs the operator: list each task
+        with its reason.
+      - `pre-dispatch hook deferred (exit 1)` — the queue's pre-dispatch
+        hook asked to wait. The hook runs again once the task's
+        `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
+        in `[failure_classifier]` (900 s by default) after the deferral.
+        Of the runner's own deferrals, only these set
+        `next_eligible_at`. Give the count and the earliest
+        `next_eligible_at`.
+      - Anything else was written by hand or by another tool. The
+        reason is only a label and does not hold the task. Once its
+        `next_eligible_at` passes, or at the next tick if it has none,
+        the task can be dispatched again. If a gate holds it then, the
+        gate's own reason replaces the hand-written one. List each task
+        with its reason and `next_eligible_at`.
+
+      A row with an `error` field is a state file that could not be
+      parsed. `queue states` lists those whatever `--status` asks for,
+      so report them separately, not as deferred.
+
+   8. **Healthy summary** — if none of the above, one terse line:
       "Supervisor (state) · 5h NN% · weekly NN% · pending K ·
       in-flight M".
 
