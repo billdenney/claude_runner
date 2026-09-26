@@ -202,6 +202,25 @@ class TestRoundTrip:
         assert loaded == s
         assert loaded.runs[0].usage.total_tokens == 30
 
+    def test_state_round_trip_with_unknown_cost(self, queue_dir: Path) -> None:
+        """A cost claude reported but the runner could not use is ``null``."""
+        when = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
+        run = RunRecord(
+            attempt=1,
+            started_at=when,
+            finished_at=when,
+            stop_reason="end_turn",
+            duration_s=1.5,
+            cost_usd=None,
+        )
+        s = TaskState(task_id="002", status="completed", attempts=1, runs=[run])
+        path = state_path_for(queue_dir, s.task_id)
+        write_state_atomic(s, path)
+        assert "cost_usd: null" in path.read_text(encoding="utf-8")
+        loaded = load_state(path)
+        assert loaded == s
+        assert loaded.runs[0].cost_usd is None
+
 
 class TestAtomicity:
     def test_write_uses_replace_not_truncate(self, queue_dir: Path) -> None:
