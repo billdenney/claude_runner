@@ -36,6 +36,7 @@ runs:
   killed_by_cap: duration
   pid: 4242
   account: work
+  skipped_stream_lines: 0
 - schema_version: 2
   attempt: 2
   started_at: '2026-09-24T22:05:01.543428Z'
@@ -53,3 +54,4 @@ runs:
   killed_by_cap: tokens
   pid: 4243
   account: personal
+  skipped_stream_lines: 3
