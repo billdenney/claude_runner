@@ -238,7 +238,7 @@ class TestPackageDefaults:
         ("model", "effort"),
         [
             ("claude-opus-4-7", "max"),
-            ("claude-opus-4-7", "extra_high"),
+            ("claude-opus-4-7", "xhigh"),
             ("claude-sonnet-4-6", "high"),
         ],
     )
@@ -250,6 +250,18 @@ class TestPackageDefaults:
         one would park every queued task that names it; this fails first."""
         _write_task(queue_dir, "t-old", model=model, effort=effort)
         assert _candidate_ids(queue_dir) == {"t-old"}
+
+    def test_a_queued_task_with_the_old_spelling_dispatches_as_xhigh(self, queue_dir: Path) -> None:
+        """A task YAML written before ``extra_high`` became ``xhigh`` is read
+        with the new name, so it passes the gate and claude gets a level it
+        knows, instead of ignoring the flag and running at its default."""
+        path = task_path_for(queue_dir, "t-old")
+        path.write_text(
+            "id: t-old\ntitle: T\nprompt: p\nmodel: claude-opus-5-5\neffort: extra_high\n",
+            encoding="utf-8",
+        )
+        [task] = _eligible_candidates(queue_dir, {}, set(), now=_NOW, effort_levels=DEFAULT_LEVELS)
+        assert (task.id, task.effort) == ("t-old", "xhigh")
 
     def test_every_configured_pair_is_dispatchable(self, queue_dir: Path) -> None:
         """Enumerates the default table: the gate accepts every pair it lists."""

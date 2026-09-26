@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 
 from claude_task_runner.supervisor.pidfile import (
     GlobalLockProbe,
+    PidFileUnreadable,
     SupervisorAlreadyRunning,
     acquire_global_lock,
     clear_pid_file,
@@ -21,8 +23,65 @@ from claude_task_runner.supervisor.pidfile import (
     is_pid_alive,
     probe_global_lock,
     read_existing_pid,
+    read_pid_file,
     write_pid_file,
 )
+
+NOT_A_PID = [
+    pytest.param(b"not a number", "holds 'not a number', not a PID", id="words"),
+    pytest.param(b"0\n", "holds '0', not a PID", id="zero"),
+    pytest.param(b"-1\n", "holds '-1', not a PID", id="negative"),
+    pytest.param(b"+5\n", "holds '+5', not a PID", id="plus-sign"),
+    pytest.param(b"1_0\n", "holds '1_0', not a PID", id="underscore"),
+    pytest.param(b"12 34\n", "holds '12 34', not a PID", id="two-numbers"),
+    pytest.param("١٢\n".encode(), r"holds '\\xd9\\xa1\\xd9\\xa2', not a PID", id="arabic-digits"),
+    pytest.param(b"\xff\xfe", r"holds '\\xff\\xfe', not a PID", id="binary"),
+    pytest.param(f"{2**31}\n".encode(), "holds '2147483648', not a PID", id="beyond-pid_t"),
+    pytest.param(b"9" * 5000, f"holds {'9' * 40!r}, not a PID", id="5000-digits"),
+]
+"""Contents :func:`read_pid_file` refuses, and the end of its message.
+``int()`` accepts the sign, the underscore and the Arabic-Indic digits;
+``os.kill`` raises ``OverflowError`` past 2**31 - 1; and ``int()``
+refuses more than 4300 digits with a ``ValueError``."""
+
+
+class TestReadPidFile:
+    def test_missing_file(self, tmp_path: Path) -> None:
+        assert read_pid_file(tmp_path / "nope.pid") is None
+
+    @pytest.mark.parametrize(
+        ("content", "pid"),
+        [(b"1234\n", 1234), (b"  1234 \r\n", 1234), (b"1", 1), (b"2147483647", 2**31 - 1)],
+    )
+    def test_valid_pid(self, tmp_path: Path, content: bytes, pid: int) -> None:
+        p = tmp_path / "supervisor.pid"
+        p.write_bytes(content)
+        assert read_pid_file(p) == pid
+
+    @pytest.mark.parametrize("content", [b"", b"\n", b" \t\n"])
+    def test_empty(self, tmp_path: Path, content: bytes) -> None:
+        p = tmp_path / "supervisor.pid"
+        p.write_bytes(content)
+        with pytest.raises(PidFileUnreadable) as exc_info:
+            read_pid_file(p)
+        assert str(exc_info.value) == f"PID file {p} is empty"
+
+    @pytest.mark.parametrize(("content", "detail"), NOT_A_PID)
+    def test_not_a_pid(self, tmp_path: Path, content: bytes, detail: str) -> None:
+        p = tmp_path / "supervisor.pid"
+        p.write_bytes(content)
+        with pytest.raises(PidFileUnreadable) as exc_info:
+            read_pid_file(p)
+        assert str(exc_info.value) == f"PID file {p} {detail}"
+
+    def test_directory(self, tmp_path: Path) -> None:
+        p = tmp_path / "supervisor.pid"
+        p.mkdir()
+        with pytest.raises(PidFileUnreadable) as exc_info:
+            read_pid_file(p)
+        assert str(exc_info.value) == (
+            f"cannot read PID file {p}: [Errno {errno.EISDIR}] Is a directory: '{p}'"
+        )
 
 
 class TestReadExistingPid:
@@ -42,6 +101,21 @@ class TestReadExistingPid:
     def test_empty_returns_none(self, tmp_path: Path) -> None:
         p = tmp_path / "lock"
         p.write_text("")
+        assert read_existing_pid(p) is None
+
+    @pytest.mark.parametrize(("content", "detail"), NOT_A_PID)
+    def test_whatever_read_pid_file_refuses_returns_none(
+        self, tmp_path: Path, content: bytes, detail: str
+    ) -> None:
+        # The binary case used to raise UnicodeDecodeError, and 0, -1 and
+        # 2**31 came back as PIDs, the last of which crashed is_pid_alive.
+        p = tmp_path / "lock"
+        p.write_bytes(content)
+        assert read_existing_pid(p) is None
+
+    def test_directory_returns_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "lock"
+        p.mkdir()
         assert read_existing_pid(p) is None
 
 

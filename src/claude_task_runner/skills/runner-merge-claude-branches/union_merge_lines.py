@@ -35,6 +35,11 @@ appear at unique line positions per branch.
 If the file's structured-markdown shape differs from
 "Example models" lines, extend ``EXAMPLE_LINE_RE`` to a list of
 patterns and add per-pattern parser functions. Open to PRs.
+
+Exit codes: 0 done (including nothing to reconstruct, or the file is not in the
+worktree); 2 it could not run: a bad argument, a ``--base``, ``--branch`` or
+``--extra-ref`` that does not resolve, no worktree for ``--branch``, no branch
+matching ``--pattern``, or a failed git command.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ import argparse
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 # Regex for the structured line we union-merge. Currently only one
@@ -58,6 +64,22 @@ def run(args: list[str], cwd: Path) -> str:
     if r.returncode != 0:
         raise RuntimeError(f"{' '.join(args)} failed (exit {r.returncode}): {r.stderr[:400]}")
     return r.stdout
+
+
+def fail(message: str) -> int:
+    sys.stderr.write(f"ERROR: (union-merge) {message}\n")
+    return 2
+
+
+def resolves(repo: Path, ref: str) -> bool:
+    """True when ``ref`` names a commit in ``repo``."""
+    r = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
 
 
 def list_pattern_branches(repo: Path, pattern: str) -> list[str]:
@@ -351,7 +373,20 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     repo: Path = args.repo
+    if not repo.is_dir():
+        return fail(f"--repo {repo} is not a directory")
+    refs = [("--base", args.base), ("--branch", args.branch)]
+    refs += [("--extra-ref", ref) for ref in args.extra_ref if ref]
+    for flag, ref in refs:
+        if not resolves(repo, ref):
+            return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     worktree = repo / ".worktrees" / args.branch
+    if not worktree.is_dir():
+        return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
+    # A pattern that matches nothing would "reconstruct" the file from the base
+    # alone and report success.
+    if not list_pattern_branches(repo, args.pattern) and not any(args.extra_ref):
+        return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
     target = worktree / args.file
     if not target.exists():
         sys.stderr.write(f"# target file not present on branch: {target}\n")
@@ -399,4 +434,8 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(2) from None

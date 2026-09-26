@@ -84,6 +84,7 @@ from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
 )
+from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.runner.stream import (
     StreamSummary,
     parse_lines,
@@ -189,6 +190,13 @@ def build_argv(
     flag is required by the claude CLI when ``--print`` is paired with
     stream-json output.
 
+    Always emits ``--effort <task.effort>`` too. ``claude`` does not fail
+    on an effort it does not know; it warns on stderr and uses its default,
+    so the level must be one the CLI accepts. ``[effort_levels]`` is what
+    guarantees that: the supervisor parks a task whose (model, effort) it
+    rejects, and the doctor's ``effort_levels_cli`` check tries every
+    configured level against the installed CLI.
+
     ``add_dirs`` (when non-empty) widens the spawned agent's sandbox
     beyond its cwd; each path is forwarded as ``--add-dir <path>``.
     The caller resolves the list via :mod:`runner.add_dirs` so that
@@ -228,6 +236,11 @@ def build_argv(
     ]
     if task.model:
         argv.extend(["--model", task.model])
+    # The task's effort, which the supervisor has already checked against
+    # [effort_levels] (ADR-0010). Always passed, resumes included: without it
+    # claude runs at its per-model default (medium for claude-opus-5-5 in
+    # Claude Code 2.1.281), whatever the task asks for.
+    argv.extend(["--effort", task.effort])
     if task.allowed_tools:
         argv.extend(["--allowedTools", ",".join(task.allowed_tools)])
     for extra_dir in add_dirs or []:
@@ -1038,6 +1051,116 @@ def _sidecar_refile_decision(
     return new_count, new_count >= threshold
 
 
+def _apply_open_sidecar(
+    final_state: TaskState,
+    *,
+    task: Task,
+    pre_sha: str | None,
+    settings_failure_classifier: FailureClassifierSettings | None,
+) -> TaskState:
+    """Park a finalized run that left an open sidecar, unless it is stuck.
+
+    Stop-and-ask override: if the agent wrote a sidecar request that has
+    no matching response, the agent has paused for an operator decision.
+    Mark the task awaiting_sidecar regardless of how the subprocess
+    exited — clean exit, error, or cap. The orchestrator's eligibility
+    check skips awaiting_sidecar tasks, so the slot frees for the next
+    pending task while this one waits for the operator.
+
+    Sidecar re-file loop guard (ADR-0027). A task that keeps filing
+    sidecars without ever committing is stuck — the operator's answers
+    are not unblocking it (e.g. an answer that needs an upstream fix
+    which never lands, or the agent re-asking the same unresolved
+    question). Count consecutive no-progress re-files; at the threshold,
+    give up to ``failed_circuit_breaker`` (operator intervention) rather
+    than re-dispatch forever. A run that committed resets the counter, so
+    a legitimate ask->build->ask flow is never penalised.
+
+    Shared by the owned and the adopted finalize. ``final_state`` still
+    carries the attempt's ``sidecar_refile_count``: finalizing does not
+    change it.
+    """
+    made_progress = (
+        task.working_dir is not None
+        and pre_sha is not None
+        and _new_commit_since(task.working_dir, pre_sha)
+    )
+    threshold = (
+        settings_failure_classifier.sidecar_refile_loop_threshold
+        if settings_failure_classifier is not None
+        else None
+    )
+    if threshold is not None:
+        refiles, tripped = _sidecar_refile_decision(
+            final_state.sidecar_refile_count, made_progress, threshold
+        )
+    else:
+        # No failure-classifier configured (edge/test path): leave the
+        # counter untouched and never trip — the guard is a no-op.
+        refiles, tripped = final_state.sidecar_refile_count, False
+    if tripped:
+        logger.warning(
+            "task %s tripped the sidecar re-file loop guard "
+            "(%d consecutive no-progress sidecars >= threshold %d); "
+            "giving up to failed_circuit_breaker",
+            task.id,
+            refiles,
+            threshold,
+        )
+        return final_state.model_copy(
+            update={
+                "status": "failed_circuit_breaker",
+                "stop_reason": "sidecar_refile_loop",
+                "error": (
+                    f"sidecar re-file loop: {refiles} consecutive sidecars "
+                    f"filed with no commit (>= threshold {threshold}); "
+                    f"operator intervention required"
+                ),
+                "sidecar_refile_count": refiles,
+            }
+        )
+    return final_state.model_copy(
+        update={
+            "status": "awaiting_sidecar",
+            "sidecar_refile_count": refiles,
+        }
+    )
+
+
+def _run_post_dispatch_hook(
+    settings_hooks: HookSettings,
+    task: Task,
+    *,
+    attempt: int,
+    session_id: str | None,
+) -> None:
+    """Run the post-dispatch hook, best-effort: log a failure, never raise.
+
+    The run is already recorded when this runs, so neither a non-zero exit
+    nor a hook that cannot start (an unparseable command, a missing
+    executable or ``working_dir``) may fail the finalize that called it.
+    """
+    try:
+        post = hooks_mod.run_post_dispatch(
+            settings_hooks,
+            task,
+            attempt=attempt,
+            session_id=session_id,
+            cwd=task.working_dir,
+        )
+    except (hooks_mod.HookError, OSError, ValueError) as exc:
+        logger.warning("post-dispatch hook for %s could not run: %s", task.id, exc)
+        return
+    if post is not None and (post.timed_out or post.exit_code != 0):
+        logger.warning(
+            "post-dispatch hook for %s exited %d (timed_out=%s): %s",
+            task.id,
+            post.exit_code,
+            post.timed_out,
+            post.stderr.strip(),
+        )
+
+
 @dataclass(frozen=True)
 class OutputEvidence:
     """Why a clean-exit run is (or isn't) judged to have produced output.
@@ -1246,6 +1369,7 @@ def dispatch(
     account: str | None = None,
     persist_state: bool = True,
     adopt_workers: bool = False,
+    spawn_gate: SpawnGate | None = None,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
 
@@ -1269,6 +1393,12 @@ def dispatch(
     drain on stop, demote-on-restart. ``persist_state=False`` (in-memory
     force-dispatch) forces the pipe path regardless, since there is no
     state YAML to record ``log_path`` for an adopter to find.
+
+    ``spawn_gate``: the supervisor's :class:`runner.spawn_gate.SpawnGate`.
+    The attempt holds it from just before its log files are opened until
+    the worker's pid is on record, so a stopping supervisor waits for
+    that, and after the supervisor has closed it a daemon thread starts
+    no worker. ``None`` (callers outside the supervisor) skips it.
     """
     if shutil.which(claude_executable) is None:
         raise DispatchError(f"claude binary not found: {claude_executable}")
@@ -1329,12 +1459,21 @@ def dispatch(
             account=account,
         )
 
+    # Snapshot HEAD before spawning so the post-run output-evidence
+    # gate (ADR-0020) can detect a new commit. Failure here is a
+    # warning, not an error — the gate degrades gracefully to checking
+    # only sidecar/deliverable evidence. The running state records it,
+    # so a supervisor that adopts or finalizes this attempt after a
+    # restart (ADR-0025) can apply the same gates.
+    pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
+
     started_at = clock.now()
     new_state = state.model_copy(
         update={
             "status": "running",
             "attempts": state.attempts + 1,
             "last_started_at": started_at,
+            "pre_dispatch_sha": pre_sha,
         }
     )
     if persist_state:
@@ -1441,12 +1580,6 @@ def dispatch(
     _trust_dir = task.working_dir if task.working_dir else Path.cwd()
     _ensure_claude_init(claude_config_dir or None, _trust_dir)
 
-    # Snapshot HEAD before spawning so the post-run output-evidence
-    # gate (ADR-0020) can detect a new commit. Failure here is a
-    # warning, not an error — the gate degrades gracefully to checking
-    # only sidecar/deliverable evidence.
-    pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
-
     # ADR-0025: file-backed output. When adoption is on (and we have a
     # state YAML to record the log path on), redirect the worker's
     # stdout/stderr to per-attempt files so the worker is independent of
@@ -1467,21 +1600,26 @@ def dispatch(
     # stay a uniform ``Popen[str]``.
     stdout_sink: IO[bytes] | int = subprocess.PIPE
     stderr_sink: IO[bytes] | int = subprocess.PIPE
-    if use_files:
-        stdout_log_path, stderr_log_path = _attempt_log_paths(
-            queue_dir, task.id, new_state.attempts
-        )
-        # Open in binary write mode: the worker writes here for its whole
-        # life and we tail it separately. We hold the write handles only
-        # long enough to hand the fds to Popen, then close our copies (in
-        # the finally below) — the child keeps its own dup'd fds. A
-        # ``with`` block can't express this fd hand-off, hence the noqa.
-        stdout_fh = open(stdout_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
-        stderr_fh = open(stderr_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
-        stdout_sink = stdout_fh
-        stderr_sink = stderr_fh
 
+    # From here until the pid is on record, a stopping supervisor waits for
+    # this thread (runner.spawn_gate). A daemon thread that gets here after
+    # the stop began waits instead, and opens and starts nothing.
+    if spawn_gate is not None:
+        spawn_gate.enter(task.id)
     try:
+        if use_files:
+            stdout_log_path, stderr_log_path = _attempt_log_paths(
+                queue_dir, task.id, new_state.attempts
+            )
+            # Open in binary write mode: the worker writes here for its whole
+            # life and we tail it separately. We hold the write handles only
+            # long enough to hand the fds to Popen, then close our copies (in
+            # the finally below) — the child keeps its own dup'd fds. A
+            # ``with`` block can't express this fd hand-off, hence the noqa.
+            stdout_fh = open(stdout_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+            stderr_fh = open(stderr_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+            stdout_sink = stdout_fh
+            stderr_sink = stderr_fh
         process = subprocess.Popen(  # caller-controlled
             argv,
             stdout=stdout_sink,
@@ -1496,6 +1634,11 @@ def dispatch(
             # git/Rscript). Without this the children survive as orphans.
             start_new_session=True,
         )
+    except BaseException:
+        # No worker started, so there is no pid to wait for.
+        if spawn_gate is not None:
+            spawn_gate.leave(task.id)
+        raise
     finally:
         # The child has dup'd the fds; our copies are no longer needed.
         # Closing them lets the tailer (and the worker) own the file
@@ -1536,6 +1679,8 @@ def dispatch(
                 process.pid,
                 exc,
             )
+    if spawn_gate is not None:
+        spawn_gate.leave(task.id)
 
     # Persist heartbeats into the running-state YAML so the
     # supervisor's per-tick silent-orphan reaper sees fresh liveness.
@@ -1709,88 +1854,20 @@ def dispatch(
         settings_dispatch=settings_dispatch,
     )
 
-    # Stop-and-ask override: if the agent wrote a sidecar request that has
-    # no matching response, the agent has paused for an operator decision.
-    # Mark the task awaiting_sidecar regardless of how the subprocess
-    # exited — clean exit, error, or cap. The orchestrator's eligibility
-    # check skips awaiting_sidecar tasks, so the slot frees for the next
-    # pending task while this one waits for the operator.
     if has_open_sidecar:
-        # Sidecar re-file loop guard (ADR-0027). A task that keeps filing
-        # sidecars without ever committing is stuck — the operator's
-        # answers are not unblocking it (e.g. an answer that needs an
-        # upstream fix which never lands, or the agent re-asking the same
-        # unresolved question). Count consecutive no-progress re-files; at
-        # the threshold, give up to ``failed_circuit_breaker`` (operator
-        # intervention) rather than re-dispatch forever. A run that
-        # committed resets the counter, so a legitimate ask->build->ask
-        # flow is never penalised.
-        made_progress = (
-            task.working_dir is not None
-            and pre_sha is not None
-            and _new_commit_since(task.working_dir, pre_sha)
+        final_state = _apply_open_sidecar(
+            final_state,
+            task=task,
+            pre_sha=pre_sha,
+            settings_failure_classifier=settings_failure_classifier,
         )
-        threshold = (
-            settings_failure_classifier.sidecar_refile_loop_threshold
-            if settings_failure_classifier is not None
-            else None
-        )
-        if threshold is not None:
-            refiles, tripped = _sidecar_refile_decision(
-                new_state.sidecar_refile_count, made_progress, threshold
-            )
-        else:
-            # No failure-classifier configured (edge/test path): leave the
-            # counter untouched and never trip — the guard is a no-op.
-            refiles, tripped = new_state.sidecar_refile_count, False
-        if tripped:
-            logger.warning(
-                "task %s tripped the sidecar re-file loop guard "
-                "(%d consecutive no-progress sidecars >= threshold %d); "
-                "giving up to failed_circuit_breaker",
-                task.id,
-                refiles,
-                threshold,
-            )
-            final_state = final_state.model_copy(
-                update={
-                    "status": "failed_circuit_breaker",
-                    "stop_reason": "sidecar_refile_loop",
-                    "error": (
-                        f"sidecar re-file loop: {refiles} consecutive sidecars "
-                        f"filed with no commit (>= threshold {threshold}); "
-                        f"operator intervention required"
-                    ),
-                    "sidecar_refile_count": refiles,
-                }
-            )
-        else:
-            final_state = final_state.model_copy(
-                update={
-                    "status": "awaiting_sidecar",
-                    "sidecar_refile_count": refiles,
-                }
-            )
 
     if persist_state:
         write_state_atomic(final_state, state_path_for(queue_dir, task.id))
 
-    # Post-dispatch hook (best-effort).
-    post = hooks_mod.run_post_dispatch(
-        settings_hooks,
-        task,
-        attempt=run_record.attempt,
-        session_id=final_state.session_id,
-        cwd=task.working_dir,
+    _run_post_dispatch_hook(
+        settings_hooks, task, attempt=run_record.attempt, session_id=final_state.session_id
     )
-    if post is not None and (post.timed_out or post.exit_code != 0):
-        logger.warning(
-            "post-dispatch hook for %s exited %d (timed_out=%s): %s",
-            task.id,
-            post.exit_code,
-            post.timed_out,
-            post.stderr.strip(),
-        )
 
     return DispatchOutcome(
         run_record=run_record,
@@ -1806,6 +1883,8 @@ def adopt_worker(
     queue_dir: Path,
     clock: Clock,
     settings_caps: TaskCapsSettings,
+    settings_dispatch: DispatchSettings,
+    settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -1837,6 +1916,11 @@ def adopt_worker(
     ``"running"`` (the :func:`_demote_if_still_running` race guard),
     mirroring the reaper's own TOCTOU mitigation so neither clobbers the
     other.
+
+    ``settings_dispatch`` and ``settings_hooks`` are required, not
+    defaulted: the finalize applies the owned path's gates with them (see
+    :func:`_finalize_adopted`), and a caller that leaves one out must fail
+    rather than silently skip a gate.
     """
     started_at = state.last_started_at if state.last_started_at is not None else clock.now()
     log_path = Path(state.log_path) if state.log_path is not None else None
@@ -1864,6 +1948,8 @@ def adopt_worker(
             account=account,
             queue_dir=queue_dir,
             settings_failure_classifier=settings_failure_classifier,
+            settings_dispatch=settings_dispatch,
+            settings_hooks=settings_hooks,
         )
 
     logger.info(
@@ -1938,6 +2024,8 @@ def adopt_worker(
         account=account,
         queue_dir=queue_dir,
         settings_failure_classifier=settings_failure_classifier,
+        settings_dispatch=settings_dispatch,
+        settings_hooks=settings_hooks,
     )
 
 
@@ -1947,6 +2035,8 @@ def finalize_exited_worker(
     state: TaskState,
     queue_dir: Path,
     clock: Clock,
+    settings_dispatch: DispatchSettings,
+    settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
 ) -> DispatchOutcome | None:
@@ -1990,6 +2080,8 @@ def finalize_exited_worker(
         account=account,
         queue_dir=queue_dir,
         settings_failure_classifier=settings_failure_classifier,
+        settings_dispatch=settings_dispatch,
+        settings_hooks=settings_hooks,
     )
 
 
@@ -2022,11 +2114,16 @@ def _finalize_adopted(
     account: str | None,
     queue_dir: Path,
     settings_failure_classifier: FailureClassifierSettings | None,
+    settings_dispatch: DispatchSettings,
+    settings_hooks: HookSettings,
 ) -> DispatchOutcome:
     """Build the RunRecord + persist terminal state for an adopted worker.
 
     Shared by :func:`adopt_worker` and :func:`finalize_exited_worker` (a
-    worker that exited before any supervisor could adopt it).
+    worker that exited before any supervisor could adopt it). It applies
+    the owned path's post-run steps: the ADR-0020 output gate with the
+    attempt's recorded ``pre_dispatch_sha``, the ADR-0033 terminal-close
+    gate, the ADR-0027 sidecar re-file guard, and the post-dispatch hook.
 
     Exit code is inferred, not measured: a terminal ``result`` event in
     ``summary`` drives the classification (its ``stop_reason`` / error),
@@ -2071,6 +2168,16 @@ def _finalize_adopted(
 
     has_open_sidecar = any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir))
 
+    # The dispatch that took the pre-dispatch HEAD snapshot is gone; the
+    # running state carries it. A state written before that field existed
+    # can't show whether a worktree task committed. For one, skip the two
+    # gates that would read "unknown" as "no commit": the ADR-0033
+    # terminal gate would take a committed, reported run for a skip and
+    # write a block row, and the ADR-0027 guard would count its sidecar as
+    # no progress.
+    pre_sha = prior.pre_dispatch_sha
+    commit_evidence_known = task.working_dir is None or pre_sha is not None
+
     final_state, run_record = _finalize_state(
         prior=prior,
         plan=_ADOPT_PLAN,
@@ -2079,15 +2186,27 @@ def _finalize_adopted(
         summary=summary,
         cap_violation=cap_violation,
         settings_failure_classifier=settings_failure_classifier,
-        pre_sha=None,
+        pre_sha=pre_sha,
         has_open_sidecar=has_open_sidecar,
+        queue_dir=queue_dir,
+        settings_dispatch=settings_dispatch if commit_evidence_known else None,
     )
 
     if has_open_sidecar:
-        final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
+        if commit_evidence_known:
+            final_state = _apply_open_sidecar(
+                final_state,
+                task=task,
+                pre_sha=pre_sha,
+                settings_failure_classifier=settings_failure_classifier,
+            )
+        else:
+            final_state = final_state.model_copy(update={"status": "awaiting_sidecar"})
 
-    # ``pid`` and ``log_path`` are already cleared by ``_finalize_state``
-    # (the attempt has terminated; nothing left to adopt or reap).
+    # ``pid``, ``log_path`` and ``pre_dispatch_sha`` are already cleared by
+    # ``_finalize_state`` (the attempt has terminated; nothing left to adopt
+    # or reap). The hook gets this attempt's session whoever records it.
+    attempt_session_id = final_state.session_id
 
     # Recheck guard (ADR-0025): a per-tick reaper can demote this task
     # between our verdict and this write. Re-read; only persist if the
@@ -2113,6 +2232,13 @@ def _finalize_adopted(
                 current.status,
             )
             final_state = current
+
+    # The worker has exited either way. The owned path runs the hook once
+    # its worker exits, even over a reaper's concurrent demotion, so this
+    # runs it whether or not the guard stood down.
+    _run_post_dispatch_hook(
+        settings_hooks, task, attempt=run_record.attempt, session_id=attempt_session_id
+    )
 
     return DispatchOutcome(
         run_record=run_record,
@@ -2383,6 +2509,9 @@ def _finalize_state(
             # The next dispatch records a new log_path. No-op for the
             # pipe path, where log_path was never set.
             "log_path": None,
+            # The attempt's pre-dispatch HEAD has served the output gate;
+            # the next dispatch snapshots its own.
+            "pre_dispatch_sha": None,
         }
     )
     return new_state, run

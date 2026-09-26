@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import math
 import signal
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.store import (
     list_pending_tasks,
@@ -235,11 +237,18 @@ def start(
     at ``<queue>/.claude_task_runner/supervisor.pid``):
 
     \b
-    * ``SIGTERM`` / ``SIGINT`` — request a clean stop; in-flight
-      dispatch threads finish their current attempt (architectural
-      invariant 2: in-flight tasks are NOT killed when the supervisor
-      exits). Use ``claude-task-runner supervisor stop`` to do this
-      from the CLI.
+    * ``SIGTERM`` / ``SIGINT`` — stop. Between ticks the supervisor
+      stops within about half a second; a stop that arrives during a
+      tick first waits for the tick's usage poll. It dispatches nothing
+      more, and never kills an in-flight ``claude`` worker
+      (architectural invariant 2). With ``[supervisor].adopt_workers``
+      on, the default, it exits without waiting for the workers, and
+      the next supervisor adopts them (ADR-0025). With it off, it exits
+      once each in-flight attempt has finished.
+      ``claude-task-runner supervisor stop`` sends SIGTERM.
+    * ``SIGUSR1`` — drain: dispatch nothing new, keep ticking, and exit
+      once no task is in flight. ``claude-task-runner supervisor drain``
+      sends it.
     * ``SIGHUP`` — hot-reload ``claude_runner.toml`` on the next tick
       and rescan ``<queue>/todo/`` for new task YAMLs. In-flight tasks
       keep running with their already-built command-line; the new
@@ -284,6 +293,139 @@ def start(
     )
 
 
+def _say(console: Console, message: str, style: str) -> None:
+    """Print ``message`` in ``style``, as written and on one line.
+
+    Rich markup would drop a ``[word]`` from a queue path or from a config
+    table name such as ``[supervisor]``, and a ``[/]`` in a path raised
+    ``MarkupError``. Rich replaces emoji codes such as ``:b:`` even without
+    markup, so without ``emoji=False`` a queue at ``/data/a:b:c`` printed
+    with an emoji in place of ``:b:``.
+    """
+    console.print(message, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
+
+
+def _pid_to_signal(queue_path: Path, console: Console) -> int:
+    """Return the PID of the supervisor running for ``queue_path``, or exit 1.
+
+    Exits 1 when there is no PID file, when the file holds no PID, and when
+    the PID is not alive. A file that holds no PID used to read as no file,
+    but a supervisor may still be running then.
+    """
+    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
+    try:
+        pid = pidfile_mod.read_pid_file(pid_path)
+    except pidfile_mod.PidFileUnreadable as exc:
+        _say(
+            console,
+            f"{exc}, so nothing was signalled. A supervisor may still be running: "
+            "`pgrep -af 'supervisor start'` lists them.",
+            "yellow",
+        )
+        raise typer.Exit(code=1) from exc
+    if pid is None:
+        _say(console, f"No PID file at {pid_path}", "yellow")
+        raise typer.Exit(code=1)
+    if not pidfile_mod.is_pid_alive(pid):
+        _say(console, f"PID {pid} not alive (stale PID file)", "yellow")
+        raise typer.Exit(code=1)
+    return pid
+
+
+def _send_signal(pid: int, signum: signal.Signals, console: Console) -> None:
+    """Send ``signum`` to ``pid``. Exits 1 if it is gone, 2 if not allowed.
+
+    A PID of 1 or less, or this command's own, is refused by
+    :mod:`claude_task_runner.process_signals` without signalling, and
+    exits 2 too.
+    """
+    try:
+        process_signals.kill(pid, signum)
+    except process_signals.UnsafeSignalTarget as exc:
+        _say(console, str(exc), "bold red")
+        raise typer.Exit(code=2) from exc
+    except ProcessLookupError as exc:
+        _say(console, f"PID {pid} disappeared before {signum.name}", "yellow")
+        raise typer.Exit(code=1) from exc
+    except PermissionError as exc:
+        _say(console, f"not allowed to signal PID {pid}: {exc}", "bold red")
+        raise typer.Exit(code=2) from exc
+
+
+def _seconds(value: float) -> str:
+    """``value`` for a message: ``3600`` for 3600.0, ``0.5`` for 0.5.
+
+    ``{:.0f}`` printed ``--poll 0.5`` as "polling every 0s"."""
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _default_drain_wait(config: Path | None, queue_path: Path, console: Console) -> float | None:
+    """How long a waiting drain waits without ``--timeout``; ``None`` is no limit.
+
+    An attempt that starts just before the drain runs its pre-dispatch
+    hook, then up to ``[task_caps].max_duration_s_per_task``, then its
+    post-dispatch hook, and the supervisor sees its dispatch thread has
+    finished on its next tick, up to ``[usage].poll_interval_s`` later.
+    The default is the sum. The systemd unit's ``TimeoutStopSec`` is the
+    cap alone, because at that timeout systemd kills the supervisor; here
+    the timeout only ends the wait, so the margin costs nothing when the
+    drain ends sooner. A cap of 0 is no limit, so the wait has none either.
+
+    Reads the queue's settings as ``supervisor start`` does: ``--config``,
+    or ``<queue>/claude_runner.toml`` when it exists. When they do not
+    load, exits 2 before anything is signalled.
+    """
+    try:
+        settings = load_settings(resolve_per_queue_config(config, queue_path))
+    except (ConfigError, OSError) as exc:
+        _say(
+            console,
+            f"cannot load the settings for the default --timeout: {exc}. "
+            "Pass --timeout <seconds>, or --no-wait, to drain without them.",
+            "bold red",
+        )
+        raise typer.Exit(code=2) from exc
+    cap = settings.task_caps.max_duration_s_per_task
+    if cap == 0:
+        return None
+    return (
+        settings.hooks.pre_dispatch_timeout_s
+        + cap
+        + settings.hooks.post_dispatch_timeout_s
+        + settings.usage.poll_interval_s
+    )
+
+
+def _wait_for_exit(pid: int, wait_s: float | None, poll_s: float, console: Console) -> None:
+    """Check ``pid`` every ``poll_s`` seconds until it exits; exit 4 after ``wait_s``.
+
+    ``None`` waits without limit.
+    """
+    limit_s = math.inf if wait_s is None else wait_s
+    how_long = "with no time limit" if math.isinf(limit_s) else f"up to {_seconds(limit_s)}s"
+    _say(
+        console,
+        f"Waiting {how_long} for PID {pid} to exit (polling every {_seconds(poll_s)}s)...",
+        "dim",
+    )
+    deadline = time.monotonic() + limit_s
+    while time.monotonic() < deadline:
+        if not pidfile_mod.is_pid_alive(pid):
+            _say(console, f"PID {pid} exited; drain complete.", "green")
+            return
+        time.sleep(poll_s)
+    _say(
+        console,
+        f"Drain still in progress after {_seconds(limit_s)}s. The supervisor keeps "
+        "draining; re-run `supervisor drain` to wait again. `supervisor stop` would "
+        "not end the tasks it is waiting for: with [supervisor].adopt_workers on, the "
+        "next supervisor adopts them, and with it off, the supervisor waits for them "
+        "before it exits.",
+        "bold yellow",
+    )
+    raise typer.Exit(code=4)
+
+
 @app.command("stop")
 def stop(
     *,
@@ -304,41 +446,36 @@ def stop(
     queue_dir: Path = typer.Option(
         Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
     ),
-    timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for clean exit."),
 ) -> None:
-    """Send SIGTERM to the running supervisor.
+    """Send SIGTERM to the running supervisor, and return.
 
     Reads the PID from ``<queue>/.claude_task_runner/supervisor.pid``
-    and signals it. Does NOT wait for completion beyond ``timeout``.
+    and sends it one SIGTERM. Stop does not wait for the supervisor to
+    exit; ``supervisor status`` shows when it has.
 
     When ``[supervisor].adopt_workers`` is on (ADR-0025) this is the
     fast-stop path: the SIGTERM trips the daemon's fast-stop handler, so
-    the supervisor stops dispatching and exits promptly while file-backed
-    workers keep running for the next supervisor to adopt. The systemd
-    unit's ``ExecStop`` is wired here in that mode.
+    the supervisor stops dispatching and exits without waiting for its
+    workers, which keep running, file-backed, for the next supervisor to
+    adopt. The systemd unit's ``ExecStop`` is wired here in that mode, so
+    stop must return at once. With adoption off, the supervisor stops
+    dispatching too, but its process exits only once its in-flight tasks
+    finish.
+
+    \b
+    Exit codes:
+      0  SIGTERM sent
+      1  no supervisor to signal: no PID file, one that holds no PID,
+         or a PID that is not alive
+      2  --queue is not an existing directory, or signal delivery
+         rejected (permission)
     """
     _ = config  # accepted for ExecStop symmetry; stop needs no settings.
     console = Console()
-    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
-    pid = pidfile_mod.read_existing_pid(pid_path)
-    if pid is None:
-        console.print(f"[yellow]No PID file at {pid_path}[/]")
-        raise typer.Exit(code=1)
-    if not pidfile_mod.is_pid_alive(pid):
-        console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
-        raise typer.Exit(code=1)
-    try:
-        process_signals.kill(pid, signal.SIGTERM)
-    except process_signals.UnsafeSignalTarget as exc:
-        console.print(str(exc), style="bold red", markup=False, highlight=False, soft_wrap=True)
-        raise typer.Exit(code=2) from exc
-    except ProcessLookupError as exc:
-        console.print(f"[yellow]PID {pid} disappeared before SIGTERM[/]")
-        raise typer.Exit(code=1) from exc
-    except PermissionError as exc:
-        console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
-        raise typer.Exit(code=2) from exc
-    console.print(f"[green]SIGTERM sent to PID {pid}.[/]")
+    queue_path = require_queue_option(queue_dir, console)
+    pid = _pid_to_signal(queue_path, console)
+    _send_signal(pid, signal.SIGTERM, console)
+    _say(console, f"SIGTERM sent to PID {pid}.", "green")
 
 
 @app.command("drain")
@@ -349,14 +486,12 @@ def drain(
         "--config",
         "-c",
         help=(
-            "Per-queue claude_runner.toml. Accepted for symmetry with "
-            "`supervisor start` so the systemd unit's `ExecStop=... "
-            "drain ...` line can reuse the same argv as `ExecStart` "
-            "(see `cron/systemd_unit.py::_drain_command_from`). Drain "
-            "itself does not need settings — it only signals the "
-            "running supervisor via the queue's pidfile — so this is "
-            "currently a no-op, accepted to avoid `No such option: "
-            "--config` errors when the unit's `ExecStop` runs."
+            "Per-queue claude_runner.toml, for the default --timeout. "
+            "Defaults to <queue>/claude_runner.toml when that exists. Only "
+            "a waiting drain without --timeout reads it, so the systemd "
+            "unit's `ExecStop=... drain ... --no-wait` line, which reuses "
+            "the argv of `ExecStart` (see "
+            "`cron/systemd_unit.py::_drain_command_from`), never does."
         ),
     ),
     queue_dir: Path = typer.Option(
@@ -367,13 +502,16 @@ def drain(
         "--wait/--no-wait",
         help="Block until the supervisor exits (or --timeout elapses).",
     ),
-    timeout: float = typer.Option(
-        3600.0,
+    timeout: float | None = typer.Option(
+        None,
         "--timeout",
         help=(
-            "When --wait, give up after N seconds. Default 1h — longer "
-            "than the longest plausible task. Exit code 4 if the timeout "
-            "fires; the supervisor will keep draining."
+            "When --wait, give up after N seconds with exit 4; the "
+            "supervisor keeps draining. Default: the queue's "
+            "[task_caps].max_duration_s_per_task, plus "
+            "[hooks].pre_dispatch_timeout_s, "
+            "[hooks].post_dispatch_timeout_s and one "
+            "[usage].poll_interval_s; no limit when the cap is 0."
         ),
     ),
     poll_s: float = typer.Option(
@@ -405,62 +543,42 @@ def drain(
     ``supervisor start``, or let the cron watchdog restart it. The
     watchdog manages one queue, the last that ``watchdog queues`` lists.
 
-    The drain window is bounded by the longest in-flight task
-    (typically minutes for extraction work; up to
-    ``[task_caps].max_duration_s_per_task`` for the hard cap).
+    A drain lasts as long as its longest in-flight task: the
+    pre-dispatch hook, the run, up to
+    ``[task_caps].max_duration_s_per_task`` or the task's
+    ``max_duration_s_override``, and the post-dispatch hook. Without
+    ``--timeout``, a waiting drain waits for a task that starts just
+    before it and runs to the queue's cap: the cap, both hook timeouts,
+    and one ``[usage].poll_interval_s`` for the supervisor to notice.
+    With a cap of 0 it waits without limit. That default is the only
+    thing drain reads the queue's settings for, so a
+    ``claude_runner.toml`` that does not load stops only a waiting
+    drain without ``--timeout``, with exit 2 before anything is
+    signalled. Pass ``--timeout`` for a task whose override is longer
+    than the cap.
 
     \b
     Exit codes:
-      0  supervisor exited cleanly (or --no-wait and signal delivered)
-      1  no PID file / stale PID file
-      2  signal delivery rejected (permission), or refused because the
-         PID is 1 or less or this command's own
-      4  --wait timed out (supervisor still draining — re-run drain or stop)
+      0  supervisor exited (or --no-wait and signal delivered)
+      1  no supervisor to signal: no PID file, one that holds no PID,
+         or a PID that is not alive
+      2  --queue is not an existing directory, the settings for the
+         default --timeout did not load, or signal delivery rejected
+         (permission) or refused (a PID of 1 or less, or this command's own)
+      4  --wait timed out (the supervisor is still draining)
     """
     console = Console()
-    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
-    pid = pidfile_mod.read_existing_pid(pid_path)
-    if pid is None:
-        console.print(f"[yellow]No PID file at {pid_path}[/]")
-        raise typer.Exit(code=1)
-    if not pidfile_mod.is_pid_alive(pid):
-        console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
-        raise typer.Exit(code=1)
-    try:
-        process_signals.kill(pid, signal.SIGUSR1)
-    except process_signals.UnsafeSignalTarget as exc:
-        console.print(str(exc), style="bold red", markup=False, highlight=False, soft_wrap=True)
-        raise typer.Exit(code=2) from exc
-    except ProcessLookupError as exc:
-        console.print(f"[yellow]PID {pid} disappeared before SIGUSR1[/]")
-        raise typer.Exit(code=1) from exc
-    except PermissionError as exc:
-        console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
-        raise typer.Exit(code=2) from exc
-    console.print(f"[green]SIGUSR1 (drain) sent to PID {pid}.[/]")
-
-    if not wait:
-        return
-
-    import time
-
-    console.print(
-        f"[dim]Waiting up to {timeout:.0f}s for PID {pid} to exit "
-        f"(polling every {poll_s:.0f}s)...[/]"
-    )
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not pidfile_mod.is_pid_alive(pid):
-            console.print(f"[green]PID {pid} exited; drain complete.[/]")
-            return
-        time.sleep(poll_s)
-    console.print(
-        f"[bold yellow]Drain still in progress after {timeout:.0f}s.[/] "
-        "The supervisor will keep draining. Re-run `supervisor drain` "
-        "to wait further, or `supervisor stop` to force-exit (in-flight "
-        "tasks will be killed by systemd's KillMode)."
-    )
-    raise typer.Exit(code=4)
+    queue_path = require_queue_option(queue_dir, console)
+    pid = _pid_to_signal(queue_path, console)
+    wait_s = timeout
+    if wait and timeout is None:
+        # Before signalling, so a TOML that does not load leaves the
+        # supervisor as it was.
+        wait_s = _default_drain_wait(config, queue_path, console)
+    _send_signal(pid, signal.SIGUSR1, console)
+    _say(console, f"SIGUSR1 (drain) sent to PID {pid}.", "green")
+    if wait:
+        _wait_for_exit(pid, wait_s, poll_s, console)
 
 
 @app.command("status")

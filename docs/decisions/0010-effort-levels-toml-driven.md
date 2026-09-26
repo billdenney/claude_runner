@@ -97,3 +97,42 @@ wherever the runner decides to dispatch, against the settings it runs with:
 A pair is either accepted or rejected, with no alias or case folding. The
 packaged `[effort_levels]` keeps previous-generation models so that queued
 tasks naming them keep dispatching.
+
+## Update (2026-09-26): the effort reaches `claude`
+
+Validating the effort did not make it take effect. The dispatcher never
+passed it to `claude`: `build_argv` had no `--effort`, so from the first
+release every dispatched agent ran at the CLI's per-model default, whatever
+its task named. `build_argv` now passes `--effort <task.effort>` on every
+spawn, fresh or resumed. A task that leaves effort out runs at the `Task`
+default, `medium`.
+
+What Claude Code 2.1.281 does with the flag, checked against the installed
+binary without an API call:
+
+- It accepts `low`, `medium`, `high`, `xhigh` and `max`, in any case.
+- For any other name it prints `Warning: Unknown --effort value '...' —
+  ignoring it and using the default effort` on stderr and carries on. So a
+  level the CLI does not know fails silently, not loudly.
+- It downgrades a level the chosen model does not support, silently.
+- The default for `claude-opus-5-5` is `medium`. The nlmixr2lib queue's
+  `effort: high` tasks had therefore run at `medium`, and now run at `high`.
+
+Two consequences follow from the silent failure:
+
+- **`extra_high` became `xhigh`,** the CLI's name. The packaged
+  `[effort_levels]` uses `xhigh`. Files written before the rename are read
+  with the old spelling as the new one, with one warning per file: a queue
+  TOML's `[effort_levels]` by `config.loader.load_settings`, and a task
+  YAML's `effort` by `queue.store.load_task`. `RETIRED_EFFORT_LEVELS` in
+  `runner.effort_levels` holds the mapping. New input is not renamed:
+  `queue add --effort extra_high` is refused with the name to use. The gate
+  itself still has no alias or case folding; the loaders rename before it
+  sees the pair.
+- **`doctor`'s `effort_levels_cli` check** runs
+  `claude --effort <level> --version` for every configured level. That parses
+  the flag and makes no API call. The check FAILs on a level whose run exits
+  non-zero or prints a stderr line a plain `claude --version` does not. A
+  future rename in the CLI then shows up in the doctor instead of quietly
+  costing every task its effort. The check covers level names only, not
+  which models support them.

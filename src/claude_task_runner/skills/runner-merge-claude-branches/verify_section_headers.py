@@ -56,11 +56,13 @@ prose.
 Exit codes
 ----------
 
-* 0 — no missing headers (or no candidate branches, or merged file
-  not present).
+* 0 — no missing headers, or the merged file is not in the worktree.
 * 1 — at least one branch has new ``##`` / ``###`` headers absent
   from the merged file. Details printed to stdout.
-* 2 — bad arguments.
+* 2 — the check could not run: a bad argument, a ``--base``, ``--branch``
+  or ``--extra-ref`` that does not resolve, no worktree for ``--branch``, no
+  branch matching ``--pattern``, or a crash. Checking no branch at all would
+  report every header present, so that is an error, not a pass.
 
 Expected error format (sample)::
 
@@ -76,10 +78,34 @@ import argparse
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 H2_RE = re.compile(r"^## (.+)$", re.M)
 H3_RE = re.compile(r"^### ([A-Za-z0-9_, ]+)\b", re.M)
+
+
+def fail(message: str) -> int:
+    sys.stderr.write(f"ERROR: (section-verifier) {message}\n")
+    return 2
+
+
+def is_work_tree(repo: Path) -> bool:
+    r = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"], cwd=repo, capture_output=True, text=True
+    )
+    return r.returncode == 0
+
+
+def resolves(repo: Path, ref: str) -> bool:
+    """True when ``ref`` names a commit in ``repo``."""
+    r = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
 
 
 def show_or_empty(ref_path: str, cwd: Path) -> str:
@@ -100,6 +126,7 @@ def candidate_branches(repo: Path, pattern: str, extra_refs: list[str]) -> list[
         cwd=repo,
         capture_output=True,
         text=True,
+        check=True,
     )
     branches = sorted({b.strip() for b in r.stdout.splitlines() if b.strip()})
     for ref in extra_refs or []:
@@ -134,7 +161,22 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     repo: Path = args.repo
+    if not repo.is_dir() or not is_work_tree(repo):
+        return fail(f"--repo {repo} is not a git working tree")
+    refs = [("--base", args.base), ("--branch", args.branch)]
+    refs += [("--extra-ref", ref) for ref in args.extra_ref if ref]
+    for flag, ref in refs:
+        if not resolves(repo, ref):
+            return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     worktree = repo / ".worktrees" / args.branch
+    if not worktree.is_dir():
+        return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
+    branches = candidate_branches(repo, args.pattern, args.extra_ref)
+    if not branches:
+        return fail(
+            f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
+            " nothing to verify"
+        )
     merged_path = worktree / args.file
     if not merged_path.exists():
         sys.stderr.write(
@@ -147,8 +189,6 @@ def main(argv: list[str]) -> int:
 
     merged_text = merged_path.read_text()
     merged_h2, merged_h3 = extract_headers(merged_text)
-
-    branches = candidate_branches(repo, args.pattern, args.extra_ref)
 
     failures: list[tuple[str, set[str], set[str]]] = []
     for br in branches:
@@ -184,4 +224,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Exception:
+        # Exit 1 means "headers missing"; a crash must not read as that verdict.
+        traceback.print_exc()
+        raise SystemExit(2) from None

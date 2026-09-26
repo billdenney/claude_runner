@@ -69,17 +69,60 @@ def global_lock_path() -> Path:
     return global_lock_dir() / GLOBAL_LOCK_FILENAME
 
 
+_PID_T_MAX = 2**31 - 1
+"""The largest PID ``os.kill`` accepts: ``pid_t`` is a signed 32-bit int.
+It raises ``OverflowError`` for anything larger."""
+
+
+class PidFileUnreadable(Exception):
+    """A PID file exists but does not hold a PID."""
+
+
+def read_pid_file(path: Path) -> int | None:
+    """Return the PID written in ``path``, or ``None`` when there is no file.
+
+    For a caller that acts on the PID, such as ``supervisor stop``: a file
+    that exists but cannot be read, or holds anything but one PID in
+    decimal digits, raises instead of reading as no file. The daemon
+    writes the file with a truncate and then a write, so a reader can find
+    it empty while a supervisor starts, or after one crashed there.
+
+    Raises
+    ------
+    PidFileUnreadable
+        ``path`` exists but cannot be read, or does not hold a number from
+        1 to 2**31 - 1.
+    """
+    try:
+        # Bytes: decoding a binary file as text would raise UnicodeDecodeError.
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PidFileUnreadable(f"cannot read PID file {path}: {exc}") from exc
+    digits = raw.strip()
+    if not digits:
+        raise PidFileUnreadable(f"PID file {path} is empty")
+    # bytes.isdigit() is true for ASCII digits only. 2**31 - 1 has ten, and
+    # checking the length first also keeps int() from refusing a string of
+    # more than 4300 digits with a ValueError.
+    if digits.isdigit() and len(digits) <= 10:
+        pid = int(digits)
+        if 0 < pid <= _PID_T_MAX:
+            return pid
+    shown = digits[:40].decode("ascii", errors="backslashreplace")
+    raise PidFileUnreadable(f"PID file {path} holds {shown!r}, not a PID")
+
+
 def read_existing_pid(path: Path) -> int | None:
-    """Best-effort: read the PID written into a lock file."""
-    if not path.exists():
-        return None
+    """Best-effort: the PID written into a PID or lock file, or ``None``.
+
+    ``None`` covers a missing file and one that :func:`read_pid_file`
+    cannot read a PID from alike.
+    """
     try:
-        text = path.read_text().strip()
-    except OSError:
-        return None
-    try:
-        return int(text)
-    except ValueError:
+        return read_pid_file(path)
+    except PidFileUnreadable:
         return None
 
 

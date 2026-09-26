@@ -122,7 +122,7 @@ def template(
         help="Print the field table (name/required/type/default/description) instead of an example.",
     ),
 ) -> None:
-    """Print a complete, annotated example Task YAML -- how to author one.
+    """Print a complete, annotated example Task YAML.
 
     Redirect it into a new task file and edit in place::
 
@@ -177,7 +177,7 @@ def list_tasks(
         ),
     ),
 ) -> None:
-    """List pending tasks in ``<queue>/todo/`` (Task YAMLs).
+    """List the Task YAMLs pending in ``<queue>/todo/``.
 
     Each parsed task's row carries ``effort_error``: ``null`` when the
     queue's ``[effort_levels]`` accepts its (model, effort) pair, else the
@@ -289,6 +289,38 @@ def list_tasks(
             )
 
 
+def _print_deferral(console: Console, state: dict[str, object]) -> None:
+    """Print why a ``deferred`` task is parked, for ``queue states`` and ``queue show``.
+
+    Prints nothing for any other status: a task that dispatches after a
+    deferral keeps its old ``deferred_reason`` and ``next_eligible_at``,
+    so a completed task can still carry both. For a ``deferred`` task,
+    prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
+    the earliest time the supervisor tries the task again. Of the runner's
+    own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
+    readiness hold (ADR-0030) and an effort hold (ADR-0010) do not,
+    because their gate re-checks the task on every tick.
+
+    Printed as written: Rich markup would drop the ``[effort_levels]`` in
+    an unknown model's effort hold and raise on a ``[/]`` in a hook's
+    stderr, and emoji codes would turn a ``:b:`` in a path into a symbol.
+    The second and later lines of a reason are indented, so none of them
+    can pass for a task's row in ``queue states``.
+    """
+    if state.get("status") != "deferred":
+        return
+    reason = state.get("deferred_reason")
+    if isinstance(reason, str) and reason.strip():
+        shown = "\n    ".join(reason.splitlines())
+    else:
+        shown = "(none recorded)"
+    lines = [f"  deferred_reason: {shown}"]
+    next_eligible_at = state.get("next_eligible_at")
+    if next_eligible_at is not None:
+        lines.append(f"  next_eligible_at: {next_eligible_at}")
+    console.print("\n".join(lines), markup=False, highlight=False, emoji=False, soft_wrap=True)
+
+
 @app.command("states")
 def list_states(
     *,
@@ -306,6 +338,10 @@ def list_states(
 
     Skills use ``--status awaiting_sidecar`` to find work that needs
     operator attention, ``--status running`` for in-flight, etc.
+
+    Under each ``deferred`` task, the output without ``--json`` prints
+    why it is parked (``deferred_reason``) and, when set, when the
+    supervisor tries it again (``next_eligible_at``).
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -333,6 +369,8 @@ def list_states(
                     "last_finished_at",
                     "stop_reason",
                     "error",
+                    "deferred_reason",
+                    "next_eligible_at",
                 )
             }
         out.append(payload)
@@ -354,6 +392,7 @@ def list_states(
             else "yellow"
         )
         console.print(f"[bold]{item.get('task_id', item.get('id', '?'))}[/]  [{color}]{status}[/]")
+        _print_deferral(console, item)
         if item.get("error"):
             console.print(f"  [dim]error:[/] {item['error']}")
 
@@ -367,7 +406,11 @@ def show_task(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Show the input YAML AND state YAML for one task."""
+    """Show the input YAML AND state YAML for one task.
+
+    For a ``deferred`` task, the output without ``--json`` also prints
+    ``deferred_reason`` and, when set, ``next_eligible_at``.
+    """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
     task_path = task_path_for(qd, task_id)
@@ -420,6 +463,7 @@ def show_task(
             f"  status: {state_payload.get('status')}  attempts: {state_payload.get('attempts')}"
         )
         console.print(f"  session_id: {state_payload.get('session_id')}")
+        _print_deferral(console, state_payload)
     if "state_error" in payload:
         console.print(f"  [red]state error:[/] {payload['state_error']}")
     readiness = payload.get("readiness")
@@ -620,7 +664,7 @@ def backfill_working_dir(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Populate ``working_dir`` on tasks in ``todo/`` whose value is null.
+    """Fill in a null ``working_dir`` on ``todo/`` tasks.
 
     Idempotent: skips any task whose ``working_dir`` is already set
     (regardless of whether the current value matches the template).
@@ -731,7 +775,7 @@ def restart_fresh(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Clear a task's ``session_id`` so the next dispatch starts fresh.
+    """Clear a task's ``session_id`` so it starts fresh.
 
     Escape hatch for ADR-0024 session affinity: when a task's affined
     account is stuck (weekly-throttled, paused, or removed from
@@ -843,7 +887,7 @@ def force_dispatch(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Bypass throttle and priority; dispatch ``task_id`` next.
+    """Bypass throttle and priority; run ``task_id`` next.
 
     Use when an operator needs a single high-priority task to run NOW
     even though the supervisor is in ``throttled_5h`` or ``throttled_weekly``.
@@ -856,7 +900,9 @@ def force_dispatch(
       the supervisor consumes it on the next tick (typically <30 s).
       Without ``--over-limit`` the supervisor declines if all
       ``max_concurrency`` slots are taken and the request file persists
-      for a later tick. The pre-dispatch hook runs as normal.
+      for a later tick. It deletes the file when it dispatches the task,
+      and when it drops a request whose task it can no longer dispatch,
+      logging a WARNING. The pre-dispatch hook runs as normal.
     * **Supervisor not running.** Runs the dispatch in-process and
       blocks until the attempt finishes. ``--over-limit`` is implied
       (no in-flight slots to conflict with) and ignored.
@@ -865,8 +911,9 @@ def force_dispatch(
     current status is not dispatchable (``running``,
     ``awaiting_sidecar``, ``completed``, ``failed_circuit_breaker``,
     ``weekly_paused``), if the queue's ``[effort_levels]`` rejects its
-    (model, effort) pair, or if the pre-dispatch hook fails during the
-    synchronous path.
+    (model, effort) pair, if one of its ``requires`` elements is unmet
+    (ADR-0030), or if the pre-dispatch hook fails during the synchronous
+    path.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -918,6 +965,17 @@ def force_dispatch(
             console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=2)
 
+    # ADR-0030, checked here for the same reason: both force paths refuse a
+    # task with an unmet `requires` element.
+    unmet = readiness_mod.unmet_requirements(task, qd)
+    if unmet:
+        msg = f"task {task_id} has {len(unmet)} unmet readiness requirement(s): {'; '.join(unmet)}"
+        if json:
+            print(_json.dumps({"ok": False, "error": msg, "unmet": unmet}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2)
+
     if _supervisor_is_alive(qd):
         path = fd_mod.write_request(qd, task_id, allow_over_limit=over_limit)
         if not json:
@@ -939,11 +997,24 @@ def force_dispatch(
         elif picked_up:
             console.print(f"[green]task {task_id} entered `running` status.[/]")
         elif wait_seconds > 0:
-            console.print(
-                f"[yellow]task {task_id} still not running after {wait_seconds}s — "
-                "the supervisor may be honouring max_concurrency. The request "
-                "file persists; the task will dispatch on the next free slot.[/]"
-            )
+            # The supervisor deletes the request both when it dispatches the
+            # task and when it drops the request, so only a file still on
+            # disk means the request is waiting.
+            if path.exists():
+                msg = (
+                    f"task {task_id} still not running after {wait_seconds}s — "
+                    "the supervisor may be honouring max_concurrency. The request "
+                    "file persists; the task will dispatch on the next free slot."
+                )
+            else:
+                msg = (
+                    f"task {task_id} still not running after {wait_seconds}s, and "
+                    "its request file is gone: the supervisor either dispatched the "
+                    "task (its pre-dispatch hook may still be running, or may have "
+                    "deferred it) or dropped the request, logging a WARNING that says "
+                    f"why. Check `queue show {task_id}`."
+                )
+            console.print(msg, style="yellow", markup=False, highlight=False, soft_wrap=True)
         return
 
     # No supervisor running: do it inline. No race possible.

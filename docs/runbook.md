@@ -128,6 +128,30 @@ shows many tasks waiting.
 2. Walk through them; each click resolves one (no typing needed for the
    common case).
 
+## A task stays `deferred`
+
+**Symptom:** `claude-task-runner queue states --status deferred` lists a
+task that does not run.
+
+**Steps:**
+1. Read the `deferred_reason` line printed under the task.
+   `claude-task-runner queue show <task_id>` prints it for one task.
+2. The start of the reason says what parked the task:
+   - `readiness hold:` — a `requires` element is missing (ADR-0030). The
+     task goes back to `pending` on the first tick after it appears.
+     `queue show` also lists the unmet elements, checked live.
+   - `invalid effort:` — the queue's `[effort_levels]` does not accept the
+     task's (model, effort) pair (ADR-0010). Fix the task's model or effort,
+     or add the pair to `[effort_levels]` and send the supervisor SIGHUP.
+     The task goes back to `pending` on the next tick.
+   - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
+     to wait, and the rest of the reason is its stderr (ADR-0026). Once the
+     `next_eligible_at` printed below the reason has passed, the supervisor
+     tries the task again and runs the hook again.
+   - Anything else was written by hand. The supervisor treats the task as
+     ready again once its `next_eligible_at` has passed, or at once when it
+     has none.
+
 ## Cron / systemd watchdog not installed
 
 **Symptom:** Supervisor died once (e.g., after a reboot) and didn't
@@ -210,6 +234,14 @@ alone needs no restart, and `install` does not ask for one.
    claude-task-runner supervisor drain --queue <old>
    systemctl --user start claude-task-runner
    ```
+
+   `drain` returns once the supervisor has exited. Unless you pass
+   `--timeout`, it waits as long as a task that started just before it
+   may take: `[task_caps].max_duration_s_per_task`, both hook timeouts
+   and one `[usage].poll_interval_s`, with no limit when the cap is 0.
+   If it exits 4, the supervisor is still draining and the unit is still
+   active, so `systemctl --user start` would do nothing. Run `drain` again
+   before starting the unit.
 
 2. Or switch at once:
 
