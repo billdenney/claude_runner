@@ -315,8 +315,10 @@ class TestAccountList:
         assert by_name["personal"]["dispatch_cap"] == 2
         assert by_name["work"]["target_concurrency"] is None
         assert by_name["work"]["dispatch_cap"] == 1
+        # No state row: dispatch declines it ("no state"), so its cap is 0.
         assert by_name["ghost"]["target_concurrency"] is None
-        assert by_name["ghost"]["dispatch_cap"] == 1
+        assert by_name["ghost"]["dispatch_cap"] == 0
+        assert by_name["ghost"]["last_reading_at"] is None
 
         human = runner.invoke(app, args)
         assert human.exit_code == 0, human.output
@@ -368,6 +370,37 @@ class TestAccountPauseResume:
         snap = persist_mod.load(persist_mod.supervisor_state_path(queue_dir))
         assert snap is not None
         assert snap.accounts["personal"].paused is True
+        assert snap.accounts["personal"].state is SupervisorState.NO_READING
+
+    def test_pause_synthesizes_a_no_reading_row_for_an_account_without_one(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``personal`` was added to the config after supervisor.json was
+        written, so it has no row; like a seeded account it takes no tasks
+        until it is read."""
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(
+            tmp_path, accounts=[("personal", "", None), ("work", "", None)]
+        )
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                "work": AccountState(
+                    state=SupervisorState.DISPATCHING, since=datetime(2026, 5, 21, tzinfo=UTC)
+                )
+            },
+        )
+        result = runner.invoke(
+            app,
+            ["account", "pause", "personal", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        snap = persist_mod.load(persist_mod.supervisor_state_path(queue_dir))
+        assert snap is not None
+        assert snap.accounts["personal"].state is SupervisorState.NO_READING
+        assert snap.accounts["personal"].paused is True
+        assert snap.accounts["work"].state is SupervisorState.DISPATCHING
 
     def test_pause_then_resume_flips_flag(self, runner: CliRunner, tmp_path: Path) -> None:
         queue_dir = tmp_path / "q"
@@ -524,7 +557,7 @@ class TestAccountPauseResumeHumanReadable:
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
-        # No snapshot yet — _update_paused seeds one with an IDLE row.
+        # No snapshot yet: _update_paused seeds one, in NO_READING.
         result = runner.invoke(
             app,
             ["account", "pause", "personal", "--config", str(config), "--queue", str(queue_dir)],

@@ -85,6 +85,7 @@ States in `supervisor/states.py`:
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
 - `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
+- `NoReading` — no clean usage reading for the account within `[usage].max_reading_age_s`, or none yet; takes no tasks until a capture succeeds. Every account starts here.
 
 The state machine itself (`supervisor/state_machine.py`) is a thin
 wrapper that translates the result of `throttle.decision.decide()`
@@ -125,9 +126,26 @@ with no notice, but `step()` still makes the decision and records its
 target and wakeup. The account stays `Idle` until its next capture, a full
 round-robin cycle away on a multi-account queue, and tasks that arrive
 in the meantime dispatch through it under that target: none if the
-reading was throttled, the ramp target if it was slowing down. An
-account seeded `Idle` and never captured has no target yet, so only its
-`max_concurrency` caps it.
+reading was throttled, the ramp target if it was slowing down.
+
+An account takes tasks only while its last clean reading is at most
+`[usage].max_reading_age_s` old (600 s by default; the loader rejects
+less than two capture cycles, `len(accounts) × poll_interval_s × 2`).
+Failed captures don't count, so `last_reading_at` in `supervisor.json`
+moves only on a clean reading, while `last_capture_at`, which drives the
+round robin, moves on every attempt. Every account starts in
+`NoReading`, and after each tick's `step()` the daemon moves any
+`Idle`, `Dispatching` or `SlowingDown` account whose reading has gone
+stale into `NoReading` (`state_machine.expire_stale_readings`), with
+one `notify[warn]` naming the account and when it was last read. Its
+next clean reading reclassifies it. So on a multi-account queue each
+account starts taking tasks once it has been read (within one cycle),
+an account whose captures keep failing stops, and after a restart
+following downtime longer than the limit no account runs on a reading
+from before the downtime. A single-account queue reads its account
+earlier in the same tick as its dispatch pass, so it still dispatches
+on its first tick. `queue force-dispatch` bypasses this, as it bypasses
+the throttle.
 
 Per task, `runner.account_dispatch.choose_account` skips an account
 whose state is not `Dispatching`, `SlowingDown` or `Idle`, or which is
@@ -208,11 +226,13 @@ started it:
 
 At the default `[logging].level` of INFO, `Notify` actions appear as
 `notify[<level>]: <message>` lines on entry to `ErrorDrift`, `SlowingDown`,
-`Throttled5h` and `ThrottledWeekly`. `EmitEvent` actions (`state_transition`,
+`Throttled5h` and `ThrottledWeekly`, and when a reading goes stale and an
+account enters `NoReading`. `EmitEvent` actions (`state_transition`,
 `drift_detected`, `drift_clean_poll`, `usage_capture_error`, ...) are logged
 at DEBUG level only; set `[logging].level = "DEBUG"` in `claude_runner.toml`
 to see them. A usage capture that times out or cannot spawn `claude` produces
-only a `usage_capture_error` event, so at INFO it leaves no trace in the log.
+only a `usage_capture_error` event, so at INFO it leaves no trace in the log
+until the account's reading is older than `[usage].max_reading_age_s`.
 
 There is no separate drift log. Parser drift leaves three pieces of evidence:
 

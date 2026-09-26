@@ -301,6 +301,24 @@ class TestThrottleTarget:
             expected
         )
 
+    @pytest.mark.parametrize("state", list(SupervisorState))
+    @pytest.mark.parametrize("target", [None, 3])
+    def test_cap_is_zero_in_every_state_that_takes_no_tasks(
+        self, state: SupervisorState, target: int | None
+    ) -> None:
+        """``account list`` shows this cap, so it must not claim room on an
+        account dispatch skips, whatever target the state carries."""
+        takes_tasks = {
+            SupervisorState.IDLE,
+            SupervisorState.DISPATCHING,
+            SupervisorState.SLOWING_DOWN,
+        }
+        cap = account_cap(_account("personal", cap=5), _state(state=state, target=target))
+        if state in takes_tasks:
+            assert cap == (5 if target is None else target)
+        else:
+            assert cap == 0
+
     def test_slowing_account_takes_tasks_below_its_target(self) -> None:
         choice = choose_account(
             task=_task(),

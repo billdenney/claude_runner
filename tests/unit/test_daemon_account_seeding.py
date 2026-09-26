@@ -27,7 +27,7 @@ def test_initial_snapshot_seeds_named_accounts() -> None:
     )
     assert sorted(snap.accounts.keys()) == ["personal", "work"]
     for state in snap.accounts.values():
-        assert state.state is SupervisorState.IDLE
+        assert state.state is SupervisorState.NO_READING
         assert state.paused is False
 
 

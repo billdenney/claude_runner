@@ -90,6 +90,14 @@ class UsageSettings(_StrictModel):
     capture_rotation_count: int = Field(ge=0)
     poll_interval_s: float = Field(gt=0, le=MAX_DURATION_S)
     drift_recovery_clean_polls: int = Field(ge=1)
+    max_reading_age_s: float = Field(default=600.0, gt=0, le=MAX_DURATION_S)
+    """How old an account's last clean usage reading may be while it still
+    takes tasks (seconds). Past it, and before its first reading, the
+    account is NO_READING and dispatch skips it until a capture succeeds.
+    Failed captures don't count as readings. Each account is read once per
+    capture cycle (one poll per account), so the loader rejects a value
+    under two cycles."""
+
     api_timeout_s: float = Field(default=10.0, gt=0, le=MAX_DURATION_S)
     """Per-request timeout for the API usage source (seconds).
     Generous enough to swallow ordinary network jitter, tight enough
@@ -963,4 +971,25 @@ class Settings(_StrictModel):
         dupes = sorted({n for n in names if names.count(n) > 1})
         if dupes:
             raise ValueError(f"duplicate account names: {dupes}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_reading_age_spans_two_capture_cycles(self) -> Settings:
+        """Reject a ``max_reading_age_s`` that one failed capture would exceed.
+
+        The supervisor reads one account per poll, so each account is read
+        once every ``len(accounts) * poll_interval_s`` seconds. Under one
+        cycle, a healthy account would stop taking tasks between its own
+        captures; under two, a single failed capture would stop it.
+        """
+        cycle_s = len(self.accounts) * self.usage.poll_interval_s
+        if self.usage.max_reading_age_s < 2 * cycle_s:
+            raise ValueError(
+                f"[usage].max_reading_age_s = {self.usage.max_reading_age_s:g} s is under two "
+                f"capture cycles: {len(self.accounts)} account(s) x "
+                f"[usage].poll_interval_s {self.usage.poll_interval_s:g} s x 2 = "
+                f"{2 * cycle_s:g} s. Each account is read once per cycle, so a single "
+                "failed capture would stop it taking tasks. Raise max_reading_age_s or "
+                "lower poll_interval_s."
+            )
         return self

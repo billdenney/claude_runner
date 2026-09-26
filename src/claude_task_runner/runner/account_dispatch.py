@@ -68,12 +68,12 @@ _DISPATCHABLE_STATES: frozenset[SupervisorState] = frozenset(
 )
 """States where an account is willing to take a new dispatch.
 
-IDLE is included so cold-start dispatches don't stall waiting for the
-first ``/usage`` capture to land, and so tasks that arrive after the
-queue emptied don't wait for the account's next capture: on a
-multi-account queue that is a full round-robin cycle away. A captured
-IDLE account keeps the ``target_concurrency`` of the reading that idled
-it, which :func:`account_cap` applies."""
+IDLE is included so tasks that arrive after the queue emptied don't wait
+for the account's next capture: on a multi-account queue that is a full
+round-robin cycle away. An IDLE account keeps the ``target_concurrency``
+of the reading that idled it, which :func:`account_cap` applies. An
+account that has no recent clean reading is NO_READING, not IDLE, and
+takes no tasks (``state_machine.expire_stale_readings``)."""
 
 
 @dataclass(frozen=True)
@@ -261,14 +261,16 @@ def choose_account(
 def account_cap(acct: ResolvedAccount, state: AccountState) -> int:
     """How many tasks ``acct`` may run at once right now.
 
-    ``acct.policy.concurrency.max_concurrency`` (from the account's own
-    ``runner-account.toml``; 1 if absent), lowered to
-    ``state.target_concurrency`` when the account's last throttle
+    0 while the account's state takes no tasks (NO_READING, throttled,
+    ERROR_DRIFT). Otherwise ``acct.policy.concurrency.max_concurrency``
+    (from the account's own ``runner-account.toml``; 1 if absent), lowered
+    to ``state.target_concurrency`` when the account's last throttle
     decision set one. While SLOWING_DOWN that is the ramp target the
     supervisor announced. An IDLE account keeps the target of the reading
-    that idled it, 0 if that reading was throttled; only an account never
-    captured has none.
+    that idled it, 0 if that reading was throttled.
     """
+    if state.state not in _DISPATCHABLE_STATES:
+        return 0
     cap = acct.policy.concurrency.max_concurrency
     if state.target_concurrency is not None:
         cap = min(cap, state.target_concurrency)

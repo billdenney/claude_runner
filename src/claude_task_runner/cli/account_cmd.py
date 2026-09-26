@@ -94,11 +94,11 @@ def _account_row(
         "in_flight_count": in_flight_count,
         # The last throttle decision's cap (ADR-0022 ramp while
         # SLOWING_DOWN), and the number dispatch actually allows:
-        # max_concurrency lowered to that target.
+        # max_concurrency lowered to that target, or 0 for an account
+        # that takes no tasks, including one with no state yet.
         "target_concurrency": state.target_concurrency if state is not None else None,
-        "dispatch_cap": (
-            account_cap(acct, state) if state is not None else policy.concurrency.max_concurrency
-        ),
+        "dispatch_cap": account_cap(acct, state) if state is not None else 0,
+        "last_reading_at": state.last_reading_at if state is not None else None,
     }
 
 
@@ -195,8 +195,9 @@ def _update_paused(
         )
     current = snapshot.accounts.get(name)
     if current is None:
-        # Account configured but no state row: synthesize an IDLE row.
-        current = AccountState(state=SupervisorState.IDLE, since=datetime.now(UTC))
+        # Account configured but no state row: synthesize one that, like a
+        # freshly seeded account, takes no tasks until it is read.
+        current = AccountState(state=SupervisorState.NO_READING, since=datetime.now(UTC))
     if current.paused == paused:
         return False, f"account {name!r} already paused={paused!r}"
     new_state = current.model_copy(update={"paused": paused})

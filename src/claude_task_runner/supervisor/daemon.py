@@ -161,15 +161,31 @@ def run_one_tick(
         A single-account queue's usage source does not name the account,
         so its poll results are attributed to the only configured
         account (:func:`_sole_account`). Dispatch gates on the
-        per-account state, so without this the account stayed in the IDLE
-        it was seeded with and a throttled queue kept dispatching.
+        per-account state, so without this the account stayed in the
+        state it was seeded with and a throttled queue kept dispatching.
 
         A poll result that still has no account (several accounts
-        configured, but a source that does not name them) updates only
-        the top-level fields, with a policy carrying the queue-wide
-        concurrency cap.
+        configured, but a source that does not name them, as after a
+        SIGHUP that added an account) updates only the top-level fields,
+        with a policy carrying the queue-wide concurrency cap, and logs an
+        error each tick.
+
+    Freshness (``[usage].max_reading_age_s``):
+        Each tick reads one account, so after ``step()`` every account
+        goes through :func:`state_machine.expire_stale_readings`. One that
+        takes tasks but whose last clean reading is too old moves to
+        NO_READING, and the top-level view is re-mirrored in case it was
+        the account read this tick.
     """
     account_name = _reading_account(ctx.poll_result) or _sole_account(ctx.settings)
+    if account_name is None:
+        logger.error(
+            "usage poll result names no account, but %d accounts are configured, so no "
+            "account's state is updated and each stops taking tasks once its last "
+            "reading is over [usage].max_reading_age_s old. Restart the supervisor "
+            "after changing [[accounts]].",
+            len(ctx.settings.accounts),
+        )
     focused = _focus_on_account(snapshot, account_name)
 
     account_policy = _resolve_account_policy(ctx, account_name)
@@ -190,7 +206,14 @@ def run_one_tick(
     )
     new_focused, actions = sm_mod.step(inp, clock)
     new_snapshot = _propagate_to_account(new_focused, account_name, clock)
-    return new_snapshot, actions
+    new_snapshot, expiry_actions = sm_mod.expire_stale_readings(
+        new_snapshot,
+        now=clock.now(),
+        max_reading_age_s=ctx.settings.usage.max_reading_age_s,
+    )
+    if expiry_actions:
+        new_snapshot = _focus_on_account(new_snapshot, account_name)
+    return new_snapshot, actions + expiry_actions
 
 
 def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> AccountPolicy:
@@ -269,6 +292,7 @@ def _focus_on_account(
             "consecutive_clean_polls": acct.consecutive_clean_polls,
             "last_drift_message": acct.last_drift_message,
             "target_concurrency": acct.target_concurrency,
+            "last_reading_at": acct.last_reading_at,
         }
     )
 
@@ -305,6 +329,7 @@ def _propagate_to_account(
             "consecutive_clean_polls": snapshot.consecutive_clean_polls,
             "last_drift_message": snapshot.last_drift_message,
             "target_concurrency": snapshot.target_concurrency,
+            "last_reading_at": snapshot.last_reading_at,
             "last_capture_at": clock.now(),
         }
     )

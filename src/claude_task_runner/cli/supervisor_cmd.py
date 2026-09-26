@@ -629,6 +629,7 @@ def status(
             f"[bold]5h util:[/]          {snapshot.last_5h_util_pct}%"
             f"   [bold]Weekly util:[/] {snapshot.last_weekly_util_pct}%"
         )
+        console.print(f"[bold]Last reading:[/]     {snapshot.last_reading_at or 'none yet'}")
         if snapshot.scheduled_wakeup_at is not None:
             console.print(f"[bold]Next wakeup:[/]      {snapshot.scheduled_wakeup_at}")
         if snapshot.last_drift_message:

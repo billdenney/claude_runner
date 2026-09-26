@@ -388,10 +388,10 @@ def _any_account_dispatchable(
         (DISPATCHING / SLOWING_DOWN / IDLE), AND
       * is not operator-paused via ``account pause``.
 
-    Cold start: when no account has been captured yet, every entry's
-    state is the seeded IDLE — which is in the dispatchable set — so
-    this function returns True and ``choose_account`` does the actual
-    routing.
+    Cold start: every account is seeded NO_READING, which is not in the
+    dispatchable set, so this returns False until a clean reading has
+    classified at least one account. A single-account queue reads its
+    account earlier in the same tick, so it dispatches on its first tick.
 
     Note: this gate intentionally does NOT check per-account capacity
     (max_concurrency); that's :func:`account_dispatch.choose_account`'s

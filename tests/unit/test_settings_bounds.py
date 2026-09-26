@@ -11,7 +11,9 @@ A duration setting is one whose name has a unit word: ``s`` or ``seconds``
 (``poll_interval_s``, ``max_duration_s_per_task``) or ``ms``
 (``capture_post_ready_pad_ms``). The gate loads each one set to its
 ceiling, which must load unchanged, and to one more, which must fail with a
-:class:`ConfigError` naming the key. It covers both files an operator writes,
+:class:`ConfigError` naming the key. A setting that another setting bounds
+more tightly is listed, with the reason, in ``BOUNDED_BY_ANOTHER_SETTING``
+and tested on its own. It covers both files an operator writes,
 and a duration setting added later is covered without being listed. Every
 float setting must be a duration by that rule, so a float added under another
 name fails here until it is classified. The one duration string,
@@ -81,9 +83,25 @@ CASES = [
     pytest.param(file, path, ceiling, id=f"{file}:{path}") for file, path, ceiling in DURATIONS
 ]
 
+BOUNDED_BY_ANOTHER_SETTING = {
+    ("claude_runner.toml", "usage.poll_interval_s"): (
+        "[usage].max_reading_age_s must span two capture cycles of "
+        "len(accounts) x poll_interval_s and is itself at most ten years, so a "
+        "poll interval over five years is rejected by that rule, not by its own "
+        "bound. One more than the ceiling still fails on the field's own bound."
+    ),
+}
+"""Duration settings whose ceiling alone cannot load, and why."""
+
+CEILING_CASES = [
+    pytest.param(file, path, ceiling, id=f"{file}:{path}")
+    for file, path, ceiling in DURATIONS
+    if (file, path) not in BOUNDED_BY_ANOTHER_SETTING
+]
+
 
 class TestEveryDurationIsAtMostTenYears:
-    @pytest.mark.parametrize(("file", "path", "ceiling"), CASES)
+    @pytest.mark.parametrize(("file", "path", "ceiling"), CEILING_CASES)
     def test_the_ceiling_loads(self, tmp_path: Path, file: str, path: str, ceiling: int) -> None:
         (tmp_path / file).write_text(toml_setting(path, str(ceiling)), encoding="utf-8")
         assert _value_at(LOADERS[file](tmp_path), path) == ceiling
@@ -101,6 +119,25 @@ class TestEveryDurationIsAtMostTenYears:
         assert [(e["type"], e["loc"], e["ctx"]) for e in cause.errors()] == [
             ("less_than_equal", tuple(path.split(".")), {"le": ceiling})
         ]
+
+    def test_each_setting_bounded_by_another_is_a_duration(self) -> None:
+        """An entry that no longer names a duration setting fails, so the list
+        cannot outlive the rule that needs it."""
+        durations = {(file, path) for file, path, _ in DURATIONS}
+        assert set(BOUNDED_BY_ANOTHER_SETTING) <= durations
+
+    def test_poll_interval_is_bounded_by_the_reading_age(self, tmp_path: Path) -> None:
+        """Ten years alone fails the two-cycle rule; five years, with the
+        reading age at its own ceiling, is the largest that loads."""
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(toml_setting("usage.poll_interval_s", str(MAX_DURATION_S)))
+        with pytest.raises(ConfigError, match="under two capture cycles"):
+            load_settings(toml)
+        toml.write_text(
+            f"[usage]\npoll_interval_s = {MAX_DURATION_S // 2}\n"
+            f"max_reading_age_s = {MAX_DURATION_S}\n"
+        )
+        assert load_settings(toml).usage.poll_interval_s == MAX_DURATION_S // 2
 
     def test_every_float_setting_is_a_duration(self) -> None:
         """A float setting named otherwise would escape the ceiling."""

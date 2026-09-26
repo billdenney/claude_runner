@@ -34,9 +34,11 @@ from claude_task_runner.supervisor.states import (
 
 
 def _v2_payload(in_flight: list[str] | None = None) -> dict[str, object]:
+    """A v2 file in a throttled state, which every later migration keeps
+    (v7 rewrites the states that take tasks to ``no_reading``)."""
     return {
         "schema_version": 2,
-        "state": SupervisorState.SLOWING_DOWN.value,
+        "state": SupervisorState.THROTTLED_5H.value,
         "since": "2026-05-15T12:00:00+00:00",
         "last_5h_util_pct": 42,
         "last_weekly_util_pct": 18,
@@ -58,7 +60,7 @@ class TestV2Migration:
         assert snap.schema_version == SUPERVISOR_SCHEMA_VERSION
         assert "default" in snap.accounts
         acct = snap.accounts["default"]
-        assert acct.state == SupervisorState.SLOWING_DOWN
+        assert acct.state == SupervisorState.THROTTLED_5H
         assert acct.last_5h_util_pct == 42
         assert acct.last_weekly_util_pct == 18
 
@@ -86,7 +88,7 @@ class TestV2Migration:
         path.write_text(json.dumps(_v2_payload()))
         snap = load(path)
         assert snap is not None
-        assert snap.state == SupervisorState.SLOWING_DOWN
+        assert snap.state == SupervisorState.THROTTLED_5H
         assert snap.last_5h_util_pct == 42
 
 
@@ -123,7 +125,7 @@ class TestInitialSnapshot:
     def test_default_seeds_single_default_account(self) -> None:
         snap = initial_snapshot(since=datetime(2026, 5, 21, tzinfo=UTC))
         assert set(snap.accounts) == {"default"}
-        assert snap.accounts["default"].state == SupervisorState.IDLE
+        assert snap.accounts["default"].state == SupervisorState.NO_READING
 
     def test_multi_account_seed(self) -> None:
         snap = initial_snapshot(
@@ -132,7 +134,7 @@ class TestInitialSnapshot:
         )
         assert set(snap.accounts) == {"personal", "work"}
         for acct in snap.accounts.values():
-            assert acct.state == SupervisorState.IDLE
+            assert acct.state == SupervisorState.NO_READING
 
 
 class TestSchemaVersionMismatch:
