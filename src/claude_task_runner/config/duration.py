@@ -51,6 +51,8 @@ def parse_duration(value: str) -> float:
     * Fractional values (``"1.5h"``).
     * Negative values (``"-1h"``).
     * Repeated units (``"1h 2h"``).
+    * Values too large for a float, or with more digits than ``int()``
+      converts (4,300 by default).
     """
     if not isinstance(value, str):
         raise DurationParseError(f"expected str, got {type(value).__name__}: {value!r}")
@@ -67,8 +69,14 @@ def parse_duration(value: str) -> float:
         if unit in seen:
             raise DurationParseError(f"unit {unit!r} appears more than once in {value!r}")
         seen.add(unit)
-        total += int(n_str) * _UNIT_SECONDS[unit]
-    return float(total)
+        try:
+            total += int(n_str) * _UNIT_SECONDS[unit]
+        except ValueError as exc:  # more digits than sys.get_int_max_str_digits()
+            raise DurationParseError(f"duration {value!r} is too long") from exc
+    try:
+        return float(total)
+    except OverflowError as exc:
+        raise DurationParseError(f"duration {value!r} is too long") from exc
 
 
 __all__ = ["DurationParseError", "parse_duration"]

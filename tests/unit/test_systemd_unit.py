@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.config.loader import load_settings
-from claude_task_runner.config.schema import TaskCapsSettings, WatchdogSettings
+from claude_task_runner.config.schema import MAX_DURATION_S, TaskCapsSettings, WatchdogSettings
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
     _SYSTEMD_MAX_WHOLE_SECONDS,
@@ -109,6 +109,14 @@ def _only_line(text: str, key: str) -> str:
 def _watchdog(**overrides: float) -> WatchdogSettings:
     """The package defaults with ``overrides``, validated like a TOML."""
     return WatchdogSettings.model_validate({**_DEFAULTS.model_dump(), **overrides})
+
+
+def _unvalidated_watchdog(**overrides: float) -> WatchdogSettings:
+    """The package defaults with ``overrides`` the schema is not asked about.
+
+    For a span the schema refuses, such as ``inf`` or one past its ten-year
+    ceiling: only a model built without validation can bring one to the unit."""
+    return WatchdogSettings.model_construct(**{**_DEFAULTS.model_dump(), **overrides})
 
 
 class TestBuildUnitText:
@@ -292,7 +300,8 @@ class TestRestartPolicyFromWatchdog:
             # Python writes these two as 1e-05 and 1e-07, which systemd rejects.
             (1e-5, "0.00001"),
             (1e-7, "0"),
-            (_SYSTEMD_MAX_WHOLE_SECONDS + 0.5, "18446744073708.5"),
+            # The schema's ceiling: ten years.
+            (MAX_DURATION_S, "315360000"),
         ],
     )
     def test_seconds_are_written_as_systemd_reads_them(self, seconds: float, written: str) -> None:
@@ -300,11 +309,24 @@ class TestRestartPolicyFromWatchdog:
         assert _only_line(text, "RestartSec") == f"RestartSec={written}"
         assert _only_line(text, "StartLimitIntervalSec") == f"StartLimitIntervalSec={written}"
 
+    def test_the_longest_span_systemd_accepts_is_written_exactly(self) -> None:
+        """Past the schema's ten-year ceiling, so only a model built without
+        validation brings it here; it is still written to the microsecond."""
+        seconds = _SYSTEMD_MAX_WHOLE_SECONDS + 0.5
+        text = _unit(
+            _unvalidated_watchdog(restart_cooldown_s=seconds, restart_backoff_max_s=seconds)
+        )
+        assert _only_line(text, "RestartSec") == "RestartSec=18446744073708.5"
+        assert _only_line(text, "StartLimitIntervalSec") == "StartLimitIntervalSec=18446744073708.5"
+
     @pytest.mark.parametrize("key", ["restart_cooldown_s", "restart_backoff_max_s"])
     def test_a_span_longer_than_systemd_accepts_is_refused(self, key: str) -> None:
-        """systemd would ignore the line and fall back to its own default."""
+        """systemd would ignore the line and fall back to its own default.
+
+        The schema's ten-year ceiling keeps such a span out of a loaded
+        config, so only a model built without validation can bring one."""
         with pytest.raises(UnitSettingError) as excinfo:
-            _unit(_watchdog(**{key: float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)}))
+            _unit(_unvalidated_watchdog(**{key: float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)}))
         assert str(excinfo.value) == (
             f"[watchdog].{key} = 18446744073709.0 is longer than systemd accepts (18446744073708 s)"
         )
@@ -313,11 +335,8 @@ class TestRestartPolicyFromWatchdog:
     def test_an_infinite_span_is_refused(self, key: str) -> None:
         """The schema rejects ``inf`` (``tests/unit/test_settings_finite.py``),
         so only a model built without validation can bring one here."""
-        unvalidated = WatchdogSettings.model_construct(
-            **{**_DEFAULTS.model_dump(), key: float("inf")}
-        )
         with pytest.raises(UnitSettingError) as excinfo:
-            _unit(unvalidated)
+            _unit(_unvalidated_watchdog(**{key: float("inf")}))
         assert str(excinfo.value) == f"[watchdog].{key} = inf is not a finite number of seconds"
 
     def test_the_largest_burst_systemd_accepts_is_written(self) -> None:
@@ -374,7 +393,8 @@ class TestDrainStopTimeout:
             (30.1234567, "30.123457"),
             # Python writes this as 1e-05, which systemd rejects.
             (1e-5, "0.00001"),
-            (_SYSTEMD_MAX_WHOLE_SECONDS + 0.5, "18446744073708.5"),
+            # The schema's ceiling: ten years.
+            (MAX_DURATION_S, "315360000"),
         ],
     )
     def test_the_cap_is_the_timeout(self, cap: float, written: str) -> None:
@@ -401,9 +421,12 @@ class TestDrainStopTimeout:
         assert seen == list(TaskCapsSettings.model_fields)
 
     def test_a_cap_longer_than_systemd_accepts_is_refused(self) -> None:
-        """systemd would ignore the line and wait its own ``DefaultTimeoutStopSec=``, 90 s."""
+        """systemd would ignore the line and wait its own ``DefaultTimeoutStopSec=``, 90 s.
+
+        The schema's ten-year ceiling keeps such a cap out of a loaded
+        config, so only a model built without validation can bring one."""
         with pytest.raises(UnitSettingError) as excinfo:
-            _drain_unit(_task_caps(max_duration_s_per_task=float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)))
+            _drain_unit(_unvalidated_caps(float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)))
         assert str(excinfo.value) == (
             "[task_caps].max_duration_s_per_task = 18446744073709.0 is longer than systemd "
             "accepts (18446744073708 s)"
@@ -517,10 +540,7 @@ class TestSystemdParsesTheUnit:
                 "crash_loop_threshold": _SYSTEMD_MAX_UNSIGNED,
             },
             {"restart_cooldown_s": 1e-5, "restart_backoff_max_s": 1e-7, "crash_loop_threshold": 1},
-            {
-                "restart_cooldown_s": _SYSTEMD_MAX_WHOLE_SECONDS + 0.5,
-                "restart_backoff_max_s": float(_SYSTEMD_MAX_WHOLE_SECONDS),
-            },
+            {"restart_cooldown_s": MAX_DURATION_S, "restart_backoff_max_s": MAX_DURATION_S},
         ],
         ids=["defaults", "fractional", "tiny", "longest"],
     )
@@ -537,7 +557,7 @@ class TestSystemdParsesTheUnit:
 
     @pytest.mark.parametrize(
         "cap",
-        [14400, 28800, 0, 3600.5, 1e-5, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5],
+        [14400, 28800, 0, 3600.5, 1e-5, MAX_DURATION_S],
         ids=["default", "longer", "no-cap", "fractional", "tiny", "longest"],
     )
     def test_systemd_parses_the_drain_unit(self, verify_dir: Path, cap: float) -> None:
@@ -552,7 +572,7 @@ class TestSystemdParsesTheUnit:
         )
         assert _verify(verify_dir, text) == ""
 
-    @pytest.mark.parametrize("cap", [28800, 30.1234567, 1e-5, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5])
+    @pytest.mark.parametrize("cap", [28800, 30.1234567, 1e-5, MAX_DURATION_S])
     def test_systemd_reads_the_cap_as_the_timeout(self, systemd_analyze: str, cap: float) -> None:
         """To within half a microsecond, systemd's resolution."""
         line = _only_line(_drain_unit(_task_caps(max_duration_s_per_task=cap)), "TimeoutStopSec")
@@ -568,9 +588,7 @@ class TestSystemdParsesTheUnit:
             systemd_analyze, line.removeprefix("TimeoutStopSec=")
         ) == Decimal(2**64 - 1)
 
-    @pytest.mark.parametrize(
-        "seconds", [30, 0.25, 30.1234567, 1e-5, 1e-7, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5]
-    )
+    @pytest.mark.parametrize("seconds", [30, 0.25, 30.1234567, 1e-5, 1e-7, MAX_DURATION_S])
     def test_systemd_reads_what_watchdog_says(self, systemd_analyze: str, seconds: float) -> None:
         """To within half a microsecond, systemd's resolution."""
         line = _only_line(_unit(_watchdog(restart_cooldown_s=seconds)), "RestartSec")

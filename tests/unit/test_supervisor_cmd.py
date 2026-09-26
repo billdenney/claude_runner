@@ -25,6 +25,7 @@ from claude_task_runner.cli.supervisor_cmd import (
     _count_pending,
     app,
 )
+from claude_task_runner.config.loader import ConfigError
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -445,6 +446,29 @@ def test_start_refuses_a_queue_that_is_not_a_directory(
         assert not queue.exists()
     else:
         assert queue.read_text(encoding="utf-8") == ""
+
+
+def test_start_refuses_a_queue_with_an_unknown_timezone(runner: CliRunner, tmp_path: Path) -> None:
+    """The name used to load, and the throttle's first decision then raised
+    ``ZoneInfoNotFoundError``: the supervisor stopped at its first idle tick
+    and restarted into the same crash. Now it does not start."""
+    queue = tmp_path / "q"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(
+        '[dispatch_pct]\ntimezone = "Not/AZone"\n', encoding="utf-8"
+    )
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
+        patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as mock_start,
+    ):
+        result = runner.invoke(app, ["start", "--queue", str(queue)])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ConfigError)
+    assert "dispatch_pct.timezone" in str(result.exception)
+    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in str(
+        result.exception
+    )
+    mock_start.assert_not_called()
 
 
 def test_start_runs_the_daemon_on_an_existing_queue(runner: CliRunner, tmp_path: Path) -> None:
