@@ -1,36 +1,39 @@
-"""Run every runner-merge-claude-branches helper script at least once.
+"""Run every runner-merge-claude-branches helper script, and pin how each fails.
 
 The skill's scripts ship in the wheel, and Claude Code agents run them through
 bash, python3 or Rscript; merge_branches.sh also runs
 verify_branch_contributions.sh itself. None of them is imported by the
 package, so a script that no test runs can break without anything going red.
-Each gets a syntax or ``--help`` run here, plus a cheap known-answer case:
+Each gets a syntax or ``--help`` run here, plus cheap known-answer cases:
 
 * ``merge_branches.sh --dry-run`` surveys the task branches and stops before it
-  creates a worktree, so it is the one invocation beyond ``--help`` with no
-  side effects. The steps after the survey (merging, R regeneration,
-  ``devtools::check``, vignettes, the push) need an R package and a remote to
-  push to, so they are not run; the helpers they call are run one by one below.
+  creates a worktree. Full runs skip the R steps they cannot do without an R
+  package (``--skip-r-regen --skip-check``) and ``--skip-push``, and stand a
+  stub in for the vignette validator, so every repair and verify step runs.
 * The verifiers and repair scripts run against the loss they exist for: two
   task branches each add a model to the same Example-models line and append a
   canonical block at the same place, and the second ``-X theirs`` merge keeps
   only the second branch's side of both. The first branch's model and its
   whole ``### HT`` block vanish.
+* Every input that cannot be right -- a ref that does not resolve, no worktree,
+  a pattern matching nothing, a missing tool -- is an error with its own exit
+  code, never a silent pass: a check that checks nothing reports success.
 * ``verify_vignettes_parallel.R`` needs R, which CI does not install. It is
   parse-checked, and run against a worktree with no vignettes, only where
   Rscript is on PATH.
 
 restore_dropped_sections.py and union_merge_news.py have their own modules for
-their logic. Here they get the ``--help`` run, and restore_dropped_sections.py
-closes the loss in the pipeline test.
+their logic; here they get their CLI, fail-loud and ``--extra-ref`` cases.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -71,6 +74,8 @@ A_ENTRY = "`A_2020_a.R` (a note)"
 B_ENTRY = "`B_2021_b.R` (b note)"
 REGISTER_A = _with_models(A_ENTRY) + HT_BLOCK
 REGISTER_B = _with_models(B_ENTRY) + BMI_BLOCK
+# What the repair steps, in merge_branches.sh's order, make of REGISTER_B.
+REPAIRED = _with_models(B_ENTRY, A_ENTRY) + BMI_BLOCK + HT_BLOCK
 
 SECTION_REPORT = (
     "\n"
@@ -89,13 +94,56 @@ PLACEMENT_REPORT = (
     "    other's copy, and -X theirs kept one entry. Union the surviving entry's\n"
     "    Source-aliases and Example-models with the dropped one's, keeping ONE block.\n"
 )
+VERIFIER_OK = (
+    "    (placement) OK — every (canonical, model) pair a branch recorded is still filed"
+    f" under that canonical in {REGISTER}\n"
+    "    (verifier) OK — all per-branch *.R additions and brand-new ##/### canonical-section"
+    f" headers are present in {REGISTER}\n"
+)
+
+# Stand-ins for verify_vignettes_parallel.R, which needs an R package to render.
+DYING_VALIDATOR = '#!/bin/bash\necho "there is no package called callr" >&2\nexit 2\n'
+PASSING_VALIDATOR = """\
+#!/bin/bash
+# Records one rendered vignette, as verify_vignettes_parallel.R does.
+while [[ $# -gt 0 ]]; do [[ "$1" == --results ]] && results="$2"; shift; done
+echo '{"ok":true,"file":"x.Rmd"}' > "$results"
+echo "SUMMARY: 1 ok / 0 failed / 1 total"
+"""
+# The tools the scripts call, for building a PATH that lacks one of them.
+TOOLS = (
+    "Rscript",
+    "awk",
+    "bash",
+    "cat",
+    "date",
+    "dirname",
+    "env",
+    "git",
+    "grep",
+    "head",
+    "mkdir",
+    "nproc",
+    "python3",
+    "rm",
+    "sed",
+    "sh",
+    "sort",
+    "tail",
+    "tee",
+    "tr",
+    "wc",
+)
 
 
-def _run(*cmd: str | Path, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    *cmd: str | Path, cwd: Path | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a script with stdin closed, so a prompt can never wait on a terminal."""
     return subprocess.run(
         [str(c) for c in cmd],
         cwd=cwd,
+        env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -130,8 +178,7 @@ def _survey_rows(stdout: str) -> list[tuple[str, str, str, str]]:
     return re.findall(r"^ {6}(\S+) +ahead=(\d+)  files=(\d+)  (.*)$", stdout, re.MULTILINE)
 
 
-@pytest.fixture
-def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _build_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A clone whose origin carries main and three ``claude/*`` task branches.
 
     ``claude/merged`` is already folded into main, so a survey must leave it
@@ -164,25 +211,100 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return repo
 
 
-@pytest.fixture
-def worktree(repo: Path) -> Path:
-    """The consolidation worktree after folding in claude/a, then claude/b.
+def _consolidate(repo: Path, branches: Sequence[str], name: str = CONSOLIDATION) -> Path:
+    """merge_branches.sh's step 3: ``git merge --no-ff -X theirs`` per branch.
 
-    This is merge_branches.sh's step 3: ``git merge --no-ff -X theirs`` per
-    branch, in a worktree at ``<repo>/.worktrees/<branch>``, which is where
-    every helper below looks for the merged file.
+    In a worktree at ``<repo>/.worktrees/<name>``, which is where every helper
+    below looks for the merged file.
     """
     git(repo, "fetch", "-q", "origin")
-    wt = repo / ".worktrees" / CONSOLIDATION
-    git(repo, "worktree", "add", "-q", "-b", CONSOLIDATION, str(wt), "origin/main")
-    for branch in ("origin/claude/a", "origin/claude/b"):
+    wt = repo / ".worktrees" / name
+    git(repo, "worktree", "add", "-q", "-b", name, str(wt), "origin/main")
+    for branch in branches:
         git(wt, "merge", "-q", "--no-ff", "--no-edit", "-X", "theirs", branch)
+    return wt
+
+
+@pytest.fixture
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    return _build_repo(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def worktree(repo: Path) -> Path:
+    """The consolidation worktree after folding in claude/a, then claude/b."""
+    wt = _consolidate(repo, ["origin/claude/a", "origin/claude/b"])
     assert (wt / REGISTER).read_text() == REGISTER_B, "the fixture did not reproduce the loss"
     return wt
 
 
+@pytest.fixture(scope="module")
+def shared_repo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """One consolidated repo for the tests that only read it.
+
+    ``parked`` is a branch with no worktree, and nothing is checked out of it.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        repo = _build_repo(tmp_path_factory.mktemp("shared"), mp)
+        _consolidate(repo, ["origin/claude/a", "origin/claude/b"])
+        git(repo, "branch", "parked")
+        yield repo
+
+
 def _verifier_args(repo: Path) -> list[str | Path]:
     return ["--repo", repo, "--branch", CONSOLIDATION, "--file", REGISTER]
+
+
+def _bin_dir(tmp_path: Path, name: str, scripts: dict[str, str]) -> Path:
+    bin_dir = tmp_path / name
+    bin_dir.mkdir()
+    for tool, text in scripts.items():
+        (bin_dir / tool).write_text(text)
+        (bin_dir / tool).chmod(0o755)
+    return bin_dir
+
+
+def _env_with_first(bin_dir: Path) -> dict[str, str]:
+    """The current environment with ``bin_dir`` first on PATH."""
+    return {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _env_without(tmp_path: Path, missing: str) -> dict[str, str]:
+    """An environment whose PATH has every tool in TOOLS but ``missing``."""
+    bin_dir = tmp_path / f"bin-without-{missing}"
+    bin_dir.mkdir()
+    for tool in TOOLS:
+        found = shutil.which(tool)
+        if tool != missing and found is not None:
+            (bin_dir / tool).symlink_to(found)
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
+def _parsed_flags(script: Path) -> set[str]:
+    """Every flag the script's argument loop accepts, read from its case arms."""
+    arms = re.findall(r"^\s+((?:-{1,2}[a-z][a-z-]*\|?)+)\)", script.read_text(), re.MULTILINE)
+    return {flag for arm in arms for flag in arm.split("|") if flag}
+
+
+@pytest.mark.parametrize("script", [MERGE_BRANCHES, VERIFY_CONTRIBUTIONS], ids=lambda p: p.name)
+def test_help_documents_every_flag_the_script_parses(script: Path) -> None:
+    """merge_branches.sh's help once stopped at a hard-coded line 60.
+
+    It never showed --dry-run, --yes or the exit codes, and --register-file was
+    never in it. verify_branch_contributions.sh's help ran one line too far and
+    printed ``set -euo pipefail``.
+    """
+    proc = _run("bash", script, "--help")
+    assert (proc.returncode, proc.stderr) == (0, "")
+    flags = _parsed_flags(script)
+    assert "--help" in flags, "the argument loop was not found"
+    undocumented = [
+        flag
+        for flag in sorted(flags)
+        if not re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", proc.stdout)
+    ]
+    assert undocumented == []
+    assert not re.search(r"^set ", proc.stdout, re.MULTILINE)
 
 
 class TestMergeBranches:
@@ -190,17 +312,31 @@ class TestMergeBranches:
         proc = _run("bash", "-n", MERGE_BRANCHES)
         assert (proc.returncode, proc.stderr) == (0, "")
 
-    def test_help(self) -> None:
+    def test_help_prints_the_whole_header(self) -> None:
         proc = _run("bash", MERGE_BRANCHES, "--help")
         assert (proc.returncode, proc.stderr) == (0, "")
         assert proc.stdout.startswith(
             "Consolidate per-task claude/* branches into one review-ready branch.\n"
         )
         assert "\nUsage:\n  merge_branches.sh [OPTIONS]\n" in proc.stdout
+        assert proc.stdout.endswith(
+            "  8  parallel vignette validation failed, or the validator could not run\n"
+        )
 
     def test_unknown_argument_exits_2(self) -> None:
         proc = _run("bash", MERGE_BRANCHES, "--no-such-flag")
         assert (proc.returncode, proc.stderr) == (2, "unknown arg: --no-such-flag\n")
+
+    def test_flag_without_a_value_exits_2(self) -> None:
+        proc = _run("bash", MERGE_BRANCHES, "--repo")
+        assert (proc.returncode, proc.stderr) == (2, "ERROR: --repo needs a value\n")
+
+    def test_non_numeric_vignette_jobs_exits_2(self) -> None:
+        proc = _run("bash", MERGE_BRANCHES, "--vignette-jobs", "abc")
+        assert (proc.returncode, proc.stderr) == (
+            2,
+            "ERROR: --vignette-jobs must be a positive integer, not 'abc'\n",
+        )
 
     def test_dry_run_surveys_the_unmerged_branches_and_stops(self, repo: Path) -> None:
         proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
@@ -217,6 +353,17 @@ class TestMergeBranches:
         assert len([line for line in listing if line.startswith("worktree ")]) == 1
         branches = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
         assert set(branches) == {"main", "claude/merged", "claude/a", "claude/b"}
+
+    def test_survey_counts_only_the_files_a_branch_changed(self, repo: Path) -> None:
+        """Main moving on after the fork must not add main's files to the count."""
+        _commit(repo, {"inst/other.txt": "later\n"}, "main moves on")
+        git(repo, "push", "-q", "origin", "main")
+        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        assert proc.returncode == 0, proc.stderr
+        assert [row[:3] for row in _survey_rows(proc.stdout)] == [
+            ("claude/a", "1", "2"),
+            ("claude/b", "1", "2"),
+        ]
 
     def test_dry_run_aborts_when_two_branches_add_one_path_differently(self, repo: Path) -> None:
         """-X theirs would keep only the last one merged, so the survey stops.
@@ -263,6 +410,178 @@ class TestMergeBranches:
         ]
         assert proc.stdout.endswith("\n==> Dry-run; stopping before worktree creation.\n")
 
+    def test_unresolvable_base_is_a_preflight_error(self, repo: Path) -> None:
+        """It used to make every branch 0 ahead and report nothing to do."""
+        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--base", "origin/nope", "--dry-run")
+        assert (proc.returncode, proc.stderr) == (
+            3,
+            "ERROR: --base 'origin/nope' does not resolve to a commit\n",
+        )
+
+    def test_a_branch_without_a_merge_base_stops_the_survey(self, repo: Path) -> None:
+        """Its collision check used to fail silently, so it was never checked."""
+        git(repo, "checkout", "-q", "--orphan", "claude/orphan")
+        git(repo, "rm", "-rq", "--cached", ".")
+        _commit(repo, {"inst/modeldb/A_2020_a.R": "# another paper\n"}, "Add A 2020 again")
+        git(repo, "push", "-q", "origin", "claude/orphan")
+        git(repo, "checkout", "-q", "-f", "main")
+        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        assert proc.returncode == 3, proc.stdout
+        assert proc.stderr.endswith(
+            "ERROR: cannot diff origin/claude/orphan against its merge base with origin/main"
+            " (no merge base, or a shallow clone?)\n"
+        )
+
+    def test_excluding_every_branch_is_an_error(self, repo: Path) -> None:
+        """It used to leave one empty entry, surveyed as the branch ""."""
+        proc = _run(
+            "bash",
+            MERGE_BRANCHES,
+            "--repo",
+            repo,
+            "--dry-run",
+            "--exclude-ref",
+            "origin/claude/a",
+            "--exclude-ref",
+            "origin/claude/b",
+            "--exclude-ref",
+            "origin/claude/merged",
+        )
+        assert (proc.returncode, proc.stderr) == (
+            3,
+            "ERROR: no branches matched refspec 'origin/claude/*' under refs/remotes/"
+            " (after any --exclude-ref) and no --extra-ref supplied\n",
+        )
+
+    def test_without_a_terminal_it_stops_at_the_prompt(self, repo: Path) -> None:
+        """An agent's shell: read got EOF and the run ended with exit 1, silently."""
+        proc = _run(
+            "bash",
+            MERGE_BRANCHES,
+            "--repo",
+            repo,
+            "--skip-r-regen",
+            "--skip-check",
+            "--skip-vignettes",
+            "--skip-push",
+        )
+        assert (proc.returncode, proc.stderr) == (
+            3,
+            "ERROR: stdin is not a terminal, so nobody can confirm merging 2 branches."
+            " Re-run with --yes to proceed without the prompt.\n",
+        )
+        assert not (repo / ".worktrees").exists()
+
+    @pytest.mark.parametrize(
+        ("missing", "message"),
+        [
+            (
+                "Rscript",
+                "ERROR: Rscript is not on PATH. Install R, or pass --skip-r-regen,"
+                " --skip-check and --skip-vignettes and run those steps elsewhere.\n",
+            ),
+            (
+                "python3",
+                "ERROR: python3 is not on PATH; the union-merge, dedup, restore and verify"
+                " steps need it.\n",
+            ),
+        ],
+    )
+    def test_a_missing_tool_stops_it_before_anything_is_created(
+        self, missing: str, message: str, repo: Path, tmp_path: Path
+    ) -> None:
+        """Rscript used to be looked for only after the merges."""
+        proc = _run(
+            "bash", MERGE_BRANCHES, "--repo", repo, "--yes", env=_env_without(tmp_path, missing)
+        )
+        assert (proc.returncode, proc.stderr) == (3, message), proc.stdout
+        assert not (repo / ".worktrees").exists()
+
+    def _full_run(
+        self, repo: Path, env: dict[str, str], *extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Everything but the R regeneration, devtools::check and the push."""
+        return _run(
+            "bash",
+            MERGE_BRANCHES,
+            "--repo",
+            repo,
+            "--yes",
+            "--skip-r-regen",
+            "--skip-check",
+            "--skip-push",
+            "--branch-name",
+            CONSOLIDATION,
+            *extra,
+            env=env,
+        )
+
+    def test_full_run_repairs_the_merge_and_passes_the_gates(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"Rscript": PASSING_VALIDATOR}))
+        proc = self._full_run(repo, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (repo / ".worktrees" / CONSOLIDATION / REGISTER).read_text() == REPAIRED
+        assert VERIFIER_OK in proc.stdout
+        assert "SUMMARY: 1 ok / 0 failed / 1 total\n    all vignettes rendered cleanly\n" in (
+            proc.stdout
+        )
+        assert "\nMerge 2 claude/* branches (2 new models)\n" in proc.stdout
+
+    def test_a_validator_that_dies_before_any_result_fails_the_gate(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """It used to find no "ok":false, report every vignette clean, and push."""
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"Rscript": DYING_VALIDATOR}))
+        proc = self._full_run(repo, env)
+        assert proc.returncode == 8, proc.stdout
+        assert "all vignettes rendered cleanly" not in proc.stdout
+        assert (
+            "ERROR: the vignette validator exited 2 without recording a result. Its last lines:\n"
+            "    there is no package called callr\n"
+        ) in proc.stderr
+
+    def test_a_verifier_that_cannot_run_stops_the_run(self, repo: Path, tmp_path: Path) -> None:
+        """Exit 1 is a verdict to reconcile by hand; exit 2 is no verdict at all."""
+        crashing_python = (
+            f'#!/bin/bash\ncase "$1" in */verify_section_headers.py) exit 3 ;; esac\n'
+            f'exec {sys.executable} "$@"\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"python3": crashing_python}))
+        proc = self._full_run(repo, env, "--skip-vignettes")
+        assert proc.returncode == 5, proc.stdout
+        assert proc.stderr.endswith(
+            "ERROR: (verifier) verify_section_headers.py could not run (exit 3)\n"
+            f"ERROR: verify_branch_contributions.sh could not run on {REGISTER} (exit 2).\n"
+        )
+
+    def test_losses_the_repairs_cannot_fix_are_a_warning(self, repo: Path, tmp_path: Path) -> None:
+        """Two branches register one canonical under different header text.
+
+        -X theirs keeps claude/b2's block. The union-merger buckets by the whole
+        header, so it cannot fold claude/a2's model back in; that is left to the
+        operator, and the run finishes.
+        """
+        for name, model in (("a2", "A2_2020_x.R"), ("b2", "B2_2021_y.R")):
+            text = BASE_REGISTER + (
+                f"\n### LKST (**canonical for lkst, from {name}**)\n\n"
+                f"- **Example models:** `{model}` ({name}).\n"
+            )
+            _push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Register LKST ({name})")
+        proc = self._full_run(
+            repo,
+            _env_with_first(_bin_dir(tmp_path, "bin", {})),
+            "--skip-vignettes",
+            "--exclude-ref",
+            "origin/claude/a",
+            "--exclude-ref",
+            "origin/claude/b",
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert f"WARNING: verifier reported missing contributions in {REGISTER}.\n" in proc.stdout
+        assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in proc.stdout
+
 
 class TestVerifyBranchContributions:
     """merge_branches.sh runs this one directly, so these tests do too."""
@@ -281,7 +600,7 @@ class TestVerifyBranchContributions:
 
     def test_branch_is_required(self) -> None:
         proc = _run(VERIFY_CONTRIBUTIONS)
-        assert (proc.returncode, proc.stderr) == (2, "ERROR: --branch is required\n")
+        assert (proc.returncode, proc.stderr) == (2, "ERROR: (verifier) --branch is required\n")
 
     def test_unknown_argument_exits_2(self) -> None:
         proc = _run(VERIFY_CONTRIBUTIONS, "--no-such-flag")
@@ -308,6 +627,89 @@ class TestVerifyBranchContributions:
             "    Either re-run the union-merger, or hand-merge the missing entries.\n"
         )
         assert proc.stdout == filename_report + SECTION_REPORT + PLACEMENT_REPORT + footer
+
+    def test_a_branch_adding_no_model_name_does_not_stop_it(
+        self, repo: Path, worktree: Path
+    ) -> None:
+        """A grep with no match under pipefail used to end the run: exit 1, no output."""
+        _push_task_branch(repo, "claude/prose", {REGISTER: BASE_REGISTER + "\nA note.\n"}, "prose")
+        git(repo, "fetch", "-q", "origin")
+        proc = _run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
+        assert (proc.returncode, proc.stderr) == (1, "")
+        assert proc.stdout.startswith(
+            "\n"
+            f"ERROR: (verifier) 1 branch(es) have *.R contributions missing from {REGISTER}:\n"
+            "    claude/a: `A_2020_a.R`\n"
+        )
+
+    def test_a_file_the_worktree_lacks_is_skipped(self, shared_repo: Path) -> None:
+        proc = _run(
+            VERIFY_CONTRIBUTIONS, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", "x.md"
+        )
+        merged = shared_repo / ".worktrees" / CONSOLIDATION / "x.md"
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert proc.stdout == f"    (verifier) merged file not present at {merged}; skipping.\n"
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            (
+                ["--base", "origin/nope"],
+                "--base 'origin/nope' does not resolve to a commit in {repo}",
+            ),
+            (["--branch", "nope"], "--branch 'nope' does not resolve to a commit in {repo}"),
+            (
+                ["--branch", "parked"],
+                "no worktree for --branch 'parked' at {repo}/.worktrees/parked",
+            ),
+            (
+                ["--pattern", "origin/none/*"],
+                "no branch matches --pattern 'origin/none/*' and no --extra-ref was given;"
+                " nothing to verify",
+            ),
+            (
+                ["--extra-ref", "origin/nope"],
+                "--extra-ref 'origin/nope' does not resolve to a commit in {repo}",
+            ),
+            (["--file"], "--file needs a value"),
+        ],
+        ids=["base", "branch", "no-worktree", "no-match", "extra-ref", "no-value"],
+    )
+    def test_inputs_that_cannot_be_right_exit_2(
+        self, args: list[str], message: str, shared_repo: Path
+    ) -> None:
+        """Each of these used to check less than it said, or nothing, and exit 0."""
+        proc = _run(
+            VERIFY_CONTRIBUTIONS,
+            "--repo",
+            shared_repo,
+            "--branch",
+            CONSOLIDATION,
+            "--file",
+            REGISTER,
+            *args,
+        )
+        assert (proc.returncode, proc.stdout) == (2, "")
+        assert proc.stderr == f"ERROR: (verifier) {message.format(repo=shared_repo)}\n"
+
+    def test_missing_python3_exits_2(self, shared_repo: Path, tmp_path: Path) -> None:
+        """It used to skip the header and placement checks and report OK."""
+        proc = _run(
+            VERIFY_CONTRIBUTIONS,
+            "--repo",
+            shared_repo,
+            "--branch",
+            CONSOLIDATION,
+            "--file",
+            REGISTER,
+            env=_env_without(tmp_path, "python3"),
+        )
+        assert (proc.returncode, proc.stdout, proc.stderr) == (
+            2,
+            "",
+            "ERROR: (verifier) python3 is not on PATH, so the header and placement checks"
+            " cannot run\n",
+        )
 
 
 @pytest.mark.parametrize(
@@ -338,15 +740,16 @@ class TestRegisterPlacement:
         proc = _python("verify_register_placement.py", *_verifier_args(repo))
         assert (proc.returncode, proc.stdout, proc.stderr) == (1, PLACEMENT_REPORT, "")
 
-    def test_unresolvable_branch_is_an_error_not_a_pass(self, repo: Path) -> None:
-        """Every ancestor check would fail against it, reporting a clean register."""
-        merged = repo / ".worktrees" / "no-such-branch" / REGISTER
-        merged.parent.mkdir(parents=True)
-        merged.write_text(BASE_REGISTER)
+    def test_unresolvable_branch_is_an_error_not_a_pass(self, shared_repo: Path) -> None:
+        """Checked before anything can return early.
+
+        With no worktree for the branch it used to report "merged file absent;
+        skipping" and exit 0, never reaching this check.
+        """
         proc = _python(
             "verify_register_placement.py",
             "--repo",
-            repo,
+            shared_repo,
             "--branch",
             "no-such-branch",
             "--file",
@@ -355,8 +758,112 @@ class TestRegisterPlacement:
         assert (proc.returncode, proc.stdout) == (2, "")
         assert proc.stderr == (
             "ERROR: (placement) --branch 'no-such-branch' does not resolve to a commit in"
-            f" {repo}; refusing to report a vacuous pass.\n"
+            f" {shared_repo}; refusing to report a vacuous pass.\n"
         )
+
+
+# The helpers that read the consolidation worktree, and the prefix of their errors.
+WORKTREE_HELPERS = {
+    "verify_section_headers.py": "section-verifier",
+    "verify_register_placement.py": "placement",
+    "union_merge_lines.py": "union-merge",
+    "restore_dropped_sections.py": "restore",
+    "union_merge_news.py": "news",
+}
+# restore and news find the worktree with `git worktree list`; the others at
+# <repo>/.worktrees/<branch>.
+_LISTED = {"restore_dropped_sections.py", "union_merge_news.py"}
+_VERIFIERS = {"verify_section_headers.py", "verify_register_placement.py"}
+
+
+def _bad_input_cases() -> Iterator[object]:
+    for script, prefix in WORKTREE_HELPERS.items():
+        no_match = "no branch matches --pattern 'origin/none/*' and no --extra-ref was given"
+        if script in _VERIFIERS:
+            no_match += "; nothing to verify"
+        no_worktree = (
+            "no worktree of {repo} has --branch 'parked' checked out"
+            if script in _LISTED
+            else "no worktree for --branch 'parked' at {repo}/.worktrees/parked"
+        )
+        branch = "--branch 'nope' does not resolve to a commit in {repo}"
+        if script == "verify_register_placement.py":
+            branch += "; refusing to report a vacuous pass."
+        cases = {
+            "branch": (["--branch", "nope"], branch),
+            "no-worktree": (["--branch", "parked"], no_worktree),
+            "no-match": (["--pattern", "origin/none/*"], no_match),
+            "extra-ref": (
+                ["--extra-ref", "origin/nope"],
+                "--extra-ref 'origin/nope' does not resolve to a commit in {repo}",
+            ),
+        }
+        # verify_register_placement.py takes --base but never reads it.
+        if script != "verify_register_placement.py":
+            cases["base"] = (
+                ["--base", "origin/nope"],
+                "--base 'origin/nope' does not resolve to a commit in {repo}",
+            )
+        for case, (args, message) in cases.items():
+            yield pytest.param(
+                script, args, f"ERROR: ({prefix}) {message}\n", id=f"{script}-{case}"
+            )
+
+
+@pytest.mark.parametrize(("script", "args", "stderr"), list(_bad_input_cases()))
+def test_worktree_helpers_refuse_inputs_that_cannot_be_right(
+    script: str, args: list[str], stderr: str, shared_repo: Path
+) -> None:
+    """A wrong branch, base or pattern is exit 2, not a silent skip or pass.
+
+    restore_dropped_sections.py and union_merge_news.py used to fall back to
+    the main checkout when no worktree had --branch checked out, and would read
+    and rewrite its file; restore also replaced a --pattern matching nothing
+    with origin/claude/*.
+    """
+    main_copy = (shared_repo / REGISTER).read_text()
+    proc = _python(
+        script, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", REGISTER, *args
+    )
+    assert (proc.returncode, proc.stdout) == (2, "")
+    assert proc.stderr == stderr.format(repo=shared_repo)
+    assert (shared_repo / REGISTER).read_text() == main_copy
+
+
+@pytest.mark.parametrize(
+    ("script", "stdout", "stderr"),
+    [
+        (
+            "verify_section_headers.py",
+            "",
+            "# (section-verifier) merged file not present at {f}; skipping.\n",
+        ),
+        (
+            "verify_register_placement.py",
+            "    (placement) merged file absent at {f}; skipping.\n",
+            "",
+        ),
+        ("union_merge_lines.py", "", "# target file not present on branch: {f}\n"),
+        (
+            "restore_dropped_sections.py",
+            f"x.md not present on {CONSOLIDATION}; nothing to do\n",
+            "",
+        ),
+        ("union_merge_news.py", "x.md not present; nothing to do\n", ""),
+    ],
+)
+def test_worktree_helpers_skip_a_file_the_worktree_lacks(
+    script: str, stdout: str, stderr: str, shared_repo: Path
+) -> None:
+    """A repo without that register is legitimate: nothing to do, exit 0."""
+    merged = shared_repo / ".worktrees" / CONSOLIDATION / "x.md"
+    proc = _python(script, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", "x.md")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (
+        0,
+        stdout.format(f=merged),
+        stderr.format(f=merged),
+    )
+    assert not merged.exists()
 
 
 def test_union_merge_lines_restores_the_dropped_example_model(repo: Path, worktree: Path) -> None:
@@ -382,17 +889,60 @@ def test_union_then_restore_closes_everything_the_verifier_reported(
     assert _python("union_merge_lines.py", *_verifier_args(repo)).returncode == 0
     proc = _python("restore_dropped_sections.py", *_verifier_args(repo))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert (worktree / REGISTER).read_text() == (
-        _with_models(B_ENTRY, A_ENTRY) + BMI_BLOCK + HT_BLOCK
-    )
+    assert (worktree / REGISTER).read_text() == REPAIRED
 
     proc = _run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
     assert (proc.returncode, proc.stderr) == (0, "")
-    assert proc.stdout == (
-        "    (placement) OK — every (canonical, model) pair a branch recorded is still filed"
-        f" under that canonical in {REGISTER}\n"
-        "    (verifier) OK — all per-branch *.R additions and brand-new ##/### canonical-section"
-        f" headers are present in {REGISTER}\n"
+    assert proc.stdout == VERIFIER_OK
+
+
+def test_restore_takes_extra_refs(repo: Path, worktree: Path) -> None:
+    """A hand-picked branch outside --pattern gets its dropped block back too.
+
+    --extra-ref reached only the union-merger and the verifier before, so the
+    restore never saw such a branch.
+    """
+    args = [*_verifier_args(repo), "--pattern", "origin/claude/b"]
+    proc = _python("restore_dropped_sections.py", *args)
+    assert (proc.returncode, proc.stdout) == (0, f"# no dropped canonicals in {REGISTER}\n")
+    assert (worktree / REGISTER).read_text() == REGISTER_B
+
+    proc = _python("restore_dropped_sections.py", *args, "--extra-ref", "origin/claude/a")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (worktree / REGISTER).read_text() == REGISTER_B + HT_BLOCK
+
+
+def test_news_union_restores_the_dropped_bullet_and_takes_extra_refs(repo: Path) -> None:
+    """union_merge_news.py's first end-to-end run in a test."""
+    _commit(repo, {"NEWS.md": "# development version\n\n- Add Base 2000 x model.\n"}, "news")
+    git(repo, "push", "-q", "origin", "main")
+    for name, year in (("c", "2022"), ("d", "2023")):
+        news = f"# development version\n\n- Add {name.upper()} {year} {name} model.\n\n"
+        _push_task_branch(
+            repo,
+            f"claude/{name}",
+            {
+                "NEWS.md": news + "- Add Base 2000 x model.\n",
+                f"inst/modeldb/{name.upper()}_{year}_{name}.R": "# model\n",
+            },
+            f"Add {name}",
+        )
+    wt = _consolidate(repo, ["origin/claude/c", "origin/claude/d"], name="news")
+    merged = wt / "NEWS.md"
+    assert "Add C 2022" not in merged.read_text(), "the fixture did not reproduce the loss"
+    args = ["--repo", repo, "--branch", "news", "--pattern", "origin/claude/d"]
+
+    proc = _python("union_merge_news.py", *args)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.endswith("# NEWS.md already complete; nothing to do\n")
+
+    proc = _python("union_merge_news.py", *args, "--extra-ref", "origin/claude/c")
+    assert proc.returncode == 0, proc.stderr
+    assert merged.read_text() == (
+        "# development version\n\n"
+        "- Add D 2023 d model.\n\n"
+        "- Add C 2022 c model.\n\n"
+        "- Add Base 2000 x model.\n"
     )
 
 
@@ -471,6 +1021,20 @@ class TestDedupCanonicalHeaders:
             f"# DUPLICATE canonical headers (whole-file) in {register}: 1\n"
             "#   col x2 (lines [5, 11])\n"
         )
+
+    @pytest.mark.parametrize("check", [True, False], ids=["--check", "fix"])
+    def test_a_missing_file_is_an_error_and_nothing_is_edited(
+        self, check: bool, tmp_path: Path
+    ) -> None:
+        """--check used to skip it and exit 0: a merge gate passing on no file."""
+        register = tmp_path / "register.md"
+        register.write_text(self.DUPLICATED)
+        missing = tmp_path / "no-such.md"
+        flags = ["--check"] if check else []
+        proc = _python("dedup_canonical_headers.py", *flags, register, missing)
+        assert (proc.returncode, proc.stdout) == (2, "")
+        assert proc.stderr == f"ERROR: (dedup) no such file: {missing}\n"
+        assert register.read_text() == self.DUPLICATED
 
 
 class TestVerifyVignettesParallel:

@@ -26,7 +26,12 @@ Idempotent: a bullet already present is not added twice.
 
 Usage:
     union_merge_news.py --repo REPO --branch BR --base origin/main \
-        --pattern 'origin/claude/*' [--file NEWS.md] [--check]
+        --pattern 'origin/claude/*' [--extra-ref REF ...] [--file NEWS.md] [--check]
+
+Exit codes: 0 done (or the file is not in the worktree); 1 with --check,
+bullets are missing; 2 it could not run: a bad argument, a --base, --branch or
+--extra-ref that does not resolve, no worktree with --branch checked out, no
+branch matching --pattern, an unreadable base file, or a crash.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ import argparse
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 DEV_HEADING = re.compile(r"^#\s+development version", re.I)
@@ -80,14 +86,28 @@ def key(block: str) -> str:
     return re.sub(r"\s+", " ", k).strip().lower()
 
 
-def worktree_for(repo: Path, branch: str) -> Path:
-    cand = repo
+def worktree_for(repo: Path, branch: str) -> Path | None:
+    """The worktree that has ``branch`` checked out, or None.
+
+    No fallback: guessing another worktree would rewrite the wrong NEWS.md.
+    """
+    cand: Path | None = None
     for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
         if line.startswith("worktree "):
             cand = Path(line[len("worktree ") :])
         elif line == f"branch refs/heads/{branch}":
             return cand
-    return repo
+    return None
+
+
+def fail(message: str) -> int:
+    print(f"ERROR: (news) {message}", file=sys.stderr)
+    return 2
+
+
+def resolves(repo: Path, ref: str) -> bool:
+    """True when ``ref`` names a commit in ``repo``."""
+    return bool(git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo).strip())
 
 
 def bullet_ships(block: str, tokens: set[str]) -> bool:
@@ -123,12 +143,35 @@ def main() -> int:
     ap.add_argument("--branch", required=True)
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--pattern", default="origin/claude/*")
+    ap.add_argument(
+        "--extra-ref",
+        action="append",
+        default=[],
+        help="additional ref to include, e.g. a hand-picked branch outside --pattern (repeatable)",
+    )
     ap.add_argument("--file", default="NEWS.md")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
     repo = Path(args.repo)
+    if not repo.is_dir():
+        return fail(f"--repo {repo} is not a directory")
+    named = [("--base", args.base), ("--branch", args.branch)]
+    named += [("--extra-ref", ref) for ref in args.extra_ref if ref]
+    for flag, ref in named:
+        if not resolves(repo, ref):
+            return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     wt = worktree_for(repo, args.branch)
+    if wt is None:
+        return fail(f"no worktree of {repo} has --branch {args.branch!r} checked out")
+    refs = git(
+        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
+    ).split()
+    for ref in args.extra_ref:
+        if ref and ref not in refs:
+            refs.append(ref)
+    if not refs:
+        return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
     target = wt / args.file
     if not target.exists():
         print(f"{args.file} not present; nothing to do")
@@ -153,9 +196,6 @@ def main() -> int:
         if len(parts) >= 2:
             tokens.add(f"{parts[0]} {parts[1]}")
 
-    refs = git(
-        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
-    ).split()
     added: list[str] = []
     skipped = 0
     seen = set(base_keys)
@@ -208,4 +248,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # Exit 1 means "bullets missing" under --check; a crash must not read
+        # as that verdict.
+        traceback.print_exc()
+        sys.exit(2)
