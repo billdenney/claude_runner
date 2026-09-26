@@ -11,6 +11,18 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **`[failure_classifier]`'s three pattern lists, and the classifier that
+  never used them.** `environmental_patterns`, `operator_patterns` and
+  `task_patterns` fed `runner.retry.classify` (ADR-0012), which nothing
+  called. Every failed run is re-dispatched until
+  `failure_circuit_breaker_threshold` consecutive failures, whatever its error
+  says, so an `Operator: defer` failure was retried like any other. That is
+  unchanged. `classify` and `should_auto_resume` are gone, and a queue TOML
+  that still sets one of the lists is rejected at load with a message naming
+  it, like the settings below. **Before restarting a supervisor on this
+  version, delete the three lists from its `claude_runner.toml`.** The rest of
+  `[failure_classifier]` is unchanged.
+
 - **Settings that no code ever read are gone, and a queue TOML that still
   sets one no longer loads (breaking).** Every settings model is
   `extra="forbid"`, so each of these loaded without complaint and did nothing:
