@@ -105,10 +105,14 @@ def install(
     after changing it.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
-    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``.
-    A tick restarts the supervisor of each registered queue that is not
-    running, even one stopped with ``supervisor stop`` or ``drain``,
-    and backs off after repeated crashes.
+    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``,
+    replacing any queue registered there: one supervisor runs per user,
+    so the watchdog manages one queue, as the systemd unit runs one. A
+    tick restarts that queue's supervisor when it is not running, even
+    one stopped with ``supervisor stop`` or ``drain``, and backs off
+    after repeated crashes. While another supervisor holds the per-user
+    lock, such as the replaced queue's, a tick starts none, and
+    ``install`` says how to hand over.
     """
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
