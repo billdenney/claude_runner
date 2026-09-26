@@ -20,7 +20,7 @@ from pathlib import Path
 
 import typer
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
 from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.supervisor import persistence as persist_mod
@@ -81,7 +81,9 @@ def _describe(result: reclaim_mod.ReclaimResult) -> str:
 @app.command("reclaim")
 def reclaim(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
