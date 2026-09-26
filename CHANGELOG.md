@@ -22,6 +22,28 @@ Breaking changes are called out in the version notes.
   commit before this cleanup began, it names all eight dead modules removed
   since (`supervisor/window.py`, `runner/runtime_stats.py` and the six empty
   packages). vulture joins the `dev` extra.
+- **CI smoke-tests a non-editable install.** The other CI steps import the
+  package from the editable install, whose `.pth` file serves `src/`, so
+  nothing ran it from site-packages, where `pip install .` and `pipx install`
+  put it. A new step, on each Python version CI tests, installs the package
+  with `pip install .` into a fresh venv and runs `scripts/smoke_installed.py`
+  with that venv's interpreter from outside the checkout. Every version runs
+  it because the package reads its skills and default settings through
+  `importlib.resources` on namespace packages, and Python 3.11 resolves a path
+  in one with different code than 3.12 and 3.13 do. The script checks that
+  the package imports from that venv's site-packages, that
+  `claude-task-runner --help` exits 0, and that `load_settings(None)`
+  validates the shipped defaults. It checks that every skill in `SKILL_NAMES`
+  resolves to a directory in the package with a `SKILL.md`, and that
+  `watchdog.sh` and `verify_branch_contributions.sh` are executable, since
+  cron and `merge_branches.sh` run them directly. Last, `install-skills --yes`
+  into an empty `HOME` must link every skill to its directory. Each check
+  prints PASS or FAIL, and the step fails if any check does. An install with
+  the skills or the default settings left out of the wheel, with either
+  script's executable bit dropped, or with a broken console-script entry point
+  each turned it red. `tests/unit/test_smoke_installed.py` pins what the
+  script reports from an editable install, where only the site-packages check
+  fails, and against stand-ins with one defect each.
 
 ### Removed
 
