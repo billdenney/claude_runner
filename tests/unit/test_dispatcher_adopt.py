@@ -28,6 +28,7 @@ the log has no result event.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,7 +37,8 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.clock import FakeClock, RealClock
-from claude_task_runner.config.schema import TaskCapsSettings
+from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.schema import DispatchSettings, HookSettings, TaskCapsSettings
 from claude_task_runner.queue.schema import (
     SidecarOption,
     SidecarQuestion,
@@ -58,9 +60,13 @@ from claude_task_runner.runner.dispatcher import (
     finalize_exited_worker,
 )
 
+from ._git_world import git, isolate_git
 from ._sidecar_files import write_request
 
 _PID = 999_001
+
+_SETTINGS = load_settings(None)
+"""Package defaults; the adopted finalize requires the dispatch and hook settings."""
 
 
 @pytest.fixture
@@ -157,6 +163,8 @@ def test_adopt_alive_finalizes_from_terminal_result(
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
         sleep_fn=lambda _s: None,
@@ -202,6 +210,8 @@ def test_adopt_crashed_no_result_finalizes_failed(
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
         sleep_fn=lambda _s: None,
@@ -239,6 +249,8 @@ def test_adopt_missing_log_path_finalizes_crashed(queue_dir: Path) -> None:
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
         sleep_fn=lambda _s: None,
@@ -279,6 +291,8 @@ def test_adopt_cap_kill_terminates_by_pid(queue_dir: Path, monkeypatch: pytest.M
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         # 300s duration cap; started_at is 1h ago ⇒ tripped on first event.
         settings_caps=_caps(max_duration=300.0),
@@ -326,6 +340,8 @@ def test_adopt_finalize_stands_down_when_reaper_won(
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
         sleep_fn=lambda _s: None,
@@ -369,6 +385,8 @@ def test_finalize_exited_success_result_completes(queue_dir: Path) -> None:
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=FakeClock(_RESTART),
         account="work",
     )
@@ -425,7 +443,12 @@ def test_finalize_exited_without_result_writes_nothing(
     state = _seed_running(queue_dir, task, log_path=log, started_at=_STARTED)
 
     outcome = finalize_exited_worker(
-        task=task, state=state, queue_dir=queue_dir, clock=FakeClock(_RESTART)
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        clock=FakeClock(_RESTART),
     )
 
     assert outcome is None
@@ -446,7 +469,12 @@ def test_finalize_exited_without_log_path_writes_nothing(queue_dir: Path) -> Non
     write_state_atomic(state, state_path_for(queue_dir, task.id))
 
     outcome = finalize_exited_worker(
-        task=task, state=state, queue_dir=queue_dir, clock=FakeClock(_RESTART)
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        clock=FakeClock(_RESTART),
     )
 
     assert outcome is None
@@ -529,28 +557,33 @@ def _seed_case(qd: Path, tmp_path: Path, case: _Case) -> tuple[Task, TaskState]:
     if case.stderr:
         log.with_name("attempt-1.stderr").write_text(case.stderr)
     if case.open_sidecar:
-        write_request(
-            qd,
-            SidecarRequest(
-                task_id=task.id,
-                sequence=1,
-                created_at=_STARTED,
-                summary="Which encoding?",
-                context="Both appear in the source",
-                questions=[
-                    SidecarQuestion(
-                        id="encoding",
-                        prompt="Which encoding to use?",
-                        options=[
-                            SidecarOption(value="A", label="Encoding A"),
-                            SidecarOption(value="B", label="Encoding B"),
-                        ],
-                        recommended="A",
-                    )
-                ],
-            ),
-        )
+        _open_sidecar(qd, task.id)
     return task, _seed_running(qd, task, log_path=log, started_at=_STARTED)
+
+
+def _open_sidecar(queue_dir: Path, task_id: str) -> None:
+    """File one unanswered sidecar request for ``task_id``, as an agent does."""
+    write_request(
+        queue_dir,
+        SidecarRequest(
+            task_id=task_id,
+            sequence=1,
+            created_at=_STARTED,
+            summary="Which encoding?",
+            context="Both appear in the source",
+            questions=[
+                SidecarQuestion(
+                    id="encoding",
+                    prompt="Which encoding to use?",
+                    options=[
+                        SidecarOption(value="A", label="Encoding A"),
+                        SidecarOption(value="B", label="Encoding B"),
+                    ],
+                    recommended="A",
+                )
+            ],
+        ),
+    )
 
 
 def _fresh_queue(root: Path) -> Path:
@@ -573,7 +606,14 @@ def test_finalize_exited_classifies_like_adopt_worker(
 
     exited_qd = _fresh_queue(tmp_path / "exited")
     task, state = _seed_case(exited_qd, tmp_path, case)
-    exited = finalize_exited_worker(task=task, state=state, queue_dir=exited_qd, clock=clock)
+    exited = finalize_exited_worker(
+        task=task,
+        state=state,
+        queue_dir=exited_qd,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        clock=clock,
+    )
 
     adopted_qd = _fresh_queue(tmp_path / "adopted")
     task, state = _seed_case(adopted_qd, tmp_path, case)
@@ -581,6 +621,8 @@ def test_finalize_exited_classifies_like_adopt_worker(
         task=task,
         state=state,
         queue_dir=adopted_qd,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=clock,
         settings_caps=_caps(),
         sleep_fn=lambda _s: None,
@@ -621,3 +663,274 @@ def test_log_finished_at_clamps_to_the_attempt(
     got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
 
     assert got == expected
+
+
+# ---------------------------------------------------------------------------
+# The owned path's gates on the adopted finalize: the recorded pre-dispatch
+# SHA (ADR-0020), the terminal-close gate (ADR-0033), the sidecar re-file
+# guard (ADR-0027) and the post-dispatch hook
+# ---------------------------------------------------------------------------
+
+_BLOCK_FILE = "needs_acquisition.jsonl"
+_REFILE_THRESHOLD = _SETTINGS.failure_classifier.sidecar_refile_loop_threshold
+
+
+@pytest.fixture
+def worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A clone of a bare remote with its seed commit pushed, the shape of a
+    task worktree whose branch has a remote to push to."""
+    isolate_git(tmp_path, monkeypatch)
+    origin = tmp_path / "origin.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    repo = tmp_path / "wt"
+    git(tmp_path, "clone", "-q", str(origin), str(repo))
+    (repo / "README.md").write_text("seed\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "seed")
+    git(repo, "push", "-q", "origin", "HEAD:main")
+    return repo
+
+
+def _commit_and_push(repo: Path, name: str) -> None:
+    (repo / name).write_text("work\n")
+    git(repo, "add", name)
+    git(repo, "commit", "-qm", f"add {name}")
+    git(repo, "push", "-q", "origin", "HEAD:main")
+
+
+def _block_rows(queue_dir: Path) -> list[dict[str, object]]:
+    path = queue_dir / _BLOCK_FILE
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _worktree_task(worktree: Path, *, deliverable: bool) -> Task:
+    return Task(
+        id="030-gates",
+        title="t",
+        prompt="p",
+        working_dir=worktree,
+        deliverable_paths=[Path("report.md")] if deliverable else [],
+    )
+
+
+def _finalize(
+    queue_dir: Path,
+    task: Task,
+    *,
+    pre_sha: str | None,
+    entry: str = "exited",
+    refile_count: int = 0,
+    settings_hooks: HookSettings = _SETTINGS.hooks,
+) -> DispatchOutcome:
+    """Finalize a running attempt of ``task`` whose dead worker's log ends in
+    a success result, through ``entry``: ``finalize_exited_worker`` or
+    ``adopt_worker`` (whose pid the caller has made probe dead)."""
+    log = _attempt_log(queue_dir, task.id)
+    _write_log(log, [_init_line(), _assistant_line(), _result_line("end_turn")])
+    state = _seed_running(queue_dir, task, log_path=log, started_at=_STARTED).model_copy(
+        update={"pre_dispatch_sha": pre_sha, "sidecar_refile_count": refile_count}
+    )
+    write_state_atomic(state, state_path_for(queue_dir, task.id))
+    settings_dispatch: DispatchSettings = _SETTINGS.dispatch.model_copy(
+        update={"dispatch_block_file": _BLOCK_FILE}
+    )
+    if entry == "exited":
+        outcome = finalize_exited_worker(
+            task=task,
+            state=state,
+            queue_dir=queue_dir,
+            clock=FakeClock(_RESTART),
+            settings_dispatch=settings_dispatch,
+            settings_hooks=settings_hooks,
+            settings_failure_classifier=_SETTINGS.failure_classifier,
+        )
+        assert outcome is not None
+        return outcome
+    return adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        clock=FakeClock(_RESTART),
+        settings_caps=_caps(),
+        settings_dispatch=settings_dispatch,
+        settings_hooks=settings_hooks,
+        settings_failure_classifier=_SETTINGS.failure_classifier,
+        sleep_fn=lambda _s: None,
+    )
+
+
+@pytest.fixture
+def dead_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+
+
+@pytest.mark.parametrize("entry", ["exited", "adopted"])
+def test_adopted_finalize_counts_a_commit_after_the_recorded_sha(
+    queue_dir: Path, worktree: Path, dead_pid: None, entry: str
+) -> None:
+    """The costliest gap: a worktree task whose only output is a pushed
+    commit. With the attempt's pre-dispatch HEAD recorded, the ADR-0020
+    gate sees the commit, as the owned finalize does, and the run is
+    completed instead of failing end_turn_no_output and re-running."""
+    pre_sha = git(worktree, "rev-parse", "HEAD")
+    _commit_and_push(worktree, "model.R")
+
+    outcome = _finalize(
+        queue_dir, _worktree_task(worktree, deliverable=False), pre_sha=pre_sha, entry=entry
+    )
+
+    assert outcome.new_state.status == "completed"
+    assert outcome.run_record.stop_reason == "end_turn"
+    assert outcome.run_record.error is None
+    reloaded = load_state(state_path_for(queue_dir, "030-gates"))
+    assert reloaded.status == "completed"
+    assert reloaded.pre_dispatch_sha is None
+    assert _block_rows(queue_dir) == []
+
+
+@pytest.mark.parametrize(
+    ("deliverable", "status", "stop_reason"),
+    [
+        pytest.param(True, "completed", "end_turn", id="committed-report"),
+        pytest.param(False, "failed", "end_turn_no_output", id="commit-only"),
+    ],
+)
+def test_adopted_finalize_without_a_recorded_sha_keeps_the_legacy_gates(
+    queue_dir: Path, worktree: Path, deliverable: bool, status: str, stop_reason: str
+) -> None:
+    """A state written before ``pre_dispatch_sha`` existed can't show the
+    commit. The run is finalized as before: a committed report still
+    completes, a commit alone still fails the ADR-0020 gate. And the
+    ADR-0033 gate stays off, since it would take the committed report for
+    a skip and write a block row."""
+    if deliverable:
+        _commit_and_push(worktree, "report.md")
+    else:
+        _commit_and_push(worktree, "model.R")
+
+    outcome = _finalize(queue_dir, _worktree_task(worktree, deliverable=deliverable), pre_sha=None)
+
+    assert outcome.new_state.status == status
+    assert outcome.run_record.stop_reason == stop_reason
+    assert _block_rows(queue_dir) == []
+
+
+def test_adopted_finalize_writes_the_terminal_close_row(queue_dir: Path, worktree: Path) -> None:
+    """A terminal close (a report, no commit, a clean worktree) writes the
+    ADR-0033 block row on the adopted finalize, as on the owned one, and
+    the run stays completed."""
+    pre_sha = git(worktree, "rev-parse", "HEAD")
+    (worktree / "report.md").write_text("skipped: not a model paper\n")
+
+    outcome = _finalize(queue_dir, _worktree_task(worktree, deliverable=True), pre_sha=pre_sha)
+
+    assert outcome.new_state.status == "completed"
+    rows = _block_rows(queue_dir)
+    assert [(row["task"], row["block_dispatch"]) for row in rows] == [("030-gates", True)]
+
+
+@pytest.mark.parametrize(
+    ("pre_sha_known", "commit", "status", "stop_reason", "refile_count"),
+    [
+        pytest.param(
+            True,
+            False,
+            "failed_circuit_breaker",
+            "sidecar_refile_loop",
+            _REFILE_THRESHOLD,
+            id="no-progress-trips-the-guard",
+        ),
+        pytest.param(True, True, "awaiting_sidecar", "end_turn", 0, id="a-commit-resets-it"),
+        pytest.param(
+            False,
+            False,
+            "awaiting_sidecar",
+            "end_turn",
+            _REFILE_THRESHOLD - 1,
+            id="legacy-state-not-counted",
+        ),
+    ],
+)
+def test_adopted_finalize_applies_the_sidecar_refile_guard(
+    queue_dir: Path,
+    worktree: Path,
+    pre_sha_known: bool,
+    commit: bool,
+    status: str,
+    stop_reason: str,
+    refile_count: int,
+) -> None:
+    """ADR-0027 on the adopted finalize. One re-file short of the threshold,
+    a run that files another sidecar without committing trips the guard,
+    and one that committed resets the count. A legacy state can't show
+    the commit, so its sidecar is parked uncounted, as before."""
+    pre_sha = git(worktree, "rev-parse", "HEAD")
+    if commit:
+        _commit_and_push(worktree, "model.R")
+    task = _worktree_task(worktree, deliverable=False)
+    _open_sidecar(queue_dir, task.id)
+
+    outcome = _finalize(
+        queue_dir,
+        task,
+        pre_sha=pre_sha if pre_sha_known else None,
+        refile_count=_REFILE_THRESHOLD - 1,
+    )
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason, reloaded.sidecar_refile_count) == (
+        status,
+        stop_reason,
+        refile_count,
+    )
+    assert reloaded == outcome.new_state
+
+
+def _marker_hook(marker: Path) -> HookSettings:
+    return _SETTINGS.hooks.model_copy(
+        update={
+            "post_dispatch_command": (
+                f'shell:printf "%s %s %s" "$TASK_ID" "$ATTEMPT" "$SESSION_ID" > {marker}'
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize("entry", ["exited", "adopted"])
+def test_adopted_finalize_runs_the_post_dispatch_hook(
+    queue_dir: Path, tmp_path: Path, dead_pid: None, entry: str
+) -> None:
+    """The post-dispatch hook runs once the adopted finalize records the
+    run, with the attempt's task id, attempt number and session id."""
+    marker = tmp_path / "hook-ran"
+    task = Task(id="031-hook", title="t", prompt="p", working_dir=None)
+
+    _finalize(queue_dir, task, pre_sha=None, entry=entry, settings_hooks=_marker_hook(marker))
+
+    assert marker.read_text() == "031-hook 1 sess-adopt"
+
+
+def test_adopted_finalize_runs_the_hook_when_the_guard_stands_down(
+    queue_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker has exited even when a concurrent writer finalized the
+    task first. The owned path runs the hook once its worker exits, so the
+    adopted finalize runs it too, with this attempt's session id, while
+    the other writer's record stands."""
+    marker = tmp_path / "hook-ran"
+    task = Task(id="032-hook-race", title="t", prompt="p", working_dir=None)
+    real_load_state = dispatcher_mod.load_state
+
+    def _other_writer_won(path: Path) -> TaskState:
+        return real_load_state(path).model_copy(
+            update={"status": "failed", "stop_reason": "killed_by_silent_reaper"}
+        )
+
+    monkeypatch.setattr(dispatcher_mod, "load_state", _other_writer_won)
+
+    outcome = _finalize(queue_dir, task, pre_sha=None, settings_hooks=_marker_hook(marker))
+
+    assert outcome.new_state.stop_reason == "killed_by_silent_reaper"
+    assert marker.read_text() == "032-hook-race 1 sess-adopt"

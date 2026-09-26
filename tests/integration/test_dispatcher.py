@@ -549,6 +549,52 @@ class TestOutputEvidenceGate:
         self._git(repo, "add", ".")
         self._git(repo, "commit", "-q", "-m", "seed")
 
+    def test_running_state_records_the_pre_dispatch_sha(
+        self,
+        queue_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        """Every ``running`` write carries the worktree's HEAD from before the
+        worker spawned, so a supervisor that adopts or finalizes the attempt
+        after a restart can run the commit check (ADR-0025). Finalizing
+        clears it."""
+        repo = tmp_path / "wt"
+        self._init_repo(repo)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True
+        ).stdout.strip()
+        worktree_task = Task(id="997-pre-sha", title="SHA", prompt="p", working_dir=repo)
+        running_shas: list[str | None] = []
+        real_write = dispatcher_mod.write_state_atomic
+
+        def _spy(state: TaskState, path: Path) -> None:
+            if state.status == "running":
+                running_shas.append(state.pre_dispatch_sha)
+            real_write(state, path)
+
+        monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+
+        outcome = dispatch(
+            task=worktree_task,
+            state=TaskState(task_id=worktree_task.id),
+            plan=SpawnPlan(
+                strategy=ResumeStrategy.FRESH, session_id=None, prompt="p", extra_args=[]
+            ),
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_hooks=_hooks(),
+            claude_executable=str(SHIM_PATH),
+            adopt_workers=True,
+        )
+
+        assert len(running_shas) >= 2, running_shas
+        assert set(running_shas) == {head}
+        assert outcome.new_state.pre_dispatch_sha is None
+        assert load_state(state_path_for(queue_dir, worktree_task.id)).pre_dispatch_sha is None
+
     def test_clean_exit_no_artifact_flips_to_failed(
         self,
         queue_dir: Path,

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
@@ -32,6 +33,9 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner.dispatcher import adopt_worker
+
+_SETTINGS = load_settings(None)
+"""Package defaults; the adopted finalize requires the dispatch and hook settings."""
 
 WORKER = Path(__file__).parent.parent / "fixtures" / "claude_shim" / "file_worker.py"
 
@@ -112,6 +116,8 @@ def test_adopt_real_worker_to_completion(queue_dir: Path) -> None:
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
     )
@@ -151,6 +157,8 @@ def test_adopt_real_worker_crash_no_result_failed(queue_dir: Path) -> None:
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
     )
@@ -181,6 +189,8 @@ def test_adopt_waits_for_live_worker_then_finalizes(queue_dir: Path) -> None:
         task=task,
         state=state,
         queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
         clock=RealClock(),
         settings_caps=_caps(),
     )
