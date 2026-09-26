@@ -70,6 +70,21 @@ def real(path: Path) -> str:
     return os.path.realpath(path)
 
 
+def isolate_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point git at a throwaway config for the rest of the test.
+
+    Keeps the developer's own git config (signing, hooks, default branch) and
+    any GIT_DIR inherited from a git hook out of both the fixture and the code
+    under test, which runs git in this process's environment.
+    """
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text(_GITCONFIG)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for var in _LEAKY_GIT_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
 @dataclass
 class World:
     root: Path
@@ -80,16 +95,7 @@ class World:
 
     @classmethod
     def create(cls, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
-        # Keep the developer's own git config (signing, hooks, default
-        # branch) and any GIT_DIR inherited from a git hook out of both the
-        # fixture and the code under test, which runs git in this process's
-        # environment.
-        gitconfig = tmp_path / "gitconfig"
-        gitconfig.write_text(_GITCONFIG)
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
-        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        for var in _LEAKY_GIT_ENV:
-            monkeypatch.delenv(var, raising=False)
+        isolate_git(tmp_path, monkeypatch)
 
         origin = tmp_path / "origin.git"
         git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
