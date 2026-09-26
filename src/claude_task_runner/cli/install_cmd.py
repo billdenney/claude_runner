@@ -92,7 +92,9 @@ def install(
     the proposed change and asks for confirmation before writing.
 
     systemd: writes a ``--user`` unit that runs the supervisor for
-    ``--queue`` and restarts it when it fails.
+    ``--queue`` and restarts it when it fails. The queue's
+    ``[watchdog]`` sets the unit's restart policy, so re-run ``install``
+    after changing it.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
     and registers ``--queue`` in ``~/.claude_task_runner/queues.json``.
@@ -123,13 +125,27 @@ def install(
         # installed, and then the tick would restart a supervisor that
         # `Restart=on-failure` deliberately left stopped, outside the
         # unit's control.
-        sd_plan = systemd_mod.build_install_plan(
-            supervisor_command=_supervisor_command(queue_path, resolved_config),
-            queue_dir=queue_path,
-            # ADR-0025: generate fast-stop wiring when adoption is on so
-            # the unit's ExecStop / TimeoutStopSec match runtime behaviour.
-            adopt_workers=settings.supervisor.adopt_workers,
-        )
+        try:
+            sd_plan = systemd_mod.build_install_plan(
+                supervisor_command=_supervisor_command(queue_path, resolved_config),
+                queue_dir=queue_path,
+                # The queue's [watchdog] sets RestartSec, StartLimitBurst
+                # and StartLimitIntervalSec.
+                watchdog=settings.watchdog,
+                # ADR-0025: generate fast-stop wiring when adoption is on so
+                # the unit's ExecStop / TimeoutStopSec match runtime behaviour.
+                adopt_workers=settings.supervisor.adopt_workers,
+            )
+        except systemd_mod.UnitSettingError as exc:
+            # Without markup, so the "[watchdog]" in the message is printed.
+            console.print(
+                f"systemd install failed: {exc}. Nothing was written.",
+                style="bold red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+            raise typer.Exit(code=2) from exc
         verb = "replace" if sd_plan.block_existed else "create"
         console.print(f"\n[bold]Will {verb} systemd user unit at:[/]\n  {sd_plan.unit_path}\n")
         console.print("[bold]Unit text:[/]")

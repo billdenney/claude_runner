@@ -24,6 +24,7 @@ from claude_task_runner.cli.install_cmd import (
     _watchdog_script_path,
     app,
 )
+from claude_task_runner.config.loader import ConfigError
 from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
@@ -520,21 +521,12 @@ def test_install_systemd_does_not_register_queue(runner: CliRunner, tmp_path: Pa
 # ---------------------------------------------------------------------------
 
 
-def test_install_systemd_unit_ignores_the_watchdog_table(runner: CliRunner, tmp_path: Path) -> None:
-    """Pins current behaviour: the unit's restart policy is hardcoded.
+@contextmanager
+def _systemd_install_patched() -> Iterator[MagicMock]:
+    """Patch the systemd branch's I/O, but not its plan; yield the ``apply_plan`` mock.
 
-    The queue's TOML sets every ``[watchdog]`` key away from its default,
-    and the unit still gets ``RestartSec=30``, ``StartLimitBurst=5`` and
-    ``StartLimitIntervalSec=600``."""
-    queue = tmp_path / "queue"
-    queue.mkdir()
-    (queue / "claude_runner.toml").write_text(
-        "[watchdog]\n"
-        "restart_cooldown_s = 120\n"
-        "restart_backoff_max_s = 1800\n"
-        "crash_loop_threshold = 9\n",
-        encoding="utf-8",
-    )
+    The real ``build_install_plan`` runs, so the unit text is what
+    ``install`` would write, at ``$HOME/.config/systemd/user``."""
     with (
         patch(
             "claude_task_runner.cli.install_cmd._detect_init_system",
@@ -546,20 +538,102 @@ def test_install_systemd_unit_ignores_the_watchdog_table(runner: CliRunner, tmp_
         ),
         patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
     ):
+        yield mock_apply
+
+
+def _written_unit_lines(mock_apply: MagicMock) -> list[str]:
+    mock_apply.assert_called_once()
+    lines: list[str] = mock_apply.call_args.args[0].unit_text.splitlines()
+    return lines
+
+
+def test_install_systemd_unit_takes_the_watchdog_table(runner: CliRunner, tmp_path: Path) -> None:
+    """The queue's ``[watchdog]`` sets the unit's restart policy.
+
+    Before, the unit got ``RestartSec=30``, ``StartLimitBurst=5`` and
+    ``StartLimitIntervalSec=600`` whatever the TOML said."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(
+        "[watchdog]\n"
+        "restart_cooldown_s = 120\n"
+        "restart_backoff_max_s = 1800\n"
+        "crash_loop_threshold = 9\n",
+        encoding="utf-8",
+    )
+    with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 0, result.output
-    unit_lines = mock_apply.call_args.args[0].unit_text.splitlines()
+    unit_lines = _written_unit_lines(mock_apply)
+    for line in ("RestartSec=120", "StartLimitBurst=9", "StartLimitIntervalSec=1800"):
+        assert line in unit_lines
+        # The operator sees it in the unit text before confirming.
+        assert f"  {line}\n" in result.stdout
+
+
+def test_install_systemd_unit_without_a_watchdog_table_keeps_the_old_policy(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _systemd_install_patched() as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    unit_lines = _written_unit_lines(mock_apply)
     assert "RestartSec=30" in unit_lines
     assert "StartLimitBurst=5" in unit_lines
     assert "StartLimitIntervalSec=600" in unit_lines
 
 
+def test_install_systemd_refuses_a_watchdog_value_systemd_cannot_parse(
+    runner: CliRunner, tmp_path: Path, isolated_home: Path
+) -> None:
+    """systemd would ignore the line and restart after its own 100 ms.
+
+    The schema accepts ``inf`` (it is > 0), and TOML can spell it. The
+    message keeps ``[watchdog]``, which Rich markup would otherwise
+    take for a style tag and drop."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(
+        "[watchdog]\nrestart_cooldown_s = inf\n", encoding="utf-8"
+    )
+    with _systemd_install_patched() as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 2
+    assert (
+        "systemd install failed: [watchdog].restart_cooldown_s = inf is not a finite "
+        "number of seconds. Nothing was written.\n"
+    ) in result.stdout
+    assert "Unit text:" not in result.stdout
+    mock_apply.assert_not_called()
+    assert not (isolated_home / ".config").exists()
+
+
+def test_install_systemd_invalid_watchdog_value_fails_before_writing(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """A value the schema rejects stops ``install`` when the TOML loads."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(
+        "[watchdog]\ncrash_loop_threshold = 0\n", encoding="utf-8"
+    )
+    with _systemd_install_patched() as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ConfigError)
+    assert "watchdog.crash_loop_threshold" in str(result.exception)
+    mock_apply.assert_not_called()
+
+
 def test_install_cron_does_not_record_config(runner: CliRunner, tmp_path: Path) -> None:
-    """Pins current behaviour: a cron ``install --config`` is dropped.
+    """Pins current behaviour, a known gap: a cron ``install --config`` is dropped.
 
     The registry keeps only the queue's path, so the tick the crontab
     line runs spawns ``supervisor start`` without ``--config``, and that
-    supervisor finds only ``<queue>/claude_runner.toml``."""
+    supervisor finds only ``<queue>/claude_runner.toml``. The follow-up
+    that makes the tick load the queue's config changes this."""
     queue = tmp_path / "queue"
     queue.mkdir()
     config = tmp_path / "elsewhere" / "custom.toml"

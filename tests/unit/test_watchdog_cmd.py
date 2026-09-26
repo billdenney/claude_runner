@@ -474,9 +474,11 @@ class TestTickSkipsMissingQueue:
 class TestTickSettingsSource:
     """Where a tick's ``[watchdog]`` settings come from.
 
-    These pin the current behaviour: the crontab's tick loads no queue's
-    ``claude_runner.toml``, so a queue's ``[watchdog]`` table never takes
-    effect."""
+    These pin the current behaviour, a known gap: the crontab's tick
+    loads no queue's ``claude_runner.toml``, so a queue's ``[watchdog]``
+    table does not reach the cron watchdog. (The systemd unit takes it
+    at ``install``.) The follow-up that makes the tick load the queue's
+    config changes these."""
 
     def test_tick_ignores_the_queue_toml_watchdog_table(
         self, runner: CliRunner, isolated_home: Path
