@@ -136,6 +136,14 @@ Breaking changes are called out in the version notes.
   `SEVEN_DAY_LENGTH_S` duplicated `throttle.decision.FIVE_HOUR_LENGTH_S` and
   `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
 
+- **`force_dispatch_in_eow`, a task field nothing read.** It overrode the
+  end-of-week push's runtime guard, and ADR-0022 removed that push. `Task`
+  rejects unknown keys, so `load_task` now drops this one from an existing task
+  YAML instead of refusing the file, and logs a warning naming the file (once
+  per file per process, since every tick reloads every task). A task that set
+  it dispatches exactly as before. `queue template` no longer lists it, and the
+  `runner-add-task` skill no longer names it as an example.
+
 ### Fixed
 
 - **The systemd unit now takes its restart policy from the queue's
