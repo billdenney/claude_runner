@@ -422,6 +422,24 @@ def test_check_account_policies_invalid_file_fails(settings: Settings, tmp_path:
     assert "broken" in result.remediation
 
 
+def test_check_account_policies_unknown_timezone_fails(settings: Settings, tmp_path: Path) -> None:
+    """The throttle would raise on the name at its first decision for the account."""
+    from claude_task_runner.doctor.checks import check_account_policies
+
+    cfg_dir = tmp_path / "far"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text(
+        '[dispatch_pct]\ntimezone = "Not/AZone"\n', encoding="utf-8"
+    )
+    s = _set_accounts(settings, [AccountSettings(name="far", config_dir=str(cfg_dir))])
+    result = check_account_policies(s)
+    assert result.status == CheckStatus.FAIL
+    assert "far" in result.remediation
+    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in (
+        result.remediation
+    )
+
+
 # ---------------------------------------------------------------------------
 # check_dispatch_pct_legacy (ADR-0022 migration check)
 # ---------------------------------------------------------------------------

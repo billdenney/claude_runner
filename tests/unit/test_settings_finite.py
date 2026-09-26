@@ -20,9 +20,8 @@ the known-answer tests check the walk.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Literal, get_args
+from typing import Annotated, Any, Literal
 
 import pytest
 from pydantic import BaseModel, Field, PositiveFloat, ValidationError
@@ -35,48 +34,10 @@ from claude_task_runner.config.loader import (
 )
 from claude_task_runner.config.schema import AccountPolicy, Settings
 
-from ._settings_walk import ROOTS, walk_settings
+from ._settings_walk import LOADERS, ROOTS, float_paths, holds_float, toml_setting
 
 NON_FINITE = ("inf", "-inf", "nan")
 """The three non-finite values, as TOML writes them."""
-
-LOADERS: dict[str, Callable[[Path], object]] = {
-    "claude_runner.toml": lambda directory: load_settings(directory / "claude_runner.toml"),
-    PER_ACCOUNT_TOML_NAME: lambda directory: load_account_policy(str(directory)),
-}
-"""For each file in ``ROOTS``: how the runner loads it from its directory."""
-
-
-def _holds_float(annotation: Any) -> bool:
-    """Whether a field with this annotation can hold a ``float``.
-
-    Looks through ``Optional``, unions, lists, dicts and ``Annotated``. A
-    nested model is not a float: the walk visits its fields separately.
-    """
-    if isinstance(annotation, type) and issubclass(annotation, float):
-        return True
-    return any(_holds_float(arg) for arg in get_args(annotation))
-
-
-def _float_paths(root: type[BaseModel]) -> list[str]:
-    """The TOML path of every field under ``root`` that can hold a float."""
-    return [
-        field.path
-        for field in walk_settings(root)
-        if _holds_float(field.model.model_fields[field.name].annotation)
-    ]
-
-
-def _toml_setting(path: str, value: str) -> str:
-    """A TOML document that sets the dotted ``path`` to ``value``.
-
-    Writes a key in nested tables, which is where every float setting is
-    today. A float under ``[[accounts]]`` or a ``<key>`` table needs more,
-    and the gate would then fail on the error's location: extend this.
-    """
-    table, _, key = path.rpartition(".")
-    header = f"[{table}]\n" if table else ""
-    return f"{header}{key} = {value}\n"
 
 
 def _assert_rejects_non_finite(error: ConfigError, path: str) -> None:
@@ -97,7 +58,7 @@ def _assert_rejects_non_finite(error: ConfigError, path: str) -> None:
 CASES = [
     pytest.param(file, path, value, id=f"{file}:{path}={value}")
     for file, root in ROOTS.items()
-    for path in _float_paths(root)
+    for path in float_paths(root)
     for value in NON_FINITE
 ]
 
@@ -107,7 +68,7 @@ class TestEveryFloatSettingIsFinite:
     def test_a_non_finite_value_fails_to_load(
         self, tmp_path: Path, file: str, path: str, value: str
     ) -> None:
-        (tmp_path / file).write_text(_toml_setting(path, value), encoding="utf-8")
+        (tmp_path / file).write_text(toml_setting(path, value), encoding="utf-8")
         with pytest.raises(ConfigError) as excinfo:
             LOADERS[file](tmp_path)
         _assert_rejects_non_finite(excinfo.value, path)
@@ -154,7 +115,7 @@ class TestInstrument:
         ],
     )
     def test_float_annotations_hold_a_float(self, annotation: Any) -> None:
-        assert _holds_float(annotation)
+        assert holds_float(annotation)
 
     @pytest.mark.parametrize(
         "annotation",
@@ -170,11 +131,11 @@ class TestInstrument:
         ],
     )
     def test_other_annotations_do_not(self, annotation: Any) -> None:
-        assert not _holds_float(annotation)
+        assert not holds_float(annotation)
 
     def test_finds_exactly_the_float_fields_of_a_known_tree(self) -> None:
         # _Leaf is walked once, under the shorter of its two paths.
-        assert _float_paths(_Tree) == ["top", "maybe", "branch.seconds"]
+        assert float_paths(_Tree) == ["top", "maybe", "branch.seconds"]
 
     def test_finds_float_settings_in_every_section_that_has_one(self) -> None:
         assert {
@@ -186,10 +147,10 @@ class TestInstrument:
             "hooks.pre_dispatch_timeout_s",
             "worktree_reclaim.git_timeout_s",
             "dispatch.affinity_ttl_seconds",
-        } <= set(_float_paths(Settings))
+        } <= set(float_paths(Settings))
 
     def test_leaves_out_integer_settings(self) -> None:
-        paths = _float_paths(Settings)
+        paths = float_paths(Settings)
         assert "watchdog.crash_loop_threshold" not in paths
         # An int, despite the unit suffix.
         assert "task_caps.stuck_sleep_loop_kill_threshold_s" not in paths
@@ -203,17 +164,17 @@ class TestInstrument:
         assert LOADERS.keys() == ROOTS.keys()
 
     def test_writes_a_key_in_nested_tables(self) -> None:
-        assert _toml_setting("watchdog.restart_cooldown_s", "inf") == (
+        assert toml_setting("watchdog.restart_cooldown_s", "inf") == (
             "[watchdog]\nrestart_cooldown_s = inf\n"
         )
-        assert _toml_setting("dispatch_pct.day.x", "nan") == "[dispatch_pct.day]\nx = nan\n"
-        assert _toml_setting("probe_s", "-inf") == "probe_s = -inf\n"
+        assert toml_setting("dispatch_pct.day.x", "nan") == "[dispatch_pct.day]\nx = nan\n"
+        assert toml_setting("probe_s", "-inf") == "probe_s = -inf\n"
 
     @pytest.mark.parametrize("value", ["+inf", "-nan", "1e309"])
     def test_other_spellings_of_non_finite_fail_too(self, tmp_path: Path, value: str) -> None:
         """TOML reads these as the same three values; ``1e309`` overflows to ``inf``."""
         toml = tmp_path / "claude_runner.toml"
-        toml.write_text(_toml_setting("watchdog.restart_cooldown_s", value), encoding="utf-8")
+        toml.write_text(toml_setting("watchdog.restart_cooldown_s", value), encoding="utf-8")
         with pytest.raises(ConfigError) as excinfo:
             load_settings(toml)
         _assert_rejects_non_finite(excinfo.value, "watchdog.restart_cooldown_s")
@@ -225,7 +186,7 @@ class TestInstrument:
         through ``load_account_policy``. This is the case it will run."""
         monkeypatch.setattr("claude_task_runner.config.loader.AccountPolicy", _PolicyWithFloat)
         (tmp_path / PER_ACCOUNT_TOML_NAME).write_text(
-            _toml_setting("probe_s", "inf"), encoding="utf-8"
+            toml_setting("probe_s", "inf"), encoding="utf-8"
         )
         with pytest.raises(ConfigError) as excinfo:
             load_account_policy(str(tmp_path))
@@ -234,7 +195,7 @@ class TestInstrument:
     def test_a_finite_value_still_loads(self, tmp_path: Path) -> None:
         """The check rejects the value, not the key or the TOML around it."""
         (tmp_path / "claude_runner.toml").write_text(
-            _toml_setting("watchdog.restart_cooldown_s", "45.5"), encoding="utf-8"
+            toml_setting("watchdog.restart_cooldown_s", "45.5"), encoding="utf-8"
         )
         settings = LOADERS["claude_runner.toml"](tmp_path)
         assert isinstance(settings, Settings)
@@ -243,7 +204,7 @@ class TestInstrument:
     def test_the_assertion_rejects_a_different_error(self, tmp_path: Path) -> None:
         """A load that fails for another reason must not count as the gate passing."""
         toml = tmp_path / "claude_runner.toml"
-        toml.write_text(_toml_setting("watchdog.restart_cooldown_s", "-1"), encoding="utf-8")
+        toml.write_text(toml_setting("watchdog.restart_cooldown_s", "-1"), encoding="utf-8")
         with pytest.raises(ConfigError) as excinfo:
             load_settings(toml)
         with pytest.raises(AssertionError):

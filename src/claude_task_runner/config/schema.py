@@ -8,7 +8,8 @@ etc.) so a component only depends on the section it reads.
 from __future__ import annotations
 
 import re
-from typing import Literal
+import zoneinfo
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -43,6 +44,25 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
+MAX_DURATION_S: Final = 10 * 365 * 24 * 60 * 60
+"""The longest duration any setting may hold: ten years, 315,360,000 s.
+
+A finite value can still be too large: ``[watchdog] restart_cooldown_s =
+1e308`` loaded, and ``timedelta(seconds=1e308)`` then raised
+``OverflowError`` in the watchdog. Ten years is far above any real setting
+and far below every limit in the code that reads one: ``time.sleep`` and
+thread waits refuse more than about 292 years, datetime arithmetic
+overflows about 7,970 years out, and systemd refuses spans over 580,000
+years. Every setting whose name has the unit word ``s``, ``seconds`` or
+``ms`` (``poll_interval_s``, ``max_duration_s_per_task``), and every
+duration string, carries this bound. ``tests/unit/test_settings_bounds.py``
+checks each one.
+"""
+
+MAX_DURATION_MS: Final = MAX_DURATION_S * 1000
+""":data:`MAX_DURATION_S` for the settings counted in milliseconds."""
+
+
 _ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
 """Account names must be filesystem- and CLI-safe.
 
@@ -62,15 +82,15 @@ class UsageSettings(_StrictModel):
     "api_then_tty"`` (recommended over ``"api"`` because the TTY
     fall-through also refreshes the OAuth token on expiry)."""
 
-    capture_trust_timeout_s: float = Field(gt=0)
-    capture_usage_timeout_s: float = Field(gt=0)
-    capture_eof_timeout_s: float = Field(gt=0)
-    capture_post_ready_pad_ms: int = Field(ge=0)
-    capture_post_data_pad_ms: int = Field(ge=0)
+    capture_trust_timeout_s: float = Field(gt=0, le=MAX_DURATION_S)
+    capture_usage_timeout_s: float = Field(gt=0, le=MAX_DURATION_S)
+    capture_eof_timeout_s: float = Field(gt=0, le=MAX_DURATION_S)
+    capture_post_ready_pad_ms: int = Field(ge=0, le=MAX_DURATION_MS)
+    capture_post_data_pad_ms: int = Field(ge=0, le=MAX_DURATION_MS)
     capture_rotation_count: int = Field(ge=0)
-    poll_interval_s: float = Field(gt=0)
+    poll_interval_s: float = Field(gt=0, le=MAX_DURATION_S)
     drift_recovery_clean_polls: int = Field(ge=1)
-    api_timeout_s: float = Field(default=10.0, gt=0)
+    api_timeout_s: float = Field(default=10.0, gt=0, le=MAX_DURATION_S)
     """Per-request timeout for the API usage source (seconds).
     Generous enough to swallow ordinary network jitter, tight enough
     that the daemon's tick loop doesn't stall on a stuck connection.
@@ -93,7 +113,7 @@ class SessionSettings(_StrictModel):
 
 class FailureClassifierSettings(_StrictModel):
     failure_circuit_breaker_threshold: int = Field(ge=1)
-    deferral_recheck_cooldown_s: float = Field(default=900.0, ge=0)
+    deferral_recheck_cooldown_s: float = Field(default=900.0, ge=0, le=MAX_DURATION_S)
     """Seconds a task parked in ``deferred`` (pre-dispatch hook exit
     code 1 — its documented transient-defer contract) waits before the
     orchestrator re-attempts dispatch. Deferrals are NOT failures and do
@@ -113,10 +133,10 @@ class FailureClassifierSettings(_StrictModel):
 
 class TaskCapsSettings(_StrictModel):
     max_tokens_per_task: int = Field(ge=0)
-    max_duration_s_per_task: float = Field(ge=0)
-    heartbeat_silence_alert_s: float = Field(gt=0)
-    heartbeat_silence_kill_s: float = Field(ge=0)
-    heartbeat_persist_interval_s: float = Field(gt=0, default=30.0)
+    max_duration_s_per_task: float = Field(ge=0, le=MAX_DURATION_S)
+    heartbeat_silence_alert_s: float = Field(gt=0, le=MAX_DURATION_S)
+    heartbeat_silence_kill_s: float = Field(ge=0, le=MAX_DURATION_S)
+    heartbeat_persist_interval_s: float = Field(gt=0, default=30.0, le=MAX_DURATION_S)
     """Minimum seconds between in-loop ``last_heartbeat_at`` writes from
     the dispatcher. The dispatcher ticks the in-memory heartbeat on
     every stream-json event but only persists to the state YAML once
@@ -135,7 +155,7 @@ class TaskCapsSettings(_StrictModel):
     timestamp for tasks that are actively emitting events.
     """
 
-    dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0)
+    dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0, le=MAX_DURATION_S)
     """Seconds between the dispatcher's monitor-thread ``dispatcher_alive_at``
     writes. Distinct from ``heartbeat_persist_interval_s`` because
     ``last_heartbeat_at`` only updates when the agent emits a stream-json
@@ -154,7 +174,7 @@ class TaskCapsSettings(_StrictModel):
       ``zombie_verify_fs_activity_window_s``).
     """
 
-    zombie_verify_fs_activity_window_s: float = Field(gt=0, default=600.0)
+    zombie_verify_fs_activity_window_s: float = Field(gt=0, default=600.0, le=MAX_DURATION_S)
     """When the per-tick reaper would mark a task SILENT/KILL based on
     the cheap heartbeat fields, it first walks the task's working_dir
     for the most recent file ``st_mtime``. If anything was modified
@@ -182,7 +202,7 @@ class TaskCapsSettings(_StrictModel):
     extra latency before a silent subprocess is flagged.
     """
 
-    stuck_sleep_loop_kill_threshold_s: int = Field(default=600, gt=0)
+    stuck_sleep_loop_kill_threshold_s: int = Field(default=600, gt=0, le=MAX_DURATION_S)
     """How long ``last_heartbeat_at`` may be stale (agent emitting no
     stream-json events) before a descendant stuck-sleep-loop is treated
     as a zombie and killed — provided the monitor is still alive (see
@@ -235,13 +255,13 @@ class TaskCapsSettings(_StrictModel):
 
 
 class WatchdogSettings(_StrictModel):
-    restart_cooldown_s: float = Field(gt=0)
-    restart_backoff_max_s: float = Field(gt=0)
+    restart_cooldown_s: float = Field(gt=0, le=MAX_DURATION_S)
+    restart_backoff_max_s: float = Field(gt=0, le=MAX_DURATION_S)
     crash_loop_threshold: int = Field(ge=1)
 
 
 class SupervisorSettings(_StrictModel):
-    window_start_delay_s: float = Field(ge=0)
+    window_start_delay_s: float = Field(ge=0, le=MAX_DURATION_S)
     state_file: str
     preferred_init_system: str  # auto | systemd | cron
     adopt_workers: bool = True
@@ -272,9 +292,9 @@ class SupervisorSettings(_StrictModel):
 
 class HookSettings(_StrictModel):
     pre_dispatch_command: str
-    pre_dispatch_timeout_s: float = Field(gt=0)
+    pre_dispatch_timeout_s: float = Field(gt=0, le=MAX_DURATION_S)
     post_dispatch_command: str
-    post_dispatch_timeout_s: float = Field(gt=0)
+    post_dispatch_timeout_s: float = Field(gt=0, le=MAX_DURATION_S)
 
 
 class QueueSettings(_StrictModel):
@@ -348,7 +368,7 @@ class WorktreeReclaimSettings(_StrictModel):
     Gates ONLY the supervisor's periodic pass. The ``worktree reclaim`` CLI is
     always available (and is a dry run unless given ``--apply``)."""
 
-    interval_s: float = Field(default=3600.0, gt=0)
+    interval_s: float = Field(default=3600.0, gt=0, le=MAX_DURATION_S)
     """Seconds between two periodic supervisor passes. The first pass runs on
     the supervisor's first tick; a pass that raises still waits a full
     interval before the next attempt."""
@@ -385,11 +405,11 @@ class WorktreeReclaimSettings(_StrictModel):
     so a concurrent ``git worktree add`` waits instead of failing on git's
     repository locks. Empty (the default) takes no lock."""
 
-    lock_timeout_s: float = Field(default=60.0, gt=0)
+    lock_timeout_s: float = Field(default=60.0, gt=0, le=MAX_DURATION_S)
     """How long to wait for ``lock_file``. A worktree whose lock wait times out
     is kept for the next pass; it is not an error."""
 
-    git_timeout_s: float = Field(default=300.0, gt=0)
+    git_timeout_s: float = Field(default=300.0, gt=0, le=MAX_DURATION_S)
     """Timeout for each ``git`` invocation (the fetch, a status probe, one
     ``git worktree remove`` of a large tree)."""
 
@@ -576,9 +596,32 @@ def _validate_hhmm(value: str) -> str:
 
 def _validate_duration(value: str) -> str:
     try:
-        parse_duration(value)
+        seconds = parse_duration(value)
     except DurationParseError as exc:
         raise ValueError(str(exc)) from exc
+    if seconds > MAX_DURATION_S:
+        raise ValueError(f"duration {value!r} is longer than ten years ({MAX_DURATION_S} s)")
+    return value
+
+
+def _validate_timezone(value: str) -> str:
+    """``value`` if it is empty (the system's local time) or a time zone name.
+
+    Builds the zone as ``throttle.time_of_day.to_local`` does, so a name that
+    loads is one the throttle can use. An unknown name used to load, and then
+    the throttle's first decision raised ``ZoneInfoNotFoundError``, which
+    stopped the supervisor again after every restart.
+    """
+    if value:
+        try:
+            zoneinfo.ZoneInfo(value)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError) as exc:
+            reason = exc.args[0] if isinstance(exc, zoneinfo.ZoneInfoNotFoundError) else exc
+            raise ValueError(
+                f"[dispatch_pct].timezone = {value!r} is not an IANA time zone name "
+                f"such as 'UTC' or 'America/New_York' ({reason}). Leave it empty "
+                "for the system's local time."
+            ) from exc
     return value
 
 
@@ -665,7 +708,8 @@ class DispatchPctSettings(_StrictModel):
     """Composite root for the ADR-0022 dispatch-percentage policy."""
 
     timezone: str = ""
-    """IANA timezone (e.g. ``"America/New_York"``). Empty = system local."""
+    """IANA timezone (e.g. ``"America/New_York"``). Empty = system local.
+    A name this system's time zone database lacks fails to load."""
 
     day: DispatchPctBand
     """Daytime 5h thresholds."""
@@ -675,6 +719,11 @@ class DispatchPctSettings(_StrictModel):
 
     week: DispatchPctWeek
     """Weekly trace target curve."""
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str) -> str:
+        return _validate_timezone(value)
 
 
 class AccountDispatchPctBand(_StrictModel):
@@ -725,6 +774,13 @@ class AccountDispatchPolicy(_StrictModel):
     day: AccountDispatchPctBand = Field(default_factory=AccountDispatchPctBand)
     night: AccountDispatchPctNight = Field(default_factory=AccountDispatchPctNight)
     week: AccountDispatchPctWeek = Field(default_factory=AccountDispatchPctWeek)
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _validate_timezone(value)
 
 
 class AccountPolicy(_StrictModel):
@@ -802,7 +858,7 @@ class DispatchSettings(_StrictModel):
     (index rows, ``target_path`` re-acquisition rows) are ignored: the
     selector acts only on the task-keyed, explicitly-flagged block."""
 
-    affinity_ttl_seconds: float = 5400.0
+    affinity_ttl_seconds: float = Field(default=5400.0, ge=0, le=MAX_DURATION_S)
     """Session-affinity TTL, in seconds (default 5400 = 1.5h).
 
     Session affinity (ADR-0024) pins a task to the account that hosts
