@@ -22,6 +22,7 @@ pure-Python ``SafeLoader``.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -39,6 +40,8 @@ from claude_task_runner.queue.schema import (
     Task,
     TaskState,
 )
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -235,10 +238,41 @@ def _validate(model: type[T], payload: dict[str, Any], path: Path) -> T:
         raise QueueSchemaError(explain_validation_error(exc, path, model)) from exc
 
 
+_RETIRED_TASK_KEYS: dict[str, str] = {
+    "force_dispatch_in_eow": (
+        "it overrode the end-of-week push's runtime guard, and ADR-0022 removed that push"
+    ),
+}
+"""Keys a task YAML may still carry after they left :class:`Task`, each with
+why it went. ``Task`` forbids unknown keys, so without this a file written
+before a key was retired would stop loading and its task would never run."""
+
+_warned_retired_task_keys: set[tuple[Path, str]] = set()
+"""``(file, key)`` pairs already warned about. The orchestrator reloads every
+task YAML on every tick, so each pair is warned about once per process."""
+
+
+def _drop_retired_task_keys(payload: dict[str, Any], path: Path) -> None:
+    """Remove retired keys from ``payload``, warning once per file and key."""
+    for key, reason in _RETIRED_TASK_KEYS.items():
+        if key not in payload:
+            continue
+        del payload[key]
+        if (path, key) not in _warned_retired_task_keys:
+            _warned_retired_task_keys.add((path, key))
+            logger.warning(
+                "%s: ignoring the retired key %r (%s); delete it from the file",
+                path,
+                key,
+                reason,
+            )
+
+
 def load_task(path: Path) -> Task:
     """Read and validate a single Task YAML."""
     payload = _load_yaml(path)
     _check_schema_version(payload, path)
+    _drop_retired_task_keys(payload, path)
     return _validate(Task, payload, path)
 
 

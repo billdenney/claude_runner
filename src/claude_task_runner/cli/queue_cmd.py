@@ -57,7 +57,6 @@ from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
-    UnknownModel,
     validate_effort,
 )
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -105,17 +104,6 @@ def _apply_working_dir_template(template: str, task_id: str) -> Path | None:
             f"[queue].working_dir_template={template!r} is not a valid format string: {exc}"
         ) from exc
     return Path(rendered)
-
-
-def _emit(payload: object, *, json: bool, console: Console) -> None:
-    """Emit ``payload`` as JSON or as a human-readable rich rendering.
-
-    Skills always pass ``--json``; operators run interactively without.
-    """
-    if json:
-        print(_json.dumps(payload, default=str, indent=2))
-        return
-    console.print(payload)
 
 
 def _safe_load_state(path: Path) -> dict[str, object] | None:
@@ -493,9 +481,6 @@ def add_task(
         validate_effort(model, effort, settings.effort_levels)
     except UnknownEffortLevel as exc:
         console.print(f"[bold red]invalid effort:[/] {exc}")
-        raise typer.Exit(code=2) from exc
-    except UnknownModel as exc:
-        console.print(f"[bold red]unknown model:[/] {exc}")
         raise typer.Exit(code=2) from exc
 
     target = task_path_for(qd, task_id)

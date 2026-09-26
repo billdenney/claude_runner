@@ -1,8 +1,8 @@
 """Tests for mechanical readiness gates (ADR-0030).
 
 Covers the schema (``ReadinessRequirement`` validation + ``Task.requires``
-round-trip) and the evaluator (``runner.readiness.unmet_requirements`` /
-``is_ready``). The selector integration (``_eligible_candidates`` skips a task
+round-trip) and the evaluator (``runner.readiness.unmet_requirements``).
+The selector integration (``_eligible_candidates`` skips a task
 with unmet requirements without dispatching, and re-admits it once satisfied)
 lives in ``test_orchestrator_sidecar_resume.py`` alongside the other
 selector-gating tests.
@@ -16,15 +16,15 @@ import pytest
 from pydantic import ValidationError
 
 from claude_task_runner.queue.schema import ReadinessRequirement, Task
-from claude_task_runner.queue.sidecar import write_request
 from claude_task_runner.queue.store import queue_runtime_dir
 from claude_task_runner.runner.readiness import (
     HOLD_REASON_PREFIX,
     hold_reason,
     is_hold_reason,
-    is_ready,
     unmet_requirements,
 )
+
+from ._sidecar_files import write_request
 
 
 def _task(**overrides: object) -> Task:
@@ -79,7 +79,6 @@ def test_task_requires_round_trips_through_dump() -> None:
 
 def test_no_requirements_is_ready(queue_dir: Path) -> None:
     assert unmet_requirements(_task(), queue_dir) == []
-    assert is_ready(_task(), queue_dir)
 
 
 def test_file_present_is_ready(queue_dir: Path) -> None:
@@ -87,7 +86,6 @@ def test_file_present_is_ready(queue_dir: Path) -> None:
     (queue_dir / "papers" / "x_trimmed.md").write_text("content", encoding="utf-8")
     task = _task(requires=[{"kind": "file", "path": "papers/x_trimmed.md"}])
     assert unmet_requirements(task, queue_dir) == []
-    assert is_ready(task, queue_dir)
 
 
 def test_file_missing_is_unmet(queue_dir: Path) -> None:
@@ -96,16 +94,15 @@ def test_file_missing_is_unmet(queue_dir: Path) -> None:
     assert len(reasons) == 1
     assert "missing file" in reasons[0]
     assert str(queue_dir / "papers" / "x_trimmed.md") in reasons[0]
-    assert not is_ready(task, queue_dir)
 
 
 def test_file_absolute_path_used_as_is(tmp_path: Path, queue_dir: Path) -> None:
     ext = tmp_path / "elsewhere" / "input.pdf"
     ext.parent.mkdir(parents=True)
     task = _task(requires=[{"kind": "file", "path": str(ext)}])
-    assert not is_ready(task, queue_dir)  # absolute path, not yet present
+    assert len(unmet_requirements(task, queue_dir)) == 1  # absolute path, not yet present
     ext.write_text("x", encoding="utf-8")
-    assert is_ready(task, queue_dir)  # appears -> ready, no dispatch involved
+    assert unmet_requirements(task, queue_dir) == []  # appears -> ready, no dispatch involved
 
 
 def test_note_included_in_reason(queue_dir: Path) -> None:
@@ -133,7 +130,7 @@ def test_multiple_requirements_reports_only_unmet(queue_dir: Path) -> None:
 
 def test_sidecar_response_ready_when_no_open_request(queue_dir: Path) -> None:
     task = _task(requires=[{"kind": "sidecar_response"}])
-    assert is_ready(task, queue_dir)  # no open sidecar for t1
+    assert unmet_requirements(task, queue_dir) == []  # no open sidecar for t1
 
 
 def test_sidecar_response_unmet_when_request_open(queue_dir: Path) -> None:
@@ -195,7 +192,7 @@ def test_sidecar_response_ready_once_every_question_answered(queue_dir: Path) ->
             answers=[SidecarAnswer(id="q1", value="A"), SidecarAnswer(id="q2", value="B")],
         ),
     )
-    assert is_ready(_task(requires=[{"kind": "sidecar_response"}]), queue_dir)
+    assert unmet_requirements(_task(requires=[{"kind": "sidecar_response"}]), queue_dir) == []
 
 
 def _sidecar_request(task_id: str, seq: int, question_ids: tuple[str, ...] = ("q1",)):
