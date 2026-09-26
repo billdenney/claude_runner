@@ -1,4 +1,4 @@
-"""Tests for cli.supervisor_cmd — stop / status + helpers.
+"""Tests for cli.supervisor_cmd — stop / drain / status + helpers.
 
 The ``start`` command runs the daemon loop end-to-end (which we do
 test in dedicated daemon tests with mocked sources). Here we cover the
@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import json as _json
 import os
+import re
 import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from claude_task_runner.cli.supervisor_cmd import (
     _captures_dir,
@@ -68,6 +71,68 @@ def _seed_state(qd: Path, task_id: str, status: str, **kw: Any) -> TaskState:
     state = TaskState(task_id=task_id, status=status, **kw)
     write_state_atomic(state, state_path_for(qd, task_id))
     return state
+
+
+_PID = 12345
+"""The PID a fake supervisor writes to its PID file."""
+
+
+class _FakeClock:
+    """Stands in for ``time.monotonic`` and ``time.sleep``.
+
+    Time passes only when the code under test sleeps, so a wait of hours
+    runs at once and every poll is recorded.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@contextmanager
+def _live_supervisor(
+    queue_dir: Path, clock: _FakeClock, *, exits_after: float | None
+) -> Iterator[tuple[MagicMock, MagicMock]]:
+    """A supervisor that writes :data:`_PID` and exits ``exits_after`` seconds
+    into the command, or never with ``None``. Yields the ``os.kill`` and
+    ``is_pid_alive`` mocks."""
+    start = clock.now
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text(f"{_PID}\n", encoding="utf-8")
+
+    def alive(pid: int) -> bool:
+        assert pid == _PID
+        return exits_after is None or clock.now - start < exits_after
+
+    with (
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.pidfile_mod.is_pid_alive", side_effect=alive
+        ) as alive_mock,
+        patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill,
+        patch("time.monotonic", clock.monotonic),
+        patch("time.sleep", clock.sleep),
+    ):
+        yield kill, alive_mock
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _invoke(runner: CliRunner, argv: list[str]) -> Result:
+    """Invoke the supervisor app wide enough that Rich wraps no line."""
+    return runner.invoke(app, argv, env={"COLUMNS": "1000"})
+
+
+def _plain(text: str) -> str:
+    """``text`` without ANSI escapes, in case the environment forces colour."""
+    return _ANSI.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +269,52 @@ def test_stop_permission_error(runner: CliRunner, queue_dir: Path) -> None:
         result = runner.invoke(app, ["stop", "--queue", str(queue_dir)])
     assert result.exit_code == 2
     assert "not allowed" in result.stdout
+
+
+def test_stop_accepts_timeout_and_never_reads_it(runner: CliRunner, queue_dir: Path) -> None:
+    """Pins today: ``--timeout`` parses, but stop signals once and returns
+    without looking at the supervisor again."""
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, alive):
+        result = _invoke(runner, ["stop", "--queue", str(queue_dir), "--timeout", "5"])
+    assert result.exit_code == 0, result.output
+    assert _plain(result.stdout) == f"SIGTERM sent to PID {_PID}.\n"
+    kill.assert_called_once_with(_PID, signal.SIGTERM)
+    assert alive.call_count == 1
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("command", ["stop", "drain"])
+@pytest.mark.parametrize("content", ["", "\n", "not-a-pid\n"])
+def test_unparseable_pid_file_reads_as_no_pid_file(
+    runner: CliRunner, queue_dir: Path, command: str, content: str
+) -> None:
+    """Pins today: a PID file that holds no PID is reported as missing."""
+    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text(content, encoding="utf-8")
+    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+        result = _invoke(runner, [command, "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert _plain(result.stdout) == f"No PID file at {pid_path}\n"
+    kill.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["stop", "drain"])
+@pytest.mark.parametrize("pid", ["0", "-1"])
+def test_non_positive_pid_reads_as_stale(
+    runner: CliRunner, queue_dir: Path, command: str, pid: str
+) -> None:
+    """Pins today: ``0`` and ``-1`` parse as PIDs, and ``is_pid_alive``
+    calls them dead, so nothing is signalled. ``os.kill`` would send
+    ``0`` to the caller's process group and ``-1`` to every process the
+    user may signal."""
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text(f"{pid}\n", encoding="utf-8")
+    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+        result = _invoke(runner, [command, "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert _plain(result.stdout) == f"PID {pid} not alive (stale PID file)\n"
+    kill.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +528,107 @@ def test_drain_systemd_unit_execstop_argv_is_accepted_by_drain_cli(
         f"output: {result.output!r}"
     )
     assert "No such option" not in result.output
+
+
+def test_drain_no_wait_sends_sigusr1_and_returns(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, alive):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir), "--no-wait"])
+    assert result.exit_code == 0, result.output
+    assert _plain(result.stdout) == f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+    kill.assert_called_once_with(_PID, signal.SIGUSR1)
+    assert alive.call_count == 1
+    assert clock.sleeps == []
+
+
+def test_drain_waits_until_the_supervisor_exits(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=5.0) as (kill, _):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 0, result.output
+    assert _plain(result.stdout) == (
+        f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+        f"Waiting up to 3600s for PID {_PID} to exit (polling every 2s)...\n"
+        f"PID {_PID} exited; drain complete.\n"
+    )
+    kill.assert_called_once_with(_PID, signal.SIGUSR1)
+    assert clock.sleeps == [2.0, 2.0, 2.0]
+
+
+def test_drain_gives_up_after_an_hour_by_default(runner: CliRunner, queue_dir: Path) -> None:
+    """Pins today: the default --timeout is 3600 s, whatever the queue's
+    task cap, and the message on giving up."""
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 4, result.output
+    assert clock.sleeps == [2.0] * 1800
+    assert _plain(result.stdout) == (
+        f"SIGUSR1 (drain) sent to PID {_PID}.\n"
+        f"Waiting up to 3600s for PID {_PID} to exit (polling every 2s)...\n"
+        "Drain still in progress after 3600s. The supervisor will keep draining. "
+        "Re-run `supervisor drain` to wait further, or `supervisor stop` to "
+        "force-exit (in-flight tasks will be killed by systemd's KillMode).\n"
+    )
+
+
+def test_drain_honours_an_explicit_timeout_and_poll(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None):
+        result = _invoke(
+            runner, ["drain", "--queue", str(queue_dir), "--timeout", "10", "--poll", "3"]
+        )
+    assert result.exit_code == 4, result.output
+    assert clock.sleeps == [3.0, 3.0, 3.0, 3.0]
+    assert f"Waiting up to 10s for PID {_PID} to exit (polling every 3s)...\n" in _plain(
+        result.stdout
+    )
+
+
+@pytest.mark.parametrize("wait", ["--wait", "--no-wait"])
+@pytest.mark.parametrize("where", ["--config", "queue"])
+def test_drain_never_reads_the_config(
+    runner: CliRunner, queue_dir: Path, tmp_path: Path, wait: str, where: str
+) -> None:
+    """Pins today: drain reads no settings, so a TOML that does not load,
+    passed or found in the queue, changes nothing."""
+    broken = tmp_path / "broken.toml" if where == "--config" else queue_dir / "claude_runner.toml"
+    broken.write_text("this is [not toml\n", encoding="utf-8")
+    extra = ["--config", str(broken)] if where == "--config" else []
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=1.0) as (kill, _):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra, wait])
+    assert result.exit_code == 0, result.output
+    kill.assert_called_once_with(_PID, signal.SIGUSR1)
+
+
+def test_drain_stale_pid(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=0.0) as (kill, _):
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert _plain(result.stdout) == f"PID {_PID} not alive (stale PID file)\n"
+    kill.assert_not_called()
+
+
+def test_drain_process_disappeared(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
+        kill.side_effect = ProcessLookupError()
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert _plain(result.stdout) == f"PID {_PID} disappeared before SIGUSR1\n"
+    assert clock.sleeps == []
+
+
+def test_drain_permission_error(runner: CliRunner, queue_dir: Path) -> None:
+    clock = _FakeClock()
+    with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
+        kill.side_effect = PermissionError("operation not permitted")
+        result = _invoke(runner, ["drain", "--queue", str(queue_dir)])
+    assert result.exit_code == 2
+    assert _plain(result.stdout) == f"not allowed to signal PID {_PID}: operation not permitted\n"
+    assert clock.sleeps == []
 
 
 # ---------------------------------------------------------------------------
