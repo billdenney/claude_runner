@@ -63,13 +63,18 @@ def _root(
         help="Per-queue claude_runner.toml. Defaults to package settings.",
     ),
 ) -> None:
-    """If no subcommand given, behave like ``render``."""
+    """Usage capture, parse, and drift check.
+
+    With no subcommand, runs ``render``.
+    """
     settings = load_settings(config)
     ctx.ensure_object(dict)
     ctx.obj["settings"] = settings
     ctx.obj["captures_dir"] = _default_captures_dir()
     if ctx.invoked_subcommand is None:
-        ctx.invoke(render)
+        # Click calls a plain function with only the arguments given, so
+        # render gets this context explicitly.
+        ctx.invoke(render, ctx)
 
 
 @app.command("render")
