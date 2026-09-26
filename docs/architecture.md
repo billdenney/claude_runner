@@ -237,6 +237,9 @@ These properties are never violated; tests and assertions enforce them.
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs, and records a worker that exited in the meantime from its log.
+   Before a stopping supervisor releases its lock, it waits, briefly, for any
+   dispatch thread that has started a worker to record its pid
+   (`runner.spawn_gate`), so a restart can find every worker.
 3. *(Retired 2026-09-25.)* This slot said a utilization decrease without a
    detected reset is `UsageFormatDrift`. Nothing ever enforced that: the check
    was written but never called, and it has been removed. Each reading is used

@@ -266,13 +266,18 @@ def test_per_tick_reap_skipped_during_drain(
     # signal.signal so SIGUSR1's handler is invoked synchronously
     # right after registration.
     original_signal = signal.signal
+    installed: list[object] = []
 
     def signal_then_raise(signum, handler):
-        original_signal(signum, handler)
-        if signum == signal.SIGUSR1:
+        previous = original_signal(signum, handler)
+        if signum == signal.SIGUSR1 and not installed:
             # Invoke the handler in-process so the drain flag flips
-            # before the loop starts ticking.
+            # before the loop starts ticking. Only on the install:
+            # start_daemon calls signal.signal again on its way out, to
+            # put the previous handler back.
+            installed.append(handler)
             handler(signum, None)
+        return previous
 
     monkeypatch.setattr(signal, "signal", signal_then_raise)
 
