@@ -43,43 +43,32 @@ class SystemInitEvent:
     """The first line — carries the new session id."""
 
     session_id: str
-    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
 class AssistantMessageEvent:
-    """A model-emitted message; usage deltas live inside the message body."""
-
-    text_excerpt: str
-    """First ~200 chars of the assistant's text content, for log readability."""
-    usage_delta: TokenUsage
-    """Per-message usage delta. Cumulative is the sum across events."""
-    raw: dict[str, Any]
+    """A model-emitted message. Its usage is already in
+    :attr:`StreamSummary.cumulative_usage` when it is yielded."""
 
 
 @dataclass(frozen=True)
 class UserMessageEvent:
     """A user-side message (tool result, follow-up prompt)."""
 
-    raw: dict[str, Any]
-
 
 @dataclass(frozen=True)
 class ResultEvent:
     """The final line, summarizing the run.
 
-    All fields except ``raw`` are derived from common stream-json shapes
-    but we tolerate missing keys so a slightly-different upstream
-    version doesn't crash the runner.
+    All fields are derived from common stream-json shapes but we
+    tolerate missing keys so a slightly-different upstream version
+    doesn't crash the runner.
     """
 
-    subtype: str  # "success", "error", etc.
     stop_reason: str
     is_error: bool
     cost_usd: float
-    duration_ms: int
     final_usage: TokenUsage
-    raw: dict[str, Any]
 
 
 @dataclass
@@ -89,7 +78,6 @@ class StreamSummary:
     session_id: str | None = None
     cumulative_usage: TokenUsage = field(default_factory=TokenUsage)
     final_result: ResultEvent | None = None
-    event_count: int = 0
     skipped_lines: int = 0
     unknown_event_types: dict[str, int] = field(default_factory=dict)
     """How many of :attr:`skipped_lines` were events of each unrecognized
@@ -123,20 +111,6 @@ def _add_usage(a: TokenUsage, b: TokenUsage) -> TokenUsage:
     )
 
 
-def _extract_assistant_text(message: dict[str, Any]) -> str:
-    """Return the first text block's content, truncated for log lines."""
-    content = message.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                if isinstance(text, str):
-                    return text[:200]
-    if isinstance(content, str):
-        return content[:200]
-    return ""
-
-
 def parse_line(line: str | bytes) -> dict[str, Any] | None:
     """Parse a single NDJSON line into a dict, or ``None`` on malformed JSON."""
     if isinstance(line, bytes):
@@ -161,9 +135,10 @@ def parse_lines(
 ) -> Iterator[SystemInitEvent | AssistantMessageEvent | UserMessageEvent | ResultEvent]:
     """Yield typed events from an iterable of NDJSON lines.
 
-    The optional ``summary`` is mutated in-place so callers can inspect
-    cumulative state after the iterator finishes — handy for the
-    dispatcher's "what was the final usage?" path.
+    The optional ``summary`` is mutated in-place before each event is
+    yielded, so callers can read the running totals mid-stream (the
+    dispatcher checks the token cap after every event) or after the
+    iterator finishes (its "what was the final usage?" path).
 
     Empty / whitespace-only lines are skipped silently (not counted as
     drift); only non-empty lines that fail to parse increment
@@ -185,7 +160,6 @@ def parse_lines(
             continue
 
         evt_type = obj.get("type")
-        summary.event_count += 1
 
         if evt_type == "system":
             sub = obj.get("subtype")
@@ -193,9 +167,9 @@ def parse_lines(
                 session_id = obj.get("session_id")
                 if isinstance(session_id, str):
                     summary.session_id = session_id
-                    yield SystemInitEvent(session_id=session_id, raw=obj)
+                    yield SystemInitEvent(session_id=session_id)
                     continue
-            # Unknown system subtype — count it but don't yield typed event.
+            # Other system subtype — a known type, so not drift; nothing to yield.
             continue
 
         if evt_type == "assistant":
@@ -203,31 +177,23 @@ def parse_lines(
             if isinstance(message, dict):
                 delta = _coerce_token_usage(message.get("usage"))
                 summary.cumulative_usage = _add_usage(summary.cumulative_usage, delta)
-                yield AssistantMessageEvent(
-                    text_excerpt=_extract_assistant_text(message),
-                    usage_delta=delta,
-                    raw=obj,
-                )
+                yield AssistantMessageEvent()
             continue
 
         if evt_type == "user":
-            yield UserMessageEvent(raw=obj)
+            yield UserMessageEvent()
             continue
 
         if evt_type == "result":
             final_usage = _coerce_token_usage(obj.get("usage"))
             cost = obj.get("total_cost_usd") or obj.get("cost_usd") or 0.0
-            duration_ms = int(obj.get("duration_ms") or 0)
             stop_reason = str(obj.get("stop_reason") or obj.get("subtype") or "unknown")
             is_error = bool(obj.get("is_error", obj.get("subtype") == "error"))
             event = ResultEvent(
-                subtype=str(obj.get("subtype") or "result"),
                 stop_reason=stop_reason,
                 is_error=is_error,
                 cost_usd=float(cost),
-                duration_ms=duration_ms,
                 final_usage=final_usage,
-                raw=obj,
             )
             summary.final_result = event
             yield event

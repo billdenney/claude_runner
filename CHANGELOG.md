@@ -213,6 +213,27 @@ Breaking changes are called out in the version notes.
   it dispatches exactly as before. `queue template` no longer lists it, and the
   `runner-add-task` skill no longer names it as an example.
 
+- **Stream-parser fields that nothing read.** `runner.stream` filled
+  `AssistantMessageEvent.text_excerpt` and `usage_delta`, `ResultEvent.subtype`
+  and `duration_ms`, `StreamSummary.event_count`, and a `raw` copy of the
+  parsed line on all four event types. Nothing outside the parser read any of
+  them. The dispatcher reads only the summary: the session id, the running
+  usage, the skipped-line counts, and the final result's stop reason, error
+  flag, cost and usage. `_extract_assistant_text`, which existed only to fill
+  `text_excerpt`, goes too. With the default `adopt_workers = true`, every
+  attempt's full stream is already on disk in
+  `.claude_task_runner/logs/<task>/attempt-N.stream.jsonl`. The parser still
+  yields the same events, so the heartbeat is unchanged, and a result line's
+  `subtype` still stands in for a missing `stop_reason` or `is_error`. A
+  result line whose `duration_ms` is not a number no longer raises out of the
+  parser. The dead-code gate had allowlisted four of these fields. It could
+  not see `duration_ms` or `raw`, because vulture matches names across the
+  whole package: `ResultEvent(duration_ms=duration_ms)` reads a local of the
+  same name. The drift canary's usage check moves from each event's
+  `usage_delta` to the running `StreamSummary.cumulative_usage`, checked
+  exactly after each assistant message, which is the total the per-task token
+  cap reads.
+
 ### Fixed
 
 - **The cron watchdog's crash-loop backoff now engages at the tick's
@@ -244,6 +265,34 @@ Breaking changes are called out in the version notes.
   says a backoff emits a notification; the tick only logs its verdict. The
   runbook's crash-loop step says what to look for. No setting changed, and
   the systemd unit is unaffected.
+- **A task whose (model, effort) pair the queue's `[effort_levels]` rejects is
+  parked, not dispatched.** ADR-0010 said `Task.effort` was validated at load
+  time, but only `queue add` checked it: a hand-written or edited task YAML
+  naming an effort its model does not accept (`max` for `claude-sonnet-4-6`),
+  or a model missing from `[effort_levels]`, loaded and dispatched unchecked.
+  The task schema cannot check the pair, since the accepted sets live in the
+  merged settings, so the supervisor's candidate selector now does, against
+  the settings it runs with. A task that fails is set to `deferred` with
+  `deferred_reason: "invalid effort: <why>"` and one WARNING, like an ADR-0030
+  readiness hold: no attempt or run is recorded and the circuit breaker is
+  untouched. It goes back to `pending` on the first tick after its YAML is
+  fixed, or after the pair is added to `[effort_levels]` and the supervisor
+  gets SIGHUP. Only tasks the selector would dispatch are checked: a
+  completed, running or circuit-broken task is left alone when
+  `[effort_levels]` changes. The dispatch thread re-checks as a backstop, and
+  force-dispatch refuses the task on every path: the CLI exits 2 before it
+  dispatches or writes a request, and the supervisor drops a request already
+  written. `doctor`'s `task_yamls` check now FAILs on such a task, and each
+  `queue list` row carries `effort_error`, `null` when the pair is accepted.
+  `queue list` gained `--config`, which defaults to `<queue>/claude_runner.toml`
+  like `queue add`, and it exits 2 if that file does not load. The
+  previous-generation entries in the packaged `[effort_levels]` keep tasks
+  that name `claude-opus-4-7` or `claude-sonnet-4-6` dispatching, and a test
+  now fails if one is dropped. On 2026-09-26 every one of the 5,293 tasks on
+  the nlmixr2lib queue passed. The unknown-model message now shows the entry
+  to add (`"<model>" = [<levels>]` under `[effort_levels]`); the old
+  `[effort_levels.'<model>']` hint named a sub-table the schema rejects, and
+  `queue add` printed it through Rich markup, which dropped it entirely.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
