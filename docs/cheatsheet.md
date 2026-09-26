@@ -226,6 +226,25 @@ misses sit in I/O-heavy modules — chiefly the typer commands in
 `cli/*_cmd.py`, `runner/dispatcher` and `doctor/checks` — so new code
 there needs tests of its own to hold the total above the gate.
 
+
+## Dead-code gate
+
+`tests/unit/test_dead_code.py` fails when code under `src/` is unreachable
+or unused:
+
+- A module that no console-script entry point in `pyproject.toml` imports,
+  even inside a function, fails until it is deleted or listed in
+  `UNREACHABLE_ALLOWLIST`.
+- A name vulture reports as unused fails until it is deleted or listed in
+  `VULTURE_ALLOWLIST` with the reason it stays: a test double, a field only
+  serialization reads, and so on.
+
+Deleting dead code also means deleting its allowlist entry, because an entry
+that no longer matches a finding fails the gate. Run the gate on its own with:
+
+```sh
+pytest tests/unit/test_dead_code.py
+```
 ## Add a new plan
 
 There is no plan setting. The throttle compares the utilization

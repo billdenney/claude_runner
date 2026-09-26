@@ -9,6 +9,20 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Added
+
+- **A dead-code gate (`tests/unit/test_dead_code.py`).** It has two checks, both
+  run by the normal pytest step, so CI fails on them. First, every importable
+  module under `src/claude_task_runner` must be in the static import closure of
+  a console-script entry point in `pyproject.toml`, counting imports inside
+  functions. Second, everything vulture reports as unused must be deleted or
+  listed in `VULTURE_ALLOWLIST` with the reason it stays. Typer commands and
+  callbacks and pydantic validators are ignored by decorator. An allowlist entry
+  that stops matching fails the gate too, so the list cannot rot. Run on the
+  commit before this cleanup began, it names all eight dead modules removed
+  since (`supervisor/window.py`, `runner/runtime_stats.py` and the six empty
+  packages). vulture joins the `dev` extra.
+
 ### Removed
 
 - **Settings that no code ever read are gone, and a queue TOML that still
