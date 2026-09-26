@@ -229,6 +229,50 @@ def _parsed_queue(command: Any) -> Any:
     return ctx.params[_queue_option(command).name]
 
 
+def _callback_groups(
+    root: typer.Typer = app, prefix: tuple[str, ...] = ()
+) -> dict[tuple[str, ...], Callable[..., Any]]:
+    """The callback of each group in ``root``'s tree whose app registers one.
+
+    Keyed by command path. Typer gives the group the callback's docstring
+    as its help text, unless ``add_typer`` passes ``help=``.
+    """
+    callbacks: dict[tuple[str, ...], Callable[..., Any]] = {}
+    for group in root.registered_groups:
+        sub_app = group.typer_instance
+        assert sub_app is not None, group.name
+        path = (*prefix, str(group.name))
+        registered = sub_app.registered_callback
+        if registered is not None and registered.callback is not None:
+            callbacks[path] = registered.callback
+        callbacks.update(_callback_groups(sub_app, path))
+    return callbacks
+
+
+def _one_line_paragraphs(text: str) -> list[str]:
+    """The paragraphs of ``text``, each joined onto one line.
+
+    Click re-wraps each paragraph to the terminal, so this is what help
+    text and its rendering have in common at any width. A ``\\b`` marker
+    line is dropped, as click drops it.
+    """
+    paragraphs = []
+    for lines in _paragraphs(text):
+        kept = [line for line in lines if line.strip() != _NO_REWRAP]
+        paragraphs.append(" ".join(" ".join(kept).split()))
+    return paragraphs
+
+
+def _page_paragraphs(path: tuple[str, ...], root: typer.Typer = app) -> list[str]:
+    """The help text that ``path``'s rendered ``--help`` prints above its
+    options, as one-line paragraphs."""
+    output = _ANSI.sub("", _render_help(root, path))
+    above_options, found, _ = output.partition("\nOptions:\n")
+    assert found, output
+    _usage, _, text = above_options.partition("\n\n")
+    return _one_line_paragraphs(text)
+
+
 def _demo_command(
     wait: Annotated[
         bool, typer.Option(help="Wait up to ``[task_caps].max_duration_s_per_task``.")
@@ -274,6 +318,29 @@ def _demo_app(mode: MarkupMode, command: Callable[..., None] = _demo_command) ->
     demo = typer.Typer(rich_markup_mode=mode)
     demo.command()(command)
     return demo
+
+
+def _demo_group_callback() -> None:
+    """Summarise the demo group.
+
+    Its second paragraph runs over two lines, which click joins and
+    wraps again to fit the terminal.
+
+    \b
+    Exit codes:
+      0  clean
+      1  drift
+    """
+
+
+def _demo_group(**add_typer: Any) -> typer.Typer:
+    """A root app with one group, ``demo``, whose callback is
+    ``_demo_group_callback``. ``add_typer`` goes to ``add_typer``."""
+    group = typer.Typer(rich_markup_mode=None)
+    group.callback()(_demo_group_callback)
+    root = typer.Typer(rich_markup_mode=None)
+    root.add_typer(group, name="demo", **add_typer)
+    return root
 
 
 class TestChecker:
@@ -483,6 +550,49 @@ class TestQueueDefault:
         command = _node(path)
         assert _queue_option(command).show_default == CWD_DEFAULT_LABEL
         assert _parsed_queue(command) == tmp_path.resolve()
+
+
+class TestGroupHelp:
+    """What ``--help`` prints for each group whose app has a callback.
+
+    ``cli/__init__.py`` passes each of these groups a one-line ``help=``,
+    and typer prints that in place of the callback's docstring.
+    """
+
+    def test_reads_the_page_of_a_callback_docstring(self) -> None:
+        demo = _demo_group()
+        assert _callback_groups(demo) == {("demo",): _demo_group_callback}
+        paragraphs = [
+            "Summarise the demo group.",
+            "Its second paragraph runs over two lines, which click joins and wraps again "
+            "to fit the terminal.",
+            "Exit codes: 0 clean 1 drift",
+        ]
+        assert _page_paragraphs(("demo",), demo) == paragraphs
+        assert _one_line_paragraphs(inspect.getdoc(_demo_group_callback) or "") == paragraphs
+
+    def test_reads_the_page_of_an_add_typer_help(self) -> None:
+        # Typer puts add_typer's help= before the callback's docstring.
+        assert _page_paragraphs(("demo",), _demo_group(help="One line.")) == ["One line."]
+
+    def test_finds_the_groups_with_callbacks(self) -> None:
+        assert set(_callback_groups()) == {
+            ("doctor",),
+            ("install",),
+            ("install-skills",),
+            ("usage",),
+        }
+
+    def test_pages_print_the_add_typer_one_liners(self) -> None:
+        assert {path: _page_paragraphs(path) for path in _callback_groups()} == {
+            ("doctor",): ["Self-diagnostic battery (pass/warn/fail per check)."],
+            ("install",): [
+                "Install the watchdog for one queue (systemd preferred, cron fallback). "
+                "Installing it for another queue replaces the first."
+            ],
+            ("install-skills",): ["Install the task-runner skills into ~/.claude/skills/."],
+            ("usage",): ["Usage capture, parse, and drift check."],
+        }
 
 
 class TestConsoleMarkup:
