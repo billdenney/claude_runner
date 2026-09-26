@@ -187,17 +187,19 @@ class SignalGate:
 
 
 @pytest.fixture(autouse=True)
-def signal_gate(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[SignalGate]:
-    """Install a :class:`SignalGate` for the test and fail it on any blocked call."""
+def signal_gate(request: pytest.FixtureRequest) -> Iterator[SignalGate]:
+    """Install a :class:`SignalGate` for the test and fail it on any blocked call.
+
+    It patches with a private ``MonkeyPatch``. Requesting the shared
+    ``monkeypatch`` fixture from an autouse fixture would hold back a test's
+    own patches until after other autouse fixtures' teardown, such as the
+    conftest's check for leaked signal handlers.
+    """
     gate = SignalGate(
         os.kill,
         os.killpg,
         allow_self=request.node.get_closest_marker("allow_self_signal") is not None,
     )
-    monkeypatch.setattr(os, "kill", gate.kill)
-    monkeypatch.setattr(os, "killpg", gate.killpg)
     real_detect = reconcile_silent._detect_stuck_sleep_loop
 
     def gated_detect(pid: int, *, max_descendants: int = 256) -> tuple[int, str] | None:
@@ -205,8 +207,11 @@ def signal_gate(
             gate.check_scan_root(pid)
         return real_detect(pid, max_descendants=max_descendants)
 
-    monkeypatch.setattr(reconcile_silent, "_detect_stuck_sleep_loop", gated_detect)
-    yield gate
+    with pytest.MonkeyPatch.context() as patches:
+        patches.setattr(os, "kill", gate.kill)
+        patches.setattr(os, "killpg", gate.killpg)
+        patches.setattr(reconcile_silent, "_detect_stuck_sleep_loop", gated_detect)
+        yield gate
     if gate.violations:
         pytest.fail("signal gate: " + "; ".join(gate.violations), pytrace=False)
 
