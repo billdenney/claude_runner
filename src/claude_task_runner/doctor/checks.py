@@ -1053,9 +1053,13 @@ def check_skills_installed(_settings: Settings) -> CheckResult:
     if bad:
         details.append(f"{bad} of {len(SKILL_NAMES)} skills missing or broken")
         # install-skills replaces a broken symlink by itself, but only
-        # --overwrite replaces something without a SKILL.md.
-        overwrite = " --overwrite" if incomplete else ""
-        remediation.append(f"Run `claude-task-runner install-skills --yes{overwrite}`.")
+        # --overwrite replaces something without a SKILL.md. Both commands
+        # are written out so test_docs_cli_refs.py checks them.
+        remediation.append(
+            "Run `claude-task-runner install-skills --yes --overwrite`."
+            if incomplete
+            else "Run `claude-task-runner install-skills --yes`."
+        )
         for label, names in (
             ("Missing", missing),
             ("Broken symlink", dangling),
