@@ -285,6 +285,27 @@ def test_stop_accepts_timeout_and_never_reads_it(runner: CliRunner, queue_dir: P
 
 
 @pytest.mark.parametrize("command", ["stop", "drain"])
+@pytest.mark.parametrize("kind", ["missing", "a-file"])
+def test_stop_and_drain_refuse_a_queue_that_is_not_a_directory(
+    runner: CliRunner, tmp_path: Path, command: str, kind: str
+) -> None:
+    """A mistyped ``--queue`` used to print "No PID file at ...", which
+    reads as "the supervisor is not running"."""
+    queue = tmp_path / "no-such-queue"
+    if kind == "a-file":
+        queue.write_text("", encoding="utf-8")
+    with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
+        result = _invoke(runner, [command, "--queue", str(queue)])
+    assert result.exit_code == 2
+    assert result.stdout == f"--queue is not an existing directory: {queue.resolve()}\n"
+    kill.assert_not_called()
+    if kind == "missing":
+        assert not queue.exists()
+    else:
+        assert queue.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize("command", ["stop", "drain"])
 @pytest.mark.parametrize("content", ["", "\n", "not-a-pid\n"])
 def test_unparseable_pid_file_reads_as_no_pid_file(
     runner: CliRunner, queue_dir: Path, command: str, content: str

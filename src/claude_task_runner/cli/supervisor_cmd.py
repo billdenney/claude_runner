@@ -319,7 +319,8 @@ def stop(
     """
     _ = config  # accepted for ExecStop symmetry; stop needs no settings.
     console = Console()
-    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    queue_path = require_queue_option(queue_dir, console)
+    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
     pid = pidfile_mod.read_existing_pid(pid_path)
     if pid is None:
         console.print(f"[yellow]No PID file at {pid_path}[/]")
@@ -410,11 +411,13 @@ def drain(
     Exit codes:
       0  supervisor exited cleanly (or --no-wait and signal delivered)
       1  no PID file / stale PID file
-      2  signal delivery rejected (permission)
+      2  --queue is not an existing directory, or signal delivery
+         rejected (permission)
       4  --wait timed out (supervisor still draining — re-run drain or stop)
     """
     console = Console()
-    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    queue_path = require_queue_option(queue_dir, console)
+    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
     pid = pidfile_mod.read_existing_pid(pid_path)
     if pid is None:
         console.print(f"[yellow]No PID file at {pid_path}[/]")

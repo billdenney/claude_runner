@@ -375,7 +375,8 @@ class TestLayout:
             "\n  Exit codes:\n"
             "    0  supervisor exited cleanly (or --no-wait and signal delivered)\n"
             "    1  no PID file / stale PID file\n"
-            "    2  signal delivery rejected (permission)\n"
+            "    2  --queue is not an existing directory, or signal delivery\n"
+            "       rejected (permission)\n"
             "    4  --wait timed out (supervisor still draining — re-run drain or stop)\n"
         ) in _render_help(app, ("supervisor", "drain"))
 

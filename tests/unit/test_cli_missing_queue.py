@@ -95,8 +95,6 @@ class Outcome(NamedTuple):
 REFUSED = "--queue is not an existing directory: {queue}\n"
 """What :func:`claude_task_runner.cli._helpers.require_queue_option` prints."""
 
-NO_PID_FILE = "No PID file at {queue}/.claude_task_runner/supervisor.pid\n"
-
 OUTCOMES: dict[tuple[str, ...], Outcome] = {
     ("account", "list"): Outcome(2, REFUSED),
     ("account", "pause"): Outcome(2, REFUSED),
@@ -123,11 +121,10 @@ OUTCOMES: dict[tuple[str, ...], Outcome] = {
     ("sidecar", "answer"): Outcome(2, "", REFUSED),
     ("sidecar", "list"): Outcome(2, "", REFUSED),
     ("sidecar", "show"): Outcome(2, "", REFUSED),
-    # stop and drain only read the PID file, and never create anything.
-    ("supervisor", "drain"): Outcome(1, NO_PID_FILE),
+    ("supervisor", "drain"): Outcome(2, REFUSED),
     ("supervisor", "start"): Outcome(2, REFUSED),
     ("supervisor", "status"): Outcome(2, REFUSED),
-    ("supervisor", "stop"): Outcome(1, NO_PID_FILE),
+    ("supervisor", "stop"): Outcome(2, REFUSED),
     ("watchdog", "register"): Outcome(
         2, "", "register failed: not an existing directory: {queue}\n"
     ),

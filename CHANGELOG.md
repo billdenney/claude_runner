@@ -201,13 +201,25 @@ Breaking changes are called out in the version notes.
   now also when `--queue` is a file, which used to crash it, and the seven
   checks that read the queue's files are left out. It exits 1, and its
   `--json` keeps its shape. `supervisor stop` and `drain` only read the PID
-  file and are unchanged. Underneath, `queue_runtime_dir()` and `todo_dir()`
+  file and never created the queue; the next entry covers them.
+  Underneath, `queue_runtime_dir()` and `todo_dir()`
   no longer pass `parents=True`. They create the queue's subdirectories but
   never the queue directory, so any other caller that reaches them with a
   missing queue gets `FileNotFoundError` instead of an empty queue.
   `tests/unit/test_cli_missing_queue.py` runs every command that takes
   `--queue` against a missing path. It checks that nothing is created and
   pins the exit code and message, so a command added later is covered.
+- **`supervisor stop` and `supervisor drain` say when `--queue` is wrong.**
+  Given a `--queue` that is not an existing directory, they printed
+  `No PID file at <queue>/.claude_task_runner/supervisor.pid` and exited 1,
+  which reads as "the supervisor is not running", not "you named the wrong
+  queue". Both now exit 2 with `--queue is not an existing directory: <path>`
+  before they look for the PID file, as `supervisor start` and
+  `supervisor status` already did. The systemd unit's `ExecStop` runs one of
+  them with the `-` prefix, so systemd ignores the exit status, and a unit
+  installed before that prefix counted 1 and 2 alike as a failure. Nothing
+  else runs them. `tests/unit/test_cli_missing_queue.py` pins the new
+  outcome.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
