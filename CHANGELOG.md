@@ -157,6 +157,14 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Skipped stream-json lines are recorded and logged, not dropped silently.**
+  The parser skips a malformed line, or an event of a type it does not know, so
+  one bad line cannot abort a run. But nothing looked at the count, and the
+  `StreamWarning` meant to report it was never issued. Each run's `RunRecord`
+  now carries `skipped_stream_lines`, and the dispatcher logs a warning naming
+  the unknown event types, since a non-zero count can mean Claude Code's stream
+  format has drifted. `StreamWarning` is gone. Run records written before this
+  read as 0.
 - **The systemd unit now takes its restart policy from the queue's
   `[watchdog]`.** `install` wrote `RestartSec=30`, `StartLimitBurst=5` and
   `StartLimitIntervalSec=600` into the unit whatever the queue's

@@ -543,6 +543,7 @@ def _resolve_self_user() -> str:
 
 def _build_run_record(
     *,
+    task_id: str,
     attempt: int,
     started_at: datetime,
     finished_at: datetime,
@@ -589,6 +590,18 @@ def _build_run_record(
 
     cost = final.cost_usd if final is not None else 0.0
 
+    if summary.skipped_lines:
+        unknown = dict(sorted(summary.unknown_event_types.items()))
+        logger.warning(
+            "task %s attempt %d: skipped %d stream-json line(s): %d malformed, "
+            "unknown event types %s",
+            task_id,
+            attempt,
+            summary.skipped_lines,
+            summary.skipped_lines - sum(unknown.values()),
+            unknown or "none",
+        )
+
     return RunRecord(
         attempt=attempt,
         started_at=started_at,
@@ -602,6 +615,7 @@ def _build_run_record(
         killed_by_cap=killed,
         pid=pid,
         account=account,
+        skipped_stream_lines=summary.skipped_lines,
     )
 
 
@@ -1641,6 +1655,7 @@ def dispatch(
     finished_at = clock.now()
 
     run_record = _build_run_record(
+        task_id=task.id,
         attempt=new_state.attempts,
         started_at=started_at,
         finished_at=finished_at,
@@ -1943,6 +1958,7 @@ def _finalize_adopted(
     # hand-seeded / legacy state with attempts==0 can't trip RunRecord's
     # ``attempt >= 1`` constraint.
     run_record = _build_run_record(
+        task_id=task.id,
         attempt=max(1, prior.attempts),
         started_at=started_at,
         finished_at=finished_at,
