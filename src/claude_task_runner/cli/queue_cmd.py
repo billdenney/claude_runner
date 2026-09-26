@@ -32,7 +32,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    require_queue_option,
+    resolve_per_queue_config,
+)
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.queue.schema import Task
@@ -148,7 +152,9 @@ def template(
 @app.command("list")
 def list_tasks(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     order_by_dispatch: bool = typer.Option(
         False,
@@ -249,7 +255,9 @@ def list_tasks(
 @app.command("states")
 def list_states(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     status_filter: list[str] = typer.Option(
         [],
         "--status",
@@ -316,7 +324,9 @@ def list_states(
 def show_task(
     task_id: str = typer.Argument(..., help="Task ID (filename stem)."),
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show the input YAML AND state YAML for one task."""
@@ -390,7 +400,9 @@ def add_task(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     task_id: str = typer.Option(..., "--id", help="Task identifier."),
     title: str = typer.Option(..., "--title", help="Short task title."),
     prompt_file: Path | None = typer.Option(None, "--prompt-file", help="Read prompt from a file."),
@@ -555,7 +567,9 @@ def backfill_working_dir(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -669,7 +683,9 @@ def _supervisor_is_alive(queue_dir: Path) -> bool:
 def restart_fresh(
     task_id: str = typer.Argument(..., help="Task id whose session to abandon."),
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Clear a task's ``session_id`` so the next dispatch starts fresh.
@@ -762,7 +778,9 @@ def force_dispatch(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     over_limit: bool = typer.Option(
         False,
         "--over-limit",
