@@ -774,9 +774,11 @@ def start_daemon(
     )
 
     # Tracks live dispatch slots (thread + account attribution) keyed by
-    # task id. Threads are non-daemon so the supervisor process won't
-    # terminate until in-flight tasks finish (architectural invariant 2 —
-    # in-flight tasks are not killed by supervisor death). The slot's
+    # task id. With [supervisor].adopt_workers off the threads are
+    # non-daemon, so the supervisor process won't terminate until in-flight
+    # tasks finish; with it on they are daemon threads and the next
+    # supervisor adopts their workers (ADR-0025). Either way in-flight
+    # tasks are not killed by supervisor death (invariant 2). The slot's
     # ``account`` field is the source of truth for
     # :class:`InFlightRecord` rebuilds each tick.
     in_flight_slots: dict[str, DispatchSlot] = {}
@@ -1044,8 +1046,8 @@ def start_daemon(
 
                 # A stop that arrived during the usage poll ends the tick
                 # here, before anything is dispatched. A new dispatch would
-                # start work that the exit then abandons mid-start
-                # (adoption on) or waits for (adoption off).
+                # only hold up the exit: it waits for that worker to start
+                # (adoption on) or for its whole attempt (adoption off).
                 if stop_flag["stop"]:
                     break
 
