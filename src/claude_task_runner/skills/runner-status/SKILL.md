@@ -73,18 +73,27 @@ or recent failures), follow the prioritized triage flow below.
       `claude-task-runner usage healthcheck` or invoke `/runner-usage`
       to investigate. Stop here unless the user wants more.
 
-   2. **Weekly cap** — if `snapshot.state == "throttled_weekly"`:
+   2. **No usage reading** — if `snapshot.state == "no_reading"`, or
+      any entry of `snapshot.accounts` has `state == "no_reading"`:
+      that account takes no tasks until a clean `/usage` capture lands.
+      Print each such account with its `last_reading_at` ("never" when
+      null) in yellow. Every account starts there after a supervisor
+      start and leaves within one capture cycle (one poll per account),
+      so only one that persists is a problem; point the user at the
+      runbook section "An account stays in `no_reading`".
+
+   3. **Weekly cap** — if `snapshot.state == "throttled_weekly"`:
       print "Weekly utilization NN% > target (throttled)" in yellow.
       The trace-following rule (ADR-0022) means the supervisor will
       auto-resume when the curve catches up; surface
       `snapshot.scheduled_wakeup_at` if present.
 
-   3. **5h throttle** — if `snapshot.state in ("throttled_5h",
+   4. **5h throttle** — if `snapshot.state in ("throttled_5h",
       "slowing_down")`: print 5h utilization + state. For each
       `slowing_down` account, also give its target from the
       per-account table ("personal slowing down, target 2").
 
-   4. **Awaiting sidecars** — run
+   5. **Awaiting sidecars** — run
       `claude-task-runner queue states --status awaiting_sidecar
       --queue <CWD> --json` and report count + task IDs. Suggest
       `/runner-answer-sidecar` if any.
@@ -96,13 +105,13 @@ or recent failures), follow the prioritized triage flow below.
       `n_open` and `n_outstanding_questions`. Never report "0 open
       sidecars" off the request count alone.
 
-   5. **Hung tasks** — run with `--status possibly_hung`. Report each.
+   6. **Hung tasks** — run with `--status possibly_hung`. Report each.
 
-   6. **Recent failures** — `--status failed` and
+   7. **Recent failures** — `--status failed` and
       `--status failed_circuit_breaker`. Report counts; if non-zero,
       offer the task IDs.
 
-   7. **Healthy summary** — if none of the above, one terse line:
+   8. **Healthy summary** — if none of the above, one terse line:
       "Supervisor (state) · 5h NN% · weekly NN% · pending K ·
       in-flight M".
 

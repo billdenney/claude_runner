@@ -16,17 +16,23 @@ The dispatch math lives in :mod:`claude_task_runner.throttle`. This
 module is a thin translator from the throttle package's
 :class:`Decision` into a ``(snapshot, actions)`` tuple plus the
 non-decision concerns (IDLE classification, ERROR_DRIFT routing).
+
+Each tick reads one account, so the daemon also calls
+:func:`expire_stale_readings` on every account each tick: an account
+takes tasks only while its last clean reading is recent.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.schema import (
     SupervisorSettings,
     UsageSettings,
 )
+from claude_task_runner.runner.account_dispatch import _DISPATCHABLE_STATES
 from claude_task_runner.supervisor.actions import (
     Action,
     EmitEvent,
@@ -83,7 +89,8 @@ def _entry(
     """Build a new snapshot with ``state`` and ``since=clock.now()``.
 
     ``target_concurrency`` is required so that no entry can carry an old
-    state's dispatch cap into the new state.
+    state's dispatch cap into the new state. A clean ``reading`` also
+    stamps ``last_reading_at``.
     """
     update: dict[str, object] = {
         "state": state,
@@ -91,6 +98,7 @@ def _entry(
         "target_concurrency": target_concurrency,
     }
     if reading is not None:
+        update["last_reading_at"] = clock.now()
         update["last_5h_util_pct"] = reading.five_hour.utilization_pct
         update["last_weekly_util_pct"] = reading.seven_day.utilization_pct
         if reading.five_hour.resets_at is not None:
@@ -109,18 +117,82 @@ def _entry(
 def _state_transition(
     previous_state: SupervisorState,
     new_state: SupervisorState,
-    reading: UsageReading,
+    *,
+    five_hour_util: int,
+    weekly_util: int,
 ) -> EmitEvent:
-    """The ``state_transition`` event for a clean reading that changed the state."""
+    """The ``state_transition`` event, with the utilization the change was judged on."""
     return EmitEvent(
         event_type="state_transition",
         payload={
             "from": previous_state.value,
             "to": new_state.value,
-            "five_hour_util": reading.five_hour.utilization_pct,
-            "weekly_util": reading.seven_day.utilization_pct,
+            "five_hour_util": five_hour_util,
+            "weekly_util": weekly_util,
         },
     )
+
+
+def expire_stale_readings(
+    snapshot: SupervisorSnapshot,
+    *,
+    now: datetime,
+    max_reading_age_s: float,
+) -> tuple[SupervisorSnapshot, list[Action]]:
+    """Move every account that takes tasks but lacks a recent reading to NO_READING.
+
+    An account takes tasks only while its last clean reading
+    (:attr:`AccountState.last_reading_at`) is at most
+    ``max_reading_age_s`` old. :func:`step` updates only the account read
+    this tick, so the daemon calls this on every account each tick,
+    before dispatch. An account that moves loses its target and wakeup,
+    sends one warning and emits a ``state_transition``. Accounts already
+    out of dispatch (NO_READING, throttled, ERROR_DRIFT) are left alone.
+
+    Only ``accounts[*]`` changes; the caller re-mirrors the top-level view.
+    """
+    actions: list[Action] = []
+    accounts = dict(snapshot.accounts)
+    limit = timedelta(seconds=max_reading_age_s)
+    for name, acct in snapshot.accounts.items():
+        if acct.state not in _DISPATCHABLE_STATES:
+            continue
+        last = acct.last_reading_at
+        if last is not None and now - last <= limit:
+            continue
+        accounts[name] = acct.model_copy(
+            update={
+                "state": SupervisorState.NO_READING,
+                "since": now,
+                "target_concurrency": None,
+                "scheduled_wakeup_at": None,
+            }
+        )
+        since_text = (
+            "yet"
+            if last is None
+            else f"since {last:%Y-%m-%d %H:%M:%S %Z}, over the {max_reading_age_s:g} s limit"
+        )
+        actions.append(
+            Notify(
+                level="warn",
+                message=(
+                    f"no clean usage reading for account {name!r} {since_text}; "
+                    "no tasks go through it until a capture succeeds"
+                ),
+            )
+        )
+        actions.append(
+            _state_transition(
+                acct.state,
+                SupervisorState.NO_READING,
+                five_hour_util=acct.last_5h_util_pct,
+                weekly_util=acct.last_weekly_util_pct,
+            )
+        )
+    if not actions:
+        return snapshot, actions
+    return snapshot.model_copy(update={"accounts": accounts}), actions
 
 
 def _emit_state_specific_events(
@@ -281,6 +353,7 @@ def step(
             new_snap = snapshot.model_copy(
                 update={
                     "consecutive_clean_polls": clean,
+                    "last_reading_at": clock.now(),
                     "last_5h_util_pct": reading.five_hour.utilization_pct,
                     "last_weekly_util_pct": reading.seven_day.utilization_pct,
                     "last_5h_reset_at": (reading.five_hour.resets_at or snapshot.last_5h_reset_at),
@@ -330,7 +403,14 @@ def step(
         )
         actions.append(MonitorInFlight())
         if snapshot.state is not SupervisorState.IDLE:
-            actions.append(_state_transition(snapshot.state, SupervisorState.IDLE, reading))
+            actions.append(
+                _state_transition(
+                    snapshot.state,
+                    SupervisorState.IDLE,
+                    five_hour_util=reading.five_hour.utilization_pct,
+                    weekly_util=reading.seven_day.utilization_pct,
+                )
+            )
         return new_snap, actions
 
     new_snap = _entry(
@@ -360,6 +440,13 @@ def step(
     actions.append(MonitorInFlight())
 
     if snapshot.state is not decision.state:
-        actions.append(_state_transition(snapshot.state, decision.state, reading))
+        actions.append(
+            _state_transition(
+                snapshot.state,
+                decision.state,
+                five_hour_util=reading.five_hour.utilization_pct,
+                weekly_util=reading.seven_day.utilization_pct,
+            )
+        )
 
     return new_snap, actions

@@ -17,7 +17,7 @@ exercised in :mod:`tests.unit.test_decision`; here we cover:
   :class:`ResolvedPolicy`.
 * Action and event emission on transitions.
 * Wakeup scheduling.
-* The state enum has exactly the six surviving states.
+* The state enum has exactly its seven states.
 
 Dropped tests (removed because the underlying mechanism no longer
 exists post-ADR-0022):
@@ -1259,9 +1259,10 @@ class TestTargetConcurrency:
 
 
 class TestAllStates:
-    def test_six_surviving_states(self) -> None:
+    def test_seven_states(self) -> None:
         """ADR-0022 dropped ``PAUSED_WEEKLY`` and ``END_OF_WEEK_PUSH``, and
-        ``STOPPED`` went because nothing entered it; six states remain."""
+        ``STOPPED`` went because nothing entered it. ``NO_READING`` was added
+        for an account with no recent clean usage reading."""
         states = list(SupervisorState)
         expected = {
             SupervisorState.IDLE,
@@ -1270,9 +1271,10 @@ class TestAllStates:
             SupervisorState.THROTTLED_5H,
             SupervisorState.THROTTLED_WEEKLY,
             SupervisorState.ERROR_DRIFT,
+            SupervisorState.NO_READING,
         }
         assert set(states) == expected
-        assert len(states) == 6
+        assert len(states) == 7
 
     def test_dropped_states_no_longer_in_enum(self) -> None:
         """``paused_weekly``, ``end_of_week_push`` and ``stopped`` are gone."""

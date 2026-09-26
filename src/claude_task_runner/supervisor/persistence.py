@@ -24,6 +24,12 @@ Handles three one-way migrations at load time:
 * v5 → v6: only the version changes. The new ``target_concurrency``
   field starts as ``None`` (no cap beyond ``max_concurrency``) until each
   account's next throttle decision sets it.
+* v6 → v7: every state that takes tasks (``idle``, ``dispatching``,
+  ``slowing_down``) rewrites to ``no_reading``, top level and inside
+  every ``accounts[*]``, with its target and wakeup cleared. v7 requires
+  a recent clean reading before an account takes tasks, and an older
+  file records no reading time. Throttled and ``error_drift`` states
+  take no tasks already and are kept, as are in-flight tasks.
 """
 
 from __future__ import annotations
@@ -184,6 +190,40 @@ def _migrate_v5_to_v6(payload: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+_DISPATCHABLE_STATES_V6 = frozenset({"idle", "dispatching", "slowing_down"})
+"""The v6 states dispatch sent tasks through. v6 recorded no reading time,
+so none of them can be shown to rest on a recent reading."""
+
+
+def _clear_unread_decision(entry: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one v6 state entry (top level or ``accounts[*]``) for v7."""
+    migrated = dict(entry)
+    state = migrated.get("state")
+    if isinstance(state, str) and state in _DISPATCHABLE_STATES_V6:
+        migrated["state"] = SupervisorState.NO_READING.value
+        migrated["target_concurrency"] = None
+        migrated["scheduled_wakeup_at"] = None
+    return migrated
+
+
+def _migrate_v6_to_v7(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v6 supervisor.json payload to v7: dispatchable states become ``no_reading``.
+
+    ``since`` is kept, so a rewritten entry shows when its old state
+    began. Each account leaves ``no_reading`` on its next clean reading,
+    within one round-robin cycle.
+    """
+    migrated = _clear_unread_decision(payload)
+    accounts = migrated.get("accounts")
+    if isinstance(accounts, dict):
+        migrated["accounts"] = {
+            name: _clear_unread_decision(acct) if isinstance(acct, dict) else acct
+            for name, acct in accounts.items()
+        }
+    migrated["schema_version"] = 7
+    return migrated
+
+
 def load(path: Path) -> SupervisorSnapshot | None:
     """Read a persisted snapshot, or ``None`` if the file doesn't exist.
 
@@ -191,8 +231,8 @@ def load(path: Path) -> SupervisorSnapshot | None:
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
 
-    An older file is migrated one way (v2 → v3 → v4 → v5 → v6) before it
-    is validated; the module docstring describes each step.
+    An older file is migrated one way (v2 → v3 → v4 → v5 → v6 → v7) before
+    it is validated; the module docstring describes each step.
     """
     if not path.exists():
         return None
@@ -220,6 +260,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if sv == 5:
         payload = _migrate_v5_to_v6(payload)
         sv = 6
+    if sv == 6:
+        payload = _migrate_v6_to_v7(payload)
+        sv = 7
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"
@@ -258,17 +301,16 @@ def initial_snapshot(
 ) -> SupervisorSnapshot:
     """Build a fresh snapshot for first-time supervisor start.
 
-    Begins in ``IDLE`` so the next clean reading drives the first real
-    classification. ``account_names`` (when provided) seeds the
-    per-account state map with one entry per account; each account
-    starts in IDLE. ``None`` (the legacy default) produces a snapshot
-    with a single ``"default"`` entry, matching the v2 single-account
-    flow.
+    Begins in ``NO_READING``: no account takes tasks until a clean
+    reading classifies it. ``account_names`` (when provided) seeds the
+    per-account state map with one entry per account, each in
+    NO_READING. ``None`` (the legacy default) produces a snapshot with a
+    single ``"default"`` entry, matching the v2 single-account flow.
     """
     names = account_names if account_names is not None else ["default"]
-    accounts = {name: AccountState(state=SupervisorState.IDLE, since=since) for name in names}
+    accounts = {name: AccountState(state=SupervisorState.NO_READING, since=since) for name in names}
     return SupervisorSnapshot(
-        state=SupervisorState.IDLE,
+        state=SupervisorState.NO_READING,
         since=since,
         accounts=accounts,
     )

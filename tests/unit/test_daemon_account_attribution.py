@@ -39,6 +39,11 @@ from claude_task_runner.supervisor.states import (
 from claude_task_runner.usage.drift import UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
+READ_AT = datetime(2026, 5, 22, 11, 59, tzinfo=UTC)
+"""When the hand-built accounts below were last read: a minute before the
+noon ticks, well inside ``[usage].max_reading_age_s``, so only the account
+a tick reads changes."""
+
 
 def _reading(account: str | None, util_5h: int, util_7d: int) -> UsageReading:
     return UsageReading(
@@ -67,12 +72,14 @@ def _snapshot_with_two_accounts() -> SupervisorSnapshot:
                 since=datetime(2026, 5, 22, tzinfo=UTC),
                 last_5h_util_pct=0,
                 last_weekly_util_pct=0,
+                last_reading_at=READ_AT,
             ),
             "work": AccountState(
                 state=SupervisorState.IDLE,
                 since=datetime(2026, 5, 22, tzinfo=UTC),
                 last_5h_util_pct=0,
                 last_weekly_util_pct=0,
+                last_reading_at=READ_AT,
             ),
         },
     )
@@ -266,12 +273,15 @@ def _snapshot_with_three_accounts() -> SupervisorSnapshot:
         state=SupervisorState.IDLE,
         since=base_since,
         accounts={
-            "idle": AccountState(state=SupervisorState.IDLE, since=base_since),
+            "idle": AccountState(
+                state=SupervisorState.IDLE, since=base_since, last_reading_at=READ_AT
+            ),
             "mid": AccountState(
                 state=SupervisorState.DISPATCHING,
                 since=base_since,
                 last_5h_util_pct=15,
                 last_weekly_util_pct=20,
+                last_reading_at=READ_AT,
             ),
             "busy": AccountState(
                 state=SupervisorState.THROTTLED_5H,
@@ -334,10 +344,16 @@ def test_alternating_readings_throttle_only_attributed_account_per_tick() -> Non
         since=base_since,
         accounts={
             "a": AccountState(
-                state=SupervisorState.DISPATCHING, since=base_since, last_5h_util_pct=10
+                state=SupervisorState.DISPATCHING,
+                since=base_since,
+                last_5h_util_pct=10,
+                last_reading_at=READ_AT,
             ),
             "b": AccountState(
-                state=SupervisorState.DISPATCHING, since=base_since, last_5h_util_pct=10
+                state=SupervisorState.DISPATCHING,
+                since=base_since,
+                last_5h_util_pct=10,
+                last_reading_at=READ_AT,
             ),
         },
     )
@@ -460,12 +476,14 @@ def _two_accounts(personal_target: int) -> SupervisorSnapshot:
                 since=since,
                 last_5h_util_pct=55,
                 target_concurrency=personal_target,
+                last_reading_at=READ_AT,
             ),
             "work": AccountState(
                 state=SupervisorState.DISPATCHING,
                 since=since,
                 last_5h_util_pct=10,
                 target_concurrency=1,
+                last_reading_at=READ_AT,
             ),
         },
     )

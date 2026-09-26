@@ -91,7 +91,15 @@ throttle stack into two pictures the operator can hold in mind:
    while nothing was pending or in flight goes `IDLE` but keeps this
    cap until its next capture, so tasks that arrive meanwhile cannot
    run on an account whose last reading was throttled.
-4. The state machine emits Notify + EmitEvent on transitions; the
+4. **Require a fresh reading.** An account takes tasks only while its
+   last clean reading is at most `[usage].max_reading_age_s` old (600 s
+   by default). Every account starts in `NO_READING`, and one whose
+   captures fail for longer than the limit returns there with a
+   `notify[warn]`; it takes no tasks until a capture succeeds. On a
+   multi-account queue each account starts within one capture cycle
+   (one poll per account). The limit must span two cycles, or the
+   config does not load.
+5. The state machine emits Notify + EmitEvent on transitions; the
    payload of `throttled_weekly_entry` carries `observed_pct` and
    `target_pct` so the operator can audit the trace-following math.
    `SLOWING_DOWN` notifies `target concurrency=X/Y` on entry and again
@@ -108,7 +116,8 @@ claude-task-runner supervisor status --json
 The JSON snapshot includes `state`, `last_5h_util_pct`,
 `last_weekly_util_pct`, `target_concurrency` and `scheduled_wakeup_at` —
 the inputs and output of the most recent dispatch decision, `IDLE`
-included.
+included — and `last_reading_at`, when that decision's clean reading
+was taken.
 
 On each transition the supervisor also emits `state_transition` /
 `throttled_5h_entry` / `throttled_weekly_entry` events whose payloads
@@ -117,8 +126,9 @@ DEBUG level only, so they reach the supervisor log (journald under the
 systemd unit, `<queue>/.claude_task_runner/supervisor.log` under the cron
 watchdog) only when `claude_runner.toml` sets `[logging].level = "DEBUG"`.
 At the default INFO level the log has just a `notify[...]` line on entry to
-`SlowingDown`, `Throttled5h`, `ThrottledWeekly` or `ErrorDrift`. There is
-no separate `events.ndjson` sink unless a host wires an event callback.
+`SlowingDown`, `Throttled5h`, `ThrottledWeekly` or `ErrorDrift`, and when a
+stale reading puts an account in `NoReading`. There is no separate
+`events.ndjson` sink unless a host wires an event callback.
 
 ### Make a queue push harder during the day
 

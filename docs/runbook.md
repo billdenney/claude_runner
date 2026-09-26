@@ -35,6 +35,39 @@ sequence variant.
 8. Restart supervisor. After 3 consecutive clean polls, it leaves
    `ErrorDrift`.
 
+## An account stays in `no_reading`
+
+**Symptom:** `claude-task-runner account list` shows an account in state
+`no_reading` with `in_flight=N/0`, and dispatch sends it no tasks. When a
+reading went stale, the supervisor log has one
+`notify[warn]: no clean usage reading for account '<name>' since <time>,
+over the <limit> s limit; ...` line.
+
+**Expected at start:** every account starts in `no_reading`, including
+after the upgrade to `supervisor.json` schema 7, and leaves it at its first
+clean reading, within one capture cycle (one poll per account). No notice
+is sent for that.
+
+**Causes when it persists:** that account's `/usage` capture keeps timing
+out or failing to spawn. Those failures log only DEBUG `usage_capture_error`
+events, and they don't count as readings, so after
+`[usage].max_reading_age_s` (600 s by default) the account stops taking
+tasks. Other causes: the supervisor was down for longer than the limit, or
+`[[accounts]]` changed and only a SIGHUP followed. A reload doesn't rebuild
+the usage source, so an account added that way is never read.
+
+**Steps:**
+1. Set `[logging].level = "DEBUG"` and look for `usage_capture_error`
+   events.
+2. Capture as that account by hand: `CLAUDE_CONFIG_DIR=<its config_dir>
+   claude /usage`. On a single-account queue,
+   `claude-task-runner usage healthcheck` does the same.
+3. Fix what the capture shows (login, network, the config directory). The
+   account leaves `no_reading` at its next clean capture. Meanwhile
+   `claude-task-runner queue force-dispatch <task_id>` bypasses this check,
+   as it bypasses the throttle.
+4. After changing `[[accounts]]`, restart the supervisor.
+
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 
 **Symptom:** `~/.claude_task_runner/watchdog.log` shows multiple restarts

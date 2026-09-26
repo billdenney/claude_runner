@@ -309,3 +309,51 @@ class TestWorktreeReclaimSettings:
     def test_non_positive_limits_rejected(self, field: str, value: float) -> None:
         with pytest.raises(ValidationError):
             WorktreeReclaimSettings(**{field: value})
+
+
+class TestMaxReadingAge:
+    """``[usage].max_reading_age_s`` must span two capture cycles.
+
+    Each account is read once per ``len(accounts) * poll_interval_s``.
+    Under two cycles, one failed capture would stop a healthy account.
+    """
+
+    def _toml(self, tmp_path: Path, *, age: float, poll: float, accounts: int) -> Path:
+        body = f"[usage]\nmax_reading_age_s = {age}\npoll_interval_s = {poll}\n"
+        for i in range(accounts):
+            body += f'\n[[accounts]]\nname = "a{i}"\nconfig_dir = ""\n'
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(body)
+        return toml
+
+    def test_default_is_600_seconds(self) -> None:
+        assert load_settings(None).usage.max_reading_age_s == 600
+
+    @pytest.mark.parametrize("accounts", [1, 2, 5])
+    def test_exactly_two_cycles_loads(self, tmp_path: Path, accounts: int) -> None:
+        settings = load_settings(
+            self._toml(tmp_path, age=2 * accounts * 60, poll=60, accounts=accounts)
+        )
+        assert settings.usage.max_reading_age_s == 2 * accounts * 60
+
+    def test_under_two_cycles_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(self._toml(tmp_path, age=359.5, poll=60, accounts=3))
+        assert (
+            "[usage].max_reading_age_s = 359.5 s is under two capture cycles: 3 account(s) x "
+            "[usage].poll_interval_s 60 s x 2 = 360 s. Each account is read once per cycle, "
+            "so a single failed capture would stop it taking tasks. Raise max_reading_age_s "
+            "or lower poll_interval_s."
+        ) in str(excinfo.value)
+
+    def test_default_rejects_a_slow_poll(self, tmp_path: Path) -> None:
+        """The 600 s default with one account needs polls of 300 s or less."""
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[usage]\npoll_interval_s = 301\n")
+        with pytest.raises(ConfigError, match="under two capture cycles"):
+            load_settings(toml)
+
+    @pytest.mark.parametrize("age", [0, -1])
+    def test_must_be_positive(self, tmp_path: Path, age: float) -> None:
+        with pytest.raises(ConfigError, match="max_reading_age_s"):
+            load_settings(self._toml(tmp_path, age=age, poll=60, accounts=1))
