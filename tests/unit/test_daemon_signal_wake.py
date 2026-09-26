@@ -52,11 +52,19 @@ _WATCH_S = 1.5
 _HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
 
 
+def _ignore(_signum: int, _frame: object) -> None:
+    """Stands in for pytest's handlers during a test; see the fixture below."""
+
+
 @pytest.fixture(autouse=True)
-def _restore_signal_handlers() -> Iterator[None]:
-    """``start_daemon`` installs its handlers and never removes them. Put
-    back the ones pytest had, so a later Ctrl-C still stops the run."""
+def _harmless_handlers_around_the_daemon() -> Iterator[None]:
+    """``start_daemon`` puts back the handlers it found when it returns. Make
+    those harmless for the test: a signal that a test's thread sends after
+    the daemon has returned, which only a regression would do, then fails
+    the test instead of ending the pytest run. Put pytest's back after."""
     saved = {signum: signal.getsignal(signum) for signum in _HANDLED_SIGNALS}
+    for signum in _HANDLED_SIGNALS:
+        signal.signal(signum, _ignore)
     yield
     for signum, handler in saved.items():
         # None: a handler installed outside Python, which cannot be put back.

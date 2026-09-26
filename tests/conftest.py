@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import signal
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,6 +13,35 @@ import yaml
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import Settings
+
+# The signals supervisor.daemon.start_daemon installs handlers for.
+_DAEMON_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_signal_handlers() -> Iterator[None]:
+    """Fail a test that leaves a handler installed for a signal the daemon uses.
+
+    ``start_daemon(install_signal_handlers=True)`` used to leave its
+    handlers behind. After a test that ran it, SIGTERM and SIGINT went to
+    the finished daemon's handler, so neither Ctrl-C nor ``timeout`` could
+    stop the run; only SIGKILL could. The handlers found before the test
+    are put back whether or not it passes, so one leak does not fail every
+    test after it.
+    """
+    before = {signum: signal.getsignal(signum) for signum in _DAEMON_SIGNALS}
+    yield
+    leaked = [
+        signal.Signals(signum).name
+        for signum in _DAEMON_SIGNALS
+        if signal.getsignal(signum) != before[signum]
+    ]
+    for signum, handler in before.items():
+        # None: a handler installed outside Python, which cannot be put back.
+        if handler is not None:
+            signal.signal(signum, handler)
+    if leaked:
+        pytest.fail(f"test left a signal handler installed for {', '.join(leaked)}")
 
 
 @pytest.fixture

@@ -30,10 +30,12 @@ import logging
 import math
 import signal
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
 
 from claude_task_runner.clock import Clock, RealClock
 from claude_task_runner.config.loader import ConfigError, load_settings
@@ -562,6 +564,33 @@ def _diff_settings(old: Settings, new: Settings) -> int:
     return sum(1 for k in keys if old_d.get(k) != new_d.get(k))
 
 
+SignalHandler = Callable[[int, FrameType | None], object]
+"""A Python-level signal handler, as :func:`signal.signal` takes one."""
+
+
+@contextmanager
+def _signal_handlers_installed(handlers: Mapping[int, SignalHandler]) -> Iterator[None]:
+    """Install ``handlers`` for the block, then put back the ones they replaced.
+
+    :func:`start_daemon` runs in its caller's process, and a handler left
+    behind outlives the loop it served. Its handlers used to stay: after
+    it returned in a pytest run, SIGTERM and SIGINT still went to its
+    ``_on_signal``, so neither Ctrl-C nor ``timeout`` could stop the run.
+    The previous handlers are restored when the block exits, by return or
+    by exception. One that :func:`signal.getsignal` reports as ``None``
+    was installed outside Python and cannot be restored, so ours stays.
+    """
+    previous = {signum: signal.getsignal(signum) for signum in handlers}
+    try:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        yield
+    finally:
+        for signum, old in previous.items():
+            if old is not None:
+                signal.signal(signum, old)
+
+
 def start_daemon(
     *,
     queue_dir: Path,
@@ -595,7 +624,9 @@ def start_daemon(
         Caps the loop at N ticks — used in integration tests to drive
         a finite number of state transitions deterministically.
 
-    Signal handling (when ``install_signal_handlers=True``):
+    Signal handling (when ``install_signal_handlers=True``). The handlers
+    replace the caller's for the duration of the call only: the previous
+    ones are put back when this returns or raises.
 
     * ``SIGTERM`` / ``SIGINT`` — request a clean stop. A stop ends the
       sleep between ticks within :data:`SIGNAL_CHECK_INTERVAL_S`. One
@@ -686,11 +717,16 @@ def start_daemon(
         drain_flag["draining"] = True
         wake_flag["pending"] = True
 
-    if install_signal_handlers:
-        signal.signal(signal.SIGTERM, _on_signal)
-        signal.signal(signal.SIGINT, _on_signal)
-        signal.signal(signal.SIGHUP, _on_sighup)
-        signal.signal(signal.SIGUSR1, _on_sigusr1)
+    handlers: dict[int, SignalHandler] = (
+        {
+            signal.SIGTERM: _on_signal,
+            signal.SIGINT: _on_signal,
+            signal.SIGHUP: _on_sighup,
+            signal.SIGUSR1: _on_sigusr1,
+        }
+        if install_signal_handlers
+        else {}
+    )
 
     # Tracks live dispatch slots (thread + account attribution) keyed by
     # task id. Threads are non-daemon so the supervisor process won't
@@ -700,7 +736,10 @@ def start_daemon(
     # :class:`InFlightRecord` rebuilds each tick.
     in_flight_slots: dict[str, DispatchSlot] = {}
 
-    with pidfile_mod.acquire_global_lock():
+    # The handlers go in before the lock is taken, so a stop during startup
+    # still reaches the loop's first check, and come out after it is
+    # released, whether this returns or raises.
+    with _signal_handlers_installed(handlers), pidfile_mod.acquire_global_lock():
         pidfile_mod.write_pid_file(pid_path)
         try:
             account_names = [a.name for a in settings.accounts]
