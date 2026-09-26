@@ -3,7 +3,8 @@
 Coverage:
 
 * ``_headers_to_reading`` — happy path, missing/renamed headers,
-  unparseable values, unknown ``-status`` (warned, not raised).
+  unparseable, non-finite, out-of-range and unrepresentable values
+  (each the typed drift error), unknown ``-status`` (warned, not raised).
 * ``_read_oauth_token`` — finds tokens at each documented key path,
   raises on missing file / malformed JSON / no matching key.
 * ``ApiUsageSource.read`` — mocks ``urllib.request.urlopen``; verifies
@@ -12,6 +13,9 @@ Coverage:
 * ``ApiThenTtyUsageSource`` — falls through on each documented API
   exception, propagates TTY errors unchanged, returns API result when
   it succeeds.
+* An unrepresentable header value, read through a real
+  ``ApiUsageSource``, falls through to TTY in the composite and reaches
+  the daemon's ``safe_poll`` as drift.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_task_runner.clock import FakeClock
+from claude_task_runner.supervisor.daemon import safe_poll
 from claude_task_runner.usage.api_source import (
     ANTHROPIC_API_URL,
     ANTHROPIC_VERSION,
@@ -90,15 +95,87 @@ def test_headers_to_reading_is_case_insensitive() -> None:
     assert reading.five_hour.utilization_pct == 4
 
 
-def test_headers_to_reading_clamps_utilization_to_0_100() -> None:
-    """A bogus 1.5 ratio (utilization > 100%) clamps to 100; -0.1 clamps to 0."""
+_UTILIZATION_HEADERS = [
+    "anthropic-ratelimit-unified-5h-utilization",
+    "anthropic-ratelimit-unified-7d-utilization",
+]
+_RESET_HEADERS = [
+    "anthropic-ratelimit-unified-5h-reset",
+    "anthropic-ratelimit-unified-7d-reset",
+]
+
+
+@pytest.mark.parametrize("header", _UTILIZATION_HEADERS)
+@pytest.mark.parametrize(
+    ("value", "expected_pct"),
+    [("0", 0), ("1.0", 100), ("-0.004", 0), ("1.004", 100)],
+)
+def test_headers_to_reading_utilization_rounding_into_range_is_accepted(
+    header: str, value: str, expected_pct: int
+) -> None:
+    """The range check runs on the rounded percent, as the TTY parser's
+    does, so float noise under half a percent past either end still reads."""
     h = dict(_VALID_HEADERS)
-    h["anthropic-ratelimit-unified-5h-utilization"] = "1.5"
-    h["anthropic-ratelimit-unified-7d-utilization"] = "-0.1"
-    captured_at = datetime(2026, 5, 21, tzinfo=UTC)
-    r = _headers_to_reading(h, captured_at)
-    assert r.five_hour.utilization_pct == 100
-    assert r.seven_day.utilization_pct == 0
+    h[header] = value
+    r = _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    window = r.five_hour if "-5h-" in header else r.seven_day
+    assert window.utilization_pct == expected_pct
+
+
+@pytest.mark.parametrize("header", _UTILIZATION_HEADERS)
+@pytest.mark.parametrize(
+    ("value", "expected_pct"),
+    [("1.5", 150), ("-0.1", -10), ("1.006", 101), ("-0.006", -1), ("42.5", 4250)],
+)
+def test_headers_to_reading_out_of_range_utilization_raises(
+    header: str, value: str, expected_pct: int
+) -> None:
+    """A ratio whose percent rounds outside [0, 100] is drift. It used to
+    be clamped, so a percent sent in place of the ratio ("42.5") read as
+    100% instead of surfacing."""
+    h = dict(_VALID_HEADERS)
+    h[header] = value
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert str(exc_info.value) == f"{header} value {value!r} is {expected_pct}%, outside [0, 100]"
+
+
+@pytest.mark.parametrize("header", _UTILIZATION_HEADERS)
+@pytest.mark.parametrize("value", ["inf", "-inf", "nan", "1e400", "-1e400", "1e308"])
+def test_headers_to_reading_non_finite_utilization_raises_typed(header: str, value: str) -> None:
+    """float() accepts each of these. round() raised OverflowError on the
+    infinite ones, and on 1e308, a finite ratio that overflows once scaled
+    to a percent. Only the typed error reaches the TTY fall-through and
+    the daemon's safe_poll."""
+    h = dict(_VALID_HEADERS)
+    h[header] = value
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert str(exc_info.value) == f"{header} value {value!r} is not a finite percentage"
+
+
+@pytest.mark.parametrize("header", _RESET_HEADERS)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "inf",
+        "-inf",
+        "nan",
+        "1e400",
+        str(10**20),  # OverflowError: past the platform's time_t
+        str(-(10**20)),
+        str(2**63 - 1),  # OSError on Linux: gmtime fails with errno 75
+        "253402300800",  # ValueError: year 10000
+    ],
+)
+def test_headers_to_reading_unrepresentable_reset_raises_typed(header: str, value: str) -> None:
+    """A reset timestamp that datetime cannot represent is drift, whatever
+    fromtimestamp raises for it."""
+    h = dict(_VALID_HEADERS)
+    h[header] = value
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert str(exc_info.value).startswith(f"unparseable {header} header value {value!r}: ")
 
 
 @pytest.mark.parametrize(
@@ -131,15 +208,21 @@ def test_headers_to_reading_missing_status_is_not_fatal() -> None:
 def test_headers_to_reading_unparseable_utilization_raises() -> None:
     h = dict(_VALID_HEADERS)
     h["anthropic-ratelimit-unified-5h-utilization"] = "not-a-number"
-    with pytest.raises(UsageApiHeaderMissing):
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
         _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert str(exc_info.value).startswith(
+        "unparseable anthropic-ratelimit-unified-5h-utilization header value 'not-a-number': "
+    )
 
 
 def test_headers_to_reading_unparseable_reset_raises() -> None:
     h = dict(_VALID_HEADERS)
     h["anthropic-ratelimit-unified-5h-reset"] = "yesterday"
-    with pytest.raises(UsageApiHeaderMissing):
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
         _headers_to_reading(h, datetime(2026, 5, 21, tzinfo=UTC))
+    assert str(exc_info.value).startswith(
+        "unparseable anthropic-ratelimit-unified-5h-reset header value 'yesterday': "
+    )
 
 
 def test_headers_to_reading_unknown_status_warns_does_not_raise(
@@ -482,3 +565,48 @@ def test_composite_does_not_fall_through_on_unrelated_exception() -> None:
     with pytest.raises(RuntimeError):
         composite.read()
     tty.read.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# An unrepresentable header value, end to end through a real ApiUsageSource.
+# These values used to raise OverflowError, which the composite does not
+# fall through on and safe_poll does not catch, so the supervisor's tick
+# loop ended on its first poll.
+# ---------------------------------------------------------------------------
+
+
+_UNREPRESENTABLE_HEADER_VALUES = [
+    ("anthropic-ratelimit-unified-5h-utilization", "inf"),
+    ("anthropic-ratelimit-unified-7d-reset", str(10**20)),
+]
+
+
+@pytest.mark.parametrize(("header", "value"), _UNREPRESENTABLE_HEADER_VALUES)
+def test_composite_falls_through_on_unrepresentable_header_value(
+    tmp_path: Path, header: str, value: str
+) -> None:
+    h = dict(_VALID_HEADERS)
+    h[header] = value
+    api = ApiUsageSource(FakeClock(start=datetime.now(UTC)), config_dir=_make_creds(tmp_path))
+    tty = FakeUsageSource([_reading(util_5h=42, util_7d=55)])
+    composite = ApiThenTtyUsageSource(api=api, tty=tty)
+    with patch("urllib.request.urlopen", return_value=_MockResponse(headers=h)):
+        out = composite.read()
+    assert out.five_hour.utilization_pct == 42
+    assert out.seven_day.utilization_pct == 55
+
+
+@pytest.mark.parametrize(("header", "value"), _UNREPRESENTABLE_HEADER_VALUES)
+def test_safe_poll_returns_drift_for_unrepresentable_header_value(
+    tmp_path: Path, header: str, value: str
+) -> None:
+    """In ``api`` mode nothing sits between the source and safe_poll, so
+    the value must arrive as the drift the state machine routes to
+    ERROR_DRIFT."""
+    h = dict(_VALID_HEADERS)
+    h[header] = value
+    api = ApiUsageSource(FakeClock(start=datetime.now(UTC)), config_dir=_make_creds(tmp_path))
+    with patch("urllib.request.urlopen", return_value=_MockResponse(headers=h)):
+        result = safe_poll(api)
+    assert isinstance(result, UsageApiHeaderMissing)
+    assert header in str(result)

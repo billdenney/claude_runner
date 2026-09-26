@@ -298,6 +298,30 @@ Breaking changes are called out in the version notes.
   56–59%. An account with `max_concurrency = 1` runs 1 until it stops. The
   queue-wide `[concurrency]` ceiling still bounds the total, whatever the
   throttle state.
+- **A rate-limit header that is infinite, too large or out of range is now
+  drift, not a supervisor crash.** The API usage source turned each window's
+  `anthropic-ratelimit-unified-*-utilization` ratio into a percent with
+  `round(float(value) * 100)`. `float()` accepts `inf`, `-inf` and literals
+  such as `1e400`, and `round()` raised `OverflowError` on them, as it did on
+  `1e308`, which overflows once multiplied by 100. A `-reset` timestamp such
+  as `10**20` raised `OverflowError` from `datetime.fromtimestamp()`, and
+  `2**63 - 1` raised `OSError` on Linux. Neither is the typed
+  `UsageApiHeaderMissing`, so `api_then_tty` did not fall through to the TTY
+  source and the daemon's `safe_poll` did not catch it. The supervisor exited
+  on its first tick, and under systemd it restarted into the same crash until
+  `StartLimitBurst` stopped it. Each of these values is now
+  `UsageApiHeaderMissing`: `api_then_tty` reads that tick from the TTY
+  source, and without a TTY fall-through, as in `api` mode, the supervisor
+  enters `ERROR_DRIFT` until `drift_recovery_clean_polls` clean readings.
+  `nan` was already typed. **A ratio whose percent rounds outside [0, 100] is
+  now drift too, where it was clamped.** `1.5` read as 100% and `-0.1` as 0%,
+  and a percent sent in place of the ratio (`42.5`) would have read as 100%.
+  The TTY parser already rejects an out-of-range percent. Noise under half a
+  percent still reads: `1.004` is 100%. The error now names the header.
+  `tests/unit/test_api_usage_source.py` gives each of the four headers `inf`,
+  `-inf`, `nan` and too-large values and asserts the typed error, and reads
+  `inf` and `10**20` through a real `ApiUsageSource` into `api_then_tty` and
+  `safe_poll`.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
