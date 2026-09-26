@@ -122,7 +122,7 @@ def template(
         help="Print the field table (name/required/type/default/description) instead of an example.",
     ),
 ) -> None:
-    """Print a complete, annotated example Task YAML -- how to author one.
+    """Print a complete, annotated example Task YAML.
 
     Redirect it into a new task file and edit in place::
 
@@ -177,7 +177,7 @@ def list_tasks(
         ),
     ),
 ) -> None:
-    """List pending tasks in ``<queue>/todo/`` (Task YAMLs).
+    """List the Task YAMLs pending in ``<queue>/todo/``.
 
     Each parsed task's row carries ``effort_error``: ``null`` when the
     queue's ``[effort_levels]`` accepts its (model, effort) pair, else the
@@ -620,7 +620,7 @@ def backfill_working_dir(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Populate ``working_dir`` on tasks in ``todo/`` whose value is null.
+    """Fill in a null ``working_dir`` on ``todo/`` tasks.
 
     Idempotent: skips any task whose ``working_dir`` is already set
     (regardless of whether the current value matches the template).
@@ -731,7 +731,7 @@ def restart_fresh(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Clear a task's ``session_id`` so the next dispatch starts fresh.
+    """Clear a task's ``session_id`` so it starts fresh.
 
     Escape hatch for ADR-0024 session affinity: when a task's affined
     account is stuck (weekly-throttled, paused, or removed from
@@ -843,7 +843,7 @@ def force_dispatch(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Bypass throttle and priority; dispatch ``task_id`` next.
+    """Bypass throttle and priority; run ``task_id`` next.
 
     Use when an operator needs a single high-priority task to run NOW
     even though the supervisor is in ``throttled_5h`` or ``throttled_weekly``.

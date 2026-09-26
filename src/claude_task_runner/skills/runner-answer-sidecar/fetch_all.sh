@@ -30,34 +30,82 @@
 # asked id, so the caller must resupply q1's recorded answer alongside the
 # new ones (`answered` names them; the response file holds the values).
 #
-# Exits non-zero if claude-task-runner is missing or list/show errors.
-# Tolerates v1-schema (legacy) sidecar requests by capturing whatever
-# fields are present and emitting a "schema_warning" field.
+# Exit codes, with nothing on stdout unless 0:
+#   0  the JSON above
+#   1  the open sidecars could not be listed: claude-task-runner is not on
+#      PATH, `sidecar list` failed, or it printed no listing. stderr says
+#      why and shows the last lines the command printed.
+#   2  bad args, or the queue is missing or not a queue (no todo/)
+# A sidecar that `sidecar show` cannot read does not fail the script: it is
+# reported in its entry's "schema_warning" field. v1-schema (legacy)
+# requests are read from the request file directly, capturing whatever
+# fields are present.
 
 set -euo pipefail
 
 QUEUE="${PWD}"
+QUEUE_FROM="the working directory (no --queue given)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --queue) QUEUE="$2"; shift 2 ;;
+    --queue) QUEUE="$2"; QUEUE_FROM="--queue"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-LIST_FILE="$(mktemp)"
-trap 'rm -f "$LIST_FILE"' EXIT
-claude-task-runner sidecar list --queue "$QUEUE" --json > "$LIST_FILE" 2>/dev/null
+# Refuse anything that is not a queue. A directory that is not one has no
+# sidecars to list, so a mistyped --queue, or a run from the wrong directory
+# without one, came back as "n_open": 0, which the skill reports as "No open
+# sidecars". A queue is a directory with a todo/ subdirectory, the test
+# `worktree reclaim` and the runner-status snapshot.sh apply too.
+if [[ ! -d "$QUEUE" ]]; then
+  echo "$QUEUE_FROM is not an existing directory: $QUEUE" >&2
+  exit 2
+fi
+if [[ ! -d "$QUEUE/todo" ]]; then
+  echo "$QUEUE_FROM is not a queue directory, it has no todo/ subdirectory: $QUEUE" >&2
+  exit 2
+fi
+if ! command -v claude-task-runner > /dev/null 2>&1; then
+  echo "could not list the open sidecars: claude-task-runner is not on PATH" >&2
+  exit 1
+fi
 
-QUEUE="$QUEUE" LIST_FILE="$LIST_FILE" python3 - <<'EOF'
+LIST_FILE="$(mktemp)"
+LIST_ERR="$(mktemp)"
+trap 'rm -f "$LIST_FILE" "$LIST_ERR"' EXIT
+# A failed listing is reported by the heredoc below. This call used to send
+# stderr to /dev/null, and `sidecar list --json` prints its own errors on
+# stdout, into LIST_FILE, so set -e ended the script with no message at all.
+LIST_RC=0
+claude-task-runner sidecar list --queue "$QUEUE" --json > "$LIST_FILE" 2> "$LIST_ERR" || LIST_RC=$?
+
+QUEUE="$QUEUE" LIST_FILE="$LIST_FILE" LIST_ERR="$LIST_ERR" LIST_RC="$LIST_RC" python3 - <<'EOF'
 import json
 import os
 import subprocess
 import sys
 
 queue = os.environ["QUEUE"]
+rc = int(os.environ["LIST_RC"])
 with open(os.environ["LIST_FILE"]) as f:
-    listing = json.load(f)
-sidecars = listing.get("sidecars", [])
+    stdout = f.read()
+
+
+def could_not_list(why):
+    """Exit 1, with ``why`` and the last lines the listing printed on stderr."""
+    with open(os.environ["LIST_ERR"]) as f:
+        printed = (stdout.rstrip("\n") + "\n" + f.read()).strip().splitlines()
+    sys.exit("\n".join([f"could not list the open sidecars: {why}", *printed[-20:]]))
+
+
+# A listing that failed, or is not a listing, must never read as "n_open": 0.
+if rc != 0:
+    could_not_list(f"`claude-task-runner sidecar list --json` exited {rc}")
+try:
+    listing = json.loads(stdout)
+    sidecars = listing["sidecars"]
+except (ValueError, KeyError, TypeError) as exc:
+    could_not_list(f"`claude-task-runner sidecar list --json` printed no listing ({exc!r})")
 
 out = {
     "queue": queue,

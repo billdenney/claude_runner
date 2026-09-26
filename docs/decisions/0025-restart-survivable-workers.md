@@ -73,6 +73,43 @@ Make workers survive a supervisor restart and let a fresh supervisor
      `systemctl` `ExecStop` points at this fast stop, and
      `TimeoutStopSec` drops from 4h to a short bound.
 
+     > **Amended (2026-09-26):** until this date the stop was not
+     > immediate. The signal handlers only set flags, and the loop read
+     > them only at the top of a tick, after
+     > `time.sleep([usage].poll_interval_s)` (60 s by default). Python
+     > resumes a sleep after a handler that does not raise (PEP 475), so
+     > a stop waited for the rest of the tick and the whole sleep. On the
+     > live runner `supervisor stop` took 46 s: the supervisor logged the
+     > SIGTERM at 18:05:55.87 UTC and exited at 18:06:41.98 UTC. Under
+     > `systemctl stop` or `restart`, systemd sends SIGKILL once
+     > `TimeoutStopSec` (30 s) has passed, and SIGKILL skips the `finally`
+     > that removes `supervisor.pid`. Now the sleep runs in slices of
+     > `supervisor.daemon.SIGNAL_CHECK_INTERVAL_S` (0.5 s), and ends at
+     > the first check after a stop or drain signal. A stop that arrives
+     > during a tick ends the tick once its usage poll returns, before
+     > anything is dispatched: a new dispatch would start work that the
+     > exit then abandons. The poll still runs to the end. The part of a
+     > tick before its dispatch phase takes about 8 s on the live runner,
+     > but a TTY capture that runs into its `[usage]` capture timeouts
+     > can take longer than `TimeoutStopSec`. SIGHUP still waits for the
+     > next scheduled tick.
+     >
+     > The slow sleep had hidden a race in "exits without joining worker
+     > threads". A dispatch thread starts its worker with `Popen` and only
+     > then records the pid and log path in the task's state. An exit
+     > between the two leaves a worker that the next supervisor can
+     > neither adopt nor see, so it demotes the task and dispatches it
+     > again, and two workers run it. Now each dispatch thread holds a
+     > `runner.spawn_gate.SpawnGate` from just before it opens the log
+     > files until the pid is on record. Before it releases the supervisor
+     > lock, a stopping supervisor closes the gate and waits for the
+     > threads inside, for at most `supervisor.daemon.WORKER_START_WAIT_S`
+     > (10 s), and logs an error naming any task still inside. A daemon
+     > thread that reaches the gate after that starts nothing; its task
+     > stays `running` with no pid, and the next supervisor demotes it and
+     > dispatches it once. A thread still in its pre-dispatch hook at exit
+     > is not waited for, and the hook's process outlives it.
+
 Net: `systemctl restart` becomes near-instant *and* loses no in-flight
 work.
 

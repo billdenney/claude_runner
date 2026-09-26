@@ -54,6 +54,7 @@ from claude_task_runner.runner import effort_levels as effort_levels_mod
 from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
+from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor.states import SupervisorState
 
 if TYPE_CHECKING:
@@ -150,6 +151,7 @@ def tick_dispatch(
     draining: bool = False,
     notify_callback: NotifyCallback | None = None,
     event_callback: EventCallback | None = None,
+    spawn_gate: SpawnGate | None = None,
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
@@ -160,6 +162,9 @@ def tick_dispatch(
     as independent OS processes and the next supervisor adopts them.
     When adoption is off, threads are non-daemon so the graceful-drain
     stop can join them, preserving the historical behaviour exactly.
+    ``spawn_gate`` goes to each dispatch thread, so the stop still waits
+    for a thread that has started its worker but not yet recorded its pid
+    (see :mod:`runner.spawn_gate`).
 
     Mutates ``in_flight_slots`` in place: removes finished threads,
     inserts newly-spawned :class:`DispatchSlot` entries (one per
@@ -326,6 +331,7 @@ def tick_dispatch(
                 acct.linux_user,
                 choice.account,
             ),
+            kwargs={"spawn_gate": spawn_gate},
             name=f"dispatch-{task.id}",
             # ADR-0025: daemon when adoption is on so a fast stop need not
             # join the worker thread; the file-backed worker survives as
@@ -999,6 +1005,7 @@ def _dispatch_one_safely(
     claude_config_dir: str,
     linux_user: str | None,
     account: str,
+    spawn_gate: SpawnGate | None = None,
 ) -> None:
     """Thread entrypoint — load state, plan spawn, call dispatch, log errors.
 
@@ -1073,6 +1080,7 @@ def _dispatch_one_safely(
             adopt_workers=bool(
                 getattr(getattr(settings, "supervisor", None), "adopt_workers", False)
             ),
+            spawn_gate=spawn_gate,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)
