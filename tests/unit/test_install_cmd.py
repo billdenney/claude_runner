@@ -842,40 +842,46 @@ def test_install_systemd_refuses_a_watchdog_value_systemd_cannot_parse(
 ) -> None:
     """systemd would ignore the line and restart after its own 100 ms.
 
-    The schema accepts ``inf`` (it is > 0), and TOML can spell it. The
-    message keeps ``[watchdog]``, which Rich markup would otherwise
-    take for a style tag and drop."""
+    The schema accepts a span one second longer than systemd does. The
+    message keeps ``[watchdog]``, which Rich markup would otherwise take
+    for a style tag and drop."""
     queue = tmp_path / "queue"
     queue.mkdir()
     (queue / "claude_runner.toml").write_text(
-        "[watchdog]\nrestart_cooldown_s = inf\n", encoding="utf-8"
+        "[watchdog]\nrestart_cooldown_s = 18446744073709\n", encoding="utf-8"
     )
     with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 2
     assert (
-        "systemd install failed: [watchdog].restart_cooldown_s = inf is not a finite "
-        "number of seconds. Nothing was written.\n"
+        "systemd install failed: [watchdog].restart_cooldown_s = 18446744073709.0 is longer "
+        "than systemd accepts (18446744073708 s). Nothing was written.\n"
     ) in result.stdout
     assert "Unit text:" not in result.stdout
     mock_apply.assert_not_called()
     assert not (isolated_home / ".config").exists()
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("crash_loop_threshold", "0"),
+        # Not finite, so systemd could not parse it either.
+        ("restart_cooldown_s", "inf"),
+    ],
+)
 def test_install_systemd_invalid_watchdog_value_fails_before_writing(
-    runner: CliRunner, tmp_path: Path
+    runner: CliRunner, tmp_path: Path, key: str, value: str
 ) -> None:
     """A value the schema rejects stops ``install`` when the TOML loads."""
     queue = tmp_path / "queue"
     queue.mkdir()
-    (queue / "claude_runner.toml").write_text(
-        "[watchdog]\ncrash_loop_threshold = 0\n", encoding="utf-8"
-    )
+    (queue / "claude_runner.toml").write_text(f"[watchdog]\n{key} = {value}\n", encoding="utf-8")
     with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 1
     assert isinstance(result.exception, ConfigError)
-    assert "watchdog.crash_loop_threshold" in str(result.exception)
+    assert f"watchdog.{key}" in str(result.exception)
     mock_apply.assert_not_called()
 
 

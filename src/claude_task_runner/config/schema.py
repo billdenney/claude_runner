@@ -29,9 +29,18 @@ UsageSourceMode = Literal["tty", "api", "api_then_tty"]
 
 
 class _StrictModel(BaseModel):
-    """Base for all settings sections — forbid unknown keys to catch typos."""
+    """Base for all settings sections — forbid unknown keys to catch typos.
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    Also rejects ``inf``, ``-inf`` and ``nan`` in every float field. TOML
+    can write all three (and reads ``1e309`` as ``inf``), pydantic accepts
+    them by default, and ``inf`` passes a ``gt=0`` bound: ``[watchdog]
+    restart_cooldown_s = inf`` loaded, then crashed the watchdog with an
+    ``OverflowError``. A setting that has an "unlimited" value spells it
+    ``0``, never ``inf``. ``tests/unit/test_settings_finite.py`` checks
+    every float field of both operator files.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 _ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
@@ -807,10 +816,11 @@ class DispatchSettings(_StrictModel):
     (the automatic form of ``queue restart-fresh``) and dispatches the
     task fresh on any eligible account. Affinity is still honoured while
     the host account has capacity (a resumable session prefers its home),
-    and for sessions younger than the TTL. Set very large to restore
-    strict always-affinity behaviour; the feature never wrongly resumes
-    a session on the wrong account (it clears first, then dispatches
-    fresh)."""
+    and for sessions younger than the TTL. Set ``0`` to restore strict
+    always-affinity behaviour: a TTL of ``0`` never expires. (``inf``
+    fails to load, like any non-finite setting.) The feature never
+    wrongly resumes a session on the wrong account (it clears first,
+    then dispatches fresh)."""
 
 
 class Settings(_StrictModel):

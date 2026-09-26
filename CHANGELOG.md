@@ -183,6 +183,24 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **A float setting of `inf`, `-inf` or `nan` no longer loads (breaking for a
+  TOML that sets one).** TOML can write all three, and reads a literal too
+  large for a float, such as `1e309`, as `inf`. pydantic accepted them, and
+  `inf` passes a `> 0` bound, so `[watchdog] restart_cooldown_s = inf` loaded,
+  and the cron watchdog's next restart decision raised `OverflowError`.
+  `[dispatch].affinity_ttl_seconds` has no bound and took all three. Every
+  settings model, in `claude_runner.toml` and in each account's
+  `runner-account.toml`, now rejects a non-finite float with a `ConfigError`
+  that names the key; integer settings already did. No default or documented
+  value was `inf`: a setting with an "unlimited" value spells it `0`. For
+  `affinity_ttl_seconds`, whose docstring said to set it "very large" for
+  strict session affinity, that is `0` too: a TTL of `0` never expires. No
+  known queue TOML or per-account policy set a non-finite value.
+  `tests/unit/test_settings_finite.py` sets each float field of both files to
+  each of the three values and requires that error, so a float setting added
+  later is covered without being listed. It shares the schema walker of
+  `tests/unit/test_settings_readers.py`, now in `tests/unit/_settings_walk.py`.
+
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
@@ -232,11 +250,12 @@ Breaking changes are called out in the version notes.
   cannot parse. systemd ignores a unit line it cannot parse, with only a
   journal warning, and falls back to its own default (`RestartSec=100ms`).
   So a value systemd cannot parse now stops `install` with exit 2 before
-  anything is written: an infinite span (the schema's `> 0` check lets
-  `inf` through), a span longer than 18,446,744,073,708 s, or a
-  `crash_loop_threshold` above 4,294,967,295. Where `systemd-analyze` is
-  installed, tests run the generated unit through `systemd-analyze verify`
-  and the written spans through `systemd-analyze timespan`. A known-answer
+  anything is written: a span longer than 18,446,744,073,708 s, or a
+  `crash_loop_threshold` above 4,294,967,295. (An infinite span no longer
+  loads at all; see the entry on non-finite settings.) Where
+  `systemd-analyze` is installed, tests run the generated unit through
+  `systemd-analyze verify` and the written spans through
+  `systemd-analyze timespan`. A known-answer
   test checks that `verify` does report an ignored line. A test that walks
   `WatchdogSettings` fails when a `[watchdog]` key has no unit line.
   `build_unit_text` and `build_install_plan` now require a `watchdog`
