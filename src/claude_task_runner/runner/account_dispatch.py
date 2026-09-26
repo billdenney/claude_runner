@@ -69,8 +69,11 @@ _DISPATCHABLE_STATES: frozenset[SupervisorState] = frozenset(
 """States where an account is willing to take a new dispatch.
 
 IDLE is included so cold-start dispatches don't stall waiting for the
-first ``/usage`` capture to land — the next tick reclassifies the
-account and pulls it out of IDLE."""
+first ``/usage`` capture to land, and so tasks that arrive after the
+queue emptied don't wait for the account's next capture: on a
+multi-account queue that is a full round-robin cycle away. A captured
+IDLE account keeps the ``target_concurrency`` of the reading that idled
+it, which :func:`account_cap` applies."""
 
 
 @dataclass(frozen=True)
@@ -262,7 +265,9 @@ def account_cap(acct: ResolvedAccount, state: AccountState) -> int:
     ``runner-account.toml``; 1 if absent), lowered to
     ``state.target_concurrency`` when the account's last throttle
     decision set one. While SLOWING_DOWN that is the ramp target the
-    supervisor announced.
+    supervisor announced. An IDLE account keeps the target of the reading
+    that idled it, 0 if that reading was throttled; only an account never
+    captured has none.
     """
     cap = acct.policy.concurrency.max_concurrency
     if state.target_concurrency is not None:
