@@ -63,7 +63,9 @@ A queue inherits every default from
 `src/claude_task_runner/config/defaults/settings.toml`. The TOML at
 `./claude_runner.toml` only needs to **override** what's queue-specific.
 Settings are merged section-by-section; the schema is strict
-(`extra="forbid"`), so any typo is flagged at load time.
+(`extra="forbid"`), so any typo is flagged at load time. Numbers must be
+finite: a setting of `inf` or `nan` fails to load. Where a setting has an
+"unlimited" value, it is `0`, as the defaults file's comments say.
 
 A working minimum:
 

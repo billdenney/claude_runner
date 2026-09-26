@@ -79,7 +79,7 @@ introduces a new on-disk file MUST update this document in the same PR.
 
 States in `supervisor/states.py`:
 
-- `Idle` — no pending tasks; polling only.
+- `Idle` — nothing pending or in flight at the account's last capture; polling only. It keeps the dispatch cap that reading calls for (see below).
 - `Dispatching` — predicted 5h pct < `dispatch_pct.<band>.fivehr_slowdown_pct`.
 - `SlowingDown` — predicted 5h pct in [slowdown, stop); the account's dispatch cap falls linearly from its `max_concurrency` towards 0.
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
@@ -120,6 +120,15 @@ account's `max_concurrency` while `Dispatching`, the linear ramp while
 concurrency=X/Y` notice announces, repeated whenever it changes), and 0
 while throttled.
 
+When nothing is pending or in flight the account goes `Idle` instead,
+with no notice, but `step()` still makes the decision and records its
+target and wakeup. The account stays `Idle` until its next capture, a full
+round-robin cycle away on a multi-account queue, and tasks that arrive
+in the meantime dispatch through it under that target: none if the
+reading was throttled, the ramp target if it was slowing down. An
+account seeded `Idle` and never captured has no target yet, so only its
+`max_concurrency` caps it.
+
 Per task, `runner.account_dispatch.choose_account` skips an account
 whose state is not `Dispatching`, `SlowingDown` or `Idle`, or which is
 paused, and caps each account at `account_cap`: its `max_concurrency`
@@ -155,7 +164,9 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │                               #   on the next supervisor tick
     ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
     │   ├── attempt-<N>.stream.jsonl  #   parsed stdout NDJSON stream (re-read
-    │   │                             #   on adoption to rebuild StreamSummary)
+    │   │                             #   on adoption to rebuild StreamSummary,
+    │   │                             #   and at startup for a worker that
+    │   │                             #   exited while no supervisor ran)
     │   └── attempt-<N>.stderr        #   paired stderr (error tail kept in state)
     ├── supervisor.json             # supervisor state machine snapshot; holds
     │                               #   last_drift_message while in ErrorDrift
@@ -225,7 +236,7 @@ These properties are never violated; tests and assertions enforce them.
    restart (verdict `locked`).
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
-   to live PIDs.
+   to live PIDs, and records a worker that exited in the meantime from its log.
 3. *(Retired 2026-09-25.)* This slot said a utilization decrease without a
    detected reset is `UsageFormatDrift`. Nothing ever enforced that: the check
    was written but never called, and it has been removed. Each reading is used

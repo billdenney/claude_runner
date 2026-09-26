@@ -28,21 +28,16 @@ from __future__ import annotations
 import ast
 import functools
 from pathlib import Path
-from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel
 
-from claude_task_runner.config.schema import AccountPolicy, Settings
+from claude_task_runner.config.schema import Settings
+
+from ._settings_walk import ROOTS, walk_settings
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 SRC_DIR = REPO_ROOT / "src" / "claude_task_runner"
 SCHEMA_FILE = SRC_DIR / "config" / "schema.py"
-
-ROOTS: dict[str, type[BaseModel]] = {
-    "claude_runner.toml": Settings,
-    "runner-account.toml": AccountPolicy,
-}
-"""The two files an operator writes, and the model each one loads into."""
 
 KNOWN_UNREAD: dict[str, str] = {}
 """``"Model.field"`` entries exempt from the check, each with its reason.
@@ -54,42 +49,13 @@ settings, and each was deleted, with a loader guard, instead.
 """
 
 
-def _models_in(annotation: Any, path: str) -> list[tuple[type[BaseModel], str]]:
-    """Every settings model ``annotation`` can hold, with its TOML path.
-
-    Descends through ``dict`` values (an operator-chosen key, shown as
-    ``<key>``), lists, ``Optional`` and unions.
-    """
-    origin = get_origin(annotation)
-    if origin is dict:
-        _key_type, value_type = get_args(annotation)
-        return _models_in(value_type, f"{path}.<key>")
-    if origin is not None:
-        return [found for arg in get_args(annotation) for found in _models_in(arg, path)]
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        return [(annotation, path)]
-    return []
-
-
 def _settings_fields(root: type[BaseModel]) -> dict[str, str]:
     """``{"Model.field": "dotted.toml.path"}`` for every field under ``root``.
 
-    Breadth-first, so a model reachable by more than one path is walked
-    once, under its shortest path.
+    A model reachable by more than one path appears once, under its
+    shortest path (see :func:`walk_settings`).
     """
-    fields: dict[str, str] = {}
-    seen: set[type[BaseModel]] = set()
-    pending: list[tuple[type[BaseModel], str]] = [(root, "")]
-    while pending:
-        model, prefix = pending.pop(0)
-        if model in seen:
-            continue
-        seen.add(model)
-        for name, info in model.model_fields.items():
-            path = f"{prefix}.{name}" if prefix else name
-            fields[f"{model.__name__}.{name}"] = path
-            pending.extend(_models_in(info.annotation, path))
-    return fields
+    return {f"{field.model.__name__}.{field.name}": field.path for field in walk_settings(root)}
 
 
 def _shown(path: str) -> str:

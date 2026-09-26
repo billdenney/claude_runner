@@ -9,9 +9,9 @@ One tick:
    ``watchdog register`` write (see :mod:`cron.registry`). Only one
    supervisor runs per user, so any other queue listed there is ignored,
    with a WARNING line.
-2. Load watchdog state (recent restarts, backoff alerts). It belongs to
-   one queue, so a tick that finds another queue registered starts it
-   empty.
+2. Load watchdog state: the restarts since the supervisor last stayed
+   up (see :mod:`cron.backoff`). It belongs to one queue, so a tick that
+   finds another queue registered starts it empty.
 3. Skip the queue with an ERROR line if it is not an existing directory
    (it was deleted or moved after it was registered).
 4. Load the queue's config: the tick's own ``--config``, else the one

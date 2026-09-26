@@ -106,6 +106,23 @@ def _entry(
     return snapshot.model_copy(update=update)
 
 
+def _state_transition(
+    previous_state: SupervisorState,
+    new_state: SupervisorState,
+    reading: UsageReading,
+) -> EmitEvent:
+    """The ``state_transition`` event for a clean reading that changed the state."""
+    return EmitEvent(
+        event_type="state_transition",
+        payload={
+            "from": previous_state.value,
+            "to": new_state.value,
+            "five_hour_util": reading.five_hour.utilization_pct,
+            "weekly_util": reading.seven_day.utilization_pct,
+        },
+    )
+
+
 def _emit_state_specific_events(
     decision: Decision,
     *,
@@ -283,21 +300,8 @@ def step(
             return new_snap, actions
         # Clean threshold met — fall through to normal classification.
 
-    # IDLE when no work pending and nothing in flight.
-    if inp.pending_count == 0 and inp.in_flight_count == 0:
-        new_snap = _entry(
-            SupervisorState.IDLE,
-            snapshot=snapshot,
-            clock=clock,
-            reading=reading,
-            target_concurrency=None,
-            consecutive_clean_polls=0,
-            last_drift_message="",
-        )
-        actions.append(MonitorInFlight())
-        return new_snap, actions
-
-    # Trace-following dispatch decision (ADR-0022).
+    # Trace-following dispatch decision (ADR-0022), made before the IDLE
+    # check because an IDLE account keeps its cap.
     decision = decide(
         inp.policy,
         reading,
@@ -305,6 +309,29 @@ def step(
         poll_interval_s=inp.settings_usage.poll_interval_s,
         window_start_delay_s=inp.settings_supervisor.window_start_delay_s,
     )
+
+    # IDLE when no work pending and nothing in flight. IDLE is
+    # dispatchable, and the account stays IDLE until its next capture,
+    # which on a multi-account queue is a full round-robin cycle away.
+    # Tasks that arrive meanwhile go through it, so it keeps the cap and
+    # wakeup this reading calls for: 0 if the reading is throttled. It
+    # sends no notice and schedules nothing, since no task is waiting on
+    # it; entering it emits the usual ``state_transition``.
+    if inp.pending_count == 0 and inp.in_flight_count == 0:
+        new_snap = _entry(
+            SupervisorState.IDLE,
+            snapshot=snapshot,
+            clock=clock,
+            reading=reading,
+            target_concurrency=decision.target_concurrency,
+            consecutive_clean_polls=0,
+            last_drift_message="",
+            scheduled_wakeup_at=decision.wakeup_at,
+        )
+        actions.append(MonitorInFlight())
+        if snapshot.state is not SupervisorState.IDLE:
+            actions.append(_state_transition(snapshot.state, SupervisorState.IDLE, reading))
+        return new_snap, actions
 
     new_snap = _entry(
         decision.state,
@@ -333,16 +360,6 @@ def step(
     actions.append(MonitorInFlight())
 
     if snapshot.state is not decision.state:
-        actions.append(
-            EmitEvent(
-                event_type="state_transition",
-                payload={
-                    "from": snapshot.state.value,
-                    "to": decision.state.value,
-                    "five_hour_util": reading.five_hour.utilization_pct,
-                    "weekly_util": reading.seven_day.utilization_pct,
-                },
-            )
-        )
+        actions.append(_state_transition(snapshot.state, decision.state, reading))
 
     return new_snap, actions

@@ -50,7 +50,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO
 
@@ -1920,6 +1920,75 @@ def adopt_worker(
     )
 
 
+def finalize_exited_worker(
+    *,
+    task: Task,
+    state: TaskState,
+    queue_dir: Path,
+    clock: Clock,
+    settings_failure_classifier: FailureClassifierSettings | None = None,
+    account: str | None = None,
+) -> DispatchOutcome | None:
+    """Record the run of a file-backed worker that exited with no supervisor watching.
+
+    ADR-0025 startup adoption covers a worker that is still alive when the
+    next supervisor starts. A worker can also *finish* in the restart gap:
+    its task is still ``"running"`` on disk and its pid is gone, but its
+    stream log ends with the terminal ``result`` event. That log is the
+    evidence :func:`adopt_worker` finalizes from once an adopted pid
+    disappears, so this re-parses it and finalizes through
+    :func:`_finalize_adopted`: the same RunRecord, the same classification
+    (a success or error result, the ADR-0020 output gate, an open sidecar)
+    and the same recheck guard against a concurrent writer.
+
+    Returns ``None`` and writes nothing when the log holds no terminal
+    ``result`` event. That worker crashed or was killed mid-run, and the
+    startup reaper and ``reconcile_orphans`` handle it as they always have.
+
+    The caller has established that ``state.pid`` is dead, so nothing here
+    signals or waits on a process. No cap is applied: caps stop a live
+    worker, and this one ended on its own.
+    """
+    if state.log_path is None:
+        return None
+    log_path = Path(state.log_path)
+    summary = _reparse_stdout_file(log_path)
+    if summary.final_result is None:
+        return None
+
+    now = clock.now()
+    started_at = state.last_started_at if state.last_started_at is not None else now
+    return _finalize_adopted(
+        task=task,
+        prior=state,
+        summary=summary,
+        cap_violation=None,
+        started_at=started_at,
+        finished_at=_log_finished_at(log_path, started_at=started_at, now=now),
+        stderr_tail=_read_stderr_tail(_stderr_path_for_stdout_log(log_path)),
+        account=account,
+        queue_dir=queue_dir,
+        settings_failure_classifier=settings_failure_classifier,
+    )
+
+
+def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> datetime:
+    """Date an exited worker's finish by its stdout log's last write.
+
+    The terminal ``result`` event is the worker's last stdout write, so the
+    log's mtime is when it finished. ``now`` only dates the restart that
+    found it, which can be hours later. The mtime is capped at ``now`` and
+    floored at ``started_at``, the floor winning if the two conflict, since
+    a negative duration fails RunRecord validation. ``now`` when the log
+    can't be stat'ed.
+    """
+    try:
+        mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return now
+    return max(started_at, min(mtime, now))
+
+
 def _finalize_adopted(
     *,
     task: Task,
@@ -1935,13 +2004,16 @@ def _finalize_adopted(
 ) -> DispatchOutcome:
     """Build the RunRecord + persist terminal state for an adopted worker.
 
+    Shared by :func:`adopt_worker` and :func:`finalize_exited_worker` (a
+    worker that exited before any supervisor could adopt it).
+
     Exit code is inferred, not measured: a terminal ``result`` event in
     ``summary`` drives the classification (its ``stop_reason`` / error),
     exactly as the owned path would once ``_build_run_record`` consults
     ``summary.final_result``. With NO terminal result event we pass a
     non-zero ``process_exit_code`` so ``_build_run_record`` records a
-    ``no_result`` failure — the correct outcome for a worker that
-    vanished mid-run (crash, OOM-kill, or a kill we issued).
+    ``process_exit_nonzero`` failure — the correct outcome for a worker
+    that vanished mid-run (crash, OOM-kill, or a kill we issued).
 
     The terminal write uses the same recheck guard as the silent-orphan
     reaper: if the on-disk status is no longer ``"running"`` a concurrent
@@ -1949,7 +2021,7 @@ def _finalize_adopted(
     record (ADR-0025 concurrency note).
     """
     # No terminal result ⇒ infer a crash via a non-zero synthetic exit
-    # code so _build_run_record records ``no_result``. A present result
+    # code so _build_run_record records ``process_exit_nonzero``. A present result
     # event makes the exit code irrelevant (it branches on final_result).
     inferred_exit = 0 if summary.final_result is not None else -1
 
