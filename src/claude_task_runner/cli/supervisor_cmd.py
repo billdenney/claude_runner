@@ -235,11 +235,18 @@ def start(
     at ``<queue>/.claude_task_runner/supervisor.pid``):
 
     \b
-    * ``SIGTERM`` / ``SIGINT`` — request a clean stop; in-flight
-      dispatch threads finish their current attempt (architectural
-      invariant 2: in-flight tasks are NOT killed when the supervisor
-      exits). Use ``claude-task-runner supervisor stop`` to do this
-      from the CLI.
+    * ``SIGTERM`` / ``SIGINT`` — stop. Between ticks the supervisor
+      stops within about half a second; a stop that arrives during a
+      tick first waits for the tick's usage poll. It dispatches nothing
+      more, and never kills an in-flight ``claude`` worker
+      (architectural invariant 2). With ``[supervisor].adopt_workers``
+      on, the default, it exits without waiting for the workers, and
+      the next supervisor adopts them (ADR-0025). With it off, it exits
+      once each in-flight attempt has finished.
+      ``claude-task-runner supervisor stop`` sends SIGTERM.
+    * ``SIGUSR1`` — drain: dispatch nothing new, keep ticking, and exit
+      once no task is in flight. ``claude-task-runner supervisor drain``
+      sends it.
     * ``SIGHUP`` — hot-reload ``claude_runner.toml`` on the next tick
       and rescan ``<queue>/todo/`` for new task YAMLs. In-flight tasks
       keep running with their already-built command-line; the new
