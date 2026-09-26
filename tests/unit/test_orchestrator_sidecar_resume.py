@@ -33,7 +33,7 @@ from claude_task_runner.queue.schema import (
     Task,
     TaskState,
 )
-from claude_task_runner.queue.sidecar import write_request, write_response
+from claude_task_runner.queue.sidecar import write_response
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
@@ -47,6 +47,8 @@ from claude_task_runner.runner.orchestrator import (
     _dispatch_blocked_task_ids,
     _eligible_candidates,
 )
+
+from ._sidecar_files import write_request
 
 
 def _write_task_yaml(queue_dir: Path, task: Task) -> Path:

@@ -339,10 +339,9 @@ def test_add_unknown_effort_level(runner: CliRunner, queue_dir: Path) -> None:
 
 
 def test_add_unknown_model(runner: CliRunner, queue_dir: Path) -> None:
-    """A model with no effort entries fails (the error path includes
-    both UnknownModel and UnknownEffortLevel-by-way-of-missing-config —
-    either flavor counts here as long as exit is 2 and the model name
-    appears in the message)."""
+    """A model with no effort entries fails: validate_effort raises
+    UnknownEffortLevel with no accepted set, so the exit is 2 and the
+    message names the model."""
     result = runner.invoke(
         app,
         [

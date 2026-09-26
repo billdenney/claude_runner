@@ -104,16 +104,6 @@ def unmet_requirements(
     return unmet
 
 
-def is_ready(
-    task: Task,
-    queue_dir: Path,
-    *,
-    open_sidecar_task_ids: set[str] | None = None,
-) -> bool:
-    """True iff ``task`` has no unmet readiness requirements."""
-    return not unmet_requirements(task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids)
-
-
 #: Marker every runner-written readiness hold reason starts with. It is what
 #: distinguishes a hold this gate parked (and may therefore un-park on its own,
 #: the moment the requirement is satisfied) from an operator's manual

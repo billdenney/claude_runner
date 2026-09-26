@@ -140,6 +140,11 @@ class RunRecord(_StrictBase):
     legacy single-account RunRecords (pre-multi-account dispatch);
     set to the account name picked by :func:`runner.account_dispatch
     .choose_account` on multi-account dispatches."""
+    skipped_stream_lines: int = Field(default=0, ge=0)
+    """Stream-json lines the parser skipped for this run: malformed JSON, or
+    an event type it does not recognize. Non-zero can mean the stream format
+    has drifted; the dispatcher also logs a warning naming the unknown types.
+    ``0`` on run records written before this field existed."""
 
 
 class ReadinessRequirement(_StrictBase):
@@ -233,8 +238,6 @@ class Task(_StrictBase):
     week closes."""
     weekly_deferrable: bool = False
     """OK to skip until next weekly window; deprioritized in EOW push."""
-    force_dispatch_in_eow: bool = False
-    """Override the EOW-runtime safety guard for this specific task."""
     max_tokens_override: int | None = Field(default=None, ge=1)
     """Per-task override of ``[task_caps].max_tokens_per_task``."""
     max_duration_s_override: float | None = Field(default=None, gt=0)

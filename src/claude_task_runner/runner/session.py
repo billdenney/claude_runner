@@ -65,25 +65,6 @@ CONTINUATION_PROMPT = "Continue where you left off."
 forward without restating the full task."""
 
 
-def claude_session_jsonl(session_id: str, *, claude_projects_dir: Path | None = None) -> Path:
-    """Return the conventional path to a Claude Code session JSONL.
-
-    Defaults to ``~/.claude/projects/<project>/<session_id>.jsonl``,
-    where ``<project>`` is derived from the cwd by Claude Code itself.
-    Since we only need to know whether the file *exists* to decide on
-    resumability, callers pass the projects dir directly.
-    """
-    base = (
-        claude_projects_dir
-        if claude_projects_dir is not None
-        else Path.home() / ".claude" / "projects"
-    )
-    # The actual path includes a project subdir we can't predict here
-    # without knowing the working_dir; callers either point us at a
-    # specific project dir, or we fall back to scanning.
-    return base / f"{session_id}.jsonl"
-
-
 def session_jsonl_exists(
     session_id: str,
     *,

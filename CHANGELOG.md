@@ -11,6 +11,18 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **`[failure_classifier]`'s three pattern lists, and the classifier that
+  never used them.** `environmental_patterns`, `operator_patterns` and
+  `task_patterns` fed `runner.retry.classify` (ADR-0012), which nothing
+  called. Every failed run is re-dispatched until
+  `failure_circuit_breaker_threshold` consecutive failures, whatever its error
+  says, so an `Operator: defer` failure was retried like any other. That is
+  unchanged. `classify` and `should_auto_resume` are gone, and a queue TOML
+  that still sets one of the lists is rejected at load with a message naming
+  it, like the settings below. **Before restarting a supervisor on this
+  version, delete the three lists from its `claude_runner.toml`.** The rest of
+  `[failure_classifier]` is unchanged.
+
 - **Settings that no code ever read are gone, and a queue TOML that still
   sets one no longer loads (breaking).** Every settings model is
   `extra="forbid"`, so each of these loaded without complaint and did nothing:
@@ -94,6 +106,21 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **Ten helpers that nothing in production called.** `runner.readiness.is_ready`
+  wrapped the live `unmet_requirements`. In `queue.sidecar`, `write_request` and
+  `next_sequence` duplicated what the agent does itself under the
+  `agent-stop-and-ask` skill, and `read_response` and `outstanding_question_ids`
+  duplicated the live readers, which work on raw payloads.
+  `runner.effort_levels` lost `accepted_efforts` and `accepted_models`, since
+  `queue add` calls `validate_effort`. `UnknownModel` went with them: only
+  `accepted_efforts` raised it, so the `unknown model:` branch in `queue add`
+  could never run. `queue add` still reports an unknown model as `invalid
+  effort: model ... has no effort levels configured`.
+  `runner.heartbeat.silence_window`, `runner.session.claude_session_jsonl` and
+  `cli.queue_cmd._emit` had no caller at all. Tests now write sidecar requests
+  with a helper under `tests/unit/`, and the task-template drift guard moved
+  into its test.
+
 - **Six empty packages, the `ui` extra and the Jinja2 task-templates
   promise.** `events/`, `logs/`, `metrics/`, `notify/`, `templates/` and `ui/`
   each held only an empty `__init__.py` from the initial commit, and nothing
@@ -107,6 +134,17 @@ Breaking changes are called out in the version notes.
   task templates into a `templates/` directory. Nothing reads one, Jinja2 is
   not a dependency, and ADR-0023 rejected a template engine. The wheel's
   `force-include` entry for `templates/` goes with the package.
+- **The `stopped` supervisor state, which nothing ever entered.** Only
+  `state_machine.request_stop` set it, and nothing called that function:
+  `supervisor stop` sends SIGTERM. `request_stop`, `request_resume` and
+  `all_states` go with the state, as do its sticky branch in `step()` and the
+  daemon loop's exit check. `supervisor.json` is now schema version 5. On load,
+  an older file that says `stopped`, at the top level or for an account,
+  becomes `idle`, the same way v4 retired `paused_weekly` and
+  `end_of_week_push`. Only a hand-edited file could say `stopped`. A runner
+  from before this change refuses a v5 file. To downgrade, set
+  `schema_version` back to 4; nothing else in the format changed.
+
 - **The unused `supervisor/window.py` module and its tests.** No module
   imported it, at module level or inside a function, so neither the CLI nor
   the supervisor daemon nor the runner could reach it. Its contents either
@@ -120,6 +158,14 @@ Breaking changes are called out in the version notes.
   `time_until_reset_s` had no caller, and the module's `FIVE_HOUR_LENGTH_S` and
   `SEVEN_DAY_LENGTH_S` duplicated `throttle.decision.FIVE_HOUR_LENGTH_S` and
   `throttle.curve.SEVEN_DAYS_S`. No setting, command or file format changes.
+
+- **`force_dispatch_in_eow`, a task field nothing read.** It overrode the
+  end-of-week push's runtime guard, and ADR-0022 removed that push. `Task`
+  rejects unknown keys, so `load_task` now drops this one from an existing task
+  YAML instead of refusing the file, and logs a warning naming the file (once
+  per file per process, since every tick reloads every task). A task that set
+  it dispatches exactly as before. `queue template` no longer lists it, and the
+  `runner-add-task` skill no longer names it as an example.
 
 ### Fixed
 
@@ -142,6 +188,62 @@ Breaking changes are called out in the version notes.
   a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
   script, and on a tracked file missing from the sdist. `hatchling` joins the
   `dev` extra so the test can build.
+- **Skipped stream-json lines are recorded and logged, not dropped silently.**
+  The parser skips a malformed line, or an event of a type it does not know, so
+  one bad line cannot abort a run. But nothing looked at the count, and the
+  `StreamWarning` meant to report it was never issued. Each run's `RunRecord`
+  now carries `skipped_stream_lines`, and the dispatcher logs a warning naming
+  the unknown event types, since a non-zero count can mean Claude Code's stream
+  format has drifted. `StreamWarning` is gone. Run records written before this
+  read as 0.
+- **The systemd unit now takes its restart policy from the queue's
+  `[watchdog]`.** `install` wrote `RestartSec=30`, `StartLimitBurst=5` and
+  `StartLimitIntervalSec=600` into the unit whatever the queue's
+  `claude_runner.toml` said, so its `[watchdog]` table did nothing under
+  systemd. The unit now gets `RestartSec` from
+  `[watchdog].restart_cooldown_s`, `StartLimitBurst` from
+  `[watchdog].crash_loop_threshold` and `StartLimitIntervalSec` from
+  `[watchdog].restart_backoff_max_s`. The package defaults are 30 s, 5 and
+  600 s, so a queue that does not set them gets the same unit as before,
+  byte for byte, and a test pins that. To apply a changed `[watchdog]` to an
+  installed unit, re-run `claude-task-runner install`. It rewrites the unit
+  and reloads systemd, and the next crash uses the new values without the
+  supervisor being restarted. That was checked on systemd 255 with a
+  throwaway unit. Once systemd has started the unit more than
+  `crash_loop_threshold` times within `restart_backoff_max_s`, it stops
+  restarting it. Unlike the cron watchdog, it does not back off and retry;
+  `systemctl --user reset-failed claude-task-runner` clears the limit.
+  Seconds are written as decimals rounded to systemd's one-microsecond
+  resolution, never in exponent form: Python writes `1e-05`, which systemd
+  cannot parse. systemd ignores a unit line it cannot parse, with only a
+  journal warning, and falls back to its own default (`RestartSec=100ms`).
+  So a value systemd cannot parse now stops `install` with exit 2 before
+  anything is written: an infinite span (the schema's `> 0` check lets
+  `inf` through), a span longer than 18,446,744,073,708 s, or a
+  `crash_loop_threshold` above 4,294,967,295. Where `systemd-analyze` is
+  installed, tests run the generated unit through `systemd-analyze verify`
+  and the written spans through `systemd-analyze timespan`. A known-answer
+  test checks that `verify` does report an ignored line. A test that walks
+  `WatchdogSettings` fails when a `[watchdog]` key has no unit line.
+  `build_unit_text` and `build_install_plan` now require a `watchdog`
+  argument and no longer take `restart_sec_s`, `start_limit_burst` or
+  `start_limit_interval_s`.
+
+  **The cron watchdog still ignores a queue's `[watchdog]`.** `watchdog.sh`
+  runs `watchdog tick` with no `--config`, so the tick uses the package
+  defaults, and a cron `install --config` is not recorded. Tests pin both
+  until a follow-up makes the tick load the managed queue's config.
+- **A relative `install --config` now reaches the systemd unit as the file
+  `install` checked.** `install --config rel.toml` loaded `rel.toml` from
+  the directory it ran in, but wrote `--config rel.toml` into the unit's
+  `ExecStart` and `ExecStop` as given, and the unit runs with
+  `WorkingDirectory=<queue>`. So the supervisor read `<queue>/rel.toml`. That
+  file was usually missing, so every start failed until the start limit
+  stopped the restarts, and at best it was not the file `install` had
+  checked. `install` now makes the path absolute before loading it. If
+  `systemctl --user cat claude-task-runner` shows a relative `--config`,
+  re-run `claude-task-runner install` from the directory that path is
+  relative to.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a

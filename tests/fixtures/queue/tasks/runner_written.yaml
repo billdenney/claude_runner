@@ -38,7 +38,6 @@ tags:
 - '~'
 weekly_critical: true
 weekly_deferrable: false
-force_dispatch_in_eow: true
 max_tokens_override: 2000000
 max_duration_s_override: 5400.5
 deliverable_paths:

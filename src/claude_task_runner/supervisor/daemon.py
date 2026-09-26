@@ -57,7 +57,7 @@ from claude_task_runner.supervisor.actions import (
     Notify,
     ScheduleWakeupAt,
 )
-from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+from claude_task_runner.supervisor.states import SupervisorSnapshot
 from claude_task_runner.throttle import policy as throttle_policy
 from claude_task_runner.usage.drift import (
     UsageCaptureSpawnError,
@@ -1034,10 +1034,6 @@ def start_daemon(
                         "drain complete: in_flight=0; exiting cleanly so a "
                         "fresh supervisor can pick up the queue"
                     )
-                    break
-
-                if snapshot.state is SupervisorState.STOPPED:
-                    logger.info("supervisor in STOPPED state; exiting loop")
                     break
 
                 wakeup = next_wakeup(actions)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import errno
 import io
+import logging
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from typing import Any
 
 import pytest
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
@@ -692,3 +693,47 @@ class TestRequireQueueDir:
         finally:
             locked.chmod(0o700)
         assert str(excinfo.value) == f"not an existing directory: {queue.resolve()}"
+
+
+class TestRetiredTaskKeys:
+    """``force_dispatch_in_eow`` left :class:`Task`; files that set it still load."""
+
+    def _write(self, tmp_path: Path, extra: str = "") -> Path:
+        path = tmp_path / "t1.yaml"
+        path.write_text(f"id: t1\ntitle: T\nprompt: p\n{extra}", encoding="utf-8")
+        return path
+
+    def test_retired_key_loads_with_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = self._write(tmp_path, "force_dispatch_in_eow: true\n")
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.queue.store"):
+            first = load_task(path)
+            second = load_task(path)  # the orchestrator reloads every tick
+        assert first == second
+        assert first.id == "t1"
+        assert "force_dispatch_in_eow" not in first.model_dump()
+        assert [r.getMessage() for r in caplog.records] == [
+            f"{path}: ignoring the retired key 'force_dispatch_in_eow' (it overrode the "
+            "end-of-week push's runtime guard, and ADR-0022 removed that push); "
+            "delete it from the file"
+        ]
+
+    def test_file_without_retired_key_logs_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.queue.store"):
+            load_task(self._write(tmp_path))
+        assert caplog.records == []
+
+    def test_the_model_itself_rejects_the_key(self) -> None:
+        """Only the loader forgives the key; no code can set it on a Task."""
+        with pytest.raises(ValidationError, match="force_dispatch_in_eow"):
+            Task.model_validate(
+                {"id": "t1", "title": "T", "prompt": "p", "force_dispatch_in_eow": True}
+            )
+
+    def test_other_unknown_keys_still_fail(self, tmp_path: Path) -> None:
+        path = self._write(tmp_path, "force_dispatch_in_eow_typo: true\n")
+        with pytest.raises(QueueSchemaError, match="force_dispatch_in_eow_typo"):
+            load_task(path)

@@ -87,15 +87,3 @@ def evaluate(
         return HeartbeatStatus(verdict=HeartbeatVerdict.SILENT, silence_s=silence)
 
     return HeartbeatStatus(verdict=HeartbeatVerdict.HEALTHY, silence_s=silence)
-
-
-def silence_window(
-    settings: TaskCapsSettings,
-) -> tuple[float, float | None]:
-    """Return ``(alert_threshold_s, kill_threshold_s | None)``.
-
-    Useful for telemetry / status dashboards that want to render the
-    same windows the runner is using.
-    """
-    kill = settings.heartbeat_silence_kill_s if settings.heartbeat_silence_kill_s > 0 else None
-    return settings.heartbeat_silence_alert_s, kill

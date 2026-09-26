@@ -2,11 +2,10 @@
 
 The state machine is a thin translator from the throttle package's
 :class:`Decision` into a ``(snapshot, actions)`` tuple plus the
-non-decision concerns (STOPPED stickiness, IDLE classification,
-ERROR_DRIFT routing, capture-error skip). The throttle math itself is
+non-decision concerns (IDLE classification, ERROR_DRIFT routing,
+capture-error skip). The throttle math itself is
 exercised in :mod:`tests.unit.test_decision`; here we cover:
 
-* STOPPED stickiness.
 * IDLE classification when there's no pending work and nothing in
   flight.
 * ERROR_DRIFT routing for :class:`UsageFormatDrift` /
@@ -18,8 +17,7 @@ exercised in :mod:`tests.unit.test_decision`; here we cover:
   :class:`ResolvedPolicy`.
 * Action and event emission on transitions.
 * Wakeup scheduling.
-* ``request_stop`` / ``request_resume``.
-* ``all_states`` enumerates the seven surviving states.
+* The state enum has exactly the six surviving states.
 
 Dropped tests (removed because the underlying mechanism no longer
 exists post-ADR-0022):
@@ -54,9 +52,6 @@ from claude_task_runner.supervisor.actions import (
 )
 from claude_task_runner.supervisor.state_machine import (
     StepInput,
-    all_states,
-    request_resume,
-    request_stop,
     step,
 )
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
@@ -727,104 +722,6 @@ class TestAuthExpired:
 
 
 # ----------------------------------------------------------------------------
-# Stop / Resume
-# ----------------------------------------------------------------------------
-
-
-class TestStopAndResume:
-    def test_stop_is_sticky(
-        self,
-        policy: ResolvedPolicy,
-        clock: FakeClock,
-        supervisor_settings: SupervisorSettings,
-        usage_settings: UsageSettings,
-    ) -> None:
-        """STOPPED never moves under :func:`step` — only
-        :func:`request_resume` returns to IDLE."""
-        snap = request_stop(_initial(), clock=clock)
-        assert snap.state is SupervisorState.STOPPED
-        reading = _reading(five_pct=10, weekly_pct=5)
-        new, actions = step(
-            _input(
-                snap,
-                reading,
-                policy,
-                supervisor_settings,
-                usage_settings,
-                pending=10,
-            ),
-            clock,
-        )
-        assert new.state is SupervisorState.STOPPED
-        assert MonitorInFlight in _action_types(actions)
-
-    def test_resume_returns_to_idle(self, clock: FakeClock) -> None:
-        snap = request_stop(_initial(), clock=clock)
-        snap = request_resume(snap, clock=clock)
-        assert snap.state is SupervisorState.IDLE
-
-    def test_resume_no_op_when_not_stopped(self, clock: FakeClock) -> None:
-        snap = _initial(SupervisorState.DISPATCHING)
-        out = request_resume(snap, clock=clock)
-        assert out is snap
-
-    @pytest.mark.parametrize(
-        "reading",
-        [
-            pytest.param(UsageFormatDrift("only 1 block found"), id="drift"),
-            pytest.param(
-                _reading(
-                    five_pct=80,
-                    weekly_pct=80,
-                    five_resets=datetime(2026, 5, 4, 13, 0, tzinfo=UTC),
-                    weekly_resets=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
-                ),
-                id="clean-80pct",
-            ),
-            pytest.param(UsageCaptureTimeout("slow"), id="capture-timeout"),
-            pytest.param(UsageCaptureSpawnError("missing"), id="spawn-error"),
-            pytest.param(UsageApiAuthExpired("HTTP 401"), id="auth-expired"),
-        ],
-    )
-    def test_stopped_is_sticky_under_various_readings(
-        self,
-        reading,
-        policy: ResolvedPolicy,
-        clock: FakeClock,
-        supervisor_settings: SupervisorSettings,
-        usage_settings: UsageSettings,
-    ) -> None:
-        """STOPPED short-circuits ahead of every reading classifier
-        (drift, clean-but-high utilization, capture errors, auth-expired)
-        and returns exactly ``[MonitorInFlight()]`` with the snapshot
-        unchanged. Only :func:`request_resume` leaves STOPPED."""
-        snap = request_stop(_initial(SupervisorState.THROTTLED_5H), clock=clock)
-        assert snap.state is SupervisorState.STOPPED
-
-        new, actions = step(
-            _input(
-                snap,
-                reading,
-                policy,
-                supervisor_settings,
-                usage_settings,
-                pending=10,
-                in_flight=3,
-            ),
-            clock,
-        )
-
-        # Stays STOPPED — the snapshot is returned untouched (same
-        # object: the STOPPED branch returns ``snapshot`` directly).
-        assert new is snap
-        assert new.state is SupervisorState.STOPPED
-        # The exact emitted command set is a single MonitorInFlight — no
-        # StopDispatch, no Notify, no EmitEvent leak through the sticky
-        # short-circuit.
-        assert actions == [MonitorInFlight()]
-
-
-# ----------------------------------------------------------------------------
 # State-transition events
 # ----------------------------------------------------------------------------
 
@@ -938,6 +835,43 @@ class TestWakeupScheduling:
         assert wakeups[0].when == expected
         assert new.scheduled_wakeup_at == expected
 
+    def test_throttled_5h_unparseable_reset_schedules_fallback_wakeup(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """With no parseable 5h ``resets_at`` the wakeup falls back to one
+        full 5h window from now, plus ``window_start_delay_s``."""
+        # 450s is neither the 300s default nor poll_interval_s, so the
+        # expected time also proves step() passes this setting through.
+        settings = supervisor_settings.model_copy(update={"window_start_delay_s": 450.0})
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(
+            five_pct=80,
+            weekly_pct=5,
+            five_resets=None,  # the 5h reset time did not parse
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(
+                snap,
+                reading,
+                policy,
+                settings,
+                usage_settings,
+                pending=2,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.THROTTLED_5H
+        wakeups = [a for a in actions if isinstance(a, ScheduleWakeupAt)]
+        assert len(wakeups) == 1
+        expected = clock.now() + timedelta(hours=5, seconds=450)
+        assert wakeups[0].when == expected
+        assert new.scheduled_wakeup_at == expected
+
     def test_dispatching_clears_wakeup(
         self,
         policy: ResolvedPolicy,
@@ -978,27 +912,27 @@ class TestWakeupScheduling:
 
 
 class TestAllStates:
-    def test_all_states_returns_seven_surviving_states(self) -> None:
-        """ADR-0022 drops ``PAUSED_WEEKLY`` and ``END_OF_WEEK_PUSH``;
-        seven surviving states remain."""
-        states = list(all_states())
+    def test_six_surviving_states(self) -> None:
+        """ADR-0022 dropped ``PAUSED_WEEKLY`` and ``END_OF_WEEK_PUSH``, and
+        ``STOPPED`` went because nothing entered it; six states remain."""
+        states = list(SupervisorState)
         expected = {
             SupervisorState.IDLE,
             SupervisorState.DISPATCHING,
             SupervisorState.SLOWING_DOWN,
             SupervisorState.THROTTLED_5H,
             SupervisorState.THROTTLED_WEEKLY,
-            SupervisorState.STOPPED,
             SupervisorState.ERROR_DRIFT,
         }
         assert set(states) == expected
-        assert len(states) == 7
+        assert len(states) == 6
 
     def test_dropped_states_no_longer_in_enum(self) -> None:
-        """``paused_weekly`` and ``end_of_week_push`` are gone."""
+        """``paused_weekly``, ``end_of_week_push`` and ``stopped`` are gone."""
         values = {s.value for s in SupervisorState}
         assert "paused_weekly" not in values
         assert "end_of_week_push" not in values
+        assert "stopped" not in values
 
 
 # ----------------------------------------------------------------------------
@@ -1008,15 +942,12 @@ class TestAllStates:
 
 class TestIdleFromEveryState:
     """When ``pending==0 and in_flight==0`` and the reading is clean, the
-    step function classifies to IDLE — from every prior state, with two
-    documented exceptions baked into the machine:
-
-    * STOPPED is sticky (only ``request_resume`` leaves it).
-    * ERROR_DRIFT must first clear ``drift_recovery_clean_polls`` clean
-      polls in a row before any further classification (IDLE included)
-      can fire; this test primes the counter so the threshold is met on
-      the tick under test, exercising the fall-through into the IDLE
-      branch.
+    step function classifies to IDLE — from every prior state, with one
+    documented exception baked into the machine: ERROR_DRIFT must first
+    clear ``drift_recovery_clean_polls`` clean polls in a row before any
+    further classification (IDLE included) can fire. This test primes
+    the counter so the threshold is met on the tick under test,
+    exercising the fall-through into the IDLE branch.
 
     Enumerates the full :class:`SupervisorState` enum so a newly-added
     state can't silently skip the IDLE classification.
@@ -1058,15 +989,10 @@ class TestIdleFromEveryState:
             clock,
         )
 
-        if prior is SupervisorState.STOPPED:
-            # Sticky: never reaches the IDLE check.
-            assert new.state is SupervisorState.STOPPED
-            assert actions == [MonitorInFlight()]
-        else:
-            assert new.state is SupervisorState.IDLE, (
-                f"prior={prior.value} should classify to IDLE with no work"
-            )
-            assert MonitorInFlight in _action_types(actions)
-            # IDLE entry zeroes the drift bookkeeping.
-            assert new.consecutive_clean_polls == 0
-            assert new.last_drift_message == ""
+        assert new.state is SupervisorState.IDLE, (
+            f"prior={prior.value} should classify to IDLE with no work"
+        )
+        assert MonitorInFlight in _action_types(actions)
+        # IDLE entry zeroes the drift bookkeeping.
+        assert new.consecutive_clean_polls == 0
+        assert new.last_drift_message == ""

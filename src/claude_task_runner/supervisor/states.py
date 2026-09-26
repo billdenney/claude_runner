@@ -11,7 +11,8 @@ Schema versions
 ``schema_version`` (Task / TaskState / RunRecord). v2 was the single-
 account snapshot; v3 adds per-account state alongside the legacy
 single-account fields; v4 (ADR-0022) drops the ``paused_weekly`` and
-``end_of_week_push`` states. The legacy top-level fields remain
+``end_of_week_push`` states; v5 drops ``stopped``, which nothing ever
+entered. The legacy top-level fields remain
 populated (mirrored from ``accounts[<active>]`` after each tick).
 """
 
@@ -22,20 +23,25 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SUPERVISOR_SCHEMA_VERSION = 4
+SUPERVISOR_SCHEMA_VERSION = 5
 """Supervisor.json schema version.
 
 Bumped from 3 to 4 (ADR-0022) when ``paused_weekly`` and
 ``end_of_week_push`` were dropped from :class:`SupervisorState`.
 The persistence layer rewrites those values to ``idle`` and clears
 ``scheduled_wakeup_at`` so the next tick reclassifies under the new
-trace-following rule."""
+trace-following rule.
+
+Bumped from 4 to 5 when ``stopped`` was dropped. Nothing ever entered it:
+``supervisor stop`` sends SIGTERM, and the ``request_stop`` helper that
+set it had no caller. The persistence layer rewrites a persisted
+``stopped`` to ``idle``."""
 
 
 class SupervisorState(StrEnum):
     """The high-level state machine vertices.
 
-    Continuous spectrum (FULL/SLOW/STOPPED) of the 5h dispatch_pct
+    Continuous spectrum (full / slowdown / stop) of the 5h dispatch_pct
     bands maps onto separate states only for telemetry clarity —
     see ADR-0022 and :mod:`claude_task_runner.throttle.decision`.
     """
@@ -68,9 +74,6 @@ class SupervisorState(StrEnum):
 
     ERROR_DRIFT = "error_drift"
     """Last poll raised UsageFormatDrift; require N clean polls to recover."""
-
-    STOPPED = "stopped"
-    """Operator-issued stop. Manual intervention required to resume."""
 
 
 class AccountState(BaseModel):

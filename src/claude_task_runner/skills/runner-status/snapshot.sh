@@ -91,7 +91,7 @@ echo ""
 # `account` attribution), 5h + weekly reset, scheduled wakeup,
 # and last `/usage` capture timestamp.
 #
-# Expects supervisor.json v3 (`schema_version: 3`). v2 files are
+# Expects supervisor.json v3 or later (`schema_version` >= 3). v2 files are
 # auto-migrated by the persistence layer at daemon load time. If
 # this section reports "(no accounts map)", the file is either v2
 # (start the supervisor once to migrate) or a brand-new snapshot

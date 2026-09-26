@@ -19,8 +19,9 @@ from claude_task_runner.queue.schema import (
     SidecarQuestion,
     SidecarRequest,
 )
-from claude_task_runner.queue.sidecar import write_request
 from claude_task_runner.queue.store import queue_runtime_dir
+
+from ._sidecar_files import write_request
 
 
 @pytest.fixture

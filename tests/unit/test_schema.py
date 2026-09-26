@@ -52,7 +52,6 @@ class TestTask:
         assert t.tags == []
         assert t.weekly_critical is False
         assert t.weekly_deferrable is False
-        assert t.force_dispatch_in_eow is False
 
     def test_empty_id_rejected(self) -> None:
         with pytest.raises(ValidationError):

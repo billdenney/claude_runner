@@ -46,3 +46,17 @@ Built-in defaults cover the existing patterns from `run.sh`.
 
 High. Reverting to hardcoded patterns is a 1-line change in
 `runner.retry.classify`.
+
+## Update (2026-09-26)
+
+Nothing ever called `runner.retry.classify` or `should_auto_resume`. The
+orchestrator re-dispatches every `failed` task whatever its error text, and
+the circuit breaker (`[failure_classifier].failure_circuit_breaker_threshold`
+consecutive failed runs) is what stops the retries. So
+`environmental_patterns`, `operator_patterns` and `task_patterns` changed
+nothing: an `Operator: defer` failure was retried like any other. The two
+functions and the three lists have been removed, and the loader rejects a
+queue TOML that still sets a list with a message saying to delete it.
+Deleting them changes nothing. The rest of `[failure_classifier]` (the
+circuit-breaker threshold, `deferral_recheck_cooldown_s` and
+`sidecar_refile_loop_threshold`) is unchanged.

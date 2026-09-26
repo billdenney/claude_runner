@@ -7,10 +7,8 @@ change as Anthropic adds or removes them. We never hardcode them as a
 Public surface:
 
 * :func:`validate_effort` — raise :class:`UnknownEffortLevel` if the
-  given ``(model, effort)`` is not in the configured set.
-* :func:`accepted_efforts` — return the configured list for a model.
-* :func:`accepted_models` — return the list of models with configured
-  effort sets.
+  given ``(model, effort)`` is not in the configured set, including a
+  model with no configured set at all.
 """
 
 from __future__ import annotations
@@ -37,35 +35,6 @@ class UnknownEffortLevel(ValueError):
             super().__init__(
                 f"effort {effort!r} not in accepted set for model {model!r}: {sorted(accepted)}"
             )
-
-
-class UnknownModel(ValueError):
-    """The given model is not in the effort_levels mapping at all."""
-
-    def __init__(self, model: str, known: list[str]) -> None:
-        self.model = model
-        self.known = known
-        super().__init__(
-            f"model {model!r} has no effort_levels configured. Known models: {sorted(known)}"
-        )
-
-
-def accepted_efforts(
-    model: str,
-    effort_levels: dict[str, list[str]],
-) -> list[str]:
-    """Return the accepted-effort list for a model.
-
-    Raises :class:`UnknownModel` if the model isn't keyed in the mapping.
-    """
-    if model not in effort_levels:
-        raise UnknownModel(model, list(effort_levels))
-    return list(effort_levels[model])
-
-
-def accepted_models(effort_levels: dict[str, list[str]]) -> list[str]:
-    """Return all models that have at least one configured effort."""
-    return sorted(m for m, lst in effort_levels.items() if lst)
 
 
 def validate_effort(

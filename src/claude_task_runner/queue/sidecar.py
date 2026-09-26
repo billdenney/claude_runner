@@ -12,8 +12,10 @@ response on its next tick and resumes the task.
 
 This module provides:
 
-* Sequence numbering: a task may have multiple request/response rounds.
-* Atomic JSON writes (mirror of ``queue.store``).
+* Paths for a task's numbered request/response rounds. The agent picks
+  each request's number and writes the request itself (see the
+  ``agent-stop-and-ask`` skill).
+* Atomic JSON writes of responses (mirror of ``queue.store``).
 * Pairing helpers: list open sidecars. Openness is decided PER QUESTION --
   a request is open while any question id it asked is missing from its
   response's ``answers``, so a partial answer leaves the rest visible.
@@ -67,21 +69,6 @@ def response_path(queue_dir: Path, task_id: str, sequence: int) -> Path:
     return sidecar_dir_for(queue_dir, task_id) / f"response-{sequence:03d}.json"
 
 
-def next_sequence(queue_dir: Path, task_id: str) -> int:
-    """Compute the next free request sequence number for a task.
-
-    Walks the existing ``request-NNN.json`` files and returns ``max+1``,
-    or ``1`` if none exist. Sequence is task-scoped, not queue-scoped.
-    """
-    base = sidecar_dir_for(queue_dir, task_id)
-    existing: list[int] = []
-    for p in base.iterdir():
-        m = _REQUEST_RE.match(p.name)
-        if m is not None:
-            existing.append(int(m.group(1)))
-    return max(existing, default=0) + 1
-
-
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     parent = path.parent
     if not parent.exists():
@@ -99,22 +86,6 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         os.fsync(tmp.fileno())
         tmp_path = Path(tmp.name)
     os.replace(tmp_path, path)
-
-
-def write_request(queue_dir: Path, request: SidecarRequest) -> Path:
-    """Write a SidecarRequest JSON. Returns the resulting file path.
-
-    Uses ``request.sequence`` as-is. Caller is responsible for using
-    :func:`next_sequence` if they want monotonic numbering.
-    """
-    if request.schema_version != CURRENT_SCHEMA_VERSION:
-        raise QueueSchemaError(
-            f"refusing to write SidecarRequest with schema_version="
-            f"{request.schema_version}, current is {CURRENT_SCHEMA_VERSION}"
-        )
-    path = request_path(queue_dir, request.task_id, request.sequence)
-    _write_json_atomic(path, request.model_dump(mode="json"))
-    return path
 
 
 def write_response(queue_dir: Path, response: SidecarResponse) -> Path:
@@ -139,20 +110,6 @@ def read_request(path: Path) -> SidecarRequest:
         raise QueueSchemaError(f"{path}: invalid JSON: {exc}") from exc
     try:
         return SidecarRequest.model_validate(payload)
-    except ValidationError as exc:
-        raise QueueSchemaError(f"{path}: {exc}") from exc
-
-
-def read_response(path: Path) -> SidecarResponse:
-    try:
-        with path.open("rb") as fh:
-            payload = json.load(fh)
-    except OSError as exc:
-        raise QueueIOError(f"failed to read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise QueueSchemaError(f"{path}: invalid JSON: {exc}") from exc
-    try:
-        return SidecarResponse.model_validate(payload)
     except ValidationError as exc:
         raise QueueSchemaError(f"{path}: {exc}") from exc
 
@@ -287,19 +244,6 @@ def answered_question_ids(payload: Any) -> set[str]:
     if not isinstance(answers, list):
         raise QueueSchemaError(f"response 'answers' is not a list: {type(answers).__name__}")
     return {aid for aid in (_identifier(a) for a in answers) if aid is not None}
-
-
-def outstanding_question_ids(request_payload: Any, response_payload: Any | None) -> list[str]:
-    """Asked ids that ``response_payload`` does not answer, in asked order.
-
-    ``response_payload=None`` means no response file exists, so every asked
-    id is outstanding.
-    """
-    asked = asked_question_ids(request_payload)
-    if response_payload is None:
-        return asked
-    answered = answered_question_ids(response_payload)
-    return [qid for qid in asked if qid not in answered]
 
 
 def load_sidecar_payload(path: Path) -> Any:

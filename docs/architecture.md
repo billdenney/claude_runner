@@ -85,7 +85,6 @@ States in `supervisor/states.py`:
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
 - `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
-- `Stopped` — operator-issued stop.
 
 The state machine itself (`supervisor/state_machine.py`) is a thin
 wrapper that translates the result of `throttle.decision.decide()`
@@ -229,7 +228,8 @@ These properties are never violated; tests and assertions enforce them.
 
 Operators extend behavior without code changes:
 
-- **Failure patterns**: edit `[failure_classifier]` in `claude_runner.toml`.
+- **Retry limit**: `[failure_classifier].failure_circuit_breaker_threshold`
+  caps how many runs in a row a task may fail before it stops being retried.
 - **Effort levels**: edit `[effort_levels]` in `claude_runner.toml`.
 - **Pre/post-dispatch hooks**: set `[hooks].pre_dispatch_command` and
   `post_dispatch_command`.
