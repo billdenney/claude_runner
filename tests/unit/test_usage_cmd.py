@@ -9,19 +9,26 @@ every code path is exercised without ever touching Claude.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
+from claude_task_runner.cli import app as cli_app
 from claude_task_runner.cli.usage_cmd import _bar, _default_captures_dir, app
+from claude_task_runner.clock import FakeClock
 from claude_task_runner.usage.drift import (
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "usage"
+
+_NOW = datetime(2026, 5, 3, 12, 0, tzinfo=UTC)
+"""The time that ``render`` prints in the no-subcommand tests."""
 
 
 @pytest.fixture
@@ -120,12 +127,50 @@ def test_render_happy_path(runner: CliRunner, fixture_bytes: bytes, tmp_path: Pa
     assert "20%" in result.stdout
 
 
-# The "no subcommand → render" path uses ctx.invoke(render) inside the
-# root callback. Typer's CliRunner doesn't propagate the Context to
-# `render`'s `ctx` arg cleanly in this case (the operator-facing CLI
-# works fine because Typer's real dispatch goes through a different
-# code path). We rely on the explicit ``usage render`` invocation
-# tested above to exercise the same logic.
+@pytest.mark.parametrize(
+    ("root", "group"), [(app, []), (cli_app, ["usage"])], ids=["usage app", "entry point"]
+)
+def test_no_subcommand_runs_render(
+    runner: CliRunner, fixture_bytes: bytes, tmp_path: Path, root: typer.Typer, group: list[str]
+) -> None:
+    """``usage`` with no subcommand prints what ``usage render`` prints.
+
+    The callback called ``ctx.invoke(render)``. Click calls a plain
+    function with only the arguments given, so ``render`` never got its
+    ``ctx``, and from v0.1.0 on ``claude-task-runner usage`` crashed with
+    a TypeError.
+    """
+    with (
+        patch("claude_task_runner.cli.usage_cmd.RealClock", return_value=FakeClock(_NOW)),
+        patch(
+            "claude_task_runner.cli.usage_cmd.capture_mod.capture",
+            return_value=(fixture_bytes, tmp_path / "fake.cap"),
+        ) as capture,
+    ):
+        bare = runner.invoke(root, group)
+        explicit = runner.invoke(root, [*group, "render"])
+    assert bare.exit_code == 0, bare.exception
+    assert explicit.exit_code == 0, explicit.exception
+    assert capture.call_count == 2
+    assert "Claude Code Usage  2026-05-03 12:00:00 UTC" in bare.stdout
+    assert bare.stdout == explicit.stdout
+
+
+@pytest.mark.parametrize(
+    ("root", "group"), [(app, []), (cli_app, ["usage"])], ids=["usage app", "entry point"]
+)
+def test_no_subcommand_exits_as_render_does(
+    runner: CliRunner, root: typer.Typer, group: list[str]
+) -> None:
+    with patch(
+        "claude_task_runner.cli.usage_cmd.capture_mod.capture",
+        side_effect=UsageCaptureTimeout("TUI did not become ready"),
+    ):
+        bare = runner.invoke(root, group)
+        explicit = runner.invoke(root, [*group, "render"])
+    assert bare.exit_code == 2, bare.exception
+    assert explicit.exit_code == 2, explicit.exception
+    assert bare.stdout == explicit.stdout == "capture timeout: TUI did not become ready\n"
 
 
 def test_render_spawn_error(runner: CliRunner) -> None:

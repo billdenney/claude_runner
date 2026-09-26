@@ -78,7 +78,15 @@ def _packaged_skill_dir(name: str) -> Path:
     Used both for symlink targets (where the package lives matters) and
     copy sources.
     """
-    pkg = resources.files("claude_task_runner.skills") / name
+    try:
+        pkg = resources.files("claude_task_runner.skills") / name
+    except ModuleNotFoundError as exc:
+        # A wheel built without ``skills/`` has no package to import.
+        # Raised as the missing-skill error the callers handle.
+        raise FileNotFoundError(
+            f"packaged skill {name!r} not found: "
+            f"the claude_task_runner.skills package is missing ({exc})"
+        ) from exc
     # ``files()`` returns a Traversable; coerce to a Path. For an
     # editable install this is the source tree; for a wheel install
     # it's the package's directory in site-packages.
@@ -169,7 +177,13 @@ def install_skills(
         try:
             src = _packaged_skill_dir(name)
         except FileNotFoundError as exc:
-            console.print(f"[bold red]missing skill:[/] {exc}")
+            console.print(
+                f"missing skill: {exc}",
+                style="bold red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
             raise typer.Exit(code=2) from exc
         plan.append((name, src))
 
@@ -185,6 +199,9 @@ def install_skills(
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
 
+    # A failed skill does not stop the rest, so every failure is
+    # reported; the exit code then says the install is incomplete.
+    failed = 0
     for name, _src in plan:
         try:
             installed, detail = _install_one(
@@ -194,10 +211,20 @@ def install_skills(
                 overwrite=overwrite,
             )
         except OSError as exc:
-            console.print(f"[bold red]{name}:[/] {exc}")
+            failed += 1
+            console.print(
+                f"  failed to install {name}: {exc}",
+                style="bold red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
             continue
         marker = "[green]installed[/]" if installed else "[dim]skipped[/]"
         console.print(f"  {marker} {name}: {detail}")
+    if failed:
+        console.print(f"[bold red]Failed to install {failed} of {len(plan)} skills.[/]")
+        raise typer.Exit(code=2)
 
 
 @app.command("uninstall")
@@ -228,6 +255,7 @@ def uninstall_skills(
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
 
+    failed = 0
     for name in present:
         path = target / name
         try:
@@ -236,9 +264,19 @@ def uninstall_skills(
             else:
                 shutil.rmtree(path)
         except OSError as exc:
-            console.print(f"[red]failed to remove {name}: {exc}[/]")
+            failed += 1
+            console.print(
+                f"  failed to remove {name}: {exc}",
+                style="red",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
             continue
         console.print(f"  [green]removed[/] {name}")
+    if failed:
+        console.print(f"[bold red]Failed to remove {failed} of {len(present)} skills.[/]")
+        raise typer.Exit(code=2)
 
 
 @app.command("list")

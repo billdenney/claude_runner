@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -169,7 +170,8 @@ class ApiUsageSource:
             Credentials missing, malformed, or 401/403 from the API.
         UsageApiHeaderMissing
             The response was OK but didn't carry the documented
-            rate-limit headers.
+            rate-limit headers, or one's value cannot become a reading
+            (unparseable, not finite, or out of range).
         UsageApiNetworkError
             Connection failed, TLS failed, DNS failed, or any non-
             auth HTTP error code.
@@ -271,7 +273,8 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
 
     Raises :class:`UsageApiHeaderMissing` if any of the four required
     headers (``-5h-utilization``, ``-5h-reset``, ``-7d-utilization``,
-    ``-7d-reset``) is absent or unparseable.
+    ``-7d-reset``) is absent or has a value :func:`_window_from_headers`
+    rejects.
 
     Header lookup is case-insensitive — ``urllib`` preserves the wire
     casing, which can vary by HTTP/2 vs 1.1 framing.
@@ -323,10 +326,12 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
     assert week_util_raw is not None
     assert week_reset_raw is not None
     five_h = _window_from_headers(
+        window="5h",
         utilization=five_h_util_raw,
         reset=five_h_reset_raw,
     )
     week = _window_from_headers(
+        window="7d",
         utilization=week_util_raw,
         reset=week_reset_raw,
     )
@@ -337,23 +342,56 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
     )
 
 
-def _window_from_headers(*, utilization: str, reset: str) -> WindowReading:
+def _window_from_headers(*, window: str, utilization: str, reset: str) -> WindowReading:
     """Parse one window's util + reset headers into a :class:`WindowReading`.
 
     Utilization arrives as a float in [0.0, 1.0]; the schema field is
     an int in [0, 100] so we multiply and round. Reset arrives as a
-    Unix timestamp (seconds since epoch).
+    Unix timestamp (seconds since epoch). ``window`` (``"5h"`` or
+    ``"7d"``) names the headers in error messages.
+
+    Every value that cannot become a reading raises
+    :class:`UsageApiHeaderMissing`: a non-number, a utilization that is
+    not finite once scaled or that rounds outside [0, 100], and a reset
+    that ``datetime`` cannot represent. That is the error
+    ``api_then_tty`` falls through on and the daemon's ``safe_poll``
+    routes; anything else skips the TTY fall-through and ends the
+    daemon's tick loop.
     """
+    util_header = f"anthropic-ratelimit-unified-{window}-utilization"
+    reset_header = f"anthropic-ratelimit-unified-{window}-reset"
     try:
-        util_pct = max(0, min(100, round(float(utilization) * 100)))
+        ratio = float(utilization)
     except (TypeError, ValueError) as exc:
         raise UsageApiHeaderMissing(
-            f"unparseable utilization header value {utilization!r}: {exc}"
+            f"unparseable {util_header} header value {utilization!r}: {exc}"
         ) from exc
+    # float() accepts "nan", "inf" and "1e400" (which overflows to inf),
+    # and a finite ratio can overflow once scaled: 1e308 * 100 is inf.
+    # round() raises OverflowError on an infinity, so check first.
+    scaled = ratio * 100
+    if not math.isfinite(scaled):
+        raise UsageApiHeaderMissing(
+            f"{util_header} value {utilization!r} is not a finite percentage"
+        )
+    util_pct = round(scaled)
+    # Out of range is drift, as in the TTY parser, not clamped: a percent
+    # sent where the ratio belongs ("42.5") must not read as 100%.
+    # Checking the rounded value lets float noise under half a percent in.
+    if not 0 <= util_pct <= 100:
+        raise UsageApiHeaderMissing(
+            f"{util_header} value {utilization!r} is {util_pct}%, outside [0, 100]"
+        )
     try:
         resets_at = datetime.fromtimestamp(int(reset), tz=UTC)
-    except (TypeError, ValueError) as exc:
-        raise UsageApiHeaderMissing(f"unparseable reset header value {reset!r}: {exc}") from exc
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        # fromtimestamp raises ValueError for a year outside 1..9999,
+        # OverflowError past the platform's time_t, and OSError when the
+        # C library's gmtime rejects a value that fits time_t (errno 75
+        # at 2**63 - 1 on Linux).
+        raise UsageApiHeaderMissing(
+            f"unparseable {reset_header} header value {reset!r}: {exc}"
+        ) from exc
     return WindowReading(
         utilization_pct=util_pct,
         resets_at_raw=str(reset),

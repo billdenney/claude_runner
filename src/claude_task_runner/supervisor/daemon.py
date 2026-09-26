@@ -15,8 +15,11 @@ restart recovery is done by :func:`supervisor.adoption.adopt_running_workers`,
 which re-attaches a monitor thread to each still-running file-backed
 worker (tailing its log to completion); the broad demotion sweep in
 :func:`supervisor.reconcile.reconcile_orphans` then only demotes the
-survivors that could NOT be adopted. With adoption off, every running
-orphan is demoted for a session-resume re-dispatch, as before.
+survivors that could NOT be adopted. A worker that finished before this
+supervisor started is recorded from its stream log first, by
+:func:`supervisor.adoption.finalize_exited_workers`. With adoption off,
+every running orphan is demoted for a session-resume re-dispatch, as
+before.
 
 Driving a single tick is done by :func:`run_one_tick`, which is what
 tests exercise. The full daemon loop in :func:`run_forever` adds
@@ -672,6 +675,48 @@ def start_daemon(
                         len(corrupt_results),
                         sorted(cr.task_id for cr in corrupt_results),
                     )
+
+            # Exited-worker finalize (ADR-0025, amended 2026-09-26): must
+            # precede the silent-orphan reaper and reconcile_orphans. A
+            # file-backed worker that finished after the last supervisor
+            # stopped leaves its task "running" with a dead pid, and those
+            # passes would park it possibly_hung or demote it for a
+            # re-dispatch although its work is done. Its stream log holds
+            # the terminal result event, so record the run from the log,
+            # as the adoption monitor would have. A dead worker with no
+            # result event crashed and is left to the passes below. The
+            # snapshot's in_flight records are still the previous
+            # supervisor's here, and name each task's dispatch account.
+            exited = adoption_mod.finalize_exited_workers(
+                queue_dir,
+                settings=settings,
+                clock=clk,
+                prior_in_flight=snapshot.in_flight,
+            )
+            for ex in exited:
+                if notify_callback is not None:
+                    notify_callback(
+                        "info",
+                        f"recorded exited worker for task {ex.task_id} from its log "
+                        f"(pid={ex.pid}): status={ex.status} stop_reason={ex.stop_reason}",
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "exited_worker_finalized",
+                        {
+                            "task_id": ex.task_id,
+                            "pid": ex.pid,
+                            "log_path": ex.log_path,
+                            "status": ex.status,
+                            "stop_reason": ex.stop_reason,
+                        },
+                    )
+            if exited:
+                logger.info(
+                    "recorded %d worker(s) that exited while no supervisor ran: %s",
+                    len(exited),
+                    sorted(ex.task_id for ex in exited),
+                )
 
             # Silent-orphan reaper (must precede reconcile_orphans):
             # walks in-flight state YAMLs and grades each by heartbeat
