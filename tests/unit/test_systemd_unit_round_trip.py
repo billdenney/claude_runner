@@ -53,8 +53,9 @@ _QUEUE = "/srv/queue"
 _CONFIG = "/srv/queue/claude_runner.toml"
 _SUPERVISOR_COMMAND = f"{_BINARY} supervisor start --queue {_QUEUE} --config {_CONFIG}"
 
-# The unit's restart policy does not affect its Exec lines.
+# The unit's restart policy and stop timeout do not affect its Exec lines.
 _WATCHDOG = load_settings(None).watchdog
+_TASK_CAPS = load_settings(None).task_caps
 
 # Click/Typer usage-error exit code (unknown option, missing required
 # arg, etc.). Distinct from runtime exit codes the commands raise
@@ -104,7 +105,10 @@ class TestExecStartRoundTrip:
     def test_argv_shape(self) -> None:
         """ExecStart parses to ``start`` + the emitted flags."""
         text = build_unit_text(
-            supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE), watchdog=_WATCHDOG
+            supervisor_command=_SUPERVISOR_COMMAND,
+            queue_dir=Path(_QUEUE),
+            watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
         )
         prefix, argv = _split_exec_line(_exec_line(text, "ExecStart"))
         # No prefix: a supervisor that fails must still count as failed.
@@ -122,7 +126,10 @@ class TestExecStartRoundTrip:
         exit code 2 before the body ever ran.
         """
         text = build_unit_text(
-            supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE), watchdog=_WATCHDOG
+            supervisor_command=_SUPERVISOR_COMMAND,
+            queue_dir=Path(_QUEUE),
+            watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
         )
         _, argv = _split_exec_line(_exec_line(text, "ExecStart"))
 
@@ -156,6 +163,7 @@ class TestExecStopDrainRoundTrip:
             supervisor_command=_SUPERVISOR_COMMAND,
             queue_dir=Path(_QUEUE),
             watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
             adopt_workers=False,
         )
         prefix, argv = _split_exec_line(_exec_line(text, "ExecStop"))
@@ -176,7 +184,11 @@ class TestExecStopDrainRoundTrip:
         # lookup resolves to a writable, definitely-empty directory.
         cmd = f"{_BINARY} supervisor start --queue {tmp_path} --config {tmp_path}/c.toml"
         text = build_unit_text(
-            supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG, adopt_workers=False
+            supervisor_command=cmd,
+            queue_dir=tmp_path,
+            watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
+            adopt_workers=False,
         )
         prefix, argv = _split_exec_line(_exec_line(text, "ExecStop"))
         assert "--config" in argv  # the regression guard
@@ -211,7 +223,10 @@ class TestExecStopFastStopRoundTrip:
     def test_argv_shape(self) -> None:
         """ExecStop is the ``start`` line with ``start`` swapped to ``stop``."""
         text = build_unit_text(
-            supervisor_command=_SUPERVISOR_COMMAND, queue_dir=Path(_QUEUE), watchdog=_WATCHDOG
+            supervisor_command=_SUPERVISOR_COMMAND,
+            queue_dir=Path(_QUEUE),
+            watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
         )
         prefix, argv = _split_exec_line(_exec_line(text, "ExecStop"))
         assert prefix == "-"
@@ -226,7 +241,9 @@ class TestExecStopFastStopRoundTrip:
         rejected flag would be exit code 2.
         """
         cmd = f"{_BINARY} supervisor start --queue {tmp_path} --config {tmp_path}/c.toml"
-        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG)
+        text = build_unit_text(
+            supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG, task_caps=_TASK_CAPS
+        )
         prefix, argv = _split_exec_line(_exec_line(text, "ExecStop"))
         assert argv[0] == "stop"
         assert "--config" in argv  # the regression guard for the new flag
@@ -248,7 +265,9 @@ class TestExecStartWithoutConfig:
 
     def test_start_and_stop_accept_queue_only(self, runner: CliRunner, tmp_path: Path) -> None:
         cmd = f"{_BINARY} supervisor start --queue {tmp_path}"
-        text = build_unit_text(supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG)
+        text = build_unit_text(
+            supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG, task_caps=_TASK_CAPS
+        )
 
         start = _split_exec_line(_exec_line(text, "ExecStart"))
         assert start == ("", ["start", "--queue", str(tmp_path)])
@@ -263,7 +282,11 @@ class TestExecStartWithoutConfig:
     def test_start_and_drain_accept_queue_only(self, runner: CliRunner, tmp_path: Path) -> None:
         cmd = f"{_BINARY} supervisor start --queue {tmp_path}"
         text = build_unit_text(
-            supervisor_command=cmd, queue_dir=tmp_path, watchdog=_WATCHDOG, adopt_workers=False
+            supervisor_command=cmd,
+            queue_dir=tmp_path,
+            watchdog=_WATCHDOG,
+            task_caps=_TASK_CAPS,
+            adopt_workers=False,
         )
 
         prefix, stop_argv = _split_exec_line(_exec_line(text, "ExecStop"))

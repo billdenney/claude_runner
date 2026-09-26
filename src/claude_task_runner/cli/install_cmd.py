@@ -103,9 +103,11 @@ def install(
     ``--queue`` and restarts it when it fails. A unit that is already
     running keeps its supervisor, so when the new unit would start it
     differently, such as for another queue, ``install`` says so and how
-    to restart it. The queue's
-    ``[watchdog]`` sets the unit's restart policy, so re-run ``install``
-    after changing it.
+    to restart it. The queue's ``[watchdog]`` sets the unit's restart
+    policy. With ``[supervisor].adopt_workers`` off, a stop drains, and
+    ``[task_caps].max_duration_s_per_task`` sets how long it waits for
+    in-flight tasks (0: until they finish). Re-run ``install`` after
+    changing either.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
     and registers ``--queue`` in ``~/.claude_task_runner/queues.json``,
@@ -154,12 +156,16 @@ def install(
                 # The queue's [watchdog] sets RestartSec, StartLimitBurst
                 # and StartLimitIntervalSec.
                 watchdog=settings.watchdog,
+                # With adoption off, [task_caps].max_duration_s_per_task
+                # sets TimeoutStopSec: how long a stop waits for the drain.
+                task_caps=settings.task_caps,
                 # ADR-0025: generate fast-stop wiring when adoption is on so
                 # the unit's ExecStop / TimeoutStopSec match runtime behaviour.
                 adopt_workers=settings.supervisor.adopt_workers,
             )
         except systemd_mod.UnitSettingError as exc:
-            # Without markup, so the "[watchdog]" in the message is printed.
+            # Without markup, so the "[watchdog]" or "[task_caps]" in the
+            # message is printed.
             console.print(
                 f"systemd install failed: {exc}. Nothing was written.",
                 style="bold red",
