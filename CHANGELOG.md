@@ -227,6 +227,14 @@ Breaking changes are called out in the version notes.
   a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
   script, and on a tracked file missing from the sdist. `hatchling` joins the
   `dev` extra so the test can build.
+- **`[project.urls]` now points at the real repository.** `Homepage` and
+  `Issues` named `github.com/billdenney/claude_task_runner`, but the
+  repository is `github.com/billdenney/claude_runner`. The old address returns
+  404 and does not redirect, so every built wheel's METADATA carried two dead
+  `Project-URL` links. `tests/unit/test_packaging.py` now fails when a GitHub
+  link in `[project.urls]` names any repository but the one `origin` points
+  to. It skips when the checkout has no `origin` remote or `origin` is not on
+  GitHub.
 - **Skipped stream-json lines are recorded and logged, not dropped silently.**
   The parser skips a malformed line, or an event of a type it does not know, so
   one bad line cannot abort a run. But nothing looked at the count, and the
