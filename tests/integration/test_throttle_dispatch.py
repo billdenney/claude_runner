@@ -11,6 +11,10 @@ dispatched through each account.
   that account.
 * **Throttled or drifting.** THROTTLED_5H, THROTTLED_WEEKLY and
   ERROR_DRIFT mean no new dispatch, on a single-account queue too.
+* **IDLE.** An account captured while nothing was pending goes IDLE,
+  which is dispatchable, but tasks that arrive before its next capture
+  run under the cap of that reading. Only an account never captured is
+  capped by its ``max_concurrency`` alone.
 
 The multi-account configuration mirrors a live two-account queue:
 ``personal`` allows 5 concurrent tasks, ``work`` allows 1, and the
@@ -40,9 +44,9 @@ from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.actions import Action, Notify
-from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
+from claude_task_runner.supervisor.daemon import PollResult, TickContext, run_one_tick
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
-from claude_task_runner.usage.drift import UsageFormatDrift
+from claude_task_runner.usage.drift import UsageCaptureTimeout, UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
 NOW = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
@@ -122,14 +126,16 @@ def _single_account_settings(tmp_path: Path) -> Settings:
 def _tick(
     snapshot: SupervisorSnapshot,
     settings: Settings,
-    reading: UsageReading | UsageFormatDrift,
+    reading: PollResult,
     clock: FakeClock,
+    *,
+    pending_count: int = PENDING,
 ) -> tuple[SupervisorSnapshot, list[Action]]:
     """One supervisor tick, built the way ``start_daemon`` builds it."""
     ctx = TickContext(
         settings=settings,
         poll_result=reading,
-        pending_count=PENDING,
+        pending_count=pending_count,
         in_flight_count=0,
         account_policies={a.name: a.policy for a in resolve_accounts(settings)},
     )
@@ -212,6 +218,72 @@ class TestMultiAccountSlowdown:
         assert counts == {"personal": 2, "work": 1}
 
 
+class TestMultiAccountIdle:
+    """An account that went IDLE keeps the cap its last reading called for.
+
+    Each tick captures one account, so an account classified IDLE while
+    the queue was empty stays IDLE until its next capture, one round-robin
+    cycle later. Tasks that arrive in between must not run through it
+    beyond what that reading allows: nothing if it was throttled, the ramp
+    target if it was slowing down, its ``max_concurrency`` otherwise.
+    """
+
+    @pytest.mark.parametrize(
+        ("five_hour_pct", "weekly_pct", "expected"),
+        [
+            # The queue-wide ceiling of 5 leaves ``personal`` 4 of its 5.
+            (30, 5, {"work": 1, "personal": 4}),
+            # Ramp: ceil(5 * (1 - (55 - 40) / (60 - 40))) = 2.
+            (55, 5, {"work": 1, "personal": 2}),
+            (65, 5, {"work": 1}),
+            (10, 90, {"work": 1}),
+        ],
+        ids=["dispatching", "slowing_down", "throttled_5h", "throttled_weekly"],
+    )
+    def test_idle_account_dispatches_what_its_reading_allows(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        five_hour_pct: int,
+        weekly_pct: int,
+        expected: dict[str, int],
+    ) -> None:
+        """``personal`` is captured while nothing is pending, so it goes
+        IDLE. Then eight tasks arrive and ``work`` is captured at 10%."""
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+
+        snapshot, _ = _tick(
+            snapshot,
+            settings,
+            _reading(five_hour_pct, "personal", weekly_pct=weekly_pct),
+            clock,
+            pending_count=0,
+        )
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "work"), clock)
+
+        assert snapshot.accounts["personal"].state is SupervisorState.IDLE
+        assert snapshot.accounts["work"].state is SupervisorState.DISPATCHING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == expected
+
+    def test_account_never_captured_still_dispatches(self, tmp_path: Path, queue_dir: Path) -> None:
+        """Cold start: ``work`` keeps the IDLE it was seeded with and has no
+        decision yet, so only its ``max_concurrency`` of 1 caps it."""
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "personal"), clock)
+
+        assert snapshot.accounts["work"].state is SupervisorState.IDLE
+        assert snapshot.accounts["work"].target_concurrency is None
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {
+            "work": 1,
+            "personal": 4,
+        }
+
+
 class TestSingleAccountSlowdown:
     """A queue with no ``[[accounts]]`` block: one ``default`` account.
 
@@ -289,3 +361,38 @@ class TestSingleAccountThrottled:
 
         assert snapshot.accounts["default"].state is SupervisorState.DISPATCHING
         assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"default": 4}
+
+
+class TestSingleAccountIdle:
+    """A single-account queue captures its account every tick, so a stale
+    IDLE lasts only while a capture fails: a failed capture leaves the
+    state as it was, and dispatch still runs that tick."""
+
+    @pytest.mark.parametrize(
+        ("idle_reading", "expected"),
+        [
+            (_reading(65, None), {}),
+            (_reading(10, None, weekly_pct=90), {}),
+            # Ramp: ceil(4 * (1 - (55 - 40) / (60 - 40))) = 1.
+            (_reading(55, None), {"default": 1}),
+        ],
+        ids=["throttled_5h", "throttled_weekly", "slowing_down"],
+    )
+    def test_idle_cap_holds_through_a_failed_capture(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        idle_reading: UsageReading,
+        expected: dict[str, int],
+    ) -> None:
+        """The queue is empty at the first capture, so the account goes
+        IDLE. Then eight tasks arrive and the next capture times out."""
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+
+        snapshot, _ = _tick(snapshot, settings, idle_reading, clock, pending_count=0)
+        snapshot, _ = _tick(snapshot, settings, UsageCaptureTimeout("slow"), clock)
+
+        assert snapshot.accounts["default"].state is SupervisorState.IDLE
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == expected

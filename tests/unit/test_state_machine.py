@@ -796,6 +796,66 @@ class TestStateTransitionEvents:
         ]
         assert transitions == []
 
+    def test_entering_idle_emits_state_transition(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """The queue draining is a transition too. The IDLE branch used to
+        return before this event, so an account was seen leaving ``idle``
+        but never entering it."""
+        reading = _reading(
+            five_pct=10,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        _, actions = step(
+            _input(
+                _initial(SupervisorState.DISPATCHING),
+                reading,
+                policy,
+                supervisor_settings,
+                usage_settings,
+            ),
+            clock,
+        )
+        assert actions == [
+            MonitorInFlight(),
+            EmitEvent(
+                event_type="state_transition",
+                payload={
+                    "from": SupervisorState.DISPATCHING.value,
+                    "to": SupervisorState.IDLE.value,
+                    "five_hour_util": 10,
+                    "weekly_util": 5,
+                },
+            ),
+        ]
+
+    def test_staying_idle_emits_nothing(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        reading = _reading(
+            five_pct=10,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        _, actions = step(
+            _input(
+                _initial(SupervisorState.IDLE), reading, policy, supervisor_settings, usage_settings
+            ),
+            clock,
+        )
+        assert actions == [MonitorInFlight()]
+
 
 # ----------------------------------------------------------------------------
 # Wakeup scheduling
@@ -905,6 +965,68 @@ class TestWakeupScheduling:
         assert new.scheduled_wakeup_at is None
         assert not any(isinstance(a, ScheduleWakeupAt) for a in actions)
 
+    def test_idle_records_its_readings_wakeup(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """An IDLE entry records the wakeup of the decision whose cap it
+        keeps, but schedules nothing: no task is waiting on it."""
+        five_reset = datetime(2026, 5, 4, 13, 0, tzinfo=UTC)
+        reading = _reading(
+            five_pct=80,
+            weekly_pct=5,
+            five_resets=five_reset,
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(
+                _initial(SupervisorState.DISPATCHING),
+                reading,
+                policy,
+                supervisor_settings,
+                usage_settings,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.IDLE
+        assert new.scheduled_wakeup_at == five_reset + timedelta(
+            seconds=supervisor_settings.window_start_delay_s
+        )
+        assert not any(isinstance(a, ScheduleWakeupAt) for a in actions)
+
+    def test_idle_drops_an_earlier_throttles_wakeup(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """A clean reading has no wakeup. An account that goes IDLE after a
+        throttle used to keep that throttle's wakeup, long past, until work
+        arrived."""
+        snap = _initial(SupervisorState.THROTTLED_5H).model_copy(
+            update={
+                "scheduled_wakeup_at": datetime(2026, 5, 4, 9, 5, tzinfo=UTC),
+                "target_concurrency": 0,
+            }
+        )
+        reading = _reading(
+            five_pct=10,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, _ = step(
+            _input(snap, reading, policy, supervisor_settings, usage_settings),
+            clock,
+        )
+        assert new.state is SupervisorState.IDLE
+        assert new.scheduled_wakeup_at is None
+        assert new.target_concurrency == 5
+
 
 # ----------------------------------------------------------------------------
 # target_concurrency: the dispatch cap the decision chose
@@ -960,20 +1082,58 @@ class TestTargetConcurrency:
         assert new.state is state
         assert new.target_concurrency == target
 
-    def test_idle_clears_target(
+    @pytest.mark.parametrize(
+        ("five_pct", "weekly_pct", "weekly_resets_days", "target"),
+        [
+            (10, 5, 4.0, 5),
+            # Ramp: ceil(5 * (1 - (50 - 40) / (60 - 40))) = 3.
+            (50, 5, 4.0, 3),
+            (65, 5, 4.0, 0),
+            # Half the week left: the trace target is about 39%.
+            (10, 60, 3.5, 0),
+        ],
+        ids=["dispatching", "slowing_down", "throttled_5h", "throttled_weekly"],
+    )
+    def test_idle_keeps_its_readings_target(
         self,
         policy: ResolvedPolicy,
         clock: FakeClock,
         supervisor_settings: SupervisorSettings,
         usage_settings: UsageSettings,
+        five_pct: int,
+        weekly_pct: int,
+        weekly_resets_days: float,
+        target: int,
     ) -> None:
-        reading = _reading(five_pct=50, weekly_pct=5)
-        new, _ = step(
-            _input(_slowing(3), reading, policy, supervisor_settings, usage_settings),
+        """IDLE is dispatchable until the account's next capture, so an
+        account that goes IDLE keeps the cap its reading calls for. The prior
+        target of 4 is none of the expected ones, so a carried or cleared
+        target fails. IDLE still sends no notice, schedules no wakeup and
+        stops nothing: its only event is the transition."""
+        reading = _reading(
+            five_pct=five_pct,
+            weekly_pct=weekly_pct,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=weekly_resets_days),
+        )
+        new, actions = step(
+            _input(_slowing(4), reading, policy, supervisor_settings, usage_settings),
             clock,
         )
         assert new.state is SupervisorState.IDLE
-        assert new.target_concurrency is None
+        assert new.target_concurrency == target
+        assert actions == [
+            MonitorInFlight(),
+            EmitEvent(
+                event_type="state_transition",
+                payload={
+                    "from": SupervisorState.SLOWING_DOWN.value,
+                    "to": SupervisorState.IDLE.value,
+                    "five_hour_util": five_pct,
+                    "weekly_util": weekly_pct,
+                },
+            ),
+        ]
 
     @pytest.mark.parametrize(
         "error",
@@ -1062,6 +1222,35 @@ class TestTargetConcurrency:
         )
         assert new.target_concurrency == 3
         assert _notifies(actions) == []
+
+    def test_slowdown_notifies_on_leaving_idle_at_the_same_target(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """An IDLE account keeps its ramp target, but work arriving enters
+        SLOWING_DOWN afresh, so the operator hears the cap again."""
+        idle = _initial(SupervisorState.IDLE).model_copy(update={"target_concurrency": 3})
+        reading = _reading(
+            five_pct=50,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(idle, reading, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert new.state is SupervisorState.SLOWING_DOWN
+        assert new.target_concurrency == 3
+        assert _notifies(actions) == [
+            Notify(
+                level="info",
+                message="slowing dispatch: 5h=50% in [40, 60) (day); target concurrency=3/5",
+            )
+        ]
 
 
 # ----------------------------------------------------------------------------
@@ -1154,3 +1343,24 @@ class TestIdleFromEveryState:
         # IDLE entry zeroes the drift bookkeeping.
         assert new.consecutive_clean_polls == 0
         assert new.last_drift_message == ""
+        # ...and records this reading's cap, whatever the prior state.
+        assert new.target_concurrency == 5
+        # Entering IDLE is a transition; staying in it is not.
+        expected_transitions = (
+            []
+            if prior is SupervisorState.IDLE
+            else [
+                EmitEvent(
+                    event_type="state_transition",
+                    payload={
+                        "from": prior.value,
+                        "to": SupervisorState.IDLE.value,
+                        "five_hour_util": 10,
+                        "weekly_util": 5,
+                    },
+                )
+            ]
+        )
+        assert [
+            a for a in actions if isinstance(a, EmitEvent) and a.event_type == "state_transition"
+        ] == expected_transitions
