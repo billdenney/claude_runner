@@ -47,7 +47,7 @@ class TestBuildUnitText:
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
         )
-        # Exit-status 0 means STOPPED state; we don't want a relaunch loop.
+        # Exit status 0 is a clean stop or finished drain; no relaunch loop.
         assert "RestartPreventExitStatus=0" in text
 
     def test_restart_sec_customizable(self) -> None:

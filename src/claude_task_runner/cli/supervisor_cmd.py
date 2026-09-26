@@ -221,7 +221,7 @@ def start(
 ) -> None:
     """Run the supervisor in the foreground.
 
-    Blocks until SIGTERM/SIGINT or until STOPPED state is reached.
+    Blocks until SIGTERM/SIGINT, or until a drain finishes.
     Acquires the host-wide global lock; raises if another supervisor
     is already running.
 
