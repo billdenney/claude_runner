@@ -8,6 +8,7 @@ PATH lookups are deterministic regardless of the developer's machine.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,12 +25,15 @@ from claude_task_runner.cli.install_cmd import (
     _watchdog_script_path,
     app,
 )
-from claude_task_runner.config.loader import ConfigError
+from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.schema import WatchdogSettings
+from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.cron.registry import (
     load_registered_queues,
     queues_registry_path,
     register_queue,
 )
+from claude_task_runner.supervisor.pidfile import acquire_global_lock
 
 
 @pytest.fixture
@@ -133,6 +137,7 @@ def _systemd_plan_mock(*, block_existed: bool = False, unit_path: Path | None = 
         unit_path=unit_path or Path("/tmp/test.service"),
         unit_text="[Unit]\nDescription=test\n",
         enable_command=["systemctl", "--user", "enable", "--now", "claude-task-runner.service"],
+        existing_text=None,
     )
 
 
@@ -228,6 +233,160 @@ def test_install_systemd_apply_failure(runner: CliRunner, tmp_path: Path) -> Non
         result = runner.invoke(app, ["--yes", "--queue", str(tmp_path)])
     assert result.exit_code == 2
     assert "systemd install failed" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `install` — systemd branch, with the unit already running
+# ---------------------------------------------------------------------------
+
+_EXE = "/usr/local/bin/claude-task-runner"
+
+
+def _write_installed_unit(
+    queue: Path,
+    *,
+    exe: str = _EXE,
+    config: Path | None = None,
+    watchdog: WatchdogSettings | None = None,
+) -> None:
+    """Write the unit an earlier ``install --queue <queue>`` would have written."""
+    command = f"{exe} supervisor start --queue {queue}"
+    if config is not None:
+        command += f" --config {config}"
+    path = systemd_mod.systemd_unit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        systemd_mod.build_unit_text(
+            supervisor_command=command,
+            queue_dir=queue,
+            watchdog=watchdog if watchdog is not None else load_settings(None).watchdog,
+        ),
+        encoding="utf-8",
+    )
+
+
+@contextmanager
+def _systemd_install(*, active: bool | None) -> Iterator[MagicMock]:
+    """Patch out the systemd branch's I/O; yield the ``apply_plan`` mock.
+
+    ``active`` is what ``is_unit_active`` answers; with ``None`` any
+    question to systemd fails the test."""
+
+    def _is_active(*_args: object, **_kwargs: object) -> bool:
+        if active is None:
+            raise AssertionError("asked systemd whether the unit is active")
+        return active
+
+    with (
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            return_value="systemd",
+        ),
+        patch("claude_task_runner.cli.install_cmd.shutil.which", return_value=_EXE),
+        patch(
+            "claude_task_runner.cli.install_cmd.systemd_mod.is_unit_active",
+            side_effect=_is_active,
+        ),
+        patch("claude_task_runner.cli.install_cmd.systemd_mod.apply_plan") as mock_apply,
+    ):
+        yield mock_apply
+
+
+def test_install_systemd_says_the_running_unit_keeps_the_old_queue(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """``enable --now`` does not restart an active unit; systemd 255 keeps the old process.
+
+    install used to print "systemd unit installed and started." while the
+    old queue's supervisor went on running and holding the per-user lock."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=True) as mock_apply:
+        result = runner.invoke(app, ["--queue", str(new)], input="y\n")
+    assert result.exit_code == 0, result.output
+    mock_apply.assert_called_once()
+    lines = result.stdout.splitlines()
+    note = lines.index(
+        f"The unit is running the supervisor for {old.resolve()}. Installing does not restart "
+        "it, and systemd applies the new ExecStart, WorkingDirectory only when the unit next "
+        "starts, so that supervisor keeps running until then."
+    )
+    assert lines[note + 1 : note + 7] == [
+        "To let its in-flight tasks finish, then switch, run:",
+        f"  claude-task-runner supervisor drain --queue {old.resolve()}",
+        "  systemctl --user start claude-task-runner",
+        "To switch at once, run:",
+        "  systemctl --user restart claude-task-runner",
+        "",
+    ]
+    assert note < next(i for i, line in enumerate(lines) if "Apply this change?" in line)
+    # The answer to the prompt is not echoed, so the prompt shares the last line.
+    assert lines[-1].endswith(
+        "? [y/n] (n): systemd unit installed. Its running supervisor keeps the old command "
+        "until the unit restarts (see above)."
+    )
+
+
+def test_install_systemd_says_to_restart_for_a_new_command(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Same queue, another executable, as after reinstalling into a new venv."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    _write_installed_unit(queue.resolve(), exe="/old/venv/bin/claude-task-runner")
+    with _systemd_install(active=True):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    note = lines.index(
+        "The unit is running. Installing does not restart it, and systemd applies the new "
+        "ExecStart only when the unit next starts. To apply it now, run:"
+    )
+    assert lines[note + 1] == "  systemctl --user restart claude-task-runner"
+
+
+def test_install_systemd_policy_change_needs_no_restart(runner: CliRunner, tmp_path: Path) -> None:
+    """systemd 255 applies RestartSec and StartLimit* at daemon-reload, so nothing is asked."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = queue.resolve() / "claude_runner.toml"
+    config.write_text("[watchdog]\nrestart_cooldown_s = 7\n", encoding="utf-8")
+    # Installed before the TOML changed: the same command, the old policy.
+    _write_installed_unit(queue.resolve(), config=config)
+    with _systemd_install(active=None):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
+
+
+def test_install_systemd_stopped_unit_starts_with_the_new_unit(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=False):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    assert "The unit is running" not in result.stdout
+    assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
+
+
+def test_install_systemd_abort_after_the_running_unit_note(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_installed_unit(old.resolve())
+    with _systemd_install(active=True) as mock_apply:
+        result = runner.invoke(app, ["--queue", str(new)], input="n\n")
+    assert result.exit_code == 1
+    mock_apply.assert_not_called()
+    assert f"The unit is running the supervisor for {old.resolve()}." in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +615,99 @@ def test_install_cron_registry_write_failure_leaves_crontab_untouched(
     assert "watchdog registration failed" in result.stdout
     mock_backup.assert_not_called()
     mock_apply.assert_not_called()
+
+
+def test_install_cron_replaces_the_registered_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """One supervisor runs per user, so the watchdog manages one queue.
+
+    A second cron install used to add its queue beside the first. Every
+    tick then spawned the second queue's supervisor, and every spawn
+    exited on the lock that the first queue's supervisor held. The y/N
+    prompt names the queue being replaced."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    register_queue(old)
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(new)], input="y\n")
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    shown = lines.index("It replaces, since the watchdog manages one queue:")
+    assert lines[shown + 1] == f"  {old.resolve()}"
+    assert shown < next(i for i, line in enumerate(lines) if "Apply this change?" in line)
+    assert load_registered_queues() == [new.resolve()]
+    # The lock is free, so the next tick starts the new queue's supervisor.
+    assert lines[-1] == "crontab updated."
+
+
+def test_install_cron_lists_each_queue_an_older_registry_held(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    a, b, new = tmp_path / "a", tmp_path / "b", tmp_path / "new"
+    new.mkdir()
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"queues": [str(a), str(new), str(b), str(a)]}))
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    shown = lines.index("It replaces, since the watchdog manages one queue:")
+    assert lines[shown + 1 : shown + 3] == [f"  {a}", f"  {b}"]
+    assert load_registered_queues() == [new.resolve()]
+
+
+def test_install_cron_rerun_replaces_nothing(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    register_queue(queue)
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert "It replaces" not in result.stdout
+
+
+def test_install_cron_says_how_to_hand_over_from_the_running_supervisor(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Ticks start none while the replaced queue's supervisor holds the lock."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    (old / ".claude_task_runner").mkdir(parents=True)
+    new.mkdir()
+    register_queue(old)
+    (old / ".claude_task_runner" / "supervisor.pid").write_text(f"{os.getpid()}\n")
+    with acquire_global_lock(), _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "crontab updated.",
+        f"The supervisor for {old.resolve()} (pid {os.getpid()}) still holds global.lock, "
+        "so the watchdog starts this queue's supervisor once it exits. To hand over now, "
+        f"run: claude-task-runner supervisor drain --queue {old.resolve()}",
+    ]
+
+
+def test_install_cron_shows_it_replaces_an_unreadable_registry(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The registry is only read before the prompt; registering backs it up."""
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(queue)], input="y\n")
+    assert result.exit_code == 0, result.output
+    shown = next(
+        line for line in result.stdout.splitlines() if line.startswith("It replaces the registry")
+    )
+    assert shown.startswith(
+        f"It replaces the registry, which is unreadable (corrupt queues registry at {registry} ("
+    )
+    assert shown.endswith("); a copy is kept as queues.json.broken.")
+    assert load_registered_queues() == [queue.resolve()]
+    assert (registry.parent / "queues.json.broken").read_text(encoding="utf-8") == "{not json"
 
 
 @pytest.mark.parametrize("init_system", ["systemd", "cron"])
@@ -927,17 +1179,20 @@ def _registered(tmp_path: Path, *names: str) -> list[Path]:
 def test_uninstall_lists_the_queues_the_registry_still_holds(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """A later cron install would manage them again, even one deleted since."""
-    queues = _registered(tmp_path, "a", "b")
-    queues[1].rmdir()
+    """Every entry of a list an older version wrote, even one deleted since."""
+    queues = [tmp_path / "a", tmp_path / "b"]
+    queues[0].mkdir()
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"queues": [str(q) for q in queues]}), encoding="utf-8")
     with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt") as mock_apply:
         result = runner.invoke(app, ["uninstall", "--yes"])
     assert result.exit_code == 0, result.output
     mock_apply.assert_called_once()
     assert result.stdout.splitlines()[-4:] == [
         "crontab block removed.",
-        f"{queues_registry_path()} still lists 2 queues, and a later cron install "
-        "manages every queue it lists. To drop one:",
+        f"{registry} still lists 2 queues. No tick reads it without the cron block, and a "
+        "later cron install replaces the list with its own queue. To drop them now:",
         f"  claude-task-runner watchdog unregister --queue {queues[0]}",
         f"  claude-task-runner watchdog unregister --queue {queues[1]}",
     ]
@@ -953,8 +1208,8 @@ def test_uninstall_without_a_cron_block_lists_the_registry(
         result = runner.invoke(app, ["uninstall", "--yes"])
     assert result.exit_code == 0, result.output
     assert result.stdout.splitlines()[-2:] == [
-        f"{queues_registry_path()} still lists 1 queue, and a later cron install "
-        "manages every queue it lists. To drop one:",
+        f"{queues_registry_path()} still lists 1 queue. No tick reads it without the cron "
+        "block, and a later cron install replaces the list with its own queue. To drop it now:",
         f"  claude-task-runner watchdog unregister --queue {queue}",
     ]
 

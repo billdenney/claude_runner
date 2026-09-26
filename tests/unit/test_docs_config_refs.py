@@ -50,6 +50,15 @@ RETIRED_KEYS = {
         "Never wired into dispatch; removed 2026-09-25. ADR-0011 (deprecated) "
         "records the design, and its dated update says the table is gone."
     ),
+    "failure_classifier.environmental_patterns": (
+        "Matched failures for runner.retry.classify, which nothing called; "
+        "removed 2026-09-26. ADR-0012 records the design and its dated update "
+        "says the lists are gone; ADR-0024 mentions the default list as history."
+    ),
+    "failure_classifier.operator_patterns": (
+        "Removed with failure_classifier.environmental_patterns."
+    ),
+    "failure_classifier.task_patterns": ("Removed with failure_classifier.environmental_patterns."),
 }
 """Tables and fields that no longer exist but which docs may still name.
 

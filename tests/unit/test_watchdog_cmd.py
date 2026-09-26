@@ -4,6 +4,7 @@ The registry the tick walks is tested in ``test_cron_registry.py``."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -28,6 +29,7 @@ from claude_task_runner.cron.registry import (
     queues_registry_path,
     register_queue,
 )
+from claude_task_runner.supervisor.pidfile import acquire_global_lock
 
 
 @pytest.fixture
@@ -63,23 +65,80 @@ class TestRegisterCommand:
         assert "registered:" not in result.stdout
         assert not queues_registry_path().exists()
 
+    def test_register_replaces_the_registered_queue(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """One supervisor runs per user, so the watchdog manages one queue."""
+        a, b = isolated_home / "a", isolated_home / "b"
+        a.mkdir()
+        b.mkdir()
+        register_queue(a)
+        result = runner.invoke(app, ["register", "--queue", str(b)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {b.resolve()}\nreplaced: {a.resolve()}\n"
+        assert load_registered_queues() == [b.resolve()]
+
+    def test_register_the_registered_queue_again(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        queue = isolated_home / "q"
+        queue.mkdir()
+        register_queue(queue)
+        result = runner.invoke(app, ["register", "--queue", str(queue)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {queue.resolve()}\n"
+
+    def test_register_collapses_an_older_list(self, runner: CliRunner, isolated_home: Path) -> None:
+        a, b, c = (isolated_home / name for name in ("a", "b", "c"))
+        c.mkdir()
+        _write_older_registry([a, b, a])
+        result = runner.invoke(app, ["register", "--queue", str(c)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"registered: {c.resolve()}\nreplaced: {a}\nreplaced: {b}\n"
+        assert load_registered_queues() == [c.resolve()]
+
+    def test_register_says_how_to_hand_over_from_the_running_supervisor(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """Ticks start none until the replaced queue's supervisor exits."""
+        a, b = isolated_home / "a", isolated_home / "b"
+        (a / ".claude_task_runner").mkdir(parents=True)
+        b.mkdir()
+        register_queue(a)
+        (a / ".claude_task_runner" / "supervisor.pid").write_text(f"{os.getpid()}\n")
+        with acquire_global_lock():
+            result = runner.invoke(app, ["register", "--queue", str(b)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            f"registered: {b.resolve()}",
+            f"replaced: {a.resolve()}",
+            f"The supervisor for {a.resolve()} (pid {os.getpid()}) still holds global.lock, "
+            "so the watchdog starts this queue's supervisor once it exits. To hand over now, "
+            f"run: claude-task-runner supervisor drain --queue {a.resolve()}",
+        ]
+
+
+def _write_older_registry(queues: list[Path]) -> None:
+    """Write ``queues.json`` listing several queues, as an older version could."""
+    path = queues_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"queues": [str(q) for q in queues]}), encoding="utf-8")
+
 
 class TestUnregisterCommand:
     def test_unregister_a_deleted_queue(self, runner: CliRunner, isolated_home: Path) -> None:
+        """From a list an older version wrote, so another entry is there to keep."""
         queue = isolated_home / "q"
         keep = isolated_home / "keep"
-        queue.mkdir()
         keep.mkdir()
-        register_queue(queue)
-        register_queue(keep)
-        queue.rmdir()
+        _write_older_registry([queue, keep])
 
         result = runner.invoke(app, ["unregister", "--queue", str(queue)])
 
         assert result.exit_code == 0, result.output
-        assert result.stdout == f"unregistered: {queue.resolve()}\n"
+        assert result.stdout == f"unregistered: {queue}\n"
         assert result.stderr == ""
-        assert load_registered_queues() == [keep.resolve()]
+        assert load_registered_queues() == [keep]
         assert not queue.exists()
 
     def test_unregister_defaults_to_the_current_directory(
@@ -153,37 +212,81 @@ class TestUnregisterCommand:
         assert sorted(p.name for p in queues_registry_path().parent.iterdir()) == ["queues.json"]
 
 
+def _missing_warning(queue: Path) -> str:
+    return (
+        f"warning: {queue} is not an existing directory, so the watchdog skips it. "
+        f"To stop managing it, run: claude-task-runner watchdog unregister --queue {queue}\n"
+    )
+
+
+def _ignored_warning(managed: Path, ignored: list[Path]) -> str:
+    return (
+        "warning: one supervisor runs per user, so the watchdog manages only the last "
+        f"queue, {managed}, and ignores {', '.join(str(q) for q in ignored)}. To register "
+        "just one, run: claude-task-runner watchdog register --queue <queue>\n"
+    )
+
+
 class TestQueuesCommand:
-    def test_queues_lists_registered(self, runner: CliRunner, isolated_home: Path) -> None:
+    def test_queues_lists_the_registered_queue(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
         for name in ("a", "b"):
             (isolated_home / name).mkdir()
             register_queue(isolated_home / name)
         result = runner.invoke(app, ["queues"])
-        assert result.exit_code == 0
-        assert "a" in result.stdout
-        assert "b" in result.stdout
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{(isolated_home / 'b').resolve()}\n"
+        assert result.stderr == ""
+
+    def test_queues_with_an_empty_registry(self, runner: CliRunner) -> None:
+        result = runner.invoke(app, ["queues"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+    def test_queues_lists_an_older_list_and_warns_about_the_ignored(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """Stdout stays one path per line, so a script reading it is unaffected."""
+        a, b = isolated_home / "a", isolated_home / "b"
+        a.mkdir()
+        b.mkdir()
+        _write_older_registry([a, b, a, b])
+
+        result = runner.invoke(app, ["queues"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{a}\n{b}\n{a}\n{b}\n"
+        assert result.stderr == _ignored_warning(b, [a])
 
     def test_queues_warns_about_a_missing_queue_on_stderr(
         self, runner: CliRunner, isolated_home: Path
     ) -> None:
-        """Stdout stays one path per line, so a script reading it is unaffected."""
         gone = isolated_home / "gone"
-        live = isolated_home / "live"
         gone.mkdir()
-        live.mkdir()
         register_queue(gone)
-        register_queue(live)
         gone.rmdir()
 
         result = runner.invoke(app, ["queues"])
 
         assert result.exit_code == 0, result.output
-        assert result.stdout == f"{gone.resolve()}\n{live.resolve()}\n"
-        assert result.stderr == (
-            f"warning: {gone.resolve()} is not an existing directory, so the watchdog "
-            "skips it. To stop managing it, run: claude-task-runner watchdog unregister "
-            f"--queue {gone.resolve()}\n"
-        )
+        assert result.stdout == f"{gone.resolve()}\n"
+        assert result.stderr == _missing_warning(gone.resolve())
+
+    def test_queues_warns_only_about_the_managed_queue_being_missing(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """An ignored entry that is gone gets no warning of its own."""
+        live, gone, also_gone = (isolated_home / n for n in ("live", "gone", "also-gone"))
+        live.mkdir()
+        _write_older_registry([also_gone, live, gone])
+
+        result = runner.invoke(app, ["queues"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == f"{also_gone}\n{live}\n{gone}\n"
+        assert result.stderr == _ignored_warning(gone, [also_gone, live]) + _missing_warning(gone)
 
 
 class TestTickCommand:
@@ -367,27 +470,23 @@ class TestTickSkipsMissingQueue:
         isolated_home: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Both supervisors are down, and the missing queue is listed first.
+        """An older list names a missing queue first and the real one last.
 
-        Every queue shares one restart cooldown. The missing queue used to take
-        the restart, which left the real queue in cooldown on every tick."""
+        The missing queue used to take the restart, and with it the cooldown
+        every queue shared, which left the real queue in cooldown on every
+        tick. The tick now manages only the last queue and ignores the rest."""
         gone = isolated_home / "gone"
         real = isolated_home / "real"
-        gone.mkdir()
         real.mkdir()
-        register_queue(gone)
-        register_queue(real)
-        gone.rmdir()
+        _write_older_registry([gone, real])
         spawned = _record_spawns(monkeypatch)
 
         result = runner.invoke(app, ["tick"])
 
         assert result.exit_code == 0, result.output
-        assert spawned == [real.resolve()]
-        assert result.stdout.count(_skipped_line(gone.resolve())) == 1
-        assert f"watchdog queue={real.resolve()} alive=False pid=None verdict=restart" in (
-            result.stdout
-        )
+        assert spawned == [real]
+        assert _skipped_line(gone) not in result.stdout
+        assert f"watchdog queue={real} alive=False pid=None verdict=restart" in result.stdout
         assert len(load_state(watchdog_state_path()).recent_restarts) == 1
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by directory permissions")
@@ -399,14 +498,11 @@ class TestTickSkipsMissingQueue:
     ) -> None:
         """Path.is_dir raises PermissionError here on Python 3.12 and 3.13.
 
-        Raised in the loop, it would end the tick before the queues after it."""
+        Raised in the tick, it would end it before the state is saved."""
         locked = isolated_home / "locked"
         hidden = locked / "q"
-        real = isolated_home / "real"
         hidden.mkdir(parents=True)
-        real.mkdir()
         register_queue(hidden)
-        register_queue(real)
         spawned = _record_spawns(monkeypatch)
         locked.chmod(0o000)
         try:
@@ -415,8 +511,9 @@ class TestTickSkipsMissingQueue:
             locked.chmod(0o700)
 
         assert result.exit_code == 0, result.output
-        assert spawned == [real.resolve()]
+        assert spawned == []
         assert result.stdout.count(_skipped_line(hidden.resolve())) == 1
+        assert load_state(watchdog_state_path()).queue == hidden.resolve()
 
     def test_dry_run_reports_the_missing_queue(
         self,
@@ -492,7 +589,11 @@ class TestTickSettingsSource:
         )
         register_queue(queue)
         last_restart = datetime.now(UTC) - timedelta(seconds=60)
-        write_state_atomic(WatchdogState(recent_restarts=[last_restart]), watchdog_state_path())
+        # Named for the queue, as a tick writes it; a history for no queue is dropped.
+        write_state_atomic(
+            WatchdogState(queue=queue.resolve(), recent_restarts=[last_restart]),
+            watchdog_state_path(),
+        )
 
         result = runner.invoke(app, ["tick", "--dry-run"])
 

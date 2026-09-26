@@ -9,6 +9,8 @@ two that touch external state (``check_claude_binary`` PATH lookup,
 
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -56,6 +58,7 @@ from claude_task_runner.supervisor.persistence import (
 from claude_task_runner.supervisor.persistence import (
     write_atomic as supervisor_write_atomic,
 )
+from claude_task_runner.supervisor.pidfile import acquire_global_lock
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 
 
@@ -510,76 +513,88 @@ def test_check_queue_perms_unknown_linux_user(settings: Settings, queue_dir: Pat
 # ---------------------------------------------------------------------------
 
 
-def test_check_global_lock_no_file(settings: Settings, tmp_path: Path) -> None:
+@contextmanager
+def _global_lock_at(path: Path) -> Iterator[None]:
     with patch(
         "claude_task_runner.doctor.checks.pidfile_mod.global_lock_path",
-        return_value=tmp_path / "nonexistent.lock",
+        return_value=path,
     ):
+        yield
+
+
+FREE_DETAIL = "free (no supervisor running)"
+
+
+def test_check_global_lock_no_file(settings: Settings, tmp_path: Path) -> None:
+    with _global_lock_at(tmp_path / "nonexistent.lock"):
         result = check_global_lock(settings)
     assert result.status == CheckStatus.PASS
-    assert "no lock file" in result.detail
+    assert result.detail == FREE_DETAIL
+    assert not (tmp_path / "nonexistent.lock").exists()
 
 
-def test_check_global_lock_unreadable_pid(settings: Settings, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("12345", id="a-pid"),
+        pytest.param("not a number", id="unreadable-pid"),
+        pytest.param("", id="empty"),
+        pytest.param(f"{os.getpid()}", id="a-live-pid-as-after-pid-reuse"),
+    ],
+)
+def test_check_global_lock_file_nobody_holds(
+    settings: Settings, tmp_path: Path, content: str
+) -> None:
+    """Regression: doctor used to judge the lock by the PID in the file.
+
+    The file keeps the last holder's PID after it exits, so doctor warned
+    "stale" after every stop and suggested rm, and a PID that the OS had
+    given to another process read as a running supervisor. The lock is
+    free whatever the file says, and the next supervisor locks it again."""
     lock = tmp_path / "global.lock"
-    lock.write_text("not a number", encoding="utf-8")
-    with (
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.global_lock_path",
-            return_value=lock,
-        ),
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.read_existing_pid",
-            return_value=None,
-        ),
-    ):
-        result = check_global_lock(settings)
-    assert result.status == CheckStatus.WARN
-    assert "PID is unreadable" in result.detail
-
-
-def test_check_global_lock_stale_pid(settings: Settings, tmp_path: Path) -> None:
-    lock = tmp_path / "global.lock"
-    lock.write_text("12345", encoding="utf-8")
-    with (
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.global_lock_path",
-            return_value=lock,
-        ),
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.read_existing_pid",
-            return_value=12345,
-        ),
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.is_pid_alive",
-            return_value=False,
-        ),
-    ):
-        result = check_global_lock(settings)
-    assert result.status == CheckStatus.WARN
-    assert "not alive" in result.detail
-
-
-def test_check_global_lock_live(settings: Settings, tmp_path: Path) -> None:
-    lock = tmp_path / "global.lock"
-    lock.write_text("12345", encoding="utf-8")
-    with (
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.global_lock_path",
-            return_value=lock,
-        ),
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.read_existing_pid",
-            return_value=12345,
-        ),
-        patch(
-            "claude_task_runner.doctor.checks.pidfile_mod.is_pid_alive",
-            return_value=True,
-        ),
-    ):
+    lock.write_text(content, encoding="utf-8")
+    with _global_lock_at(lock):
         result = check_global_lock(settings)
     assert result.status == CheckStatus.PASS
-    assert "12345" in result.detail
+    assert result.detail == FREE_DETAIL
+
+
+def test_check_global_lock_held(settings: Settings, tmp_path: Path) -> None:
+    lock = tmp_path / "global.lock"
+    with acquire_global_lock(lock_path=lock), _global_lock_at(lock):
+        result = check_global_lock(settings)
+    assert result.status == CheckStatus.PASS
+    assert result.detail == f"held by the supervisor with PID {os.getpid()}"
+
+
+def test_check_global_lock_held_before_its_pid_is_written(
+    settings: Settings, tmp_path: Path
+) -> None:
+    lock = tmp_path / "global.lock"
+    lock.write_text("", encoding="utf-8")
+    with lock.open("a+") as fh, _global_lock_at(lock):
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        result = check_global_lock(settings)
+    assert result.status == CheckStatus.PASS
+    assert result.detail == "held by a supervisor that has not written its PID yet"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not denied by file permissions")
+def test_check_global_lock_file_that_cannot_be_opened(settings: Settings, tmp_path: Path) -> None:
+    lock = tmp_path / "global.lock"
+    lock.write_text("", encoding="utf-8")
+    lock.chmod(0o000)
+    try:
+        with _global_lock_at(lock):
+            result = check_global_lock(settings)
+    finally:
+        lock.chmod(0o600)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == f"could not check {lock}: [Errno 13] Permission denied: '{lock}'"
+    assert result.remediation == (
+        f"`claude-task-runner supervisor start` must be able to open {lock} for reading "
+        f"and writing. Check its owner and mode: ls -l {lock}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1076,16 +1091,36 @@ def test_check_watchdog_cron_present_but_queue_unregistered(
     )
 
 
-def test_check_watchdog_cron_registry_lists_other_queues_only(
+def _manage_this_queue_instead(queue: Path) -> str:
+    return (
+        f"To manage this queue instead, run `claude-task-runner watchdog register --queue "
+        f"{queue}`, or re-run `claude-task-runner install --queue {queue}`."
+    )
+
+
+def _manages_another(managed: Path) -> str:
+    return f"it manages {managed}, not this queue, so no tick restarts this queue's supervisor"
+
+
+def _write_older_registry(queues: list[Path]) -> None:
+    """Write ``queues.json`` listing several queues, as an older version could."""
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"queues": [str(q) for q in queues]}), encoding="utf-8")
+
+
+def test_check_watchdog_cron_manages_another_queue(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
+    """The watchdog manages one queue, and here it is another one."""
     other = tmp_path / "other-queue"
     other.mkdir()
     register_queue(other)
     with _watchdog_probes(tmp_path / "nonexistent.service"):
         result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.WARN
-    assert "does not list this queue" in result.detail
+    assert result.detail == "cron watchdog detected, but " + _manages_another(other.resolve())
+    assert result.remediation == _manage_this_queue_instead(queue_dir.resolve())
 
 
 def test_check_watchdog_cron_corrupt_registry_reported_without_side_effects(
@@ -1131,11 +1166,10 @@ def test_check_watchdog_systemd_unit_skips_the_cron_registry(
 UNREGISTER_HEADER = "Register a queue that moved at its new path. Drop one that is gone for good:"
 
 
-def test_check_watchdog_cron_registered_queue_was_deleted(
+def test_check_watchdog_cron_managed_queue_was_deleted(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
     """A queue deleted after it was registered stays registered, and every tick skips it."""
-    register_queue(queue_dir)
     gone = tmp_path / "gone"
     gone.mkdir()
     register_queue(gone)
@@ -1144,61 +1178,58 @@ def test_check_watchdog_cron_registered_queue_was_deleted(
         result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.WARN
     assert result.detail == (
-        f"cron watchdog detected, but registered queue {gone.resolve()} is not an "
-        "existing directory, so every tick skips it"
-    )
-    assert result.remediation == (
-        f"{UNREGISTER_HEADER}\n  claude-task-runner watchdog unregister --queue {gone.resolve()}"
-    )
-
-
-def test_check_watchdog_cron_lists_every_missing_queue(
-    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
-) -> None:
-    register_queue(queue_dir)
-    gone = tmp_path / "gone"
-    now_a_file = tmp_path / "now-a-file"
-    for q in (gone, now_a_file):
-        q.mkdir()
-        register_queue(q)
-        q.rmdir()
-    now_a_file.write_text("", encoding="utf-8")
-    with _watchdog_probes(tmp_path / "nonexistent.service"):
-        result = check_watchdog_installed(settings, queue_dir)
-    assert result.status == CheckStatus.WARN
-    assert result.detail == (
-        "cron watchdog detected, but 2 registered queues are not existing directories, "
-        f"so every tick skips them: {gone.resolve()}, {now_a_file.resolve()}"
+        f"cron watchdog detected, but {_manages_another(gone.resolve())}; and registered "
+        f"queue {gone.resolve()} is not an existing directory, so every tick skips it"
     )
     assert result.remediation.splitlines() == [
+        _manage_this_queue_instead(queue_dir.resolve()),
         UNREGISTER_HEADER,
         f"  claude-task-runner watchdog unregister --queue {gone.resolve()}",
-        f"  claude-task-runner watchdog unregister --queue {now_a_file.resolve()}",
     ]
 
 
-def test_check_watchdog_cron_unregistered_queue_and_a_missing_one(
+def test_check_watchdog_cron_older_list_ending_with_this_queue(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
-    """Both problems are reported, the one about this queue first."""
-    gone = tmp_path / "gone"
-    gone.mkdir()
-    register_queue(gone)
-    gone.rmdir()
+    """The tick manages this queue and ignores the rest, even a gone one."""
+    other, gone = tmp_path / "other", tmp_path / "gone"
+    other.mkdir()
+    _write_older_registry([other, gone, other, queue_dir.resolve()])
     with _watchdog_probes(tmp_path / "nonexistent.service"):
         result = check_watchdog_installed(settings, queue_dir)
-    queue = queue_dir.resolve()
     assert result.status == CheckStatus.WARN
     assert result.detail == (
-        f"cron watchdog detected, but {queues_registry_path()} does not list this queue, "
-        f"so no tick restarts its supervisor; and registered queue {gone.resolve()} is not "
-        "an existing directory, so every tick skips it"
+        f"cron watchdog detected, but {queues_registry_path()} lists 3 queues; one supervisor "
+        f"runs per user, so it manages only the last and ignores {other}, {gone}"
+    )
+    assert result.remediation == (
+        "To register just one, run `claude-task-runner watchdog register --queue <queue>`."
+    )
+
+
+def test_check_watchdog_cron_older_list_ending_with_a_missing_queue(
+    settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
+) -> None:
+    """Every problem is reported, the one about this queue first."""
+    queue = queue_dir.resolve()
+    gone = tmp_path / "gone"
+    now_a_file = tmp_path / "now-a-file"
+    now_a_file.write_text("", encoding="utf-8")
+    _write_older_registry([queue, gone, now_a_file])
+    with _watchdog_probes(tmp_path / "nonexistent.service"):
+        result = check_watchdog_installed(settings, queue_dir)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"cron watchdog detected, but {_manages_another(now_a_file)}; and "
+        f"{queues_registry_path()} lists 3 queues; one supervisor runs per user, so it "
+        f"manages only the last and ignores {queue}, {gone}; and registered queue "
+        f"{now_a_file} is not an existing directory, so every tick skips it"
     )
     assert result.remediation.splitlines() == [
-        f"Run `claude-task-runner watchdog register --queue {queue}`, "
-        f"or re-run `claude-task-runner install --queue {queue}`.",
+        _manage_this_queue_instead(queue),
+        "To register just one, run `claude-task-runner watchdog register --queue <queue>`.",
         UNREGISTER_HEADER,
-        f"  claude-task-runner watchdog unregister --queue {gone.resolve()}",
+        f"  claude-task-runner watchdog unregister --queue {now_a_file}",
     ]
 
 
@@ -1207,7 +1238,6 @@ def test_check_watchdog_cron_queue_behind_an_unsearchable_directory(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
     """Path.is_dir raises PermissionError here on Python 3.12 and 3.13; doctor must not."""
-    register_queue(queue_dir)
     locked = tmp_path / "locked"
     hidden = locked / "q"
     hidden.mkdir(parents=True)
@@ -1220,8 +1250,8 @@ def test_check_watchdog_cron_queue_behind_an_unsearchable_directory(
         locked.chmod(0o700)
     assert result.status == CheckStatus.WARN
     assert result.detail == (
-        f"cron watchdog detected, but registered queue {hidden.resolve()} is not an "
-        "existing directory, so every tick skips it"
+        f"cron watchdog detected, but {_manages_another(hidden.resolve())}; and registered "
+        f"queue {hidden.resolve()} is not an existing directory, so every tick skips it"
     )
 
 

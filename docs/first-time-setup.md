@@ -174,13 +174,18 @@ systemd-user vs cron and asks for confirmation before writing anything.
 - **systemd:** writes a `--user` unit that runs `supervisor start` for this
   queue, starts it now, and restarts it after a crash. A clean exit
   (`supervisor stop`, or a `drain` once in-flight tasks finish) leaves it
-  stopped.
+  stopped. If the unit is already running, for example for another queue,
+  `install` rewrites it but does not restart it, and says how to.
 - **cron:** adds a crontab line that runs `claude-task-runner watchdog tick`
   every minute, and registers this queue in
-  `~/.claude_task_runner/queues.json`. A tick restarts the supervisor of each
-  registered queue that is not running, however it stopped, and backs off
-  exponentially after repeated crashes (ADR-0002). A tick manages only the
-  registered queues, which `claude-task-runner watchdog queues` lists.
+  `~/.claude_task_runner/queues.json`, replacing any queue registered there
+  before. Only one supervisor runs per user, so the watchdog manages one
+  queue, as the systemd unit runs one. A tick restarts that queue's
+  supervisor when it is not running, however it stopped, and backs off
+  exponentially after repeated crashes (ADR-0002). While another supervisor
+  holds the per-user lock, such as one a previous `install` started for
+  another queue, a tick starts none; `install` says how to hand over.
+  `claude-task-runner watchdog queues` shows the registered queue.
 
 ## 6. Start the supervisor
 

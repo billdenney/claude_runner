@@ -16,10 +16,13 @@ This module is the **pure parser**. The dispatcher reads bytes from the
 subprocess and feeds them to :func:`parse_lines`. We DON'T spawn
 subprocesses here.
 
-Robust parsing: malformed JSON lines are skipped with a
-:class:`StreamWarning` (not raised) so a single corrupt line doesn't
-abort the whole run. If the entire stream produces zero events, the
-caller should treat that as a process error, not a parse error.
+Robust parsing: a malformed line, or an event of a type this parser does
+not recognize, is skipped and counted in :attr:`StreamSummary.skipped_lines`
+rather than aborting the run; unrecognized types are also counted by name.
+The dispatcher records the count on the run's :class:`RunRecord` and logs a
+warning, since a non-zero count can mean the stream format has drifted. If
+the entire stream produces zero events, the caller should treat that as a
+process error, not a parse error.
 """
 
 from __future__ import annotations
@@ -33,10 +36,6 @@ from typing import Any
 from claude_task_runner.queue.schema import TokenUsage
 
 logger = logging.getLogger(__name__)
-
-
-class StreamWarning(UserWarning):
-    """Issued for skipped (malformed/unrecognized) NDJSON lines."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +91,9 @@ class StreamSummary:
     final_result: ResultEvent | None = None
     event_count: int = 0
     skipped_lines: int = 0
+    unknown_event_types: dict[str, int] = field(default_factory=dict)
+    """How many of :attr:`skipped_lines` were events of each unrecognized
+    ``type``; the rest were malformed lines."""
 
 
 def _coerce_token_usage(d: Any | None) -> TokenUsage:
@@ -231,5 +233,8 @@ def parse_lines(
             yield event
             continue
 
-        # Unrecognized event type — count and continue.
+        # Unrecognized event type — count it by name and continue. A
+        # missing or non-string ``type`` is named by its Python type.
         summary.skipped_lines += 1
+        name = evt_type if isinstance(evt_type, str) else f"<{type(evt_type).__name__}>"
+        summary.unknown_event_types[name] = summary.unknown_event_types.get(name, 0) + 1

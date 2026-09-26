@@ -100,15 +100,22 @@ def install(
     the proposed change and asks for confirmation before writing.
 
     systemd: writes a ``--user`` unit that runs the supervisor for
-    ``--queue`` and restarts it when it fails. The queue's
+    ``--queue`` and restarts it when it fails. A unit that is already
+    running keeps its supervisor, so when the new unit would start it
+    differently, such as for another queue, ``install`` says so and how
+    to restart it. The queue's
     ``[watchdog]`` sets the unit's restart policy, so re-run ``install``
     after changing it.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
-    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``.
-    A tick restarts the supervisor of each registered queue that is not
-    running, even one stopped with ``supervisor stop`` or ``drain``,
-    and backs off after repeated crashes.
+    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``,
+    replacing any queue registered there: one supervisor runs per user,
+    so the watchdog manages one queue, as the systemd unit runs one. A
+    tick restarts that queue's supervisor when it is not running, even
+    one stopped with ``supervisor stop`` or ``drain``, and backs off
+    after repeated crashes. While another supervisor holds the per-user
+    lock, such as the replaced queue's, a tick starts none, and
+    ``install`` says how to hand over.
     """
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
@@ -164,6 +171,17 @@ def install(
         for line in sd_plan.unit_text.splitlines():
             console.print(f"  {line}")
         console.print(f"\n[bold]Then run:[/] {' '.join(sd_plan.enable_command)}\n")
+        # Asked only when the new unit would start the supervisor
+        # differently, so an unchanged or policy-only install asks nothing.
+        changed = systemd_mod.changed_start_directives(sd_plan.existing_text, sd_plan.unit_text)
+        running = bool(changed) and systemd_mod.is_unit_active()
+        if running:
+            console.print(
+                _running_unit_note(sd_plan.existing_text, changed, queue_path) + "\n",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
         if not yes and not Confirm.ask("Apply this change?", default=False):
             console.print("[yellow]Aborted.[/]")
             raise typer.Exit(code=1)
@@ -172,7 +190,14 @@ def install(
         except systemd_mod.SystemdError as exc:
             console.print(f"[bold red]systemd install failed:[/] {exc}")
             raise typer.Exit(code=2) from exc
-        console.print("[green]systemd unit installed and started.[/]")
+        if running:
+            console.print(
+                "[green]systemd unit installed.[/] Its running supervisor keeps the old "
+                "command until the unit restarts (see above).",
+                soft_wrap=True,
+            )
+        else:
+            console.print("[green]systemd unit installed and started.[/]")
         return
 
     # cron path
@@ -186,10 +211,11 @@ def install(
     else:
         console.print("  [dim](no visible diff — block already up to date)[/]")
     # The crontab line runs `watchdog tick` with no --queue, and a tick
-    # manages only the queues in this registry.
+    # manages only the queue in this registry.
     registry = registry_mod.queues_registry_path()
     console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
     console.print(f"  {queue_path}")
+    _show_replaced_queues(console, queue_path)
     if not yes and not Confirm.ask("\nApply this change?", default=False):
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
@@ -198,7 +224,7 @@ def install(
     # leaves nothing changed. The other order could leave a cron line
     # whose ticks have no queue to manage.
     try:
-        registry_mod.register_queue(queue_path)
+        replaced = registry_mod.register_queue(queue_path)
     except OSError as exc:
         console.print(f"[bold red]watchdog registration failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -212,6 +238,64 @@ def install(
         console.print(f"[bold red]crontab install failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab updated.[/]")
+    note = registry_mod.handover_note(queue_path, replaced)
+    if note is not None:
+        console.print(note, markup=False, highlight=False, soft_wrap=True)
+
+
+def _show_replaced_queues(console: Console, queue: Path) -> None:
+    """List the queues that registering ``queue`` replaces, before the y/N prompt.
+
+    One supervisor runs per user, so the watchdog manages one queue, and
+    registering one replaces whatever the registry lists now. Read
+    without side effects: a corrupt registry is only reported here, and
+    ``register_queue`` keeps a copy of it as ``queues.json.broken``.
+    Paths are printed without Rich markup, so a ``[`` stays as typed."""
+    try:
+        current = registry_mod.read_registered_queues()
+    except registry_mod.RegistryError as exc:
+        console.print(
+            f"It replaces the registry, which is unreadable ({exc}); "
+            "a copy is kept as queues.json.broken.",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        return
+    replaced = [q for q in dict.fromkeys(current) if q != queue]
+    if not replaced:
+        return
+    console.print("[bold]It replaces, since the watchdog manages one queue:[/]")
+    for q in replaced:
+        console.print(f"  {q}", markup=False, highlight=False, soft_wrap=True)
+
+
+def _running_unit_note(existing_text: str | None, changed: list[str], queue: Path) -> str:
+    """Say that the active unit keeps its supervisor on the old command.
+
+    ``systemctl --user enable --now`` does not restart an active unit,
+    and systemd applies ``changed`` only when it next starts the service.
+    Switching queues, a drain first lets the old queue's in-flight tasks
+    finish; the drained supervisor exits 0, which the unit does not
+    restart, so it is started by hand."""
+    what = ", ".join(changed)
+    old = systemd_mod.unit_queue(existing_text) if existing_text is not None else None
+    if old is not None and old != queue:
+        return (
+            f"The unit is running the supervisor for {old}. Installing does not restart it, "
+            f"and systemd applies the new {what} only when the unit next starts, so that "
+            "supervisor keeps running until then.\n"
+            "To let its in-flight tasks finish, then switch, run:\n"
+            f"  claude-task-runner supervisor drain --queue {old}\n"
+            "  systemctl --user start claude-task-runner\n"
+            "To switch at once, run:\n"
+            "  systemctl --user restart claude-task-runner"
+        )
+    return (
+        "The unit is running. Installing does not restart it, and systemd applies the new "
+        f"{what} only when the unit next starts. To apply it now, run:\n"
+        "  systemctl --user restart claude-task-runner"
+    )
 
 
 @app.command("uninstall")
@@ -226,8 +310,9 @@ def uninstall(
 
     Leaves ``~/.claude_task_runner/queues.json`` as it is. Once no cron
     block is installed, lists the queues it still holds with the
-    ``watchdog unregister`` command for each, because a later cron
-    ``install`` manages all of them again.
+    ``watchdog unregister`` command for each. No tick reads the registry
+    without the cron block, and a later cron ``install`` replaces it
+    with its own queue.
     """
     settings = load_settings(config)
     console = Console()
@@ -285,11 +370,12 @@ def uninstall(
 def _report_registered_queues(console: Console) -> None:
     """List what ``queues.json`` still holds once no cron block is installed.
 
-    ``uninstall`` leaves the registry alone, and a later cron ``install``
-    manages every queue it lists again, including any that has since
-    been moved or deleted. Printed without Rich markup, so a ``[`` in a
-    path stays as typed. A corrupt registry is reported and left as it
-    is; the uninstall itself has already succeeded."""
+    ``uninstall`` leaves the registry alone. No tick reads it without the
+    cron block, and a later cron ``install`` replaces it with its own
+    queue, so this is for an operator who wants it gone now. Printed
+    without Rich markup, so a ``[`` in a path stays as typed. A corrupt
+    registry is reported and left as it is; the uninstall itself has
+    already succeeded."""
     registry = registry_mod.queues_registry_path()
     try:
         queues = registry_mod.read_registered_queues()
@@ -304,10 +390,10 @@ def _report_registered_queues(console: Console) -> None:
         return
     if not queues:
         return
-    count = "1 queue" if len(queues) == 1 else f"{len(queues)} queues"
+    count, them = ("1 queue", "it") if len(queues) == 1 else (f"{len(queues)} queues", "them")
     console.print(
-        f"{registry} still lists {count}, and a later cron install manages every "
-        "queue it lists. To drop one:",
+        f"{registry} still lists {count}. No tick reads it without the cron block, and "
+        f"a later cron install replaces the list with its own queue. To drop {them} now:",
         markup=False,
         highlight=False,
         soft_wrap=True,

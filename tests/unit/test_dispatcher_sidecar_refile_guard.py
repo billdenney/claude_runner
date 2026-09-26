@@ -32,9 +32,6 @@ def test_taskstate_sidecar_refile_count_defaults_zero():
 
 def test_failure_classifier_threshold_default_is_four():
     s = FailureClassifierSettings(
-        environmental_patterns=[],
-        operator_patterns=[],
-        task_patterns=[],
         failure_circuit_breaker_threshold=3,
     )
     assert s.sidecar_refile_loop_threshold == 4

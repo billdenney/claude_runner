@@ -9,7 +9,33 @@ Breaking changes are called out in the version notes.
 
 ## [Unreleased]
 
+### Added
+
+- **A dead-code gate (`tests/unit/test_dead_code.py`).** It has two checks, both
+  run by the normal pytest step, so CI fails on them. First, every importable
+  module under `src/claude_task_runner` must be in the static import closure of
+  a console-script entry point in `pyproject.toml`, counting imports inside
+  functions. Second, everything vulture reports as unused must be deleted or
+  listed in `VULTURE_ALLOWLIST` with the reason it stays. Typer commands and
+  callbacks and pydantic validators are ignored by decorator. An allowlist entry
+  that stops matching fails the gate too, so the list cannot rot. Run on the
+  commit before this cleanup began, it names all eight dead modules removed
+  since (`supervisor/window.py`, `runner/runtime_stats.py` and the six empty
+  packages). vulture joins the `dev` extra.
+
 ### Removed
+
+- **`[failure_classifier]`'s three pattern lists, and the classifier that
+  never used them.** `environmental_patterns`, `operator_patterns` and
+  `task_patterns` fed `runner.retry.classify` (ADR-0012), which nothing
+  called. Every failed run is re-dispatched until
+  `failure_circuit_breaker_threshold` consecutive failures, whatever its error
+  says, so an `Operator: defer` failure was retried like any other. That is
+  unchanged. `classify` and `should_auto_resume` are gone, and a queue TOML
+  that still sets one of the lists is rejected at load with a message naming
+  it, like the settings below. **Before restarting a supervisor on this
+  version, delete the three lists from its `claude_runner.toml`.** The rest of
+  `[failure_classifier]` is unchanged.
 
 - **Settings that no code ever read are gone, and a queue TOML that still
   sets one no longer loads (breaking).** Every settings model is
@@ -182,7 +208,33 @@ Breaking changes are called out in the version notes.
   `tests/unit/test_cli_missing_queue.py` runs every command that takes
   `--queue` against a missing path. It checks that nothing is created and
   pins the exit code and message, so a command added later is covered.
-
+- **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
+  longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
+  every file under `src/claude_task_runner/`, data files included, but a
+  `force-include` table added `config/defaults/`, `skills/` and
+  `cron/watchdog.sh` again. hatchling 1.24 to 1.29 wrote the two directories'
+  19 files into the wheel twice, with only a zipfile warning. hatchling 1.30,
+  released 2026-06-01, refuses a second file at the same archive path, so
+  every build of the wheel has failed since. CI only ran `pip install -e`,
+  which never builds the real wheel. The table is gone. An editable install
+  no longer copies those files into `site-packages` either; the source tree
+  its `.pth` file points at shadowed the copies, so nothing read them.
+  `tests/unit/test_packaging.py` builds the sdist, a wheel from the tree (what
+  `pip install .` builds) and a wheel from the unpacked sdist (what `uv build`
+  builds) with the `[build-system]` backend. It fails on a duplicate archive
+  path, on a tracked package file that is missing from the wheel or has lost
+  its executable bit, on anything outside the package and its `.dist-info`, on
+  a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
+  script, and on a tracked file missing from the sdist. `hatchling` joins the
+  `dev` extra so the test can build.
+- **Skipped stream-json lines are recorded and logged, not dropped silently.**
+  The parser skips a malformed line, or an event of a type it does not know, so
+  one bad line cannot abort a run. But nothing looked at the count, and the
+  `StreamWarning` meant to report it was never issued. Each run's `RunRecord`
+  now carries `skipped_stream_lines`, and the dispatcher logs a warning naming
+  the unknown event types, since a non-zero count can mean Claude Code's stream
+  format has drifted. `StreamWarning` is gone. Run records written before this
+  read as 0.
 - **The systemd unit now takes its restart policy from the queue's
   `[watchdog]`.** `install` wrote `RestartSec=30`, `StartLimitBurst=5` and
   `StartLimitIntervalSec=600` into the unit whatever the queue's
@@ -231,6 +283,28 @@ Breaking changes are called out in the version notes.
   `systemctl --user cat claude-task-runner` shows a relative `--config`,
   re-run `claude-task-runner install` from the directory that path is
   relative to.
+- **A systemd `install` no longer claims it started a unit that keeps
+  running the old command.** `install` rewrites the unit file, reloads
+  systemd and runs `systemctl --user enable --now claude-task-runner`, which
+  starts a stopped unit but does not restart a running one. So
+  `install --queue B` over a unit running A's supervisor printed
+  `systemd unit installed and started.`, while A's supervisor went on
+  running with its old command, and holding the per-user lock, until the
+  unit next restarted. On systemd 255, a throwaway unit kept its main
+  process and old command through a rewrite, `daemon-reload` and
+  `enable --now`. When the unit is active and the new text changes a
+  directive that systemd applies only when it starts the service
+  (`ExecStart`, `WorkingDirectory`, `Environment`, `Type`, `StandardOutput`
+  or `StandardError`), `install` now says so before the y/N prompt, names
+  the queue the unit is running, and gives the commands that switch: drain
+  the old queue's supervisor, then `systemctl --user start`, or
+  `systemctl --user restart` at once. It then prints
+  `systemd unit installed.` without "and started". A change to the restart
+  policy or to `ExecStop` alone applies at the reload, as the same
+  throwaway unit showed, so it prints nothing new and does not ask systemd
+  whether the unit is active. `cron/systemd_unit.py` sorts every directive
+  the unit writes into those two groups, and a test fails when a new
+  directive is in neither. The runbook has a section for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
@@ -294,6 +368,56 @@ Breaking changes are called out in the version notes.
   `claude-task-runner watchdog unregister --queue <path>` for each. The
   runbook has a section for the symptom, including how to stop a supervisor
   that an older version already started on a recreated queue.
+- **The cron watchdog manages one queue, so it no longer fights the per-user
+  lock.** Only one supervisor runs per user, because each takes
+  `~/.claude_task_runner/global.lock`. Yet a cron `install` or
+  `watchdog register` for a second queue added it to
+  `~/.claude_task_runner/queues.json` beside the first, and a tick managed
+  every queue listed. While one queue's supervisor held the lock, every tick
+  spawned the other queue's, and each spawn exited 2 with
+  `another supervisor is already running`. Each refused spawn counted toward
+  the crash-loop threshold that all queues shared in `watchdog_state.json`,
+  so a real crash of the running queue could be held in BACKOFF: one extra
+  minute with the default settings, three with `restart_cooldown_s = 60`.
+  Registry order also picked the winner. With `[B, A]` and A running, a
+  crash of A started B's supervisor and refused A's from then on, so a
+  second `install` never took effect.
+
+  Now, as with the single systemd unit, a cron `install` and
+  `watchdog register` replace the registered queue, and each names the
+  queue it replaces. A tick manages the last queue in `queues.json`, so a
+  file that an older version let grow keeps working: the tick ignores the
+  other entries and logs a `WARNING` naming them, `watchdog queues` warns
+  about them on stderr, and doctor's `watchdog_installed` check warns and
+  gives the fix. When the managed queue's supervisor is down but another
+  process holds `global.lock`, the tick logs the new `verdict=locked`,
+  starts nothing and counts no restart, so the queue starts on the first
+  tick after the lock frees. The tick asks the lock itself, with a
+  non-blocking `flock`, because the PID left in the file outlives its
+  holder. `install` and `watchdog register` say when the replaced queue's
+  supervisor still holds the lock, and give the
+  `claude-task-runner supervisor drain --queue <old-queue>` that hands
+  over. The restart history in `watchdog_state.json` now names its queue,
+  and a tick that finds another queue registered starts it empty, so one
+  queue's restarts never hold back another's. The runbook has a section
+  for `verdict=locked`. Tests replay the old failures on a simulated cron
+  clock against the real lock, and temporary mutants (append instead of
+  replace, ignore the lock, keep the history across a switch, trust the
+  lock file's PID, manage the first entry) each fail them.
+- **`watchdog tick --dry-run` no longer records a restart.** A dry run saved
+  the restart it approved, so the next real tick counted a restart that
+  never happened toward the cooldown and the crash-loop threshold: a real
+  tick a second after a dry run gave `verdict=cooldown`. A dry run now
+  decides and logs, but saves no state.
+- **doctor's `global_lock` check asks the lock, not the PID left in it.**
+  The file keeps the last holder's PID after it exits, so doctor warned
+  that the lock was stale after every supervisor stop and suggested
+  removing it, and a PID that the OS had since given to another process
+  read as a running supervisor. doctor now probes the lock with `flock` and
+  reports it free, or held with the holder's PID. A leftover file is
+  harmless, since the next supervisor locks the same file. Removing it
+  while a supervisor holds the lock is what would let a second one run
+  beside it, so the runbook's crash-loop section no longer suggests it.
 - **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
   refuse a `--queue` that is not an existing directory.** They used to
   create it, because `queue_runtime_dir()` and `todo_dir()` make their
