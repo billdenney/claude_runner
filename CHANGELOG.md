@@ -169,6 +169,25 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
+  longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
+  every file under `src/claude_task_runner/`, data files included, but a
+  `force-include` table added `config/defaults/`, `skills/` and
+  `cron/watchdog.sh` again. hatchling 1.24 to 1.29 wrote the two directories'
+  19 files into the wheel twice, with only a zipfile warning. hatchling 1.30,
+  released 2026-06-01, refuses a second file at the same archive path, so
+  every build of the wheel has failed since. CI only ran `pip install -e`,
+  which never builds the real wheel. The table is gone. An editable install
+  no longer copies those files into `site-packages` either; the source tree
+  its `.pth` file points at shadowed the copies, so nothing read them.
+  `tests/unit/test_packaging.py` builds the sdist, a wheel from the tree (what
+  `pip install .` builds) and a wheel from the unpacked sdist (what `uv build`
+  builds) with the `[build-system]` backend. It fails on a duplicate archive
+  path, on a tracked package file that is missing from the wheel or has lost
+  its executable bit, on anything outside the package and its `.dist-info`, on
+  a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
+  script, and on a tracked file missing from the sdist. `hatchling` joins the
+  `dev` extra so the test can build.
 - **Skipped stream-json lines are recorded and logged, not dropped silently.**
   The parser skips a malformed line, or an event of a type it does not know, so
   one bad line cannot abort a run. But nothing looked at the count, and the
