@@ -317,6 +317,17 @@ def test_non_positive_pid_reads_as_stale(
     kill.assert_not_called()
 
 
+@pytest.mark.parametrize("command", ["stop", "drain"])
+def test_pid_beyond_pid_t_crashes(runner: CliRunner, queue_dir: Path, command: str) -> None:
+    """Pins today: a number too big for a C ``pid_t`` reaches ``os.kill``
+    in ``is_pid_alive``, which raises ``OverflowError``."""
+    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
+    pid_path.write_text(f"{2**31}\n", encoding="utf-8")
+    result = _invoke(runner, [command, "--queue", str(queue_dir)])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, OverflowError)
+
+
 # ---------------------------------------------------------------------------
 # `status` command
 # ---------------------------------------------------------------------------
