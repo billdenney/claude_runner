@@ -281,7 +281,7 @@ def uninstall_skills(
 
 @app.command("list")
 def list_installed() -> None:
-    """Show which task-runner skills are present in ``~/.claude/skills/``."""
+    """Show which task-runner skills are in ``~/.claude/skills/``."""
     console = Console()
     target = _skills_target_dir()
     for name in SKILL_NAMES:
