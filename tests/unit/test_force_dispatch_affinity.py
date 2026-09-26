@@ -33,6 +33,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
@@ -104,6 +105,7 @@ def _multi_account_settings() -> Any:
         concurrency=SimpleNamespace(initial_concurrency=1, max_concurrency=2),
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         claude=SimpleNamespace(executable="claude", config_dir=""),

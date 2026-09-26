@@ -362,6 +362,34 @@ def test_add_unknown_model(runner: CliRunner, queue_dir: Path) -> None:
     assert "claude-totally-not-a-real-model" in result.stdout
 
 
+def test_add_unknown_model_message_keeps_its_brackets(runner: CliRunner, queue_dir: Path) -> None:
+    """Printed without Rich markup. With it, Rich took "[effort_levels...]"
+    for a style tag and dropped it, so the hint read "add a  entry to
+    claude_runner.toml"."""
+    result = runner.invoke(
+        app,
+        [
+            "add",
+            "--queue",
+            str(queue_dir),
+            "--id",
+            "t1",
+            "--title",
+            "test",
+            "--prompt",
+            "do it",
+            "--model",
+            "claude-newmodel-99",
+        ],
+    )
+    assert result.exit_code == 2
+    assert " ".join(result.stdout.split()) == (
+        "invalid effort: model 'claude-newmodel-99' has no effort levels configured; "
+        'add "claude-newmodel-99" = [<levels>] under [effort_levels] in '
+        "claude_runner.toml or use a configured model"
+    )
+
+
 def test_add_exists_without_overwrite(runner: CliRunner, queue_dir: Path) -> None:
     """Pre-existing YAML at the target path blocks add (no --overwrite)."""
     _make_task(queue_dir, "t1")
