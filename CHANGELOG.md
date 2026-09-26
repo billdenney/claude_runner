@@ -183,6 +183,16 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **`claude-task-runner usage` with no subcommand runs `render`, as intended,
+  instead of crashing.** `docs/cheatsheet.md` gives bare `usage` for live
+  utilization, but from v0.1.0 on it printed a `TypeError` traceback and exited
+  1. The group's callback called `ctx.invoke(render)`, and click calls a plain
+  function with only the arguments given, so `render` never got its context.
+  A comment in the tests said that only the test runner missed this path and
+  the real CLI worked; both failed the same way. Tests now run bare `usage`
+  through the `usage` app and through the entry point, and check that it
+  prints and exits as `usage render` does, on a snapshot and on a capture
+  timeout.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a

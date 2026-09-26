@@ -69,7 +69,9 @@ def _root(
     ctx.obj["settings"] = settings
     ctx.obj["captures_dir"] = _default_captures_dir()
     if ctx.invoked_subcommand is None:
-        ctx.invoke(render)
+        # Click calls a plain function with only the arguments given, so
+        # render gets this context explicitly.
+        ctx.invoke(render, ctx)
 
 
 @app.command("render")
