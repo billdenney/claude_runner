@@ -264,6 +264,24 @@ Breaking changes are called out in the version notes.
   to add (`"<model>" = [<levels>]` under `[effort_levels]`); the old
   `[effort_levels.'<model>']` hint named a sub-table the schema rejects, and
   `queue add` printed it through Rich markup, which dropped it entirely.
+- **`queue states` and `queue show` print why a task is `deferred`.** A
+  parked task records why in `deferred_reason`: a readiness hold (ADR-0030),
+  an effort hold (ADR-0010), a pre-dispatch hook's exit 1 with the hook's
+  stderr (ADR-0026) or an operator's own words. Both commands printed it only
+  with `--json`, so an operator saw `deferred` but not why. Without `--json`,
+  both now print it under a `deferred` task, followed by `next_eligible_at`
+  when it is set. Of the runner's own deferrals, only a hook deferral sets
+  it. The reason is printed as written. Rich markup would drop the
+  `[effort_levels]` in an unknown model's effort hold and crash the command
+  on a `[/]` in a hook's stderr, and Rich's emoji codes, which stay on when
+  markup is off, turn a `:b:` in a path into a symbol. The second and later
+  lines of a reason are indented. A task in any other status shows no
+  reason, because a task that dispatches after a deferral keeps its old one:
+  on 2026-09-26, 24 completed tasks on the nlmixr2lib queue still carried
+  one. The skills read these commands only with `--json`, which is
+  unchanged. The entry for ADR-0030's readiness hold said the hold showed in
+  `queue list`, which never reads a task's state. It now names
+  `queue states`.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
@@ -1041,7 +1059,7 @@ Breaking changes are called out in the version notes.
   both directions.
 - A task the readiness gate holds is now parked as `deferred` with a
   `readiness hold: <reasons>` reason instead of being an invisible per-tick
-  skip, so `queue list` shows why it has never run. No `next_eligible_at` is
+  skip, so `queue states` shows why it has never run. No `next_eligible_at` is
   set — a cooldown would forfeit ADR-0030's promise to unblock the first
   tick after the element appears — and the park is written only on
   transition, leaves `attempts` / `runs` untouched, and clears itself back

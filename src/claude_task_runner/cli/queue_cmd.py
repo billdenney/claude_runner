@@ -289,6 +289,38 @@ def list_tasks(
             )
 
 
+def _print_deferral(console: Console, state: dict[str, object]) -> None:
+    """Print why a ``deferred`` task is parked, for ``queue states`` and ``queue show``.
+
+    Prints nothing for any other status: a task that dispatches after a
+    deferral keeps its old ``deferred_reason`` and ``next_eligible_at``,
+    so a completed task can still carry both. For a ``deferred`` task,
+    prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
+    the earliest time the supervisor tries the task again. Of the runner's
+    own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
+    readiness hold (ADR-0030) and an effort hold (ADR-0010) do not,
+    because their gate re-checks the task on every tick.
+
+    Printed as written: Rich markup would drop the ``[effort_levels]`` in
+    an unknown model's effort hold and raise on a ``[/]`` in a hook's
+    stderr, and emoji codes would turn a ``:b:`` in a path into a symbol.
+    The second and later lines of a reason are indented, so none of them
+    can pass for a task's row in ``queue states``.
+    """
+    if state.get("status") != "deferred":
+        return
+    reason = state.get("deferred_reason")
+    if isinstance(reason, str) and reason.strip():
+        shown = "\n    ".join(reason.splitlines())
+    else:
+        shown = "(none recorded)"
+    lines = [f"  deferred_reason: {shown}"]
+    next_eligible_at = state.get("next_eligible_at")
+    if next_eligible_at is not None:
+        lines.append(f"  next_eligible_at: {next_eligible_at}")
+    console.print("\n".join(lines), markup=False, highlight=False, emoji=False, soft_wrap=True)
+
+
 @app.command("states")
 def list_states(
     *,
@@ -306,6 +338,10 @@ def list_states(
 
     Skills use ``--status awaiting_sidecar`` to find work that needs
     operator attention, ``--status running`` for in-flight, etc.
+
+    Under each ``deferred`` task, the output without ``--json`` prints
+    why it is parked (``deferred_reason``) and, when set, when the
+    supervisor tries it again (``next_eligible_at``).
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -333,6 +369,8 @@ def list_states(
                     "last_finished_at",
                     "stop_reason",
                     "error",
+                    "deferred_reason",
+                    "next_eligible_at",
                 )
             }
         out.append(payload)
@@ -354,6 +392,7 @@ def list_states(
             else "yellow"
         )
         console.print(f"[bold]{item.get('task_id', item.get('id', '?'))}[/]  [{color}]{status}[/]")
+        _print_deferral(console, item)
         if item.get("error"):
             console.print(f"  [dim]error:[/] {item['error']}")
 
@@ -367,7 +406,11 @@ def show_task(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Show the input YAML AND state YAML for one task."""
+    """Show the input YAML AND state YAML for one task.
+
+    For a ``deferred`` task, the output without ``--json`` also prints
+    ``deferred_reason`` and, when set, ``next_eligible_at``.
+    """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
     task_path = task_path_for(qd, task_id)
@@ -420,6 +463,7 @@ def show_task(
             f"  status: {state_payload.get('status')}  attempts: {state_payload.get('attempts')}"
         )
         console.print(f"  session_id: {state_payload.get('session_id')}")
+        _print_deferral(console, state_payload)
     if "state_error" in payload:
         console.print(f"  [red]state error:[/] {payload['state_error']}")
     readiness = payload.get("readiness")
