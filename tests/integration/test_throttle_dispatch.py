@@ -13,8 +13,10 @@ dispatched through each account.
   ERROR_DRIFT mean no new dispatch, on a single-account queue too.
 * **IDLE.** An account captured while nothing was pending goes IDLE,
   which is dispatchable, but tasks that arrive before its next capture
-  run under the cap of that reading. Only an account never captured is
-  capped by its ``max_concurrency`` alone.
+  run under the cap of that reading.
+* **No fresh reading.** An account whose last clean reading is older
+  than ``[usage].max_reading_age_s``, or that has none, is NO_READING
+  and takes no tasks until a capture succeeds.
 
 The multi-account configuration mirrors a live two-account queue:
 ``personal`` allows 5 concurrent tasks, ``work`` allows 1, and the
@@ -48,6 +50,7 @@ from claude_task_runner.supervisor.daemon import PollResult, TickContext, run_on
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 from claude_task_runner.usage.drift import UsageCaptureTimeout, UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
+from claude_task_runner.usage.multi_account_source import MultiAccountSourceError
 
 NOW = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
 """Noon UTC: inside the default day band (slowdown 40, stop 60)."""
@@ -267,21 +270,148 @@ class TestMultiAccountIdle:
         assert snapshot.accounts["work"].state is SupervisorState.DISPATCHING
         assert _dispatch_counts(queue_dir, settings, snapshot, clock) == expected
 
-    def test_account_never_captured_still_dispatches(self, tmp_path: Path, queue_dir: Path) -> None:
-        """Cold start: ``work`` keeps the IDLE it was seeded with and has no
-        decision yet, so only its ``max_concurrency`` of 1 caps it."""
+
+def _capture_timeout(account: str) -> PollResult:
+    """A capture of ``account`` that timed out, as the multi-account source reports it."""
+    return MultiAccountSourceError.wrap(account, UsageCaptureTimeout("slow"))
+
+
+def _warnings(actions: list[Action]) -> list[str]:
+    return [a.message for a in actions if isinstance(a, Notify) and a.level == "warn"]
+
+
+class TestFreshReadingRequired:
+    """An account takes tasks only while its last clean reading is recent.
+
+    ``[usage].max_reading_age_s`` (600 s by default) bounds the age of that
+    reading. Failed captures don't count. An account never read, or whose
+    last reading is older than the limit, is NO_READING, and dispatch skips
+    it until a capture succeeds.
+    """
+
+    def test_account_never_read_takes_no_tasks(self, tmp_path: Path, queue_dir: Path) -> None:
+        """Cold start: the first tick reads ``personal``; ``work`` has not
+        been read yet. It used to take a task at 0% on no data."""
         settings = _two_account_settings(tmp_path)
         clock = FakeClock(NOW)
         snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
 
+        snapshot, actions = _tick(snapshot, settings, _reading(10, "personal"), clock)
+
+        assert snapshot.accounts["work"].state is SupervisorState.NO_READING
+        assert snapshot.accounts["work"].target_concurrency is None
+        assert _warnings(actions) == []
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"personal": 5}
+
+    def test_account_whose_captures_always_fail_takes_no_tasks(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        """Every capture of ``personal`` times out while ``work`` is over its
+        5h stop. ``personal`` used to stay in its seeded IDLE at 0%, sort
+        first and take all 5 tasks with no usage data at all."""
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+
+        for _ in range(3):
+            snapshot, _ = _tick(snapshot, settings, _capture_timeout("personal"), clock)
+            snapshot, _ = _tick(snapshot, settings, _reading(65, "work"), clock)
+            clock.advance(60)
+
+        assert snapshot.accounts["personal"].state is SupervisorState.NO_READING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {}
+
+    def test_account_stops_once_its_last_reading_is_too_old(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        """``personal`` reads 10% at noon, then every capture of it fails. At
+        exactly 600 s it still takes tasks; one second later it stops, and
+        the supervisor says so once."""
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "personal"), clock)
+        snapshot, _ = _tick(snapshot, settings, _reading(65, "work"), clock)
+
+        clock.advance(600)
+        snapshot, actions = _tick(snapshot, settings, _capture_timeout("personal"), clock)
+        assert snapshot.accounts["personal"].state is SupervisorState.DISPATCHING
+        assert _warnings(actions) == []
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"personal": 5}
+
+        clock.advance(1)
+        snapshot, actions = _tick(snapshot, settings, _capture_timeout("personal"), clock)
+        assert snapshot.accounts["personal"].state is SupervisorState.NO_READING
+        assert snapshot.accounts["personal"].target_concurrency is None
+        assert _warnings(actions) == [
+            "no clean usage reading for account 'personal' since 2026-05-27 12:00:00 UTC, "
+            "over the 600 s limit; no tasks go through it until a capture succeeds"
+        ]
+
+        snapshot, actions = _tick(snapshot, settings, _capture_timeout("personal"), clock)
+        assert _warnings(actions) == []
+
+    def test_account_takes_tasks_again_once_a_capture_succeeds(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "personal"), clock)
+        clock.advance(601)
+        snapshot, _ = _tick(snapshot, settings, _capture_timeout("personal"), clock)
+        assert snapshot.accounts["personal"].state is SupervisorState.NO_READING
+
         snapshot, _ = _tick(snapshot, settings, _reading(10, "personal"), clock)
 
-        assert snapshot.accounts["work"].state is SupervisorState.IDLE
-        assert snapshot.accounts["work"].target_concurrency is None
-        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {
-            "work": 1,
-            "personal": 4,
-        }
+        assert snapshot.accounts["personal"].state is SupervisorState.DISPATCHING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"personal": 5}
+
+    def test_restart_after_downtime_waits_for_each_accounts_reading(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        """Both accounts read clean at noon; the supervisor is then down for
+        two hours. Its first tick reads only ``work``, so ``personal`` must
+        not take tasks on a two-hour-old reading."""
+        settings = _two_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "personal"), clock)
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "work"), clock)
+
+        clock.advance(2 * 3600)
+        snapshot, _ = _tick(snapshot, settings, _reading(10, "work"), clock)
+
+        assert snapshot.accounts["personal"].state is SupervisorState.NO_READING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"work": 1}
+
+    def test_single_account_queue_dispatches_on_its_first_tick(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        """A single-account queue reads its account before each dispatch
+        pass, so requiring a reading costs it nothing at start."""
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+        assert snapshot.accounts["default"].state is SupervisorState.NO_READING
+
+        snapshot, _ = _tick(snapshot, settings, _reading(10, None), clock)
+
+        assert snapshot.state is SupervisorState.DISPATCHING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"default": 4}
+
+    def test_single_account_queue_whose_first_capture_fails_waits(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+
+        snapshot, _ = _tick(snapshot, settings, UsageCaptureTimeout("slow"), clock)
+
+        assert snapshot.state is SupervisorState.NO_READING
+        assert snapshot.accounts["default"].state is SupervisorState.NO_READING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {}
 
 
 class TestSingleAccountSlowdown:
