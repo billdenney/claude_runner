@@ -179,8 +179,9 @@ unit but does not restart a running one. systemd applies `ExecStart=`,
 `WorkingDirectory=` and `Environment=` only when it starts the service, so
 the running supervisor keeps its old queue and command until the unit
 restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
-`StartLimitIntervalSec=`) and `ExecStop=` apply at the reload, so a changed
-`[watchdog]` alone needs no restart, and `install` does not ask for one.
+`StartLimitIntervalSec=`), `ExecStop=` and `TimeoutStopSec=` apply at the
+reload, so a changed `[watchdog]` or `[task_caps].max_duration_s_per_task`
+alone needs no restart, and `install` does not ask for one.
 
 **Steps:**
 1. To let the old queue's in-flight tasks finish first, drain its
@@ -201,6 +202,41 @@ restarts. The restart policy (`RestartSec=`, `StartLimitBurst=`,
    With `[supervisor].adopt_workers` on, the default, the old queue's
    in-flight workers keep running, but no supervisor follows them until
    one runs for that queue again.
+
+## A systemd stop killed in-flight tasks (adoption off)
+
+**Symptom:** with `[supervisor].adopt_workers = false`,
+`systemctl --user stop` or `restart claude-task-runner` ends with
+`State 'stop-sigterm' timed out. Killing.` and
+`Main process exited, code=killed, status=9/KILL` in
+`journalctl --user -u claude-task-runner`, and the tasks that were running
+are dispatched again by the next supervisor.
+
+**Cause:** with adoption off, the unit's `ExecStop` drains. The supervisor
+dispatches nothing new and exits once its in-flight tasks finish. systemd
+waits `TimeoutStopSec` for that, then SIGKILLs the supervisor. `install`
+sets `TimeoutStopSec` to `[task_caps].max_duration_s_per_task`, the longest
+a task may run, and to `infinity` when the cap is 0. A unit installed
+before that change waits 14400 s whatever the cap. The timeout does not
+cover a task whose `max_duration_s_override` is above the queue's cap, or
+the time the pre- and post-dispatch hooks take.
+
+**Steps:**
+1. `systemctl --user show -p TimeoutStopUSec claude-task-runner` shows
+   what the next stop waits.
+2. After changing the cap, re-run `claude-task-runner install`. It rewrites
+   the unit and reloads systemd, and the next stop waits the new timeout.
+   The running supervisor needs no restart.
+3. With a cap of 0, a stop waits until every in-flight task finishes. To
+   end one sooner, kill only the supervisor; its tasks are dispatched again
+   by the next one:
+
+   ```sh
+   systemctl --user kill --kill-whom=main --signal=KILL claude-task-runner
+   ```
+
+   With `[supervisor].adopt_workers` on, the default, a stop does not wait
+   for tasks: the workers keep running and the next supervisor adopts them.
 
 ## Cron watchdog installed, but the supervisor stays down
 

@@ -248,8 +248,12 @@ def _write_installed_unit(
     exe: str = _EXE,
     config: Path | None = None,
     watchdog: WatchdogSettings | None = None,
+    adopt_workers: bool = True,
 ) -> None:
-    """Write the unit an earlier ``install --queue <queue>`` would have written."""
+    """Write the unit an earlier ``install --queue <queue>`` would have written.
+
+    It has the package's ``[task_caps]``, so with adoption off it waits
+    14400 s for a drain."""
     command = f"{exe} supervisor start --queue {queue}"
     if config is not None:
         command += f" --config {config}"
@@ -260,6 +264,8 @@ def _write_installed_unit(
             supervisor_command=command,
             queue_dir=queue,
             watchdog=watchdog if watchdog is not None else load_settings(None).watchdog,
+            task_caps=load_settings(None).task_caps,
+            adopt_workers=adopt_workers,
         ),
         encoding="utf-8",
     )
@@ -358,6 +364,31 @@ def test_install_systemd_policy_change_needs_no_restart(runner: CliRunner, tmp_p
     with _systemd_install(active=None):
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
     assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
+
+
+def test_install_systemd_task_cap_change_needs_no_restart(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """systemd 255 applies a changed TimeoutStopSec at daemon-reload, so nothing is asked.
+
+    A throwaway unit started with ``TimeoutStopSec=60``, reloaded with 3,
+    stopped in 3 s."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = queue.resolve() / "claude_runner.toml"
+    config.write_text(
+        "[supervisor]\nadopt_workers = false\n\n[task_caps]\nmax_duration_s_per_task = 28800\n",
+        encoding="utf-8",
+    )
+    # Installed before the cap changed: the same command, TimeoutStopSec=14400.
+    _write_installed_unit(queue.resolve(), config=config, adopt_workers=False)
+    with _systemd_install(active=None) as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    unit_lines = _written_unit_lines(mock_apply)
+    assert [ln for ln in unit_lines if ln.startswith("TimeoutStopSec=")] == ["TimeoutStopSec=28800"]
+    assert "The unit is running" not in result.stdout
     assert result.stdout.splitlines()[-1] == "systemd unit installed and started."
 
 
@@ -853,23 +884,58 @@ def _timeout_stop_lines(mock_apply: MagicMock) -> list[str]:
     return [ln for ln in _written_unit_lines(mock_apply) if ln.startswith("TimeoutStopSec=")]
 
 
-@pytest.mark.parametrize("cap", ["0", "14400", "28800"])
-def test_install_systemd_drain_unit_ignores_the_duration_cap(
-    runner: CliRunner, tmp_path: Path, cap: str
-) -> None:
-    """Pins current behaviour, a known gap: the drain unit waits 4 h whatever the cap.
+def _drain_toml(cap: str) -> str:
+    """A ``claude_runner.toml`` with adoption off and a task cap of ``cap``."""
+    return f"[supervisor]\nadopt_workers = false\n\n[task_caps]\nmax_duration_s_per_task = {cap}\n"
 
-    With ``[supervisor].adopt_workers`` off, ``systemctl --user stop`` waits
-    ``TimeoutStopSec`` for in-flight tasks, then SIGKILLs the supervisor.
-    ``install`` writes 14400 even where ``[task_caps].max_duration_s_per_task``
-    lets a task run longer, or without limit (0)."""
-    result, mock_apply = _install_with_task_cap(
-        runner,
-        tmp_path,
-        f"[supervisor]\nadopt_workers = false\n\n[task_caps]\nmax_duration_s_per_task = {cap}\n",
-    )
+
+@pytest.mark.parametrize(
+    ("cap", "timeout"),
+    [("0", "infinity"), ("14400", "14400"), ("28800", "28800"), ("3600.5", "3600.5")],
+)
+def test_install_systemd_drain_unit_waits_for_the_duration_cap(
+    runner: CliRunner, tmp_path: Path, cap: str, timeout: str
+) -> None:
+    """With ``[supervisor].adopt_workers`` off, a stop waits as long as the cap lets a task run.
+
+    ``systemctl --user stop`` waits ``TimeoutStopSec`` for in-flight tasks,
+    then SIGKILLs the supervisor. ``install`` used to write 14400 whatever
+    ``[task_caps].max_duration_s_per_task`` said, so a stop killed tasks
+    that a longer cap, or no cap (0), let run."""
+    result, mock_apply = _install_with_task_cap(runner, tmp_path, _drain_toml(cap))
     assert result.exit_code == 0, result.output
-    assert _timeout_stop_lines(mock_apply) == ["TimeoutStopSec=14400"]
+    assert _timeout_stop_lines(mock_apply) == [f"TimeoutStopSec={timeout}"]
+    # The operator sees it in the unit text before confirming.
+    assert f"  TimeoutStopSec={timeout}\n" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("cap", "reason"),
+    [
+        ("18446744073709", "18446744073709.0 is longer than systemd accepts (18446744073708 s)"),
+        (
+            "1e-07",
+            "1e-07 rounds to 0 at systemd's resolution of one microsecond, "
+            "and systemd reads TimeoutStopSec=0 as no timeout",
+        ),
+    ],
+)
+def test_install_systemd_refuses_a_duration_cap_the_unit_cannot_carry(
+    runner: CliRunner, tmp_path: Path, isolated_home: Path, cap: str, reason: str
+) -> None:
+    """systemd would ignore the first and wait its own 90 s, and wait forever on the second.
+
+    The message keeps ``[task_caps]``, which Rich markup would otherwise
+    take for a style tag and drop."""
+    result, mock_apply = _install_with_task_cap(runner, tmp_path, _drain_toml(cap))
+    assert result.exit_code == 2
+    assert (
+        f"systemd install failed: [task_caps].max_duration_s_per_task = {reason}. "
+        "Nothing was written.\n"
+    ) in result.stdout
+    assert "Unit text:" not in result.stdout
+    mock_apply.assert_not_called()
+    assert not (isolated_home / ".config").exists()
 
 
 @pytest.mark.parametrize("cap", ["0", "1e-07", "28800", "18446744073709"])
@@ -879,7 +945,7 @@ def test_install_systemd_fast_stop_unit_ignores_the_duration_cap(
     """With adoption on, the default, a stop leaves the workers running (ADR-0025).
 
     The supervisor exits at once, so the unit waits 30 s whatever the cap,
-    even one that systemd could not parse as a time span."""
+    even one the drain unit refuses."""
     result, mock_apply = _install_with_task_cap(
         runner, tmp_path, f"[task_caps]\nmax_duration_s_per_task = {cap}\n"
     )
