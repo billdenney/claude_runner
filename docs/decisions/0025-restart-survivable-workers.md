@@ -90,7 +90,7 @@ Make workers survive a supervisor restart and let a fresh supervisor
      > anything is dispatched: a new dispatch would start work that the
      > exit then abandons. The poll still runs to the end. The part of a
      > tick before its dispatch phase takes about 8 s on the live runner,
-     > but a TTY capture that runs into its `[usage].capture_*` timeouts
+     > but a TTY capture that runs into its `[usage]` capture timeouts
      > can take longer than `TimeoutStopSec`. SIGHUP still waits for the
      > next scheduled tick.
 
