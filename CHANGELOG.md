@@ -22,6 +22,28 @@ Breaking changes are called out in the version notes.
   commit before this cleanup began, it names all eight dead modules removed
   since (`supervisor/window.py`, `runner/runtime_stats.py` and the six empty
   packages). vulture joins the `dev` extra.
+- **CI smoke-tests a non-editable install.** The other CI steps import the
+  package from the editable install, whose `.pth` file serves `src/`, so
+  nothing ran it from site-packages, where `pip install .` and `pipx install`
+  put it. A new step, on each Python version CI tests, installs the package
+  with `pip install .` into a fresh venv and runs `scripts/smoke_installed.py`
+  with that venv's interpreter from outside the checkout. Every version runs
+  it because the package reads its skills and default settings through
+  `importlib.resources` on namespace packages, and Python 3.11 resolves a path
+  in one with different code than 3.12 and 3.13 do. The script checks that
+  the package imports from that venv's site-packages, that
+  `claude-task-runner --help` exits 0, and that `load_settings(None)`
+  validates the shipped defaults. It checks that every skill in `SKILL_NAMES`
+  resolves to a directory in the package with a `SKILL.md`, and that
+  `watchdog.sh` and `verify_branch_contributions.sh` are executable, since
+  cron and `merge_branches.sh` run them directly. Last, `install-skills --yes`
+  into an empty `HOME` must link every skill to its directory. Each check
+  prints PASS or FAIL, and the step fails if any check does. An install with
+  the skills or the default settings left out of the wheel, with either
+  script's executable bit dropped, or with a broken console-script entry point
+  each turned it red. `tests/unit/test_smoke_installed.py` pins what the
+  script reports from an editable install, where only the site-packages check
+  fails, and against stand-ins with one defect each.
 
 ### Removed
 
@@ -206,6 +228,62 @@ Breaking changes are called out in the version notes.
   through the `usage` app and through the entry point, and check that it
   prints and exits as `usage render` does, on a snapshot and on a capture
   timeout.
+- **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
+  config, and a cron `install --config` is recorded.** The crontab line runs
+  `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
+  loaded only the package defaults. A queue's `restart_cooldown_s`,
+  `restart_backoff_max_s` and `crash_loop_threshold` therefore did nothing
+  under cron. `install --config` was dropped: the registry kept only the
+  queue's path, and the restarted `supervisor start` ran without `--config`,
+  so it found only `<queue>/claude_runner.toml`. `install --config` and a new
+  `claude-task-runner watchdog register --config <toml>` now record the file,
+  made absolute, in `~/.claude_task_runner/queues.json`. It goes in a
+  `configs` map keyed by queue, and `queues` stays a list of paths, so an
+  older reader still finds the queue. A tick picks the managed queue's
+  config in this order:
+  1. the tick's own `--config`;
+  2. the recorded config;
+  3. `<queue>/claude_runner.toml`, if it exists;
+  4. the package defaults.
+
+  It decides with that config's `[watchdog]`, and a restart passes the same
+  file to `supervisor start --config`. The log line for a restart names it.
+  Registering again without `--config` drops the recorded config, and
+  unregistering the queue drops it too. `register` refuses a config that
+  does not load, whether given with `--config` or found in the queue, since
+  every tick would fail on it. When the queue's config does not load at tick
+  time (bad TOML, a schema error, or a recorded file that is gone), the tick
+  logs one `ERROR` line naming the file and the error. It neither checks
+  nor restarts the supervisor, falls back to no other config, saves its
+  state and exits 1. A supervisor started with that file would fail the same
+  way. The runbook has a section for that line. The tests that pinned the
+  old behaviour now assert the new one: a 999 s cooldown in the queue's TOML
+  holds a restart 60 s after the last one.
+- **Commands that read a queue no longer create a `--queue` that does not
+  exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
+  `account list` and `account resume` created `<queue>/todo/` or
+  `<queue>/.claude_task_runner/` and exited 0 as if the queue were empty, so
+  a mistyped, deleted or moved `--queue` looked like a queue with nothing in
+  it. `queue show`, `queue restart-fresh`, `queue backfill-working-dir`,
+  `sidecar show`, `sidecar answer` and `doctor` created it too.
+  `account pause` wrote a `supervisor.json` into the new tree, and
+  `sidecar answer --allow-partial` wrote its response there. Each of these
+  commands except `doctor` now exits 2 with
+  `--queue is not an existing directory: <path>` before it reads anything,
+  as `queue add`, `queue force-dispatch`, `supervisor start` and `install`
+  already did. With `--json` the error is `{"ok": false, "error": ...}` on
+  stdout, and the `sidecar` commands print the plain form on stderr, where
+  their other errors go. `doctor` still runs. Its `queue_layout` check FAILs,
+  now also when `--queue` is a file, which used to crash it, and the seven
+  checks that read the queue's files are left out. It exits 1, and its
+  `--json` keeps its shape. `supervisor stop` and `drain` only read the PID
+  file and are unchanged. Underneath, `queue_runtime_dir()` and `todo_dir()`
+  no longer pass `parents=True`. They create the queue's subdirectories but
+  never the queue directory, so any other caller that reaches them with a
+  missing queue gets `FileNotFoundError` instead of an empty queue.
+  `tests/unit/test_cli_missing_queue.py` runs every command that takes
+  `--queue` against a missing path. It checks that nothing is created and
+  pins the exit code and message, so a command added later is covered.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
@@ -225,6 +303,14 @@ Breaking changes are called out in the version notes.
   a missing `settings.toml`, `watchdog.sh` or `SKILL.md`, on a changed console
   script, and on a tracked file missing from the sdist. `hatchling` joins the
   `dev` extra so the test can build.
+- **`[project.urls]` now points at the real repository.** `Homepage` and
+  `Issues` named `github.com/billdenney/claude_task_runner`, but the
+  repository is `github.com/billdenney/claude_runner`. The old address returns
+  404 and does not redirect, so every built wheel's METADATA carried two dead
+  `Project-URL` links. `tests/unit/test_packaging.py` now fails when a GitHub
+  link in `[project.urls]` names any repository but the one `origin` points
+  to. It skips when the checkout has no `origin` remote or `origin` is not on
+  GitHub.
 - **Skipped stream-json lines are recorded and logged, not dropped silently.**
   The parser skips a malformed line, or an event of a type it does not know, so
   one bad line cannot abort a run. But nothing looked at the count, and the
@@ -266,10 +352,8 @@ Breaking changes are called out in the version notes.
   argument and no longer take `restart_sec_s`, `start_limit_burst` or
   `start_limit_interval_s`.
 
-  **The cron watchdog still ignores a queue's `[watchdog]`.** `watchdog.sh`
-  runs `watchdog tick` with no `--config`, so the tick uses the package
-  defaults, and a cron `install --config` is not recorded. Tests pin both
-  until a follow-up makes the tick load the managed queue's config.
+  The cron watchdog reads a queue's `[watchdog]` as well; see the entry on
+  the cron watchdog above.
 - **A relative `install --config` now reaches the systemd unit as the file
   `install` checked.** `install --config rel.toml` loaded `rel.toml` from
   the directory it ran in, but wrote `--config rel.toml` into the unit's

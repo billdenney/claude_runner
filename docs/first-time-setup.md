@@ -51,10 +51,11 @@ cd /path/to/my_queue
 
 This directory becomes the queue's root. Tasks live under `todo/<id>.yaml`;
 state lives under `.claude_task_runner/` (auto-created on first dispatch).
-Create the directory first: `queue add`, `queue force-dispatch`,
-`supervisor start` and `install` exit 2 with
+Create the directory first. A command that reads or writes the queue, such
+as `queue add`, `queue list` or `supervisor start`, exits 2 with
 `--queue is not an existing directory` rather than create a queue from a
-mistyped or deleted path.
+mistyped or deleted path, or report it empty. `doctor` fails its
+`queue_layout` check instead.
 
 ## 3. Write a minimal `claude_runner.toml`
 
@@ -184,7 +185,10 @@ systemd-user vs cron and asks for confirmation before writing anything.
   exponentially after repeated crashes (ADR-0002). While another supervisor
   holds the per-user lock, such as one a previous `install` started for
   another queue, a tick starts none; `install` says how to hand over.
-  `claude-task-runner watchdog queues` shows the registered queue.
+  `claude-task-runner watchdog queues` shows the registered queue. A tick
+  takes the queue's `[watchdog]` settings from the config `install --config`
+  recorded, else from `<queue>/claude_runner.toml`, and starts the
+  supervisor with the same file.
 
 ## 6. Start the supervisor
 

@@ -908,34 +908,105 @@ def test_install_systemd_writes_the_config_it_checked_as_an_absolute_path(
     assert "RestartSec=45" in unit_lines
 
 
-def test_install_cron_does_not_record_config(runner: CliRunner, tmp_path: Path) -> None:
-    """Pins current behaviour, a known gap: a cron ``install --config`` is dropped.
-
-    The registry keeps only the queue's path, so the tick the crontab
-    line runs spawns ``supervisor start`` without ``--config``, and that
-    supervisor finds only ``<queue>/claude_runner.toml``. The follow-up
-    that makes the tick load the queue's config changes this."""
-    queue = tmp_path / "queue"
-    queue.mkdir()
-    config = tmp_path / "elsewhere" / "custom.toml"
-    config.parent.mkdir()
-    config.write_text("[watchdog]\nrestart_cooldown_s = 999\n", encoding="utf-8")
-    with _cron_install_patched(tmp_path / "bk.txt"):
-        installed = runner.invoke(app, ["--yes", "--queue", str(queue), "--config", str(config)])
-    assert installed.exit_code == 0, installed.output
-    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
-    assert registry == {"queues": [str(queue.resolve())]}
-
+def _record_tick_spawns(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, Path | None]]:
+    """Replace the tick's spawn with a recorder of (queue, --config)."""
     spawned: list[tuple[Path, Path | None]] = []
 
     def _record(queue_dir: Path, config: Path | None = None) -> int:
         spawned.append((queue_dir, config))
         return 4242
 
-    with patch.object(watchdog_cmd, "_spawn_supervisor", _record):
-        ticked = runner.invoke(watchdog_cmd.app, ["tick"])
+    monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _record)
+    return spawned
+
+
+def test_install_cron_records_its_config(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cron ``install --config`` is recorded, and the tick uses that file.
+
+    Before, the registry kept only the queue's path, so the tick decided
+    with the package defaults and spawned ``supervisor start`` without
+    ``--config``, and that supervisor found only
+    ``<queue>/claude_runner.toml``."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = tmp_path / "elsewhere" / "custom.toml"
+    config.parent.mkdir()
+    config.write_text("[watchdog]\ncrash_loop_threshold = 7\n", encoding="utf-8")
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        installed = runner.invoke(
+            app, ["--queue", str(queue), "--config", str(config)], input="y\n"
+        )
+    assert installed.exit_code == 0, installed.output
+    # Shown under the queue it is recorded for, before the y/N prompt.
+    shown = installed.stdout.index(f"  {queue.resolve()}\n  with config {config}\n")
+    assert shown < installed.stdout.index("Apply this change?")
+    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+    assert registry == {
+        "queues": [str(queue.resolve())],
+        "configs": {str(queue.resolve()): str(config)},
+    }
+
+    spawned = _record_tick_spawns(monkeypatch)
+    ticked = runner.invoke(watchdog_cmd.app, ["tick"])
     assert ticked.exit_code == 0, ticked.output
-    assert spawned == [(queue.resolve(), None)]
+    assert "detail='restart approved (recent count: 1 of threshold 7)'" in ticked.stdout
+    assert spawned == [(queue.resolve(), config)]
+
+
+def test_install_cron_without_config_records_none(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The queue's own TOML is found at each tick, as ``supervisor start`` finds it."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    toml = queue / "claude_runner.toml"
+    toml.write_text("[watchdog]\ncrash_loop_threshold = 9\n", encoding="utf-8")
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        installed = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert installed.exit_code == 0, installed.output
+    assert "with config" not in installed.stdout
+    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+    assert registry == {"queues": [str(queue.resolve())]}
+
+    spawned = _record_tick_spawns(monkeypatch)
+    ticked = runner.invoke(watchdog_cmd.app, ["tick"])
+    assert ticked.exit_code == 0, ticked.output
+    assert "detail='restart approved (recent count: 1 of threshold 9)'" in ticked.stdout
+    assert spawned == [(queue.resolve(), toml.resolve())]
+
+
+def test_install_cron_rerun_without_config_drops_the_recorded_one(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    config = tmp_path / "custom.toml"
+    config.write_text("", encoding="utf-8")
+    for args in (["--config", str(config)], []):
+        with _cron_install_patched(tmp_path / "bk.txt"):
+            result = runner.invoke(app, ["--yes", "--queue", str(queue), *args])
+        assert result.exit_code == 0, result.output
+    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+    assert registry == {"queues": [str(queue.resolve())]}
+
+
+def test_install_cron_records_a_relative_config_as_absolute(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tick runs in cron's working directory, not the one install ran in."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "rel.toml").write_text("", encoding="utf-8")
+    monkeypatch.chdir(work)
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue), "--config", "rel.toml"])
+    assert result.exit_code == 0, result.output
+    registry = json.loads(queues_registry_path().read_text(encoding="utf-8"))
+    assert registry["configs"] == {str(queue.resolve()): str(Path.cwd() / "rel.toml")}
 
 
 # ---------------------------------------------------------------------------

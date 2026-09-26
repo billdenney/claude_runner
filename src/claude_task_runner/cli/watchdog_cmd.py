@@ -4,23 +4,28 @@ tick: systemd restarts its unit itself.
 
 One tick:
 
-1. Load watchdog settings.
-2. Find the one queue the watchdog manages: the last in
+1. Find the one queue the watchdog manages: the last in
    ``~/.claude_task_runner/queues.json``, which a cron ``install`` and
    ``watchdog register`` write (see :mod:`cron.registry`). Only one
    supervisor runs per user, so any other queue listed there is ignored,
    with a WARNING line.
-3. Load watchdog state (recent restarts, backoff alerts). It belongs to
+2. Load watchdog state (recent restarts, backoff alerts). It belongs to
    one queue, so a tick that finds another queue registered starts it
    empty.
-4. Skip the queue with an ERROR line if it is not an existing directory
-   (it was deleted or moved after it was registered). Otherwise read its
-   PID file; when its supervisor is down, check whether another process
-   holds ``global.lock``; and ask :func:`cron.backoff.decide` whether to
-   act.
-5. On RESTART verdict: spawn ``claude-task-runner supervisor start``
-   detached.
-6. Save the state, unless ``--dry-run``.
+3. Skip the queue with an ERROR line if it is not an existing directory
+   (it was deleted or moved after it was registered).
+4. Load the queue's config: the tick's own ``--config``, else the one
+   recorded in the registry by ``install --config`` or ``watchdog
+   register --config``, else ``<queue>/claude_runner.toml`` if it
+   exists, else the package defaults. If it does not load, log an ERROR
+   line, leave the supervisor alone and exit 1 after step 7.
+5. Read the queue's PID file; when its supervisor is down, check
+   whether another process holds ``global.lock``; and ask
+   :func:`cron.backoff.decide`, with the config's ``[watchdog]``,
+   whether to act.
+6. On RESTART verdict: spawn ``claude-task-runner supervisor start``
+   detached, with ``--config`` naming the same file.
+7. Save the state, unless ``--dry-run``.
 
 Output is structured logs to stdout (the cron wrapper redirects to
 ``~/.claude_task_runner/watchdog.log``).
@@ -29,7 +34,8 @@ Three more subcommands manage the registry that a tick reads:
 
 * ``watchdog register``   — make a queue the one the watchdog manages
   (``--queue``, default the current directory), replacing the queue
-  registered before.
+  registered before. ``--config`` records the queue's
+  ``claude_runner.toml``.
 * ``watchdog unregister`` — remove a queue (``--queue``, default the
   current directory). The directory need not exist.
 * ``watchdog queues``     — print the registered queues, one per line,
@@ -47,9 +53,10 @@ from pathlib import Path
 
 import typer
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL
-from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
+from claude_task_runner.clock import Clock, RealClock
+from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -101,14 +108,23 @@ def _spawn_supervisor(queue_dir: Path, config: Path | None = None) -> int:
 def tick(
     *,
     config: Path | None = typer.Option(
-        None, "--config", "-c", help="Per-queue claude_runner.toml."
+        None,
+        "--config",
+        "-c",
+        help=(
+            "claude_runner.toml to use instead of the managed queue's own: the one "
+            "recorded by install or register --config, else <queue>/claude_runner.toml."
+        ),
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Decide and log, but start nothing and save no state."
     ),
 ) -> None:
-    """One watchdog tick: examine the queue the watchdog manages and act."""
-    settings = load_settings(config)
+    """One watchdog tick: examine the queue the watchdog manages and act.
+
+    Exits 1 when the queue's config does not load, after logging an
+    ERROR line; the supervisor is then neither checked nor restarted.
+    """
     clock = RealClock()
     state_path = backoff_mod.watchdog_state_path()
 
@@ -119,7 +135,8 @@ def tick(
         sys.stdout.write(f"watchdog: bad state file ({exc}); resetting\n")
         state = backoff_mod.WatchdogState()
 
-    queues = registry_mod.load_registered_queues()
+    registry = registry_mod.load_registry()
+    queues = registry.queues
     queue_dir = registry_mod.managed_queue(queues)
     if queue_dir is None:
         sys.stdout.write("watchdog: no queues registered; nothing to do\n")
@@ -145,6 +162,7 @@ def tick(
         state = backoff_mod.WatchdogState(queue=queue_dir)
 
     new_state = state
+    config_failed = False
     # os.path.isdir is False where Path.is_dir raises (a parent that
     # denies access), so such a path is reported instead of ending the tick.
     if not os.path.isdir(queue_dir):
@@ -155,41 +173,105 @@ def tick(
             f"claude-task-runner watchdog unregister --queue {queue_dir}\n"
         )
     else:
-        alive, pid = _supervisor_is_alive(queue_dir)
-        lock_held, lock_pid = False, None
-        if not alive:
-            # Only when the supervisor is down, so a healthy tick never
-            # holds the lock, even for the moment a probe does.
-            lock_held, lock_pid = _probe_global_lock(ts)
-        decision = backoff_mod.decide(
-            state=state,
-            supervisor_alive=alive,
-            lock_held=lock_held,
-            lock_holder_pid=lock_pid,
-            settings=settings.watchdog,
-            clock=clock,
-        )
-        new_state = decision.new_state
-
-        sys.stdout.write(
-            f"{ts} watchdog queue={queue_dir} alive={alive} pid={pid} "
-            f"verdict={decision.verdict.value} detail={decision.detail!r}\n"
-        )
-
-        if decision.verdict is backoff_mod.WatchdogVerdict.RESTART and not dry_run:
-            try:
-                new_pid = _spawn_supervisor(queue_dir, config)
-            except Exception as exc:
-                sys.stdout.write(f"{ts} watchdog: spawn failed for {queue_dir}: {exc}\n")
-            else:
-                sys.stdout.write(
-                    f"{ts} watchdog: spawned supervisor for {queue_dir} as pid={new_pid}\n"
-                )
+        queue_config = _queue_config(config, registry, queue_dir)
+        try:
+            settings = load_settings(queue_config)
+        except ConfigError as exc:
+            # A supervisor started with this config would fail to load it too.
+            config_failed = True
+            sys.stdout.write(
+                f"{ts} watchdog: ERROR queue={queue_dir} config={queue_config} does not "
+                f"load, so its supervisor was not checked or restarted: {_one_line(exc)}\n"
+            )
+        else:
+            new_state = _decide_and_act(
+                queue_dir=queue_dir,
+                queue_config=queue_config,
+                watchdog=settings.watchdog,
+                state=state,
+                clock=clock,
+                ts=ts,
+                dry_run=dry_run,
+            )
 
     # A dry run starts nothing, so the restart it approved must not count
     # toward the next real tick's cooldown or crash-loop threshold.
     if not dry_run:
         backoff_mod.write_state_atomic(new_state, state_path)
+    if config_failed:
+        raise typer.Exit(code=1)
+
+
+def _one_line(exc: Exception) -> str:
+    """``exc``'s message on one line, so each watchdog.log entry stays one line.
+
+    A pydantic validation error spans several lines; they are joined
+    with ``"; "``, and spaces within a line are kept."""
+    return "; ".join(line.strip() for line in str(exc).splitlines() if line.strip())
+
+
+def _queue_config(
+    explicit: Path | None, registry: registry_mod.Registry, queue_dir: Path
+) -> Path | None:
+    """The ``claude_runner.toml`` a tick uses for ``queue_dir``; ``None`` for the defaults.
+
+    In order: the tick's own ``--config``; the config ``install --config``
+    or ``watchdog register --config`` recorded for the queue; then, as
+    ``supervisor start`` finds it, ``<queue>/claude_runner.toml`` if it
+    exists."""
+    if explicit is not None:
+        return explicit
+    recorded = registry.configs.get(queue_dir)
+    if recorded is not None:
+        return recorded
+    return resolve_per_queue_config(None, queue_dir)
+
+
+def _decide_and_act(
+    *,
+    queue_dir: Path,
+    queue_config: Path | None,
+    watchdog: WatchdogSettings,
+    state: backoff_mod.WatchdogState,
+    clock: Clock,
+    ts: str,
+    dry_run: bool,
+) -> backoff_mod.WatchdogState:
+    """Decide for ``queue_dir`` with its ``[watchdog]``, restart it if approved.
+
+    Returns the state to save. A restart passes ``queue_config`` to the
+    supervisor, so it runs with the settings the decision used."""
+    alive, pid = _supervisor_is_alive(queue_dir)
+    lock_held, lock_pid = False, None
+    if not alive:
+        # Only when the supervisor is down, so a healthy tick never
+        # holds the lock, even for the moment a probe does.
+        lock_held, lock_pid = _probe_global_lock(ts)
+    decision = backoff_mod.decide(
+        state=state,
+        supervisor_alive=alive,
+        lock_held=lock_held,
+        lock_holder_pid=lock_pid,
+        settings=watchdog,
+        clock=clock,
+    )
+
+    sys.stdout.write(
+        f"{ts} watchdog queue={queue_dir} alive={alive} pid={pid} "
+        f"verdict={decision.verdict.value} detail={decision.detail!r}\n"
+    )
+
+    if decision.verdict is backoff_mod.WatchdogVerdict.RESTART and not dry_run:
+        try:
+            new_pid = _spawn_supervisor(queue_dir, queue_config)
+        except Exception as exc:
+            sys.stdout.write(f"{ts} watchdog: spawn failed for {queue_dir}: {exc}\n")
+        else:
+            with_config = f" with --config {queue_config}" if queue_config is not None else ""
+            sys.stdout.write(
+                f"{ts} watchdog: spawned supervisor for {queue_dir} as pid={new_pid}{with_config}\n"
+            )
+    return decision.new_state
 
 
 def _probe_global_lock(ts: str) -> pidfile_mod.GlobalLockProbe:
@@ -214,6 +296,15 @@ def register(
     queue_dir: Path = typer.Option(
         Path.cwd, "--queue", help="Queue directory to register.", show_default=CWD_DEFAULT_LABEL
     ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "claude_runner.toml for the watchdog to use for this queue, recorded in "
+            "queues.json. Without it, a tick uses <queue>/claude_runner.toml if it exists."
+        ),
+    ),
 ) -> None:
     """Make a queue the one the cron watchdog manages.
 
@@ -224,14 +315,29 @@ def register(
     holds the per-user lock, ticks start none; this says so, and how to
     hand over. The systemd unit does not read this registry.
     ``watchdog queues`` shows what is registered.
+
+    A tick takes the queue's [watchdog] settings from its config and
+    starts the supervisor with the same file. That is ``--config``,
+    recorded as an absolute path, else <queue>/claude_runner.toml if it
+    exists, else the package defaults. Registering again without
+    ``--config`` drops a recorded one. A config that does not load is
+    refused here, since every tick would fail on it.
     """
+    recorded = config.absolute() if config is not None else None
     try:
-        replaced = registry_mod.register_queue(queue_dir)
+        load_settings(resolve_per_queue_config(recorded, queue_dir.resolve()))
+    except ConfigError as exc:
+        print(f"register failed: {exc}", file=sys.stderr)
+        raise typer.Exit(code=2) from exc
+    try:
+        replaced = registry_mod.register_queue(queue_dir, config=recorded)
     except OSError as exc:
         print(f"register failed: {exc}", file=sys.stderr)
         raise typer.Exit(code=2) from exc
     queue = queue_dir.resolve()
     print(f"registered: {queue}")
+    if recorded is not None:
+        print(f"config: {recorded}")
     for q in replaced:
         print(f"replaced: {q}")
     note = registry_mod.handover_note(queue, replaced)
