@@ -191,7 +191,7 @@ def list_tasks(
 
     console = Console()
     out: list[dict[str, object]] = []
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     try:
         settings = load_settings(resolve_per_queue_config(config, qd))
     except ConfigError as exc:
@@ -308,9 +308,10 @@ def list_states(
     operator attention, ``--status running`` for in-flight, etc.
     """
     console = Console()
+    qd = require_queue_option(queue_dir, console, json=json)
     filter_set = set(status_filter)
     out: list[dict[str, object]] = []
-    for path in list_state_files(queue_dir.resolve()):
+    for path in list_state_files(qd):
         payload = _safe_load_state(path)
         if payload is None:
             out.append({"id": path.stem, "path": str(path), "error": "unparseable"})
@@ -367,7 +368,8 @@ def show_task(
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show the input YAML AND state YAML for one task."""
-    qd = queue_dir.resolve()
+    console = Console()
+    qd = require_queue_option(queue_dir, console, json=json)
     task_path = task_path_for(qd, task_id)
     state_path = state_path_for(qd, task_id)
 
@@ -405,7 +407,6 @@ def show_task(
         print(_json.dumps(payload, default=str, indent=2))
         return
 
-    console = Console()
     console.print(f"[bold]{task_id}[/]")
     task_payload = payload.get("task")
     if isinstance(task_payload, dict):
@@ -634,7 +635,7 @@ def backfill_working_dir(
     upfront catches the omission once. See ADR-0023.
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
 
     template = settings.queue.working_dir_template
@@ -748,7 +749,7 @@ def restart_fresh(
     (the command reports ``noop=True`` so scripts can branch).
     """
     console = Console()
-    qd = queue_dir.resolve()
+    qd = require_queue_option(queue_dir, console, json=json)
     state_path = state_path_for(qd, task_id)
     if not state_path.exists():
         msg = f"no state YAML for task {task_id!r}: {state_path}"

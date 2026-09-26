@@ -468,7 +468,8 @@ def status(
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show the supervisor's current state and recent activity."""
-    queue_path = queue_dir.resolve()
+    console = Console()
+    queue_path = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, queue_path))
     state_path = persist_mod.supervisor_state_path(queue_path, settings.supervisor.state_file)
     pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
@@ -490,7 +491,6 @@ def status(
         print(_json.dumps(payload, default=str, indent=2))
         return
 
-    console = Console()
     console.print(f"[bold]Queue:[/]            {queue_path}")
     console.print(
         f"[bold]Supervisor PID:[/]   {pid} "

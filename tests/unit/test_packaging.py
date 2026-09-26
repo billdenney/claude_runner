@@ -12,12 +12,16 @@ These tests build with the backend ``[build-system]`` declares, the way
 ``pip install .`` does (a wheel straight from the tree) and the way ``uv
 build`` does (an sdist, then a wheel from the unpacked sdist). They pin what
 a non-editable install needs at runtime.
+
+The links in ``[project.urls]``, which every wheel's METADATA carries, are
+checked against the GitHub repository ``origin`` points to.
 """
 
 from __future__ import annotations
 
 import collections
 import configparser
+import re
 import subprocess
 import sys
 import tarfile
@@ -44,6 +48,10 @@ backend = importlib.import_module(sys.argv[1])
 print(getattr(backend, sys.argv[2])(sys.argv[3]))
 """
 
+# ``owner/repo`` in a GitHub page or clone URL: https://github.com/o/r/issues,
+# git@github.com:o/r.git, ssh://git@github.com/o/r.
+_GITHUB_REPO = re.compile(r"[/@]github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?(?:[/?#]|$)")
+
 
 def _build(hook: str, source_dir: Path, out_dir: Path) -> Path:
     """Run the backend's ``hook`` on ``source_dir``; return the artifact it wrote."""
@@ -64,6 +72,12 @@ def _build(hook: str, source_dir: Path, out_dir: Path) -> Path:
 def _duplicates(names: list[str]) -> list[str]:
     """Archive paths that appear more than once, sorted."""
     return sorted(name for name, count in collections.Counter(names).items() if count > 1)
+
+
+def _github_repo(url: str) -> str | None:
+    """The lowercased ``owner/repo`` a GitHub URL names, or None if it names none."""
+    match = _GITHUB_REPO.search(url)
+    return match.group(1).lower() if match else None
 
 
 @pytest.fixture(scope="module")
@@ -143,6 +157,56 @@ def test_duplicates_known_answers() -> None:
     assert _duplicates(["a", "b", "a", "c", "b", "a"]) == ["a", "b"]
     assert _duplicates(["a", "b", "c"]) == []
     assert _duplicates([]) == []
+
+
+def test_github_repo_known_answers() -> None:
+    for url in (
+        "https://github.com/billdenney/claude_runner",
+        "https://github.com/billdenney/claude_runner/issues",
+        "https://github.com/BillDenney/Claude_Runner.git",
+        "git@github.com:billdenney/claude_runner.git",
+        "ssh://git@github.com/billdenney/claude_runner.git",
+    ):
+        assert _github_repo(url) == "billdenney/claude_runner", url
+    assert _github_repo("https://github.com/billdenney/claude_task_runner") == (
+        "billdenney/claude_task_runner"
+    )
+    assert _github_repo("https://github.com/billdenney") is None
+    assert _github_repo("https://notgithub.com/billdenney/claude_runner") is None
+    assert _github_repo("/home/bill/github/claude_task_runner") is None
+
+
+def test_project_urls_name_the_origin_repository() -> None:
+    """``[project.urls]`` must name the GitHub repository ``origin`` points to.
+
+    Every wheel's METADATA carries these links. They named
+    ``billdenney/claude_task_runner``, the package's name, which returns 404:
+    the repository is ``billdenney/claude_runner``. A clone of a fork fails
+    this test, since its ``origin`` names the fork.
+    """
+    proc = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 2:  # git-remote(1): no remote by that name
+        pytest.skip("this checkout has no git remote named origin")
+    assert proc.returncode == 0, proc.stderr
+    origin_url = proc.stdout.strip()
+    if "github.com" not in origin_url:
+        pytest.skip(f"origin is not on GitHub: {origin_url}")
+    origin = _github_repo(origin_url)
+    assert origin is not None, origin_url
+    links = {
+        name: _github_repo(url)
+        for name, url in PYPROJECT["project"]["urls"].items()
+        if "github.com" in url
+    }
+    # With no GitHub link to compare, the check below would pass vacuously.
+    assert links
+    assert links == dict.fromkeys(links, origin)
 
 
 @pytest.mark.slow
