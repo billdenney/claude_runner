@@ -66,6 +66,34 @@ WantedBy=default.target
 ``[watchdog]``, when RestartSec, StartLimitBurst and
 StartLimitIntervalSec were hardcoded. Captured from that code."""
 
+_DRAIN_UNIT_BEFORE_TASK_CAPS = """\
+[Unit]
+Description=Claude Code task-runner supervisor
+After=default.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=TERM=xterm-256color
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml
+ExecStop=-/usr/local/bin/claude-task-runner supervisor drain --queue /q --config /q/claude_runner.toml --no-wait
+WorkingDirectory=/q
+KillMode=process
+TimeoutStopSec=14400
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+"""The unit ``build_unit_text`` writes for ``_START`` with adoption off,
+while it hardcodes ``TimeoutStopSec=14400``. Captured from that code."""
+
 
 def _only_line(text: str, key: str) -> str:
     """Return the unit's single ``<key>=`` line."""
@@ -289,6 +317,16 @@ class TestRestartPolicyFromWatchdog:
         )
 
 
+class TestDrainStopTimeout:
+    """How long a stop waits for in-flight tasks when adoption is off."""
+
+    def test_package_defaults_give_the_captured_unit(self) -> None:
+        text = build_unit_text(
+            supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS, adopt_workers=False
+        )
+        assert text == _DRAIN_UNIT_BEFORE_TASK_CAPS
+
+
 _SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
 
 
@@ -363,6 +401,17 @@ class TestSystemdParsesTheUnit:
             supervisor_command=f"/bin/true supervisor start --queue {queue}",
             queue_dir=queue,
             watchdog=_watchdog(**overrides),
+        )
+        assert _verify(verify_dir, text) == ""
+
+    def test_systemd_parses_the_drain_unit(self, verify_dir: Path) -> None:
+        queue = verify_dir / "q"
+        queue.mkdir()
+        text = build_unit_text(
+            supervisor_command=f"/bin/true supervisor start --queue {queue}",
+            queue_dir=queue,
+            watchdog=_DEFAULTS,
+            adopt_workers=False,
         )
         assert _verify(verify_dir, text) == ""
 

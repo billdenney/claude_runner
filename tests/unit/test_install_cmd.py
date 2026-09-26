@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from claude_task_runner.cli import watchdog_cmd
 from claude_task_runner.cli.install_cmd import (
@@ -835,6 +835,56 @@ def test_install_systemd_unit_without_a_watchdog_table_keeps_the_old_policy(
     assert "RestartSec=30" in unit_lines
     assert "StartLimitBurst=5" in unit_lines
     assert "StartLimitIntervalSec=600" in unit_lines
+
+
+def _install_with_task_cap(
+    runner: CliRunner, tmp_path: Path, toml: str
+) -> tuple[Result, MagicMock]:
+    """Run a systemd ``install --yes`` for a queue whose ``claude_runner.toml`` is ``toml``."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "claude_runner.toml").write_text(toml, encoding="utf-8")
+    with _systemd_install_patched() as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    return result, mock_apply
+
+
+def _timeout_stop_lines(mock_apply: MagicMock) -> list[str]:
+    return [ln for ln in _written_unit_lines(mock_apply) if ln.startswith("TimeoutStopSec=")]
+
+
+@pytest.mark.parametrize("cap", ["0", "14400", "28800"])
+def test_install_systemd_drain_unit_ignores_the_duration_cap(
+    runner: CliRunner, tmp_path: Path, cap: str
+) -> None:
+    """Pins current behaviour, a known gap: the drain unit waits 4 h whatever the cap.
+
+    With ``[supervisor].adopt_workers`` off, ``systemctl --user stop`` waits
+    ``TimeoutStopSec`` for in-flight tasks, then SIGKILLs the supervisor.
+    ``install`` writes 14400 even where ``[task_caps].max_duration_s_per_task``
+    lets a task run longer, or without limit (0)."""
+    result, mock_apply = _install_with_task_cap(
+        runner,
+        tmp_path,
+        f"[supervisor]\nadopt_workers = false\n\n[task_caps]\nmax_duration_s_per_task = {cap}\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert _timeout_stop_lines(mock_apply) == ["TimeoutStopSec=14400"]
+
+
+@pytest.mark.parametrize("cap", ["0", "1e-07", "28800", "18446744073709"])
+def test_install_systemd_fast_stop_unit_ignores_the_duration_cap(
+    runner: CliRunner, tmp_path: Path, cap: str
+) -> None:
+    """With adoption on, the default, a stop leaves the workers running (ADR-0025).
+
+    The supervisor exits at once, so the unit waits 30 s whatever the cap,
+    even one that systemd could not parse as a time span."""
+    result, mock_apply = _install_with_task_cap(
+        runner, tmp_path, f"[task_caps]\nmax_duration_s_per_task = {cap}\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert _timeout_stop_lines(mock_apply) == ["TimeoutStopSec=30"]
 
 
 def test_install_systemd_refuses_a_watchdog_value_systemd_cannot_parse(
