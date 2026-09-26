@@ -558,7 +558,7 @@ class TestLayout:
             "       or a PID that is not alive\n"
             "    2  --queue is not an existing directory, the settings for the\n"
             "       default --timeout did not load, or signal delivery rejected\n"
-            "       (permission)\n"
+            "       (permission) or refused (a PID of 1 or less, or this command's own)\n"
             "    4  --wait timed out (the supervisor is still draining)\n"
         ) in _render_help(app, ("supervisor", "drain"))
 

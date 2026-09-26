@@ -43,7 +43,11 @@ from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.usage.models import UsageReading, WindowReading
 from claude_task_runner.usage.source import FakeUsageSource
 
-pytestmark = pytest.mark.usefixtures("harmless_signal_handlers", "private_global_lock")
+pytestmark = [
+    pytest.mark.usefixtures("harmless_signal_handlers", "private_global_lock"),
+    # The stop is a SIGTERM to this process, sent on purpose.
+    pytest.mark.allow_self_signal,
+]
 
 SHIM_PATH = Path(__file__).parent.parent / "fixtures" / "claude_shim" / "claude"
 TASK_ID = "t1"
