@@ -578,36 +578,45 @@ def check_queue_perms_for_linux_users(settings: Settings, queue_dir: Path) -> Ch
 
 
 def check_global_lock(_settings: Settings) -> CheckResult:
-    """No stale or orphan global lock file."""
+    """Report whether a supervisor holds ``global.lock``.
+
+    Asks the lock itself, through :func:`pidfile_mod.probe_global_lock`.
+    The PID written in the file stays after its holder exits, and may by
+    now belong to an unrelated process, so it cannot tell a running
+    supervisor from a leftover file. A leftover file is harmless: the OS
+    released its lock when the holder exited, and the next
+    ``supervisor start`` locks the same file. Removing the file while a
+    supervisor holds the lock is what does harm, since the next
+    ``supervisor start`` would lock a new file and run beside it."""
     path = pidfile_mod.global_lock_path()
-    if not path.exists():
+    try:
+        probe = pidfile_mod.probe_global_lock(lock_path=path)
+    except OSError as exc:
+        return CheckResult(
+            name="global_lock",
+            status=CheckStatus.WARN,
+            detail=f"could not check {path}: {exc}",
+            remediation=(
+                f"`claude-task-runner supervisor start` must be able to open {path} "
+                f"for reading and writing. Check its owner and mode: ls -l {path}"
+            ),
+        )
+    if not probe.held:
         return CheckResult(
             name="global_lock",
             status=CheckStatus.PASS,
-            detail="no lock file (no supervisor running)",
+            detail="free (no supervisor running)",
         )
-    pid = pidfile_mod.read_existing_pid(path)
-    if pid is None:
+    if probe.pid is None:
         return CheckResult(
             name="global_lock",
-            status=CheckStatus.WARN,
-            detail=f"lock file exists at {path} but PID is unreadable",
-            remediation=f"Inspect or remove: {path}",
-        )
-    if not pidfile_mod.is_pid_alive(pid):
-        return CheckResult(
-            name="global_lock",
-            status=CheckStatus.WARN,
-            detail=f"lock file holds PID {pid} which is not alive (stale)",
-            remediation=(
-                f"Remove the stale lock: rm {path}\n"
-                "  Then re-run `claude-task-runner supervisor start`."
-            ),
+            status=CheckStatus.PASS,
+            detail="held by a supervisor that has not written its PID yet",
         )
     return CheckResult(
         name="global_lock",
         status=CheckStatus.PASS,
-        detail=f"held by live PID {pid}",
+        detail=f"held by the supervisor with PID {probe.pid}",
     )
 
 

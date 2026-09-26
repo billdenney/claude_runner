@@ -211,6 +211,15 @@ Breaking changes are called out in the version notes.
   never happened toward the cooldown and the crash-loop threshold: a real
   tick a second after a dry run gave `verdict=cooldown`. A dry run now
   decides and logs, but saves no state.
+- **doctor's `global_lock` check asks the lock, not the PID left in it.**
+  The file keeps the last holder's PID after it exits, so doctor warned
+  that the lock was stale after every supervisor stop and suggested
+  removing it, and a PID that the OS had since given to another process
+  read as a running supervisor. doctor now probes the lock with `flock` and
+  reports it free, or held with the holder's PID. A leftover file is
+  harmless, since the next supervisor locks the same file. Removing it
+  while a supervisor holds the lock is what would let a second one run
+  beside it, so the runbook's crash-loop section no longer suggests it.
 - **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
   refuse a `--queue` that is not an existing directory.** They used to
   create it, because `queue_runtime_dir()` and `todo_dir()` make their

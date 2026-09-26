@@ -53,8 +53,11 @@ read the exception with `journalctl --user -u claude-task-runner`.
    - Disk full → `usage_captures/` rotation hadn't run; clear old captures.
    - Settings TOML invalid → `claude-task-runner doctor` (loads the TOML
      through the schema and reports the offending field).
-   - Stale `global.lock` from a hard kill → check `~/.claude_task_runner/global.lock`,
-     remove if no live process.
+   - A leftover `~/.claude_task_runner/global.lock` is not a cause. The OS
+     releases the lock when its holder dies, and the next supervisor locks
+     the same file. `claude-task-runner doctor` reports under `global_lock`
+     whether a live supervisor holds it. Do not remove the file while one
+     does: the next supervisor would lock a new file and run beside it.
 3. Once root cause is fixed, manual restart: `claude-task-runner supervisor start`.
 
 ## Task `possibly_hung` for hours
