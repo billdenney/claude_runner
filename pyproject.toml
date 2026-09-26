@@ -47,6 +47,9 @@ dev = [
     # Run lint / format hooks locally before each commit.
     # Mirrors the GitHub Actions CI lint steps; see .pre-commit-config.yaml.
     "pre-commit>=3.7",
+    # tests/unit/test_packaging.py builds the sdist and wheel in this venv, so
+    # it needs the [build-system] backend. That test fails if the two differ.
+    "hatchling>=1.24",
 ]
 
 [project.scripts]
@@ -57,12 +60,12 @@ Homepage = "https://github.com/billdenney/claude_task_runner"
 Issues = "https://github.com/billdenney/claude_task_runner/issues"
 
 [tool.hatch.build.targets.wheel]
+# Ships every file under the package that .gitignore doesn't exclude, data
+# files included (skills/, config/defaults/, cron/watchdog.sh). Don't add a
+# `force-include` for anything already in the package: hatchling refuses a
+# second file at the same archive path, so the wheel build fails.
+# tests/unit/test_packaging.py builds both artifacts and checks what they ship.
 packages = ["src/claude_task_runner"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/claude_task_runner/config/defaults" = "claude_task_runner/config/defaults"
-"src/claude_task_runner/skills" = "claude_task_runner/skills"
-"src/claude_task_runner/cron/watchdog.sh" = "claude_task_runner/cron/watchdog.sh"
 
 [tool.ruff]
 line-length = 100
