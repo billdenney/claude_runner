@@ -105,10 +105,14 @@ def install(
     after changing it.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
-    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``.
-    A tick restarts the supervisor of each registered queue that is not
-    running, even one stopped with ``supervisor stop`` or ``drain``,
-    and backs off after repeated crashes.
+    and registers ``--queue`` in ``~/.claude_task_runner/queues.json``,
+    replacing any queue registered there: one supervisor runs per user,
+    so the watchdog manages one queue, as the systemd unit runs one. A
+    tick restarts that queue's supervisor when it is not running, even
+    one stopped with ``supervisor stop`` or ``drain``, and backs off
+    after repeated crashes. While another supervisor holds the per-user
+    lock, such as the replaced queue's, a tick starts none, and
+    ``install`` says how to hand over.
     """
     if ctx.invoked_subcommand is not None:
         return  # Subcommand handles itself.
@@ -186,10 +190,11 @@ def install(
     else:
         console.print("  [dim](no visible diff — block already up to date)[/]")
     # The crontab line runs `watchdog tick` with no --queue, and a tick
-    # manages only the queues in this registry.
+    # manages only the queue in this registry.
     registry = registry_mod.queues_registry_path()
     console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
     console.print(f"  {queue_path}")
+    _show_replaced_queues(console, queue_path)
     if not yes and not Confirm.ask("\nApply this change?", default=False):
         console.print("[yellow]Aborted.[/]")
         raise typer.Exit(code=1)
@@ -198,7 +203,7 @@ def install(
     # leaves nothing changed. The other order could leave a cron line
     # whose ticks have no queue to manage.
     try:
-        registry_mod.register_queue(queue_path)
+        replaced = registry_mod.register_queue(queue_path)
     except OSError as exc:
         console.print(f"[bold red]watchdog registration failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
@@ -212,6 +217,36 @@ def install(
         console.print(f"[bold red]crontab install failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab updated.[/]")
+    note = registry_mod.handover_note(queue_path, replaced)
+    if note is not None:
+        console.print(note, markup=False, highlight=False, soft_wrap=True)
+
+
+def _show_replaced_queues(console: Console, queue: Path) -> None:
+    """List the queues that registering ``queue`` replaces, before the y/N prompt.
+
+    One supervisor runs per user, so the watchdog manages one queue, and
+    registering one replaces whatever the registry lists now. Read
+    without side effects: a corrupt registry is only reported here, and
+    ``register_queue`` keeps a copy of it as ``queues.json.broken``.
+    Paths are printed without Rich markup, so a ``[`` stays as typed."""
+    try:
+        current = registry_mod.read_registered_queues()
+    except registry_mod.RegistryError as exc:
+        console.print(
+            f"It replaces the registry, which is unreadable ({exc}); "
+            "a copy is kept as queues.json.broken.",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        return
+    replaced = [q for q in dict.fromkeys(current) if q != queue]
+    if not replaced:
+        return
+    console.print("[bold]It replaces, since the watchdog manages one queue:[/]")
+    for q in replaced:
+        console.print(f"  {q}", markup=False, highlight=False, soft_wrap=True)
 
 
 @app.command("uninstall")
@@ -226,8 +261,9 @@ def uninstall(
 
     Leaves ``~/.claude_task_runner/queues.json`` as it is. Once no cron
     block is installed, lists the queues it still holds with the
-    ``watchdog unregister`` command for each, because a later cron
-    ``install`` manages all of them again.
+    ``watchdog unregister`` command for each. No tick reads the registry
+    without the cron block, and a later cron ``install`` replaces it
+    with its own queue.
     """
     settings = load_settings(config)
     console = Console()
@@ -285,11 +321,12 @@ def uninstall(
 def _report_registered_queues(console: Console) -> None:
     """List what ``queues.json`` still holds once no cron block is installed.
 
-    ``uninstall`` leaves the registry alone, and a later cron ``install``
-    manages every queue it lists again, including any that has since
-    been moved or deleted. Printed without Rich markup, so a ``[`` in a
-    path stays as typed. A corrupt registry is reported and left as it
-    is; the uninstall itself has already succeeded."""
+    ``uninstall`` leaves the registry alone. No tick reads it without the
+    cron block, and a later cron ``install`` replaces it with its own
+    queue, so this is for an operator who wants it gone now. Printed
+    without Rich markup, so a ``[`` in a path stays as typed. A corrupt
+    registry is reported and left as it is; the uninstall itself has
+    already succeeded."""
     registry = registry_mod.queues_registry_path()
     try:
         queues = registry_mod.read_registered_queues()
@@ -304,10 +341,10 @@ def _report_registered_queues(console: Console) -> None:
         return
     if not queues:
         return
-    count = "1 queue" if len(queues) == 1 else f"{len(queues)} queues"
+    count, them = ("1 queue", "it") if len(queues) == 1 else (f"{len(queues)} queues", "them")
     console.print(
-        f"{registry} still lists {count}, and a later cron install manages every "
-        "queue it lists. To drop one:",
+        f"{registry} still lists {count}. No tick reads it without the cron block, and "
+        f"a later cron install replaces the list with its own queue. To drop {them} now:",
         markup=False,
         highlight=False,
         soft_wrap=True,

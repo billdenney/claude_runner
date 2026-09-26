@@ -85,7 +85,10 @@ app.add_typer(
 app.add_typer(
     install_cmd.app,
     name="install",
-    help="Install the watchdog (systemd preferred, cron fallback).",
+    help=(
+        "Install the watchdog for one queue (systemd preferred, cron fallback). "
+        "Installing it for another queue replaces the first."
+    ),
 )
 app.add_typer(
     install_skills_cmd.app,

@@ -166,21 +166,30 @@ of `origin/main` after a fetch, and `git status` is clean apart from
 `interval_s`, and set `[worktree_reclaim].lock_file` to your pre-dispatch
 hook's flock. See ADR-0034 and the runbook.
 
-### Change which queues the cron watchdog manages
+### Change the queue the cron watchdog manages
 
 ```sh
-claude-task-runner watchdog queues                       # one path per line; stderr warns about a missing one
-claude-task-runner watchdog register --queue <queue>     # add a queue (the directory must exist)
+claude-task-runner watchdog queues                       # one path per line; the last is the managed queue
+claude-task-runner watchdog register --queue <queue>     # manage this queue instead (the directory must exist)
 claude-task-runner watchdog unregister --queue <queue>   # drop a queue (the directory need not exist)
 ```
 
-A tick skips a registered queue that is not an existing directory and logs an
+One supervisor runs per user, so the cron watchdog manages one queue.
+`register` replaces it, as a cron `install` does. When the old queue's
+supervisor still holds the per-user lock, `register` says so: until that one
+exits, every tick logs `verdict=locked` and starts nothing. Hand over with
+`claude-task-runner supervisor drain --queue <old-queue>`. A `queues.json`
+that an older version let grow lists more queues; the watchdog manages the
+last, and `watchdog queues` warns about the others on stderr. See the runbook's
+[Cron watchdog logs `verdict=locked`](runbook.md#cron-watchdog-logs-verdictlocked).
+
+A tick skips a managed queue that is not an existing directory and logs an
 `ERROR` line to `~/.claude_task_runner/watchdog.log` each minute. It keeps the
 entry, so a queue on a filesystem that was not mounted is managed again once it
 is. `claude-task-runner install uninstall` removes the crontab block but leaves
-`~/.claude_task_runner/queues.json`, so a later cron `install` manages every
-queue still listed. It prints those queues, each with the `unregister` command
-that drops it. See the runbook's
+`~/.claude_task_runner/queues.json`. No tick reads it then, and a later cron
+`install` replaces it with its own queue. It prints the queues still listed,
+each with the `unregister` command that drops it. See the runbook's
 [A registered queue was deleted or moved](runbook.md#a-registered-queue-was-deleted-or-moved).
 
 ### Stale branch cleanup
@@ -265,10 +274,10 @@ polls. When the new tier is a different login:
    claude-task-runner supervisor start   # or let the cron watchdog restart it on its next tick
    ```
 
-   The cron watchdog restarts only the queues that
-   `claude-task-runner watchdog queues` lists. A cron `install` registers
-   its queue. If yours is missing, add it with
-   `claude-task-runner watchdog register --queue <queue>`.
+   The cron watchdog restarts only the queue that
+   `claude-task-runner watchdog queues` lists, the last line if it lists
+   more. A cron `install` registers its queue. If yours is not that one,
+   run `claude-task-runner watchdog register --queue <queue>`.
 
    Under the systemd unit, use `systemctl --user restart claude-task-runner`
    instead. Its `ExecStop` keeps in-flight tasks: the new supervisor

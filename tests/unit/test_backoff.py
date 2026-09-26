@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from claude_task_runner.cron.backoff import (
     load_state,
     write_state_atomic,
 )
+from claude_task_runner.queue.schema import CURRENT_SCHEMA_VERSION
 
 
 def _settings(
@@ -168,3 +170,132 @@ class TestPersistence:
         path.write_text('{"schema_version": 99, "recent_restarts": []}')
         with pytest.raises(WatchdogStateError, match="schema_version=99"):
             load_state(path)
+
+
+class TestLocked:
+    """Another process holds global.lock, so a restart would exit at once."""
+
+    def test_dead_supervisor_with_the_lock_held_is_locked(self, clock: FakeClock) -> None:
+        out = decide(
+            state=WatchdogState(),
+            supervisor_alive=False,
+            lock_held=True,
+            lock_holder_pid=4321,
+            settings=_settings(),
+            clock=clock,
+        )
+        assert out.verdict is WatchdogVerdict.LOCKED
+        assert out.detail == (
+            "another supervisor (pid 4321) holds global.lock; starting none until it exits"
+        )
+        assert out.next_check_at is None
+        # No restart is counted, so none can hold back the one after the lock frees.
+        assert out.new_state == WatchdogState()
+
+    def test_holder_pid_unknown(self, clock: FakeClock) -> None:
+        out = decide(
+            state=WatchdogState(),
+            supervisor_alive=False,
+            lock_held=True,
+            settings=_settings(),
+            clock=clock,
+        )
+        assert out.verdict is WatchdogVerdict.LOCKED
+        assert out.detail == "another supervisor holds global.lock; starting none until it exits"
+
+    def test_alive_supervisor_is_skipped_whoever_holds_the_lock(self, clock: FakeClock) -> None:
+        out = decide(
+            state=WatchdogState(),
+            supervisor_alive=True,
+            lock_held=True,
+            lock_holder_pid=4321,
+            settings=_settings(),
+            clock=clock,
+        )
+        assert out.verdict is WatchdogVerdict.SKIP
+
+    @pytest.mark.parametrize(
+        ("ages_s", "unlocked"),
+        [
+            pytest.param([10.0], WatchdogVerdict.COOLDOWN, id="would-cool-down"),
+            pytest.param(
+                [50.0, 40.0, 30.0, 20.0, 10.0], WatchdogVerdict.BACKOFF, id="would-back-off"
+            ),
+        ],
+    )
+    def test_lock_comes_before_cooldown_and_backoff(
+        self, clock: FakeClock, ages_s: list[float], unlocked: WatchdogVerdict
+    ) -> None:
+        """The state is kept as it is: no restart, and no crash-loop alert."""
+        state = WatchdogState(
+            recent_restarts=[clock.now() - timedelta(seconds=age) for age in ages_s]
+        )
+        free = decide(state=state, supervisor_alive=False, settings=_settings(), clock=clock)
+        assert free.verdict is unlocked
+        out = decide(
+            state=state,
+            supervisor_alive=False,
+            lock_held=True,
+            lock_holder_pid=4321,
+            settings=_settings(),
+            clock=clock,
+        )
+        assert out.verdict is WatchdogVerdict.LOCKED
+        assert out.new_state == state
+
+    def test_locked_still_ages_out_old_restarts(self, clock: FakeClock) -> None:
+        recent = clock.now() - timedelta(seconds=10)
+        old = clock.now() - timedelta(seconds=301)
+        out = decide(
+            state=WatchdogState(recent_restarts=[old, recent]),
+            supervisor_alive=False,
+            lock_held=True,
+            settings=_settings(cooldown=30.0, backoff_max=600.0),
+            clock=clock,
+        )
+        assert out.verdict is WatchdogVerdict.LOCKED
+        assert out.new_state.recent_restarts == [recent]
+
+    def test_lock_defaults_to_free(self, clock: FakeClock) -> None:
+        out = decide(
+            state=WatchdogState(), supervisor_alive=False, settings=_settings(), clock=clock
+        )
+        assert out.verdict is WatchdogVerdict.RESTART
+
+
+class TestStateQueue:
+    """The restart history names the queue it belongs to."""
+
+    def test_round_trip(self, tmp_path: Path, clock: FakeClock) -> None:
+        path = tmp_path / WATCHDOG_STATE_FILENAME
+        original = WatchdogState(queue=tmp_path / "q", recent_restarts=[clock.now()])
+        write_state_atomic(original, path)
+        assert load_state(path) == original
+        assert json.loads(path.read_text(encoding="utf-8"))["queue"] == str(tmp_path / "q")
+
+    def test_file_from_before_the_field_loads_as_no_queue(self, tmp_path: Path) -> None:
+        path = tmp_path / WATCHDOG_STATE_FILENAME
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "recent_restarts": ["2026-09-26T12:00:00Z"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = load_state(path)
+        assert loaded.queue is None
+        assert loaded.recent_restarts == [datetime(2026, 9, 26, 12, 0, tzinfo=UTC)]
+
+    def test_decide_keeps_the_queue(self, tmp_path: Path, clock: FakeClock) -> None:
+        state = WatchdogState(queue=tmp_path / "q")
+        for alive, lock_held in ((True, False), (False, True), (False, False)):
+            out = decide(
+                state=state,
+                supervisor_alive=alive,
+                lock_held=lock_held,
+                settings=_settings(),
+                clock=clock,
+            )
+            assert out.new_state.queue == tmp_path / "q"

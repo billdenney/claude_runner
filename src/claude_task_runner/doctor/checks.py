@@ -578,36 +578,45 @@ def check_queue_perms_for_linux_users(settings: Settings, queue_dir: Path) -> Ch
 
 
 def check_global_lock(_settings: Settings) -> CheckResult:
-    """No stale or orphan global lock file."""
+    """Report whether a supervisor holds ``global.lock``.
+
+    Asks the lock itself, through :func:`pidfile_mod.probe_global_lock`.
+    The PID written in the file stays after its holder exits, and may by
+    now belong to an unrelated process, so it cannot tell a running
+    supervisor from a leftover file. A leftover file is harmless: the OS
+    released its lock when the holder exited, and the next
+    ``supervisor start`` locks the same file. Removing the file while a
+    supervisor holds the lock is what does harm, since the next
+    ``supervisor start`` would lock a new file and run beside it."""
     path = pidfile_mod.global_lock_path()
-    if not path.exists():
+    try:
+        probe = pidfile_mod.probe_global_lock(lock_path=path)
+    except OSError as exc:
+        return CheckResult(
+            name="global_lock",
+            status=CheckStatus.WARN,
+            detail=f"could not check {path}: {exc}",
+            remediation=(
+                f"`claude-task-runner supervisor start` must be able to open {path} "
+                f"for reading and writing. Check its owner and mode: ls -l {path}"
+            ),
+        )
+    if not probe.held:
         return CheckResult(
             name="global_lock",
             status=CheckStatus.PASS,
-            detail="no lock file (no supervisor running)",
+            detail="free (no supervisor running)",
         )
-    pid = pidfile_mod.read_existing_pid(path)
-    if pid is None:
+    if probe.pid is None:
         return CheckResult(
             name="global_lock",
-            status=CheckStatus.WARN,
-            detail=f"lock file exists at {path} but PID is unreadable",
-            remediation=f"Inspect or remove: {path}",
-        )
-    if not pidfile_mod.is_pid_alive(pid):
-        return CheckResult(
-            name="global_lock",
-            status=CheckStatus.WARN,
-            detail=f"lock file holds PID {pid} which is not alive (stale)",
-            remediation=(
-                f"Remove the stale lock: rm {path}\n"
-                "  Then re-run `claude-task-runner supervisor start`."
-            ),
+            status=CheckStatus.PASS,
+            detail="held by a supervisor that has not written its PID yet",
         )
     return CheckResult(
         name="global_lock",
         status=CheckStatus.PASS,
-        detail=f"held by live PID {pid}",
+        detail=f"held by the supervisor with PID {probe.pid}",
     )
 
 
@@ -1083,16 +1092,18 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
 
 
 def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
-    """PASS only when the cron watchdog's registry lists ``queue_dir``
-    and every registered path is an existing directory.
+    """PASS only when the cron watchdog manages ``queue_dir``, the
+    registry lists no other queue, and the queue is an existing directory.
 
     The crontab line runs ``watchdog tick`` with no ``--queue``, and a
-    tick manages only the queues in the registry. A cron watchdog that an
-    older ``install`` set up has an empty registry, and without this
-    check doctor passed it while no tick ever restarted the supervisor.
-    A registered queue that was later deleted or moved stays registered,
-    and every tick skips it with an ERROR line, so it is reported here
-    too. Reads the registry without side effects, so a corrupt file is
+    tick manages one queue: the last in the registry, since only one
+    supervisor runs per user. A cron watchdog that an older ``install``
+    set up has an empty registry, and without this check doctor passed
+    it while no tick ever restarted the supervisor. An older registry can
+    also list several queues, and a tick ignores all but the last. A
+    managed queue that was later deleted or moved stays registered, and
+    every tick skips it with an ERROR line, so it is reported here too.
+    Reads the registry without side effects, so a corrupt file is
     reported instead of being backed up and treated as empty."""
     queue = queue_dir.resolve()
     registry = registry_mod.queues_registry_path()
@@ -1106,27 +1117,37 @@ def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
             detail=f"cron watchdog detected, but its queue registry is unreadable: {exc}",
             remediation=f"Fix or remove {registry}, then run `{register}`.",
         )
+    managed = registry_mod.managed_queue(registered)
+    ignored = registry_mod.ignored_queues(registered)
     problems: list[str] = []
     fixes: list[str] = []
-    if queue not in registered:
+    if managed is None:
         problems.append(f"{registry} does not list this queue, so no tick restarts its supervisor")
         fixes.append(f"Run `{register}`, or re-run `claude-task-runner install --queue {queue}`.")
+    elif managed != queue:
+        problems.append(
+            f"it manages {managed}, not this queue, so no tick restarts this queue's supervisor"
+        )
+        fixes.append(
+            f"To manage this queue instead, run `{register}`, or re-run "
+            f"`claude-task-runner install --queue {queue}`."
+        )
+    if ignored:
+        problems.append(
+            f"{registry} lists {len(ignored) + 1} queues; one supervisor runs per user, so "
+            f"it manages only the last and ignores {', '.join(str(q) for q in ignored)}"
+        )
+        fixes.append(
+            "To register just one, run `claude-task-runner watchdog register --queue <queue>`."
+        )
     # os.path.isdir is False where Path.is_dir raises (a parent that
-    # denies access), as in the tick, so one such path cannot end doctor.
-    missing = [q for q in registered if not os.path.isdir(q)]
-    if missing:
-        if len(missing) == 1:
-            problems.append(
-                f"registered queue {missing[0]} is not an existing directory, "
-                "so every tick skips it"
-            )
-        else:
-            problems.append(
-                f"{len(missing)} registered queues are not existing directories, "
-                f"so every tick skips them: {', '.join(str(q) for q in missing)}"
-            )
+    # denies access), as in the tick, so such a path cannot end doctor.
+    if managed is not None and not os.path.isdir(managed):
+        problems.append(
+            f"registered queue {managed} is not an existing directory, so every tick skips it"
+        )
         fixes.append("Register a queue that moved at its new path. Drop one that is gone for good:")
-        fixes.extend(f"  claude-task-runner watchdog unregister --queue {q}" for q in missing)
+        fixes.append(f"  claude-task-runner watchdog unregister --queue {managed}")
     if not problems:
         return CheckResult(
             name="watchdog_installed",

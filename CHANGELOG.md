@@ -307,6 +307,56 @@ Breaking changes are called out in the version notes.
   `claude-task-runner watchdog unregister --queue <path>` for each. The
   runbook has a section for the symptom, including how to stop a supervisor
   that an older version already started on a recreated queue.
+- **The cron watchdog manages one queue, so it no longer fights the per-user
+  lock.** Only one supervisor runs per user, because each takes
+  `~/.claude_task_runner/global.lock`. Yet a cron `install` or
+  `watchdog register` for a second queue added it to
+  `~/.claude_task_runner/queues.json` beside the first, and a tick managed
+  every queue listed. While one queue's supervisor held the lock, every tick
+  spawned the other queue's, and each spawn exited 2 with
+  `another supervisor is already running`. Each refused spawn counted toward
+  the crash-loop threshold that all queues shared in `watchdog_state.json`,
+  so a real crash of the running queue could be held in BACKOFF: one extra
+  minute with the default settings, three with `restart_cooldown_s = 60`.
+  Registry order also picked the winner. With `[B, A]` and A running, a
+  crash of A started B's supervisor and refused A's from then on, so a
+  second `install` never took effect.
+
+  Now, as with the single systemd unit, a cron `install` and
+  `watchdog register` replace the registered queue, and each names the
+  queue it replaces. A tick manages the last queue in `queues.json`, so a
+  file that an older version let grow keeps working: the tick ignores the
+  other entries and logs a `WARNING` naming them, `watchdog queues` warns
+  about them on stderr, and doctor's `watchdog_installed` check warns and
+  gives the fix. When the managed queue's supervisor is down but another
+  process holds `global.lock`, the tick logs the new `verdict=locked`,
+  starts nothing and counts no restart, so the queue starts on the first
+  tick after the lock frees. The tick asks the lock itself, with a
+  non-blocking `flock`, because the PID left in the file outlives its
+  holder. `install` and `watchdog register` say when the replaced queue's
+  supervisor still holds the lock, and give the
+  `claude-task-runner supervisor drain --queue <old-queue>` that hands
+  over. The restart history in `watchdog_state.json` now names its queue,
+  and a tick that finds another queue registered starts it empty, so one
+  queue's restarts never hold back another's. The runbook has a section
+  for `verdict=locked`. Tests replay the old failures on a simulated cron
+  clock against the real lock, and temporary mutants (append instead of
+  replace, ignore the lock, keep the history across a switch, trust the
+  lock file's PID, manage the first entry) each fail them.
+- **`watchdog tick --dry-run` no longer records a restart.** A dry run saved
+  the restart it approved, so the next real tick counted a restart that
+  never happened toward the cooldown and the crash-loop threshold: a real
+  tick a second after a dry run gave `verdict=cooldown`. A dry run now
+  decides and logs, but saves no state.
+- **doctor's `global_lock` check asks the lock, not the PID left in it.**
+  The file keeps the last holder's PID after it exits, so doctor warned
+  that the lock was stale after every supervisor stop and suggested
+  removing it, and a PID that the OS had since given to another process
+  read as a running supervisor. doctor now probes the lock with `flock` and
+  reports it free, or held with the holder's PID. A leftover file is
+  harmless, since the next supervisor locks the same file. Removing it
+  while a supervisor holds the lock is what would let a second one run
+  beside it, so the runbook's crash-loop section no longer suggests it.
 - **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
   refuse a `--queue` that is not an existing directory.** They used to
   create it, because `queue_runtime_dir()` and `todo_dir()` make their
