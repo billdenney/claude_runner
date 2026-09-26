@@ -149,11 +149,12 @@ Global (cross-queue):
 ```
 ~/.claude_task_runner/
 ├── global.lock                     # fcntl lock; single supervisor across queues
-├── queues.json                     # queues the cron watchdog manages
-│                                   #   (added by cron `install` and
-│                                   #   `watchdog register`, removed by
+├── queues.json                     # the one queue the cron watchdog
+│                                   #   manages (replaced by cron `install`
+│                                   #   and `watchdog register`, removed by
 │                                   #   `watchdog unregister`)
 ├── watchdog_state.json             # cron watchdog restart history + backoff
+│                                   #   for the queue it manages
 ├── watchdog.log                    # cron watchdog output (watchdog.sh)
 ├── usage_captures/<ts>.cap         # raw PTY captures from the `usage` CLI
 │                                   #   commands (rotated)
@@ -194,7 +195,11 @@ There is no separate drift log. Parser drift leaves three pieces of evidence:
 These properties are never violated; tests and assertions enforce them.
 
 1. **At most one supervisor process per host** — enforced by `fcntl.flock` on
-   `~/.claude_task_runner/global.lock`.
+   `~/.claude_task_runner/global.lock`. So the cron watchdog manages one
+   queue, as the systemd unit runs one: a cron `install` or
+   `watchdog register` replaces the registered queue. While another process
+   holds the lock, a watchdog tick starts no supervisor and counts no
+   restart (verdict `locked`).
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs.

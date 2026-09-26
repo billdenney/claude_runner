@@ -7,6 +7,8 @@ PATH lookups are deterministic regardless of the developer's machine.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +30,7 @@ from claude_task_runner.cron.registry import (
     queues_registry_path,
     register_queue,
 )
+from claude_task_runner.supervisor.pidfile import acquire_global_lock
 
 
 @pytest.fixture
@@ -456,6 +459,99 @@ def test_install_cron_registry_write_failure_leaves_crontab_untouched(
     mock_apply.assert_not_called()
 
 
+def test_install_cron_replaces_the_registered_queue(runner: CliRunner, tmp_path: Path) -> None:
+    """One supervisor runs per user, so the watchdog manages one queue.
+
+    A second cron install used to add its queue beside the first. Every
+    tick then spawned the second queue's supervisor, and every spawn
+    exited on the lock that the first queue's supervisor held. The y/N
+    prompt names the queue being replaced."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    register_queue(old)
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(new)], input="y\n")
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    shown = lines.index("It replaces, since the watchdog manages one queue:")
+    assert lines[shown + 1] == f"  {old.resolve()}"
+    assert shown < next(i for i, line in enumerate(lines) if "Apply this change?" in line)
+    assert load_registered_queues() == [new.resolve()]
+    # The lock is free, so the next tick starts the new queue's supervisor.
+    assert lines[-1] == "crontab updated."
+
+
+def test_install_cron_lists_each_queue_an_older_registry_held(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    a, b, new = tmp_path / "a", tmp_path / "b", tmp_path / "new"
+    new.mkdir()
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"queues": [str(a), str(new), str(b), str(a)]}))
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    shown = lines.index("It replaces, since the watchdog manages one queue:")
+    assert lines[shown + 1 : shown + 3] == [f"  {a}", f"  {b}"]
+    assert load_registered_queues() == [new.resolve()]
+
+
+def test_install_cron_rerun_replaces_nothing(runner: CliRunner, tmp_path: Path) -> None:
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    register_queue(queue)
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert "It replaces" not in result.stdout
+
+
+def test_install_cron_says_how_to_hand_over_from_the_running_supervisor(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Ticks start none while the replaced queue's supervisor holds the lock."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    (old / ".claude_task_runner").mkdir(parents=True)
+    new.mkdir()
+    register_queue(old)
+    (old / ".claude_task_runner" / "supervisor.pid").write_text(f"{os.getpid()}\n")
+    with acquire_global_lock(), _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--yes", "--queue", str(new)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "crontab updated.",
+        f"The supervisor for {old.resolve()} (pid {os.getpid()}) still holds global.lock, "
+        "so the watchdog starts this queue's supervisor once it exits. To hand over now, "
+        f"run: claude-task-runner supervisor drain --queue {old.resolve()}",
+    ]
+
+
+def test_install_cron_shows_it_replaces_an_unreadable_registry(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """The registry is only read before the prompt; registering backs it up."""
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{not json", encoding="utf-8")
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    with _cron_install_patched(tmp_path / "bk.txt"):
+        result = runner.invoke(app, ["--queue", str(queue)], input="y\n")
+    assert result.exit_code == 0, result.output
+    shown = next(
+        line for line in result.stdout.splitlines() if line.startswith("It replaces the registry")
+    )
+    assert shown.startswith(
+        f"It replaces the registry, which is unreadable (corrupt queues registry at {registry} ("
+    )
+    assert shown.endswith("); a copy is kept as queues.json.broken.")
+    assert load_registered_queues() == [queue.resolve()]
+    assert (registry.parent / "queues.json.broken").read_text(encoding="utf-8") == "{not json"
+
+
 @pytest.mark.parametrize("init_system", ["systemd", "cron"])
 def test_install_missing_queue_dir_fails_before_any_change(
     runner: CliRunner, tmp_path: Path, init_system: str
@@ -755,17 +851,20 @@ def _registered(tmp_path: Path, *names: str) -> list[Path]:
 def test_uninstall_lists_the_queues_the_registry_still_holds(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """A later cron install would manage them again, even one deleted since."""
-    queues = _registered(tmp_path, "a", "b")
-    queues[1].rmdir()
+    """Every entry of a list an older version wrote, even one deleted since."""
+    queues = [tmp_path / "a", tmp_path / "b"]
+    queues[0].mkdir()
+    registry = queues_registry_path()
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"queues": [str(q) for q in queues]}), encoding="utf-8")
     with _cron_uninstall_patched(_block_plan(), tmp_path / "bk.txt") as mock_apply:
         result = runner.invoke(app, ["uninstall", "--yes"])
     assert result.exit_code == 0, result.output
     mock_apply.assert_called_once()
     assert result.stdout.splitlines()[-4:] == [
         "crontab block removed.",
-        f"{queues_registry_path()} still lists 2 queues, and a later cron install "
-        "manages every queue it lists. To drop one:",
+        f"{registry} still lists 2 queues. No tick reads it without the cron block, and a "
+        "later cron install replaces the list with its own queue. To drop them now:",
         f"  claude-task-runner watchdog unregister --queue {queues[0]}",
         f"  claude-task-runner watchdog unregister --queue {queues[1]}",
     ]
@@ -781,8 +880,8 @@ def test_uninstall_without_a_cron_block_lists_the_registry(
         result = runner.invoke(app, ["uninstall", "--yes"])
     assert result.exit_code == 0, result.output
     assert result.stdout.splitlines()[-2:] == [
-        f"{queues_registry_path()} still lists 1 queue, and a later cron install "
-        "manages every queue it lists. To drop one:",
+        f"{queues_registry_path()} still lists 1 queue. No tick reads it without the cron "
+        "block, and a later cron install replaces the list with its own queue. To drop it now:",
         f"  claude-task-runner watchdog unregister --queue {queue}",
     ]
 

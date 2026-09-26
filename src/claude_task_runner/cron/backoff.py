@@ -1,11 +1,16 @@
 """Exponential backoff state for the watchdog.
 
 The watchdog tick runs every minute from cron and decides whether to
-restart the supervisor. (A systemd install runs no tick; the unit's
-``Restart=on-failure`` restarts the supervisor instead.)
+restart the supervisor of the one queue it manages. (A systemd install
+runs no tick; the unit's ``Restart=on-failure`` restarts the supervisor
+instead.)
 If the supervisor crashes immediately after each restart, naive policy
 would loop forever burning CPU and log volume. We protect with:
 
+* The **lock**: while another process holds the per-user
+  ``global.lock``, a supervisor started now would exit at once, so
+  refuse without counting a restart (LOCKED). Counted, those refusals
+  would hold back the restart once the lock frees.
 * A **cooldown**: after a restart, refuse another for
   ``[watchdog].restart_cooldown_s`` seconds (default 30s).
 * **Crash-loop detection**: if more than
@@ -14,9 +19,9 @@ would loop forever burning CPU and log volume. We protect with:
   ``[watchdog].restart_backoff_max_s`` (default 600s) before the next
   attempt and emit a ``critical`` notification.
 
-State persists to ``~/.claude_task_runner/watchdog_state.json``. The
-file is small (a list of timestamps) and atomic-write keeps the
-watchdog safe to run concurrently with itself.
+State persists to ``~/.claude_task_runner/watchdog_state.json``, which
+names the queue it belongs to. The file is small (a list of timestamps)
+and atomic-write keeps the watchdog safe to run concurrently with itself.
 
 This module is **pure logic**: callers feed it the current time + a
 loaded :class:`WatchdogState`, get back a :class:`WatchdogDecision`.
@@ -53,6 +58,11 @@ class WatchdogVerdict(StrEnum):
     SKIP = "skip"
     """Supervisor is alive; nothing to do."""
 
+    LOCKED = "locked"
+    """Supervisor is down, but another process holds the per-user
+    ``global.lock``, so a supervisor started now would exit at once.
+    Wait, and count no restart."""
+
     COOLDOWN = "cooldown"
     """Supervisor is dead but we restarted recently — wait."""
 
@@ -69,6 +79,12 @@ class WatchdogState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = CURRENT_SCHEMA_VERSION
+    queue: Path | None = None
+    """The queue this history belongs to: the one the watchdog manages. A
+    tick that finds another queue registered starts an empty history, so
+    one queue's restarts never hold back another's. ``None`` in a file
+    written before the field existed."""
+
     recent_restarts: list[datetime] = Field(default_factory=list)
     """Restart timestamps within the analysis window. Older entries
     are pruned on each tick."""
@@ -86,7 +102,7 @@ class WatchdogDecision:
     Attributes
     ----------
     verdict
-        SKIP, COOLDOWN, BACKOFF, or RESTART.
+        SKIP, LOCKED, COOLDOWN, BACKOFF, or RESTART.
     new_state
         The state to persist after acting (whether or not we restarted).
         For RESTART verdict, this includes the new restart timestamp.
@@ -187,17 +203,24 @@ def decide(
     supervisor_alive: bool,
     settings: WatchdogSettings,
     clock: Clock,
+    lock_held: bool = False,
+    lock_holder_pid: int | None = None,
 ) -> WatchdogDecision:
     """Pure decision: should the watchdog restart now?
 
     Decision tree:
 
     1. Supervisor is alive → SKIP (no action).
-    2. Supervisor is dead, last restart within ``restart_cooldown_s`` →
+    2. Supervisor is dead, but another process holds ``global.lock``
+       (``lock_held``; ``lock_holder_pid`` is the PID the lock file
+       records, if any) → LOCKED. A supervisor started now would exit
+       at once, so no restart is counted: a crash-loop count made of
+       those refusals would hold back the restart once the lock frees.
+    3. Supervisor is dead, last restart within ``restart_cooldown_s`` →
        COOLDOWN (wait).
-    3. Supervisor is dead, recent restart count exceeds
+    4. Supervisor is dead, recent restart count exceeds
        ``crash_loop_threshold`` → BACKOFF (refuse + notify).
-    4. Otherwise → RESTART.
+    5. Otherwise → RESTART.
 
     Caller is responsible for actually invoking the restart and for
     persisting :attr:`WatchdogDecision.new_state` afterward.
@@ -212,6 +235,17 @@ def decide(
             new_state=pruned,
             next_check_at=None,
             detail="supervisor alive",
+        )
+
+    if lock_held:
+        holder = "another supervisor"
+        if lock_holder_pid is not None:
+            holder += f" (pid {lock_holder_pid})"
+        return WatchdogDecision(
+            verdict=WatchdogVerdict.LOCKED,
+            new_state=pruned,
+            next_check_at=None,
+            detail=f"{holder} holds global.lock; starting none until it exits",
         )
 
     # Crash-loop protection takes priority over plain cooldown: rapid

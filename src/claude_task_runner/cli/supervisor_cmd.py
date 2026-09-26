@@ -390,7 +390,7 @@ def drain(
     ``supervisor stop``, and the new supervisor adopts the running
     workers (ADR-0025). Without systemd, follow ``drain`` with
     ``supervisor start``, or let the cron watchdog restart it. The
-    watchdog manages only the queues that ``watchdog queues`` lists.
+    watchdog manages one queue, the last that ``watchdog queues`` lists.
 
     The drain window is bounded by the longest in-flight task
     (typically minutes for extraction work; up to

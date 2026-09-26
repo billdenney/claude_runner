@@ -4,13 +4,16 @@
 # it; systemd restarts its unit itself.
 #
 # Delegates all logic to `claude-task-runner watchdog tick`, which:
-#   1. Reads supervisor.pid for each queue registered in
-#      ~/.claude_task_runner/queues.json (a cron install registers its
-#      --queue; `claude-task-runner watchdog register` adds one and
-#      `claude-task-runner watchdog unregister` removes one). A registered
-#      path that is not an existing directory is skipped with an ERROR line.
-#   2. If supervisor is dead AND backoff allows (cron.backoff.decide):
-#      restarts via `claude-task-runner supervisor start --queue ...`.
+#   1. Reads supervisor.pid for the one queue it manages, the last in
+#      ~/.claude_task_runner/queues.json. A cron install and
+#      `claude-task-runner watchdog register` replace that queue, and
+#      `claude-task-runner watchdog unregister` removes it. One supervisor
+#      runs per user, so any other queue listed there is ignored with a
+#      WARNING line. A managed path that is not an existing directory is
+#      skipped with an ERROR line.
+#   2. If the supervisor is dead, no other process holds global.lock AND
+#      backoff allows (cron.backoff.decide): restarts it via
+#      `claude-task-runner supervisor start --queue ...`.
 #   3. Logs to ~/.claude_task_runner/watchdog.log.
 #
 # Why a shell script and not direct cron invocation: ensures stdout/

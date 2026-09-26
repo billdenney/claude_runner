@@ -111,8 +111,9 @@ come back.
 1. `claude-task-runner doctor` shows whether watchdog is installed.
 2. `claude-task-runner install` auto-detects systemd vs cron, shows the
    proposed change, asks for confirmation. Accept it.
-3. Verify. Under cron, `claude-task-runner watchdog queues` must list the
-   queue (see the next section if it does not). Stop the supervisor with
+3. Verify. Under cron, `claude-task-runner watchdog queues` must print the
+   queue, as its last line if it prints several: the watchdog manages only
+   that one (see the next section if it does not). Stop the supervisor with
    `claude-task-runner supervisor stop`. The first tick after it exits
    restarts it, and `~/.claude_task_runner/watchdog.log` shows
    `verdict=restart`.
@@ -156,9 +157,11 @@ yet a stopped supervisor never comes back. Run in the queue directory,
 `claude-task-runner doctor` warns under `watchdog_installed` that the
 registry does not list the queue. With an empty registry, every tick in
 `~/.claude_task_runner/watchdog.log` logs
-`watchdog: no queues registered; nothing to do`.
+`watchdog: no queues registered; nothing to do`. If the ticks log
+`verdict=locked` instead, see
+[Cron watchdog logs `verdict=locked`](#cron-watchdog-logs-verdictlocked).
 
-**Cause:** a tick manages only the queues listed in
+**Cause:** a tick manages only the queue registered in
 `~/.claude_task_runner/queues.json`. An older `install` did not register
 its queue there, so the cron watchdog it installed has nothing to manage.
 
@@ -177,6 +180,44 @@ its queue there, so the cron watchdog it installed has nothing to manage.
    shows `verdict=restart`, then `spawned supervisor`, and
    `claude-task-runner supervisor status` shows it alive.
 
+## Cron watchdog logs `verdict=locked`
+
+**Symptom:** the supervisor of the queue that the cron watchdog manages stays
+down, and every tick in `~/.claude_task_runner/watchdog.log` logs
+`verdict=locked detail='another supervisor (pid <pid>) holds global.lock;
+starting none until it exits'`.
+
+**Cause:** only one supervisor runs per user. Each one takes the per-user
+`~/.claude_task_runner/global.lock`, and a second one exits with
+`another supervisor is already running`. While another supervisor holds the
+lock, a tick starts none, and counts no restart toward its crash-loop
+backoff, so the managed queue's supervisor starts on the first tick after
+that one exits. Usually the holder is the supervisor of the queue registered
+before. `claude-task-runner install --queue <queue>` and
+`claude-task-runner watchdog register --queue <queue>` replace the
+registered queue, since the watchdog manages one, but they do not stop the
+old queue's supervisor; both say so when they replace a queue whose
+supervisor holds the lock. The holder can also be a supervisor started by
+hand, or the systemd unit's.
+
+**Steps:**
+1. `ps -o args= -p <pid>` shows the holder's `--queue`.
+2. To hand over now, drain it:
+
+   ```sh
+   claude-task-runner supervisor drain --queue <old-queue>
+   ```
+
+   It stops dispatching and exits once its in-flight tasks finish, and the
+   next tick after that starts the managed queue's supervisor.
+   `claude-task-runner supervisor stop --queue <old-queue>` exits sooner.
+   With `[supervisor].adopt_workers` on, the default, the old queue's
+   in-flight workers then keep running, but nothing reaps them until a
+   supervisor runs for that queue again.
+3. If the holder is the systemd unit's supervisor, both the unit and the
+   cron watchdog are installed. `claude-task-runner install uninstall`
+   offers to remove each; keep the one you want.
+
 ## A registered queue was deleted or moved
 
 **Symptom:** every minute, `~/.claude_task_runner/watchdog.log` gets a line
@@ -184,8 +225,7 @@ its queue there, so the cron watchdog it installed has nothing to manage.
 was not restarted and the directory was not created`.
 `claude-task-runner watchdog queues` prints a warning about the same path on
 stderr. With the cron watchdog installed, `claude-task-runner doctor` warns
-under `watchdog_installed` and prints the `unregister` command for each such
-path.
+under `watchdog_installed` and prints the `unregister` command for the path.
 
 **Cause:** the queue is registered with the cron watchdog (by `install` or
 `watchdog register`), and its directory was later deleted, moved or replaced
@@ -198,12 +238,12 @@ the per-user `global.lock`, so the real queue's supervisor failed with
 
 **Steps:**
 1. `claude-task-runner watchdog queues` lists the registered queues and
-   warns about each one that is not an existing directory.
-2. If the queue moved, register the new path and drop the old one:
+   warns when the one the watchdog manages, the last, is not an existing
+   directory.
+2. If the queue moved, register the new path. It replaces the old one:
 
    ```sh
    claude-task-runner watchdog register --queue <new-path>
-   claude-task-runner watchdog unregister --queue <old-path>
    ```
 
 3. If it is gone for good, drop it:

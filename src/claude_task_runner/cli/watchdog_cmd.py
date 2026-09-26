@@ -5,27 +5,36 @@ tick: systemd restarts its unit itself.
 One tick:
 
 1. Load watchdog settings.
-2. Load watchdog state (recent restarts, backoff alerts).
-3. For each registered queue (``~/.claude_task_runner/queues.json``,
-   written by a cron ``install`` and by ``watchdog register``; see
-   :mod:`cron.registry`):
-   skip it with an ERROR line if it is not an existing directory (it was
-   deleted or moved after it was registered); otherwise read the PID
-   file and ask :func:`cron.backoff.decide` whether to act.
-4. On RESTART verdict: spawn ``claude-task-runner supervisor start``
+2. Find the one queue the watchdog manages: the last in
+   ``~/.claude_task_runner/queues.json``, which a cron ``install`` and
+   ``watchdog register`` write (see :mod:`cron.registry`). Only one
+   supervisor runs per user, so any other queue listed there is ignored,
+   with a WARNING line.
+3. Load watchdog state (recent restarts, backoff alerts). It belongs to
+   one queue, so a tick that finds another queue registered starts it
+   empty.
+4. Skip the queue with an ERROR line if it is not an existing directory
+   (it was deleted or moved after it was registered). Otherwise read its
+   PID file; when its supervisor is down, check whether another process
+   holds ``global.lock``; and ask :func:`cron.backoff.decide` whether to
+   act.
+5. On RESTART verdict: spawn ``claude-task-runner supervisor start``
    detached.
+6. Save the state.
 
 Output is structured logs to stdout (the cron wrapper redirects to
 ``~/.claude_task_runner/watchdog.log``).
 
-Three more subcommands manage the registry that a tick walks:
+Three more subcommands manage the registry that a tick reads:
 
-* ``watchdog register``   — add a queue (``--queue``, default the current
-  directory).
+* ``watchdog register``   — make a queue the one the watchdog manages
+  (``--queue``, default the current directory), replacing the queue
+  registered before.
 * ``watchdog unregister`` — remove a queue (``--queue``, default the
   current directory). The directory need not exist.
 * ``watchdog queues``     — print the registered queues, one per line,
-  and warn on stderr about each one that is not an existing directory.
+  and warn on stderr about any that the watchdog ignores, and about the
+  managed queue when it is not an existing directory.
 """
 
 from __future__ import annotations
@@ -95,7 +104,7 @@ def tick(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Decide but don't spawn anything."),
 ) -> None:
-    """One watchdog tick: examine each registered queue and act."""
+    """One watchdog tick: examine the queue the watchdog manages and act."""
     settings = load_settings(config)
     clock = RealClock()
     state_path = backoff_mod.watchdog_state_path()
@@ -108,30 +117,52 @@ def tick(
         state = backoff_mod.WatchdogState()
 
     queues = registry_mod.load_registered_queues()
-    if not queues:
+    queue_dir = registry_mod.managed_queue(queues)
+    if queue_dir is None:
         sys.stdout.write("watchdog: no queues registered; nothing to do\n")
         return
 
-    new_state = state
-    for queue_dir in queues:
-        ts = clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-        # Checked before decide(): every queue shares one restart history,
-        # so a skipped queue must not take a restart from the others.
-        # os.path.isdir is False where Path.is_dir raises (a parent that
-        # denies access), so one such path cannot end the tick early.
-        if not os.path.isdir(queue_dir):
-            sys.stdout.write(
-                f"{ts} watchdog: ERROR queue={queue_dir} is not an existing directory, "
-                "so its supervisor was not restarted and the directory was not created. "
-                "If the queue moved, register its new path. If it is gone for good, run: "
-                f"claude-task-runner watchdog unregister --queue {queue_dir}\n"
-            )
-            continue
+    ts = clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ignored = registry_mod.ignored_queues(queues)
+    if ignored:
+        sys.stdout.write(
+            f"{ts} watchdog: WARNING queues.json lists {len(ignored) + 1} queues, but one "
+            "supervisor runs per user, so the watchdog manages only the last one, "
+            f"{queue_dir}, and ignores {', '.join(str(q) for q in ignored)}. To register "
+            "just one, run: claude-task-runner watchdog register --queue <queue>\n"
+        )
 
+    if state.queue != queue_dir:
+        # Restarts counted for another queue must not hold this one back.
+        if state.queue is not None:
+            sys.stdout.write(
+                f"{ts} watchdog: now managing {queue_dir}, not {state.queue}; "
+                "its restart history starts empty\n"
+            )
+        state = backoff_mod.WatchdogState(queue=queue_dir)
+
+    new_state = state
+    # os.path.isdir is False where Path.is_dir raises (a parent that
+    # denies access), so such a path is reported instead of ending the tick.
+    if not os.path.isdir(queue_dir):
+        sys.stdout.write(
+            f"{ts} watchdog: ERROR queue={queue_dir} is not an existing directory, "
+            "so its supervisor was not restarted and the directory was not created. "
+            "If the queue moved, register its new path. If it is gone for good, run: "
+            f"claude-task-runner watchdog unregister --queue {queue_dir}\n"
+        )
+    else:
         alive, pid = _supervisor_is_alive(queue_dir)
+        lock_held, lock_pid = False, None
+        if not alive:
+            # Only when the supervisor is down, so a healthy tick never
+            # holds the lock, even for the moment a probe does.
+            lock_held, lock_pid = _probe_global_lock(ts)
         decision = backoff_mod.decide(
-            state=new_state,
+            state=state,
             supervisor_alive=alive,
+            lock_held=lock_held,
+            lock_holder_pid=lock_pid,
             settings=settings.watchdog,
             clock=clock,
         )
@@ -153,6 +184,22 @@ def tick(
                 )
 
     backoff_mod.write_state_atomic(new_state, state_path)
+
+
+def _probe_global_lock(ts: str) -> pidfile_mod.GlobalLockProbe:
+    """Probe ``global.lock``; if that fails, log it and report the lock free.
+
+    Free is how a tick decided before it probed: it goes ahead with the
+    restart, and a supervisor that cannot take the lock says why in its
+    own log."""
+    try:
+        return pidfile_mod.probe_global_lock()
+    except OSError as exc:
+        sys.stdout.write(
+            f"{ts} watchdog: ERROR could not check global.lock ({exc}); "
+            "deciding as if no other supervisor held it\n"
+        )
+        return pidfile_mod.GlobalLockProbe(held=False, pid=None)
 
 
 @app.command("register")
@@ -202,14 +249,28 @@ def unregister(
 def list_queues() -> None:
     """Print the registered queues, one per line.
 
-    Warns on stderr about each one that is not an existing directory,
-    which a tick skips. Stdout stays one path per line.
+    The watchdog manages the last one. A registry written before
+    ``watchdog register`` replaced its entry can list more; the watchdog
+    ignores those, and a warning on stderr names them. Another warns
+    when the managed queue is not an existing directory, which a tick
+    skips. Stdout stays one path per line.
     """
-    for q in registry_mod.load_registered_queues():
+    queues = registry_mod.load_registered_queues()
+    for q in queues:
         print(q)
-        if not os.path.isdir(q):
-            print(
-                f"warning: {q} is not an existing directory, so the watchdog skips it. "
-                f"To stop managing it, run: claude-task-runner watchdog unregister --queue {q}",
-                file=sys.stderr,
-            )
+    managed = registry_mod.managed_queue(queues)
+    ignored = registry_mod.ignored_queues(queues)
+    if ignored:
+        print(
+            f"warning: one supervisor runs per user, so the watchdog manages only the "
+            f"last queue, {managed}, and ignores {', '.join(str(q) for q in ignored)}. "
+            "To register just one, run: claude-task-runner watchdog register --queue <queue>",
+            file=sys.stderr,
+        )
+    if managed is not None and not os.path.isdir(managed):
+        print(
+            f"warning: {managed} is not an existing directory, so the watchdog skips it. "
+            "To stop managing it, run: claude-task-runner watchdog unregister "
+            f"--queue {managed}",
+            file=sys.stderr,
+        )

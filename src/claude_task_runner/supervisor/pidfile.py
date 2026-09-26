@@ -13,6 +13,11 @@ supervisor process per host**. We enforce by:
 Per-queue ``supervisor.pid`` files are also maintained so multiple
 tooling consumers can find the live PID without holding the lock
 themselves.
+
+The PID stays in ``global.lock`` after its holder exits, and the OS may
+later give that number to an unrelated process, so the file's content
+cannot say whether a supervisor is running. :func:`probe_global_lock`
+asks the lock itself.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 GLOBAL_LOCK_FILENAME = "global.lock"
 """Stored under ``~/.claude_task_runner/`` so it's per-user, not
@@ -130,6 +135,50 @@ def acquire_global_lock(*, lock_path: Path | None = None) -> Iterator[Path]:
     finally:
         with contextlib.suppress(OSError):
             fh.close()
+
+
+class GlobalLockProbe(NamedTuple):
+    """What :func:`probe_global_lock` found."""
+
+    held: bool
+    """A process holds the lock, so a supervisor started now would exit
+    with :class:`SupervisorAlreadyRunning`."""
+
+    pid: int | None
+    """The PID written in the lock file while it is ``held``: the holder's,
+    since :func:`acquire_global_lock` writes it right after locking.
+    ``None`` when the lock is free, or when the file holds no PID yet."""
+
+
+def probe_global_lock(*, lock_path: Path | None = None) -> GlobalLockProbe:
+    """Report whether a process holds ``global.lock``, without keeping it.
+
+    Tries a shared, non-blocking ``flock`` and releases it at once. The
+    OS drops a flock when its holder exits, so unlike the PID left in the
+    file, a lock that is free is never mistaken for a running supervisor.
+    A supervisor that tries to lock the file during the few microseconds
+    the probe holds it fails as if another supervisor were running.
+
+    A missing lock file counts as free, and the probe does not create it.
+    Raises :class:`OSError` when the file exists but cannot be opened, or
+    when ``flock`` fails for a reason other than the lock being held.
+    """
+    path = lock_path if lock_path is not None else global_lock_path()
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return GlobalLockProbe(held=False, pid=None)
+    try:
+        try:
+            # Shared, so a read-only descriptor can take it on filesystems
+            # that emulate flock with fcntl locks, such as NFS.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return GlobalLockProbe(held=True, pid=read_existing_pid(path))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return GlobalLockProbe(held=False, pid=None)
+    finally:
+        os.close(fd)
 
 
 def write_pid_file(path: Path) -> None:
