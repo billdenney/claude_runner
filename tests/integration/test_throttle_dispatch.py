@@ -1,17 +1,20 @@
-"""SLOWING_DOWN dispatch applies the concurrency the operator is told (ADR-0022).
+"""Dispatch applies the throttle decision the operator is told (ADR-0022).
 
-When an account enters SLOWING_DOWN the supervisor notifies
-``slowing dispatch: ... target concurrency=X/Y``. ``X`` is ADR-0022's
-linear ramp: the account's ``max_concurrency`` at ``fivehr_slowdown_pct``,
-falling to 0 at ``fivehr_stop_pct``. These tests drive the real daemon
-tick (:func:`run_one_tick`) and the real orchestrator
-(:func:`tick_dispatch`), then count the tasks dispatched through each
-account, so they fail whenever dispatch applies a number other than the
-one the operator was told.
+These tests drive the real daemon tick (:func:`run_one_tick`) and the
+real orchestrator (:func:`tick_dispatch`), then count the tasks
+dispatched through each account.
 
-The configuration mirrors a live two-account queue: ``personal`` allows
-5 concurrent tasks, ``work`` allows 1, and the queue-wide
-``[concurrency]`` block allows 5.
+* **SLOWING_DOWN.** The supervisor notifies ``slowing dispatch: ...
+  target concurrency=X/Y``. ``X`` is ADR-0022's linear ramp: the
+  account's ``max_concurrency`` at ``fivehr_slowdown_pct``, falling to 0
+  at ``fivehr_stop_pct``. Dispatch must run exactly ``X`` tasks through
+  that account.
+* **Throttled or drifting.** THROTTLED_5H, THROTTLED_WEEKLY and
+  ERROR_DRIFT mean no new dispatch, on a single-account queue too.
+
+The multi-account configuration mirrors a live two-account queue:
+``personal`` allows 5 concurrent tasks, ``work`` allows 1, and the
+queue-wide ``[concurrency]`` block allows 5.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.actions import Action, Notify
 from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+from claude_task_runner.usage.drift import UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
 NOW = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
@@ -73,7 +77,9 @@ def queue_dir(tmp_path: Path) -> Path:
     return qd
 
 
-def _reading(five_hour_pct: int, account: str | None) -> UsageReading:
+def _reading(five_hour_pct: int, account: str | None, *, weekly_pct: int = 5) -> UsageReading:
+    """A clean reading. The weekly window resets in 4 days, so the trace
+    target is about 34%: the default 5% is under it, 90% is over it."""
     return UsageReading(
         captured_at=NOW,
         five_hour=WindowReading(
@@ -82,7 +88,7 @@ def _reading(five_hour_pct: int, account: str | None) -> UsageReading:
             resets_at=NOW + timedelta(hours=2),
         ),
         seven_day=WindowReading(
-            utilization_pct=5,
+            utilization_pct=weekly_pct,
             resets_at_raw="y",
             resets_at=NOW + timedelta(days=4),
         ),
@@ -90,10 +96,33 @@ def _reading(five_hour_pct: int, account: str | None) -> UsageReading:
     )
 
 
+def _two_account_settings(tmp_path: Path) -> Settings:
+    """``personal`` allows 5, ``work`` allows 1, the queue allows 5."""
+    _write_account_policy(tmp_path / "personal", max_concurrency=5)
+    _write_account_policy(tmp_path / "work", max_concurrency=1)
+    return _load(
+        tmp_path,
+        "[concurrency]\nmax_concurrency = 5\ninitial_concurrency = 5\n\n"
+        f'[[accounts]]\nname = "personal"\nconfig_dir = "{tmp_path / "personal"}"\n\n'
+        f'[[accounts]]\nname = "work"\nconfig_dir = "{tmp_path / "work"}"\n',
+    )
+
+
+def _single_account_settings(tmp_path: Path) -> Settings:
+    """No ``[[accounts]]`` block: one ``default`` account, which allows 4,
+    as does the queue."""
+    _write_account_policy(tmp_path / "claude", max_concurrency=4)
+    return _load(
+        tmp_path,
+        "[concurrency]\nmax_concurrency = 4\ninitial_concurrency = 4\n\n"
+        f'[claude]\nconfig_dir = "{tmp_path / "claude"}"\n',
+    )
+
+
 def _tick(
     snapshot: SupervisorSnapshot,
     settings: Settings,
-    reading: UsageReading,
+    reading: UsageReading | UsageFormatDrift,
     clock: FakeClock,
 ) -> tuple[SupervisorSnapshot, list[Action]]:
     """One supervisor tick, built the way ``start_daemon`` builds it."""
@@ -160,14 +189,7 @@ class TestMultiAccountSlowdown:
     def test_slowed_account_dispatches_its_ramp_target(
         self, tmp_path: Path, queue_dir: Path, capture_order: tuple[str, str]
     ) -> None:
-        _write_account_policy(tmp_path / "personal", max_concurrency=5)
-        _write_account_policy(tmp_path / "work", max_concurrency=1)
-        settings = _load(
-            tmp_path,
-            "[concurrency]\nmax_concurrency = 5\ninitial_concurrency = 5\n\n"
-            f'[[accounts]]\nname = "personal"\nconfig_dir = "{tmp_path / "personal"}"\n\n'
-            f'[[accounts]]\nname = "work"\nconfig_dir = "{tmp_path / "work"}"\n',
-        )
+        settings = _two_account_settings(tmp_path)
         clock = FakeClock(NOW)
         snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["personal", "work"])
         five_hour_pct = {"personal": 55, "work": 10}
@@ -205,12 +227,7 @@ class TestSingleAccountSlowdown:
     def test_dispatches_the_ramp_target(
         self, tmp_path: Path, queue_dir: Path, five_hour_pct: int, ramp_target: int
     ) -> None:
-        _write_account_policy(tmp_path / "claude", max_concurrency=4)
-        settings = _load(
-            tmp_path,
-            "[concurrency]\nmax_concurrency = 4\ninitial_concurrency = 4\n\n"
-            f'[claude]\nconfig_dir = "{tmp_path / "claude"}"\n',
-        )
+        settings = _single_account_settings(tmp_path)
         clock = FakeClock(NOW)
         snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
 
@@ -225,3 +242,50 @@ class TestSingleAccountSlowdown:
         counts = _dispatch_counts(queue_dir, settings, snapshot, clock)
 
         assert counts == {"default": ramp_target}
+
+
+class TestSingleAccountThrottled:
+    """A single-account queue dispatches nothing while throttled or drifting.
+
+    Dispatch gates on each account's own state, so an unnamed reading has
+    to reach ``accounts["default"]``, not only the top-level view.
+    """
+
+    @pytest.mark.parametrize(
+        ("poll_result", "expected"),
+        [
+            (_reading(65, None), SupervisorState.THROTTLED_5H),
+            (_reading(10, None, weekly_pct=90), SupervisorState.THROTTLED_WEEKLY),
+            (UsageFormatDrift("only 1 block found"), SupervisorState.ERROR_DRIFT),
+        ],
+        ids=["throttled_5h", "throttled_weekly", "error_drift"],
+    )
+    def test_dispatches_nothing(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        poll_result: UsageReading | UsageFormatDrift,
+        expected: SupervisorState,
+    ) -> None:
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+
+        snapshot, _ = _tick(snapshot, settings, poll_result, clock)
+
+        assert snapshot.state is expected
+        assert snapshot.accounts["default"].state is expected
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {}
+
+    def test_dispatches_again_once_the_reading_recovers(
+        self, tmp_path: Path, queue_dir: Path
+    ) -> None:
+        settings = _single_account_settings(tmp_path)
+        clock = FakeClock(NOW)
+        snapshot = persist_mod.initial_snapshot(since=NOW, account_names=["default"])
+
+        snapshot, _ = _tick(snapshot, settings, _reading(65, None), clock)
+        snapshot, _ = _tick(snapshot, settings, _reading(10, None), clock)
+
+        assert snapshot.accounts["default"].state is SupervisorState.DISPATCHING
+        assert _dispatch_counts(queue_dir, settings, snapshot, clock) == {"default": 4}
