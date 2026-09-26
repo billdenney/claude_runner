@@ -206,6 +206,11 @@ Breaking changes are called out in the version notes.
   clock against the real lock, and temporary mutants (append instead of
   replace, ignore the lock, keep the history across a switch, trust the
   lock file's PID, manage the first entry) each fail them.
+- **`watchdog tick --dry-run` no longer records a restart.** A dry run saved
+  the restart it approved, so the next real tick counted a restart that
+  never happened toward the cooldown and the crash-loop threshold: a real
+  tick a second after a dry run gave `verdict=cooldown`. A dry run now
+  decides and logs, but saves no state.
 - **`supervisor start`, `install`, `queue add` and `queue force-dispatch`
   refuse a `--queue` that is not an existing directory.** They used to
   create it, because `queue_runtime_dir()` and `todo_dir()` make their

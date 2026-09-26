@@ -369,3 +369,47 @@ class TestRestartHistory:
         assert load_state(watchdog_state_path()) == WatchdogState(
             queue=queue, recent_restarts=[now]
         )
+
+
+class TestDryRun:
+    """A dry run used to save the restart it approved and never performed."""
+
+    def test_dry_run_saves_no_state(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch, supervisors: Supervisors
+    ) -> None:
+        queue = _make_queue(isolated_home, "q")
+        register_queue(queue)
+
+        out = _tick(monkeypatch, 0, "--dry-run")
+
+        assert _verdicts(out) == {"q": "restart"}
+        assert supervisors.spawns == []
+        assert not watchdog_state_path().exists()
+
+    def test_dry_run_leaves_an_existing_state_as_it_is(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch, supervisors: Supervisors
+    ) -> None:
+        """Nor does it save the reset for a newly registered queue."""
+        a, b = _make_queue(isolated_home, "a"), _make_queue(isolated_home, "b")
+        write_state_atomic(
+            WatchdogState(queue=a, recent_restarts=[T0 - timedelta(seconds=30)]),
+            watchdog_state_path(),
+        )
+        before = watchdog_state_path().read_bytes()
+        register_queue(b)
+
+        out = _tick(monkeypatch, 0, "--dry-run")
+
+        assert _verdicts(out) == {"b": "restart"}
+        assert watchdog_state_path().read_bytes() == before
+
+    def test_the_real_tick_after_a_dry_run_is_not_held_back(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch, supervisors: Supervisors
+    ) -> None:
+        """A second later a saved phantom restart would have meant COOLDOWN."""
+        queue = _make_queue(isolated_home, "q")
+        register_queue(queue)
+        _tick(monkeypatch, 0, "--dry-run")
+        out = _tick(monkeypatch, 0, offset_s=2.0)
+        assert _verdicts(out) == {"q": "restart"}
+        assert supervisors.spawns == [queue]

@@ -20,7 +20,7 @@ One tick:
    act.
 5. On RESTART verdict: spawn ``claude-task-runner supervisor start``
    detached.
-6. Save the state.
+6. Save the state, unless ``--dry-run``.
 
 Output is structured logs to stdout (the cron wrapper redirects to
 ``~/.claude_task_runner/watchdog.log``).
@@ -102,7 +102,9 @@ def tick(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Decide but don't spawn anything."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Decide and log, but start nothing and save no state."
+    ),
 ) -> None:
     """One watchdog tick: examine the queue the watchdog manages and act."""
     settings = load_settings(config)
@@ -183,7 +185,10 @@ def tick(
                     f"{ts} watchdog: spawned supervisor for {queue_dir} as pid={new_pid}\n"
                 )
 
-    backoff_mod.write_state_atomic(new_state, state_path)
+    # A dry run starts nothing, so the restart it approved must not count
+    # toward the next real tick's cooldown or crash-loop threshold.
+    if not dry_run:
+        backoff_mod.write_state_atomic(new_state, state_path)
 
 
 def _probe_global_lock(ts: str) -> pidfile_mod.GlobalLockProbe:
