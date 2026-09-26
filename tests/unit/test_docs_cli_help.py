@@ -16,7 +16,7 @@ found on 2026-09-25, ten help texts in nine commands were affected.
 
 Every ``typer.Typer`` in ``cli/`` now passes ``rich_markup_mode=None``, so
 click prints help as written, in its plain format. This module checks
-five things:
+six things:
 
 * Every command's ``--help``, rendered through the real entry point,
   contains every bracketed token of its source help text.
@@ -44,6 +44,14 @@ five things:
   ``usage`` with no subcommand runs ``render``. They now pass
   ``short_help=``, the line the root listing prints, and
   ``TestGroupHelp`` pins those lines.
+* No command listing cuts a row short in an 80-column terminal. Click
+  lists a command by the first sentence of its help, and cuts one that
+  does not fit at a word and adds ``...``. When this was checked on
+  2026-09-26, 15 rows ended that way, such as ``account`` and
+  ``watchdog`` in the root listing, and their first sentences were
+  shortened. Click's test runner lays help out 80 columns wide, while an
+  80-column terminal gets 78, so ``_listing`` asks click for the width a
+  terminal gets.
 
 Rich markup in ``console.print`` output is separate and still renders;
 ``TestConsoleMarkup`` pins that.
@@ -333,16 +341,17 @@ def _cut_short(root: typer.Typer = app) -> dict[tuple[str, ...], dict[str, str]]
     sentence does not fit, click cuts it at a word and adds ``...``. A
     ``short_help`` is listed whole instead, wrapped if need be.
     """
-    tree = typer.main.get_command(root)
     cut: dict[tuple[str, ...], dict[str, str]] = {}
-    for path in _command_paths(tree):
-        if getattr(_node(path, tree), "commands", None):
-            rows = {
-                name: text for name, text in _listing(path, root).items() if text.endswith("...")
-            }
-            if rows:
-                cut[path] = rows
+    for path in _group_paths(typer.main.get_command(root)):
+        rows = {name: text for name, text in _listing(path, root).items() if text.endswith("...")}
+        if rows:
+            cut[path] = rows
     return cut
+
+
+def _group_paths(tree: Any = CLI) -> list[tuple[str, ...]]:
+    """Every command path whose ``--help`` lists commands."""
+    return [path for path in _command_paths(tree) if getattr(_node(path, tree), "commands", None)]
 
 
 def _demo_command(
@@ -725,7 +734,11 @@ class TestGroupHelp:
 
 
 class TestListing:
-    """The command listings that ``--help`` prints in an 80-column terminal."""
+    """The command listings that ``--help`` prints in an 80-column terminal.
+
+    Click lists a command by the first sentence of its help, so that
+    sentence must fit its row, or click cuts it short with ``...``.
+    """
 
     def test_lays_help_out_as_a_terminal_does(self) -> None:
         # A terminal leaves two columns spare, up to 80 columns.
@@ -745,37 +758,68 @@ class TestListing:
         }
         assert _cut_short(demo) == {("demo",): {"long": cut}}
 
-    def test_rows_cut_short_today(self) -> None:
-        assert _cut_short() == {
-            (): {
-                "account": "List configured accounts; pause/resume per-account...",
-                "watchdog": "Watchdog tick (the cron entry-point) and queue...",
-            },
-            ("account",): {
-                "list": "List configured accounts with their resolved policy and current...",
-                "resume": "Reverse ``account pause <name>``; the dispatcher includes it...",
-            },
-            ("install",): {
-                "uninstall": "Remove the watchdog installation (systemd unit AND/OR cron...",
-            },
-            ("install-skills",): {"list": "Show which task-runner skills are present in..."},
-            ("queue",): {
-                "backfill-working-dir": "Populate ``working_dir`` on tasks in ``todo/``...",
-                "force-dispatch": "Bypass throttle and priority; dispatch...",
-                "list": "List pending tasks in ``<queue>/todo/`` (Task...",
-                "restart-fresh": "Clear a task's ``session_id`` so the next...",
-                "template": "Print a complete, annotated example Task YAML --...",
-            },
-            ("usage",): {
-                "refresh": "Refresh OAuth tokens for every configured account...",
-                "whoami": "Show which Claude account this `[claude].config_dir` is...",
-            },
-            ("watchdog",): {
-                "tick": "One watchdog tick: examine the queue the watchdog manages...",
-            },
-            ("worktree",): {
-                "reclaim": "Reclaim the git worktrees of completed, merged, clean tasks...",
-            },
+    def test_finds_the_listings(self) -> None:
+        # Guards the gate below against a walk that finds nothing.
+        assert {(), ("queue",), ("usage",)} <= set(_group_paths())
+
+    def test_no_row_is_cut_short(self) -> None:
+        cut = _cut_short()
+        assert cut == {}, (
+            "These command listings cut a row short with '...' in an 80-column terminal:\n"
+            + "\n".join(
+                f"  {' '.join(('claude-task-runner', *path, '--help'))}: {name}  {text}"
+                for path, rows in cut.items()
+                for name, text in rows.items()
+            )
+            + "\nClick lists a command by the first sentence of its help. Shorten "
+            "that sentence to fit, and move what it loses to the next sentence."
+        )
+
+    def test_rows_that_were_cut_short(self) -> None:
+        # All 15 were cut short with "..." before their first sentences
+        # were shortened.
+        rows = {
+            (): ("account", "watchdog"),
+            ("account",): ("list", "resume"),
+            ("install",): ("uninstall",),
+            ("install-skills",): ("list",),
+            ("queue",): (
+                "backfill-working-dir",
+                "force-dispatch",
+                "list",
+                "restart-fresh",
+                "template",
+            ),
+            ("usage",): ("refresh", "whoami"),
+            ("watchdog",): ("tick",),
+            ("worktree",): ("reclaim",),
+        }
+        assert {
+            (path, name): _listing(path)[name] for path, names in rows.items() for name in names
+        } == {
+            ((), "account"): "List configured accounts; pause or resume their dispatch.",
+            ((), "watchdog"): "Watchdog tick (the cron entry point) and queue registry.",
+            (("account",), "list"): "List configured accounts, their resolved policy and state.",
+            (("account",), "resume"): (
+                "Reverse ``account pause <name>``; dispatch includes it again."
+            ),
+            (("install",), "uninstall"): "Remove the watchdog's systemd unit and/or cron block.",
+            (("install-skills",), "list"): (
+                "Show which task-runner skills are in ``~/.claude/skills/``."
+            ),
+            (("queue",), "backfill-working-dir"): (
+                "Fill in a null ``working_dir`` on ``todo/`` tasks."
+            ),
+            (("queue",), "force-dispatch"): "Bypass throttle and priority; run ``task_id`` next.",
+            (("queue",), "list"): "List the Task YAMLs pending in ``<queue>/todo/``.",
+            (("queue",), "restart-fresh"): "Clear a task's ``session_id`` so it starts fresh.",
+            (("queue",), "template"): "Print a complete, annotated example Task YAML.",
+            (("usage",), "refresh"): "Refresh the OAuth token of every configured account.",
+            (("usage",), "whoami"): "Show which Claude account `[claude].config_dir` is using.",
+            (("watchdog",), "tick"): "Run one watchdog tick on the queue the watchdog manages.",
+            (("worktree",), "reclaim"): (
+                "Reclaim the git worktrees of completed, merged, clean tasks."
+            ),
         }
 
 

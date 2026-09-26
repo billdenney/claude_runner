@@ -78,7 +78,7 @@ app.add_typer(
 app.add_typer(
     account_cmd.app,
     name="account",
-    help="List configured accounts; pause/resume per-account dispatch.",
+    help="List configured accounts; pause or resume their dispatch.",
 )
 app.add_typer(queue_cmd.app, name="queue", help="List and add tasks to a queue.")
 app.add_typer(
@@ -102,7 +102,7 @@ app.add_typer(
 app.add_typer(
     watchdog_cmd.app,
     name="watchdog",
-    help="Watchdog tick (the cron entry-point) and queue registration.",
+    help="Watchdog tick (the cron entry point) and queue registry.",
 )
 app.add_typer(
     doctor_cmd.app,

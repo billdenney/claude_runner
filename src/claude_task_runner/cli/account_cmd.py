@@ -113,7 +113,7 @@ def list_accounts(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """List configured accounts with their resolved policy and current state.
+    """List configured accounts, their resolved policy and state.
 
     Skills use ``--json`` for machine-parseable output; operators run
     interactively without it for a human-readable summary.
@@ -246,7 +246,7 @@ def resume_account(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Reverse ``account pause <name>``; the dispatcher includes it again."""
+    """Reverse ``account pause <name>``; dispatch includes it again."""
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
