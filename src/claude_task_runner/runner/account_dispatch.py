@@ -33,10 +33,18 @@ Selection rule
    ``last_5h_util_pct``. Tie-break by ``last_weekly_util_pct``, then
    account name (lexicographic, deterministic).
 
-There is intentionally no queue-wide concurrency cap: each account's
-``max_concurrency`` (from its own ``runner-account.toml``) is the only
-ceiling. The operator chooses per-account caps such that their sum is
-acceptable.
+Capacity
+--------
+An account has capacity while its in-flight count is below its cap: its
+``max_concurrency`` (from its own ``runner-account.toml``), lowered to
+the ``target_concurrency`` of its last throttle decision when that is
+set. While SLOWING_DOWN that target is ADR-0022's linear ramp, the
+number the supervisor announced, so each account slows down on its own
+5h reading.
+
+This module applies no queue-wide cap. The orchestrator separately
+bounds the queue's total in-flight tasks by ``[concurrency]``
+(``runner.orchestrator._target_concurrency``).
 """
 
 from __future__ import annotations
@@ -157,12 +165,13 @@ def choose_account(
                     f"{affined_account!r} is {state.state.value}"
                 ),
             )
-        if not _has_capacity(affined_account, acct, in_flight):
+        if not _has_capacity(affined_account, acct, state, in_flight):
             return DispatchChoice(
                 account=None,
                 reason=(
                     f"session affinity blocks dispatch: host account "
-                    f"{affined_account!r} at capacity"
+                    f"{affined_account!r} at capacity "
+                    f"({_capacity_text(affined_account, acct, state, in_flight)})"
                 ),
             )
         return DispatchChoice(
@@ -194,10 +203,13 @@ def choose_account(
                 account=None,
                 reason=f"pinned account {pinned!r} is {state.state.value}",
             )
-        if not _has_capacity(pinned, acct, in_flight):
+        if not _has_capacity(pinned, acct, state, in_flight):
             return DispatchChoice(
                 account=None,
-                reason=f"pinned account {pinned!r} at capacity",
+                reason=(
+                    f"pinned account {pinned!r} at capacity "
+                    f"({_capacity_text(pinned, acct, state, in_flight)})"
+                ),
             )
         return DispatchChoice(account=pinned, reason=f"pinned to {pinned!r}")
 
@@ -214,8 +226,10 @@ def choose_account(
         if maybe_state.state not in _DISPATCHABLE_STATES:
             blocked_reasons.append(f"{name}: {maybe_state.state.value}")
             continue
-        if not _has_capacity(name, acct, in_flight):
-            blocked_reasons.append(f"{name}: at capacity")
+        if not _has_capacity(name, acct, maybe_state, in_flight):
+            blocked_reasons.append(
+                f"{name}: at capacity ({_capacity_text(name, acct, maybe_state, in_flight)})"
+            )
             continue
         sort_key = (
             maybe_state.last_5h_util_pct,
@@ -241,19 +255,39 @@ def choose_account(
     )
 
 
+def account_cap(acct: ResolvedAccount, state: AccountState) -> int:
+    """How many tasks ``acct`` may run at once right now.
+
+    ``acct.policy.concurrency.max_concurrency`` (from the account's own
+    ``runner-account.toml``; 1 if absent), lowered to
+    ``state.target_concurrency`` when the account's last throttle
+    decision set one. While SLOWING_DOWN that is the ramp target the
+    supervisor announced.
+    """
+    cap = acct.policy.concurrency.max_concurrency
+    if state.target_concurrency is not None:
+        cap = min(cap, state.target_concurrency)
+    return cap
+
+
 def _has_capacity(
     name: str,
     acct: ResolvedAccount,
+    state: AccountState,
     in_flight: list[InFlightRecord],
 ) -> bool:
-    """True iff dispatching one more task to ``name`` stays under its cap.
+    """True iff dispatching one more task to ``name`` stays under :func:`account_cap`."""
+    return account_in_flight_count(name, in_flight) < account_cap(acct, state)
 
-    The cap is ``acct.policy.concurrency.max_concurrency`` (loaded from
-    the account's own ``runner-account.toml``; defaults to 1 if absent).
-    There is no queue-wide ceiling.
-    """
-    used = sum(1 for r in in_flight if r.account == name)
-    return used < acct.policy.concurrency.max_concurrency
+
+def _capacity_text(
+    name: str,
+    acct: ResolvedAccount,
+    state: AccountState,
+    in_flight: list[InFlightRecord],
+) -> str:
+    """``in-flight/cap`` for a decline reason, e.g. ``2/2``."""
+    return f"{account_in_flight_count(name, in_flight)}/{account_cap(acct, state)}"
 
 
 def account_in_flight_count(account: str, in_flight: list[InFlightRecord]) -> int:

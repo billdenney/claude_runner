@@ -9,22 +9,30 @@ When a poll result carries ``UsageReading.account = "personal"``,
 3. Stamp ``accounts["personal"].last_capture_at`` to the current
    clock so the multi-account picker advances on the next tick.
 
-Single-account flows (``reading.account is None``) keep the old
-behaviour bit-for-bit.
+A single-account queue's source names no account
+(``reading.account is None``); its poll results belong to the only
+configured account, so they update ``accounts[<that account>]`` too.
+Dispatch gates on that per-account state.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.schema import AccountConcurrencyPolicy, AccountPolicy
+from claude_task_runner.supervisor.actions import Notify
 from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
+from claude_task_runner.supervisor.persistence import initial_snapshot
 from claude_task_runner.supervisor.states import (
     AccountState,
     SupervisorSnapshot,
     SupervisorState,
 )
+from claude_task_runner.usage.drift import UsageFormatDrift
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
 
@@ -131,8 +139,9 @@ def test_attributed_reading_mirrors_top_level_for_state_machine_backcompat() -> 
 
 
 def test_unattributed_reading_keeps_legacy_behavior() -> None:
-    """When ``reading.account is None``, the existing single-account
-    flow runs untouched: top-level updates, no per-account write."""
+    """An unnamed reading whose sole configured account (``default``) is
+    not in the snapshot updates the top-level fields only: no per-account
+    write."""
     settings = load_settings(None)
     clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
     snap = _snapshot_with_two_accounts()
@@ -354,3 +363,141 @@ def test_alternating_readings_throttle_only_attributed_account_per_tick() -> Non
     assert snap.accounts["b"].state is SupervisorState.THROTTLED_5H
     assert snap.accounts["a"].state is SupervisorState.THROTTLED_5H
     assert snap.accounts["b"].last_5h_util_pct == 65
+
+
+# ---------------------------------------------------------------------------
+# Single-account queues: unnamed poll results belong to the only account
+# ---------------------------------------------------------------------------
+
+_POLICY_MAX_4 = {"default": AccountPolicy(concurrency=AccountConcurrencyPolicy(max_concurrency=4))}
+"""The ``default`` account's own policy. Its cap of 4 differs from the
+queue-wide default of 2, so a decision that used the queue-wide cap
+instead would show up in ``target_concurrency``."""
+
+
+@pytest.mark.parametrize(
+    ("util_5h", "state", "target"),
+    [
+        (10, SupervisorState.DISPATCHING, 4),
+        # Ramp: ceil(4 * (1 - (50 - 40) / (60 - 40))) = 2.
+        (50, SupervisorState.SLOWING_DOWN, 2),
+        (65, SupervisorState.THROTTLED_5H, 0),
+    ],
+    ids=["dispatching", "slowing_down", "throttled_5h"],
+)
+def test_unnamed_reading_updates_the_sole_account(
+    util_5h: int, state: SupervisorState, target: int
+) -> None:
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    snap = initial_snapshot(since=datetime(2026, 5, 22, tzinfo=UTC), account_names=["default"])
+
+    new_snap, _ = run_one_tick(
+        snap,
+        TickContext(
+            settings=_utc_settings(),  # one account: the legacy "default"
+            poll_result=_reading_5h_only(account=None, util_5h=util_5h, util_7d=20),
+            pending_count=3,
+            in_flight_count=0,
+            account_policies=_POLICY_MAX_4,
+        ),
+        clock,
+    )
+
+    acct = new_snap.accounts["default"]
+    assert acct.state is state
+    assert acct.last_5h_util_pct == util_5h
+    assert acct.target_concurrency == target
+    assert acct.last_capture_at == datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
+    assert new_snap.state is state
+
+
+def test_unnamed_drift_puts_the_sole_account_in_error_drift() -> None:
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    snap = initial_snapshot(since=datetime(2026, 5, 22, tzinfo=UTC), account_names=["default"])
+
+    new_snap, _ = run_one_tick(
+        snap,
+        TickContext(
+            settings=_utc_settings(),
+            poll_result=UsageFormatDrift("only 1 block found"),
+            pending_count=3,
+            in_flight_count=0,
+            account_policies=_POLICY_MAX_4,
+        ),
+        clock,
+    )
+
+    assert new_snap.accounts["default"].state is SupervisorState.ERROR_DRIFT
+    assert "only 1 block found" in new_snap.accounts["default"].last_drift_message
+
+
+# ---------------------------------------------------------------------------
+# target_concurrency moves between the account and the top-level view
+# ---------------------------------------------------------------------------
+
+_POLICIES_5_AND_1 = {
+    "personal": AccountPolicy(concurrency=AccountConcurrencyPolicy(max_concurrency=5)),
+    "work": AccountPolicy(concurrency=AccountConcurrencyPolicy(max_concurrency=1)),
+}
+
+
+def _two_accounts(personal_target: int) -> SupervisorSnapshot:
+    """``personal`` is slowing down at ``personal_target``. The top-level
+    view mirrors ``work``, captured last, whose target is 1."""
+    since = datetime(2026, 5, 22, tzinfo=UTC)
+    return SupervisorSnapshot(
+        state=SupervisorState.DISPATCHING,
+        since=since,
+        last_5h_util_pct=10,
+        target_concurrency=1,
+        accounts={
+            "personal": AccountState(
+                state=SupervisorState.SLOWING_DOWN,
+                since=since,
+                last_5h_util_pct=55,
+                target_concurrency=personal_target,
+            ),
+            "work": AccountState(
+                state=SupervisorState.DISPATCHING,
+                since=since,
+                last_5h_util_pct=10,
+                target_concurrency=1,
+            ),
+        },
+    )
+
+
+def _tick_personal(snap: SupervisorSnapshot, util_5h: int) -> tuple[SupervisorSnapshot, list]:
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    return run_one_tick(
+        snap,
+        TickContext(
+            settings=_utc_settings(),
+            poll_result=_reading_5h_only(account="personal", util_5h=util_5h, util_7d=20),
+            pending_count=3,
+            in_flight_count=0,
+            account_policies=_POLICIES_5_AND_1,
+        ),
+        clock,
+    )
+
+
+def test_new_target_lands_on_the_account() -> None:
+    """personal climbs from 45% (target 4) to 55%: its target becomes 2,
+    and work's stays 1."""
+    new_snap, actions = _tick_personal(_two_accounts(personal_target=4), util_5h=55)
+
+    assert new_snap.accounts["personal"].target_concurrency == 2
+    assert new_snap.accounts["work"].target_concurrency == 1
+    assert [a.message for a in actions if isinstance(a, Notify)] == [
+        "slowing dispatch: 5h=55% in [40, 60) (day); target concurrency=2/5"
+    ]
+
+
+def test_previous_target_comes_from_the_account() -> None:
+    """personal's target is unchanged at 2, so there is no new notice,
+    even though the top-level view held work's target of 1."""
+    new_snap, actions = _tick_personal(_two_accounts(personal_target=2), util_5h=55)
+
+    assert new_snap.accounts["personal"].target_concurrency == 2
+    assert not any(isinstance(a, Notify) for a in actions)

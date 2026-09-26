@@ -907,6 +907,164 @@ class TestWakeupScheduling:
 
 
 # ----------------------------------------------------------------------------
+# target_concurrency: the dispatch cap the decision chose
+# ----------------------------------------------------------------------------
+
+
+def _slowing(target: int) -> SupervisorSnapshot:
+    return _initial(SupervisorState.SLOWING_DOWN).model_copy(update={"target_concurrency": target})
+
+
+def _notifies(actions) -> list[Notify]:
+    return [a for a in actions if isinstance(a, Notify)]
+
+
+class TestTargetConcurrency:
+    """``step`` records each decision's ``target_concurrency`` on the
+    snapshot, which is what dispatch caps the account at (ADR-0022)."""
+
+    @pytest.mark.parametrize(
+        ("five_pct", "weekly_pct", "weekly_resets_days", "state", "target"),
+        [
+            (10, 5, 4.0, SupervisorState.DISPATCHING, 5),
+            # Ramp: ceil(5 * (1 - (50 - 40) / (60 - 40))) = 3.
+            (50, 5, 4.0, SupervisorState.SLOWING_DOWN, 3),
+            (65, 5, 4.0, SupervisorState.THROTTLED_5H, 0),
+            # Half the week left: the trace target is about 39%.
+            (10, 60, 3.5, SupervisorState.THROTTLED_WEEKLY, 0),
+        ],
+        ids=["dispatching", "slowing_down", "throttled_5h", "throttled_weekly"],
+    )
+    def test_each_decision_records_its_target(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+        five_pct: int,
+        weekly_pct: int,
+        weekly_resets_days: float,
+        state: SupervisorState,
+        target: int,
+    ) -> None:
+        reading = _reading(
+            five_pct=five_pct,
+            weekly_pct=weekly_pct,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=weekly_resets_days),
+        )
+        new, _ = step(
+            _input(_initial(), reading, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert new.state is state
+        assert new.target_concurrency == target
+
+    def test_idle_clears_target(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        reading = _reading(five_pct=50, weekly_pct=5)
+        new, _ = step(
+            _input(_slowing(3), reading, policy, supervisor_settings, usage_settings),
+            clock,
+        )
+        assert new.state is SupervisorState.IDLE
+        assert new.target_concurrency is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [UsageFormatDrift("only 1 block found"), UsageApiAuthExpired("401")],
+        ids=["parser_drift", "auth_expired"],
+    )
+    def test_error_drift_clears_target(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+        error: Exception,
+    ) -> None:
+        new, _ = step(
+            _input(_slowing(3), error, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert new.state is SupervisorState.ERROR_DRIFT
+        assert new.target_concurrency is None
+
+    def test_skipped_capture_keeps_target(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """A capture timeout changes nothing, including the cap in force."""
+        new, _ = step(
+            _input(
+                _slowing(3),
+                UsageCaptureTimeout("slow"),
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=2,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.SLOWING_DOWN
+        assert new.target_concurrency == 3
+
+    def test_slowdown_notifies_again_when_target_changes(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """Dispatch applies the new cap at once, so the operator hears it."""
+        reading = _reading(
+            five_pct=55,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(_slowing(4), reading, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert new.target_concurrency == 2
+        assert _notifies(actions) == [
+            Notify(
+                level="info",
+                message="slowing dispatch: 5h=55% in [40, 60) (day); target concurrency=2/5",
+            )
+        ]
+
+    def test_slowdown_silent_while_target_unchanged(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        reading = _reading(
+            five_pct=50,
+            weekly_pct=5,
+            five_resets=clock.now() + timedelta(hours=2),
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(_slowing(3), reading, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert new.target_concurrency == 3
+        assert _notifies(actions) == []
+
+
+# ----------------------------------------------------------------------------
 # Exhaustive state enumeration
 # ----------------------------------------------------------------------------
 

@@ -31,7 +31,7 @@ from rich.console import Console
 from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
-from claude_task_runner.runner.account_dispatch import account_in_flight_count
+from claude_task_runner.runner.account_dispatch import account_cap, account_in_flight_count
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -88,6 +88,13 @@ def _account_row(
         "last_5h_util_pct": state.last_5h_util_pct if state is not None else None,
         "last_weekly_util_pct": state.last_weekly_util_pct if state is not None else None,
         "in_flight_count": in_flight_count,
+        # The last throttle decision's cap (ADR-0022 ramp while
+        # SLOWING_DOWN), and the number dispatch actually allows:
+        # max_concurrency lowered to that target.
+        "target_concurrency": state.target_concurrency if state is not None else None,
+        "dispatch_cap": (
+            account_cap(acct, state) if state is not None else policy.concurrency.max_concurrency
+        ),
     }
 
 
@@ -150,7 +157,8 @@ def list_accounts(
         console.print(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}")
         console.print(
             f"  state:           {state_str}   "
-            f"5h={util_5h_s}   weekly={util_w_s}   in_flight={row['in_flight_count']}"
+            f"5h={util_5h_s}   weekly={util_w_s}   "
+            f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
         )
 
 

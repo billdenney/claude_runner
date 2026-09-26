@@ -88,7 +88,9 @@ echo ""
 # /usage capture round-robin from PR 8). Reports each account's
 # state, 5h util, weekly util, paused flag, per-account in-flight
 # count (derived from supervisor.json `in_flight` records'
-# `account` attribution), 5h + weekly reset, scheduled wakeup,
+# `account` attribution), the throttle target that caps it
+# (`target_concurrency`: the ADR-0022 ramp while slowing_down; "—"
+# when no decision has set one), 5h + weekly reset, scheduled wakeup,
 # and last `/usage` capture timestamp.
 #
 # Expects supervisor.json v3 or later (`schema_version` >= 3). v2 files are
@@ -129,21 +131,23 @@ in_flight_by_account = Counter(
 print("**Per-account state** (from supervisor.json `accounts`)")
 print()
 print(
-    "| account | state | 5h | weekly | paused | in-flight | "
+    "| account | state | 5h | weekly | paused | in-flight | target | "
     "5h reset | weekly reset | wakeup | last capture |"
 )
-print("|---|---|---:|---:|:-:|---:|---|---|---|---|")
+print("|---|---|---:|---:|:-:|---:|---:|---|---|---|---|")
 for name in sorted(accounts):
     a = accounts[name]
     paused = "yes" if a.get("paused") else ""
     last_cap = a.get("last_capture_at") or "—"
     wakeup = a.get("scheduled_wakeup_at") or "—"
+    target = a.get("target_concurrency")
     print(
         f"| {name} | `{a.get('state','?')}` "
         f"| {a.get('last_5h_util_pct','?')}% "
         f"| {a.get('last_weekly_util_pct','?')}% "
         f"| {paused} "
         f"| {in_flight_by_account.get(name, 0)} "
+        f"| {'—' if target is None else target} "
         f"| {a.get('last_5h_reset_at','—')} "
         f"| {a.get('last_weekly_reset_at','—')} "
         f"| {wakeup} "

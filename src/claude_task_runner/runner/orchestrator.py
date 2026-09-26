@@ -7,13 +7,15 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the target concurrency for this tick.
+2. Computes the queue-wide ceiling for this tick (``[concurrency]``).
 3. Picks eligible pending tasks (no ``running`` state file, all
    ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
    to pick the account to dispatch through (equal-priority across
    accounts, least 5h util wins). Skips the task when no account has
-   capacity.
+   capacity. Each account's capacity includes the ``target_concurrency``
+   of its last throttle decision, so a SLOWING_DOWN account runs at
+   most the ramp target the supervisor announced (ADR-0022).
 5. Spawns one ``threading.Thread`` per dispatched task that calls
    :func:`runner.dispatcher.dispatch` with the chosen account's
    ``config_dir`` / ``linux_user``. Threads are non-daemon so the
@@ -222,7 +224,7 @@ def tick_dispatch(
     if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
-    target = _target_concurrency(queue_dir, settings, snapshot)
+    target = _target_concurrency(queue_dir, settings)
     available = max(0, target - len(in_flight_slots))
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
@@ -528,14 +530,18 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     return state.runs[-1].pid
 
 
-def _target_concurrency(
-    queue_dir: Path,
-    settings: Settings,
-    snapshot: SupervisorSnapshot,
-) -> int:
-    """Conservative target: ``initial_concurrency`` until at least one task
-    has completed in this queue, then ``max_concurrency``. Halved while
-    SLOWING_DOWN.
+def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
+    """Queue-wide ceiling on in-flight tasks across all accounts.
+
+    ``[concurrency].initial_concurrency`` until at least one task has
+    completed in this queue, then ``[concurrency].max_concurrency``.
+
+    Throttling is not applied here. Each account's own cap, including
+    its SLOWING_DOWN ramp target, is enforced per task by
+    :func:`account_dispatch.choose_account`. This used to halve the
+    ceiling whenever the top-level state was SLOWING_DOWN, which ignored
+    the ramp the supervisor announced and, with several accounts,
+    depended on which account had been captured last.
     """
     have_warmup = _has_any_completed(queue_dir)
     base = (
@@ -543,10 +549,7 @@ def _target_concurrency(
         if have_warmup
         else settings.concurrency.initial_concurrency
     )
-    base = max(1, base)
-    if snapshot.state is SupervisorState.SLOWING_DOWN:
-        return max(1, base // 2)
-    return base
+    return max(1, base)
 
 
 def _has_any_completed(queue_dir: Path) -> bool:
