@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import patch
@@ -323,12 +324,16 @@ class TestMissingQueue:
 
     def test_doctor_json_keeps_its_shape(self, tmp_path: Path) -> None:
         queue = tmp_path / "gone" / "queue"
-        result = _run(("doctor",), queue, tmp_path, "--json")
+        # effort_levels_cli would otherwise run the machine's own claude.
+        silent = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("claude_task_runner.doctor.checks._run_claude_version", return_value=silent):
+            result = _run(("doctor",), queue, tmp_path, "--json")
         assert result.exit_code == 1, result.output
         payload = json.loads(result.stdout)
         assert payload["queue_dir"] == str(queue.resolve())
         assert [r["name"] for r in payload["results"]] == [
             "claude_binary",
+            "effort_levels_cli",
             "accounts",
             "legacy_claude_config_dir",
             "account_policies",
@@ -340,7 +345,7 @@ class TestMissingQueue:
             "skills_installed",
             "watchdog_installed",
         ]
-        assert payload["results"][8] == {
+        assert payload["results"][9] == {
             "name": "queue_layout",
             "status": "fail",
             "detail": f"queue dir is not an existing directory: {queue.resolve()}; "

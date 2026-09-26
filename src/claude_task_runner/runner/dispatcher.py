@@ -188,6 +188,13 @@ def build_argv(
     flag is required by the claude CLI when ``--print`` is paired with
     stream-json output.
 
+    Always emits ``--effort <task.effort>`` too. ``claude`` does not fail
+    on an effort it does not know; it warns on stderr and uses its default,
+    so the level must be one the CLI accepts. ``[effort_levels]`` is what
+    guarantees that: the supervisor parks a task whose (model, effort) it
+    rejects, and the doctor's ``effort_levels_cli`` check tries every
+    configured level against the installed CLI.
+
     ``add_dirs`` (when non-empty) widens the spawned agent's sandbox
     beyond its cwd; each path is forwarded as ``--add-dir <path>``.
     The caller resolves the list via :mod:`runner.add_dirs` so that
@@ -227,6 +234,11 @@ def build_argv(
     ]
     if task.model:
         argv.extend(["--model", task.model])
+    # The task's effort, which the supervisor has already checked against
+    # [effort_levels] (ADR-0010). Always passed, resumes included: without it
+    # claude runs at its per-model default (medium for claude-opus-5-5 in
+    # Claude Code 2.1.281), whatever the task asks for.
+    argv.extend(["--effort", task.effort])
     if task.allowed_tools:
         argv.extend(["--allowedTools", ",".join(task.allowed_tools)])
     for extra_dir in add_dirs or []:
