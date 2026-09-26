@@ -311,9 +311,13 @@ class TestRestartPolicyFromWatchdog:
 
     @pytest.mark.parametrize("key", ["restart_cooldown_s", "restart_backoff_max_s"])
     def test_an_infinite_span_is_refused(self, key: str) -> None:
-        """The schema's ``gt=0`` lets ``inf`` through, and TOML can spell it."""
+        """The schema rejects ``inf`` (``tests/unit/test_settings_finite.py``),
+        so only a model built without validation can bring one here."""
+        unvalidated = WatchdogSettings.model_construct(
+            **{**_DEFAULTS.model_dump(), key: float("inf")}
+        )
         with pytest.raises(UnitSettingError) as excinfo:
-            _unit(_watchdog(**{key: float("inf")}))
+            _unit(unvalidated)
         assert str(excinfo.value) == f"[watchdog].{key} = inf is not a finite number of seconds"
 
     def test_the_largest_burst_systemd_accepts_is_written(self) -> None:
