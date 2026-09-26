@@ -15,7 +15,7 @@ from claude_task_runner.runner.effort_levels import (
 )
 
 LEVELS = {
-    "claude-opus-4-7": ["low", "medium", "high", "max", "extra_high"],
+    "claude-opus-4-7": ["low", "medium", "high", "xhigh", "max"],
     "claude-sonnet-4-6": ["low", "medium", "high"],
     "claude-haiku-4-5": ["low", "medium", "high"],
 }
@@ -56,10 +56,24 @@ class TestValidateEffort:
 
     def test_error_message_lists_accepted(self) -> None:
         with pytest.raises(UnknownEffortLevel) as exc_info:
-            validate_effort("claude-haiku-4-5", "extra_high", LEVELS)
-        msg = str(exc_info.value)
+            validate_effort("claude-haiku-4-5", "xhigh", LEVELS)
         # Accepted set is sorted in the message for stability
-        assert "['high', 'low', 'medium']" in msg
+        assert str(exc_info.value) == (
+            "effort 'xhigh' not in accepted set for model 'claude-haiku-4-5': "
+            "['high', 'low', 'medium']"
+        )
+
+    def test_old_spelling_names_the_new_one(self) -> None:
+        """New input with the pre-2026-09-26 spelling is refused, not renamed
+        (only files already written are read with the new name), and the
+        message says what to write instead."""
+        with pytest.raises(UnknownEffortLevel) as exc_info:
+            validate_effort("claude-opus-4-7", "extra_high", LEVELS)
+        assert str(exc_info.value) == (
+            "effort 'extra_high' not in accepted set for model 'claude-opus-4-7': "
+            "['high', 'low', 'max', 'medium', 'xhigh']; 'extra_high' is now 'xhigh', "
+            "the claude CLI's name for it"
+        )
 
     def test_case_sensitive(self) -> None:
         # We don't normalize case — Anthropic's strings are lowercase.

@@ -133,6 +133,39 @@ class TestBuildArgv:
         assert argv[idx + 1] == "sess-abc"
         assert argv[-1] == "Continue."
 
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_effort_is_passed_once_before_the_prompt(
+        self, fresh_plan: SpawnPlan, effort: str
+    ) -> None:
+        """Without --effort, claude runs at its per-model default (medium for
+        claude-opus-5-5 in Claude Code 2.1.281) whatever the task asks for,
+        which is how every dispatch ran until 2026-09-26 (ADR-0010)."""
+        task = Task(id="x", title="x", prompt="p", effort=effort, allowed_tools=["Read"])
+        argv = build_argv(task, fresh_plan, claude_executable="claude")
+        assert argv.count("--effort") == 1
+        idx = argv.index("--effort")
+        assert argv[idx + 1] == effort
+        assert idx < argv.index("--allowedTools") < argv.index("--")
+
+    def test_effort_is_passed_on_resume(self, task: Task) -> None:
+        """A resumed session gets the task's effort too: the flag sets the
+        effort for the process's requests, not for the transcript."""
+        plan = SpawnPlan(
+            strategy=ResumeStrategy.RESUME,
+            session_id="sess-abc",
+            prompt="Continue.",
+            extra_args=[],
+        )
+        argv = build_argv(task, plan, claude_executable="claude")
+        assert argv[argv.index("--effort") + 1] == task.effort
+
+    def test_task_default_effort_is_passed(self, fresh_plan: SpawnPlan) -> None:
+        """A task that leaves effort out runs at the Task default, not at
+        whatever the CLI would pick for the model."""
+        task = Task(id="x", title="x", prompt="p")
+        argv = build_argv(task, fresh_plan, claude_executable="claude")
+        assert argv[argv.index("--effort") + 1] == "medium"
+
     def test_no_tools_omits_flag(self) -> None:
         task = Task(id="x", title="x", prompt="p", allowed_tools=[])
         plan = SpawnPlan(
@@ -714,6 +747,38 @@ class TestSpawnUsesNewSession:
         assert captured.get("start_new_session") is True
         # Sanity: the real subprocess still ran to completion.
         assert outcome.new_state.status == "completed"
+
+    def test_spawned_argv_carries_the_task_effort(
+        self,
+        queue_dir: Path,
+        fresh_plan: SpawnPlan,
+        monkeypatch: pytest.MonkeyPatch,
+        reset_shim_env: None,
+    ) -> None:
+        """The effort reaches the process dispatch actually spawns, not just
+        build_argv's return value."""
+        task = Task(id="001-foo", title="Foo", prompt="Do the foo", effort="xhigh")
+        real_popen = dispatcher_mod.subprocess.Popen
+        spawned: list[list[str]] = []
+
+        def _spy_popen(args: list[str], **kwargs: object) -> object:
+            spawned.append(list(args))
+            return real_popen(args, **kwargs)  # type: ignore[call-overload]
+
+        with mock.patch.object(dispatcher_mod.subprocess, "Popen", side_effect=_spy_popen):
+            dispatch(
+                task=task,
+                state=TaskState(task_id=task.id),
+                plan=fresh_plan,
+                queue_dir=queue_dir,
+                clock=RealClock(),
+                settings_caps=_caps(),
+                settings_hooks=_hooks(),
+                claude_executable=str(SHIM_PATH),
+            )
+
+        [argv] = [a for a in spawned if a and a[0] == str(SHIM_PATH)]
+        assert argv[argv.index("--effort") + 1] == "xhigh"
 
 
 class TestPidPersistFailureSurfaces:

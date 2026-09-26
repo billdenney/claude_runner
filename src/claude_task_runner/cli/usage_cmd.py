@@ -272,7 +272,7 @@ def whoami(
         help="Skip the TUI capture; report only credentials.json fields.",
     ),
 ) -> None:
-    """Show which Claude account this `[claude].config_dir` is using.
+    """Show which Claude account `[claude].config_dir` is using.
 
     Reads ``credentials.json`` for ``subscriptionType`` /
     ``rateLimitTier`` and (unless ``--quick``) does a one-shot
@@ -328,7 +328,7 @@ def whoami(
 
 @app.command("refresh")
 def refresh(ctx: typer.Context) -> None:
-    """Refresh OAuth tokens for every configured account (non-interactive).
+    """Refresh the OAuth token of every configured account.
 
     Each refresh spawns ``claude /usage`` in a PTY against the account's
     ``config_dir``. The TUI's OAuth-backed call rewrites the credentials

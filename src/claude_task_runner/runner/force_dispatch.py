@@ -66,6 +66,7 @@ from claude_task_runner.runner import readiness
 from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.session import plan_next_spawn
+from claude_task_runner.runner.spawn_gate import SpawnGate
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
@@ -234,6 +235,7 @@ def tick_consume(
     clock: Clock,
     in_flight_slots: dict[str, DispatchSlot],
     claude_executable: str = "claude",
+    spawn_gate: SpawnGate | None = None,
 ) -> int:
     """Drain the force-dispatch request queue; return tasks actually dispatched.
 
@@ -245,6 +247,8 @@ def tick_consume(
 
     Force-dispatched tasks honour ``task.account`` pinning when set;
     otherwise they route to the first configured account that exists.
+    ``spawn_gate`` goes to each dispatch thread, as in
+    :func:`runner.orchestrator.tick_dispatch`.
     """
     requests = list_requests(queue_dir)
     if not requests:
@@ -404,6 +408,7 @@ def tick_consume(
             claude_config_dir=picked.config_dir,
             linux_user=picked.linux_user,
             account=picked.name,
+            spawn_gate=spawn_gate,
         )
         dispatched += 1
 
@@ -421,6 +426,7 @@ def _spawn_dispatch_thread(
     claude_config_dir: str,
     linux_user: str | None,
     account: str,
+    spawn_gate: SpawnGate | None = None,
 ) -> None:
     """Spawn the same shape of dispatch thread the orchestrator does."""
     # Local import to avoid a circular dependency at module-load time:
@@ -441,6 +447,7 @@ def _spawn_dispatch_thread(
             linux_user,
             account,
         ),
+        kwargs={"spawn_gate": spawn_gate},
         name=f"force-dispatch-{task.id}",
         # ADR-0025: match the orchestrator's thread lifetime — daemon when
         # adoption is on so a fast stop need not join the (file-backed,

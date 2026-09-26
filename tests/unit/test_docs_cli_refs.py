@@ -1063,15 +1063,23 @@ class TestSourcesMatchCli:
         ]
 
     def test_scan_finds_the_fetch_all_invocations(self) -> None:
-        # A comment span, the `sidecar list` call, a span in a docstring of
-        # the Python heredoc, and the argv list that heredoc runs
-        # `sidecar show` with.
+        # Comment spans in the header and the queue check, `command -v`, a
+        # comment span and the `sidecar list` call, the spans in the
+        # heredoc's two "could not list" messages and in a docstring, and
+        # the argv list the heredoc runs `sidecar show` with.
         fetch_all = PACKAGE_DIR / "skills" / "runner-answer-sidecar" / "fetch_all.sh"
         assert _mentions_in(fetch_all) == [
             Mention(29, ("sidecar", "answer")),
-            Mention(49, ("sidecar", "list", "--queue", "$QUEUE", "--json")),
-            Mention(71, ("sidecar", "list")),
-            Mention(95, ("sidecar", "show", _EXPR, _EXPR, "--queue", _EXPR, "--json")),
+            Mention(36, ("sidecar", "list")),
+            Mention(39, ("sidecar", "show")),
+            Mention(59, ("worktree", "reclaim")),
+            Mention(68, ()),
+            Mention(77, ("sidecar", "list", "--json")),
+            Mention(80, ("sidecar", "list", "--queue", "$QUEUE", "--json")),
+            Mention(103, ("sidecar", "list", "--json")),
+            Mention(108, ("sidecar", "list", "--json")),
+            Mention(119, ("sidecar", "list")),
+            Mention(143, ("sidecar", "show", _EXPR, _EXPR, "--queue", _EXPR, "--json")),
         ]
 
     def test_scan_finds_the_fixed_oauth_refresh_docstring(self) -> None:

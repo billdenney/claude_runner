@@ -244,6 +244,14 @@ alone needs no restart, and `install` does not ask for one.
    systemctl --user start claude-task-runner
    ```
 
+   `drain` returns once the supervisor has exited. Unless you pass
+   `--timeout`, it waits as long as a task that started just before it
+   may take: `[task_caps].max_duration_s_per_task`, both hook timeouts
+   and one `[usage].poll_interval_s`, with no limit when the cap is 0.
+   If it exits 4, the supervisor is still draining and the unit is still
+   active, so `systemctl --user start` would do nothing. Run `drain` again
+   before starting the unit.
+
 2. Or switch at once:
 
    ```sh

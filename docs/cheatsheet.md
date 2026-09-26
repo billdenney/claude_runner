@@ -318,9 +318,14 @@ polls. When the new tier is a different login:
    so throttling would keep reading the old account's utilization.
 
    ```sh
-   claude-task-runner supervisor drain   # no new dispatches; exits once in-flight tasks finish
+   claude-task-runner supervisor drain   # no new dispatches; returns once in-flight tasks finish
    claude-task-runner supervisor start   # or let the cron watchdog restart it on its next tick
    ```
+
+   `drain` waits up to the task cap, plus both hook timeouts and one
+   poll interval (no limit when the cap is 0). If it exits 4, the old
+   supervisor is still draining, and `start` would fail on the lock; run
+   `drain` again first.
 
    The cron watchdog restarts only the queue that
    `claude-task-runner watchdog queues` lists, the last line if it lists

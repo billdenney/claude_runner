@@ -8,10 +8,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron.backoff import (
+    RETIRED_STATE_KEYS,
     STALE_RESTART_AGE,
     WATCHDOG_STATE_FILENAME,
     WatchdogDecision,
@@ -98,25 +100,8 @@ class TestDecide:
             clock=clock,
         )
         assert out.verdict is WatchdogVerdict.BACKOFF
-        # First alert should be set in the new state.
-        assert out.new_state.last_backoff_alerted_at is not None
-
-    def test_alert_throttled(self, clock: FakeClock) -> None:
-        # Already in backoff and alerted recently — don't re-alert.
-        restarts = [clock.now() - timedelta(seconds=i * 35) for i in range(5)]
-        state = WatchdogState(
-            recent_restarts=list(reversed(restarts)),
-            last_backoff_alerted_at=clock.now() - timedelta(seconds=60),
-        )
-        out = decide(
-            state=state,
-            supervisor_alive=False,
-            settings=_settings(threshold=5),
-            clock=clock,
-        )
-        assert out.verdict is WatchdogVerdict.BACKOFF
-        # Same alert timestamp preserved (no fresh alert).
-        assert out.new_state.last_backoff_alerted_at == state.last_backoff_alerted_at
+        # Backing off changes nothing: no restart is counted.
+        assert out.new_state == state
 
     def test_alive_before_it_has_stayed_up_keeps_the_history(self, clock: FakeClock) -> None:
         """Up for less than min(10 x cooldown, max) since the last restart."""
@@ -134,8 +119,7 @@ class TestDecide:
         """Up 300 s (min(10 x 30, 600)) after the last restart ends the crash loop."""
         last = clock.now() - timedelta(seconds=up_s)
         state = WatchdogState(
-            recent_restarts=[last - timedelta(seconds=60 * i) for i in (3, 2, 1, 0)],
-            last_backoff_alerted_at=last - timedelta(seconds=30),
+            recent_restarts=[last - timedelta(seconds=60 * i) for i in (3, 2, 1, 0)]
         )
         out = decide(state=state, supervisor_alive=True, settings=_settings(), clock=clock)
         assert out.verdict is WatchdogVerdict.SKIP
@@ -191,22 +175,6 @@ class TestDecide:
             f"crash loop: {restarts} restarts without the supervisor staying up 300s; "
             f"backing off until {(last + timedelta(seconds=wait_s)).isoformat()}"
         )
-
-    def test_alert_re_emitted_after_long_silence(self, clock: FakeClock) -> None:
-        # Backoff state more than 10 minutes old → re-alert.
-        restarts = [clock.now() - timedelta(seconds=i * 35) for i in range(5)]
-        state = WatchdogState(
-            recent_restarts=list(reversed(restarts)),
-            last_backoff_alerted_at=clock.now() - timedelta(seconds=900),
-        )
-        out = decide(
-            state=state,
-            supervisor_alive=False,
-            settings=_settings(threshold=5),
-            clock=clock,
-        )
-        assert out.verdict is WatchdogVerdict.BACKOFF
-        assert out.new_state.last_backoff_alerted_at == clock.now()
 
 
 _T0 = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
@@ -303,13 +271,42 @@ class TestPersistence:
 
     def test_round_trip(self, tmp_path: Path, clock: FakeClock) -> None:
         path = tmp_path / WATCHDOG_STATE_FILENAME
-        original = WatchdogState(
-            recent_restarts=[clock.now()],
-            last_backoff_alerted_at=clock.now(),
-        )
+        original = WatchdogState(queue=Path("/q"), recent_restarts=[clock.now()])
         write_state_atomic(original, path)
         loaded = load_state(path)
         assert loaded == original
+
+    def test_a_file_with_the_retired_alert_key_keeps_its_history(
+        self, tmp_path: Path, clock: FakeClock
+    ) -> None:
+        """An older version wrote last_backoff_alerted_at; loading drops just that key.
+
+        extra="forbid" would otherwise reject the file, and the tick would
+        start the restart history empty."""
+        path = tmp_path / WATCHDOG_STATE_FILENAME
+        restarts = [clock.now() - timedelta(seconds=120), clock.now() - timedelta(seconds=60)]
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "queue": "/q",
+                    "recent_restarts": [t.isoformat() for t in restarts],
+                    "last_backoff_alerted_at": clock.now().isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load_state(path) == WatchdogState(queue=Path("/q"), recent_restarts=restarts)
+
+    def test_written_files_carry_no_retired_key(self, tmp_path: Path, clock: FakeClock) -> None:
+        path = tmp_path / WATCHDOG_STATE_FILENAME
+        write_state_atomic(WatchdogState(recent_restarts=[clock.now()]), path)
+        assert set(json.loads(path.read_text(encoding="utf-8"))) & RETIRED_STATE_KEYS == set()
+
+    def test_a_retired_key_is_still_rejected_in_code(self) -> None:
+        """Only the file loader drops it; code that passes it has a bug."""
+        with pytest.raises(ValidationError, match="last_backoff_alerted_at"):
+            WatchdogState.model_validate({"last_backoff_alerted_at": None})
 
     def test_invalid_json_raises(self, tmp_path: Path) -> None:
         path = tmp_path / WATCHDOG_STATE_FILENAME

@@ -50,8 +50,11 @@ all at once.
 
 5. **Effort** — `AskUserQuestion` with the per-model accepted set.
    Read `[effort_levels]` from the config: typically `low`, `medium`,
-   `high`, `max`, `extra_high` for opus; smaller set for sonnet /
-   haiku. The CLI will reject mismatched (model, effort) pairs.
+   `high`, `xhigh`, `max` for opus; smaller set for sonnet /
+   haiku. The runner passes it to the agent as `claude --effort`, so it
+   sets how hard the agent thinks, and its token cost. `queue add`
+   rejects a mismatched (model, effort) pair, including `extra_high`,
+   the old name for `xhigh`.
 
 6. **Priority** — `AskUserQuestion` with `low | normal | high`.
    Default `normal`.

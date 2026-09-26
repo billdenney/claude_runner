@@ -22,19 +22,23 @@ every running orphan is demoted for a session-resume re-dispatch, as
 before.
 
 Driving a single tick is done by :func:`run_one_tick`, which is what
-tests exercise. The full daemon loop in :func:`run_forever` adds
+tests exercise. The full daemon loop in :func:`start_daemon` adds
 sleep / signal handling around it.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
+import math
 import signal
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
 
 from claude_task_runner.clock import Clock, RealClock
 from claude_task_runner.config.loader import ConfigError, load_settings
@@ -47,6 +51,7 @@ from claude_task_runner.config.schema import (
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -374,17 +379,80 @@ def sleep_for_next_poll(
     """Sleep until the next poll tick.
 
     If ``wakeup_at`` is set and is closer than ``poll_interval_s``, we
-    sleep until then. Otherwise we sleep ``poll_interval_s``. Skewing
-    later than the wakeup is fine — the next clean poll will reclassify.
+    sleep until then. Otherwise we sleep ``poll_interval_s``.
+
+    A ``wakeup_at`` that is already due means the next poll is due: we
+    return without sleeping. The state machine never schedules a wakeup
+    less than one poll interval after its decision, so one that has
+    passed means this tick ran that long after deciding (a long worktree
+    reclaim, say, or a stalled disk), and a warning says the supervisor
+    is not keeping up with its poll interval.
+
+    ``sleep_fn`` does the sleeping. :func:`start_daemon` passes
+    :func:`sleep_until_woken`, so that a stop or drain signal ends the
+    sleep early.
     """
     now = clock.now()
     delay = float(poll_interval_s)
     if wakeup_at is not None:
         until = (wakeup_at - now).total_seconds()
-        if until > 0:
-            delay = min(delay, until)
+        if until < 0:
+            logger.warning(
+                "supervisor is not keeping up with its poll interval: this tick "
+                "ended %.1f s after the wakeup it scheduled for %s; polling again "
+                "at once",
+                -until,
+                wakeup_at.isoformat(),
+            )
+        delay = min(delay, max(until, 0.0))
     if delay > 0:
         sleep_fn(delay)
+
+
+SIGNAL_CHECK_INTERVAL_S = 0.5
+"""Longest :func:`sleep_until_woken` sleeps before it checks its flag again.
+
+It bounds how late the sleep between ticks sees a stop or drain signal
+(ADR-0025): :func:`start_daemon` sleeps with :func:`sleep_until_woken`."""
+
+
+def sleep_until_woken(
+    delay: float,
+    *,
+    woken: Callable[[], bool],
+    sleep_fn: Callable[[float], None] = time.sleep,
+    slice_s: float = SIGNAL_CHECK_INTERVAL_S,
+) -> None:
+    """Sleep ``delay`` seconds, or until ``woken()`` returns true.
+
+    Sleeps in slices of at most ``slice_s`` and calls ``woken()`` before
+    each one, so a flag that a signal handler sets ends the sleep within
+    one slice. A single ``time.sleep(delay)`` would not end early: when a
+    handler returns without raising, Python resumes the sleep (PEP 475).
+
+    The handler cannot wake a :class:`threading.Event` instead. Python
+    runs a handler in the main thread between two bytecodes, which can be
+    inside ``Event.wait`` while it holds the event's lock, and
+    ``Event.set`` in the handler then waits for that lock forever. A pipe
+    the handler writes to would wake the sleep at once, but it would
+    still need this loop: the handler runs only when the main thread
+    runs, and a signal the kernel delivers to another thread leaves the
+    main thread asleep in ``select`` until its timeout.
+
+    Raises :class:`ValueError` for a ``delay`` that ``time.sleep`` rejects
+    (negative, NaN or infinite; an infinite one would otherwise sleep
+    forever, a slice at a time) and for a ``slice_s`` that is not a
+    positive, finite number of seconds.
+    """
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError(f"delay must be a finite number of seconds >= 0, got {delay!r}")
+    if not (math.isfinite(slice_s) and slice_s > 0):
+        raise ValueError(f"slice_s must be a finite number of seconds > 0, got {slice_s!r}")
+    remaining = delay
+    while remaining > 0 and not woken():
+        step = min(remaining, slice_s)
+        sleep_fn(step)
+        remaining -= step
 
 
 @dataclass
@@ -538,6 +606,57 @@ def _diff_settings(old: Settings, new: Settings) -> int:
     return sum(1 for k in keys if old_d.get(k) != new_d.get(k))
 
 
+SignalHandler = Callable[[int, FrameType | None], object]
+"""A Python-level signal handler, as :func:`signal.signal` takes one."""
+
+
+@contextmanager
+def _signal_handlers_installed(handlers: Mapping[int, SignalHandler]) -> Iterator[None]:
+    """Install ``handlers`` for the block, then put back the ones they replaced.
+
+    :func:`start_daemon` runs in its caller's process, and a handler left
+    behind outlives the loop it served. Its handlers used to stay: after
+    it returned in a pytest run, SIGTERM and SIGINT still went to its
+    ``_on_signal``, so neither Ctrl-C nor ``timeout`` could stop the run.
+    The previous handlers are restored when the block exits, by return or
+    by exception. One that :func:`signal.getsignal` reports as ``None``
+    was installed outside Python and cannot be restored, so ours stays.
+    """
+    previous = {signum: signal.getsignal(signum) for signum in handlers}
+    try:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        yield
+    finally:
+        for signum, old in previous.items():
+            if old is not None:
+                signal.signal(signum, old)
+
+
+WORKER_START_WAIT_S = 10.0
+"""Longest a stopping :func:`start_daemon` waits for dispatch threads that
+have started a worker but not yet recorded its pid (:mod:`runner.spawn_gate`).
+
+That window is one ``Popen`` and one state write, so it normally lasts
+milliseconds. The bound matters only when the write stalls on a slow disk,
+and it keeps the exit well inside the systemd unit's ``TimeoutStopSec``."""
+
+
+def _wait_for_worker_starts(gate: SpawnGate) -> None:
+    """Close ``gate``, wait for the workers being started, and log any that
+    still have no pid on record when the wait ends."""
+    starting = gate.close(WORKER_START_WAIT_S)
+    if starting:
+        logger.error(
+            "supervisor exiting with %d worker(s) still starting after %g s and "
+            "no pid on record: %s. The next supervisor cannot adopt them and will "
+            "dispatch these tasks again; check each for a second claude process",
+            len(starting),
+            WORKER_START_WAIT_S,
+            starting,
+        )
+
+
 def start_daemon(
     *,
     queue_dir: Path,
@@ -571,15 +690,29 @@ def start_daemon(
         Caps the loop at N ticks — used in integration tests to drive
         a finite number of state transitions deterministically.
 
-    Signal handling (when ``install_signal_handlers=True``):
+    Signal handling (when ``install_signal_handlers=True``). The handlers
+    replace the caller's for the duration of the call only: the previous
+    ones are put back when this returns or raises.
 
-    * ``SIGTERM`` / ``SIGINT`` — request a clean stop. In-flight
-      dispatch threads are NOT killed (architectural invariant 2);
-      the loop exits but threads finish their current attempt.
+    * ``SIGTERM`` / ``SIGINT`` — request a clean stop. A stop ends the
+      sleep between ticks within :data:`SIGNAL_CHECK_INTERVAL_S`. One
+      that arrives during a tick ends it once its usage poll returns,
+      before anything is dispatched. In-flight workers are NOT killed
+      (architectural invariant 2). With ``[supervisor].adopt_workers``
+      on, the process exits without joining the dispatch threads and
+      the next supervisor adopts the workers (ADR-0025). It waits only
+      for a thread that has started a worker to record its pid, for at
+      most :data:`WORKER_START_WAIT_S` (see :mod:`runner.spawn_gate`).
+      With it off, the interpreter joins the threads at exit, so each
+      in-flight attempt finishes first.
+    * ``SIGUSR1`` — drain: stop dispatching, keep ticking, and exit once
+      no task is in flight. It ends the sleep like a stop, so the first
+      drain tick runs at once. Later drain ticks keep the poll interval.
     * ``SIGHUP`` — request a hot-reload of ``claude_runner.toml`` on
-      the next tick. Newly-added task YAMLs in ``todo/`` are picked
-      up automatically because the orchestrator rescans on every tick.
-      Malformed TOML is logged and the old config stays active.
+      the next tick. It does not end the sleep, so the reload waits for
+      the next scheduled tick. Newly-added task YAMLs in ``todo/`` are
+      picked up automatically because the orchestrator rescans on every
+      tick. Malformed TOML is logged and the old config stays active.
       In-flight tasks are unaffected.
     """
     clk = clock if clock is not None else RealClock()
@@ -597,15 +730,24 @@ def start_daemon(
     stop_flag = {"stop": False}
     reload_flag = {"pending": False}
     drain_flag = {"draining": False}
+    # Set by the stop and drain handlers so that sleep_until_woken ends
+    # the sleep between ticks; cleared at the top of each tick, which
+    # acts on the request. A handler only assigns to these dicts: it must
+    # not take a lock (see sleep_until_woken).
+    wake_flag = {"pending": False}
 
     def _on_signal(signum: int, _frame: object) -> None:
-        # SIGTERM / SIGINT request a stop. The loop breaks on the next
-        # iteration. With adoption on (ADR-0025) the dispatch threads are
-        # daemons, so the process exits promptly WITHOUT joining them and
-        # the file-backed workers survive for the next supervisor to
-        # adopt. With adoption off the threads are non-daemon, so the
-        # interpreter joins them at exit and each in-flight attempt
-        # finishes first (the historical behaviour).
+        # SIGTERM / SIGINT request a stop. The loop checks for it before a
+        # tick's dispatch phase and again before the sleep, and the sleep
+        # ends within SIGNAL_CHECK_INTERVAL_S. A tick already under way
+        # finishes its usage poll first. With adoption on (ADR-0025) the
+        # dispatch threads are daemons, so the process then exits WITHOUT
+        # joining them and the file-backed workers survive for the next
+        # supervisor to adopt; it waits only for a worker being started to
+        # have its pid on record (runner.spawn_gate). With adoption off
+        # the threads are non-daemon, so the interpreter joins them at
+        # exit and each in-flight attempt finishes first (the historical
+        # behaviour).
         if settings.supervisor.adopt_workers:
             logger.info(
                 "supervisor caught signal %s; fast stop (adopt_workers on — "
@@ -615,11 +757,15 @@ def start_daemon(
         else:
             logger.info("supervisor caught signal %s; stopping", signum)
         stop_flag["stop"] = True
+        wake_flag["pending"] = True
 
     def _on_sighup(_signum: int, _frame: object) -> None:
         # Defer the reload to the next tick — running reload work
         # inside the signal handler would be unsafe (re-entrant I/O,
-        # GIL surprises). The handler only flips a flag.
+        # GIL surprises). The handler only flips a flag. It leaves the
+        # sleep alone, so the reload waits for the next scheduled tick:
+        # nothing waits on a reload the way systemd waits on a stop, and
+        # an early tick would add a usage poll per SIGHUP.
         logger.info("supervisor caught SIGHUP; reload pending on next tick")
         reload_flag["pending"] = True
 
@@ -630,29 +776,45 @@ def start_daemon(
         # loop stops dispatching new tasks but keeps ticking so the
         # reaper sees in-flight completions. Once in_flight_slots is
         # empty, the loop exits cleanly. Idempotent — a second
-        # SIGUSR1 doesn't do anything new.
+        # SIGUSR1 doesn't do anything new. It ends the sleep, so the
+        # first drain tick runs at once; the ticks after it keep the
+        # poll interval, because each tick clears wake_flag.
         if not drain_flag["draining"]:
             logger.info(
                 "supervisor caught SIGUSR1; entering drain mode "
                 "(no new dispatches; exit when in_flight=0)"
             )
         drain_flag["draining"] = True
+        wake_flag["pending"] = True
 
-    if install_signal_handlers:
-        signal.signal(signal.SIGTERM, _on_signal)
-        signal.signal(signal.SIGINT, _on_signal)
-        signal.signal(signal.SIGHUP, _on_sighup)
-        signal.signal(signal.SIGUSR1, _on_sigusr1)
+    handlers: dict[int, SignalHandler] = (
+        {
+            signal.SIGTERM: _on_signal,
+            signal.SIGINT: _on_signal,
+            signal.SIGHUP: _on_sighup,
+            signal.SIGUSR1: _on_sigusr1,
+        }
+        if install_signal_handlers
+        else {}
+    )
 
     # Tracks live dispatch slots (thread + account attribution) keyed by
-    # task id. Threads are non-daemon so the supervisor process won't
-    # terminate until in-flight tasks finish (architectural invariant 2 —
-    # in-flight tasks are not killed by supervisor death). The slot's
+    # task id. With [supervisor].adopt_workers off the threads are
+    # non-daemon, so the supervisor process won't terminate until in-flight
+    # tasks finish; with it on they are daemon threads and the next
+    # supervisor adopts their workers (ADR-0025). Either way in-flight
+    # tasks are not killed by supervisor death (invariant 2). The slot's
     # ``account`` field is the source of truth for
     # :class:`InFlightRecord` rebuilds each tick.
     in_flight_slots: dict[str, DispatchSlot] = {}
+    # Every dispatch thread this run starts holds this gate while it starts
+    # a worker; the exit below waits for them (runner.spawn_gate).
+    spawn_gate = SpawnGate()
 
-    with pidfile_mod.acquire_global_lock():
+    # The handlers go in before the lock is taken, so a stop during startup
+    # still reaches the loop's first check, and come out after it is
+    # released, whether this returns or raises.
+    with _signal_handlers_installed(handlers), pidfile_mod.acquire_global_lock():
         pidfile_mod.write_pid_file(pid_path)
         try:
             account_names = [a.name for a in settings.accounts]
@@ -867,6 +1029,9 @@ def start_daemon(
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
+                # This tick answers every wake request made before it. One
+                # made during the tick ends the next sleep at once.
+                wake_flag["pending"] = False
 
                 if reload_flag["pending"]:
                     settings, prior_pending = _apply_sighup_reload(
@@ -904,6 +1069,13 @@ def start_daemon(
                 )
                 persist_mod.write_atomic(snapshot, state_path)
 
+                # A stop that arrived during the usage poll ends the tick
+                # here, before anything is dispatched. A new dispatch would
+                # only hold up the exit: it waits for that worker to start
+                # (adoption on) or for its whole attempt (adoption off).
+                if stop_flag["stop"]:
+                    break
+
                 # Drain force-dispatch requests BEFORE the throttle gate so
                 # operator overrides land even when the state machine has
                 # parked the supervisor in THROTTLED_5H / THROTTLED_WEEKLY.
@@ -920,6 +1092,7 @@ def start_daemon(
                             clock=clk,
                             in_flight_slots=in_flight_slots,
                             claude_executable=settings.claude.executable,
+                            spawn_gate=spawn_gate,
                         )
                     except Exception:
                         # Keep the loop alive, but tally the failure so a
@@ -1025,6 +1198,7 @@ def start_daemon(
                         draining=drain_flag["draining"],
                         notify_callback=notify_callback,
                         event_callback=event_callback,
+                        spawn_gate=spawn_gate,
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
@@ -1130,14 +1304,27 @@ def start_daemon(
                     )
                     break
 
+                # A stop that arrived during the rest of the tick ends the
+                # loop without sleeping.
+                if stop_flag["stop"]:
+                    break
+
                 wakeup = next_wakeup(actions)
                 sleep_for_next_poll(
                     wakeup_at=wakeup,
                     poll_interval_s=settings.usage.poll_interval_s,
                     clock=clk,
+                    # Ends early when a stop or drain handler sets wake_flag.
+                    sleep_fn=functools.partial(
+                        sleep_until_woken, woken=lambda: wake_flag["pending"]
+                    ),
                 )
                 ticks += 1
         finally:
+            # Before the lock goes, let every dispatch thread that has started
+            # a worker record its pid, or the next supervisor could neither
+            # adopt that worker nor see it, and would dispatch its task again.
+            _wait_for_worker_starts(spawn_gate)
             pidfile_mod.clear_pid_file(pid_path)
 
     return handle

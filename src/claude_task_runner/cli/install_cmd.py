@@ -321,7 +321,7 @@ def uninstall(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the y/N confirmation."),
 ) -> None:
-    """Remove the watchdog installation (systemd unit AND/OR cron block).
+    """Remove the watchdog's systemd unit and/or cron block.
 
     Leaves ``~/.claude_task_runner/queues.json`` as it is. Once no cron
     block is installed, lists the queues it still holds with the
