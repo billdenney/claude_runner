@@ -4,8 +4,9 @@
 # of these defaults. See ADR-0014: every cutoff is a setting.
 #
 # Every number must be finite. TOML's inf and nan, and a literal too large for
-# a float such as 1e309, fail to load. A setting that has an "unlimited" value
-# spells it 0, as its comment below says.
+# a float such as 1e309, fail to load. So does a duration longer than ten years
+# (315,360,000 s; a *_ms setting 315,360,000,000). A setting that has an
+# "unlimited" value spells it 0, as its comment below says.
 
 # ---------------------------------------------------------------------------
 # Claude CLI invocation
@@ -133,7 +134,7 @@ drift_recovery_clean_polls  = 3         # consecutive clean polls to leave Error
 #    ⇒ THROTTLED_WEEKLY; else weekly allows dispatch.
 # ---------------------------------------------------------------------------
 [dispatch_pct]
-timezone = ""             # IANA name (e.g. "America/New_York"); "" = system local
+timezone = ""             # IANA name (e.g. "America/New_York"); "" = system local; an unknown name fails to load
 
 [dispatch_pct.day]
 fivehr_slowdown_pct = 40  # < 40% : full dispatch

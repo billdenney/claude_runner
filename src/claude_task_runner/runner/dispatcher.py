@@ -612,14 +612,24 @@ def _build_run_record(
 
     if summary.skipped_lines:
         unknown = dict(sorted(summary.unknown_event_types.items()))
+        unusable = dict(sorted(summary.unusable_event_types.items()))
         logger.warning(
             "task %s attempt %d: skipped %d stream-json line(s): %d malformed, "
-            "unknown event types %s",
+            "%sunknown event types %s",
             task_id,
             attempt,
             summary.skipped_lines,
-            summary.skipped_lines - sum(unknown.values()),
+            summary.skipped_lines - sum(unknown.values()) - sum(unusable.values()),
+            f"unusable known event types {unusable}, " if unusable else "",
             unknown or "none",
+        )
+    if summary.unusable_values:
+        logger.warning(
+            "task %s attempt %d: unusable stream-json values %s (token counts taken "
+            "as 0, a cost recorded as unknown, is_error taken from subtype)",
+            task_id,
+            attempt,
+            dict(sorted(summary.unusable_values.items())),
         )
 
     return RunRecord(
@@ -629,7 +639,7 @@ def _build_run_record(
         stop_reason=stop_reason,
         error=error,
         usage=usage,
-        cost_usd=max(float(cost), 0.0),
+        cost_usd=cost,
         duration_s=duration_s,
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
         killed_by_cap=killed,

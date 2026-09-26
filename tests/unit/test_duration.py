@@ -91,6 +91,20 @@ class TestInvalid:
         with pytest.raises(DurationParseError, match="expected str"):
             parse_duration(40)  # type: ignore[arg-type]
 
+    def test_too_long_for_a_float(self) -> None:
+        """``float()`` raised ``OverflowError``, which escaped as itself."""
+        with pytest.raises(DurationParseError, match="is too long"):
+            parse_duration("1" + "0" * 399 + "d")
+
+    def test_more_digits_than_int_converts(self) -> None:
+        """``int()`` refuses more than 4,300 digits with a plain ``ValueError``."""
+        with pytest.raises(DurationParseError, match="is too long"):
+            parse_duration("1" + "0" * 4999 + "s")
+
+    def test_the_largest_float_still_parses(self) -> None:
+        """Not a limit of its own: the settings' ceiling is ten years."""
+        assert parse_duration("2" + "0" * 302 + "s") == 2e302
+
 
 class TestADRExamples:
     """Examples from ADR-0022 — verify they all parse to the documented values."""

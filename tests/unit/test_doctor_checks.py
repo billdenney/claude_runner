@@ -9,6 +9,7 @@ two that touch external state (``check_claude_binary`` PATH lookup,
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -20,7 +21,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from typer.testing import CliRunner
 
+from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES, SkillState
+from claude_task_runner.cli.install_skills_cmd import app as install_skills_app
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.cron.registry import queues_registry_path, register_queue
@@ -62,6 +66,9 @@ from claude_task_runner.supervisor.persistence import (
 )
 from claude_task_runner.supervisor.pidfile import acquire_global_lock
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+
+from ._fs_faults import unsearchable
+from ._skill_installs import make
 
 
 @pytest.fixture
@@ -420,6 +427,24 @@ def test_check_account_policies_invalid_file_fails(settings: Settings, tmp_path:
     result = check_account_policies(s)
     assert result.status == CheckStatus.FAIL
     assert "broken" in result.remediation
+
+
+def test_check_account_policies_unknown_timezone_fails(settings: Settings, tmp_path: Path) -> None:
+    """The throttle would raise on the name at its first decision for the account."""
+    from claude_task_runner.doctor.checks import check_account_policies
+
+    cfg_dir = tmp_path / "far"
+    cfg_dir.mkdir()
+    (cfg_dir / "runner-account.toml").write_text(
+        '[dispatch_pct]\ntimezone = "Not/AZone"\n', encoding="utf-8"
+    )
+    s = _set_accounts(settings, [AccountSettings(name="far", config_dir=str(cfg_dir))])
+    result = check_account_policies(s)
+    assert result.status == CheckStatus.FAIL
+    assert "far" in result.remediation
+    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in (
+        result.remediation
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1137,32 +1162,128 @@ def test_check_supervisor_state_corrupt(settings: Settings, queue_dir: Path) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_check_skills_installed_all_present(settings: Settings, tmp_path: Path) -> None:
-    skills_dir = tmp_path / "skills"
-    skills_dir.mkdir()
-    from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES
-
-    for name in SKILL_NAMES:
-        (skills_dir / name).mkdir()
-    import contextlib
-
-    with patch.object(Path, "home", return_value=tmp_path.parent):
-        # Make .claude/skills resolve to our tmp dir.
-        (tmp_path.parent / ".claude").mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(FileExistsError):
-            (tmp_path.parent / ".claude" / "skills").symlink_to(skills_dir)
-        result = check_skills_installed(settings)
-    assert result.status == CheckStatus.PASS
-
-
-def test_check_skills_installed_some_missing(settings: Settings, tmp_path: Path) -> None:
-    """Pointing at an empty skills dir → WARN."""
+@pytest.fixture
+def skills_home(tmp_path: Path) -> Iterator[Path]:
+    """An empty ``~/.claude/skills/`` in a HOME of this test's own."""
     home = tmp_path / "homedir"
-    home.mkdir()
     (home / ".claude" / "skills").mkdir(parents=True)
     with patch.object(Path, "home", return_value=home):
-        result = check_skills_installed(settings)
+        yield home / ".claude" / "skills"
+
+
+def test_check_skills_installed_all_present(settings: Settings, skills_home: Path) -> None:
+    for i, name in enumerate(SKILL_NAMES):
+        make(SkillState.SYMLINKED if i % 2 else SkillState.COPIED, skills_home / name)
+    result = check_skills_installed(settings)
+    assert result.status == CheckStatus.PASS
+    assert result.detail == f"all {len(SKILL_NAMES)} task-runner skills present at {skills_home}"
+    assert result.remediation == ""
+
+
+def test_check_skills_installed_some_missing(settings: Settings, skills_home: Path) -> None:
+    """Pointing at an empty skills dir → WARN, naming the command that installs them."""
+    result = check_skills_installed(settings)
     assert result.status == CheckStatus.WARN
+    assert result.detail == f"{len(SKILL_NAMES)} of {len(SKILL_NAMES)} skills missing or broken"
+    assert result.remediation == (
+        f"Run `claude-task-runner install-skills --yes`.\nMissing: {', '.join(SKILL_NAMES)}"
+    )
+
+
+def test_check_skills_installed_reports_broken_skills(
+    settings: Settings, skills_home: Path
+) -> None:
+    """A symlink to nothing and an entry without a SKILL.md are broken, not
+    installed. Only --overwrite replaces the second."""
+    dangling, incomplete, missing, *installed = SKILL_NAMES
+    make(SkillState.DANGLING, skills_home / dangling)
+    make(SkillState.INCOMPLETE, skills_home / incomplete)
+    for name in installed:
+        make(SkillState.SYMLINKED, skills_home / name)
+    result = check_skills_installed(settings)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == f"3 of {len(SKILL_NAMES)} skills missing or broken"
+    assert result.remediation == (
+        "Run `claude-task-runner install-skills --yes --overwrite`.\n"
+        f"Missing: {missing}\n"
+        f"Broken symlink: {dangling}\n"
+        f"No SKILL.md: {incomplete}"
+    )
+
+
+def test_check_skills_installed_a_broken_symlink_needs_no_overwrite(
+    settings: Settings, skills_home: Path
+) -> None:
+    make(SkillState.DANGLING, skills_home / SKILL_NAMES[0])
+    for name in SKILL_NAMES[1:]:
+        make(SkillState.COPIED, skills_home / name)
+    result = check_skills_installed(settings)
+    assert result.status == CheckStatus.WARN
+    assert result.remediation == (
+        f"Run `claude-task-runner install-skills --yes`.\nBroken symlink: {SKILL_NAMES[0]}"
+    )
+
+
+@pytest.mark.parametrize("state", [SkillState.MISSING, SkillState.DANGLING, SkillState.INCOMPLETE])
+def test_check_skills_installed_remediation_repairs_it(
+    settings: Settings, skills_home: Path, state: SkillState
+) -> None:
+    """Running the command the remediation names makes the check pass. For
+    a broken symlink it used to change nothing: install-skills skipped the
+    symlink as already present."""
+    make(state, skills_home / SKILL_NAMES[0])
+    for name in SKILL_NAMES[1:]:
+        make(SkillState.SYMLINKED, skills_home / name)
+    before = check_skills_installed(settings)
+    assert before.status == CheckStatus.WARN
+    command = before.remediation.splitlines()[0].split("`")[1].split()
+    assert command[:2] == ["claude-task-runner", "install-skills"]
+    result = CliRunner().invoke(install_skills_app, command[2:])
+    assert result.exit_code == 0, result.stdout
+    assert check_skills_installed(settings).status == CheckStatus.PASS
+
+
+def test_check_skills_installed_unreadable_claude_dir(
+    settings: Settings, skills_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable ``~/.claude`` is a WARN that names the error. On Python
+    3.11 to 3.13 the check used to raise PermissionError, which crashed the
+    whole doctor run."""
+    unsearchable(monkeypatch, skills_home.parent)
+    result = check_skills_installed(settings)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == f"could not check {len(SKILL_NAMES)} of {len(SKILL_NAMES)} skills"
+    assert result.remediation == "\n".join(
+        [
+            "Could not check these; fix the error, then re-run the doctor:",
+            *(
+                f"  {name}: [Errno {errno.EACCES}] Permission denied: '{skills_home / name}'"
+                for name in SKILL_NAMES
+            ),
+        ]
+    )
+
+
+def test_check_skills_installed_reports_broken_and_unchecked_together(
+    settings: Settings, skills_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make(SkillState.DANGLING, skills_home / SKILL_NAMES[0])
+    for name in SKILL_NAMES[1:]:
+        make(SkillState.COPIED, skills_home / name)
+    unsearchable(monkeypatch, skills_home / SKILL_NAMES[1])
+    result = check_skills_installed(settings)
+    assert result.status == CheckStatus.WARN
+    total = len(SKILL_NAMES)
+    assert result.detail == (
+        f"1 of {total} skills missing or broken; could not check 1 of {total} skills"
+    )
+    assert result.remediation == (
+        "Run `claude-task-runner install-skills --yes`.\n"
+        f"Broken symlink: {SKILL_NAMES[0]}\n"
+        "Could not check these; fix the error, then re-run the doctor:\n"
+        f"  {SKILL_NAMES[1]}: [Errno {errno.EACCES}] Permission denied: "
+        f"'{skills_home / SKILL_NAMES[1] / 'SKILL.md'}'"
+    )
 
 
 # ---------------------------------------------------------------------------

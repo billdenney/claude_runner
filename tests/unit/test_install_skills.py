@@ -56,9 +56,12 @@ class TestInstall:
             assert not installed.is_symlink()
 
     def test_existing_without_overwrite_skips(self, runner: CliRunner, isolated_home: Path) -> None:
-        # Pre-populate with placeholder.
+        # Pre-populate with an installed skill: it has a SKILL.md. (One
+        # without is incomplete and needs --overwrite; see
+        # test_install_skills_cmd.py.)
         target = isolated_home / ".claude" / "skills" / SKILL_NAMES[0]
         target.mkdir(parents=True)
+        (target / "SKILL.md").write_text("# preexisting\n")
         (target / "marker").write_text("preexisting")
 
         result = runner.invoke(app, ["--yes"])
