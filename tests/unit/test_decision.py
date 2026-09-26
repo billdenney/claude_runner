@@ -312,12 +312,18 @@ class TestDefensiveBranches:
             five_h_resets_at=None,  # parser failure
             weekly_resets_at=now + timedelta(days=4),
         )
-        d = decide(_policy(timezone="UTC"), reading, clock, poll_interval_s=POLL)
+        d = decide(
+            _policy(timezone="UTC"),
+            reading,
+            clock,
+            poll_interval_s=POLL,
+            window_start_delay_s=450,
+        )
         assert d.state is SupervisorState.THROTTLED_5H
-        # Fallback wakeup is ~5h out (not within poll-interval clamp).
-        assert d.wakeup_at is not None
-        assert d.wakeup_at > now + timedelta(hours=4)
-        assert d.wakeup_at < now + timedelta(hours=6)
+        # Exactly one 5h window plus the delay. 450s is neither POLL nor
+        # the 300s default, so a dropped, doubled or hardcoded delay
+        # term cannot land on this time.
+        assert d.wakeup_at == now + timedelta(hours=5, seconds=450)
 
     def test_degenerate_slow_equals_stop_returns_zero(self) -> None:
         """A misconfigured ResolvedBand with slowdown_pct >= stop_pct
