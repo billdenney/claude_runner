@@ -62,7 +62,20 @@ agent-loop turns and lets new sidecars sneak in mid-pass.
    arrives here with `partial: true`, `answered: ["q1"]`. Present only what
    `questions[]` contains — re-asking `q1` wastes the operator's clicks.
 
-2. **If `n_open == 0`**, tell the user "No open sidecars." and stop.
+   **A non-zero exit means the sidecars are unknown.** The script then
+   prints nothing on stdout and says why on stderr. Never tell the user
+   "No open sidecars" after one:
+
+   - **Exit 2:** the queue does not exist or has no `todo/`
+     subdirectory, usually a mistyped `--queue` or a working directory
+     that is not the queue. Tell the user which path was tried and ask
+     for the queue's path.
+   - **Exit 1:** the open sidecars could not be listed, because
+     `claude-task-runner` is not on PATH, or `sidecar list` failed or
+     printed no listing. Show the user the reason from stderr.
+
+2. **If the script exited 0 and `n_open == 0`**, tell the user "No open
+   sidecars." and stop.
 
    Report **`n_outstanding_questions`**, not just `n_open`, whenever you
    state how much is pending. One request can hold four unanswered
