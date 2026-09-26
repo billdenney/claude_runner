@@ -28,7 +28,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import resolve_per_queue_config
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import account_in_flight_count
@@ -97,7 +97,9 @@ def list_accounts(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """List configured accounts with their resolved policy and current state.
@@ -199,7 +201,9 @@ def pause_account(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Skip ``name`` from dispatch until ``account resume <name>``.
@@ -225,7 +229,9 @@ def resume_account(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Reverse ``account pause <name>``; the dispatcher includes it again."""

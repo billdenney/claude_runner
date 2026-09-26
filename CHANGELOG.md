@@ -162,6 +162,22 @@ Breaking changes are called out in the version notes.
   paragraph has no `\b`. Known-answer tests pin the checker: under the old
   mode it reports exactly the tokens Rich drops, both on a demo app and on
   the real CLI.
+- **`--help` shows the default of `--queue` as `(current directory)`, not a
+  Python repr.** Every command that takes `--queue`, 22 of the 44 help pages,
+  printed `[default: <bound method Path.cwd of <class 'pathlib.Path'>>]`
+  (the names in it vary with the Python version). Each `--queue` passes the
+  method `Path.cwd` as its default, so that click calls it when the command
+  runs, and typer shows a callable default that is not a plain function with
+  `str()`. Each now also passes `show_default=CWD_DEFAULT_LABEL`, which
+  `cli/_helpers.py` defines once. The default itself is unchanged: the
+  directory the command runs in. `tests/unit/test_docs_cli_help.py` now fails
+  when any command's `--help` shows a default holding a Python repr
+  (`<bound method`, `<function`, `<class` or `<built-in`). Because the label
+  changes only the help, it also checks that every `--queue` still parses to
+  the directory the command runs in, so a default fixed at import would fail
+  even though help still said `(current directory)`. Known-answer tests pin
+  both checks: the old declaration is flagged and the new one is not, and a
+  demo `--queue` whose default is fixed at import is caught.
 - **A cron watchdog tick no longer recreates a registered queue that was
   deleted or moved.** `register_queue` rejects a path that is not a
   directory, but only when it registers it. For a queue that was later

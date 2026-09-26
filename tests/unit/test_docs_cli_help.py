@@ -16,7 +16,7 @@ found on 2026-09-25, ten help texts in nine commands were affected.
 
 Every ``typer.Typer`` in ``cli/`` now passes ``rich_markup_mode=None``, so
 click prints help as written, in its plain format. This module checks
-three things:
+four things:
 
 * Every command's ``--help``, rendered through the real entry point,
   contains every bracketed token of its source help text.
@@ -27,6 +27,15 @@ three things:
   re-wrap. Click joins the lines of each paragraph and wraps them to the
   terminal, which turns an "Exit codes:" table or a bullet list into one
   run-on paragraph. A ``\b`` line before the paragraph keeps its lines.
+* No ``--help`` shows a Python repr as an option's default. Typer shows a
+  callable default with ``str()`` unless it is a plain function, and every
+  ``--queue`` defaults to the bound method ``Path.cwd``. When this was
+  found on 2026-09-26, 22 of the 44 pages printed
+  ``[default: <bound method Path.cwd of <class 'pathlib.Path'>>]``. Each
+  ``--queue`` now passes ``show_default=CWD_DEFAULT_LABEL`` and prints
+  ``[default: (current directory)]``. The label changes only the help, so
+  ``TestQueueDefault`` checks that every ``--queue`` still defaults to the
+  directory the command runs in.
 
 Rich markup in ``console.print`` output is separate and still renders;
 ``TestConsoleMarkup`` pins that.
@@ -37,7 +46,7 @@ from __future__ import annotations
 import inspect
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -47,6 +56,7 @@ from typer.core import MarkupMode
 from typer.testing import CliRunner
 
 from claude_task_runner.cli import app
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL
 
 CLI: Any = typer.main.get_command(app)
 """The click command tree that ``claude-task-runner`` dispatches through.
@@ -71,6 +81,17 @@ numbered item. Click would join it onto the line above."""
 _NO_REWRAP = "\b"
 """Click's marker. A paragraph whose first line is exactly this keeps its
 line breaks."""
+
+_DEFAULT = re.compile(r"[\[;] ?default: ([^;\]]*)")
+"""The value of the ``default:`` item in the brackets click prints after an
+option's help: ``[default: 2.0]``, or ``[env var: X; default: 2.0; required]``.
+Click wraps a long default onto the next line, so this is matched against
+help whose whitespace is collapsed."""
+
+_REPR_MARKERS = ("<bound method", "<function", "<class", "<built-in")
+"""How the repr of a method, function, class or builtin starts. Typer shows
+a callable default with ``str()``, which for these is the repr, unless it
+is a plain function, which it shows as ``(dynamic)``."""
 
 
 def _path_id(path: tuple[str, ...]) -> str:
@@ -172,6 +193,42 @@ def _rewrapped_layouts(text: str) -> list[str]:
     ]
 
 
+def _defaults(output: str) -> list[str]:
+    """Each option default that rendered ``--help`` shows, whitespace collapsed."""
+    return _DEFAULT.findall(" ".join(_ANSI.sub("", output).split()))
+
+
+def _repr_defaults(output: str) -> list[str]:
+    """The defaults that rendered ``--help`` shows as a Python repr.
+
+    Values are compared squashed, because click can break a line inside a
+    repr, including at the hyphen in ``<built-in``.
+    """
+    markers = [_squash(marker) for marker in _REPR_MARKERS]
+    return [value for value in _defaults(output) if any(m in _squash(value) for m in markers)]
+
+
+def _queue_option(command: Any) -> Any:
+    """``command``'s ``--queue`` option, or ``None`` when it has none."""
+    return next((param for param in command.params if "--queue" in param.opts), None)
+
+
+def _queue_paths() -> list[tuple[str, ...]]:
+    """Every command path whose command takes ``--queue``."""
+    return [path for path in _command_paths() if _queue_option(_node(path)) is not None]
+
+
+def _parsed_queue(command: Any) -> Any:
+    """The ``--queue`` that ``command`` gets when it is run without one.
+
+    This parses the command line and does not run the command, since some
+    commands start a supervisor or edit the crontab. ``resilient_parsing``
+    lets a command with a required argument parse without it.
+    """
+    ctx = command.make_context(command.name, [], resilient_parsing=True)
+    return ctx.params[_queue_option(command).name]
+
+
 def _demo_command(
     wait: Annotated[
         bool, typer.Option(help="Wait up to ``[task_caps].max_duration_s_per_task``.")
@@ -184,10 +241,38 @@ def _demo_command(
     """
 
 
-def _demo_app(mode: MarkupMode) -> typer.Typer:
-    """A one-command app whose help has brackets Rich drops and brackets it keeps."""
+_OLD_QUEUE_OPTION = typer.Option(Path.cwd, "--queue", help="Queue directory.")
+"""``--queue`` as every command declared it before the fix."""
+
+_QUEUE_OPTION = typer.Option(
+    Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+)
+"""``--queue`` as every command declares it now."""
+
+_IMPORT_TIME_QUEUE_OPTION = typer.Option(
+    Path.cwd(), "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+)
+"""A ``--queue`` whose default is the directory this module was imported in.
+Its help is the same as ``_QUEUE_OPTION``'s."""
+
+
+def _old_queue_command(queue_dir: Path = _OLD_QUEUE_OPTION) -> None:
+    """Read the demo queue."""
+
+
+def _queue_command(queue_dir: Path = _QUEUE_OPTION) -> None:
+    """Read the demo queue."""
+
+
+def _import_time_queue_command(queue_dir: Path = _IMPORT_TIME_QUEUE_OPTION) -> None:
+    """Read the demo queue."""
+
+
+def _demo_app(mode: MarkupMode, command: Callable[..., None] = _demo_command) -> typer.Typer:
+    """A one-command app. The default command's help has brackets Rich drops
+    and brackets it keeps."""
     demo = typer.Typer(rich_markup_mode=mode)
-    demo.command()(_demo_command)
+    demo.command()(command)
     return demo
 
 
@@ -304,6 +389,100 @@ class TestLayout:
             + "\n\nPut a line holding only \\b (click's no-rewrap marker) before "
             "each one."
         )
+
+
+class TestDefaults:
+    def test_finds_the_defaults_and_flags_the_reprs(self) -> None:
+        # As click prints them: wrapped, once at the hyphen in "<built-in".
+        text = (
+            "Options:\n"
+            "  --queue <path>  Queue directory.  [default: <bound method\n"
+            "                  Path.cwd of <class 'pathlib.Path'>>]\n"
+            "  --clock <name>  Clock.  [env var: CLOCK; default: <built-\n"
+            "                  in function time>; required]\n"
+            "  --kind <name>   Type.  [default: <class 'int'>]\n"
+            "  --hook <name>   Hook.  [default: functools.partial(<function\n"
+            "                  done at 0x7f>)]\n"
+            "  --dir <path>    Work directory.  [default: (current directory)]\n"
+            "  --at <time>     Sets the default: now.  [default: (dynamic)]\n"
+            "  --wait <s>      Seconds.  [default: 2.0; 0<=x<=60]\n"
+        )
+        reprs = [
+            "<bound method Path.cwd of <class 'pathlib.Path'>>",
+            "<built- in function time>",
+            "<class 'int'>",
+            "functools.partial(<function done at 0x7f>)",
+        ]
+        assert _defaults(text) == [*reprs, "(current directory)", "(dynamic)", "2.0"]
+        assert _repr_defaults(text) == reprs
+
+    def test_flags_the_old_queue_option(self) -> None:
+        # The repr names differ between Python versions: PathBase.cwd and
+        # pathlib._local.Path on 3.13.
+        help_text = _render_help(_demo_app(None, _old_queue_command), ())
+        assert _repr_defaults(help_text) == [repr(Path.cwd)]
+
+    def test_passes_the_new_queue_option(self) -> None:
+        help_text = _render_help(_demo_app(None, _queue_command), ())
+        assert _defaults(help_text) == ["(current directory)"]
+        assert _repr_defaults(help_text) == []
+
+    def test_scan_finds_the_known_default(self) -> None:
+        # Guards the parametrised gate below against a pattern that
+        # silently finds nothing.
+        assert _defaults(_render_help(app, ("supervisor", "status"))) == ["(current directory)"]
+
+    @pytest.mark.parametrize("path", _command_paths(), ids=_path_id)
+    def test_no_default_is_a_python_repr(self, path: tuple[str, ...]) -> None:
+        reprs = _repr_defaults(_render_help(app, path))
+        assert not reprs, (
+            f"`claude-task-runner {_path_id(path)} --help` shows a Python repr as a default:\n"
+            + "\n".join(f"  [default: {value}]" for value in reprs)
+            + "\nTyper shows a callable default with str() unless it is a plain "
+            "function. Give the option a show_default string that describes the "
+            "default; for Path.cwd, show_default=CWD_DEFAULT_LABEL from "
+            "cli/_helpers.py."
+        )
+
+
+class TestQueueDefault:
+    """``--queue`` defaults to the directory the command runs in, as help says.
+
+    ``show_default`` changes only what help shows. A ``--queue`` whose
+    default was fixed at import, ``Path.cwd()`` in place of ``Path.cwd``,
+    would still show ``(current directory)``.
+    """
+
+    def test_flags_a_default_fixed_at_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        demo = _demo_app(None, _import_time_queue_command)
+        assert _defaults(_render_help(demo, ())) == ["(current directory)"]
+        monkeypatch.chdir(tmp_path)
+        parsed = _parsed_queue(typer.main.get_command(demo))
+        assert parsed == _IMPORT_TIME_QUEUE_OPTION.default
+        assert parsed != tmp_path.resolve()
+
+    def test_passes_a_default_computed_at_run_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        command = typer.main.get_command(_demo_app(None, _queue_command))
+        assert _parsed_queue(command) == tmp_path.resolve()
+
+    def test_finds_the_queue_commands(self) -> None:
+        # Guards the parametrised check below against a walk that finds nothing.
+        assert {("supervisor", "status"), ("install",)} <= set(_queue_paths())
+
+    @pytest.mark.parametrize("path", _queue_paths(), ids=_path_id)
+    def test_defaults_to_the_directory_the_command_runs_in(
+        self, path: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # CLI was built when this module was imported, in another directory.
+        monkeypatch.chdir(tmp_path)
+        command = _node(path)
+        assert _queue_option(command).show_default == CWD_DEFAULT_LABEL
+        assert _parsed_queue(command) == tmp_path.resolve()
 
 
 class TestConsoleMarkup:
