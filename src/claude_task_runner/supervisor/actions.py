@@ -63,9 +63,11 @@ class EmitEvent(_ActionBase):
 
 @dataclass(frozen=True)
 class StopDispatch(_ActionBase):
-    """Refuse to start any new dispatches this tick. Diagnostic-only —
-    the actual dispatch decisions are gated by ``target_concurrency`` on
-    the :class:`throttle.decision.Decision`. Useful for telemetry."""
+    """Refuse to start any new dispatches this tick. Diagnostic-only:
+    dispatch is gated per account by the ``state`` and
+    ``target_concurrency`` that :func:`state_machine.step` records on the
+    snapshot and the daemon copies into ``accounts[<name>]``. Useful for
+    telemetry."""
 
 
 # Public union for type-narrowed iteration.

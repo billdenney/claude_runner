@@ -9,7 +9,9 @@ The supervisor runs as a long-lived ``simple`` service with
 ``Restart=on-failure``. Systemd handles backoff, exit-code tracking,
 and signals, so we don't need our :mod:`cron.backoff` module under
 systemd. The unit's restart policy comes from the queue's
-``[watchdog]`` table instead (see :func:`build_unit_text`). Nothing on
+``[watchdog]`` table instead, and with ``[supervisor].adopt_workers``
+off its stop timeout comes from ``[task_caps]`` (see
+:func:`build_unit_text`). Nothing on
 the systemd path runs ``watchdog tick``, and a systemd ``install``
 does not register its queue with the cron watchdog.
 
@@ -27,7 +29,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_task_runner.config.schema import WatchdogSettings
+from claude_task_runner.config.schema import TaskCapsSettings, WatchdogSettings
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +73,11 @@ RELOADED_DIRECTIVES = frozenset(
 when it next stops the service or decides whether to restart it, so a
 ``daemon-reload`` applies them to a running supervisor. Checked on
 systemd 255 for ``RestartSec``, ``StartLimitBurst``,
-``StartLimitIntervalSec`` and ``ExecStop``. Every directive that
-:func:`build_unit_text` writes is in exactly one of these two sets."""
+``StartLimitIntervalSec``, ``ExecStop``, ``TimeoutStopSec`` and
+``KillMode``. A throwaway unit started with ``TimeoutStopSec=60`` and
+reloaded with ``3`` stopped in 3 s, and one reloaded from 3 to 8 in 8 s.
+Every directive that :func:`build_unit_text` writes is in exactly one of
+these two sets."""
 
 
 class SystemdError(RuntimeError):
@@ -80,13 +85,15 @@ class SystemdError(RuntimeError):
 
 
 class UnitSettingError(ValueError):
-    """A ``[watchdog]`` value that systemd cannot parse.
+    """A setting the unit cannot carry: systemd cannot parse its line, or
+    would read it as something else.
 
     systemd ignores a unit line it cannot parse, with only a journal
     warning, and falls back to its own default: ``RestartSec=100ms``,
-    and the manager's ``DefaultStartLimitBurst=`` (5) and
-    ``DefaultStartLimitIntervalSec=`` (10 s) unless configured
-    otherwise. So such a value is refused before the unit is written."""
+    and the manager's ``DefaultStartLimitBurst=`` (5),
+    ``DefaultStartLimitIntervalSec=`` (10 s) and ``DefaultTimeoutStopSec=``
+    (90 s) unless configured otherwise. So such a value is refused before
+    the unit is written."""
 
 
 @dataclass(frozen=True)
@@ -185,12 +192,13 @@ def _stop_command_from(supervisor_command: str) -> str:
 # Short ExecStop timeout for the adoption fast-stop path (ADR-0025).
 # The supervisor exits in well under a second once it stops dispatching;
 # 30s is a generous bound that still lets `systemctl restart` be
-# near-instant instead of waiting out the 4h drain ceiling.
+# near-instant instead of waiting out the drain's ceiling, the task cap.
 _ADOPT_TIMEOUT_STOP_SEC = 30
 
 
-def _timespan(seconds: float, key: str) -> str:
-    """``seconds`` as a systemd time span, for the ``[watchdog]`` key ``key``.
+def _timespan(seconds: float, setting: str) -> str:
+    """``seconds`` as a systemd time span, for ``setting``, such as
+    ``[watchdog].restart_cooldown_s``.
 
     Rounded to systemd's resolution of one microsecond, and never in
     exponent form, which systemd rejects (``1e-07``). A whole number
@@ -198,31 +206,56 @@ def _timespan(seconds: float, key: str) -> str:
     ``0.25``. A span under half a microsecond renders as ``0``, which
     systemd reads as no delay (``RestartSec``) or no rate limit
     (``StartLimitIntervalSec``); the cron watchdog treats such a span
-    the same way.
+    the same way. For ``TimeoutStopSec`` it reads ``0`` as no timeout,
+    so :func:`_drain_timeout` refuses such a span.
 
     Raises :class:`UnitSettingError` for a span systemd would reject.
     """
     if not math.isfinite(seconds):
-        raise UnitSettingError(f"[watchdog].{key} = {seconds} is not a finite number of seconds")
+        raise UnitSettingError(f"{setting} = {seconds} is not a finite number of seconds")
     text = f"{seconds:.6f}".rstrip("0").rstrip(".")
     if int(text.partition(".")[0]) > _SYSTEMD_MAX_WHOLE_SECONDS:
         raise UnitSettingError(
-            f"[watchdog].{key} = {seconds} is longer than systemd accepts "
-            f"({_SYSTEMD_MAX_WHOLE_SECONDS} s)"
+            f"{setting} = {seconds} is longer than systemd accepts ({_SYSTEMD_MAX_WHOLE_SECONDS} s)"
         )
     return text
 
 
-def _burst(count: int, key: str) -> str:
-    """``count`` as a ``StartLimitBurst=`` value, for the ``[watchdog]`` key ``key``.
+def _burst(count: int, setting: str) -> str:
+    """``count`` as a ``StartLimitBurst=`` value, for ``setting``.
 
     Raises :class:`UnitSettingError` for a count systemd would reject.
     """
     if count > _SYSTEMD_MAX_UNSIGNED:
         raise UnitSettingError(
-            f"[watchdog].{key} = {count} is more than systemd accepts ({_SYSTEMD_MAX_UNSIGNED})"
+            f"{setting} = {count} is more than systemd accepts ({_SYSTEMD_MAX_UNSIGNED})"
         )
     return str(count)
+
+
+def _drain_timeout(task_caps: TaskCapsSettings) -> str:
+    """``TimeoutStopSec`` for the drain wiring: ``[task_caps].max_duration_s_per_task``.
+
+    That is the longest the cap lets an attempt run, and every attempt
+    in flight when a stop begins started before it. A cap of 0 is no
+    limit, so the stop waits for as long as the tasks run: ``infinity``.
+
+    Raises :class:`UnitSettingError` for a cap :func:`_timespan` refuses,
+    and for one it would write as ``0``. systemd reads
+    ``TimeoutStopSec=0`` as no timeout, not a short one (checked on
+    systemd 255).
+    """
+    setting = "[task_caps].max_duration_s_per_task"
+    cap = task_caps.max_duration_s_per_task
+    if cap == 0:
+        return "infinity"
+    span = _timespan(cap, setting)
+    if span == "0":
+        raise UnitSettingError(
+            f"{setting} = {cap} rounds to 0 at systemd's resolution of one microsecond, "
+            "and systemd reads TimeoutStopSec=0 as no timeout"
+        )
+    return span
 
 
 def build_unit_text(
@@ -230,8 +263,8 @@ def build_unit_text(
     supervisor_command: str,
     queue_dir: Path,
     watchdog: WatchdogSettings,
+    task_caps: TaskCapsSettings,
     description: str = "Claude Code task-runner supervisor",
-    timeout_stop_sec: int | None = None,
     adopt_workers: bool = True,
 ) -> str:
     """Build the ``[Unit]/[Service]/[Install]`` text.
@@ -239,6 +272,10 @@ def build_unit_text(
     ``supervisor_command`` is the full command line to invoke (e.g.
     ``/home/bill/.venv/bin/claude-task-runner supervisor start --queue
     /home/bill/queue``).
+
+    ``task_caps`` is the queue's ``[task_caps]`` table. With adoption off
+    its ``max_duration_s_per_task`` is the stop timeout (see below); with
+    adoption on the unit does not use it.
 
     The restart policy comes from ``watchdog``, the queue's
     ``[watchdog]`` table (the settings :mod:`cron.backoff` takes for the
@@ -266,21 +303,29 @@ def build_unit_text(
       daemon's *fast stop*: it stops dispatching and exits promptly
       without joining worker threads. The file-backed workers keep
       running as independent processes and the next supervisor adopts
-      them — so ``TimeoutStopSec`` drops to a short bound
-      (:data:`_ADOPT_TIMEOUT_STOP_SEC`) instead of the 4h drain ceiling.
+      them — so ``TimeoutStopSec`` is a short fixed bound
+      (:data:`_ADOPT_TIMEOUT_STOP_SEC`), whatever ``task_caps`` says.
     * **Adoption OFF.** ``ExecStop`` calls ``supervisor drain --no-wait``
-      (SIGUSR1) and ``TimeoutStopSec`` stays generous (default 14400s =
-      4h, matching ``[task_caps].max_duration_s_per_task``) so the
-      graceful drain can finish the longest in-flight task before exit.
-      This is the historical PR-11 wiring, unchanged except for the
-      ``-`` prefix described below.
+      (SIGUSR1). systemd sends SIGTERM as soon as it returns (checked on
+      systemd 255), and the supervisor then exits once each dispatch
+      thread has finished its attempt. ``TimeoutStopSec`` is
+      ``task_caps.max_duration_s_per_task``, or ``infinity`` for a cap
+      of 0 (see :func:`_drain_timeout`). It has no margin over the cap:
+      an attempt in flight began before the stop, so its cap runs out no
+      later than the timeout. The timeout does not cover time outside
+      the cap: a pre-dispatch hook still running when the stop began,
+      the post-dispatch hook, how late the dispatcher notices a spent
+      cap (it checks when the agent emits an event), or a task's
+      ``max_duration_s_override`` above the queue's cap. With the
+      default cap, 14400 s, the unit is the one this function wrote
+      before it read ``[task_caps]``. This is the historical PR-11
+      wiring, except for the ``-`` prefix described below.
 
     In both cases ``KillMode=process`` keeps systemd from signalling the
     dispatched ``claude`` subprocesses if it ever escalates to SIGKILL
     on the main PID after ``TimeoutStopSec`` — required for adoption so
     the surviving workers aren't killed on supervisor stop, and harmless
-    for the drain path. Operators can override ``timeout_stop_sec``
-    explicitly; when left ``None`` it defaults per the mode above.
+    for the drain path.
 
     Also in both cases, ``ExecStop`` carries systemd's ``-`` prefix, so
     systemd ignores its exit status. systemd runs ExecStop even when the
@@ -301,15 +346,15 @@ def build_unit_text(
     """
     if adopt_workers:
         stop_command = _stop_command_from(supervisor_command)
-        effective_timeout = (
-            timeout_stop_sec if timeout_stop_sec is not None else _ADOPT_TIMEOUT_STOP_SEC
-        )
+        timeout_stop = str(_ADOPT_TIMEOUT_STOP_SEC)
     else:
         stop_command = _drain_command_from(supervisor_command)
-        effective_timeout = timeout_stop_sec if timeout_stop_sec is not None else 14400
-    restart_sec = _timespan(watchdog.restart_cooldown_s, "restart_cooldown_s")
-    start_limit_burst = _burst(watchdog.crash_loop_threshold, "crash_loop_threshold")
-    start_limit_interval = _timespan(watchdog.restart_backoff_max_s, "restart_backoff_max_s")
+        timeout_stop = _drain_timeout(task_caps)
+    restart_sec = _timespan(watchdog.restart_cooldown_s, "[watchdog].restart_cooldown_s")
+    start_limit_burst = _burst(watchdog.crash_loop_threshold, "[watchdog].crash_loop_threshold")
+    start_limit_interval = _timespan(
+        watchdog.restart_backoff_max_s, "[watchdog].restart_backoff_max_s"
+    )
     return (
         "[Unit]\n"
         f"Description={description}\n"
@@ -342,7 +387,7 @@ def build_unit_text(
         # claude subprocesses are never signalled on supervisor stop —
         # essential for the adoption path where they must survive.
         "KillMode=process\n"
-        f"TimeoutStopSec={effective_timeout}\n"
+        f"TimeoutStopSec={timeout_stop}\n"
         "Restart=on-failure\n"
         f"RestartSec={restart_sec}\n"
         # Don't restart when supervisor exits cleanly (a successful drain
@@ -361,28 +406,34 @@ def build_install_plan(
     supervisor_command: str,
     queue_dir: Path,
     watchdog: WatchdogSettings,
+    task_caps: TaskCapsSettings,
     unit_path: Path | None = None,
     adopt_workers: bool = True,
 ) -> SystemdInstallPlan:
     """Compute what installing the systemd unit will do.
 
     ``watchdog`` is the queue's ``[watchdog]`` table, which sets the
-    unit's restart policy (see :func:`build_unit_text`). It has no
-    default, so a caller cannot fall back to a hardcoded policy by
-    leaving it out. ``adopt_workers`` selects the stop wiring
+    unit's restart policy (see :func:`build_unit_text`). ``task_caps``
+    is its ``[task_caps]`` table, whose ``max_duration_s_per_task`` sets
+    how long a stop waits for the drain when adoption is off. Neither
+    has a default, so a caller cannot fall back to a hardcoded policy or
+    timeout by leaving it out. ``adopt_workers`` selects the stop wiring
     (ADR-0025): True (default) wires the fast-stop ExecStop + short
-    ``TimeoutStopSec``; False keeps the graceful-drain ExecStop + 4h
-    timeout. The CLI passes the queue's ``[supervisor].adopt_workers``
-    so the generated unit matches the runtime behaviour.
+    ``TimeoutStopSec``; False keeps the graceful-drain ExecStop, with the
+    task cap as the timeout. The CLI passes the queue's
+    ``[supervisor].adopt_workers`` so the generated unit matches the
+    runtime behaviour.
 
-    Raises :class:`UnitSettingError` for a ``[watchdog]`` value that
-    systemd cannot parse.
+    Raises :class:`UnitSettingError` for a ``[watchdog]`` value, or with
+    adoption off a ``[task_caps].max_duration_s_per_task``, that the
+    unit cannot carry.
     """
     target = unit_path if unit_path is not None else systemd_unit_path()
     unit_text = build_unit_text(
         supervisor_command=supervisor_command,
         queue_dir=queue_dir,
         watchdog=watchdog,
+        task_caps=task_caps,
         adopt_workers=adopt_workers,
     )
     enable_command = [

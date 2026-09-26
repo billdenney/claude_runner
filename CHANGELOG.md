@@ -118,6 +118,16 @@ Breaking changes are called out in the version notes.
 
 ### Changed
 
+- **`supervisor.json` is schema v6: each account records its
+  `target_concurrency`,** the cap from its last throttle decision
+  (`max_concurrency` while dispatching, the ramp while slowing down, 0
+  while throttled; unset in `idle` and `error_drift`). A v5 file migrates
+  on load with nothing rewritten, and each account's target is set at its
+  next capture. An older runner refuses a v6 file with
+  `schema_version=6 does not match supported 5`. `account list` shows
+  `in_flight=N/cap`, and its `--json` rows add `target_concurrency` and
+  `dispatch_cap`. The `runner-status` per-account table gains a `target`
+  column.
 - **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
   so a tick's `todo/` scan is about 11× faster.** Every supervisor tick,
   `_eligible_candidates` and `planned_dispatch_order` load every task YAML in
@@ -284,6 +294,33 @@ Breaking changes are called out in the version notes.
   `tests/unit/test_cli_missing_queue.py` runs every command that takes
   `--queue` against a missing path. It checks that nothing is created and
   pins the exit code and message, so a command added later is covered.
+- **A single-account queue now stops dispatching while throttled or
+  drifting.** Its usage source names no account, so each reading updated
+  only the top-level snapshot, and `accounts["default"]` stayed in the
+  `idle` it was seeded with. Dispatch has gated on each account's own state
+  since the per-account gate (PR 9, 2026-05-22), so `THROTTLED_5H`,
+  `THROTTLED_WEEKLY` and `ERROR_DRIFT` never stopped a single-account
+  queue: it kept dispatching up to its cap right after notifying "pausing
+  dispatch". An unnamed reading or poll error now belongs to the queue's
+  only account. That also makes the decision scale that account's own
+  `max_concurrency`, the cap dispatch applies, rather than the queue-wide
+  one. Queues with two or more accounts were not affected.
+- **`SLOWING_DOWN` now dispatches the concurrency it announces, per account
+  (ADR-0022).** On entering `SLOWING_DOWN` the supervisor notified
+  `target concurrency=X/Y`, where `X` is ADR-0022's linear ramp, but
+  nothing read that number. Dispatch instead halved the queue-wide
+  `[concurrency].max_concurrency` whenever the top-level state was
+  `SLOWING_DOWN`. That state mirrors whichever account was captured last,
+  so on a two-account queue an account slowing down at 55% 5h, told 2 of 5,
+  ran 4 or 1 depending on capture order. Now each account is capped at its
+  `max_concurrency` lowered to its own decision's target, and the
+  queue-wide halving is gone. The notice repeats whenever the target
+  changes, so the last one names the cap in force. **This changes how much
+  runs.** With `max_concurrency = 5` and the 40/60 day band an account now
+  runs 5 tasks at 40–43% 5h, 4 at 44–47%, 3 at 48–51%, 2 at 52–55% and 1 at
+  56–59%. An account with `max_concurrency = 1` runs 1 until it stops. The
+  queue-wide `[concurrency]` ceiling still bounds the total, whatever the
+  throttle state.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
@@ -387,6 +424,35 @@ Breaking changes are called out in the version notes.
   whether the unit is active. `cron/systemd_unit.py` sorts every directive
   the unit writes into those two groups, and a test fails when a new
   directive is in neither. The runbook has a section for the symptom.
+- **With `[supervisor].adopt_workers` off, a systemd stop now waits as long
+  as `[task_caps].max_duration_s_per_task` lets a task run.** The unit's
+  `ExecStop` drains, and `systemctl --user stop` or `restart` waits
+  `TimeoutStopSec` for the in-flight tasks, then SIGKILLs the supervisor.
+  `install` wrote `TimeoutStopSec=14400` whatever the cap, so with a cap of
+  28800, or 0 (no limit), a stop killed at 4 h tasks that the cap let run
+  longer, and the next supervisor dispatched them again. `install` now
+  writes the cap, and `infinity` for 0. The default cap is 14400, so a queue
+  that does not set it gets the same unit as before, byte for byte, and a
+  test pins that. The timeout has no margin over the cap: an attempt in
+  flight when a stop begins started before it, so its cap runs out first.
+  It does not cover time outside the cap: a pre-dispatch hook still running
+  when the stop began, the post-dispatch hook, the wait until the dispatcher
+  notices a spent cap (it checks when the agent emits an event), or a task's
+  `max_duration_s_override` above the queue's cap. A cap the unit cannot
+  carry stops `install` with exit 2 before anything is written: one longer
+  than 18,446,744,073,708 s, `inf`, or one under half a microsecond, which
+  would be written as `0`, and systemd reads `TimeoutStopSec=0` as no
+  timeout. With adoption on, the default, the unit keeps its fixed 30 s and
+  does not read the cap. On systemd 255, throwaway units showed that a
+  reloaded `TimeoutStopSec` times the next stop without a restart: one
+  started with 60 and reloaded with 3 stopped in 3 s, one reloaded from 3
+  to 8 in 8 s. So re-running `install` after changing the cap is enough, and
+  `install` asks nothing more when only the cap changed. The same units
+  showed that systemd sends the supervisor SIGTERM as soon as `ExecStop`
+  returns. `build_unit_text` and `build_install_plan` now require a
+  `task_caps` argument, and `build_unit_text` no longer takes
+  `timeout_stop_sec`, which only a test passed. The runbook has a section
+  for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
