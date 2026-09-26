@@ -25,6 +25,18 @@ Breaking changes are called out in the version notes.
 
 ### Removed
 
+- **`[failure_classifier]`'s three pattern lists, and the classifier that
+  never used them.** `environmental_patterns`, `operator_patterns` and
+  `task_patterns` fed `runner.retry.classify` (ADR-0012), which nothing
+  called. Every failed run is re-dispatched until
+  `failure_circuit_breaker_threshold` consecutive failures, whatever its error
+  says, so an `Operator: defer` failure was retried like any other. That is
+  unchanged. `classify` and `should_auto_resume` are gone, and a queue TOML
+  that still sets one of the lists is rejected at load with a message naming
+  it, like the settings below. **Before restarting a supervisor on this
+  version, delete the three lists from its `claude_runner.toml`.** The rest of
+  `[failure_classifier]` is unchanged.
+
 - **Settings that no code ever read are gone, and a queue TOML that still
   sets one no longer loads (breaking).** Every settings model is
   `extra="forbid"`, so each of these loaded without complaint and did nothing:
@@ -171,6 +183,14 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **Skipped stream-json lines are recorded and logged, not dropped silently.**
+  The parser skips a malformed line, or an event of a type it does not know, so
+  one bad line cannot abort a run. But nothing looked at the count, and the
+  `StreamWarning` meant to report it was never issued. Each run's `RunRecord`
+  now carries `skipped_stream_lines`, and the dispatcher logs a warning naming
+  the unknown event types, since a non-zero count can mean Claude Code's stream
+  format has drifted. `StreamWarning` is gone. Run records written before this
+  read as 0.
 - **The systemd unit now takes its restart policy from the queue's
   `[watchdog]`.** `install` wrote `RestartSec=30`, `StartLimitBurst=5` and
   `StartLimitIntervalSec=600` into the unit whatever the queue's

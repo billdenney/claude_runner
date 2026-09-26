@@ -122,9 +122,6 @@ def settings_kwargs() -> dict[str, object]:
             post_dispatch_timeout_s=60,
         ),
         "settings_failure_classifier": FailureClassifierSettings(
-            environmental_patterns=[],
-            operator_patterns=[],
-            task_patterns=[],
             failure_circuit_breaker_threshold=3,
         ),
         "settings_dispatch": DispatchSettings(auto_detect_paths_in_prompt=False),

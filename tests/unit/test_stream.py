@@ -130,6 +130,23 @@ class TestParseLines:
         events = list(parse_lines([line], summary=summary))
         assert events == []
         assert summary.skipped_lines == 1
+        assert summary.unknown_event_types == {"totally_new_event": 1}
+
+    def test_skipped_lines_split_into_malformed_and_unknown_types(self) -> None:
+        lines = [
+            '{"type": "a"}',
+            "{broken",
+            '{"type": "b"}',
+            '{"type": "a"}',
+            '{"no_type": 1}',
+            '{"type": 7}',
+            SAMPLE_RESULT,
+        ]
+        summary = StreamSummary()
+        events = list(parse_lines(lines, summary=summary))
+        assert [type(e) for e in events] == [ResultEvent]
+        assert summary.skipped_lines == 6
+        assert summary.unknown_event_types == {"a": 2, "b": 1, "<NoneType>": 1, "<int>": 1}
 
     def test_system_with_unknown_subtype(self) -> None:
         line = '{"type": "system", "subtype": "unknown_thing"}'
