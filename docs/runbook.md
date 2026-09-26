@@ -62,8 +62,16 @@ the start limit, and `systemctl --user start claude-task-runner` starts the
 supervisor again.
 
 **Steps:**
-1. Watchdog backoff should have engaged after `crash_loop_threshold`
-   crashes — verify in `watchdog.log` that exponential backoff is active.
+1. Check that the watchdog is backing off. It counts the restarts since
+   the supervisor last stayed up `min(10 × restart_cooldown_s,
+   restart_backoff_max_s)`, 300 s by default. After
+   `[watchdog].crash_loop_threshold` of them (5 by default), ticks log
+   `verdict=backoff` with `backing off until <time>`. The wait from one
+   restart to the next doubles, from twice the cooldown up to
+   `[watchdog].restart_backoff_max_s` (600 s by default). So a supervisor
+   that dies on every start is restarted about six times an hour, not every
+   minute. Once it stays up 300 s, the count starts over. Nothing sends a
+   notification; `watchdog.log` is the record.
 2. Read `supervisor.log` for the failing exception. Common causes:
    - Disk full → `usage_captures/` rotation hadn't run; clear old captures.
    - Settings TOML invalid → `claude-task-runner doctor` (loads the TOML

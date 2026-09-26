@@ -215,6 +215,35 @@ Breaking changes are called out in the version notes.
 
 ### Fixed
 
+- **The cron watchdog's crash-loop backoff now engages at the tick's
+  once-a-minute cadence.** `cron/backoff.py` counted restarts over
+  `min(10 × restart_cooldown_s, restart_backoff_max_s)`, 300 s by default,
+  and dropped a restart exactly that old. With ticks 60 s apart, the count
+  before a decision never reached `crash_loop_threshold` (5). A supervisor
+  that died on every start was restarted every minute, indefinitely: 120
+  simulated ticks gave 120 restarts and no backoff. A wider window alone
+  would not have fixed it, because the restarts the waits are measured from
+  aged out before the waits could grow.
+
+  The history is now every restart since the supervisor last stayed up. A
+  tick that finds the supervisor up `min(10 × restart_cooldown_s,
+  restart_backoff_max_s)` after its last restart (300 s by default) clears
+  it, and restarts older than 24 h are dropped. From the threshold on, the
+  wait from one restart to the next doubles, from twice the cooldown up to
+  `restart_backoff_max_s`. With the defaults:
+  - A supervisor that never comes up is restarted five times a minute
+    apart, then after 2, 4 and 8 minutes, then every 10 minutes: six
+    restarts an hour instead of sixty.
+  - One that dies 90 s after each start is held back the same way. Before,
+    a tick found it up in between, and its restarts aged out of the 300 s
+    window.
+  - One that runs 10 minutes or more between crashes is never held back.
+
+  BACKOFF's log detail now reads `crash loop: N restarts without the
+  supervisor staying up 300s; backing off until …`. The docstring no longer
+  says a backoff emits a notification; the tick only logs its verdict. The
+  runbook's crash-loop step says what to look for. No setting changed, and
+  the systemd unit is unaffected.
 - **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
   config, and a cron `install --config` is recorded.** The crontab line runs
   `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick

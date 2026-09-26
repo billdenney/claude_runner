@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron.backoff import (
+    STALE_RESTART_AGE,
     WATCHDOG_STATE_FILENAME,
     WatchdogDecision,
     WatchdogState,
@@ -18,6 +20,7 @@ from claude_task_runner.cron.backoff import (
     WatchdogVerdict,
     decide,
     load_state,
+    stayed_up_s,
     write_state_atomic,
 )
 from claude_task_runner.queue.schema import CURRENT_SCHEMA_VERSION
@@ -115,18 +118,79 @@ class TestDecide:
         # Same alert timestamp preserved (no fresh alert).
         assert out.new_state.last_backoff_alerted_at == state.last_backoff_alerted_at
 
-    def test_backoff_window_pruning(self, clock: FakeClock) -> None:
-        # Old restarts (well past 10 cooldowns) get pruned.
+    def test_alive_before_it_has_stayed_up_keeps_the_history(self, clock: FakeClock) -> None:
+        """Up for less than min(10 x cooldown, max) since the last restart."""
         old = clock.now() - timedelta(seconds=10_000)
         recent = clock.now() - timedelta(seconds=10)
         state = WatchdogState(recent_restarts=[old, recent])
+        out = decide(state=state, supervisor_alive=True, settings=_settings(), clock=clock)
+        assert out.verdict is WatchdogVerdict.SKIP
+        assert out.new_state == state
+
+    @pytest.mark.parametrize(("up_s", "cleared"), [(299.0, False), (300.0, True)])
+    def test_staying_up_clears_the_history(
+        self, clock: FakeClock, up_s: float, cleared: bool
+    ) -> None:
+        """Up 300 s (min(10 x 30, 600)) after the last restart ends the crash loop."""
+        last = clock.now() - timedelta(seconds=up_s)
+        state = WatchdogState(
+            recent_restarts=[last - timedelta(seconds=60 * i) for i in (3, 2, 1, 0)],
+            last_backoff_alerted_at=last - timedelta(seconds=30),
+        )
+        out = decide(state=state, supervisor_alive=True, settings=_settings(), clock=clock)
+        assert out.verdict is WatchdogVerdict.SKIP
+        if cleared:
+            assert out.new_state == WatchdogState()
+        else:
+            assert out.new_state == state
+
+    def test_stayed_up_period_follows_the_settings(self, clock: FakeClock) -> None:
+        """Ten cooldowns, capped at restart_backoff_max_s."""
+        assert stayed_up_s(_settings(cooldown=30.0, backoff_max=600.0)) == 300.0
+        assert stayed_up_s(_settings(cooldown=100.0, backoff_max=600.0)) == 600.0
+        last = clock.now() - timedelta(seconds=599)
         out = decide(
-            state=state,
+            state=WatchdogState(recent_restarts=[last]),
             supervisor_alive=True,
+            settings=_settings(cooldown=100.0, backoff_max=600.0),
+            clock=clock,
+        )
+        assert out.new_state.recent_restarts == [last]
+
+    @pytest.mark.parametrize("alive", [True, False])
+    def test_restarts_older_than_a_day_are_forgotten(self, clock: FakeClock, alive: bool) -> None:
+        stale = clock.now() - STALE_RESTART_AGE
+        kept = clock.now() - STALE_RESTART_AGE + timedelta(seconds=1)
+        recent = clock.now() - timedelta(seconds=10)
+        out = decide(
+            state=WatchdogState(recent_restarts=[stale, kept, recent]),
+            supervisor_alive=alive,
             settings=_settings(),
             clock=clock,
         )
-        assert out.new_state.recent_restarts == [recent]
+        assert out.new_state.recent_restarts[:2] == [kept, recent]
+        assert stale not in out.new_state.recent_restarts
+
+    @pytest.mark.parametrize(
+        ("restarts", "wait_s"),
+        [(5, 60.0), (6, 120.0), (7, 240.0), (8, 480.0), (9, 600.0), (12, 600.0)],
+    )
+    def test_the_wait_doubles_up_to_restart_backoff_max_s(
+        self, clock: FakeClock, restarts: int, wait_s: float
+    ) -> None:
+        """cooldown x 2 ** excess from the last restart, excess 1 at the threshold."""
+        last = clock.now() - timedelta(seconds=1)
+        state = WatchdogState(
+            recent_restarts=[last - timedelta(seconds=60 * i) for i in reversed(range(restarts))]
+        )
+        out = decide(state=state, supervisor_alive=False, settings=_settings(), clock=clock)
+        assert out.verdict is WatchdogVerdict.BACKOFF
+        assert out.next_check_at == last + timedelta(seconds=wait_s)
+        assert out.new_state.recent_restarts == state.recent_restarts
+        assert out.detail == (
+            f"crash loop: {restarts} restarts without the supervisor staying up 300s; "
+            f"backing off until {(last + timedelta(seconds=wait_s)).isoformat()}"
+        )
 
     def test_alert_re_emitted_after_long_silence(self, clock: FakeClock) -> None:
         # Backoff state more than 10 minutes old → re-alert.
@@ -180,14 +244,56 @@ def _restart_ticks(decisions: list[WatchdogDecision]) -> list[int]:
 class TestCronCadence:
     """:func:`decide` at the cadence the crontab line runs the tick."""
 
-    def test_a_supervisor_that_never_comes_up_is_restarted_every_minute(self) -> None:
-        """Pins the current behaviour, the bug: the backoff never engages.
+    def test_a_supervisor_that_never_comes_up_backs_off_to_the_max(self) -> None:
+        """Five restarts a minute apart, then waits of 2, 4, 8 and 10 ticks.
 
-        Restarts are counted over min(10 x cooldown, max) = 300 s, and a
-        timestamp exactly 300 s old is pruned. So at one tick a minute the
-        count before a decision is at most 4, below the threshold of 5."""
+        Before, restarts were counted over a 300 s window, and a timestamp
+        exactly 300 s old was pruned, so at one tick a minute the count
+        never reached the threshold of 5: all 120 ticks restarted.
+
+        The sixth restart comes a tick after the fifth because the first
+        wait, 2 x cooldown = 60 s, ends at the next tick. The waits then
+        run 120, 240 and 480 s, and 600 s (restart_backoff_max_s) from
+        there on: six restarts an hour."""
         decisions = _cron_ticks(_settings(), ticks=120)
-        assert _restart_ticks(decisions) == list(range(120))
+        restarts = _restart_ticks(decisions)
+        assert restarts == [0, 1, 2, 3, 4, 5, 7, 11, 19, 29, 39, 49, 59, 69, 79, 89, 99, 109, 119]
+        gaps = [b - a for a, b in itertools.pairwise(restarts)]
+        assert gaps == [1, 1, 1, 1, 1, 2, 4, 8] + [10] * 10
+        verdicts = {d.verdict for d in decisions}
+        assert verdicts == {WatchdogVerdict.RESTART, WatchdogVerdict.BACKOFF}
+
+    def test_a_supervisor_that_dies_90s_after_each_start_backs_off(self) -> None:
+        """A tick finds it up in between, but never for 300 s, so the count grows."""
+        decisions = _cron_ticks(_settings(), ticks=60, survive_s=90.0)
+        assert _restart_ticks(decisions) == [0, 2, 4, 6, 8, 10, 12, 16, 24, 34, 44, 54]
+
+    def test_a_supervisor_that_stays_up_10_min_is_never_held_back(self) -> None:
+        """Each run outlasts 300 s, so each crash starts a fresh count."""
+        decisions = _cron_ticks(_settings(), ticks=120, survive_s=600.0)
+        assert _restart_ticks(decisions) == list(range(0, 120, 10))
+        assert WatchdogVerdict.BACKOFF not in {d.verdict for d in decisions}
+
+    def test_after_staying_up_the_next_crash_restarts_at_once(self) -> None:
+        """A crash loop that ended leaves no count behind."""
+        loop = _cron_ticks(_settings(), ticks=30)
+        state = loop[-1].new_state
+        assert len(state.recent_restarts) >= 5
+        last = state.recent_restarts[-1]
+        up = decide(
+            state=state,
+            supervisor_alive=True,
+            settings=_settings(),
+            clock=FakeClock(last + timedelta(seconds=300)),
+        )
+        crashed = decide(
+            state=up.new_state,
+            supervisor_alive=False,
+            settings=_settings(),
+            clock=FakeClock(last + timedelta(seconds=360)),
+        )
+        assert crashed.verdict is WatchdogVerdict.RESTART
+        assert crashed.detail == "restart approved (recent count: 1 of threshold 5)"
 
 
 class TestPersistence:
@@ -289,18 +395,20 @@ class TestLocked:
         assert out.verdict is WatchdogVerdict.LOCKED
         assert out.new_state == state
 
-    def test_locked_still_ages_out_old_restarts(self, clock: FakeClock) -> None:
+    def test_locked_keeps_the_history_but_forgets_stale_restarts(self, clock: FakeClock) -> None:
+        """The supervisor is down, so nothing shows the crash loop is over."""
         recent = clock.now() - timedelta(seconds=10)
         old = clock.now() - timedelta(seconds=301)
+        stale = clock.now() - STALE_RESTART_AGE
         out = decide(
-            state=WatchdogState(recent_restarts=[old, recent]),
+            state=WatchdogState(recent_restarts=[stale, old, recent]),
             supervisor_alive=False,
             lock_held=True,
             settings=_settings(cooldown=30.0, backoff_max=600.0),
             clock=clock,
         )
         assert out.verdict is WatchdogVerdict.LOCKED
-        assert out.new_state.recent_restarts == [recent]
+        assert out.new_state.recent_restarts == [old, recent]
 
     def test_lock_defaults_to_free(self, clock: FakeClock) -> None:
         out = decide(
