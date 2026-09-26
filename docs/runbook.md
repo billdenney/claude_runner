@@ -42,9 +42,18 @@ in a short window. `<queue>/.claude_task_runner/supervisor.log` ends with the
 same exception each time.
 
 This section covers the cron watchdog. Under the systemd unit, systemd
-restarts the supervisor itself (`Restart=on-failure`) and stops once it has
-started the unit `StartLimitBurst` times within `StartLimitIntervalSec`;
-read the exception with `journalctl --user -u claude-task-runner`.
+restarts the supervisor itself (`Restart=on-failure`), `RestartSec` after
+each crash, and stops once it has started the unit more than
+`StartLimitBurst` times within `StartLimitIntervalSec`. `install` writes
+those three from the queue's `[watchdog].restart_cooldown_s`,
+`[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
+(30 s, 5 and 600 s by default). After changing them, re-run
+`claude-task-runner install`: it rewrites the unit and reloads systemd, and
+the next crash uses the new values without the supervisor being restarted.
+Read the exception with `journalctl --user -u claude-task-runner`. Once the
+cause is fixed, `systemctl --user reset-failed claude-task-runner` clears
+the start limit, and `systemctl --user start claude-task-runner` starts the
+supervisor again.
 
 **Steps:**
 1. Watchdog backoff should have engaged after `crash_loop_threshold`
@@ -126,9 +135,10 @@ come back.
 
    On systemd older than 252, spell the option `--kill-who=main`, or run
    `kill -KILL <pid>` with the PID that
-   `claude-task-runner supervisor status --queue <queue>` prints. About
-   30s later (`RestartSec=30`) the unit is active again with a new main
-   PID, and `journalctl --user -u claude-task-runner` shows
+   `claude-task-runner supervisor status --queue <queue>` prints. After
+   `RestartSec` (the queue's `[watchdog].restart_cooldown_s`, 30 s by
+   default) the unit is active again with a new main PID, and
+   `journalctl --user -u claude-task-runner` shows
    `Main process exited, code=killed, status=9/KILL`, then
    `Scheduled restart job`. In-flight `claude` workers keep running
    (`KillMode=process`). With `[supervisor].adopt_workers` on, the
