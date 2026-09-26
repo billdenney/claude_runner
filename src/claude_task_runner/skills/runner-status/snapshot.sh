@@ -268,7 +268,7 @@ rc = int(os.environ["SC_RC"])
 with open(os.environ["SC_OUT"]) as f:
     stdout = f.read()
 with open(os.environ["SC_ERR"]) as f:
-    printed = stdout + "\n" + f.read()
+    printed = stdout.rstrip("\n") + "\n" + f.read()
 if rc != 0:
     could_not_list(f"`claude-task-runner sidecar list --json` exited {rc}", printed)
 try:
