@@ -65,7 +65,11 @@ sub-app invoked on its own, as the unit tests do, uses its own.
 ``console.print`` markup is separate and unaffected.
 ``tests/unit/test_docs_cli_help.py`` gates all of this.
 """
-app.add_typer(usage_cmd.app, name="usage", help="Usage capture, parse, and drift check.")
+# doctor, install, install-skills and usage register a callback, whose
+# docstring is the group's --help text. They pass short_help=, the line the
+# root listing prints, and not help=, which typer would print in place of
+# the docstring. tests/unit/test_docs_cli_help.py checks both.
+app.add_typer(usage_cmd.app, name="usage", short_help="Usage capture, parse, and drift check.")
 app.add_typer(
     supervisor_cmd.app,
     name="supervisor",
@@ -85,7 +89,7 @@ app.add_typer(
 app.add_typer(
     install_cmd.app,
     name="install",
-    help=(
+    short_help=(
         "Install the watchdog for one queue (systemd preferred, cron fallback). "
         "Installing it for another queue replaces the first."
     ),
@@ -93,7 +97,7 @@ app.add_typer(
 app.add_typer(
     install_skills_cmd.app,
     name="install-skills",
-    help="Install the task-runner skills into ~/.claude/skills/.",
+    short_help="Install the task-runner skills into ~/.claude/skills/.",
 )
 app.add_typer(
     watchdog_cmd.app,
@@ -103,7 +107,7 @@ app.add_typer(
 app.add_typer(
     doctor_cmd.app,
     name="doctor",
-    help="Self-diagnostic battery (pass/warn/fail per check).",
+    short_help="Self-diagnostic battery (pass/warn/fail per check).",
 )
 app.add_typer(
     worktree_cmd.app,

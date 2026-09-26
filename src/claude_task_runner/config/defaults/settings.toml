@@ -2,6 +2,10 @@
 #
 # Per-queue overrides live in <queue>/claude_runner.toml and are merged on top
 # of these defaults. See ADR-0014: every cutoff is a setting.
+#
+# Every number must be finite. TOML's inf and nan, and a literal too large for
+# a float such as 1e309, fail to load. A setting that has an "unlimited" value
+# spells it 0, as its comment below says.
 
 # ---------------------------------------------------------------------------
 # Claude CLI invocation

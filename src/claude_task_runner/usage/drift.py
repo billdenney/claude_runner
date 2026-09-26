@@ -55,6 +55,10 @@ class UsageApiAuthExpired(UsageCaptureSpawnError):
 class UsageApiHeaderMissing(UsageFormatDrift):
     """The ``/v1/messages`` response was missing one of the documented headers.
 
+    Also raised when a required header is present but its value cannot
+    become a reading: unparseable, not finite, a utilization outside
+    [0, 100] percent, or a reset timestamp ``datetime`` cannot represent.
+
     The ``anthropic-ratelimit-unified-{5h,7d}-{utilization,reset,status}``
     headers are reverse-engineered (see the andrew-kramer-inno gist
     referenced in the ADR). Anthropic could rename or remove them

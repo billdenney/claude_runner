@@ -11,7 +11,9 @@ supervisor can adopt the worker after a restart.
 These drive the real ``dispatch()`` against the bundled fake ``claude``
 shim, once with ``adopt_workers=False`` (pipe) and once True (files),
 and assert the outcomes match where it matters and that the on-disk log
-artifacts exist.
+artifacts exist. The log an owned run leaves is also finalized a second
+time as a worker that exited with no supervisor watching, which must
+reach the owned run's verdict.
 """
 
 from __future__ import annotations
@@ -31,8 +33,13 @@ from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
     state_path_for,
+    write_state_atomic,
 )
-from claude_task_runner.runner.dispatcher import dispatch
+from claude_task_runner.runner.dispatcher import (
+    DispatchOutcome,
+    dispatch,
+    finalize_exited_worker,
+)
 from claude_task_runner.runner.session import ResumeStrategy, SpawnPlan
 
 SHIM_PATH = Path(__file__).parent.parent / "fixtures" / "claude_shim" / "claude"
@@ -227,3 +234,54 @@ def test_file_backed_error_path_marks_failed(
     outcome = _dispatch(queue_dir, task, fresh_plan, adopt=True)
     assert outcome.new_state.status == "failed"  # type: ignore[attr-defined]
     assert outcome.run_record.stop_reason == "rate_limit"  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "is_error", "status"),
+    [
+        pytest.param("end_turn", "false", "completed", id="success"),
+        pytest.param("error_during_execution", "true", "failed", id="error-result"),
+    ],
+)
+def test_exited_worker_finalize_matches_owned_finalize(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    stop_reason: str,
+    is_error: str,
+    status: str,
+) -> None:
+    """A worker that exits with no supervisor watching is classified as the
+    owned path classifies the same worker. The owned run leaves its log on
+    disk; the test re-seeds the task as ``running`` on that log, as a
+    supervisor restart would have left it, and finalizes it again as an
+    exited worker."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-owned")
+    monkeypatch.setenv("SHIM_STOP_REASON", stop_reason)
+    monkeypatch.setenv("SHIM_IS_ERROR", is_error)
+    owned = _dispatch(queue_dir, task, fresh_plan, adopt=True)
+    assert isinstance(owned, DispatchOutcome)
+
+    log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
+    running = TaskState(
+        task_id=task.id,
+        status="running",
+        attempts=1,
+        last_started_at=owned.run_record.started_at,
+        pid=owned.run_record.pid,
+        log_path=str(log),
+    )
+    write_state_atomic(running, state_path_for(queue_dir, task.id))
+
+    exited = finalize_exited_worker(
+        task=task, state=running, queue_dir=queue_dir, clock=RealClock()
+    )
+
+    assert exited is not None
+    assert exited.new_state.status == owned.new_state.status == status
+    assert exited.run_record.stop_reason == stop_reason
+    assert exited.new_state.session_id == owned.new_state.session_id == "sess-owned"
+    for field in ("stop_reason", "error", "usage", "cost_usd", "killed_by_cap", "attempt", "pid"):
+        assert getattr(exited.run_record, field) == getattr(owned.run_record, field), field
