@@ -284,6 +284,56 @@ def start(
     )
 
 
+def _say(console: Console, message: str, style: str) -> None:
+    """Print ``message`` in ``style``, as written and on one line.
+
+    Rich markup would drop a ``[word]`` from a queue path or from a config
+    table name such as ``[supervisor]``, and a ``[/]`` in a path raised
+    ``MarkupError``. Printed as
+    :func:`~claude_task_runner.cli._helpers.require_queue_option` prints.
+    """
+    console.print(message, style=style, markup=False, highlight=False, soft_wrap=True)
+
+
+def _pid_to_signal(queue_path: Path, console: Console) -> int:
+    """Return the PID of the supervisor running for ``queue_path``, or exit 1.
+
+    Exits 1 when there is no PID file, when the file holds no PID, and when
+    the PID is not alive. A file that holds no PID used to read as no file,
+    but a supervisor may still be running then.
+    """
+    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
+    try:
+        pid = pidfile_mod.read_pid_file(pid_path)
+    except pidfile_mod.PidFileUnreadable as exc:
+        _say(
+            console,
+            f"{exc}, so nothing was signalled. A supervisor may still be running: "
+            "`pgrep -af 'supervisor start'` lists them.",
+            "yellow",
+        )
+        raise typer.Exit(code=1) from exc
+    if pid is None:
+        _say(console, f"No PID file at {pid_path}", "yellow")
+        raise typer.Exit(code=1)
+    if not pidfile_mod.is_pid_alive(pid):
+        _say(console, f"PID {pid} not alive (stale PID file)", "yellow")
+        raise typer.Exit(code=1)
+    return pid
+
+
+def _send_signal(pid: int, signum: signal.Signals, console: Console) -> None:
+    """Send ``signum`` to ``pid``. Exits 1 if it is gone, 2 if not allowed."""
+    try:
+        os.kill(pid, signum)
+    except ProcessLookupError as exc:
+        _say(console, f"PID {pid} disappeared before {signum.name}", "yellow")
+        raise typer.Exit(code=1) from exc
+    except PermissionError as exc:
+        _say(console, f"not allowed to signal PID {pid}: {exc}", "bold red")
+        raise typer.Exit(code=2) from exc
+
+
 @app.command("stop")
 def stop(
     *,
@@ -320,23 +370,9 @@ def stop(
     _ = config  # accepted for ExecStop symmetry; stop needs no settings.
     console = Console()
     queue_path = require_queue_option(queue_dir, console)
-    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
-    pid = pidfile_mod.read_existing_pid(pid_path)
-    if pid is None:
-        console.print(f"[yellow]No PID file at {pid_path}[/]")
-        raise typer.Exit(code=1)
-    if not pidfile_mod.is_pid_alive(pid):
-        console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
-        raise typer.Exit(code=1)
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError as exc:
-        console.print(f"[yellow]PID {pid} disappeared before SIGTERM[/]")
-        raise typer.Exit(code=1) from exc
-    except PermissionError as exc:
-        console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
-        raise typer.Exit(code=2) from exc
-    console.print(f"[green]SIGTERM sent to PID {pid}.[/]")
+    pid = _pid_to_signal(queue_path, console)
+    _send_signal(pid, signal.SIGTERM, console)
+    _say(console, f"SIGTERM sent to PID {pid}.", "green")
 
 
 @app.command("drain")
@@ -417,23 +453,9 @@ def drain(
     """
     console = Console()
     queue_path = require_queue_option(queue_dir, console)
-    pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
-    pid = pidfile_mod.read_existing_pid(pid_path)
-    if pid is None:
-        console.print(f"[yellow]No PID file at {pid_path}[/]")
-        raise typer.Exit(code=1)
-    if not pidfile_mod.is_pid_alive(pid):
-        console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
-        raise typer.Exit(code=1)
-    try:
-        os.kill(pid, signal.SIGUSR1)
-    except ProcessLookupError as exc:
-        console.print(f"[yellow]PID {pid} disappeared before SIGUSR1[/]")
-        raise typer.Exit(code=1) from exc
-    except PermissionError as exc:
-        console.print(f"[bold red]not allowed to signal PID {pid}:[/] {exc}")
-        raise typer.Exit(code=2) from exc
-    console.print(f"[green]SIGUSR1 (drain) sent to PID {pid}.[/]")
+    pid = _pid_to_signal(queue_path, console)
+    _send_signal(pid, signal.SIGUSR1, console)
+    _say(console, f"SIGUSR1 (drain) sent to PID {pid}.", "green")
 
     if not wait:
         return

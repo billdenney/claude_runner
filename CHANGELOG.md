@@ -220,6 +220,24 @@ Breaking changes are called out in the version notes.
   installed before that prefix counted 1 and 2 alike as a failure. Nothing
   else runs them. `tests/unit/test_cli_missing_queue.py` pins the new
   outcome.
+- **`supervisor stop` and `supervisor drain` say when the PID file holds no
+  PID.** An empty `supervisor.pid`, or one holding text, printed
+  `No PID file at <path>`, and one holding `0` or `-1` printed a stale PID.
+  Both say no supervisor is running, but one may be: the daemon writes the
+  file with a truncate and then a write. A number too big for a `pid_t`,
+  such as 2147483648, crashed both commands with `OverflowError`. They now
+  print `PID file <path> is empty`,
+  `PID file <path> holds '<text>', not a PID` or
+  `cannot read PID file <path>: <error>`, say that nothing was signalled
+  and how to find a running supervisor, and exit 1. The new
+  `pidfile.read_pid_file()` tells a missing file from one without a PID.
+  `read_existing_pid()`, which `supervisor status`, `queue force-dispatch`,
+  the watchdog tick and the lock-holder check use, now wraps it, so it
+  returns `None` for such a file where `0` and `-1` came back as PIDs,
+  2147483648 crashed `is_pid_alive()`, and a binary file raised
+  `UnicodeDecodeError`. What those commands print is otherwise unchanged.
+  stop and drain now also print without Rich markup, which dropped a
+  `[word]` from a queue path and raised `MarkupError` on a `[/]`.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a

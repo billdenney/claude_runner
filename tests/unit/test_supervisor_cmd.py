@@ -8,6 +8,7 @@ status command uses.
 
 from __future__ import annotations
 
+import errno
 import json as _json
 import os
 import re
@@ -305,48 +306,71 @@ def test_stop_and_drain_refuse_a_queue_that_is_not_a_directory(
         assert queue.read_text(encoding="utf-8") == ""
 
 
+_NOT_SIGNALLED = (
+    ", so nothing was signalled. A supervisor may still be running: "
+    "`pgrep -af 'supervisor start'` lists them.\n"
+)
+
+
 @pytest.mark.parametrize("command", ["stop", "drain"])
-@pytest.mark.parametrize("content", ["", "\n", "not-a-pid\n"])
-def test_unparseable_pid_file_reads_as_no_pid_file(
-    runner: CliRunner, queue_dir: Path, command: str, content: str
+@pytest.mark.parametrize(
+    ("content", "detail"),
+    [
+        pytest.param("", "is empty", id="empty"),
+        pytest.param("\n", "is empty", id="newline"),
+        pytest.param("not-a-pid\n", "holds 'not-a-pid', not a PID", id="words"),
+        # is_pid_alive called these dead, so nothing was signalled, but
+        # os.kill would send 0 to the caller's process group and -1 to
+        # every process the user may signal.
+        pytest.param("0\n", "holds '0', not a PID", id="zero"),
+        pytest.param("-1\n", "holds '-1', not a PID", id="negative"),
+        # os.kill raised OverflowError, so both commands ended in a traceback.
+        pytest.param(f"{2**31}\n", "holds '2147483648', not a PID", id="beyond-pid_t"),
+    ],
+)
+def test_a_pid_file_without_a_pid_is_reported(
+    runner: CliRunner, queue_dir: Path, command: str, content: str, detail: str
 ) -> None:
-    """Pins today: a PID file that holds no PID is reported as missing."""
+    """It used to read as "No PID file", or as a stale PID, but a
+    supervisor may be running with a PID file it has not finished writing."""
     pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
     pid_path.write_text(content, encoding="utf-8")
     with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
         result = _invoke(runner, [command, "--queue", str(queue_dir)])
-    assert result.exit_code == 1
-    assert _plain(result.stdout) == f"No PID file at {pid_path}\n"
+    assert result.exit_code == 1, result.output
+    assert _plain(result.stdout) == f"PID file {pid_path} {detail}{_NOT_SIGNALLED}"
     kill.assert_not_called()
 
 
 @pytest.mark.parametrize("command", ["stop", "drain"])
-@pytest.mark.parametrize("pid", ["0", "-1"])
-def test_non_positive_pid_reads_as_stale(
-    runner: CliRunner, queue_dir: Path, command: str, pid: str
+def test_an_unreadable_pid_file_is_reported(
+    runner: CliRunner, queue_dir: Path, command: str
 ) -> None:
-    """Pins today: ``0`` and ``-1`` parse as PIDs, and ``is_pid_alive``
-    calls them dead, so nothing is signalled. ``os.kill`` would send
-    ``0`` to the caller's process group and ``-1`` to every process the
-    user may signal."""
-    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
-    pid_path.write_text(f"{pid}\n", encoding="utf-8")
+    pid_path = queue_dir.resolve() / ".claude_task_runner" / "supervisor.pid"
+    pid_path.mkdir()
     with patch("claude_task_runner.cli.supervisor_cmd.os.kill") as kill:
         result = _invoke(runner, [command, "--queue", str(queue_dir)])
-    assert result.exit_code == 1
-    assert _plain(result.stdout) == f"PID {pid} not alive (stale PID file)\n"
+    assert result.exit_code == 1, result.output
+    assert _plain(result.stdout) == (
+        f"cannot read PID file {pid_path}: [Errno {errno.EISDIR}] Is a directory: "
+        f"'{pid_path}'{_NOT_SIGNALLED}"
+    )
     kill.assert_not_called()
 
 
 @pytest.mark.parametrize("command", ["stop", "drain"])
-def test_pid_beyond_pid_t_crashes(runner: CliRunner, queue_dir: Path, command: str) -> None:
-    """Pins today: a number too big for a C ``pid_t`` reaches ``os.kill``
-    in ``is_pid_alive``, which raises ``OverflowError``."""
-    pid_path = queue_dir / ".claude_task_runner" / "supervisor.pid"
-    pid_path.write_text(f"{2**31}\n", encoding="utf-8")
-    result = _invoke(runner, [command, "--queue", str(queue_dir)])
-    assert result.exit_code == 1
-    assert isinstance(result.exception, OverflowError)
+@pytest.mark.parametrize("name", ["q[abc]", "q[/]x"])
+def test_a_bracket_in_the_queue_path_is_printed_as_typed(
+    runner: CliRunner, tmp_path: Path, command: str, name: str
+) -> None:
+    """Printed as Rich markup, ``[abc]`` was dropped from the path and
+    ``[/]`` raised ``MarkupError``."""
+    queue = tmp_path / name
+    queue.mkdir(parents=True)  # q[/]x is q[ holding ]x
+    result = _invoke(runner, [command, "--queue", str(queue)])
+    assert result.exit_code == 1, result.output
+    pid_path = queue.resolve() / ".claude_task_runner" / "supervisor.pid"
+    assert _plain(result.stdout) == f"No PID file at {pid_path}\n"
 
 
 # ---------------------------------------------------------------------------
