@@ -96,6 +96,16 @@ Breaking changes are called out in the version notes.
 
 ### Changed
 
+- **`supervisor.json` is schema v6: each account records its
+  `target_concurrency`,** the cap from its last throttle decision
+  (`max_concurrency` while dispatching, the ramp while slowing down, 0
+  while throttled; unset in `idle` and `error_drift`). A v5 file migrates
+  on load with nothing rewritten, and each account's target is set at its
+  next capture. An older runner refuses a v6 file with
+  `schema_version=6 does not match supported 5`. `account list` shows
+  `in_flight=N/cap`, and its `--json` rows add `target_concurrency` and
+  `dispatch_cap`. The `runner-status` per-account table gains a `target`
+  column.
 - **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
   so a tick's `todo/` scan is about 11× faster.** Every supervisor tick,
   `_eligible_candidates` and `planned_dispatch_order` load every task YAML in
@@ -182,6 +192,34 @@ Breaking changes are called out in the version notes.
   `runner-add-task` skill no longer names it as an example.
 
 ### Fixed
+
+- **A single-account queue now stops dispatching while throttled or
+  drifting.** Its usage source names no account, so each reading updated
+  only the top-level snapshot, and `accounts["default"]` stayed in the
+  `idle` it was seeded with. Dispatch has gated on each account's own state
+  since the per-account gate (PR 9, 2026-05-22), so `THROTTLED_5H`,
+  `THROTTLED_WEEKLY` and `ERROR_DRIFT` never stopped a single-account
+  queue: it kept dispatching up to its cap right after notifying "pausing
+  dispatch". An unnamed reading or poll error now belongs to the queue's
+  only account. That also makes the decision scale that account's own
+  `max_concurrency`, the cap dispatch applies, rather than the queue-wide
+  one. Queues with two or more accounts were not affected.
+- **`SLOWING_DOWN` now dispatches the concurrency it announces, per account
+  (ADR-0022).** On entering `SLOWING_DOWN` the supervisor notified
+  `target concurrency=X/Y`, where `X` is ADR-0022's linear ramp, but
+  nothing read that number. Dispatch instead halved the queue-wide
+  `[concurrency].max_concurrency` whenever the top-level state was
+  `SLOWING_DOWN`. That state mirrors whichever account was captured last,
+  so on a two-account queue an account slowing down at 55% 5h, told 2 of 5,
+  ran 4 or 1 depending on capture order. Now each account is capped at its
+  `max_concurrency` lowered to its own decision's target, and the
+  queue-wide halving is gone. The notice repeats whenever the target
+  changes, so the last one names the cap in force. **This changes how much
+  runs.** With `max_concurrency = 5` and the 40/60 day band an account now
+  runs 5 tasks at 40–43% 5h, 4 at 44–47%, 3 at 48–51%, 2 at 52–55% and 1 at
+  56–59%. An account with `max_concurrency = 1` runs 1 until it stops. The
+  queue-wide `[concurrency]` ceiling still bounds the total, whatever the
+  throttle state.
 
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships

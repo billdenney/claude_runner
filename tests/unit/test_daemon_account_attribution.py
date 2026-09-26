@@ -23,7 +23,11 @@ import pytest
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
-from claude_task_runner.config.schema import AccountConcurrencyPolicy, AccountPolicy
+from claude_task_runner.config.schema import (
+    AccountConcurrencyPolicy,
+    AccountPolicy,
+    AccountSettings,
+)
 from claude_task_runner.supervisor.actions import Notify
 from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
 from claude_task_runner.supervisor.persistence import initial_snapshot
@@ -501,3 +505,36 @@ def test_previous_target_comes_from_the_account() -> None:
 
     assert new_snap.accounts["personal"].target_concurrency == 2
     assert not any(isinstance(a, Notify) for a in actions)
+
+
+def test_unnamed_reading_with_several_accounts_updates_only_the_top_level() -> None:
+    """With two accounts configured an unnamed reading cannot be placed:
+    it updates the top-level view alone, decided against the queue-wide
+    ``[concurrency].max_concurrency`` (2 by default)."""
+    base = _utc_settings()
+    settings = base.model_copy(
+        update={
+            "accounts": [
+                AccountSettings(name="personal", config_dir=""),
+                AccountSettings(name="work", config_dir=""),
+            ]
+        }
+    )
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    snap = _snapshot_with_two_accounts()
+
+    new_snap, _ = run_one_tick(
+        snap,
+        TickContext(
+            settings=settings,
+            poll_result=_reading_5h_only(account=None, util_5h=10, util_7d=20),
+            pending_count=3,
+            in_flight_count=0,
+            account_policies=_POLICIES_5_AND_1,
+        ),
+        clock,
+    )
+
+    assert new_snap.state is SupervisorState.DISPATCHING
+    assert new_snap.target_concurrency == 2
+    assert new_snap.accounts == snap.accounts
