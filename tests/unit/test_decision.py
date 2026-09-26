@@ -107,11 +107,19 @@ class TestSlowingDown:
             five_h_resets_at=now + timedelta(hours=2),
             weekly_resets_at=now + timedelta(days=4),
         )
-        d = decide(_policy(max_concurrency=5), reading, clock, poll_interval_s=POLL)
+        d = decide(
+            _policy(max_concurrency=5),
+            reading,
+            clock,
+            poll_interval_s=POLL,
+            window_start_delay_s=450,
+        )
         assert d.state is SupervisorState.SLOWING_DOWN
         # Linear ramp: progress = (50-40)/(60-40) = 0.5; ceil(5 * 0.5) = 3.
         assert d.target_concurrency == 3
-        assert d.wakeup_at is not None
+        # Just past the 5h reset: the reset plus the delay. 450s is
+        # neither POLL nor the 300s default.
+        assert d.wakeup_at == now + timedelta(hours=2, seconds=450)
 
     def test_slow_at_band_edge_top(self) -> None:
         # observed exactly at slowdown_pct — should ramp at top of band (max concurrency).
@@ -217,8 +225,7 @@ class TestThrottledWeekly:
         )
         d = decide(_policy(timezone="UTC"), reading, clock, poll_interval_s=POLL)
         assert d.state is SupervisorState.THROTTLED_WEEKLY
-        assert d.wakeup_at is not None
-        assert d.wakeup_at >= now + timedelta(seconds=POLL)
+        assert d.wakeup_at == now + timedelta(seconds=POLL)
 
 
 class TestWeeklyResetUnparseable:
