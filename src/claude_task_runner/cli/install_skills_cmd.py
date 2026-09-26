@@ -463,7 +463,7 @@ def _list_line(name: str, path: Path) -> tuple[str, str]:
 
 @app.command("list")
 def list_installed() -> None:
-    """Show which task-runner skills are present in ``~/.claude/skills/``."""
+    """Show which task-runner skills are in ``~/.claude/skills/``."""
     console = Console()
     target = skills_dir()
     unchecked = 0

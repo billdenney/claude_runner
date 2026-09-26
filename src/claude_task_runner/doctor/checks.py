@@ -91,6 +91,101 @@ def check_claude_binary(settings: Settings) -> CheckResult:
     )
 
 
+_CLAUDE_VERSION_TIMEOUT_S = 15
+"""How long one ``claude ... --version`` may take in
+:func:`check_effort_levels_cli`. It makes no API call, and returns in well
+under a second when the binary is healthy."""
+
+
+def _run_claude_version(exe: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``<exe> <args> --version``, which parses the flags and makes no API call."""
+    return subprocess.run(
+        [exe, *args, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_CLAUDE_VERSION_TIMEOUT_S,
+    )
+
+
+def _stderr_lines(completed: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line for line in completed.stderr.splitlines() if line.strip()]
+
+
+def check_effort_levels_cli(settings: Settings) -> CheckResult:
+    """The installed ``claude`` knows every level in ``[effort_levels]``.
+
+    The dispatcher passes each task's effort as ``claude --effort <level>``.
+    Claude Code does not fail on a level it does not know: it warns on
+    stderr and runs at the model's default effort, so a misspelled, retired
+    or renamed level would quietly cost every task that names it the effort
+    it asks for. ``claude --effort <level> --version`` parses the flag and
+    exits without an API call, so each distinct level is tried that way. A
+    level is reported when that run exits non-zero or prints a stderr line
+    that a plain ``claude --version`` does not, whatever the CLI's wording.
+
+    This checks the level names only. Whether a model supports a level is
+    the CLI's call at request time, and it downgrades an unsupported one
+    silently; ``[effort_levels]`` should list only levels the model
+    supports.
+    """
+    name = "effort_levels_cli"
+    exe = shutil.which(settings.claude.executable)
+    if exe is None:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.WARN,
+            detail=f"skipped: {settings.claude.executable!r} not found on PATH (see claude_binary)",
+        )
+    levels = sorted({level for accepted in settings.effort_levels.values() for level in accepted})
+    try:
+        baseline = _run_claude_version(exe)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.FAIL,
+            detail=f"`{exe} --version` failed: {type(exc).__name__}: {exc}",
+            remediation="Check the claude install: `claude --version` must run.",
+        )
+    if baseline.returncode != 0:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.FAIL,
+            detail=f"`{exe} --version` exited {baseline.returncode}",
+            remediation="\n".join(_stderr_lines(baseline)) or "Check the claude install.",
+        )
+    usual = set(_stderr_lines(baseline))
+
+    rejected: list[str] = []
+    for level in levels:
+        try:
+            completed = _run_claude_version(exe, "--effort", level)
+        except (OSError, subprocess.SubprocessError) as exc:
+            rejected.append(f"{level}: {type(exc).__name__}: {exc}")
+            continue
+        extra = [line for line in _stderr_lines(completed) if line not in usual]
+        if completed.returncode != 0 or extra:
+            said = "; ".join(extra) or f"exited {completed.returncode}"
+            rejected.append(f"{level}: {said}")
+    if rejected:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.FAIL,
+            detail=(
+                f"{len(rejected)} of {len(levels)} [effort_levels] level(s) not accepted by {exe}"
+            ),
+            remediation=(
+                "\n".join(rejected) + "\nRename each in [effort_levels] (and in the task "
+                "YAMLs that use it) to a level `claude --help` lists under --effort."
+            ),
+        )
+    return CheckResult(
+        name=name,
+        status=CheckStatus.PASS,
+        detail=f"{exe} accepts all {len(levels)} [effort_levels] levels: {', '.join(levels)}",
+    )
+
+
 def check_accounts(settings: Settings) -> CheckResult:
     """Every configured account's ``config_dir`` exists and is authenticated.
 
@@ -1331,6 +1426,7 @@ def all_checks(
     """
     checks: list[Callable[[], CheckResult]] = [
         lambda: check_claude_binary(settings),
+        lambda: check_effort_levels_cli(settings),
         lambda: check_accounts(settings),
         lambda: check_legacy_claude_config_dir(settings),
         lambda: check_account_policies(settings),

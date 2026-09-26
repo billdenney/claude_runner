@@ -83,6 +83,7 @@ from claude_task_runner.runner.session import (
     ResumeStrategy,
     SpawnPlan,
 )
+from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.runner.stream import (
     StreamSummary,
     parse_lines,
@@ -188,6 +189,13 @@ def build_argv(
     flag is required by the claude CLI when ``--print`` is paired with
     stream-json output.
 
+    Always emits ``--effort <task.effort>`` too. ``claude`` does not fail
+    on an effort it does not know; it warns on stderr and uses its default,
+    so the level must be one the CLI accepts. ``[effort_levels]`` is what
+    guarantees that: the supervisor parks a task whose (model, effort) it
+    rejects, and the doctor's ``effort_levels_cli`` check tries every
+    configured level against the installed CLI.
+
     ``add_dirs`` (when non-empty) widens the spawned agent's sandbox
     beyond its cwd; each path is forwarded as ``--add-dir <path>``.
     The caller resolves the list via :mod:`runner.add_dirs` so that
@@ -227,6 +235,11 @@ def build_argv(
     ]
     if task.model:
         argv.extend(["--model", task.model])
+    # The task's effort, which the supervisor has already checked against
+    # [effort_levels] (ADR-0010). Always passed, resumes included: without it
+    # claude runs at its per-model default (medium for claude-opus-5-5 in
+    # Claude Code 2.1.281), whatever the task asks for.
+    argv.extend(["--effort", task.effort])
     if task.allowed_tools:
         argv.extend(["--allowedTools", ",".join(task.allowed_tools)])
     for extra_dir in add_dirs or []:
@@ -1225,6 +1238,7 @@ def dispatch(
     account: str | None = None,
     persist_state: bool = True,
     adopt_workers: bool = False,
+    spawn_gate: SpawnGate | None = None,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
 
@@ -1248,6 +1262,12 @@ def dispatch(
     drain on stop, demote-on-restart. ``persist_state=False`` (in-memory
     force-dispatch) forces the pipe path regardless, since there is no
     state YAML to record ``log_path`` for an adopter to find.
+
+    ``spawn_gate``: the supervisor's :class:`runner.spawn_gate.SpawnGate`.
+    The attempt holds it from just before its log files are opened until
+    the worker's pid is on record, so a stopping supervisor waits for
+    that, and after the supervisor has closed it a daemon thread starts
+    no worker. ``None`` (callers outside the supervisor) skips it.
     """
     if shutil.which(claude_executable) is None:
         raise DispatchError(f"claude binary not found: {claude_executable}")
@@ -1446,21 +1466,26 @@ def dispatch(
     # stay a uniform ``Popen[str]``.
     stdout_sink: IO[bytes] | int = subprocess.PIPE
     stderr_sink: IO[bytes] | int = subprocess.PIPE
-    if use_files:
-        stdout_log_path, stderr_log_path = _attempt_log_paths(
-            queue_dir, task.id, new_state.attempts
-        )
-        # Open in binary write mode: the worker writes here for its whole
-        # life and we tail it separately. We hold the write handles only
-        # long enough to hand the fds to Popen, then close our copies (in
-        # the finally below) — the child keeps its own dup'd fds. A
-        # ``with`` block can't express this fd hand-off, hence the noqa.
-        stdout_fh = open(stdout_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
-        stderr_fh = open(stderr_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
-        stdout_sink = stdout_fh
-        stderr_sink = stderr_fh
 
+    # From here until the pid is on record, a stopping supervisor waits for
+    # this thread (runner.spawn_gate). A daemon thread that gets here after
+    # the stop began waits instead, and opens and starts nothing.
+    if spawn_gate is not None:
+        spawn_gate.enter(task.id)
     try:
+        if use_files:
+            stdout_log_path, stderr_log_path = _attempt_log_paths(
+                queue_dir, task.id, new_state.attempts
+            )
+            # Open in binary write mode: the worker writes here for its whole
+            # life and we tail it separately. We hold the write handles only
+            # long enough to hand the fds to Popen, then close our copies (in
+            # the finally below) — the child keeps its own dup'd fds. A
+            # ``with`` block can't express this fd hand-off, hence the noqa.
+            stdout_fh = open(stdout_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+            stderr_fh = open(stderr_log_path, "wb")  # noqa: SIM115 - fd handed to Popen, closed in finally
+            stdout_sink = stdout_fh
+            stderr_sink = stderr_fh
         process = subprocess.Popen(  # caller-controlled
             argv,
             stdout=stdout_sink,
@@ -1475,6 +1500,11 @@ def dispatch(
             # git/Rscript). Without this the children survive as orphans.
             start_new_session=True,
         )
+    except BaseException:
+        # No worker started, so there is no pid to wait for.
+        if spawn_gate is not None:
+            spawn_gate.leave(task.id)
+        raise
     finally:
         # The child has dup'd the fds; our copies are no longer needed.
         # Closing them lets the tailer (and the worker) own the file
@@ -1515,6 +1545,8 @@ def dispatch(
                 process.pid,
                 exc,
             )
+    if spawn_gate is not None:
+        spawn_gate.leave(task.id)
 
     # Persist heartbeats into the running-state YAML so the
     # supervisor's per-tick silent-orphan reaper sees fresh liveness.

@@ -362,6 +362,35 @@ def test_add_unknown_model(runner: CliRunner, queue_dir: Path) -> None:
     assert "claude-totally-not-a-real-model" in result.stdout
 
 
+def test_add_refuses_the_old_effort_spelling(runner: CliRunner, queue_dir: Path) -> None:
+    """`extra_high` is now `xhigh`, the claude CLI's name (ADR-0010). Files
+    written before the rename are still read as `xhigh`, but new input is
+    refused with the name to use, so no new file gets the old spelling."""
+    result = runner.invoke(
+        app,
+        [
+            "add",
+            "--queue",
+            str(queue_dir),
+            "--id",
+            "t1",
+            "--title",
+            "test",
+            "--prompt",
+            "do it",
+            "--effort",
+            "extra_high",
+        ],
+    )
+    assert result.exit_code == 2
+    assert " ".join(result.stdout.split()) == (
+        "invalid effort: effort 'extra_high' not in accepted set for model "
+        "'claude-opus-5-5': ['high', 'low', 'max', 'medium', 'xhigh']; 'extra_high' is "
+        "now 'xhigh', the claude CLI's name for it"
+    )
+    assert not (queue_dir / "todo" / "t1.yaml").exists()
+
+
 def test_add_unknown_model_message_keeps_its_brackets(runner: CliRunner, queue_dir: Path) -> None:
     """Printed without Rich markup. With it, Rich took "[effort_levels...]"
     for a style tag and dropped it, so the hint read "add a  entry to

@@ -40,6 +40,7 @@ from claude_task_runner.queue.schema import (
     Task,
     TaskState,
 )
+from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -268,11 +269,42 @@ def _drop_retired_task_keys(payload: dict[str, Any], path: Path) -> None:
             )
 
 
+_warned_retired_efforts: set[tuple[Path, str]] = set()
+"""``(file, spelling)`` pairs already warned about by
+:func:`_rename_retired_effort`, once per process for the same reason as
+:data:`_warned_retired_task_keys`."""
+
+
+def _rename_retired_effort(payload: dict[str, Any], path: Path) -> None:
+    """Read a retired ``effort`` spelling as its current name, warning once per file.
+
+    ``extra_high`` becomes ``xhigh`` (see
+    :data:`~claude_task_runner.runner.effort_levels.RETIRED_EFFORT_LEVELS`).
+    The ``claude`` CLI ignores an effort it does not know and runs at its
+    default, so a task YAML written before the rename would otherwise
+    quietly lose the effort it asks for. The file itself is not rewritten.
+    """
+    effort = payload.get("effort")
+    if not isinstance(effort, str) or effort not in RETIRED_EFFORT_LEVELS:
+        return
+    renamed = RETIRED_EFFORT_LEVELS[effort]
+    payload["effort"] = renamed
+    if (path, effort) not in _warned_retired_efforts:
+        _warned_retired_efforts.add((path, effort))
+        logger.warning(
+            "%s: reading effort %r as %r, the claude CLI's name; update the file",
+            path,
+            effort,
+            renamed,
+        )
+
+
 def load_task(path: Path) -> Task:
     """Read and validate a single Task YAML."""
     payload = _load_yaml(path)
     _check_schema_version(payload, path)
     _drop_retired_task_keys(payload, path)
+    _rename_retired_effort(payload, path)
     return _validate(Task, payload, path)
 
 

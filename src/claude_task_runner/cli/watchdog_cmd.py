@@ -120,7 +120,12 @@ def tick(
         False, "--dry-run", help="Decide and log, but start nothing and save no state."
     ),
 ) -> None:
-    """One watchdog tick: examine the queue the watchdog manages and act.
+    """Run one watchdog tick on the queue the watchdog manages.
+
+    The tick restarts the queue's supervisor when it is down, unless
+    another supervisor holds the per-user lock, or the queue's
+    ``[watchdog]`` settings hold it back after a recent restart or after
+    repeated crashes.
 
     Exits 1 when the queue's config does not load, after logging an
     ERROR line; the supervisor is then neither checked nor restarted.
