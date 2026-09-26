@@ -12,6 +12,8 @@ Public surface:
 * :func:`hold_reason` / :func:`is_hold_reason` — the ``deferred_reason``
   the supervisor writes when it parks a task whose pair fails
   :func:`validate_effort`, and the test for one it wrote.
+* :data:`RETIRED_EFFORT_LEVELS` — old spellings still read from files,
+  each mapped to the name the ``claude`` CLI accepts.
 
 The task schema cannot run :func:`validate_effort`, because the accepted
 sets come from the merged settings, which ``queue.store.load_task`` never
@@ -19,10 +21,30 @@ sees. So each place that has the settings in hand checks the pair itself:
 ``queue add`` before it writes a task, the supervisor's candidate
 selector before it dispatches one (parking a mismatched task as
 ``deferred``, see :func:`hold_reason`), both force-dispatch paths, the
-doctor's ``task_yamls`` check and ``queue list``.
+doctor's ``task_yamls`` check and ``queue list``. The dispatcher then
+passes the effort to ``claude`` as ``--effort <level>``, and the doctor's
+``effort_levels_cli`` check confirms the installed CLI accepts every
+configured level.
 """
 
 from __future__ import annotations
+
+RETIRED_EFFORT_LEVELS: dict[str, str] = {
+    "extra_high": "xhigh",
+}
+"""Old effort spellings the runner still reads, each mapped to the name the
+``claude`` CLI accepts.
+
+``claude --effort`` takes ``low``, ``medium``, ``high``, ``xhigh`` and ``max``
+(Claude Code 2.1.281). It does not fail on a name it does not know: it
+warns on stderr and runs at the model's default effort, so a task would
+quietly lose the effort it asked for. Until 2026-09-26 the runner spelled
+``xhigh`` as ``extra_high``, so queue TOMLs and task YAMLs written before
+then may still say that. ``config.loader.load_settings`` and
+``queue.store.load_task`` read each old spelling as its new name and warn
+once per file, so those files keep working unedited. New input is not
+renamed: ``queue add --effort extra_high`` is refused with a pointer to the
+new name (see :class:`UnknownEffortLevel`)."""
 
 
 class UnknownEffortLevel(ValueError):
@@ -43,9 +65,13 @@ class UnknownEffortLevel(ValueError):
                 "claude_runner.toml or use a configured model"
             )
         else:
-            super().__init__(
+            message = (
                 f"effort {effort!r} not in accepted set for model {model!r}: {sorted(accepted)}"
             )
+            renamed = RETIRED_EFFORT_LEVELS.get(effort)
+            if renamed is not None:
+                message += f"; {effort!r} is now {renamed!r}, the claude CLI's name for it"
+            super().__init__(message)
 
 
 def validate_effort(

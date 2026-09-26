@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from claude_task_runner.doctor.checks import (
     check_account_sudo,
     check_accounts,
     check_claude_binary,
+    check_effort_levels_cli,
     check_global_lock,
     check_legacy_claude_config_dir,
     check_legacy_runner_dir,
@@ -93,6 +95,162 @@ def test_check_claude_binary_fail(settings: Settings) -> None:
     assert result.status == CheckStatus.FAIL
     assert "not found" in result.detail
     assert result.remediation != ""
+
+
+# ---------------------------------------------------------------------------
+# check_effort_levels_cli (ADR-0010)
+# ---------------------------------------------------------------------------
+
+_VERSION_LINE = 'echo "2.1.281 (Claude Code)"\n'
+_UNKNOWN_EFFORT_WARNING = (
+    "Warning: Unknown --effort value 'extra_high' — ignoring it and using the default "
+    "effort. Valid values: low, medium, high, xhigh, max."
+)
+"""What Claude Code 2.1.281 prints on stderr for ``--effort extra_high``."""
+
+
+def _fake_claude(directory: Path, body: str) -> Path:
+    """A ``claude`` that runs ``body`` (bash) with the real argv."""
+    directory.mkdir(parents=True, exist_ok=True)
+    exe = directory / "claude"
+    exe.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
+@pytest.fixture(autouse=True)
+def _silent_claude_on_path(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every battery run in this module finds a fake ``claude`` that accepts
+    any flag, so check_effort_levels_cli never runs the machine's own CLI.
+    Its own tests below name their fakes in ``[claude].executable``; a
+    ``live`` test gets the machine's real PATH."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+    exe = _fake_claude(tmp_path_factory.mktemp("path-claude"), _VERSION_LINE)
+    monkeypatch.setenv("PATH", f"{exe.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def _with_claude(settings: Settings, exe: Path | str) -> Settings:
+    return settings.model_copy(
+        update={"claude": settings.claude.model_copy(update={"executable": str(exe)})}
+    )
+
+
+def _with_levels(settings: Settings, **extra: list[str]) -> Settings:
+    return settings.model_copy(update={"effort_levels": {**settings.effort_levels, **extra}})
+
+
+def test_check_effort_levels_cli_passes_when_every_level_is_known(
+    settings: Settings, tmp_path: Path
+) -> None:
+    exe = _fake_claude(tmp_path, _VERSION_LINE)
+    result = check_effort_levels_cli(_with_claude(settings, exe))
+    assert result.status == CheckStatus.PASS
+    assert result.detail == (
+        f"{exe} accepts all 5 [effort_levels] levels: high, low, max, medium, xhigh"
+    )
+
+
+def test_check_effort_levels_cli_fails_on_a_level_the_cli_ignores(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The CLI's answer to an unknown level is a stderr warning and exit 0,
+    so the check must read stderr, not just the exit code."""
+    exe = _fake_claude(
+        tmp_path,
+        f'if [ "$1" = "--effort" ] && [ "$2" = "extra_high" ]; then\n'
+        f'  echo "{_UNKNOWN_EFFORT_WARNING}" >&2\nfi\n' + _VERSION_LINE,
+    )
+    result = check_effort_levels_cli(
+        _with_levels(_with_claude(settings, exe), **{"claude-x": ["extra_high"]})
+    )
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == f"1 of 6 [effort_levels] level(s) not accepted by {exe}"
+    assert result.remediation == (
+        f"extra_high: {_UNKNOWN_EFFORT_WARNING}\n"
+        "Rename each in [effort_levels] (and in the task YAMLs that use it) to a "
+        "level `claude --help` lists under --effort."
+    )
+
+
+def test_check_effort_levels_cli_ignores_stderr_every_run_prints(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A notice the CLI prints whatever the flags (an update nag) is not a
+    complaint about the level."""
+    exe = _fake_claude(tmp_path, 'echo "A new version is available" >&2\n' + _VERSION_LINE)
+    assert check_effort_levels_cli(_with_claude(settings, exe)).status == CheckStatus.PASS
+
+
+def test_check_effort_levels_cli_fails_on_a_level_that_exits_nonzero(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A future CLI that refuses an unknown level outright is caught too."""
+    exe = _fake_claude(tmp_path, 'if [ "$2" = "max" ]; then exit 2; fi\n' + _VERSION_LINE)
+    result = check_effort_levels_cli(_with_claude(settings, exe))
+    assert result.status == CheckStatus.FAIL
+    assert result.remediation.splitlines()[0] == "max: exited 2"
+
+
+def test_check_effort_levels_cli_fails_when_version_fails(
+    settings: Settings, tmp_path: Path
+) -> None:
+    exe = _fake_claude(tmp_path, 'echo "config is corrupt" >&2\nexit 1\n')
+    result = check_effort_levels_cli(_with_claude(settings, exe))
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == f"`{exe} --version` exited 1"
+    assert result.remediation == "config is corrupt"
+
+
+def test_check_effort_levels_cli_fails_when_claude_cannot_start(
+    settings: Settings, tmp_path: Path
+) -> None:
+    exe = tmp_path / "claude"
+    exe.write_text("#!/nonexistent/interpreter\n", encoding="utf-8")
+    exe.chmod(0o755)
+    result = check_effort_levels_cli(_with_claude(settings, exe))
+    assert result.status == CheckStatus.FAIL
+    assert result.detail.startswith(f"`{exe} --version` failed: FileNotFoundError: ")
+
+
+def test_check_effort_levels_cli_reports_a_level_that_hangs(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("claude_task_runner.doctor.checks._CLAUDE_VERSION_TIMEOUT_S", 1)
+    exe = _fake_claude(tmp_path, 'if [ "$2" = "low" ]; then sleep 5; fi\n' + _VERSION_LINE)
+    result = check_effort_levels_cli(_with_claude(settings, exe))
+    assert result.status == CheckStatus.FAIL
+    assert result.detail == f"1 of 5 [effort_levels] level(s) not accepted by {exe}"
+    assert result.remediation.startswith("low: TimeoutExpired: ")
+
+
+def test_check_effort_levels_cli_skips_without_claude(settings: Settings, tmp_path: Path) -> None:
+    """claude_binary FAILs for a missing CLI; this check does not FAIL twice."""
+    missing = tmp_path / "no-such-claude"
+    result = check_effort_levels_cli(_with_claude(settings, missing))
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (f"skipped: {str(missing)!r} not found on PATH (see claude_binary)")
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    os.environ.get("CTR_RUN_LIVE_TESTS") != "1", reason="set CTR_RUN_LIVE_TESTS=1 to run"
+)
+def test_check_effort_levels_cli_passes_with_the_installed_claude(tmp_path: Path) -> None:
+    """The packaged [effort_levels] against the real CLI on this machine."""
+    exe = shutil.which("claude")
+    assert exe is not None, "the live test needs claude on PATH"
+    assert not Path(exe).resolve().is_relative_to(tmp_path.parent.parent), exe  # not a fake
+    result = check_effort_levels_cli(load_settings(None))
+    assert result.status == CheckStatus.PASS, result.remediation
+    assert (
+        result.detail
+        == f"{exe} accepts all 5 [effort_levels] levels: high, low, max, medium, xhigh"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +914,7 @@ def test_check_task_yamls_uses_the_queue_effort_levels(settings: Settings, queue
     """A pair only the queue's own [effort_levels] accepts passes, and a
     previous-generation pair the package defaults keep passes too."""
     _make_task(queue_dir, "t1", model="claude-custom-1", effort="low")
-    _make_task(queue_dir, "t2", model="claude-opus-4-7", effort="extra_high")
+    _make_task(queue_dir, "t2", model="claude-opus-4-7", effort="xhigh")
     queue_settings = settings.model_copy(
         update={"effort_levels": {**settings.effort_levels, "claude-custom-1": ["low"]}}
     )
@@ -1346,6 +1504,7 @@ def test_all_checks_missing_queue_leaves_out_the_queue_checks(
     results = [fn() for fn in all_checks(settings, gone / "q")]
     assert [r.name for r in results] == [
         "claude_binary",
+        "effort_levels_cli",
         "accounts",
         "legacy_claude_config_dir",
         "account_policies",
@@ -1357,7 +1516,7 @@ def test_all_checks_missing_queue_leaves_out_the_queue_checks(
         "skills_installed",
         "watchdog_installed",
     ]
-    assert results[8].status is CheckStatus.FAIL
+    assert results[9].status is CheckStatus.FAIL
     assert not gone.exists()
 
 
@@ -1367,7 +1526,7 @@ def test_all_checks_existing_queue_runs_the_queue_checks(
     """The contrast to the test above: the same battery plus the queue checks."""
     present = [fn().name for fn in all_checks(settings, queue_dir)]
     missing = [fn().name for fn in all_checks(settings, tmp_path / "gone")]
-    assert present[9:16] == _QUEUE_CHECKS
+    assert present[10:17] == _QUEUE_CHECKS
     assert [name for name in present if name not in _QUEUE_CHECKS] == missing
 
 
