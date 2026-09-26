@@ -272,6 +272,57 @@ class TestAccountList:
         assert by_name["personal"]["in_flight_count"] == 2
         assert by_name["work"]["paused"] is True
 
+    def test_dispatch_cap_is_max_lowered_to_the_throttle_target(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """personal (max 5) is slowing down with a target of 2; work (max 1)
+        has no decision yet; ghost has no state at all."""
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        (cfg_dir / "runner-account.toml").write_text(
+            "[concurrency]\nmax_concurrency = 5\n", encoding="utf-8"
+        )
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(
+            tmp_path,
+            accounts=[("personal", str(cfg_dir), None), ("work", "", None), ("ghost", "", None)],
+        )
+        accounts = {
+            "personal": AccountState(
+                state=SupervisorState.SLOWING_DOWN,
+                since=datetime(2026, 5, 21, tzinfo=UTC),
+                last_5h_util_pct=55,
+                target_concurrency=2,
+            ),
+            "work": AccountState(
+                state=SupervisorState.IDLE, since=datetime(2026, 5, 21, tzinfo=UTC)
+            ),
+        }
+        in_flight = [
+            InFlightRecord(
+                task_id=f"t{i}", account="personal", started_at=datetime(2026, 5, 21, tzinfo=UTC)
+            )
+            for i in range(2)
+        ]
+        _seed_snapshot(queue_dir, accounts=accounts, in_flight=in_flight)
+        args = ["account", "list", "--config", str(config), "--queue", str(queue_dir)]
+
+        result = runner.invoke(app, [*args, "--json"])
+        assert result.exit_code == 0, result.output
+        by_name = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
+        assert by_name["personal"]["target_concurrency"] == 2
+        assert by_name["personal"]["dispatch_cap"] == 2
+        assert by_name["work"]["target_concurrency"] is None
+        assert by_name["work"]["dispatch_cap"] == 1
+        assert by_name["ghost"]["target_concurrency"] is None
+        assert by_name["ghost"]["dispatch_cap"] == 1
+
+        human = runner.invoke(app, args)
+        assert human.exit_code == 0, human.output
+        assert "in_flight=2/2" in human.stdout
+        assert "in_flight=0/1" in human.stdout
+
 
 class TestAccountPauseResume:
     def test_pause_unknown_account_errors(self, runner: CliRunner, tmp_path: Path) -> None:

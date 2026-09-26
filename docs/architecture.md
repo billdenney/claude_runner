@@ -81,7 +81,7 @@ States in `supervisor/states.py`:
 
 - `Idle` — no pending tasks; polling only.
 - `Dispatching` — predicted 5h pct < `dispatch_pct.<band>.fivehr_slowdown_pct`.
-- `SlowingDown` — predicted 5h pct in [slowdown, stop); target concurrency reduced linearly.
+- `SlowingDown` — predicted 5h pct in [slowdown, stop); the account's dispatch cap falls linearly from its `max_concurrency` towards 0.
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
 - `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
@@ -107,6 +107,29 @@ all I/O happens in `supervisor/daemon.py` based on the action list.
    `fivehr_stop_pct`; classify into `Dispatching`, `SlowingDown`,
    or `Throttled5h`. The linear concurrency ramp shape is unchanged
    from ADR-0004.
+
+### How the decision gates dispatch
+
+Each tick captures `/usage` for one account (round-robin across
+`[[accounts]]`; a single-account queue's unnamed reading belongs to its
+only account). `step()` records the decision's `state` and
+`target_concurrency` on the snapshot, and the daemon copies them into
+that account's entry in `supervisor.json` `accounts`. The target is the
+account's `max_concurrency` while `Dispatching`, the linear ramp while
+`SlowingDown` (the number the `slowing dispatch: … target
+concurrency=X/Y` notice announces, repeated whenever it changes), and 0
+while throttled.
+
+Per task, `runner.account_dispatch.choose_account` skips an account
+whose state is not `Dispatching`, `SlowingDown` or `Idle`, or which is
+paused, and caps each account at `account_cap`: its `max_concurrency`
+lowered to its `target_concurrency`. Each account slows down on its own
+5h reading. Separately, the orchestrator bounds the whole queue's
+in-flight count by `[concurrency]` (`initial_concurrency` until the
+queue's first completion, then `max_concurrency`); that ceiling does not
+depend on throttle state, but while it binds an account can run fewer
+tasks than its target. `claude-task-runner account list` shows each
+account's `in_flight=N/cap`.
 
 The math is centralised in the `throttle/` package (`curve.py`,
 `time_of_day.py`, `policy.py`, `decision.py`). All pure functions;
@@ -151,7 +174,8 @@ Global (cross-queue):
 ├── queues.json                     # the one queue the cron watchdog
 │                                   #   manages (replaced by cron `install`
 │                                   #   and `watchdog register`, removed by
-│                                   #   `watchdog unregister`)
+│                                   #   `watchdog unregister`), and the
+│                                   #   config their `--config` recorded
 ├── watchdog_state.json             # cron watchdog restart history + backoff
 │                                   #   for the queue it manages
 ├── watchdog.log                    # cron watchdog output (watchdog.sh)

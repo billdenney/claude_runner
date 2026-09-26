@@ -103,14 +103,19 @@ def install(
     ``--queue`` and restarts it when it fails. A unit that is already
     running keeps its supervisor, so when the new unit would start it
     differently, such as for another queue, ``install`` says so and how
-    to restart it. The queue's
-    ``[watchdog]`` sets the unit's restart policy, so re-run ``install``
-    after changing it.
+    to restart it. The queue's ``[watchdog]`` sets the unit's restart
+    policy. With ``[supervisor].adopt_workers`` off, a stop drains, and
+    ``[task_caps].max_duration_s_per_task`` sets how long it waits for
+    in-flight tasks (0: until they finish). Re-run ``install`` after
+    changing either.
 
     cron: adds a crontab line that runs ``watchdog tick`` every minute
     and registers ``--queue`` in ``~/.claude_task_runner/queues.json``,
-    replacing any queue registered there: one supervisor runs per user,
-    so the watchdog manages one queue, as the systemd unit runs one. A
+    with ``--config`` if given, replacing any queue registered there:
+    one supervisor runs per user, so the watchdog manages one queue, as
+    the systemd unit runs one. A tick takes the queue's [watchdog]
+    settings from that config, else from <queue>/claude_runner.toml, and
+    starts the supervisor with the same file. A
     tick restarts that queue's supervisor when it is not running, even
     one stopped with ``supervisor stop`` or ``drain``, and backs off
     after repeated crashes. While another supervisor holds the per-user
@@ -151,12 +156,16 @@ def install(
                 # The queue's [watchdog] sets RestartSec, StartLimitBurst
                 # and StartLimitIntervalSec.
                 watchdog=settings.watchdog,
+                # With adoption off, [task_caps].max_duration_s_per_task
+                # sets TimeoutStopSec: how long a stop waits for the drain.
+                task_caps=settings.task_caps,
                 # ADR-0025: generate fast-stop wiring when adoption is on so
                 # the unit's ExecStop / TimeoutStopSec match runtime behaviour.
                 adopt_workers=settings.supervisor.adopt_workers,
             )
         except systemd_mod.UnitSettingError as exc:
-            # Without markup, so the "[watchdog]" in the message is printed.
+            # Without markup, so the "[watchdog]" or "[task_caps]" in the
+            # message is printed.
             console.print(
                 f"systemd install failed: {exc}. Nothing was written.",
                 style="bold red",
@@ -210,11 +219,17 @@ def install(
             console.print(f"  [{color}]{line}[/]")
     else:
         console.print("  [dim](no visible diff — block already up to date)[/]")
-    # The crontab line runs `watchdog tick` with no --queue, and a tick
-    # manages only the queue in this registry.
+    # The crontab line runs `watchdog tick` with no --queue or --config: a
+    # tick manages only the queue in this registry, with the config
+    # recorded for it, else <queue>/claude_runner.toml.
+    recorded_config = resolved_config if config is not None else None
     registry = registry_mod.queues_registry_path()
     console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
     console.print(f"  {queue_path}")
+    if recorded_config is not None:
+        console.print(
+            f"  with config {recorded_config}", markup=False, highlight=False, soft_wrap=True
+        )
     _show_replaced_queues(console, queue_path)
     if not yes and not Confirm.ask("\nApply this change?", default=False):
         console.print("[yellow]Aborted.[/]")
@@ -224,7 +239,7 @@ def install(
     # leaves nothing changed. The other order could leave a cron line
     # whose ticks have no queue to manage.
     try:
-        replaced = registry_mod.register_queue(queue_path)
+        replaced = registry_mod.register_queue(queue_path, config=recorded_config)
     except OSError as exc:
         console.print(f"[bold red]watchdog registration failed:[/] {exc}")
         raise typer.Exit(code=2) from exc
