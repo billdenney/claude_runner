@@ -62,6 +62,7 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("observability.py", "_reset_for_tests"): "tests reset logging setup with it",
     ("queue/schema.py", "resumed_from_session"): "RunRecord field, persisted to state YAML",
     ("queue/schema.py", "killed_by_cap"): "RunRecord field, persisted to state YAML",
+    ("queue/schema.py", "skipped_stream_lines"): "RunRecord field, persisted to state YAML",
     ("queue/schema.py", "responded_at"): "SidecarResponse field, persisted to response JSON",
     ("usage/capture.py", "logfile_read"): "set on the pexpect child, which reads it",
     ("cli/usage_cmd.py", "EXIT_OK"): "names exit code 0 beside the other EXIT_* codes",
@@ -69,12 +70,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
         "WatchdogDecision field; its docstring says `watchdog tick` does not read it"
     ),
     # --- Dead; each names what removes it or decides its fate --------------
-    ("runner/retry.py", "classify"): "removed by chore/retire-failure-classifier-patterns",
-    ("runner/retry.py", "should_auto_resume"): (
-        "removed by chore/retire-failure-classifier-patterns"
-    ),
-    ("runner/stream.py", "StreamWarning"): "removed by fix/surface-skipped-stream-lines",
-    ("runner/stream.py", "skipped_lines"): "read once fix/surface-skipped-stream-lines lands",
     ("throttle/decision.py", "target_concurrency"): (
         "ADR-0022's slowdown ramp, which dispatch ignores; its card decides wire or remove"
     ),
