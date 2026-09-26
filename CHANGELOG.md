@@ -710,6 +710,31 @@ Breaking changes are called out in the version notes.
   under either loader, and a deeper document is rejected with its location.
   The deepest schema-valid document is 5 levels, so no file that could
   validate is affected.
+- **`settings.toml`'s example `runner-account.toml` uses `[dispatch_pct.*]`,
+  and a gate loads every example in its comments.** The comment under
+  `[[accounts]]` showed an account's file with `[throttle.five_hour]` and
+  `[throttle.time_of_day]`, the tables ADR-0022 replaced. The loader rejects
+  any `throttle` key, so an operator who copied the example got a file that
+  does not load. It now shows the same values under `[dispatch_pct.day]` and
+  `[dispatch_pct.night]`. A note says each key is optional and that a key
+  left out keeps the queue's value.
+  `tests/unit/test_settings_toml_examples.py` extracts each commented TOML
+  example in `settings.toml` and loads it the way the runner loads its file:
+  the `[[accounts]]` one as a `claude_runner.toml`, the per-account one
+  through `load_account_policy`. Each must load with every key as written.
+  The per-account example must show every table the file takes. Laid over
+  the default queue policy, its bands must stay in order, which
+  `throttle.policy.resolve` does not check. An account's `[dispatch_pct.*]`
+  must take the same keys as the queue's, as the note says. A new example
+  fails the gate until a test loads it. Known-answer tests pin the
+  extractor. A deleted or reworded example fails the gate; it does not load
+  as an empty file. Against the old example, the gate fails with the
+  loader's `[throttle.*]` message. Three docstrings that predated ADR-0022
+  or schema v6 were corrected. `TickContext` now says per-account overrides
+  compose onto `settings.dispatch_pct`, not `settings.throttle`.
+  `SupervisorSnapshot` names `SUPERVISOR_SCHEMA_VERSION` instead of
+  "schema v3". `AccountState` no longer calls `last_capture_at` a hook for
+  a "future" multi-account source, since `MultiAccountUsageSource` uses it.
 
 ### Added
 

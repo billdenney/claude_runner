@@ -99,12 +99,18 @@ class TickContext:
     bundles them with the loaded settings. Tests construct one
     explicitly to drive :func:`run_one_tick` deterministically.
 
-    ``account_policies`` (PR 13) maps account name → resolved
-    :class:`AccountPolicy`. Used by :func:`run_one_tick` to layer
-    per-account throttle overrides on top of the queue-wide
-    ``settings.throttle`` when the poll result is attributed to a
-    specific account. Empty dict (the default) reproduces the
-    pre-PR-13 single-throttle behaviour.
+    ``account_policies`` maps account name → the :class:`AccountPolicy`
+    read from that account's ``runner-account.toml``
+    (:func:`config.loader.resolve_accounts`, called every tick). For a
+    poll result attributed to an account, :func:`run_one_tick` composes
+    its policy onto the queue-wide ``settings.dispatch_pct`` with
+    :func:`throttle.policy.resolve`: each ``[dispatch_pct.*]`` key the
+    account sets overrides the queue's value, and its ``max_concurrency``
+    is the cap the decision ramps down from. An account missing from the
+    dict, or a result attributed to no account, gets the queue-wide
+    ``[dispatch_pct.*]`` and ``[concurrency].max_concurrency``
+    (:func:`_resolve_account_policy`), so the empty default applies the
+    queue-wide policy to every tick.
     """
 
     settings: Settings
