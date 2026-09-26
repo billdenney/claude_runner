@@ -900,7 +900,9 @@ def force_dispatch(
       the supervisor consumes it on the next tick (typically <30 s).
       Without ``--over-limit`` the supervisor declines if all
       ``max_concurrency`` slots are taken and the request file persists
-      for a later tick. The pre-dispatch hook runs as normal.
+      for a later tick. It deletes the file when it dispatches the task,
+      and when it drops a request whose task it can no longer dispatch,
+      logging a WARNING. The pre-dispatch hook runs as normal.
     * **Supervisor not running.** Runs the dispatch in-process and
       blocks until the attempt finishes. ``--over-limit`` is implied
       (no in-flight slots to conflict with) and ignored.
@@ -909,8 +911,9 @@ def force_dispatch(
     current status is not dispatchable (``running``,
     ``awaiting_sidecar``, ``completed``, ``failed_circuit_breaker``,
     ``weekly_paused``), if the queue's ``[effort_levels]`` rejects its
-    (model, effort) pair, or if the pre-dispatch hook fails during the
-    synchronous path.
+    (model, effort) pair, if one of its ``requires`` elements is unmet
+    (ADR-0030), or if the pre-dispatch hook fails during the synchronous
+    path.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -962,6 +965,17 @@ def force_dispatch(
             console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=2)
 
+    # ADR-0030, checked here for the same reason: both force paths refuse a
+    # task with an unmet `requires` element.
+    unmet = readiness_mod.unmet_requirements(task, qd)
+    if unmet:
+        msg = f"task {task_id} has {len(unmet)} unmet readiness requirement(s): {'; '.join(unmet)}"
+        if json:
+            print(_json.dumps({"ok": False, "error": msg, "unmet": unmet}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2)
+
     if _supervisor_is_alive(qd):
         path = fd_mod.write_request(qd, task_id, allow_over_limit=over_limit)
         if not json:
@@ -983,11 +997,24 @@ def force_dispatch(
         elif picked_up:
             console.print(f"[green]task {task_id} entered `running` status.[/]")
         elif wait_seconds > 0:
-            console.print(
-                f"[yellow]task {task_id} still not running after {wait_seconds}s — "
-                "the supervisor may be honouring max_concurrency. The request "
-                "file persists; the task will dispatch on the next free slot.[/]"
-            )
+            # The supervisor deletes the request both when it dispatches the
+            # task and when it drops the request, so only a file still on
+            # disk means the request is waiting.
+            if path.exists():
+                msg = (
+                    f"task {task_id} still not running after {wait_seconds}s — "
+                    "the supervisor may be honouring max_concurrency. The request "
+                    "file persists; the task will dispatch on the next free slot."
+                )
+            else:
+                msg = (
+                    f"task {task_id} still not running after {wait_seconds}s, and "
+                    "its request file is gone: the supervisor either dispatched the "
+                    "task (its pre-dispatch hook may still be running, or may have "
+                    "deferred it) or dropped the request, logging a WARNING that says "
+                    f"why. Check `queue show {task_id}`."
+                )
+            console.print(msg, style="yellow", markup=False, highlight=False, soft_wrap=True)
         return
 
     # No supervisor running: do it inline. No race possible.
