@@ -401,6 +401,35 @@ Breaking changes are called out in the version notes.
   whether the unit is active. `cron/systemd_unit.py` sorts every directive
   the unit writes into those two groups, and a test fails when a new
   directive is in neither. The runbook has a section for the symptom.
+- **With `[supervisor].adopt_workers` off, a systemd stop now waits as long
+  as `[task_caps].max_duration_s_per_task` lets a task run.** The unit's
+  `ExecStop` drains, and `systemctl --user stop` or `restart` waits
+  `TimeoutStopSec` for the in-flight tasks, then SIGKILLs the supervisor.
+  `install` wrote `TimeoutStopSec=14400` whatever the cap, so with a cap of
+  28800, or 0 (no limit), a stop killed at 4 h tasks that the cap let run
+  longer, and the next supervisor dispatched them again. `install` now
+  writes the cap, and `infinity` for 0. The default cap is 14400, so a queue
+  that does not set it gets the same unit as before, byte for byte, and a
+  test pins that. The timeout has no margin over the cap: an attempt in
+  flight when a stop begins started before it, so its cap runs out first.
+  It does not cover time outside the cap: a pre-dispatch hook still running
+  when the stop began, the post-dispatch hook, the wait until the dispatcher
+  notices a spent cap (it checks when the agent emits an event), or a task's
+  `max_duration_s_override` above the queue's cap. A cap the unit cannot
+  carry stops `install` with exit 2 before anything is written: one longer
+  than 18,446,744,073,708 s, `inf`, or one under half a microsecond, which
+  would be written as `0`, and systemd reads `TimeoutStopSec=0` as no
+  timeout. With adoption on, the default, the unit keeps its fixed 30 s and
+  does not read the cap. On systemd 255, throwaway units showed that a
+  reloaded `TimeoutStopSec` times the next stop without a restart: one
+  started with 60 and reloaded with 3 stopped in 3 s, one reloaded from 3
+  to 8 in 8 s. So re-running `install` after changing the cap is enough, and
+  `install` asks nothing more when only the cap changed. The same units
+  showed that systemd sends the supervisor SIGTERM as soon as `ExecStop`
+  returns. `build_unit_text` and `build_install_plan` now require a
+  `task_caps` argument, and `build_unit_text` no longer takes
+  `timeout_stop_sec`, which only a test passed. The runbook has a section
+  for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
