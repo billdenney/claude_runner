@@ -40,6 +40,7 @@ from claude_task_runner.runner.heartbeat import HeartbeatVerdict
 from claude_task_runner.supervisor.reconcile_silent import (
     KILL_STOP_REASON,
     STEADY_SILENT_STOP_REASON,
+    ReapResult,
     _latest_mtime_in_tree,
     reap_silent_orphans_tick,
 )
@@ -169,6 +170,72 @@ def test_dispatcher_alive_stale_falls_through_to_hb(tmp_path: Path) -> None:
     # Both stale + no working_dir = no FS check = act on KILL verdict.
     assert len(results) == 1
     assert results[0].verdict is HeartbeatVerdict.KILL
+
+
+def test_dispatcher_alive_exactly_alert_old_still_short_circuits(tmp_path: Path) -> None:
+    """The Layer-2 gate is inclusive: a dispatcher_alive_at exactly
+    ``heartbeat_silence_alert_s`` old still proves a live monitor, so a
+    task whose last_heartbeat_at alone would be SILENT is left untouched."""
+    qd = _queue(tmp_path)
+    _seed_task_and_state(
+        qd,
+        "t-alive-at-alert",
+        started_at=_now() - timedelta(seconds=3600),
+        # Past the 300s alert but short of the 600s stuck-sleep-loop bar,
+        # so the /proc detector never runs.
+        last_heartbeat_at=_now() - timedelta(seconds=500),
+        dispatcher_alive_at=_now() - timedelta(seconds=300),
+        pid=7,
+        working_dir=None,
+    )
+    before = load_state(state_path_for(qd, "t-alive-at-alert"))
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-alive-at-alert"},
+        settings=_settings(alert=300, kill=0),
+        clock=FakeClock(_now()),
+    )
+
+    assert results == []
+    assert load_state(state_path_for(qd, "t-alive-at-alert")) == before
+
+
+def test_dispatcher_alive_one_second_past_alert_falls_through(tmp_path: Path) -> None:
+    """One second older than ``heartbeat_silence_alert_s``,
+    dispatcher_alive_at no longer proves a live monitor, so the
+    last_heartbeat_at verdict (SILENT) applies."""
+    qd = _queue(tmp_path)
+    _seed_task_and_state(
+        qd,
+        "t-alive-past-alert",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=500),
+        dispatcher_alive_at=_now() - timedelta(seconds=301),
+        pid=7,
+        working_dir=None,
+    )
+    before = load_state(state_path_for(qd, "t-alive-past-alert"))
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-alive-past-alert"},
+        settings=_settings(alert=300, kill=0),
+        clock=FakeClock(_now()),
+    )
+
+    assert results == [
+        ReapResult(
+            task_id="t-alive-past-alert",
+            verdict=HeartbeatVerdict.SILENT,
+            silence_s=500.0,
+            pid=7,
+            sigtermed=False,
+        )
+    ]
+    assert load_state(state_path_for(qd, "t-alive-past-alert")) == before.model_copy(
+        update={"status": "possibly_hung", "stop_reason": STEADY_SILENT_STOP_REASON, "pid": None}
+    )
 
 
 def test_dispatcher_alive_predates_started_treated_as_none(tmp_path: Path) -> None:
@@ -331,6 +398,80 @@ def test_fs_stale_mtime_still_kills(tmp_path: Path) -> None:
     reloaded = load_state(state_path_for(qd, "t-zombie"))
     assert reloaded.status == "failed"
     assert reloaded.stop_reason == KILL_STOP_REASON
+
+
+def test_fs_mtime_exactly_window_old_counts_as_activity(tmp_path: Path) -> None:
+    """The Layer-3 window is inclusive: an mtime exactly
+    ``zombie_verify_fs_activity_window_s`` old still proves activity, so
+    the task stays running with last_heartbeat_at refreshed to the mtime."""
+    qd = _queue(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    _seed_task_and_state(
+        qd,
+        "t-fs-at-window",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-at-window"))
+    mtime = _now() - timedelta(seconds=600)
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-fs-at-window"},
+        settings=_settings(alert=300, kill=0, fs_window=600),
+        clock=FakeClock(_now()),
+        fs_mtime_fn=lambda _path: mtime.timestamp(),
+    )
+
+    assert results == []
+    assert load_state(state_path_for(qd, "t-fs-at-window")) == before.model_copy(
+        update={"last_heartbeat_at": mtime}
+    )
+
+
+def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None:
+    """One second older than ``zombie_verify_fs_activity_window_s``, the
+    mtime proves nothing: the heartbeat verdict (SILENT) applies and
+    last_heartbeat_at is not refreshed."""
+    qd = _queue(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    _seed_task_and_state(
+        qd,
+        "t-fs-past-window",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-past-window"))
+    mtime = _now() - timedelta(seconds=601)
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-fs-past-window"},
+        settings=_settings(alert=300, kill=0, fs_window=600),
+        clock=FakeClock(_now()),
+        fs_mtime_fn=lambda _path: mtime.timestamp(),
+    )
+
+    assert results == [
+        ReapResult(
+            task_id="t-fs-past-window",
+            verdict=HeartbeatVerdict.SILENT,
+            silence_s=2000.0,
+            pid=42,
+            sigtermed=False,
+        )
+    ]
+    assert load_state(state_path_for(qd, "t-fs-past-window")) == before.model_copy(
+        update={"status": "possibly_hung", "stop_reason": STEADY_SILENT_STOP_REASON, "pid": None}
+    )
 
 
 def test_fs_check_skipped_when_no_working_dir(tmp_path: Path) -> None:

@@ -22,6 +22,28 @@ Breaking changes are called out in the version notes.
   commit before this cleanup began, it names all eight dead modules removed
   since (`supervisor/window.py`, `runner/runtime_stats.py` and the six empty
   packages). vulture joins the `dev` extra.
+- **CI smoke-tests a non-editable install.** The other CI steps import the
+  package from the editable install, whose `.pth` file serves `src/`, so
+  nothing ran it from site-packages, where `pip install .` and `pipx install`
+  put it. A new step, on each Python version CI tests, installs the package
+  with `pip install .` into a fresh venv and runs `scripts/smoke_installed.py`
+  with that venv's interpreter from outside the checkout. Every version runs
+  it because the package reads its skills and default settings through
+  `importlib.resources` on namespace packages, and Python 3.11 resolves a path
+  in one with different code than 3.12 and 3.13 do. The script checks that
+  the package imports from that venv's site-packages, that
+  `claude-task-runner --help` exits 0, and that `load_settings(None)`
+  validates the shipped defaults. It checks that every skill in `SKILL_NAMES`
+  resolves to a directory in the package with a `SKILL.md`, and that
+  `watchdog.sh` and `verify_branch_contributions.sh` are executable, since
+  cron and `merge_branches.sh` run them directly. Last, `install-skills --yes`
+  into an empty `HOME` must link every skill to its directory. Each check
+  prints PASS or FAIL, and the step fails if any check does. An install with
+  the skills or the default settings left out of the wheel, with either
+  script's executable bit dropped, or with a broken console-script entry point
+  each turned it red. `tests/unit/test_smoke_installed.py` pins what the
+  script reports from an editable install, where only the site-packages check
+  fails, and against stand-ins with one defect each.
 
 ### Removed
 
@@ -106,6 +128,16 @@ Breaking changes are called out in the version notes.
 
 ### Changed
 
+- **`supervisor.json` is schema v6: each account records its
+  `target_concurrency`,** the cap from its last throttle decision
+  (`max_concurrency` while dispatching, the ramp while slowing down, 0
+  while throttled; unset in `idle` and `error_drift`). A v5 file migrates
+  on load with nothing rewritten, and each account's target is set at its
+  next capture. An older runner refuses a v6 file with
+  `schema_version=6 does not match supported 5`. `account list` shows
+  `in_flight=N/cap`, and its `--json` rows add `target_concurrency` and
+  `dispatch_cap`. The `runner-status` per-account table gains a `target`
+  column.
 - **Queue YAML is parsed with LibYAML's `CSafeLoader` when PyYAML has it,
   so a tick's `todo/` scan is about 11× faster.** Every supervisor tick,
   `_eligible_candidates` and `planned_dispatch_order` load every task YAML in
@@ -191,8 +223,88 @@ Breaking changes are called out in the version notes.
   it dispatches exactly as before. `queue template` no longer lists it, and the
   `runner-add-task` skill no longer names it as an example.
 
+- **Stream-parser fields that nothing read.** `runner.stream` filled
+  `AssistantMessageEvent.text_excerpt` and `usage_delta`, `ResultEvent.subtype`
+  and `duration_ms`, `StreamSummary.event_count`, and a `raw` copy of the
+  parsed line on all four event types. Nothing outside the parser read any of
+  them. The dispatcher reads only the summary: the session id, the running
+  usage, the skipped-line counts, and the final result's stop reason, error
+  flag, cost and usage. `_extract_assistant_text`, which existed only to fill
+  `text_excerpt`, goes too. With the default `adopt_workers = true`, every
+  attempt's full stream is already on disk in
+  `.claude_task_runner/logs/<task>/attempt-N.stream.jsonl`. The parser still
+  yields the same events, so the heartbeat is unchanged, and a result line's
+  `subtype` still stands in for a missing `stop_reason` or `is_error`. A
+  result line whose `duration_ms` is not a number no longer raises out of the
+  parser. The dead-code gate had allowlisted four of these fields. It could
+  not see `duration_ms` or `raw`, because vulture matches names across the
+  whole package: `ResultEvent(duration_ms=duration_ms)` reads a local of the
+  same name. The drift canary's usage check moves from each event's
+  `usage_delta` to the running `StreamSummary.cumulative_usage`, checked
+  exactly after each assistant message, which is the total the per-task token
+  cap reads.
+
 ### Fixed
 
+- **A task whose (model, effort) pair the queue's `[effort_levels]` rejects is
+  parked, not dispatched.** ADR-0010 said `Task.effort` was validated at load
+  time, but only `queue add` checked it: a hand-written or edited task YAML
+  naming an effort its model does not accept (`max` for `claude-sonnet-4-6`),
+  or a model missing from `[effort_levels]`, loaded and dispatched unchecked.
+  The task schema cannot check the pair, since the accepted sets live in the
+  merged settings, so the supervisor's candidate selector now does, against
+  the settings it runs with. A task that fails is set to `deferred` with
+  `deferred_reason: "invalid effort: <why>"` and one WARNING, like an ADR-0030
+  readiness hold: no attempt or run is recorded and the circuit breaker is
+  untouched. It goes back to `pending` on the first tick after its YAML is
+  fixed, or after the pair is added to `[effort_levels]` and the supervisor
+  gets SIGHUP. Only tasks the selector would dispatch are checked: a
+  completed, running or circuit-broken task is left alone when
+  `[effort_levels]` changes. The dispatch thread re-checks as a backstop, and
+  force-dispatch refuses the task on every path: the CLI exits 2 before it
+  dispatches or writes a request, and the supervisor drops a request already
+  written. `doctor`'s `task_yamls` check now FAILs on such a task, and each
+  `queue list` row carries `effort_error`, `null` when the pair is accepted.
+  `queue list` gained `--config`, which defaults to `<queue>/claude_runner.toml`
+  like `queue add`, and it exits 2 if that file does not load. The
+  previous-generation entries in the packaged `[effort_levels]` keep tasks
+  that name `claude-opus-4-7` or `claude-sonnet-4-6` dispatching, and a test
+  now fails if one is dropped. On 2026-09-26 every one of the 5,293 tasks on
+  the nlmixr2lib queue passed. The unknown-model message now shows the entry
+  to add (`"<model>" = [<levels>]` under `[effort_levels]`); the old
+  `[effort_levels.'<model>']` hint named a sub-table the schema rejects, and
+  `queue add` printed it through Rich markup, which dropped it entirely.
+- **The cron watchdog now takes a queue's `[watchdog]` from the queue's own
+  config, and a cron `install --config` is recorded.** The crontab line runs
+  `watchdog.sh`, which runs `watchdog tick` with no `--config`, and the tick
+  loaded only the package defaults. A queue's `restart_cooldown_s`,
+  `restart_backoff_max_s` and `crash_loop_threshold` therefore did nothing
+  under cron. `install --config` was dropped: the registry kept only the
+  queue's path, and the restarted `supervisor start` ran without `--config`,
+  so it found only `<queue>/claude_runner.toml`. `install --config` and a new
+  `claude-task-runner watchdog register --config <toml>` now record the file,
+  made absolute, in `~/.claude_task_runner/queues.json`. It goes in a
+  `configs` map keyed by queue, and `queues` stays a list of paths, so an
+  older reader still finds the queue. A tick picks the managed queue's
+  config in this order:
+  1. the tick's own `--config`;
+  2. the recorded config;
+  3. `<queue>/claude_runner.toml`, if it exists;
+  4. the package defaults.
+
+  It decides with that config's `[watchdog]`, and a restart passes the same
+  file to `supervisor start --config`. The log line for a restart names it.
+  Registering again without `--config` drops the recorded config, and
+  unregistering the queue drops it too. `register` refuses a config that
+  does not load, whether given with `--config` or found in the queue, since
+  every tick would fail on it. When the queue's config does not load at tick
+  time (bad TOML, a schema error, or a recorded file that is gone), the tick
+  logs one `ERROR` line naming the file and the error. It neither checks
+  nor restarts the supervisor, falls back to no other config, saves its
+  state and exits 1. A supervisor started with that file would fail the same
+  way. The runbook has a section for that line. The tests that pinned the
+  old behaviour now assert the new one: a 999 s cooldown in the queue's TOML
+  holds a restart 60 s after the last one.
 - **Commands that read a queue no longer create a `--queue` that does not
   exist.** `queue list`, `queue states`, `sidecar list`, `supervisor status`,
   `account list` and `account resume` created `<queue>/todo/` or
@@ -248,6 +360,33 @@ Breaking changes are called out in the version notes.
   `UnicodeDecodeError`. What those commands print is otherwise unchanged.
   stop and drain now also print without Rich markup, which dropped a
   `[word]` from a queue path and raised `MarkupError` on a `[/]`.
+- **A single-account queue now stops dispatching while throttled or
+  drifting.** Its usage source names no account, so each reading updated
+  only the top-level snapshot, and `accounts["default"]` stayed in the
+  `idle` it was seeded with. Dispatch has gated on each account's own state
+  since the per-account gate (PR 9, 2026-05-22), so `THROTTLED_5H`,
+  `THROTTLED_WEEKLY` and `ERROR_DRIFT` never stopped a single-account
+  queue: it kept dispatching up to its cap right after notifying "pausing
+  dispatch". An unnamed reading or poll error now belongs to the queue's
+  only account. That also makes the decision scale that account's own
+  `max_concurrency`, the cap dispatch applies, rather than the queue-wide
+  one. Queues with two or more accounts were not affected.
+- **`SLOWING_DOWN` now dispatches the concurrency it announces, per account
+  (ADR-0022).** On entering `SLOWING_DOWN` the supervisor notified
+  `target concurrency=X/Y`, where `X` is ADR-0022's linear ramp, but
+  nothing read that number. Dispatch instead halved the queue-wide
+  `[concurrency].max_concurrency` whenever the top-level state was
+  `SLOWING_DOWN`. That state mirrors whichever account was captured last,
+  so on a two-account queue an account slowing down at 55% 5h, told 2 of 5,
+  ran 4 or 1 depending on capture order. Now each account is capped at its
+  `max_concurrency` lowered to its own decision's target, and the
+  queue-wide halving is gone. The notice repeats whenever the target
+  changes, so the last one names the cap in force. **This changes how much
+  runs.** With `max_concurrency = 5` and the 40/60 day band an account now
+  runs 5 tasks at 40–43% 5h, 4 at 44–47%, 3 at 48–51%, 2 at 52–55% and 1 at
+  56–59%. An account with `max_concurrency = 1` runs 1 until it stops. The
+  queue-wide `[concurrency]` ceiling still bounds the total, whatever the
+  throttle state.
 - **`uv build --wheel`, `pip install .` and a non-editable `pipx install` no
   longer fail.** `[tool.hatch.build.targets.wheel] packages` already ships
   every file under `src/claude_task_runner/`, data files included, but a
@@ -316,10 +455,8 @@ Breaking changes are called out in the version notes.
   argument and no longer take `restart_sec_s`, `start_limit_burst` or
   `start_limit_interval_s`.
 
-  **The cron watchdog still ignores a queue's `[watchdog]`.** `watchdog.sh`
-  runs `watchdog tick` with no `--config`, so the tick uses the package
-  defaults, and a cron `install --config` is not recorded. Tests pin both
-  until a follow-up makes the tick load the managed queue's config.
+  The cron watchdog reads a queue's `[watchdog]` as well; see the entry on
+  the cron watchdog above.
 - **A relative `install --config` now reaches the systemd unit as the file
   `install` checked.** `install --config rel.toml` loaded `rel.toml` from
   the directory it ran in, but wrote `--config rel.toml` into the unit's
@@ -353,6 +490,35 @@ Breaking changes are called out in the version notes.
   whether the unit is active. `cron/systemd_unit.py` sorts every directive
   the unit writes into those two groups, and a test fails when a new
   directive is in neither. The runbook has a section for the symptom.
+- **With `[supervisor].adopt_workers` off, a systemd stop now waits as long
+  as `[task_caps].max_duration_s_per_task` lets a task run.** The unit's
+  `ExecStop` drains, and `systemctl --user stop` or `restart` waits
+  `TimeoutStopSec` for the in-flight tasks, then SIGKILLs the supervisor.
+  `install` wrote `TimeoutStopSec=14400` whatever the cap, so with a cap of
+  28800, or 0 (no limit), a stop killed at 4 h tasks that the cap let run
+  longer, and the next supervisor dispatched them again. `install` now
+  writes the cap, and `infinity` for 0. The default cap is 14400, so a queue
+  that does not set it gets the same unit as before, byte for byte, and a
+  test pins that. The timeout has no margin over the cap: an attempt in
+  flight when a stop begins started before it, so its cap runs out first.
+  It does not cover time outside the cap: a pre-dispatch hook still running
+  when the stop began, the post-dispatch hook, the wait until the dispatcher
+  notices a spent cap (it checks when the agent emits an event), or a task's
+  `max_duration_s_override` above the queue's cap. A cap the unit cannot
+  carry stops `install` with exit 2 before anything is written: one longer
+  than 18,446,744,073,708 s, `inf`, or one under half a microsecond, which
+  would be written as `0`, and systemd reads `TimeoutStopSec=0` as no
+  timeout. With adoption on, the default, the unit keeps its fixed 30 s and
+  does not read the cap. On systemd 255, throwaway units showed that a
+  reloaded `TimeoutStopSec` times the next stop without a restart: one
+  started with 60 and reloaded with 3 stopped in 3 s, one reloaded from 3
+  to 8 in 8 s. So re-running `install` after changing the cap is enough, and
+  `install` asks nothing more when only the cap changed. The same units
+  showed that systemd sends the supervisor SIGTERM as soon as `ExecStop`
+  returns. `build_unit_text` and `build_install_plan` now require a
+  `task_caps` argument, and `build_unit_text` no longer takes
+  `timeout_stop_sec`, which only a test passed. The runbook has a section
+  for the symptom.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a
