@@ -223,7 +223,7 @@ class TestMigrationV3ToV4:
         assert snap.accounts["b"].state is SupervisorState.SLOWING_DOWN
 
     def test_v2_then_v3_then_v4_chain(self, queue_dir: Path) -> None:
-        """v2 payload migrates through v3 to v4 in one load."""
+        """v2 payload migrates through v3 and v4 to v5 in one load."""
         v2 = {
             "schema_version": 2,
             "state": "idle",
@@ -234,3 +234,84 @@ class TestMigrationV3ToV4:
         assert snap is not None
         assert snap.state is SupervisorState.IDLE
         assert snap.accounts["default"].state is SupervisorState.IDLE
+
+
+class TestMigrationV4ToV5:
+    """``stopped`` rewrites to ``idle``; nothing else in the file changes."""
+
+    def _write(self, queue_dir: Path, payload: dict) -> Path:
+        path = supervisor_state_path(queue_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload))
+        return path
+
+    def test_stopped_rewrites_to_idle(self, queue_dir: Path) -> None:
+        v4 = {
+            "schema_version": 4,
+            "state": "stopped",
+            "since": "2026-09-25T12:00:00+00:00",
+            "accounts": {
+                "a": {"state": "stopped", "since": "2026-09-25T12:00:00+00:00"},
+                "b": {
+                    "state": "throttled_5h",
+                    "since": "2026-09-25T12:00:00+00:00",
+                    "scheduled_wakeup_at": "2026-09-25T17:05:00+00:00",
+                },
+            },
+            "in_flight": [
+                {
+                    "task_id": "task-001",
+                    "account": "b",
+                    "started_at": "2026-09-25T11:00:00+00:00",
+                },
+            ],
+            "in_flight_task_ids": ["task-001"],
+        }
+        snap = load(self._write(queue_dir, v4))
+        assert snap is not None
+        assert snap.schema_version == 5
+        assert snap.state is SupervisorState.IDLE
+        assert snap.accounts["a"].state is SupervisorState.IDLE
+        # Other states, their wakeups and in-flight tasks are untouched.
+        assert snap.accounts["b"].state is SupervisorState.THROTTLED_5H
+        assert snap.accounts["b"].scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
+        assert [r.task_id for r in snap.in_flight] == ["task-001"]
+        assert snap.in_flight_task_ids == ["task-001"]
+
+    def test_v4_without_stopped_keeps_state_and_wakeup(self, queue_dir: Path) -> None:
+        v4 = {
+            "schema_version": 4,
+            "state": "dispatching",
+            "since": "2026-09-25T12:00:00+00:00",
+            "scheduled_wakeup_at": "2026-09-25T17:05:00+00:00",
+        }
+        snap = load(self._write(queue_dir, v4))
+        assert snap is not None
+        assert snap.schema_version == 5
+        assert snap.state is SupervisorState.DISPATCHING
+        assert snap.scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
+
+    def test_v3_stopped_migrates_through_to_idle(self, queue_dir: Path) -> None:
+        """v3 -> v4 passes ``stopped`` through; v4 -> v5 rewrites it."""
+        v3 = {"schema_version": 3, "state": "stopped", "since": "2026-09-25T12:00:00+00:00"}
+        snap = load(self._write(queue_dir, v3))
+        assert snap is not None
+        assert snap.schema_version == 5
+        assert snap.state is SupervisorState.IDLE
+
+    def test_malformed_account_entry_still_fails_loud(self, queue_dir: Path) -> None:
+        """The migration passes a non-object account through untouched, and
+        validation then rejects the file rather than guessing."""
+        v4 = {
+            "schema_version": 4,
+            "state": "stopped",
+            "since": "2026-09-25T12:00:00+00:00",
+            "accounts": {"a": "not-an-object"},
+        }
+        with pytest.raises(SupervisorPersistenceError, match="accounts"):
+            load(self._write(queue_dir, v4))
+
+    def test_written_snapshot_is_v5(self, queue_dir: Path) -> None:
+        path = supervisor_state_path(queue_dir)
+        write_atomic(initial_snapshot(since=datetime(2026, 9, 25, 12, 0, tzinfo=UTC)), path)
+        assert json.loads(path.read_text())["schema_version"] == 5
