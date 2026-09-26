@@ -242,12 +242,6 @@ def task_template() -> str:
     return "\n".join(lines) + "\n"
 
 
-def template_covers_all_fields() -> list[str]:
-    """Field names the generated template fails to emit (generator self-check)."""
-    tpl = task_template()
-    return [n for n in Task.model_fields if f"{n}:" not in tpl]
-
-
 # ---------------------------------------------------------------------------
 # Friendly validation errors
 # ---------------------------------------------------------------------------

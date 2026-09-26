@@ -22,6 +22,19 @@ PER_QUEUE_CONFIG_NAME = "claude_runner.toml"
 """Conventional filename for a per-queue runner config sitting at
 ``<queue>/claude_runner.toml``."""
 
+CWD_DEFAULT_LABEL = "current directory"
+"""What ``--help`` shows as the default of an option whose default is ``Path.cwd``.
+
+Such an option passes the method, not ``Path.cwd()``, so click calls it
+when the command runs, and the default is the directory the command runs
+in. Typer shows a callable default with ``str()`` unless it is a plain
+function, and ``Path.cwd`` is a bound method, so without
+``show_default=CWD_DEFAULT_LABEL`` help printed
+``[default: <bound method Path.cwd of <class 'pathlib.Path'>>]``. With it,
+help prints ``[default: (current directory)]``.
+``tests/unit/test_docs_cli_help.py`` gates the help and the default.
+"""
+
 
 def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | None:
     """Pick the per-queue ``claude_runner.toml`` to feed to ``load_settings``.

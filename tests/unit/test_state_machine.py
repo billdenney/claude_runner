@@ -835,6 +835,43 @@ class TestWakeupScheduling:
         assert wakeups[0].when == expected
         assert new.scheduled_wakeup_at == expected
 
+    def test_throttled_5h_unparseable_reset_schedules_fallback_wakeup(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """With no parseable 5h ``resets_at`` the wakeup falls back to one
+        full 5h window from now, plus ``window_start_delay_s``."""
+        # 450s is neither the 300s default nor poll_interval_s, so the
+        # expected time also proves step() passes this setting through.
+        settings = supervisor_settings.model_copy(update={"window_start_delay_s": 450.0})
+        snap = _initial(SupervisorState.DISPATCHING)
+        reading = _reading(
+            five_pct=80,
+            weekly_pct=5,
+            five_resets=None,  # the 5h reset time did not parse
+            weekly_resets=clock.now() + timedelta(days=4),
+        )
+        new, actions = step(
+            _input(
+                snap,
+                reading,
+                policy,
+                settings,
+                usage_settings,
+                pending=2,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.THROTTLED_5H
+        wakeups = [a for a in actions if isinstance(a, ScheduleWakeupAt)]
+        assert len(wakeups) == 1
+        expected = clock.now() + timedelta(hours=5, seconds=450)
+        assert wakeups[0].when == expected
+        assert new.scheduled_wakeup_at == expected
+
     def test_dispatching_clears_wakeup(
         self,
         policy: ResolvedPolicy,

@@ -19,7 +19,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import require_queue_option, resolve_per_queue_config
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    require_queue_option,
+    resolve_per_queue_config,
+)
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.observability import configure_logging
@@ -214,7 +218,9 @@ def start(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     max_ticks: int | None = typer.Option(
         None, "--max-ticks", help="Cap loop at N ticks (testing)."
     ),
@@ -295,7 +301,9 @@ def stop(
             "the unit's ExecStop runs."
         ),
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for clean exit."),
 ) -> None:
     """Send SIGTERM to the running supervisor.
@@ -348,7 +356,9 @@ def drain(
             "--config` errors when the unit's `ExecStop` runs."
         ),
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     wait: bool = typer.Option(
         True,
         "--wait/--no-wait",
@@ -452,7 +462,9 @@ def status(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Per-queue claude_runner.toml."
     ),
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Show the supervisor's current state and recent activity."""

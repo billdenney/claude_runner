@@ -6,9 +6,6 @@ import pytest
 
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
-    UnknownModel,
-    accepted_efforts,
-    accepted_models,
     validate_effort,
 )
 
@@ -17,40 +14,6 @@ LEVELS = {
     "claude-sonnet-4-6": ["low", "medium", "high"],
     "claude-haiku-4-5": ["low", "medium", "high"],
 }
-
-
-class TestAcceptedEfforts:
-    def test_returns_list(self) -> None:
-        assert accepted_efforts("claude-opus-4-7", LEVELS) == [
-            "low",
-            "medium",
-            "high",
-            "max",
-            "extra_high",
-        ]
-
-    def test_returns_copy_not_reference(self) -> None:
-        out = accepted_efforts("claude-opus-4-7", LEVELS)
-        out.append("forged")
-        # Original unchanged
-        assert "forged" not in LEVELS["claude-opus-4-7"]
-
-    def test_unknown_model_raises(self) -> None:
-        with pytest.raises(UnknownModel) as exc_info:
-            accepted_efforts("claude-foo-9-9", LEVELS)
-        assert exc_info.value.model == "claude-foo-9-9"
-        assert "claude-opus-4-7" in str(exc_info.value)
-
-
-class TestAcceptedModels:
-    def test_includes_all_with_efforts(self) -> None:
-        assert set(accepted_models(LEVELS)) == set(LEVELS)
-
-    def test_excludes_empty_lists(self) -> None:
-        levels = {**LEVELS, "claude-empty-0-0": []}
-        out = accepted_models(levels)
-        assert "claude-empty-0-0" not in out
-        assert "claude-opus-4-7" in out
 
 
 class TestValidateEffort:

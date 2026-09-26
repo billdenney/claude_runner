@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron.systemd_unit import (
+    _SYSTEMD_MAX_UNSIGNED,
+    _SYSTEMD_MAX_WHOLE_SECONDS,
     UNIT_NAME,
     SystemdError,
+    UnitSettingError,
     apply_plan,
     build_install_plan,
     build_unit_text,
@@ -20,6 +29,38 @@ _START = (
     "/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml"
 )
 
+_DEFAULTS = load_settings(None).watchdog
+"""The package's ``[watchdog]`` defaults: 30 s, 600 s and 5."""
+
+_UNIT_BEFORE_WATCHDOG = """\
+[Unit]
+Description=Claude Code task-runner supervisor
+After=default.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=TERM=xterm-256color
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/claude-task-runner supervisor start --queue /q --config /q/claude_runner.toml
+ExecStop=-/usr/local/bin/claude-task-runner supervisor stop --queue /q --config /q/claude_runner.toml
+WorkingDirectory=/q
+KillMode=process
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+"""The unit ``build_unit_text`` wrote for ``_START`` before it read
+``[watchdog]``, when RestartSec, StartLimitBurst and
+StartLimitIntervalSec were hardcoded. Captured from that code."""
+
 
 def _only_line(text: str, key: str) -> str:
     """Return the unit's single ``<key>=`` line."""
@@ -28,11 +69,17 @@ def _only_line(text: str, key: str) -> str:
     return lines[0]
 
 
+def _watchdog(**overrides: float) -> WatchdogSettings:
+    """The package defaults with ``overrides``, validated like a TOML."""
+    return WatchdogSettings.model_validate({**_DEFAULTS.model_dump(), **overrides})
+
+
 class TestBuildUnitText:
     def test_includes_required_sections(self) -> None:
         text = build_unit_text(
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
+            watchdog=_DEFAULTS,
         )
         assert "[Unit]" in text
         assert "[Service]" in text
@@ -46,31 +93,18 @@ class TestBuildUnitText:
         text = build_unit_text(
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
+            watchdog=_DEFAULTS,
         )
         # Exit status 0 is a clean stop or finished drain; no relaunch loop.
         assert "RestartPreventExitStatus=0" in text
-
-    def test_restart_sec_customizable(self) -> None:
-        text = build_unit_text(
-            supervisor_command="x",
-            queue_dir=Path("/q"),
-            restart_sec_s=120,
-        )
-        assert "RestartSec=120" in text
-
-    def test_start_limit_customizable(self) -> None:
-        text = build_unit_text(
-            supervisor_command="x",
-            queue_dir=Path("/q"),
-            start_limit_burst=10,
-        )
-        assert "StartLimitBurst=10" in text
 
     def test_includes_drain_execstop_when_adoption_off(self) -> None:
         """With adoption OFF, ExecStop runs ``supervisor drain --no-wait``
         so systemctl stop/restart goes through the graceful-drain path
         (the historical PR-11 wiring, plus the ``-`` prefix)."""
-        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), adopt_workers=False)
+        text = build_unit_text(
+            supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS, adopt_workers=False
+        )
         # Same binary path as ExecStart so the operator's pipx install is
         # honoured, the same --queue / --config so drain targets the right
         # state file, and the `-` prefix so systemd ignores its exit status.
@@ -83,7 +117,7 @@ class TestBuildUnitText:
         """ADR-0025: with adoption ON (the default), ExecStop runs
         ``supervisor stop`` (a SIGTERM) so the daemon's fast stop trips —
         the supervisor exits promptly and file-backed workers survive."""
-        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"))
+        text = build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), watchdog=_DEFAULTS)
         assert _only_line(text, "ExecStop") == (
             "ExecStop=-/usr/local/bin/claude-task-runner supervisor stop "
             "--queue /q --config /q/claude_runner.toml"
@@ -101,7 +135,10 @@ class TestBuildUnitText:
         ``Restart=on-failure``."""
         for adopt in (True, False):
             text = build_unit_text(
-                supervisor_command=_START, queue_dir=Path("/q"), adopt_workers=adopt
+                supervisor_command=_START,
+                queue_dir=Path("/q"),
+                watchdog=_DEFAULTS,
+                adopt_workers=adopt,
             )
             assert _only_line(text, "ExecStart") == f"ExecStart={_START}"
             assert _only_line(text, "ExecStop").startswith(
@@ -113,7 +150,10 @@ class TestBuildUnitText:
         systemd's SIGKILL escalation on the main PID — in BOTH modes."""
         for adopt in (True, False):
             text = build_unit_text(
-                supervisor_command="x", queue_dir=Path("/q"), adopt_workers=adopt
+                supervisor_command="x",
+                queue_dir=Path("/q"),
+                watchdog=_DEFAULTS,
+                adopt_workers=adopt,
             )
             assert "KillMode=process" in text
 
@@ -121,14 +161,16 @@ class TestBuildUnitText:
         """ADR-0025: with adoption ON (default) the supervisor fast-stops,
         so TimeoutStopSec drops to a short 30s bound instead of the 4h
         drain ceiling — a `systemctl restart` is near-instant."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS)
         assert "TimeoutStopSec=30" in text
 
     def test_timeout_stop_sec_default_matches_max_task_duration_when_adoption_off(self) -> None:
         """With adoption OFF, TimeoutStopSec=14400 (4h) matches the default
         [task_caps].max_duration_s_per_task so drain has time to finish
         the longest plausibly-allowed task."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), adopt_workers=False)
+        text = build_unit_text(
+            supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS, adopt_workers=False
+        )
         assert "TimeoutStopSec=14400" in text
 
     def test_timeout_stop_sec_customizable(self) -> None:
@@ -138,6 +180,7 @@ class TestBuildUnitText:
             text = build_unit_text(
                 supervisor_command="x",
                 queue_dir=Path("/q"),
+                watchdog=_DEFAULTS,
                 timeout_stop_sec=1800,
                 adopt_workers=adopt,
             )
@@ -149,9 +192,210 @@ class TestBuildUnitText:
         sequence handles the eventual fresh-start when needed
         (``systemctl restart`` runs stop then start; ``stop`` alone
         leaves it stopped). Restart=on-failure only fires for crashes."""
-        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"))
+        text = build_unit_text(supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS)
         assert "Restart=on-failure" in text
         assert "RestartPreventExitStatus=0" in text
+
+
+_UNIT_LINE_OF = {
+    "restart_cooldown_s": "RestartSec",
+    "crash_loop_threshold": "StartLimitBurst",
+    "restart_backoff_max_s": "StartLimitIntervalSec",
+}
+"""The unit line each ``[watchdog]`` key sets."""
+
+
+def _unit(watchdog: WatchdogSettings) -> str:
+    return build_unit_text(supervisor_command=_START, queue_dir=Path("/q"), watchdog=watchdog)
+
+
+class TestRestartPolicyFromWatchdog:
+    """The unit's restart policy comes from the queue's ``[watchdog]``."""
+
+    def test_package_defaults_reproduce_the_hardcoded_unit(self) -> None:
+        """A queue that sets no ``[watchdog]`` gets the same unit as before."""
+        assert _unit(_DEFAULTS) == _UNIT_BEFORE_WATCHDOG
+
+    def test_each_key_sets_its_line(self) -> None:
+        text = _unit(
+            _watchdog(restart_cooldown_s=120, restart_backoff_max_s=1800, crash_loop_threshold=9)
+        )
+        assert _only_line(text, "RestartSec") == "RestartSec=120"
+        assert _only_line(text, "StartLimitBurst") == "StartLimitBurst=9"
+        assert _only_line(text, "StartLimitIntervalSec") == "StartLimitIntervalSec=1800"
+
+    def test_every_watchdog_key_sets_exactly_its_line(self) -> None:
+        """Each ``[watchdog]`` key changes its own unit line and nothing else.
+
+        Walks the schema, so a key added to ``[watchdog]`` later fails
+        here until it has a unit line in ``_UNIT_LINE_OF``."""
+        assert set(_UNIT_LINE_OF) == set(WatchdogSettings.model_fields)
+        before = _unit(_DEFAULTS).splitlines()
+        for key, unit_key in _UNIT_LINE_OF.items():
+            default = getattr(_DEFAULTS, key)
+            after = _unit(_watchdog(**{key: default * 2})).splitlines()
+            changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
+            assert changed == [(f"{unit_key}={default:g}", f"{unit_key}={default * 2:g}")], key
+
+    @pytest.mark.parametrize(
+        ("seconds", "written"),
+        [
+            (30, "30"),
+            (0.25, "0.25"),
+            (30.5, "30.5"),
+            # Rounded to systemd's resolution of one microsecond.
+            (30.1234567, "30.123457"),
+            # Python writes these two as 1e-05 and 1e-07, which systemd rejects.
+            (1e-5, "0.00001"),
+            (1e-7, "0"),
+            (_SYSTEMD_MAX_WHOLE_SECONDS + 0.5, "18446744073708.5"),
+        ],
+    )
+    def test_seconds_are_written_as_systemd_reads_them(self, seconds: float, written: str) -> None:
+        text = _unit(_watchdog(restart_cooldown_s=seconds, restart_backoff_max_s=seconds))
+        assert _only_line(text, "RestartSec") == f"RestartSec={written}"
+        assert _only_line(text, "StartLimitIntervalSec") == f"StartLimitIntervalSec={written}"
+
+    @pytest.mark.parametrize("key", ["restart_cooldown_s", "restart_backoff_max_s"])
+    def test_a_span_longer_than_systemd_accepts_is_refused(self, key: str) -> None:
+        """systemd would ignore the line and fall back to its own default."""
+        with pytest.raises(UnitSettingError) as excinfo:
+            _unit(_watchdog(**{key: float(_SYSTEMD_MAX_WHOLE_SECONDS + 1)}))
+        assert str(excinfo.value) == (
+            f"[watchdog].{key} = 18446744073709.0 is longer than systemd accepts (18446744073708 s)"
+        )
+
+    @pytest.mark.parametrize("key", ["restart_cooldown_s", "restart_backoff_max_s"])
+    def test_an_infinite_span_is_refused(self, key: str) -> None:
+        """The schema's ``gt=0`` lets ``inf`` through, and TOML can spell it."""
+        with pytest.raises(UnitSettingError) as excinfo:
+            _unit(_watchdog(**{key: float("inf")}))
+        assert str(excinfo.value) == f"[watchdog].{key} = inf is not a finite number of seconds"
+
+    def test_the_largest_burst_systemd_accepts_is_written(self) -> None:
+        text = _unit(_watchdog(crash_loop_threshold=_SYSTEMD_MAX_UNSIGNED))
+        assert _only_line(text, "StartLimitBurst") == "StartLimitBurst=4294967295"
+
+    def test_a_burst_larger_than_systemd_accepts_is_refused(self) -> None:
+        with pytest.raises(UnitSettingError) as excinfo:
+            _unit(_watchdog(crash_loop_threshold=_SYSTEMD_MAX_UNSIGNED + 1))
+        assert str(excinfo.value) == (
+            "[watchdog].crash_loop_threshold = 4294967296 is more than systemd accepts (4294967295)"
+        )
+
+
+_SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
+
+
+def _verify(unit_dir: Path, text: str) -> str:
+    """What ``systemd-analyze verify`` prints about ``text`` as a unit.
+
+    Its exit status says nothing here: a line systemd cannot parse gets
+    a warning, and ``verify`` still exits 0."""
+    assert _SYSTEMD_ANALYZE is not None
+    unit = unit_dir / "ctr-verify.service"
+    unit.write_text(text, encoding="utf-8")
+    proc = subprocess.run(
+        [_SYSTEMD_ANALYZE, "verify", "--man=no", str(unit)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return proc.stdout + proc.stderr
+
+
+@pytest.fixture
+def systemd_analyze() -> str:
+    if _SYSTEMD_ANALYZE is None:
+        pytest.skip("systemd-analyze is not installed")
+    return _SYSTEMD_ANALYZE
+
+
+@pytest.fixture
+def verify_dir(systemd_analyze: str, tmp_path: Path) -> Path:
+    """A directory to verify units in; skips where ``verify`` has warnings of its own."""
+    baseline = _verify(tmp_path, "[Unit]\nDescription=baseline\n\n[Service]\nExecStart=/bin/true\n")
+    if baseline:
+        pytest.skip(f"systemd-analyze verify is not usable here: {baseline.strip()}")
+    return tmp_path
+
+
+class TestSystemdParsesTheUnit:
+    """The unit text against systemd's own parser, where one is installed."""
+
+    def test_the_check_sees_a_line_systemd_ignores(self, verify_dir: Path) -> None:
+        """Guards the checks below: they would pass on no warnings at all."""
+        out = _verify(
+            verify_dir,
+            "[Unit]\nDescription=t\nStartLimitBurst=4294967296\n\n"
+            "[Service]\nExecStart=/bin/true\nRestartSec=1e-05\n",
+        )
+        assert "Failed to parse unsigned value, ignoring: 4294967296" in out
+        assert "Failed to parse sec value, ignoring: 1e-05" in out
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {
+                "restart_cooldown_s": 0.25,
+                "restart_backoff_max_s": 30.1234567,
+                "crash_loop_threshold": _SYSTEMD_MAX_UNSIGNED,
+            },
+            {"restart_cooldown_s": 1e-5, "restart_backoff_max_s": 1e-7, "crash_loop_threshold": 1},
+            {
+                "restart_cooldown_s": _SYSTEMD_MAX_WHOLE_SECONDS + 0.5,
+                "restart_backoff_max_s": float(_SYSTEMD_MAX_WHOLE_SECONDS),
+            },
+        ],
+        ids=["defaults", "fractional", "tiny", "longest"],
+    )
+    def test_systemd_parses_every_line(self, verify_dir: Path, overrides: dict[str, float]) -> None:
+        queue = verify_dir / "q"
+        queue.mkdir()
+        text = build_unit_text(
+            supervisor_command=f"/bin/true supervisor start --queue {queue}",
+            queue_dir=queue,
+            watchdog=_watchdog(**overrides),
+        )
+        assert _verify(verify_dir, text) == ""
+
+    @pytest.mark.parametrize(
+        "seconds", [30, 0.25, 30.1234567, 1e-5, 1e-7, _SYSTEMD_MAX_WHOLE_SECONDS + 0.5]
+    )
+    def test_systemd_reads_what_watchdog_says(self, systemd_analyze: str, seconds: float) -> None:
+        """To within half a microsecond, systemd's resolution."""
+        line = _only_line(_unit(_watchdog(restart_cooldown_s=seconds)), "RestartSec")
+        written = line.removeprefix("RestartSec=")
+        proc = subprocess.run(
+            [systemd_analyze, "timespan", written],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        match = re.search(r"(?:μs|us): (\d+)", proc.stdout)
+        assert match is not None, proc.stdout
+        microseconds = Decimal(match.group(1))
+        assert microseconds == Decimal(written) * 1_000_000
+        assert abs(microseconds - Decimal(repr(seconds)) * 1_000_000) <= Decimal("0.5")
+
+    def test_the_longest_span_is_the_one_systemd_accepts(self, systemd_analyze: str) -> None:
+        def _timespan(text: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [systemd_analyze, "timespan", text],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        assert _timespan(str(_SYSTEMD_MAX_WHOLE_SECONDS)).returncode == 0
+        too_long = _timespan(str(_SYSTEMD_MAX_WHOLE_SECONDS + 1))
+        assert too_long.returncode != 0
+        assert "out of range" in too_long.stderr
 
 
 class TestBuildInstallPlan:
@@ -159,6 +403,7 @@ class TestBuildInstallPlan:
         plan = build_install_plan(
             supervisor_command="/usr/bin/claude-task-runner supervisor start",
             queue_dir=Path("/queue"),
+            watchdog=_DEFAULTS,
             unit_path=tmp_path / f"{UNIT_NAME}.service",
         )
         assert plan.unit_path.name == f"{UNIT_NAME}.service"
@@ -172,6 +417,7 @@ class TestBuildInstallPlan:
         plan = build_install_plan(
             supervisor_command="/usr/bin/x",
             queue_dir=Path("/q"),
+            watchdog=_DEFAULTS,
             unit_path=path,
         )
         assert plan.block_existed is True
@@ -193,6 +439,7 @@ class TestApplyPlan:
         plan = build_install_plan(
             supervisor_command="/usr/bin/x",
             queue_dir=tmp_path,
+            watchdog=_DEFAULTS,
             unit_path=unit_path,
         )
         binary = self._make_fake_systemctl(tmp_path)
@@ -205,6 +452,7 @@ class TestApplyPlan:
         plan = build_install_plan(
             supervisor_command="/usr/bin/x",
             queue_dir=tmp_path,
+            watchdog=_DEFAULTS,
             unit_path=unit_path,
         )
         binary = self._make_fake_systemctl(tmp_path, fail=True)
@@ -294,6 +542,7 @@ def test_unit_text_includes_term_and_path_environment() -> None:
     text = build_unit_text(
         supervisor_command="/usr/bin/claude-task-runner supervisor start",
         queue_dir=Path("/home/bill/queue"),
+        watchdog=_DEFAULTS,
     )
     assert "Environment=TERM=" in text
     assert "Environment=PATH=" in text

@@ -24,6 +24,7 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL
 from claude_task_runner.queue.schema import (
     SidecarAnswer,
     SidecarResponse,
@@ -63,7 +64,9 @@ def _one_line(summary: object) -> str:
 @app.command("list")
 def list_sidecars(
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """List unanswered sidecar requests across all tasks.
@@ -169,7 +172,9 @@ def show_sidecar(
     task_id: str = typer.Argument(...),
     sequence: int = typer.Argument(..., min=1),
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Print the full content of one sidecar request."""
@@ -216,7 +221,9 @@ def answer_sidecar(
     task_id: str = typer.Argument(...),
     sequence: int = typer.Argument(..., min=1),
     *,
-    queue_dir: Path = typer.Option(Path.cwd, "--queue", help="Queue directory."),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
     answers_json: str | None = typer.Option(
         None,
         "--answers",

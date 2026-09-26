@@ -11,14 +11,14 @@ from claude_task_runner.queue.help import (
     explain_validation_error,
     field_reference,
     task_template,
-    template_covers_all_fields,
 )
 from claude_task_runner.queue.schema import Task
 
 
 def test_template_covers_every_field():
     # Drift guard: adding a Task field without updating the template fails here.
-    assert template_covers_all_fields() == []
+    tpl = task_template()
+    assert [name for name in Task.model_fields if f"{name}:" not in tpl] == []
 
 
 def test_template_is_itself_a_valid_task():

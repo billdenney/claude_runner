@@ -8,9 +8,10 @@ machine.
 The supervisor runs as a long-lived ``simple`` service with
 ``Restart=on-failure``. Systemd handles backoff, exit-code tracking,
 and signals, so we don't need our :mod:`cron.backoff` module under
-systemd. Nothing on the systemd path runs ``watchdog tick``, and a
-systemd ``install`` does not register its queue with the cron
-watchdog.
+systemd. The unit's restart policy comes from the queue's
+``[watchdog]`` table instead (see :func:`build_unit_text`). Nothing on
+the systemd path runs ``watchdog tick``, and a systemd ``install``
+does not register its queue with the cron watchdog.
 
 When operators have neither systemd-as-PID-1 nor ``systemctl --user``
 working (e.g. inside Docker without a tmpfiles.d setup), we fall back
@@ -20,10 +21,13 @@ to cron. Detection is in :func:`is_systemd_user_available`.
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from claude_task_runner.config.schema import WatchdogSettings
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +35,28 @@ UNIT_NAME = "claude-task-runner"
 """systemd unit name; appended to ``~/.config/systemd/user/`` as
 ``<UNIT_NAME>.service``."""
 
+_SYSTEMD_MAX_WHOLE_SECONDS = 18_446_744_073_708
+"""The largest whole part of a time span, in seconds, that systemd
+accepts: just under 2**64 microseconds. ``systemd-analyze timespan``
+(systemd 255) rejects one more with "Numerical result out of range"."""
+
+_SYSTEMD_MAX_UNSIGNED = 2**32 - 1
+"""The largest ``StartLimitBurst=`` systemd accepts; one more is
+"Failed to parse unsigned value"."""
+
 
 class SystemdError(RuntimeError):
     """Failure to interact with ``systemctl --user``."""
+
+
+class UnitSettingError(ValueError):
+    """A ``[watchdog]`` value that systemd cannot parse.
+
+    systemd ignores a unit line it cannot parse, with only a journal
+    warning, and falls back to its own default: ``RestartSec=100ms``,
+    and the manager's ``DefaultStartLimitBurst=`` (5) and
+    ``DefaultStartLimitIntervalSec=`` (10 s) unless configured
+    otherwise. So such a value is refused before the unit is written."""
 
 
 @dataclass(frozen=True)
@@ -132,14 +155,48 @@ def _stop_command_from(supervisor_command: str) -> str:
 _ADOPT_TIMEOUT_STOP_SEC = 30
 
 
+def _timespan(seconds: float, key: str) -> str:
+    """``seconds`` as a systemd time span, for the ``[watchdog]`` key ``key``.
+
+    Rounded to systemd's resolution of one microsecond, and never in
+    exponent form, which systemd rejects (``1e-07``). A whole number
+    renders without a fraction (``30.0`` as ``30``), and ``0.25`` as
+    ``0.25``. A span under half a microsecond renders as ``0``, which
+    systemd reads as no delay (``RestartSec``) or no rate limit
+    (``StartLimitIntervalSec``); the cron watchdog treats such a span
+    the same way.
+
+    Raises :class:`UnitSettingError` for a span systemd would reject.
+    """
+    if not math.isfinite(seconds):
+        raise UnitSettingError(f"[watchdog].{key} = {seconds} is not a finite number of seconds")
+    text = f"{seconds:.6f}".rstrip("0").rstrip(".")
+    if int(text.partition(".")[0]) > _SYSTEMD_MAX_WHOLE_SECONDS:
+        raise UnitSettingError(
+            f"[watchdog].{key} = {seconds} is longer than systemd accepts "
+            f"({_SYSTEMD_MAX_WHOLE_SECONDS} s)"
+        )
+    return text
+
+
+def _burst(count: int, key: str) -> str:
+    """``count`` as a ``StartLimitBurst=`` value, for the ``[watchdog]`` key ``key``.
+
+    Raises :class:`UnitSettingError` for a count systemd would reject.
+    """
+    if count > _SYSTEMD_MAX_UNSIGNED:
+        raise UnitSettingError(
+            f"[watchdog].{key} = {count} is more than systemd accepts ({_SYSTEMD_MAX_UNSIGNED})"
+        )
+    return str(count)
+
+
 def build_unit_text(
     *,
     supervisor_command: str,
     queue_dir: Path,
+    watchdog: WatchdogSettings,
     description: str = "Claude Code task-runner supervisor",
-    restart_sec_s: int = 30,
-    start_limit_burst: int = 5,
-    start_limit_interval_s: int = 600,
     timeout_stop_sec: int | None = None,
     adopt_workers: bool = True,
 ) -> str:
@@ -147,9 +204,26 @@ def build_unit_text(
 
     ``supervisor_command`` is the full command line to invoke (e.g.
     ``/home/bill/.venv/bin/claude-task-runner supervisor start --queue
-    /home/bill/queue``). systemd's restart policy gives us crash-loop
-    protection for free; we additionally cap with ``StartLimitBurst``
-    so a hopelessly broken supervisor doesn't churn forever.
+    /home/bill/queue``).
+
+    The restart policy comes from ``watchdog``, the queue's
+    ``[watchdog]`` table (the settings :mod:`cron.backoff` takes for the
+    cron watchdog):
+
+    * ``RestartSec`` is ``restart_cooldown_s``: how long systemd waits
+      after a crash before it restarts the supervisor.
+    * ``StartLimitBurst`` is ``crash_loop_threshold`` and
+      ``StartLimitIntervalSec`` is ``restart_backoff_max_s``: once the
+      unit has been started more than that many times within that many
+      seconds, systemd stops restarting it. It can be started by hand
+      once the interval has passed, or at once after ``systemctl --user
+      reset-failed``. The cron watchdog backs off and retries instead.
+
+    With the package defaults (30 s, 5 and 600 s) the unit is the one
+    this function wrote before it read ``[watchdog]``. Seconds are
+    rendered by :func:`_timespan`. A value systemd would reject raises
+    :class:`UnitSettingError`, so no unit is written that systemd would
+    run with its own defaults instead.
 
     Stop wiring depends on ``adopt_workers`` (ADR-0025):
 
@@ -199,11 +273,14 @@ def build_unit_text(
     else:
         stop_command = _drain_command_from(supervisor_command)
         effective_timeout = timeout_stop_sec if timeout_stop_sec is not None else 14400
+    restart_sec = _timespan(watchdog.restart_cooldown_s, "restart_cooldown_s")
+    start_limit_burst = _burst(watchdog.crash_loop_threshold, "crash_loop_threshold")
+    start_limit_interval = _timespan(watchdog.restart_backoff_max_s, "restart_backoff_max_s")
     return (
         "[Unit]\n"
         f"Description={description}\n"
         "After=default.target\n"
-        f"StartLimitIntervalSec={start_limit_interval_s}\n"
+        f"StartLimitIntervalSec={start_limit_interval}\n"
         f"StartLimitBurst={start_limit_burst}\n"
         "\n"
         "[Service]\n"
@@ -233,7 +310,7 @@ def build_unit_text(
         "KillMode=process\n"
         f"TimeoutStopSec={effective_timeout}\n"
         "Restart=on-failure\n"
-        f"RestartSec={restart_sec_s}\n"
+        f"RestartSec={restart_sec}\n"
         # Don't restart when supervisor exits cleanly (a successful drain
         # or fast-stop).
         "RestartPreventExitStatus=0\n"
@@ -249,25 +326,29 @@ def build_install_plan(
     *,
     supervisor_command: str,
     queue_dir: Path,
+    watchdog: WatchdogSettings,
     unit_path: Path | None = None,
-    restart_sec_s: int = 30,
-    start_limit_burst: int = 5,
     adopt_workers: bool = True,
 ) -> SystemdInstallPlan:
     """Compute what installing the systemd unit will do.
 
-    ``adopt_workers`` selects the stop wiring (ADR-0025): True (default)
-    wires the fast-stop ExecStop + short ``TimeoutStopSec``; False keeps
-    the graceful-drain ExecStop + 4h timeout. The CLI passes the queue's
-    ``[supervisor].adopt_workers`` so the generated unit matches the
-    runtime behaviour.
+    ``watchdog`` is the queue's ``[watchdog]`` table, which sets the
+    unit's restart policy (see :func:`build_unit_text`). It has no
+    default, so a caller cannot fall back to a hardcoded policy by
+    leaving it out. ``adopt_workers`` selects the stop wiring
+    (ADR-0025): True (default) wires the fast-stop ExecStop + short
+    ``TimeoutStopSec``; False keeps the graceful-drain ExecStop + 4h
+    timeout. The CLI passes the queue's ``[supervisor].adopt_workers``
+    so the generated unit matches the runtime behaviour.
+
+    Raises :class:`UnitSettingError` for a ``[watchdog]`` value that
+    systemd cannot parse.
     """
     target = unit_path if unit_path is not None else systemd_unit_path()
     unit_text = build_unit_text(
         supervisor_command=supervisor_command,
         queue_dir=queue_dir,
-        restart_sec_s=restart_sec_s,
-        start_limit_burst=start_limit_burst,
+        watchdog=watchdog,
         adopt_workers=adopt_workers,
     )
     enable_command = [
