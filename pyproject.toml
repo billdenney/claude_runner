@@ -61,10 +61,10 @@ Issues = "https://github.com/billdenney/claude_task_runner/issues"
 
 [tool.hatch.build.targets.wheel]
 # Ships every file under the package that .gitignore doesn't exclude, data
-# files included (skills/, config/defaults/, cron/watchdog.sh). Don't add a
-# `force-include` for anything already in the package: hatchling refuses a
-# second file at the same archive path, so the wheel build fails.
-# tests/unit/test_packaging.py builds both artifacts and checks what they ship.
+# files included (skills/, config/defaults/, cron/watchdog.sh), so none of
+# them needs a `force-include`. Force-including a directory that is already in
+# the package adds each of its files twice, and hatchling 1.30+ then fails the
+# build. tests/unit/test_packaging.py builds the artifacts and checks them.
 packages = ["src/claude_task_runner"]
 
 [tool.ruff]

@@ -81,7 +81,7 @@ def _packaged_skill_dir(name: str) -> Path:
     pkg = resources.files("claude_task_runner.skills") / name
     # ``files()`` returns a Traversable; coerce to a Path. For an
     # editable install this is the source tree; for a wheel install
-    # it's the resolved .dist-info location.
+    # it's the package's directory in site-packages.
     path = Path(str(pkg))
     if not path.exists():
         raise FileNotFoundError(f"packaged skill {name!r} not found at expected path {path}")
