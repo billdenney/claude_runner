@@ -120,6 +120,33 @@ def test_supports_symlinks_no_when_oserror(tmp_path: Path) -> None:
         assert _supports_symlinks(tmp_path) is False
 
 
+def test_supports_symlinks_no_when_the_probe_cannot_be_removed(tmp_path: Path) -> None:
+    probe = tmp_path / ".symlink_probe"
+    real_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == probe:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_unlink(self, missing_ok=missing_ok)
+
+    with patch.object(Path, "unlink", unlink):
+        assert _supports_symlinks(tmp_path) is False
+    assert probe.is_symlink()
+
+
+def test_supports_symlinks_lets_an_unexpected_error_through(tmp_path: Path) -> None:
+    """The ``return`` that was in its ``finally`` block swallowed this error
+    whenever removing the probe failed too."""
+    with (
+        patch.object(Path, "symlink_to", side_effect=RuntimeError("unexpected")),
+        patch.object(
+            Path, "unlink", side_effect=PermissionError(errno.EACCES, "Permission denied")
+        ),
+        pytest.raises(RuntimeError, match="unexpected"),
+    ):
+        _supports_symlinks(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # skill_state
 # ---------------------------------------------------------------------------

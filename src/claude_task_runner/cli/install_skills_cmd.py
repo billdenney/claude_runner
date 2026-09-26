@@ -157,16 +157,18 @@ def _supports_symlinks(target_dir: Path) -> bool:
     probe = target_dir / ".symlink_probe"
     try:
         probe.symlink_to(target_dir)
+        supported = True
     except (OSError, NotImplementedError):
-        return False
-    finally:
-        try:
-            probe.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return False
-    return True
+        supported = False
+    # Not a ``finally`` block: a return there dropped any other error from
+    # symlink_to, and Python 3.14 reports it at compile time (PEP 765).
+    try:
+        probe.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        supported = False
+    return supported
 
 
 def _install_one(
