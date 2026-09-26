@@ -160,6 +160,17 @@ Breaking changes are called out in the version notes.
   runs `watchdog tick` with no `--config`, so the tick uses the package
   defaults, and a cron `install --config` is not recorded. Tests pin both
   until a follow-up makes the tick load the managed queue's config.
+- **A relative `install --config` now reaches the systemd unit as the file
+  `install` checked.** `install --config rel.toml` loaded `rel.toml` from
+  the directory it ran in, but wrote `--config rel.toml` into the unit's
+  `ExecStart` and `ExecStop` as given, and the unit runs with
+  `WorkingDirectory=<queue>`. So the supervisor read `<queue>/rel.toml`. That
+  file was usually missing, so every start failed until the start limit
+  stopped the restarts, and at best it was not the file `install` had
+  checked. `install` now makes the path absolute before loading it. If
+  `systemctl --user cat claude-task-runner` shows a relative `--config`,
+  re-run `claude-task-runner install` from the directory that path is
+  relative to.
 - **`--help` no longer drops bracketed words such as `[queue]` and
   `list[str]`.** Typer's default `rich_markup_mode` is `"rich"`, which parses
   every help string as Rich console markup. Rich takes `[` followed by a

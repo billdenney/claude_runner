@@ -627,6 +627,35 @@ def test_install_systemd_invalid_watchdog_value_fails_before_writing(
     mock_apply.assert_not_called()
 
 
+def test_install_systemd_writes_the_config_it_checked_as_an_absolute_path(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative ``--config`` must name the same file inside the unit.
+
+    ``install`` loads the TOML relative to the directory it runs in, but
+    the unit runs with ``WorkingDirectory=<queue>``. The relative path
+    used to go into ExecStart and ExecStop as given, so the supervisor
+    looked for ``<queue>/rel.toml``, a file that install never checked
+    and that usually does not exist."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "rel.toml").write_text("[watchdog]\nrestart_cooldown_s = 45\n", encoding="utf-8")
+    monkeypatch.chdir(work)
+    checked = Path.cwd() / "rel.toml"
+    with _systemd_install_patched() as mock_apply:
+        result = runner.invoke(app, ["--yes", "--queue", str(queue), "--config", "rel.toml"])
+    assert result.exit_code == 0, result.output
+    unit_lines = _written_unit_lines(mock_apply)
+    exe = "/usr/local/bin/claude-task-runner"
+    queue_flag = f"--queue {queue.resolve()}"
+    assert f"ExecStart={exe} supervisor start {queue_flag} --config {checked}" in unit_lines
+    assert f"ExecStop=-{exe} supervisor stop {queue_flag} --config {checked}" in unit_lines
+    # The TOML that install loaded is the one whose [watchdog] the unit carries.
+    assert "RestartSec=45" in unit_lines
+
+
 def test_install_cron_does_not_record_config(runner: CliRunner, tmp_path: Path) -> None:
     """Pins current behaviour, a known gap: a cron ``install --config`` is dropped.
 

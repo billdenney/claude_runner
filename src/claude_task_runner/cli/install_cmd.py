@@ -43,6 +43,9 @@ def _supervisor_command(queue_dir: Path, config: Path | None = None) -> str:
     Previously the ``--config`` flag was accepted by ``install`` but
     dropped on the floor, leaving the supervisor to fall back to
     defaults (e.g. wrong ``config_dir`` -> wrong Claude account).
+    ``config`` must be absolute, as ``install`` makes it: the unit runs
+    with ``WorkingDirectory=<queue>``, where a relative path would name
+    a file under the queue rather than the one ``install`` checked.
     """
     exe = shutil.which("claude-task-runner")
     if exe is None:
@@ -110,6 +113,10 @@ def install(
     # by the unit's supervisor under systemd or by the next tick under cron.
     queue_path = require_queue_option(queue_dir, console)
     resolved_config = resolve_per_queue_config(config, queue_path)
+    if resolved_config is not None:
+        # Absolute, naming the file loaded below: the unit runs with
+        # WorkingDirectory=<queue>, where a relative path names another.
+        resolved_config = resolved_config.absolute()
     settings = load_settings(resolved_config)
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
