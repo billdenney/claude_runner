@@ -7,13 +7,15 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the target concurrency for this tick.
+2. Computes the queue-wide ceiling for this tick (``[concurrency]``).
 3. Picks eligible pending tasks (no ``running`` state file, all
    ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
    to pick the account to dispatch through (equal-priority across
    accounts, least 5h util wins). Skips the task when no account has
-   capacity.
+   capacity. Each account's capacity includes the ``target_concurrency``
+   of its last throttle decision, so a SLOWING_DOWN account runs at
+   most the ramp target the supervisor announced (ADR-0022).
 5. Spawns one ``threading.Thread`` per dispatched task that calls
    :func:`runner.dispatcher.dispatch` with the chosen account's
    ``config_dir`` / ``linux_user``. Threads are non-daemon so the
@@ -48,6 +50,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner import effort_levels as effort_levels_mod
 from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
@@ -222,7 +225,7 @@ def tick_dispatch(
     if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
-    target = _target_concurrency(queue_dir, settings, snapshot)
+    target = _target_concurrency(queue_dir, settings)
     available = max(0, target - len(in_flight_slots))
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
@@ -246,6 +249,7 @@ def tick_dispatch(
         completed_ids,
         now=clock.now(),
         block_file=block_file,
+        effort_levels=settings.effort_levels,
     )
     if not candidates:
         return _refresh_in_flight(snapshot, in_flight_slots)
@@ -528,14 +532,18 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     return state.runs[-1].pid
 
 
-def _target_concurrency(
-    queue_dir: Path,
-    settings: Settings,
-    snapshot: SupervisorSnapshot,
-) -> int:
-    """Conservative target: ``initial_concurrency`` until at least one task
-    has completed in this queue, then ``max_concurrency``. Halved while
-    SLOWING_DOWN.
+def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
+    """Queue-wide ceiling on in-flight tasks across all accounts.
+
+    ``[concurrency].initial_concurrency`` until at least one task has
+    completed in this queue, then ``[concurrency].max_concurrency``.
+
+    Throttling is not applied here. Each account's own cap, including
+    its SLOWING_DOWN ramp target, is enforced per task by
+    :func:`account_dispatch.choose_account`. This used to halve the
+    ceiling whenever the top-level state was SLOWING_DOWN, which ignored
+    the ramp the supervisor announced and, with several accounts,
+    depended on which account had been captured last.
     """
     have_warmup = _has_any_completed(queue_dir)
     base = (
@@ -543,10 +551,7 @@ def _target_concurrency(
         if have_warmup
         else settings.concurrency.initial_concurrency
     )
-    base = max(1, base)
-    if snapshot.state is SupervisorState.SLOWING_DOWN:
-        return max(1, base // 2)
-    return base
+    return max(1, base)
 
 
 def _has_any_completed(queue_dir: Path) -> bool:
@@ -701,33 +706,44 @@ def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[s
     return blocked
 
 
-def _record_readiness_hold(
+def _is_parked_with(state: TaskState | None, reason: str) -> bool:
+    """True iff ``state`` is already parked as ``deferred`` with exactly ``reason``."""
+    return state is not None and state.status == "deferred" and state.deferred_reason == reason
+
+
+def _park_deferred(
     queue_dir: Path,
     task_id: str,
     state: TaskState | None,
     reason: str,
 ) -> None:
-    """Park a task the readiness gate is holding as ``deferred`` + ``reason``.
+    """Park a task a selector gate is holding as ``deferred`` + ``reason``.
 
-    Makes a mechanical hold VISIBLE. Without this the gate is silent: the
-    selector skips the task on every tick with only a debug log, so
-    ``queue list`` still shows it ``pending`` and an operator investigating
-    "why has this never run?" has nothing to read. That gap is what forced
-    hand-parking five refharvest tasks with a hand-written
-    ``deferred_reason`` on 2026-08-06.
+    Used by both selector gates: the readiness gate (ADR-0030) and the
+    effort gate (ADR-0010). Each writes its own reason prefix, see
+    :func:`readiness.hold_reason` and :func:`effort_levels.hold_reason`.
+
+    Makes a hold VISIBLE. Without this a gate is silent: the selector
+    skips the task on every tick with only a debug log, so ``queue states``
+    still shows it ``pending`` and an operator investigating "why has this
+    never run?" has nothing to read. That gap is what forced hand-parking
+    five refharvest tasks with a hand-written ``deferred_reason`` on
+    2026-08-06.
 
     Deliberately writes NO ``next_eligible_at``. A cooldown would break the
     ADR-0030 promise that a held task dispatches the first tick after its
     element appears: the `deferred` branch in :func:`_eligible_candidates`
-    falls straight through when ``next_eligible_at`` is unset, so the
-    readiness check itself stays the only gate and re-admission is immediate.
+    falls straight through when ``next_eligible_at`` is unset, so the gates
+    themselves stay the only thing holding the task and re-admission is
+    immediate.
 
-    Writes only on TRANSITION (when the persisted status/reason differ), so
-    a queue holding hundreds of blocked tasks costs one write each — not one
-    per task per tick. ``attempts`` / ``runs`` are untouched: a hold is not
-    an attempt and must never feed the circuit breaker.
+    Writes only on TRANSITION (when the persisted status/reason differ, see
+    :func:`_is_parked_with`), so a queue holding hundreds of blocked tasks
+    costs one write each — not one per task per tick. ``attempts`` /
+    ``runs`` are untouched: a hold is not an attempt and must never feed the
+    circuit breaker.
     """
-    if state is not None and state.status == "deferred" and state.deferred_reason == reason:
+    if _is_parked_with(state, reason):
         return  # already parked with this exact reason — no rewrite, no churn
     base = state if state is not None else TaskState(task_id=task_id)
     new_state = base.model_copy(
@@ -744,30 +760,55 @@ def _record_readiness_hold(
     except Exception as exc:
         # Best-effort bookkeeping: the task is already being skipped by the
         # caller, so a failed write costs visibility, never correctness.
-        logger.warning("could not record readiness hold for task %s: %s", task_id, exc)
+        logger.warning("could not park task %s as deferred (%s): %s", task_id, reason, exc)
 
 
-def _clear_readiness_hold(queue_dir: Path, task_id: str, state: TaskState | None) -> None:
-    """Un-park a task whose readiness hold (and only ours) is now satisfied.
+def _unpark(
+    queue_dir: Path,
+    task_id: str,
+    state: TaskState | None,
+    owns: Callable[[str | None], bool],
+) -> TaskState | None:
+    """Un-park a task whose hold (and only one ``owns`` recognises) has cleared.
 
     Restores ``pending`` and clears the reason so the state stops claiming a
-    block that no longer exists. Scoped by
-    :func:`readiness.is_hold_reason`: an operator's manual park and the
-    pre-dispatch hook's exit-1 deferral carry different reasons and are left
-    exactly as they are — self-healing must never quietly undo a human's
-    decision to hold a task.
+    block that no longer exists. Scoped by ``owns``, a gate's
+    ``is_hold_reason``: an operator's manual park, the pre-dispatch hook's
+    exit-1 deferral and the other gate's hold carry different reasons and
+    are left exactly as they are — self-healing must never quietly undo a
+    human's decision to hold a task.
+
+    Returns the state the rest of the selector should see: the un-parked
+    one (even when the write fails, since un-parking is bookkeeping and the
+    task is admitted either way), or ``state`` itself when there was
+    nothing to clear.
     """
-    if state is None or state.status != "deferred":
-        return
-    if not readiness_mod.is_hold_reason(state.deferred_reason):
-        return
+    if state is None or state.status != "deferred" or not owns(state.deferred_reason):
+        return state
     new_state = state.model_copy(
         update={"status": "pending", "deferred_reason": None, "next_eligible_at": None}
     )
+    logger.info("task %s: un-parked, its hold has cleared: %s", task_id, state.deferred_reason)
     try:
         write_state_atomic(new_state, state_path_for(queue_dir, task_id))
     except Exception as exc:
-        logger.warning("could not clear readiness hold for task %s: %s", task_id, exc)
+        logger.warning("could not un-park task %s: %s", task_id, exc)
+    return new_state
+
+
+def _effort_hold_reason(task: Task, effort_levels: dict[str, list[str]]) -> str | None:
+    """The ``deferred_reason`` to park ``task`` with, or ``None`` if its pair is accepted.
+
+    See ADR-0010. The task schema cannot check ``(model, effort)`` because
+    the accepted sets live in the merged settings, so the selector and the
+    dispatch backstop check it here, against the settings the supervisor
+    is running with.
+    """
+    try:
+        effort_levels_mod.validate_effort(task.model, task.effort, effort_levels)
+    except effort_levels_mod.UnknownEffortLevel as exc:
+        return effort_levels_mod.hold_reason(exc)
+    return None
 
 
 def _eligible_candidates(
@@ -776,11 +817,17 @@ def _eligible_candidates(
     completed_ids: set[str],
     now: datetime | None = None,
     block_file: str | None = None,
+    *,
+    effort_levels: dict[str, list[str]],
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
     # When omitted (older unit tests that exercise non-deferred paths),
     # a deferred task simply isn't cooldown-gated.
+    #
+    # ``effort_levels`` is the merged ``[effort_levels]`` table the effort
+    # gate checks each task's (model, effort) against. Required, with no
+    # default: a caller that forgot it must fail, not skip the check.
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots.keys())
 
@@ -816,10 +863,10 @@ def _eligible_candidates(
         if task.id in in_flight_ids:
             continue
 
-        # ``state`` stays in scope past this block: the readiness gate below
-        # needs it to record / clear a hold, and it must apply to a task that
-        # has no state file yet (never dispatched) exactly as it does to one
-        # resuming from awaiting_sidecar, deferred, or failed.
+        # ``state`` stays in scope past this block: the effort and readiness
+        # gates below need it to record / clear a hold, and they must apply to
+        # a task that has no state file yet (never dispatched) exactly as they
+        # do to one resuming from awaiting_sidecar, deferred, or failed.
         state: TaskState | None = None
         sp = state_path_for(queue_dir, task.id)
         if sp.exists():
@@ -878,6 +925,32 @@ def _eligible_candidates(
                 # deferred task past its cooldown: fall through to the
                 # depends_on check and add to out.
 
+        # Effort gate (ADR-0010): a task whose (model, effort) pair the merged
+        # [effort_levels] rejects is never dispatched. It is parked as
+        # `deferred` with an `invalid effort: ...` reason and a WARNING, and
+        # un-parked the first tick after the task YAML is fixed (or the TOML
+        # is, and the supervisor re-reads it on SIGHUP). The task schema
+        # cannot check this: the accepted sets live in the settings.
+        #
+        # Like the readiness gate below, this sits AFTER the per-status
+        # branching, so a completed, running or circuit-broken task is never
+        # re-parked because [effort_levels] changed under it. It sits BEFORE
+        # depends_on so an authoring error surfaces as soon as the task is
+        # queued, not only once its dependencies finish.
+        effort_reason = _effort_hold_reason(task, effort_levels)
+        if effort_reason is not None:
+            if not _is_parked_with(state, effort_reason):
+                # Once per transition, not once per tick.
+                logger.warning(
+                    "parking task %s as deferred: %s. Fix the task's model or effort, "
+                    "or add the pair to [effort_levels] and send the supervisor SIGHUP",
+                    task.id,
+                    effort_reason,
+                )
+                _park_deferred(queue_dir, task.id, state, effort_reason)
+            continue
+        state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
+
         unmet = [d for d in task.depends_on if d not in completed_ids]
         if unmet:
             continue
@@ -906,12 +979,12 @@ def _eligible_candidates(
                 len(unmet_reqs),
                 "; ".join(unmet_reqs),
             )
-            _record_readiness_hold(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
+            _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
             continue
 
         # Satisfied — if THIS gate is what parked the task, un-park it so the
         # state stops advertising a block that has cleared.
-        _clear_readiness_hold(queue_dir, task.id, state)
+        _unpark(queue_dir, task.id, state, readiness_mod.is_hold_reason)
 
         out.append(task)
     return out
@@ -944,6 +1017,11 @@ def _dispatch_one_safely(
     race: candidates are chosen once per tick, and a requirement can be
     withdrawn (a re-acquisition park deleting a bad trim) between selection
     and spawn.
+
+    The ADR-0010 effort gate is re-checked here for the same reason: the
+    selector parks a task whose (model, effort) pair ``[effort_levels]``
+    rejects, and this makes that hold for every path that spawns this
+    function, whatever the caller checked.
     """
     sp = state_path_for(queue_dir, task.id)
     if sp.exists():
@@ -954,6 +1032,12 @@ def _dispatch_one_safely(
     else:
         state = TaskState(task_id=task.id)
 
+    effort_reason = _effort_hold_reason(task, settings.effort_levels)
+    if effort_reason is not None:
+        logger.warning("refusing to dispatch task %s: %s", task.id, effort_reason)
+        _park_deferred(queue_dir, task.id, state, effort_reason)
+        return
+
     unmet_reqs = readiness_mod.unmet_requirements(task, queue_dir)
     if unmet_reqs:
         logger.warning(
@@ -962,7 +1046,7 @@ def _dispatch_one_safely(
             len(unmet_reqs),
             "; ".join(unmet_reqs),
         )
-        _record_readiness_hold(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
+        _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
         return
 
     try:

@@ -16,15 +16,17 @@ supervisor (no race with the supervisor's own dispatch loop):
 2. The supervisor's tick loop calls :func:`tick_consume` BEFORE the
    throttle gate. It scans the request directory, revalidates each
    task (still in ``todo/``, still in a dispatchable status, not
-   already in-flight, ``requires`` satisfied), respects
-   ``max_concurrency`` unless the request was written with
-   ``allow_over_limit=True``, and spawns exactly the same per-task
-   dispatch thread the orchestrator does.
+   already in-flight, (model, effort) accepted, ``requires``
+   satisfied), respects ``max_concurrency`` unless the request was
+   written with ``allow_over_limit=True``, and spawns exactly the same
+   per-task dispatch thread the orchestrator does.
 
 The bypass is scoped to the THROTTLE. The ADR-0030 ``requires`` gate is
 still enforced on both paths: those elements are mechanical preconditions
 on the run's inputs, so forcing past one only buys a worker that discovers
-the missing file and exits.
+the missing file and exits. So is the ADR-0010 effort gate: a (model,
+effort) pair ``[effort_levels]`` rejects is an authoring error to fix, not
+a throttle to override.
 
 For the "no supervisor running" case (CLI smoke tests, local
 fixture-queue debugging), :func:`dispatch_synchronously` runs one
@@ -61,6 +63,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
+from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.session import plan_next_spawn
 
@@ -76,7 +79,8 @@ class ForceDispatchError(RuntimeError):
 
     Reasons: task YAML missing from ``todo/``, task already in a
     non-dispatchable status (``running``, ``awaiting_sidecar``,
-    ``completed``, ``failed_circuit_breaker``), an unmet ADR-0030
+    ``completed``, ``failed_circuit_breaker``), a (model, effort) pair
+    ``[effort_levels]`` rejects (ADR-0010), an unmet ADR-0030
     ``requires`` element, or, in the synchronous path, ``claude`` is
     not on PATH.
     """
@@ -304,6 +308,23 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
+        # Effort gate (ADR-0010). A (model, effort) pair [effort_levels]
+        # rejects is an authoring error, not a throttle, so force does not
+        # override it. Drop the request like the readiness branch below; the
+        # selector parks the task as `deferred` with the same message, and
+        # un-parks it once the task or [effort_levels] is fixed.
+        try:
+            validate_effort(task.model, task.effort, settings.effort_levels)
+        except UnknownEffortLevel as exc:
+            logger.warning(
+                "force-dispatch %s: invalid effort (%s); dropping request — "
+                "force overrides the throttle, not the task's configuration",
+                task.id,
+                exc,
+            )
+            consume_request(queue_dir, task.id)
+            continue
+
         # Mechanical readiness (ADR-0030). Force-dispatch bypasses the
         # THROTTLE — that is its whole purpose — but a `requires` element is
         # not a throttle: it says the input this run reads is not on disk.
@@ -470,6 +491,13 @@ def dispatch_synchronously(
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
     if state.status not in _FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
+
+    # ADR-0010, same reasoning as tick_consume: force overrides the throttle,
+    # not a (model, effort) pair the queue's [effort_levels] rejects.
+    try:
+        validate_effort(task.model, task.effort, settings.effort_levels)
+    except UnknownEffortLevel as exc:
+        raise ForceDispatchError(f"task {task.id} has an invalid effort: {exc}") from exc
 
     # ADR-0030, same reasoning as tick_consume: force overrides the throttle,
     # not a missing input. Raising (rather than dispatching into a guaranteed

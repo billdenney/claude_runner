@@ -12,7 +12,8 @@ Schema versions
 account snapshot; v3 adds per-account state alongside the legacy
 single-account fields; v4 (ADR-0022) drops the ``paused_weekly`` and
 ``end_of_week_push`` states; v5 drops ``stopped``, which nothing ever
-entered. The legacy top-level fields remain
+entered; v6 adds ``target_concurrency``, the per-account dispatch cap
+from the last throttle decision. The legacy top-level fields remain
 populated (mirrored from ``accounts[<active>]`` after each tick).
 """
 
@@ -23,7 +24,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SUPERVISOR_SCHEMA_VERSION = 5
+SUPERVISOR_SCHEMA_VERSION = 6
 """Supervisor.json schema version.
 
 Bumped from 3 to 4 (ADR-0022) when ``paused_weekly`` and
@@ -35,7 +36,13 @@ trace-following rule.
 Bumped from 4 to 5 when ``stopped`` was dropped. Nothing ever entered it:
 ``supervisor stop`` sends SIGTERM, and the ``request_stop`` helper that
 set it had no caller. The persistence layer rewrites a persisted
-``stopped`` to ``idle``."""
+``stopped`` to ``idle``.
+
+Bumped from 5 to 6 when ``target_concurrency`` was added to
+:class:`AccountState` and the top-level snapshot. A v5 file needs no
+rewrite: the field starts as ``None`` until each account's next
+decision. The bump makes an older supervisor refuse a v6 file with a
+version error rather than an unknown-field error."""
 
 
 class SupervisorState(StrEnum):
@@ -53,7 +60,9 @@ class SupervisorState(StrEnum):
     """Predicted utilization < full-band threshold; full target concurrency."""
 
     SLOWING_DOWN = "slowing_down"
-    """In the slowdown band; target concurrency reduced linearly."""
+    """In the slowdown band. The account's dispatch cap
+    (``target_concurrency``) falls linearly from its ``max_concurrency``
+    at ``fivehr_slowdown_pct`` towards 0 at ``fivehr_stop_pct``."""
 
     THROTTLED_5H = "throttled_5h"
     """5-hour utilization >= the configured no-dispatch threshold.
@@ -110,6 +119,15 @@ class AccountState(BaseModel):
     scheduled_wakeup_at: datetime | None = None
     consecutive_clean_polls: int = Field(ge=0, default=0)
     last_drift_message: str = ""
+
+    target_concurrency: int | None = Field(ge=0, default=None)
+    """How many tasks this account may run at once, from its last throttle
+    decision (:attr:`throttle.decision.Decision.target_concurrency`): its
+    ``max_concurrency`` while DISPATCHING, ADR-0022's linear ramp while
+    SLOWING_DOWN, 0 while throttled. ``None`` in IDLE and ERROR_DRIFT,
+    which make no decision, and before the first capture.
+    :func:`runner.account_dispatch.choose_account` caps the account at
+    this and at its ``max_concurrency``, whichever is lower."""
 
     paused: bool = False
     """When True, the dispatch policy skips this account. Operator-set
@@ -173,6 +191,9 @@ class SupervisorSnapshot(BaseModel):
     scheduled_wakeup_at: datetime | None = None
     consecutive_clean_polls: int = Field(ge=0, default=0)
     last_drift_message: str = ""
+    target_concurrency: int | None = Field(ge=0, default=None)
+    """Mirror of :attr:`AccountState.target_concurrency` for the account
+    this view reflects."""
 
     in_flight_task_ids: list[str] = Field(default_factory=list)
     """Legacy: task IDs currently dispatched (un-attributed). Kept

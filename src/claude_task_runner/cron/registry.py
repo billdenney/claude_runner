@@ -1,9 +1,16 @@
 """Registry of the queue that the cron watchdog manages.
 
 ``~/.claude_task_runner/queues.json`` holds
-``{"queues": ["/path/to/queue"]}``. The crontab line that a cron
-``install`` adds runs ``watchdog tick`` with no ``--queue``, and a tick
-restarts the registered queue's supervisor when it is not running.
+``{"queues": ["/path/to/queue"]}``, plus
+``"configs": {"/path/to/queue": "/path/to/claude_runner.toml"}`` when
+the queue was registered with ``--config``. The crontab line that a cron
+``install`` adds runs ``watchdog tick`` with no ``--queue`` or
+``--config``. A tick restarts the registered queue's supervisor when it
+is not running, and loads the queue's recorded config for its
+``[watchdog]`` settings, else ``<queue>/claude_runner.toml`` if it
+exists, and passes the same file to ``supervisor start --config``.
+``queues`` stays a list of paths, so a reader that predates ``configs``
+still finds the queue.
 
 Only one supervisor runs per user, because each takes the per-user
 ``global.lock``, so the watchdog manages one queue, as the systemd unit
@@ -38,6 +45,7 @@ import logging
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from claude_task_runner.queue.store import require_queue_dir
@@ -53,20 +61,37 @@ class RegistryError(ValueError):
     """``queues.json`` exists but does not hold a registry."""
 
 
+@dataclass(frozen=True)
+class Registry:
+    """What ``queues.json`` holds."""
+
+    queues: list[Path] = field(default_factory=list)
+    """The registered queues; the watchdog manages the last."""
+
+    configs: dict[Path, Path] = field(default_factory=dict)
+    """The absolute ``claude_runner.toml`` path recorded for a queue by
+    ``install --config`` or ``watchdog register --config``. A queue with
+    none uses ``<queue>/claude_runner.toml`` if it exists, else the
+    package defaults, as ``supervisor start`` does."""
+
+
 def queues_registry_path() -> Path:
     """Resolve ``~/.claude_task_runner/queues.json``."""
     return Path.home() / ".claude_task_runner" / QUEUES_REGISTRY_FILENAME
 
 
-def read_registered_queues() -> list[Path]:
-    """Return the registered queues, or ``[]`` when there is no registry file.
+def read_registry() -> Registry:
+    """Return the registry, or an empty one when there is no registry file.
 
     Raises :class:`RegistryError` when the file exists but cannot be
-    read, is not JSON, is not a JSON object, or has a ``queues`` value
-    that is not a list. Writes nothing."""
+    read, is not JSON, is not a JSON object, has a ``queues`` value that
+    is not a list, or has a ``configs`` value that is not an object of
+    absolute paths. Every config this package records is absolute, and a
+    tick runs in cron's working directory, so a relative one would name
+    some other file. Writes nothing."""
     path = queues_registry_path()
     if not path.exists():
-        return []
+        return Registry()
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -76,7 +101,25 @@ def read_registered_queues() -> list[Path]:
     raw = payload.get("queues", [])
     if not isinstance(raw, list):
         raise RegistryError(f"queues registry at {path}: 'queues' is not a list")
-    return [Path(q) for q in raw if isinstance(q, str)]
+    raw_configs = payload.get("configs", {})
+    if not isinstance(raw_configs, dict):
+        raise RegistryError(f"queues registry at {path}: 'configs' is not an object")
+    configs: dict[Path, Path] = {}
+    for queue, config in raw_configs.items():
+        if not isinstance(config, str) or not os.path.isabs(config):
+            raise RegistryError(
+                f"queues registry at {path}: the config for {queue} is not an absolute path"
+            )
+        configs[Path(queue)] = Path(config)
+    return Registry(queues=[Path(q) for q in raw if isinstance(q, str)], configs=configs)
+
+
+def read_registered_queues() -> list[Path]:
+    """Return the registered queues, or ``[]`` when there is no registry file.
+
+    Raises :class:`RegistryError` as :func:`read_registry` does. Writes
+    nothing."""
+    return read_registry().queues
 
 
 def _backup_broken_registry(path: Path) -> None:
@@ -94,28 +137,42 @@ def _backup_broken_registry(path: Path) -> None:
         logger.error("watchdog: backed up corrupt registry to %s", backup)
 
 
-def load_registered_queues() -> list[Path]:
-    """Return the registered queues, treating a corrupt registry as empty.
+def load_registry() -> Registry:
+    """Return the registry, treating a corrupt one as empty.
 
     A corrupt registry would otherwise silently lose every queue
     registration, so it is logged at ERROR and copied to
     ``queues.json.broken``, where the operator can recover it before the
     next ``register`` overwrites it."""
     try:
-        return read_registered_queues()
+        return read_registry()
     except RegistryError as exc:
         logger.error("watchdog: %s", exc)
         _backup_broken_registry(queues_registry_path())
-        return []
+        return Registry()
 
 
-def _write_registry(queues: list[Path]) -> None:
-    """Replace the registry with ``queues``.
+def load_registered_queues() -> list[Path]:
+    """Return the registered queues, treating a corrupt registry as empty.
 
-    Writes a temporary file and renames it over the registry, so a tick
-    reading it at the same moment sees the old list or the new one,
-    never half a file. On failure the registry is unchanged and the
-    temporary file is removed."""
+    See :func:`load_registry`."""
+    return load_registry().queues
+
+
+def _write_registry(queues: list[Path], configs: dict[Path, Path] | None = None) -> None:
+    """Replace the registry with ``queues`` and the ``configs`` recorded for them.
+
+    ``configs`` entries for queues not in ``queues`` are dropped, and
+    ``"configs"`` is left out of the file when none remain, so a
+    registry with no recorded config reads as it always has. Writes a
+    temporary file and renames it over the registry, so a tick reading
+    it at the same moment sees the old registry or the new one, never
+    half a file. On failure the registry is unchanged and the temporary
+    file is removed."""
+    payload: dict[str, object] = {"queues": [str(q) for q in queues]}
+    kept = {str(q): str(c) for q, c in (configs or {}).items() if q in queues}
+    if kept:
+        payload["configs"] = kept
     path = queues_registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
@@ -129,7 +186,7 @@ def _write_registry(queues: list[Path]) -> None:
             suffix=".tmp",
         ) as tmp:
             tmp_path = Path(tmp.name)
-            tmp.write(json.dumps({"queues": [str(q) for q in queues]}, indent=2) + "\n")
+            tmp.write(json.dumps(payload, indent=2) + "\n")
             tmp.flush()
             os.fsync(tmp.fileno())
         os.replace(tmp_path, path)
@@ -157,7 +214,7 @@ def ignored_queues(queues: list[Path]) -> list[Path]:
     return [q for q in dict.fromkeys(queues) if q != managed]
 
 
-def register_queue(queue_dir: Path) -> list[Path]:
+def register_queue(queue_dir: Path, config: Path | None = None) -> list[Path]:
     """Make ``queue_dir`` the one queue the cron watchdog manages.
 
     Returns the queues it replaced, each once and in registry order, or
@@ -166,6 +223,13 @@ def register_queue(queue_dir: Path) -> list[Path]:
     queue registered before, and every entry of a registry that lists
     several.
 
+    ``config`` is recorded, made absolute, as the queue's
+    ``claude_runner.toml``. The registration replaces the old one, so
+    registering without ``config`` drops a config recorded before, and
+    a tick goes back to ``<queue>/claude_runner.toml``. The caller checks
+    that ``config`` loads; this only records it. Nothing is written when
+    the queue and its config are already all the registry holds.
+
     Raises :class:`NotADirectoryError` unless ``queue_dir`` is an
     existing directory (see :func:`require_queue_dir`). A registered typo
     would otherwise be created by the next tick's restart, and the
@@ -173,11 +237,12 @@ def register_queue(queue_dir: Path) -> list[Path]:
     global lock. The tick checks the path again, because a registered
     queue can be deleted or moved later."""
     resolved = require_queue_dir(queue_dir)
-    existing = load_registered_queues()
-    if existing == [resolved]:
+    recorded = {resolved: config.absolute()} if config is not None else {}
+    existing = load_registry()
+    if existing.queues == [resolved] and existing.configs == recorded:
         return []
-    _write_registry([resolved])
-    return [q for q in dict.fromkeys(existing) if q != resolved]
+    _write_registry([resolved], recorded)
+    return [q for q in dict.fromkeys(existing.queues) if q != resolved]
 
 
 def _recorded_supervisor_pid(queue: Path) -> int | None:
@@ -235,8 +300,9 @@ def unregister_queue(queue_dir: Path) -> list[Path]:
     file as it was. The lenient :func:`load_registered_queues` would
     read it as empty, and rewriting that would drop every other queue."""
     targets = {Path(os.path.abspath(queue_dir)), queue_dir.resolve()}
-    registered = read_registered_queues()
-    removed = [q for q in registered if q in targets]
+    registry = read_registry()
+    removed = [q for q in registry.queues if q in targets]
     if removed:
-        _write_registry([q for q in registered if q not in targets])
+        # The removed queues' recorded configs go with them.
+        _write_registry([q for q in registry.queues if q not in targets], registry.configs)
     return removed

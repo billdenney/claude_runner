@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -115,6 +116,7 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
         # Stubs for fields tick_dispatch never reads directly:
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
@@ -123,7 +125,9 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
     )
 
 
-def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
+def _make_snapshot(
+    state: SupervisorState, *, target_concurrency: int | None = None
+) -> SupervisorSnapshot:
     """Snapshot seeded with one "default" account mirroring the top-level state.
 
     PR 9 introduced per-account gating in tick_dispatch; mirroring the
@@ -136,10 +140,12 @@ def _make_snapshot(state: SupervisorState) -> SupervisorSnapshot:
         {
             "state": state,
             "since": datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
+            "target_concurrency": target_concurrency,
             "accounts": {
                 "default": AccountState(
                     state=state,
                     since=datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC),
+                    target_concurrency=target_concurrency,
                 ),
             },
         }
@@ -211,38 +217,19 @@ def test_completed_task_ids_skips_unparseable(queue_dir: Path) -> None:
 def test_target_concurrency_uses_initial_before_first_completion(queue_dir: Path) -> None:
     """No completed tasks → use initial_concurrency."""
     settings = _make_settings(initial=2, max_c=5)
-    snap = _make_snapshot(SupervisorState.DISPATCHING)
-    assert _target_concurrency(queue_dir, settings, snap) == 2
+    assert _target_concurrency(queue_dir, settings) == 2
 
 
 def test_target_concurrency_uses_max_after_first_completion(queue_dir: Path) -> None:
     settings = _make_settings(initial=2, max_c=5)
-    snap = _make_snapshot(SupervisorState.DISPATCHING)
     _seed_state(queue_dir, "warmup", "completed")
-    assert _target_concurrency(queue_dir, settings, snap) == 5
-
-
-def test_target_concurrency_halved_in_slowing_down(queue_dir: Path) -> None:
-    settings = _make_settings(initial=2, max_c=5)
-    snap = _make_snapshot(SupervisorState.SLOWING_DOWN)
-    _seed_state(queue_dir, "warmup", "completed")
-    # max=5 halved => 2
-    assert _target_concurrency(queue_dir, settings, snap) == 2
-
-
-def test_target_concurrency_floored_at_one(queue_dir: Path) -> None:
-    """Even with max=1 and slow-down halving, we never return 0."""
-    settings = _make_settings(initial=1, max_c=1)
-    snap = _make_snapshot(SupervisorState.SLOWING_DOWN)
-    _seed_state(queue_dir, "warmup", "completed")
-    assert _target_concurrency(queue_dir, settings, snap) == 1
+    assert _target_concurrency(queue_dir, settings) == 5
 
 
 def test_target_concurrency_clamps_zero_or_negative_to_one(queue_dir: Path) -> None:
     """A misconfigured settings with max=0 still returns 1 (the floor)."""
     settings = _make_settings(initial=0, max_c=0)
-    snap = _make_snapshot(SupervisorState.DISPATCHING)
-    assert _target_concurrency(queue_dir, settings, snap) == 1
+    assert _target_concurrency(queue_dir, settings) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +592,32 @@ def test_tick_dispatch_dispatches_in_dispatching_state(queue_dir: Path) -> None:
             slot.thread.join(timeout=2)
 
 
+def test_tick_dispatch_slowing_down_applies_the_account_target(queue_dir: Path) -> None:
+    """SLOWING_DOWN caps the account at its ramp target, not at half the
+    queue's ceiling: 3 of 5, where halving would have allowed 2."""
+    settings = _make_settings(initial=5, max_c=5)
+    snap = _make_snapshot(SupervisorState.SLOWING_DOWN, target_concurrency=3)
+    for i in range(5):
+        _make_task(queue_dir, f"t{i}")
+    in_flight: dict[str, DispatchSlot] = {}
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
+        return_value=None,
+    ):
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=RealClock(),
+            snapshot=snap,
+            in_flight_slots=in_flight,
+            accounts=_resolved(cap=5),
+        )
+        assert set(in_flight.keys()) == {"t0", "t1", "t2"}
+        for slot in list(in_flight.values()):
+            slot.thread.join(timeout=2)
+
+
 def test_tick_dispatch_respects_in_flight_capacity(queue_dir: Path) -> None:
     """If in_flight already equals target, no new dispatches."""
     settings = _make_settings(initial=1, max_c=1)
@@ -772,6 +785,36 @@ def test_tick_dispatch_no_eligible_candidates(queue_dir: Path) -> None:
         )
     mock_dispatch.assert_not_called()
     assert in_flight == {}
+
+
+def test_tick_dispatch_checks_effort_against_its_settings(queue_dir: Path) -> None:
+    """tick_dispatch hands the selector ``settings.effort_levels`` (ADR-0010):
+    with a table that lacks the task's model, the task is parked instead of
+    dispatched."""
+    settings = _make_settings()
+    settings.effort_levels = {"claude-other-1": ["low"]}
+    _make_task(queue_dir, "t1")
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    in_flight: dict[str, DispatchSlot] = {}
+
+    with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as mock_dispatch:
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=RealClock(),
+            snapshot=snap,
+            in_flight_slots=in_flight,
+        )
+
+    mock_dispatch.assert_not_called()
+    assert in_flight == {}
+    state = load_state(state_path_for(queue_dir, "t1"))
+    assert state.status == "deferred"
+    assert state.deferred_reason == (
+        "invalid effort: model 'claude-opus-5-5' has no effort levels configured; "
+        'add "claude-opus-5-5" = [<levels>] under [effort_levels] in '
+        "claude_runner.toml or use a configured model"
+    )
 
 
 def test_tick_dispatch_priority_sort(queue_dir: Path) -> None:

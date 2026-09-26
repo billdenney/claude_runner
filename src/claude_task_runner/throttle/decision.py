@@ -21,7 +21,10 @@ Decision order (per ADR-0022):
      * else → ``DISPATCHING`` at ``max_concurrency``.
 
 In-flight tasks are NEVER killed by the decision — the
-``target_concurrency`` only gates *new* dispatches.
+``target_concurrency`` only gates *new* dispatches. The state machine
+records it on the account's :class:`supervisor.states.AccountState`, and
+:func:`runner.account_dispatch.choose_account` caps that account's
+in-flight tasks at it.
 """
 
 from __future__ import annotations
@@ -47,8 +50,10 @@ class Decision:
     """Output of :func:`decide`.
 
     ``state`` and ``target_concurrency`` drive the supervisor's
-    immediate action; ``wakeup_at`` schedules the next reclassification
-    when the supervisor goes idle.
+    immediate action: both land on the account's state, and dispatch
+    through the account stops, or is capped at ``target_concurrency``,
+    accordingly. ``wakeup_at`` schedules the next reclassification when
+    the supervisor goes idle.
 
     The diagnostic fields (``target_pct``, ``observed_*``, ``band``,
     ``slowdown_pct``, ``stop_pct``) drive event payloads and the
