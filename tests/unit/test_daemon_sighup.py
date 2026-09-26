@@ -179,6 +179,7 @@ def _reading(pct: int) -> UsageReading:
     )
 
 
+@pytest.mark.allow_self_signal
 def test_start_daemon_sighup_triggers_reload_on_next_tick(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

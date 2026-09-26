@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json as _json
 import logging
-import os
 import signal
 from collections.abc import Callable
 from pathlib import Path
@@ -19,6 +18,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
     require_queue_option,
@@ -328,7 +328,10 @@ def stop(
         console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
         raise typer.Exit(code=1)
     try:
-        os.kill(pid, signal.SIGTERM)
+        process_signals.kill(pid, signal.SIGTERM)
+    except process_signals.UnsafeSignalTarget as exc:
+        console.print(str(exc), style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2) from exc
     except ProcessLookupError as exc:
         console.print(f"[yellow]PID {pid} disappeared before SIGTERM[/]")
         raise typer.Exit(code=1) from exc
@@ -410,7 +413,8 @@ def drain(
     Exit codes:
       0  supervisor exited cleanly (or --no-wait and signal delivered)
       1  no PID file / stale PID file
-      2  signal delivery rejected (permission)
+      2  signal delivery rejected (permission), or refused because the
+         PID is 1 or less or this command's own
       4  --wait timed out (supervisor still draining — re-run drain or stop)
     """
     console = Console()
@@ -423,7 +427,10 @@ def drain(
         console.print(f"[yellow]PID {pid} not alive (stale PID file)[/]")
         raise typer.Exit(code=1)
     try:
-        os.kill(pid, signal.SIGUSR1)
+        process_signals.kill(pid, signal.SIGUSR1)
+    except process_signals.UnsafeSignalTarget as exc:
+        console.print(str(exc), style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2) from exc
     except ProcessLookupError as exc:
         console.print(f"[yellow]PID {pid} disappeared before SIGUSR1[/]")
         raise typer.Exit(code=1) from exc
