@@ -38,6 +38,7 @@ import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -86,6 +87,7 @@ def _make_settings(*, initial: int = 1, max_c: int = 5) -> Any:
         ),
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),

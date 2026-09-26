@@ -38,6 +38,7 @@ from claude_task_runner.queue.store import (
     load_task,
     queue_runtime_dir,
 )
+from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
@@ -689,16 +690,30 @@ def check_legacy_runner_dir(_settings: Settings, queue_dir: Path) -> CheckResult
     )
 
 
-def check_task_yamls(_settings: Settings, queue_dir: Path) -> CheckResult:
-    """Every YAML in ``todo/`` validates against the schema."""
+def check_task_yamls(settings: Settings, queue_dir: Path) -> CheckResult:
+    """Every YAML in ``todo/`` validates against the schema and names a
+    (model, effort) pair ``[effort_levels]`` accepts.
+
+    The schema cannot check the pair, since the accepted sets live in the
+    settings (ADR-0010), so this check does. The supervisor parks a
+    pending task that fails it as ``deferred`` instead of dispatching it.
+    Every YAML is checked whatever its state, as ``queue list`` does: a
+    completed task's file still names a pair the queue's config should
+    know.
+    """
     bad: list[str] = []
     count = 0
     for path in list_pending_tasks(queue_dir):
         count += 1
         try:
-            load_task(path)
+            task = load_task(path)
         except (QueueIOError, QueueSchemaError) as exc:
             bad.append(f"{path.name}: {exc}")
+            continue
+        try:
+            validate_effort(task.model, task.effort, settings.effort_levels)
+        except UnknownEffortLevel as exc:
+            bad.append(f"{path.name}: invalid effort: {exc}")
     if bad:
         return CheckResult(
             name="task_yamls",

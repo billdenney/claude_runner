@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -115,6 +116,7 @@ def _make_settings(*, initial: int = 1, max_c: int = 5):
         # Stubs for fields tick_dispatch never reads directly:
         task_caps=SimpleNamespace(),
         session=SimpleNamespace(),
+        effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
         failure_classifier=None,
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
@@ -772,6 +774,36 @@ def test_tick_dispatch_no_eligible_candidates(queue_dir: Path) -> None:
         )
     mock_dispatch.assert_not_called()
     assert in_flight == {}
+
+
+def test_tick_dispatch_checks_effort_against_its_settings(queue_dir: Path) -> None:
+    """tick_dispatch hands the selector ``settings.effort_levels`` (ADR-0010):
+    with a table that lacks the task's model, the task is parked instead of
+    dispatched."""
+    settings = _make_settings()
+    settings.effort_levels = {"claude-other-1": ["low"]}
+    _make_task(queue_dir, "t1")
+    snap = _make_snapshot(SupervisorState.DISPATCHING)
+    in_flight: dict[str, DispatchSlot] = {}
+
+    with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as mock_dispatch:
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=RealClock(),
+            snapshot=snap,
+            in_flight_slots=in_flight,
+        )
+
+    mock_dispatch.assert_not_called()
+    assert in_flight == {}
+    state = load_state(state_path_for(queue_dir, "t1"))
+    assert state.status == "deferred"
+    assert state.deferred_reason == (
+        "invalid effort: model 'claude-opus-5-5' has no effort levels configured; "
+        'add "claude-opus-5-5" = [<levels>] under [effort_levels] in '
+        "claude_runner.toml or use a configured model"
+    )
 
 
 def test_tick_dispatch_priority_sort(queue_dir: Path) -> None:
