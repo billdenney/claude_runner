@@ -20,6 +20,7 @@ MERGE_SKILL = "src/claude_task_runner/skills/runner-merge-claude-branches"
 
 RUN_BY: dict[str, str] = {
     "scripts/generate_synthetic_fixtures.py": "test_generate_synthetic_fixtures.py",
+    "scripts/smoke_installed.py": "test_smoke_installed.py",
     "src/claude_task_runner/cron/watchdog.sh": "test_watchdog_cmd.py",
     "src/claude_task_runner/skills/runner-answer-sidecar/fetch_all.sh": "test_fetch_all_script.py",
     f"{MERGE_SKILL}/dedup_canonical_headers.py": "test_merge_skill_scripts.py",
