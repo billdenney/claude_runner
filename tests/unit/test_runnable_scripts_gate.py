@@ -30,6 +30,7 @@ RUN_BY: dict[str, str] = {
     f"{MERGE_SKILL}/union_merge_lines.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/union_merge_news.py": "test_union_merge_news.py",
     f"{MERGE_SKILL}/verify_branch_contributions.sh": "test_merge_skill_scripts.py",
+    f"{MERGE_SKILL}/verify_no_base_reverts.py": "test_verify_no_base_reverts.py",
     f"{MERGE_SKILL}/verify_register_placement.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/verify_section_headers.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/verify_vignettes_parallel.R": "test_merge_skill_scripts.py",

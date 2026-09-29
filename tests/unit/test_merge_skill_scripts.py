@@ -27,8 +27,9 @@ Each gets a syntax or ``--help`` run here, plus cheap known-answer cases:
   nothing and is never reported missing, and a branch whose tip moved on after
   the merge contributes only the part that was merged.
 
-restore_dropped_sections.py and union_merge_news.py have their own modules for
-their logic; here they get their CLI, fail-loud and ``--extra-ref`` cases.
+restore_dropped_sections.py, union_merge_news.py and verify_no_base_reverts.py
+have their own modules for their logic; here they get their CLI, fail-loud and
+``--extra-ref`` cases.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from ._merge_skill_repo import (
     push_task_branch,
     run,
     run_helper,
+    update_main,
 )
 
 MERGE_BRANCHES = SKILL_DIR / "merge_branches.sh"
@@ -561,6 +563,47 @@ class TestMergeBranches:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert (repo / ".worktrees" / CONSOLIDATION / REGISTER).read_text() == REPAIRED
         assert VERIFIER_OK in proc.stdout
+        assert (
+            f"    (reverts) OK — nothing origin/main has in {REGISTER} was reverted by the merge\n"
+        ) in proc.stdout
+
+    def test_register_content_the_merge_reverted_stops_the_run(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Main rewords the WT line and adds a note under it after both branches forked.
+
+        Both branches rewrote that line, so -X theirs keeps their older copy,
+        without the note. The union merger puts main's longer annotation back,
+        since it rebuilds Example-models lines, but nothing restores the note:
+        the run stops before the R steps, and repairs nothing.
+        """
+        reworded = "(base model, reworded on main).\n- **Notes:** Added on main."
+        update_main(repo, {REGISTER: BASE_REGISTER.replace("(base model).", reworded)}, "note")
+        proc = self._full_run(
+            repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes"
+        )
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 5, proc.stdout
+        assert (
+            f"\nERROR: (reverts) 1 block(s) of {REGISTER} lost content that origin/main has:\n"
+            "    ## Body size\n"
+            "    ### WT (**canonical for body weight**)\n"
+            "      missing line: - **Notes:** Added on main.\n"
+        ) in proc.stdout
+        assert proc.stderr.endswith(
+            "ERROR: the merge reverted register content origin/main has (listed above). Nothing"
+            f" was repaired: restore it by hand in {wt}, commit, and re-run"
+            " verify_no_base_reverts.py until it passes before regenerating and pushing.\n"
+        )
+        assert "==> Regenerating" not in proc.stdout
+        assert (wt / REGISTER).read_text() == (
+            BASE_REGISTER.replace(
+                "(base model).",
+                "(base model, reworded on main), `B_2021_b.R` (b note), `A_2020_a.R` (a note).",
+            )
+            + BMI_BLOCK
+            + HT_BLOCK
+        )
 
 
 class TestVerifyBranchContributions:
@@ -700,6 +743,7 @@ class TestVerifyBranchContributions:
         "restore_dropped_sections.py",
         "union_merge_lines.py",
         "union_merge_news.py",
+        "verify_no_base_reverts.py",
         "verify_register_placement.py",
         "verify_section_headers.py",
     ],
@@ -750,11 +794,16 @@ WORKTREE_HELPERS = {
     "union_merge_lines.py": "union-merge",
     "restore_dropped_sections.py": "restore",
     "union_merge_news.py": "news",
+    "verify_no_base_reverts.py": "reverts",
 }
-# restore and news find the worktree with `git worktree list`; the others at
+# These find the worktree with `git worktree list`; the others at
 # <repo>/.worktrees/<branch>.
-_LISTED = {"restore_dropped_sections.py", "union_merge_news.py"}
-_VERIFIERS = {"verify_section_headers.py", "verify_register_placement.py"}
+_LISTED = {"restore_dropped_sections.py", "union_merge_news.py", "verify_no_base_reverts.py"}
+_VERIFIERS = {
+    "verify_section_headers.py",
+    "verify_register_placement.py",
+    "verify_no_base_reverts.py",
+}
 
 
 def _bad_input_cases() -> Iterator[object]:
@@ -829,6 +878,11 @@ def test_worktree_helpers_refuse_inputs_that_cannot_be_right(
             "",
         ),
         ("union_merge_news.py", "x.md not present; nothing to do\n", ""),
+        (
+            "verify_no_base_reverts.py",
+            "    (reverts) x.md is not on origin/main; nothing to check.\n",
+            "",
+        ),
     ],
 )
 def test_worktree_helpers_skip_a_file_the_worktree_lacks(
