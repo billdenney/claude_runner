@@ -25,6 +25,7 @@ RUN_BY: dict[str, str] = {
     "src/claude_task_runner/skills/runner-answer-sidecar/fetch_all.sh": "test_fetch_all_script.py",
     f"{MERGE_SKILL}/dedup_canonical_headers.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/merge_branches.sh": "test_merge_skill_scripts.py",
+    f"{MERGE_SKILL}/merge_set.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/restore_dropped_sections.py": "test_restore_dropped_sections_gate.py",
     f"{MERGE_SKILL}/union_merge_lines.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/union_merge_news.py": "test_union_merge_news.py",

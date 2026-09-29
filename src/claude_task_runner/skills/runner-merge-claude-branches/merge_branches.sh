@@ -11,7 +11,8 @@
 #   5. Register repairs: union-merge of covariate-columns.md (recovers the
 #      annotations -X theirs would have lost), dedup of duplicate canonical
 #      headers, restore of dropped canonical blocks, then the contribution
-#      verifier
+#      verifier. Every repair and verify step reads only the merge set: the
+#      branches this run merged, each at the commit it merged (merge_set.py).
 #   6. Union-merge of NEWS.md
 #   7. R-side registry regeneration (buildModelDb + document)
 #   8. devtools::check pre-push gate
