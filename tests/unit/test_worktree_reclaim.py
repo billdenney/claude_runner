@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import shutil
 import threading
 import time
 from collections.abc import Iterator
@@ -19,8 +20,13 @@ from typing import Any, get_args
 import pytest
 
 from claude_task_runner.config.schema import WorktreeReclaimSettings
-from claude_task_runner.queue.schema import TaskStatus
-from claude_task_runner.queue.store import state_path_for, todo_dir
+from claude_task_runner.queue.schema import Task, TaskStatus
+from claude_task_runner.queue.store import (
+    state_path_for,
+    task_path_for,
+    todo_dir,
+    write_task_atomic,
+)
 from claude_task_runner.worktree import reclaim as reclaim_mod
 from claude_task_runner.worktree.reclaim import (
     KeepReason,
@@ -68,6 +74,18 @@ def assert_untouched(world: World, task_id: str) -> None:
     assert (wt / ".git").is_file(), f"{wt} was removed"
     assert real(wt) in world.registered_worktrees()
     assert world.branch_exists(f"claude/{task_id}")
+
+
+def move_yaml(world: World, task_id: str, directory: str = "done", *, copy: bool = False) -> Path:
+    """Move (or copy) a task's YAML out of ``todo/``, as a queue's own tooling does."""
+    src = task_path_for(world.queue, task_id)
+    dst = world.queue / directory / src.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if copy:
+        shutil.copy2(src, dst)
+    else:
+        src.rename(dst)
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +746,109 @@ class TestQueueDiscovery:
         assert result.branch == "task/wt-7"
         assert not wt.exists()
         assert not world.branch_exists("task/wt-7")
+
+
+class TestTaskDirs:
+    """``task_dirs``: task YAMLs a queue moved out of ``todo/`` (2026-09-30)."""
+
+    def test_task_moved_to_done_is_reclaimed(self, world: World) -> None:
+        wt = world.add_task("t-done")
+        move_yaml(world, "t-done")
+        report = run(world)
+        result = only(report, "t-done")
+        assert result.outcome is Outcome.RECLAIMED
+        assert result.branch_deleted is True
+        assert not wt.exists()
+        assert not world.branch_exists("claude/t-done")
+        assert report.tasks_scanned == 1
+
+    @pytest.mark.parametrize("status", NON_COMPLETED_STATUSES)
+    def test_done_location_is_not_evidence_of_completion(self, world: World, status: str) -> None:
+        world.add_task("t-done", status=status)
+        move_yaml(world, "t-done")
+        result = only(run(world), "t-done")
+        assert (result.outcome, result.reason) == (Outcome.KEPT, KeepReason.STATUS)
+        assert result.detail == f"status={status}"
+        assert_untouched(world, "t-done")
+
+    def test_unmerged_task_in_done_is_kept(self, world: World) -> None:
+        world.add_task("t-done", merge=False)
+        move_yaml(world, "t-done")
+        result = only(run(world), "t-done")
+        assert (result.outcome, result.reason) == (Outcome.KEPT, KeepReason.UNMERGED)
+        assert_untouched(world, "t-done")
+
+    def test_task_in_todo_and_done_is_considered_once(self, world: World) -> None:
+        """Counting both copies would call the worktree shared and keep it forever."""
+        wt = world.add_task("t-both")
+        move_yaml(world, "t-both", copy=True)
+        report = run(world)
+        result = only(report, "t-both")
+        assert result.outcome is Outcome.RECLAIMED
+        assert report.tasks_scanned == 2
+        assert not wt.exists()
+
+    def test_first_listed_directory_wins(self, world: World) -> None:
+        wt = world.add_task("t-both")
+        stale = Task(id="t-both", title="t-both", prompt="extract", working_dir=None)
+        (world.queue / "done").mkdir()
+        write_task_atomic(stale, world.queue / "done" / "t-both.yaml")
+
+        assert only(run(world, apply=False), "t-both").outcome is Outcome.WOULD_RECLAIM
+        done_first = WorktreeReclaimSettings(task_dirs=["done", "todo"])
+        report = run(world, apply=False, settings=done_first)
+        assert report.results == ()
+        assert report.tasks_scanned == 2
+        assert wt.exists()
+
+    def test_working_dir_shared_across_directories_is_kept(self, world: World) -> None:
+        wt = world.add_task("t-a")
+        world.write_task("t-b", working_dir=wt)
+        world.write_state("t-b", "completed")
+        move_yaml(world, "t-b")
+        report = run(world)
+        for task_id in ("t-a", "t-b"):
+            result = only(report, task_id)
+            assert (result.reason, result.detail) == (
+                KeepReason.SHARED_WORKING_DIR,
+                "working_dir is named by 2 tasks: t-a, t-b",
+            )
+        assert_untouched(world, "t-a")
+
+    def test_todo_only_ignores_done(self, world: World) -> None:
+        world.add_task("t-done")
+        move_yaml(world, "t-done")
+        report = run(world, settings=WorktreeReclaimSettings(task_dirs=["todo"]))
+        assert report.results == ()
+        assert report.tasks_scanned == 0
+        assert_untouched(world, "t-done")
+
+    def test_missing_done_directory_is_skipped_not_created(self, world: World) -> None:
+        wt = world.add_task("t-todo")
+        report = run(world)
+        assert only(report, "t-todo").outcome is Outcome.RECLAIMED
+        assert report.tasks_scanned == 1
+        assert not wt.exists()
+        assert not (world.queue / "done").exists()
+
+    def test_nested_directory(self, world: World) -> None:
+        wt = world.add_task("t-arch")
+        move_yaml(world, "t-arch", "archive/2026")
+        settings = WorktreeReclaimSettings(task_dirs=["todo", "archive/2026"])
+        assert only(run(world, settings=settings), "t-arch").outcome is Outcome.RECLAIMED
+        assert not wt.exists()
+
+    def test_unparseable_yaml_outside_todo_names_its_directory(self, world: World) -> None:
+        (todo_dir(world.queue) / "broken.yaml").write_text("id: [\n")
+        (world.queue / "done").mkdir()
+        (world.queue / "done" / "torn.yaml").write_text("id: [\n")
+        world.add_task("t-ok")
+        move_yaml(world, "t-ok")
+        report = run(world)
+        assert report.unparseable_tasks == ("broken", "done/torn")
+        assert report.tasks_scanned == 3
+        assert only(report, "t-ok").outcome is Outcome.RECLAIMED
+        assert report.ok is True
 
 
 class TestReportShape:
