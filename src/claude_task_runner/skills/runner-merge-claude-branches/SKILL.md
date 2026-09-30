@@ -55,14 +55,50 @@ files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
 branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;
 override per repo. `--extra-ref` (repeatable) adds a hand-picked branch the
-pattern does not match; it reaches every repair and verify step.
+pattern does not match; it reaches every repair and verify step. An excluded
+branch reaches none of them: every helper reads only the merge set (see
+"The merge set" below).
 
 From an agent's shell, which has no terminal, pass `--yes` once the operator
 has confirmed the scope (step 2): without it the script stops at its
 confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
 prints every flag and exit code. Each exit code has one meaning; the ones that
-stop a run partway are 5 (a repair or verification step failed, or the
-verifier could not run), 6 (`devtools::check`), 7 (push) and 8 (vignettes).
+stop a run partway are 5 (a repair or verification step failed, the verifier
+could not run, or the revert check found base content the merge reverted),
+6 (`devtools::check`), 7 (push) and 8 (vignettes).
+
+## The merge set
+
+`--pattern` matches more than the branches a run merges: branches left out with
+`--exclude-ref`, branches pushed after the survey (or pushed to again after
+they were merged), and branches from earlier rounds that the base already has.
+On 2026-09-29 the helpers still read the 18 branches that run had left out:
+6 orphan `**Example models:**` entries and 6 NEWS bullets for models the merge
+did not ship leaked in, and the verifiers reported dozens of their
+contributions as missing. (Two more orphan entries came from branches that were
+merged, from content they had only inherited; see step 6.)
+
+So every repair and verify helper asks `merge_set.py` which branches count,
+and what each contributed. For a branch R, consolidation branch B and base:
+
+- **merged commit** `M = git merge-base R B`: R's tip when R is an ancestor of
+  B. If R's tip moved on after B merged it, M is the part B merged, and the
+  later commits count for nothing.
+- R is **in the merge set** when M is not an ancestor of the base, i.e. B
+  merged something of R's that the base lacks. A branch never merged has M at
+  its fork point, which the base has; a branch from an earlier round is on the
+  base. A branch merged only through another merged branch (one an
+  `--extra-ref` branch had merged into itself, say) is in it too: its commits
+  are in B.
+- R's **own diff** runs from its fork point `F = git merge-base <base> M` to M.
+  What R has at F it inherited from main; main may have renamed or removed it
+  since, so it is not R's contribution.
+
+Each helper prints what the gate left out, and names each branch that moved
+on; a branch already on the base is not mentioned. A helper whose merge set is
+empty exits 2: the branch or the pattern is wrong, and a check of nothing must
+not pass. `python3 merge_set.py --repo ... --branch ...` prints the members,
+one `<ref> <merged commit> <fork point>` line each.
 
 ## Steps the skill follows
 
@@ -106,7 +142,8 @@ verifier could not run), 6 (`devtools::check`), 7 (push) and 8 (vignettes).
      do NOT skip that step.
 
 **ORDER NOTE (changed 2026-08-20).** The register repairs (steps 6, 6b, 6c,
-6d) now run BEFORE the R regeneration (step 5 below), not after.
+6d) now run BEFORE the R regeneration (step 5 below), not after, and so do the
+verifier (step 7) and the revert check (step 7b).
 `buildModelDb()` calls `checkModelConventions()`, which treats a duplicate
 register entry as an ERROR -- and duplicate entries are exactly what `-X
 theirs` produces when two branches each add the same new canonical. Running
@@ -135,11 +172,37 @@ exists to repair. Repair, then regenerate.
 
 6. **Union-merge covariate-columns.md** via
    `union_merge_lines.py`. This script:
-   - Parses each branch's diff for added `**Example models:**` lines.
-   - Buckets additions by (covariate header, subsection).
-   - Builds a union of `(filename, annotation)` per bucket,
-     preserving the most-informative annotation per filename.
-   - Re-emits each Example-models line as a single deduplicated list.
+   - Reads each branch in the merge set whose own diff touched the file, at
+     its merged commit.
+   - Takes from each branch only the `**Example models:**` entries it added,
+     or whose annotation it changed, relative to its fork point. An entry it
+     merely inherited is main's, and main may have renamed or removed it
+     since: on 2026-09-29 the pre-rename `Willmann_2018_rivaroxaban.R` came
+     back twice that way, from branches that had been merged.
+   - Buckets the entries by (covariate header, subsection) and unions them
+     with the base's, keeping the most informative (longest) annotation per
+     filename.
+   - Rebuilds each Example-models line the union adds to: the line's own
+     models first, then the branches' additions. The line keeps its prefix
+     and the text after its last entry.
+
+   **The emitter is idempotent (fixed 2026-09-29).** It used to rebuild every
+   line as `", ".join(entries) + "."`. Where an annotation opens a `(` it never
+   closes, the parser ran to the end of the line, so the annotation took the
+   line's final full stop and the emitter appended another: one per round,
+   until three lines of nlmixr2lib's covariate register (in the
+   `BACT_PTT_LOG10CFU`, `CONMED_QPRL_ORAL` and `FORM_VINP_IR` blocks) ended in
+   13 or more. It also turned `; ` separators into `, ` and dropped prose
+   between or after the entries. Now an unclosed annotation ends before the
+   next entry, else after its last `)`, else before the trailing full stops;
+   the text after the last entry is kept as it is; and a line the union adds
+   nothing to is left byte for byte, so running the union twice gives what
+   running it once gives. A line it does add to is still rebuilt with `, `
+   between entries, and text between two entries is not kept. Existing runs
+   of full stops are left as they are; they no longer grow. An Example-models
+   line with no inline list (a list-style heading with one sub-bullet per
+   model, or prose) is never rewritten; the placement check (step 7) reports
+   a branch's model missing from it.
 
 6b. **Dedup duplicate canonical headers** via
    `dedup_canonical_headers.py --global inst/references/covariate-columns.md`.
@@ -178,9 +241,13 @@ exists to repair. Repair, then regenerate.
    loss it repairs -- on an 80-branch round it proposed 31 blocks of which 20
    were pre-rename spellings. Three skips, each reported in its output:
 
-   - **ancestry** -- only branches that are ancestors of the consolidation
-     branch contribute; the `--pattern` glob also matches earlier rounds and
-     branches pushed after the survey.
+   - **the merge set** -- only branches in the merge set (see "The merge set"
+     above) contribute, each read at its merged commit; the `--pattern` glob
+     also matches earlier rounds, branches left out with `--exclude-ref` and
+     branches pushed after the survey. A branch that moved on after it was
+     merged contributes the part that was merged. (The ancestry test this
+     replaced skipped such a branch outright, so a block it contributed and
+     the merge lost was not restored.)
    - **fork point** -- only blocks a branch ADDED count. Comparing against the
      current base is not enough: when main renames a canonical, every branch cut
      before the rename still carries the old spelling, which is then absent from
@@ -215,11 +282,23 @@ exists to repair. Repair, then regenerate.
    is doubly silent: entries already on main are DELETED *and* every other
    branch's bullet is dropped. On 2026-08-20 NEWS.md came out of the merge
    **85 lines short with not one of the 169 merged models represented**; an
-   earlier round lost 60. The script rebuilds from base plus every branch's
-   bullets, **gated on the model actually being shipped by this merge** --
-   a branch whose tip advanced after the survey may carry bullets for models
-   that were not folded in, and announcing those would advertise models the
-   package does not have.
+   earlier round lost 60. The script rebuilds from base plus **the bullets
+   each branch in the merge set added**: present in NEWS.md at its merged
+   commit, absent at its fork point. A branch left out of the merge adds
+   nothing, and one that moved on after it was merged adds only what the
+   merged part added.
+
+   This provenance gate replaced one that parsed "Add <Author> <Year>" and
+   kept a bullet when a shipped model file had that author and year. On
+   2026-09-29 that was wrong both ways: it kept six bullets from branches
+   left out of the merge, because another shipped model shared their author
+   and year ("Add Wang 2020 caspofungin" rode in on a shipped Wang 2020
+   model), and it dropped bullets whose file stem spells them differently: a
+   lettered year (`Chen_2021a_tacrolimus.R`) or a surname particle ("Le
+   Marouille", `Marouille_2021_palbociclib.R`). Reading each branch's whole
+   file also brought back three bullets main had reworded since those
+   branches forked, in their old wording, beside the new. The rebuild now
+   lists any bullet of the merge result it drops.
 
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh`, which now applies THREE checks per
@@ -242,33 +321,83 @@ exists to repair. Repair, then regenerate.
    97-branch consolidation: `UGT2B15_STAR2_HET`/`_HOM`,
    `RRT_CRRT_EFFLUENT_FLOW`, and `lkst`.
 
-   Two subtleties (c) handles, both learned the hard way:
+   Two subtleties, both learned the hard way:
 
-   - It only considers branches that are **ancestors** of the consolidation
-     branch. The queue keeps pushing while a merge runs, so the pattern also
-     matches branches that appeared after the survey; blaming the merge for
-     their content is a false positive.
+   - All three checks read only **the merge set**, and only **what each
+     branch added**: its own diff, from its fork point to its merged commit.
+     The queue keeps pushing while a merge runs and `--exclude-ref` leaves
+     branches out, so the pattern also matches branches that are not in the
+     merge; on 2026-09-29 the unmerged branches produced dozens of false
+     "missing" reports. Content a branch merely inherited is main's: if the
+     merge loses it, step 7b reports it against the base.
    - A header may name several canonicals sharing one block
      (`### QTc, QTcF, QTcI, QTcP, QTcS`), and that list GROWS as spellings are
-     ratified. Each name is indexed separately, so a block that *gained* a
-     name is not read as a different canonical with everything under it lost.
+     ratified. Checks (b) and (c) index each name separately, so a block that
+     *gained* a name is not read as a different canonical with everything
+     under it lost.
 
    The verifier exits 1 when it finds losses, and `merge_branches.sh` turns
    that into a WARNING to reconcile by hand. It exits 2 when it cannot run at
    all: a `--base`, `--branch` or `--extra-ref` that does not resolve, no
-   worktree for the branch, a `--pattern` matching nothing, or no `python3`.
-   Each of those used to pass silently -- a verifier that checks nothing
-   reports everything present -- and `merge_branches.sh` now stops with exit 5
-   on them. The helpers it calls (`union_merge_lines.py`,
+   worktree for the branch, a `--pattern` matching nothing, an empty merge
+   set, or no `python3`. Each of those used to pass silently -- a verifier
+   that checks nothing reports everything present -- and `merge_branches.sh`
+   now stops with exit 5 on them. The helpers it calls (`union_merge_lines.py`,
    `restore_dropped_sections.py`, `union_merge_news.py`, the two delegated
-   verifiers and `dedup_canonical_headers.py`) apply the same rule: a missing
-   worktree, file argument or matching branch is an error, never a skip.
+   verifiers, `verify_no_base_reverts.py`, `merge_set.py` and
+   `dedup_canonical_headers.py`) apply the same rule: a missing worktree, file
+   argument or matching branch, or an empty merge set, is an error, never a
+   skip.
 
-   **Known false positive.** The verifier splits a multi-name header such as
-   `### CONMED_ATORVASTATIN_DOSE, CONMED_FLV_DOSE, ...` into separate names
-   and then cannot find each as a standalone `###` entry, so it reports the
-   branch as missing contributions when the block is present. Confirm
-   against the file before acting on such a report.
+   **A report against a multi-name heading is real.** This section used to
+   call such a report (`### fm_125d3, fm_1ohm, ...`) a known false positive,
+   to be confirmed against the file and set aside. On 2026-09-29 the `fm_*`
+   placement reports were real: a branch cut before main added nine pathways
+   to that heading won the merge, and the heading lost them, with main's
+   example entries, a paragraph and the wording of its notes.
+   `buildModelDb()` passed anyway, which proved nothing; the package's
+   convention tests then failed on 16 models. Checks (b) and (c) compare
+   heading names one by one, so a heading whose list merely grew is not
+   reported; content of the base lost this way is reported by step 7b, which
+   stops the run. Treat any report as real until the file shows otherwise.
+
+7b. **Revert check** via `verify_no_base_reverts.py`, on the union file and
+   every register file, after the NEWS union and before the regeneration.
+   `-X theirs` resolves a conflicting hunk with the incoming side, so a
+   branch cut from an older main can put back its older copy of a whole
+   block: main's newer lines vanish although the branch never touched them.
+   The repairs above cannot see this -- they restore what BRANCHES added --
+   and the regeneration can pass. On 2026-09-29 a stale copy of the
+   `fm_<pathway>` block in parameter-names.md lost the nine names above, and
+   a new `### CONMED_RTV_CC` block pasted into the middle of
+   `CONMED_RTV_AUC_12H`'s notes line cut it in two, taking its second half
+   into the new block.
+
+   It reports every piece of the base's content that the merge result lacks
+   and that no merge-set branch's own diff removed; a line a branch edited or
+   deleted on purpose is therefore not reported. Content is compared block by
+   block: a `### ` block is matched, within its own `## ` section, to the
+   result's blocks that share a heading name with it (a multi-name heading is
+   split on commas, and its `(**...**)` description is not a name). So a
+   block that moved is not a loss, and a token two sections both use
+   (compartment-names.md registers some as a compartment and as a suffix) is
+   never matched across them. Each heading name, the heading's description,
+   each Example-models entry and its annotation, and every other non-blank
+   line must survive; how many full stops end an Example-models line is not
+   compared. A line cut in two by a pasted block -- its first part kept, the
+   rest now ending a line of another block -- is reported even though the
+   branch's own commit did it, which is what happened to CONMED_RTV_AUC_12H.
+
+   Exit 0 is clean, 1 lists every affected block and line, 2 means it could
+   not run. `merge_branches.sh` stops with exit 5 on either of the last two,
+   before the regeneration. Nothing is repaired automatically, because which
+   copy of a block is right needs judgement: put the base's content back by
+   hand, keeping what the branches added, commit, and re-run the check until
+   it passes. Replayed on the 2026-09-29 merge after the automated repairs,
+   it reported those two blocks and nothing else; the hand-repaired branch
+   passes it.
+
+   Regression tests: `tests/unit/test_verify_no_base_reverts.py`.
 
 8. **`devtools::check` pre-push gate**:
 

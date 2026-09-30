@@ -19,8 +19,23 @@ shorter, with 5 reordered duplicates re-added, and NOT ONE of the 169 merged
 models had a NEWS entry. A previous round lost 60.
 
 This script rebuilds the file: it takes the BASE version as authoritative for
-accumulated history, then re-applies every bullet any branch added relative to
-base, de-duplicated, inserted under the "# development version" heading.
+accumulated history, then re-applies every bullet a merged branch added,
+de-duplicated, inserted under the "# development version" heading.
+
+Which bullets a branch added is decided by provenance, not by reading the
+bullet. For each ref in the merge set (see merge_set.py) it compares NEWS.md at
+the commit the consolidation merged with NEWS.md at that commit's fork point
+from the base; the bullets that are new there are the branch's own. A ref the
+consolidation did not merge adds nothing, and a ref whose tip moved on after
+the merge adds only what the merged part added.
+
+This replaced a gate that parsed "Add <Author> <Year>" and kept a bullet when
+some shipped model file had that author and year. It was wrong both ways on
+2026-09-29: it kept six bullets from branches left out of the merge ("Add Wang
+2020 caspofungin" passed because another Wang 2020 model shipped), and it
+dropped bullets whose file stem does not spell the author and year the same
+way: a lettered year (Chen_2021a_tacrolimus.R) or a surname particle ("Le
+Marouille", Marouille_2021_palbociclib.R).
 
 Idempotent: a bullet already present is not added twice.
 
@@ -31,24 +46,21 @@ Usage:
 Exit codes: 0 done (or the file is not in the worktree); 1 with --check,
 bullets are missing; 2 it could not run: a bad argument, a --base, --branch or
 --extra-ref that does not resolve, no worktree with --branch checked out, no
-branch matching --pattern, an unreadable base file, or a crash.
+branch matching --pattern, an empty merge set, an unreadable base file, or a
+crash.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import traceback
 from pathlib import Path
 
+import merge_set
+
 DEV_HEADING = re.compile(r"^#\s+development version", re.I)
-
-
-def git(args: list[str], cwd: Path) -> str:
-    out = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
-    return out.stdout if out.returncode == 0 else ""
 
 
 # NEWS.md files mix bullet markers -- this package's older entries use "* " and
@@ -86,55 +98,18 @@ def key(block: str) -> str:
     return re.sub(r"\s+", " ", k).strip().lower()
 
 
-def worktree_for(repo: Path, branch: str) -> Path | None:
-    """The worktree that has ``branch`` checked out, or None.
-
-    No fallback: guessing another worktree would rewrite the wrong NEWS.md.
-    """
-    cand: Path | None = None
-    for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
-        if line.startswith("worktree "):
-            cand = Path(line[len("worktree ") :])
-        elif line == f"branch refs/heads/{branch}":
-            return cand
-    return None
-
-
 def fail(message: str) -> int:
     print(f"ERROR: (news) {message}", file=sys.stderr)
     return 2
 
 
-def resolves(repo: Path, ref: str) -> bool:
-    """True when ``ref`` names a commit in ``repo``."""
-    return bool(git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo).strip())
-
-
-def bullet_ships(block: str, tokens: set[str]) -> bool:
-    """True when the bullet's OWN author-year names a model this merge adds.
-
-    Parses the bullet rather than substring-scanning it. A substring test
-    false-positives badly on short surnames -- "xu" and "ai" match inside
-    squashed compound names like "vandenberg" -- which would let through
-    bullets for models the merge does not ship.
-    """
-    if not tokens:
-        return True  # no modeldb diff to gate on; keep prior behaviour
-    m = re.match(r"^[-*]\s+(?:Add|Update|Fix)\s+(.+?)\s+((?:19|20)\d{2})\b", block.strip())
-    if not m:
-        return True  # not an "Add <Author> <Year>" bullet; do not gate it out
-    raw = m.group(1).strip()
-    # A surname is a few words at most ("van den Berg", "Olsson Gisleskog").
-    # A long capture means this is not the per-model form -- e.g. "Add 14
-    # published imatinib population PK models transcribed from the Yang 2025
-    # external evaluation", where the non-greedy match swallows the whole
-    # phrase. Such a bullet legitimately covers many models and MUST NOT be
-    # gated out on a failed surname match; keep it.
-    if len(raw.split()) > 3:
-        return True
-    author = re.sub(r"[^a-z]", "", raw.lower())
-    year = m.group(2)
-    return (author, year) in {(a.replace(" ", ""), y) for a, y in (t.split(" ", 1) for t in tokens)}
+def added_by(repo: Path, member: merge_set.Member, file_rel: str) -> list[str]:
+    """The bullets ``member`` added: in its merged copy, not at its fork point."""
+    merged = merge_set.read_file(repo, member.merged, file_rel)
+    if merged is None:
+        return []
+    inherited = {key(b) for b in bullets(merge_set.read_file(repo, member.fork, file_rel) or "")}
+    return [b for b in bullets(merged) if key(b) not in inherited]
 
 
 def main() -> int:
@@ -159,17 +134,12 @@ def main() -> int:
     named = [("--base", args.base), ("--branch", args.branch)]
     named += [("--extra-ref", ref) for ref in args.extra_ref if ref]
     for flag, ref in named:
-        if not resolves(repo, ref):
+        if not merge_set.resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
-    wt = worktree_for(repo, args.branch)
+    wt = merge_set.worktree_of(repo, args.branch)
     if wt is None:
         return fail(f"no worktree of {repo} has --branch {args.branch!r} checked out")
-    refs = git(
-        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
-    ).split()
-    for ref in args.extra_ref:
-        if ref and ref not in refs:
-            refs.append(ref)
+    refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
     if not refs:
         return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
     target = wt / args.file
@@ -177,45 +147,29 @@ def main() -> int:
         print(f"{args.file} not present; nothing to do")
         return 0
 
-    base_text = git(["show", f"{args.base}:{args.file}"], repo)
+    base_text = merge_set.read_file(repo, args.base, args.file)
     if not base_text:
         print(f"cannot read {args.base}:{args.file}; refusing to rewrite", file=sys.stderr)
         return 2
     base_keys = {key(b) for b in bullets(base_text)}
 
-    # Only advertise models this merge actually ships. A branch whose tip
-    # advanced after the survey may carry bullets for models that were NOT
-    # folded in; adding those would announce models the package does not have.
-    shipped = git(
-        ["diff", "--name-only", f"{args.base}...{args.branch}", "--", "inst/modeldb/"], repo
-    ).split()
-    stems = {Path(x).stem.lower() for x in shipped}
-    tokens: set[str] = set()
-    for st in stems:
-        parts = st.split("_")
-        if len(parts) >= 2:
-            tokens.add(f"{parts[0]} {parts[1]}")
+    found = merge_set.compute(repo, args.branch, args.base, refs)
+    for line in found.summary():
+        print(f"# {line}")
+    if not found.members:
+        return fail(merge_set.empty_message(args.pattern, args.branch, args.base))
 
     added: list[str] = []
-    skipped = 0
     seen = set(base_keys)
-    for ref in refs:
-        text = git(["show", f"{ref}:{args.file}"], repo)
-        if not text:
-            continue
-        for b in bullets(text):
+    for member in found.members:
+        for b in added_by(repo, member, args.file):
             k = key(b)
-            if k in seen:
-                continue
-            seen.add(k)
-            if not bullet_ships(b, tokens):
-                skipped += 1
-                continue
-            added.append(b)
-    if skipped:
-        print(f"# skipped {skipped} bullet(s) for models not shipped by this merge")
+            if k not in seen:
+                seen.add(k)
+                added.append(b)
 
-    current_keys = {key(b) for b in bullets(target.read_text())}
+    current = bullets(target.read_text(encoding="utf-8"))
+    current_keys = {key(b) for b in current}
     lost_from_base = [b for b in bullets(base_text) if key(b) not in current_keys]
     missing_added = [b for b in added if key(b) not in current_keys]
 
@@ -230,6 +184,16 @@ def main() -> int:
         return 1
 
     # Base is authoritative for accumulated history; re-apply every branch bullet.
+    # Anything else in the merge result goes: a stale branch's copy brings back
+    # bullets main has since reworded or removed. Named, so the drop is not silent.
+    dropped = [b for b in current if key(b) not in seen]
+    if dropped:
+        print(
+            f"# dropping {len(dropped)} bullet(s) that are neither on {args.base} nor added by a"
+            " merged branch:"
+        )
+        for b in dropped:
+            print(f"#   {b.splitlines()[0]}")
     lines = base_text.splitlines()
     for idx, line in enumerate(lines):
         if DEV_HEADING.match(line):
@@ -242,7 +206,7 @@ def main() -> int:
     for b in added:
         payload.extend(["", *b.splitlines()])
     out = "\n".join(lines[:insert_at] + payload + lines[insert_at:]).rstrip("\n") + "\n"
-    target.write_text(out)
+    target.write_text(out, encoding="utf-8")
     print(f"# rebuilt {args.file}: {len(base_keys)} base + {len(added)} branch bullets")
     return 0
 

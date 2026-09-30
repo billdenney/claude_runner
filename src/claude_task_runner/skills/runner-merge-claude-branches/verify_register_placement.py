@@ -11,6 +11,14 @@ This check asks the stronger question: for every (canonical, model.R) pair a
 branch recorded, is that model still listed UNDER THAT CANONICAL after the
 merge?
 
+A branch "recorded" a pair when its own diff added it: present at the commit
+the consolidation merged, absent at that commit's fork point from the base.
+Only branches in the merge set count (merge_set.py). Pairs a branch merely
+inherited are main's content, not the branch's: when a stale copy of a block
+wins the merge and loses them, verify_no_base_reverts.py reports that loss
+against the base, and a pair main has since removed or renamed (a pre-rename
+model file, say) is not expected in the merge at all.
+
 It exists because a 97-branch consolidation (2026-08-31) lost four such pairs
 while the filename check passed on all of them:
 
@@ -28,41 +36,26 @@ bucket) nor restore_dropped_sections.py (it restores only blocks that vanished
 ENTIRELY) repairs.
 
 Exit codes: 0 clean (or the merged file is not in the worktree), 1 missing
-placements found, 2 the check could not run: a bad argument, a --branch or
---extra-ref that does not resolve, no worktree for --branch, no branch matching
---pattern, or a crash. (--base is accepted for a uniform interface and unused:
-ancestry, not the base, decides which branches are checked.)
+placements found, 2 the check could not run: a bad argument, a --base, --branch
+or --extra-ref that does not resolve, no worktree for --branch, no branch
+matching --pattern, an empty merge set, or a crash.
 """
 
 import argparse
 import collections
 import re
-import subprocess
 import sys
 import traceback
 from pathlib import Path
 
+import merge_set
+
 R_FILE = re.compile(r"`([A-Za-z0-9_.\-]+\.R)`")
-
-
-def git(args: list[str], repo: Path) -> str:
-    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True).stdout
 
 
 def fail(message: str) -> int:
     print(f"ERROR: (placement) {message}", file=sys.stderr)
     return 2
-
-
-def resolves(repo: Path, ref: str) -> bool:
-    """True when ``ref`` names a commit in ``repo``."""
-    probe = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
 def parse(text: str) -> dict[str, set[str]]:
@@ -113,28 +106,21 @@ def main() -> int:
     # is indistinguishable from "not an ancestor" -- so a bad --branch would
     # silently drop every branch and report a clean register. Fail loudly
     # instead of passing vacuously.
-    if not resolves(repo, args.branch):
+    if not merge_set.resolves(repo, args.branch):
         return fail(
             f"--branch {args.branch!r} does not resolve to a commit in {repo};"
             " refusing to report a vacuous pass."
         )
+    if not merge_set.resolves(repo, args.base):
+        return fail(f"--base {args.base!r} does not resolve to a commit in {repo}")
     for er in args.extra_ref:
-        if er and not resolves(repo, er):
+        if er and not merge_set.resolves(repo, er):
             return fail(f"--extra-ref {er!r} does not resolve to a commit in {repo}")
     worktree = repo / ".worktrees" / args.branch
     if not worktree.is_dir():
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
 
-    refs = [
-        r
-        for r in git(
-            ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
-        ).split()
-        if r
-    ]
-    for er in args.extra_ref:
-        if er and er not in refs:
-            refs.append(er)
+    refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
     if not refs:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
@@ -148,38 +134,27 @@ def main() -> int:
     merged = parse(merged_path.read_text(errors="replace"))
 
     # Only branches actually FOLDED IN may be checked.  The queue keeps pushing
-    # while a consolidation runs, so the pattern also matches branches that
-    # appeared after the survey and are not in this merge; holding the merge
-    # responsible for their content would be a false positive.  Step 4 uses real
-    # merges, so "folded in" == "is an ancestor of the consolidation branch".
-    merged_refs = []
-    skipped = 0
-    for r in refs:
-        rc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", r, args.branch], cwd=repo, capture_output=True
-        )
-        if rc.returncode == 0:
-            merged_refs.append(r)
-        elif rc.returncode == 1:
-            skipped += 1
-        else:
-            return fail(f"git merge-base --is-ancestor {r} {args.branch} failed")
-    refs = merged_refs
-    if skipped:
-        print(
-            f"    (placement) ignoring {skipped} branch(es) matching the "
-            f"pattern that are not ancestors of {args.branch} "
-            f"(pushed after the survey; not in this merge)"
+    # while a consolidation runs, and merge_branches.sh --exclude-ref leaves
+    # branches out on purpose, so the pattern also matches branches that are
+    # not in this merge; holding the merge responsible for their content would
+    # be a false positive.  merge_set.py decides, from ancestry.
+    found = merge_set.compute(repo, args.branch, args.base, refs)
+    for line in found.summary():
+        print(f"    (placement) {line}")
+    if not found.members:
+        return fail(
+            merge_set.empty_message(args.pattern, args.branch, args.base) + "; nothing to verify"
         )
 
     gaps: dict[tuple[str, str], list[str]] = collections.defaultdict(list)
-    for br in refs:
-        txt = git(["show", f"{br}:{args.file}"], repo)
+    for member in found.members:
+        txt = merge_set.read_file(repo, member.merged, args.file)
         if not txt:
             continue
+        inherited = parse(merge_set.read_file(repo, member.fork, args.file) or "")
         for canon, models in parse(txt).items():
-            for m in models - merged.get(canon, set()):
-                gaps[(canon, m)].append(br.replace("origin/", ""))
+            for m in models - inherited.get(canon, set()) - merged.get(canon, set()):
+                gaps[(canon, m)].append(member.ref.replace("origin/", ""))
 
     if not gaps:
         print(

@@ -11,8 +11,11 @@
 #   5. Register repairs: union-merge of covariate-columns.md (recovers the
 #      annotations -X theirs would have lost), dedup of duplicate canonical
 #      headers, restore of dropped canonical blocks, then the contribution
-#      verifier
-#   6. Union-merge of NEWS.md
+#      verifier. Every repair and verify step reads only the merge set: the
+#      branches this run merged, each at the commit it merged (merge_set.py).
+#   6. Union-merge of NEWS.md, then the revert check: register content the
+#      base has that the merge lost and no merged branch removed stops the
+#      run (verify_no_base_reverts.py)
 #   7. R-side registry regeneration (buildModelDb + document)
 #   8. devtools::check pre-push gate
 #   9. Parallel vignette validation pre-push gate
@@ -90,7 +93,8 @@
 #      survey stops before merging), or every merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
 #      script failed, duplicate canonical headers survived dedup, the
-#      verifier could not run, or the R registry regeneration failed
+#      verifier could not run, the revert check found base content the merge
+#      reverted (or could not run), or the R registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
@@ -713,6 +717,38 @@ if [[ -f NEWS.md ]]; then
     git add NEWS.md
     git commit -m "Union-merge NEWS.md across all folded branches" >/dev/null
     echo "    committed NEWS.md union"
+  fi
+fi
+
+# Revert check. -X theirs resolves a conflicting hunk with the incoming side,
+# so a branch cut from an older main can put back its older copy of a whole
+# register block: main's newer lines vanish although the branch never touched
+# them. None of the repairs above can see that -- they restore what BRANCHES
+# added -- and the R regeneration can still pass. On 2026-09-29 a stale copy
+# of the fm_<pathway> block dropped nine names from its heading in
+# parameter-names.md (16 models then failed the convention tests), and a new
+# CONMED_RTV_CC block cut CONMED_RTV_AUC_12H's notes in half. Report every line
+# the base has that the merge lost and no merged branch's own diff removed, and
+# stop: which copy of a block is right needs judgement, so nothing is repaired.
+REVERT_TARGETS=()
+for rf in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+  [[ -n "$rf" ]] || continue
+  [[ " ${REVERT_TARGETS[*]:-} " == *" $rf "* ]] && continue
+  if [[ -f "$rf" ]] || git cat-file -e "${BASE}:${rf}" 2>/dev/null; then
+    REVERT_TARGETS+=(--file "$rf")
+  fi
+done
+if (( ${#REVERT_TARGETS[@]} )); then
+  echo
+  echo "==> Checking the registers for base content the merge reverted"
+  revert_rc=0
+  "$PYTHON3" "$SCRIPT_DIR/verify_no_base_reverts.py" \
+    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN" \
+    "${EXTRA_REF_ARGS[@]}" "${REVERT_TARGETS[@]}" || revert_rc=$?
+  if (( revert_rc == 1 )); then
+    die 5 "the merge reverted register content $BASE has (listed above). Nothing was repaired: restore it by hand in $WT_ABS, commit, and re-run verify_no_base_reverts.py until it passes before regenerating and pushing."
+  elif (( revert_rc != 0 )); then
+    die 5 "verify_no_base_reverts.py could not run (exit $revert_rc)."
   fi
 fi
 

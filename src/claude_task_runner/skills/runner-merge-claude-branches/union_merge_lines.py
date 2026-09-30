@@ -13,24 +13,41 @@ silently losing every other branch's annotations.
 
 This script repairs that loss after the merge:
 
-1. Reads the file at ``origin/<base>`` as the merge base.
-2. For each ``<pattern>`` branch that touched the file, reads its
-   tip version.
+1. Reads the file at ``--base``.
+2. Finds the branches in the merge set (see merge_set.py) whose own diff
+   touched the file, and reads each one's copy at the commit that was
+   merged. A ref the pattern matches but the consolidation did not merge
+   contributes nothing: on 2026-09-29 the refs left out with
+   ``--exclude-ref`` put orphan Example-models entries into a merge that
+   did not ship their models. A ref whose tip moved on after the merge
+   contributes only the part that was merged.
 3. Parses every ``**Example models:**`` line and buckets the
    ``(filename, annotation)`` entries by ``(covariate header,
    subsection header)`` resolved from the most recent ``##``/``###``
    markdown headings.
-4. Builds a union across base + all branches, taking the longest
-   (most informative) annotation per filename per bucket.
+4. Builds a union of the base's entries and those each branch changed:
+   ones it added, or whose annotation it changed, relative to its fork
+   point. An entry a branch only inherited is main's; main may have
+   renamed or removed it since. The longest (most informative)
+   annotation per filename per bucket wins.
 5. Walks the CURRENT (post-merge) file and re-emits each
-   Example-models line as a single deduplicated list, preserving
-   the original line prefix.
+   Example-models line the union adds to, keeping the line's own prefix
+   and the text after its last entry. A line the union adds nothing to is
+   left byte-for-byte as it is, so a second run changes nothing.
 6. Writes the result back to the merge branch's worktree.
+
+The re-emit used to append a full stop to every line it rebuilt, and to
+rebuild every line. Where an annotation opens a "(" it never closes, the
+annotation swallowed the line's final full stop, so each consolidation round
+added one more: three lines of nlmixr2lib's covariate register reached 13 or
+more. Existing runs of full stops are left as they are; they no longer grow.
 
 Out-of-scope additions (brand-new lines, new sections, table rows
 that aren't Example-models lines) are NOT touched — the merge
 already handles those via standard 3-way merging because they
-appear at unique line positions per branch.
+appear at unique line positions per branch. Neither is an Example-models
+line with no inline list: a list-style heading, whose models are sub-bullets
+under it, or a prose body such as "none yet".
 
 If the file's structured-markdown shape differs from
 "Example models" lines, extend ``EXAMPLE_LINE_RE`` to a list of
@@ -39,17 +56,20 @@ patterns and add per-pattern parser functions. Open to PRs.
 Exit codes: 0 done (including nothing to reconstruct, or the file is not in the
 worktree); 2 it could not run: a bad argument, a ``--base``, ``--branch`` or
 ``--extra-ref`` that does not resolve, no worktree for ``--branch``, no branch
-matching ``--pattern``, or a failed git command.
+matching ``--pattern``, an empty merge set, or a failed git command.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import traceback
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import merge_set
 
 # Regex for the structured line we union-merge. Currently only one
 # shape is supported; the regex is permissive on whitespace and bullet
@@ -57,13 +77,11 @@ from pathlib import Path
 # reasonable markdown.
 EXAMPLE_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s*\*\*Example models:\*\*\s*(.*)$")
 SECTION_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+FILENAME_RE = re.compile(r"`([^`]+\.R)`")
+# Where the next entry starts: a comma, then a backticked model file.
+NEXT_ENTRY_RE = re.compile(r",\s*`[^`]+\.R`")
 
-
-def run(args: list[str], cwd: Path) -> str:
-    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)} failed (exit {r.returncode}): {r.stderr[:400]}")
-    return r.stdout
+Bucket = tuple[str, str]
 
 
 def fail(message: str) -> int:
@@ -71,273 +89,237 @@ def fail(message: str) -> int:
     return 2
 
 
-def resolves(repo: Path, ref: str) -> bool:
-    """True when ``ref`` names a commit in ``repo``."""
-    r = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    return r.returncode == 0
+def _closing_paren(text: str, start: int) -> int | None:
+    """Index of the ")" that closes the "(" at ``start``, or None if none does."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
-def list_pattern_branches(repo: Path, pattern: str) -> list[str]:
-    """Return remote branches matching the configured glob (e.g.
-    ``origin/claude/*``)."""
-    refspec = f"refs/remotes/{pattern}"
-    out = run(
-        ["git", "for-each-ref", "--format=%(refname:short)", refspec],
-        cwd=repo,
-    )
-    return sorted(b.strip() for b in out.splitlines() if b.strip())
+def _unclosed_annotation_end(body: str, start: int) -> int:
+    """Where an annotation ends whose "(" at ``start`` never closes.
 
-
-def branches_touching(
-    repo: Path,
-    base: str,
-    pattern: str,
-    file_rel: str,
-    extra_refs: list[str] | None = None,
-) -> list[str]:
-    """Filter to branches whose tip has any commit modifying ``file_rel``
-    vs the configured base. ``extra_refs`` (zero or more fully-qualified
-    refs like ``origin/add-Fiedler-Kelly_2019_fremanezumab``) are
-    considered alongside the pattern matches."""
-    candidates = list(list_pattern_branches(repo, pattern))
-    if extra_refs:
-        for ref in extra_refs:
-            if ref not in candidates:
-                candidates.append(ref)
-    out = []
-    for br in candidates:
-        d = run(["git", "diff", "--name-only", f"{base}..{br}", "--", file_rel], cwd=repo)
-        if d.strip():
-            out.append(br)
-    return out
-
-
-def parse_example_models(body: str) -> list[tuple[str, str]]:
-    """Parse a body string like::
-
-        `A.R` (annot), `B.R`, `C.R` (annot)
-
-    into ``[("A.R", "(annot)"), ("B.R", ""), ("C.R", "(annot)")]``.
-
-    Handles balanced single-level nested parens inside annotations.
-    Returns the entries in the order they appeared.
+    Scanning for the closing paren alone runs to the end of the body, so the
+    annotation swallows the line's final full stop -- and every entry after
+    it. It ends instead just before the next entry, else just after its last
+    ")", else just before the run of full stops that ends the line.
     """
-    out: list[tuple[str, str]] = []
-    i = 0
-    while i < len(body):
-        m = re.search(r"`([^`]+\.R)`", body[i:])
-        if not m:
-            break
-        fname = m.group(1)
-        cursor = i + m.end()
-        # Skip whitespace.
+    following = NEXT_ENTRY_RE.search(body, start)
+    if following is not None:
+        return following.start()
+    last = body.rfind(")", start)
+    if last != -1:
+        return last + 1
+    return start + len(body[start:].rstrip(". \t"))
+
+
+def split_example_body(body: str) -> tuple[list[tuple[str, str]], str]:
+    """Split an Example-models body into its entries and the text after them.
+
+    ``"`A.R` (annot), `B.R`, `C.R` (annot)."`` gives
+    ``([("A.R", "(annot)"), ("B.R", ""), ("C.R", "(annot)")], ".")``.
+
+    The second value is everything after the last entry: normally the final
+    full stop, sometimes a sentence of prose. Joining the entries with ", "
+    and appending it rebuilds the body; what separated the entries is not
+    kept. Nested parens inside an annotation are balanced; see
+    :func:`_unclosed_annotation_end` for one that is not.
+    """
+    entries: list[tuple[str, str]] = []
+    end = 0
+    position = 0
+    while (match := FILENAME_RE.search(body, position)) is not None:
+        stop = match.end()
+        cursor = stop
         while cursor < len(body) and body[cursor] in " \t":
             cursor += 1
         annotation = ""
         if cursor < len(body) and body[cursor] == "(":
-            depth = 0
-            start = cursor
-            while cursor < len(body):
-                ch = body[cursor]
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        cursor += 1
-                        break
-                cursor += 1
-            annotation = body[start:cursor]
-        out.append((fname, annotation))
-        # Skip comma + whitespace separator.
-        while cursor < len(body) and body[cursor] in ", \t":
-            cursor += 1
-        i = cursor
-    return out
+            close = _closing_paren(body, cursor)
+            stop = close + 1 if close is not None else _unclosed_annotation_end(body, cursor)
+            annotation = body[cursor:stop]
+        entries.append((match.group(1), annotation))
+        end = position = stop
+        while position < len(body) and body[position] in ", \t":
+            position += 1
+    return entries, body[end:]
 
 
-def section_of_line(file_text: str, line_idx: int) -> tuple[str, str]:
-    """Return ``(cov_section, subsection)`` for the line at ``line_idx``.
+def parse_example_models(body: str) -> list[tuple[str, str]]:
+    """The ``(filename, annotation)`` entries of an Example-models body, in order."""
+    return split_example_body(body)[0]
 
-    Tracks the most recent ``##``-level header (covariate) and the most
-    recent deeper header (subsection). The bucket key is the pair so
-    the same subsection name under different covariates is kept
-    distinct.
 
-    NOTE: this is O(N) per call and re-splits the text. For tight
-    inner loops, build a ``_section_index`` once and reuse it.
+def _sections(lines: Sequence[str]) -> list[Bucket]:
+    """``(cov, sub)`` for each line: the latest ``##`` heading and the latest deeper one.
+
+    The bucket key is the pair, so the same subsection name under different
+    covariates is kept distinct.
     """
     cov = ""
     sub = ""
-    for i, line in enumerate(file_text.splitlines()):
-        if i > line_idx:
-            break
-        m = SECTION_RE.match(line)
-        if not m:
-            continue
-        depth = len(m.group(1))
-        name = m.group(2)
-        if depth == 2:
-            cov = name
-            sub = ""
-        elif depth >= 3:
-            sub = name
-    return cov, sub
-
-
-def _section_index(text: str) -> tuple[list[str], list[tuple[str, str]]]:
-    """Single-pass version of :func:`section_of_line`.
-
-    Returns ``(lines, idx_to_section)`` where ``idx_to_section[i]`` is
-    the ``(cov, sub)`` pair for line ``lines[i]``. Both lists are the
-    same length. Use this when the caller needs ``(cov, sub)`` for
-    many indices into the same text — folding what was an O(N^2)
-    walk per Example-line into a single O(N) pass.
-    """
-    lines = text.splitlines(keepends=False)
-    cov = ""
-    sub = ""
-    idx_to_section: list[tuple[str, str]] = []
+    found: list[Bucket] = []
     for line in lines:
-        m = SECTION_RE.match(line)
-        if m:
-            depth = len(m.group(1))
-            name = m.group(2)
+        match = SECTION_RE.match(line)
+        if match:
+            depth = len(match.group(1))
             if depth == 2:
-                cov = name
+                cov = match.group(2)
                 sub = ""
             elif depth >= 3:
-                sub = name
-        idx_to_section.append((cov, sub))
-    return lines, idx_to_section
+                sub = match.group(2)
+        found.append((cov, sub))
+    return found
 
 
-def collect_entries(
-    *,
-    repo: Path,
-    base: str,
-    branches: list[str],
-    file_rel: str,
-) -> dict[tuple[str, str], dict[str, str]]:
-    """Walk base + all branches and collect ``(cov, sub) -> {fname: annotation}``.
+def _longer(current: str, other: str) -> str:
+    return other if len(other) > len(current) else current
+
+
+@dataclass
+class Union:
+    """Per bucket, the base's entries and those the merged branches changed."""
+
+    annotations: dict[Bucket, dict[str, str]] = field(default_factory=dict)
+    """The longest annotation seen for each filename."""
+    branch_order: dict[Bucket, list[str]] = field(default_factory=dict)
+    base_order: dict[Bucket, list[str]] = field(default_factory=dict)
+
+    def order(self, bucket: Bucket) -> list[str]:
+        """Filenames in the order the branches list them, then the base's."""
+        ordered = list(self.branch_order.get(bucket, []))
+        ordered += [name for name in self.base_order.get(bucket, []) if name not in ordered]
+        return ordered
+
+
+Entries = dict[tuple[Bucket, str], str]
+
+
+def _entries(text: str) -> Iterator[tuple[Bucket, str, str]]:
+    """``(bucket, filename, annotation)`` for every Example-models entry in ``text``."""
+    lines = text.splitlines()
+    for line, bucket in zip(lines, _sections(lines), strict=True):
+        match = EXAMPLE_LINE_RE.match(line)
+        if match:
+            for filename, annotation in parse_example_models(match.group(1)):
+                yield bucket, filename, annotation
+
+
+def entry_map(text: str) -> Entries:
+    """``(bucket, filename) -> annotation`` for ``text``, the longest on a repeat."""
+    found: Entries = {}
+    for bucket, filename, annotation in _entries(text):
+        found[(bucket, filename)] = _longer(found.get((bucket, filename), ""), annotation)
+    return found
+
+
+def _fold(
+    text: str, union: Union, order: dict[Bucket, list[str]], inherited: Entries | None = None
+) -> None:
+    for bucket, filename, annotation in _entries(text):
+        if inherited is not None and inherited.get((bucket, filename)) == annotation:
+            continue
+        known = union.annotations.setdefault(bucket, {})
+        known[filename] = _longer(known.get(filename, ""), annotation)
+        listed = order.setdefault(bucket, [])
+        if filename not in listed:
+            listed.append(filename)
+
+
+def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]) -> Union:
+    """Fold the base and then what each branch changed into one :class:`Union`.
+
+    ``branch_copies`` yields each branch's copy of the file with the entries
+    at the branch's fork point. An entry already there, annotation and all,
+    is main's content rather than the branch's, and main may have renamed or
+    removed it since: on 2026-09-29 the pre-rename
+    ``Willmann_2018_rivaroxaban.R`` came back twice, from branches cut before
+    the rename. So only entries a branch added, or whose annotation it
+    changed, count.
 
     Across versions, the LONGEST observed annotation per ``(cov, sub,
-    fname)`` wins. The reasoning: each branch's annotation is its
-    model-specific note; longer non-empty annotations are strictly
-    more informative.
+    fname)`` wins, the base's on a tie. The reasoning: each branch's
+    annotation is its model-specific note; longer non-empty annotations
+    are strictly more informative. ``branch_copies`` is consumed one copy
+    at a time, so a large register is never held once per branch.
     """
-    entries: dict[tuple[str, str], dict[str, str]] = {}
-
-    versions: list[tuple[str, str]] = []
-    versions.append(("BASE", run(["git", "show", f"{base}:{file_rel}"], cwd=repo)))
-    for br in branches:
-        try:
-            versions.append((br, run(["git", "show", f"{br}:{file_rel}"], cwd=repo)))
-        except RuntimeError:
-            # Branch may have deleted the file; rare. Skip.
-            continue
-
-    for _label, text in versions:
-        lines, idx_to_section = _section_index(text)
-        for i, line in enumerate(lines):
-            m = EXAMPLE_LINE_RE.match(line)
-            if not m:
-                continue
-            cov, sub = idx_to_section[i]
-            bucket = entries.setdefault((cov, sub), {})
-            for fname, annot in parse_example_models(m.group(1)):
-                cur = bucket.get(fname)
-                if cur is None or len(annot) > len(cur):
-                    bucket[fname] = annot
-
-    return entries
+    union = Union()
+    _fold(base_text, union, union.base_order)
+    for text, inherited in branch_copies:
+        _fold(text, union, union.branch_order, inherited)
+    return union
 
 
-def emit_merged(
-    *,
-    current_text: str,
-    entries: dict[tuple[str, str], dict[str, str]],
-    branch_files: dict[str, str],
-    base_text: str,
-) -> str:
-    """Rewrite each Example-models line in ``current_text`` to the union.
+def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
+    """Rewrite each Example-models line in ``current_text`` the union adds to.
 
-    Ordering: each line is rebuilt as ``ordered_filenames`` derived
-    from (a) the current line's order, then (b) any new filenames
-    appearing in branch versions in branch order, then (c) any new
-    ones from base. This minimises diff churn against the
-    post-``-X-theirs`` file while still folding in every branch's
-    additions.
+    Returns the new text and notes for the operator. A rebuilt line lists
+    its own models first, in their order, then any the branches add in
+    branch order, then any from the base; each keeps the longest annotation
+    seen, its own included. The prefix and the text after the last entry
+    are the line's own. A line whose union adds no model and lengthens no
+    annotation is kept exactly, so re-running changes nothing.
+
+    Lines are split on "\\n" only, and rejoined the same way, so every line
+    left alone stays byte-for-byte what it was.
     """
-    current_lines, current_idx_to_section = _section_index(current_text)
-    out_lines: list[str] = []
-
-    # Pre-build per-text indices once. Without this, the original
-    # nested-section_of_line() calls cost O(N^2) per text — for a
-    # 4K-line file with 350 Example-lines across 26 branches the
-    # walk was ~70 minutes; now it's seconds.
-    branch_index: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
-        br: _section_index(text) for br, text in branch_files.items()
-    }
-    base_lines, base_idx_to_section = _section_index(base_text)
-
-    for i, line in enumerate(current_lines):
-        m = EXAMPLE_LINE_RE.match(line)
-        if not m:
-            out_lines.append(line)
+    lines = current_text.split("\n")
+    out: list[str] = []
+    left_alone: list[str] = []
+    for line, bucket in zip(lines, _sections(lines), strict=True):
+        match = EXAMPLE_LINE_RE.match(line)
+        known = union.annotations.get(bucket) if match else None
+        if match is None or not known:
+            out.append(line)
             continue
-        cov, sub = current_idx_to_section[i]
-        bucket = entries.get((cov, sub))
-        if not bucket:
-            out_lines.append(line)
+        entries, tail = split_example_body(match.group(1))
+        if not entries:
+            left_alone.append(" / ".join(part for part in bucket if part))
+            out.append(line)
             continue
+        own: dict[str, str] = {}
+        for filename, annotation in entries:
+            own[filename] = _longer(own.get(filename, annotation), annotation)
+        ordered = list(own) + [name for name in union.order(bucket) if name not in own]
+        notes = {name: _longer(own.get(name, ""), known.get(name, "")) for name in ordered}
+        if len(ordered) == len(own) and all(notes[name] == own[name] for name in own):
+            out.append(line)
+            continue
+        body = ", ".join(
+            f"`{name}` {notes[name]}" if notes[name] else f"`{name}`" for name in ordered
+        )
+        out.append(line[: match.start(1)] + body + tail)
+    report = []
+    if left_alone:
+        report.append(
+            f"# left {len(left_alone)} Example-models line(s) with no inline list of models"
+            f" as they are (a list-style heading or prose): {'; '.join(left_alone)}"
+        )
+    return "\n".join(out), report
 
-        ordered: list[str] = []
-        # 1: current order.
-        for fname, _ in parse_example_models(m.group(1)):
-            if fname not in ordered:
-                ordered.append(fname)
-        # 2: branch order.
-        for _br, (b_lines, b_idx_to_section) in branch_index.items():
-            for j, bl in enumerate(b_lines):
-                bm = EXAMPLE_LINE_RE.match(bl)
-                if not bm:
-                    continue
-                if b_idx_to_section[j] != (cov, sub):
-                    continue
-                for fname, _ in parse_example_models(bm.group(1)):
-                    if fname not in ordered:
-                        ordered.append(fname)
-        # 3: base order.
-        for j, bl in enumerate(base_lines):
-            bm = EXAMPLE_LINE_RE.match(bl)
-            if not bm:
-                continue
-            if base_idx_to_section[j] != (cov, sub):
-                continue
-            for fname, _ in parse_example_models(bm.group(1)):
-                if fname not in ordered:
-                    ordered.append(fname)
 
-        # Compose.
-        prefix_end = line.index("**Example models:**") + len("**Example models:**")
-        prefix = line[:prefix_end]
-        merged_body_parts = []
-        for fname in ordered:
-            annot = bucket.get(fname, "")
-            piece = f"`{fname}`"
-            if annot:
-                piece += f" {annot}"
-            merged_body_parts.append(piece)
-        merged_body = ", ".join(merged_body_parts) + "."
-        out_lines.append(f"{prefix} {merged_body}")
+def _branch_copies(
+    repo: Path, members: Iterable[merge_set.Member], file_rel: str
+) -> Iterator[tuple[str, Entries]]:
+    """Each member's copy at its merged commit, with the entries at its fork point.
 
-    return "\n".join(out_lines) + ("\n" if current_text.endswith("\n") else "")
+    A member that deleted the file has no copy. Fork points repeat across
+    members, so each one's entries are read once.
+    """
+    at_fork: dict[str, Entries] = {}
+    for member in members:
+        text = merge_set.read_file(repo, member.merged, file_rel)
+        if text is None:
+            continue
+        if member.fork not in at_fork:
+            at_fork[member.fork] = entry_map(merge_set.read_file(repo, member.fork, file_rel) or "")
+        yield text, at_fork[member.fork]
 
 
 def main(argv: list[str]) -> int:
@@ -378,56 +360,51 @@ def main(argv: list[str]) -> int:
     refs = [("--base", args.base), ("--branch", args.branch)]
     refs += [("--extra-ref", ref) for ref in args.extra_ref if ref]
     for flag, ref in refs:
-        if not resolves(repo, ref):
+        if not merge_set.resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     worktree = repo / ".worktrees" / args.branch
     if not worktree.is_dir():
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
     # A pattern that matches nothing would "reconstruct" the file from the base
     # alone and report success.
-    if not list_pattern_branches(repo, args.pattern) and not any(args.extra_ref):
+    candidates = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
+    if not candidates:
         return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
     target = worktree / args.file
     if not target.exists():
         sys.stderr.write(f"# target file not present on branch: {target}\n")
         return 0  # nothing to do
 
-    branches = branches_touching(
-        repo,
-        args.base,
-        args.pattern,
-        args.file,
-        extra_refs=args.extra_ref,
-    )
-    sys.stderr.write(f"# branches touching {args.file}: {len(branches)}\n")
-    for b in branches:
-        sys.stderr.write(f"#   - {b}\n")
-    if not branches:
+    found = merge_set.compute(repo, args.branch, args.base, candidates)
+    for line in found.summary():
+        sys.stderr.write(f"# {line}\n")
+    if not found.members:
+        return fail(merge_set.empty_message(args.pattern, args.branch, args.base))
+    touching = [m for m in found.members if merge_set.touches(repo, m, args.file)]
+    sys.stderr.write(f"# branches touching {args.file}: {len(touching)}\n")
+    for member in touching:
+        sys.stderr.write(f"#   - {member.ref}\n")
+    if not touching:
         sys.stderr.write("# no branches touched the union-file; nothing to reconstruct.\n")
         return 0
 
-    base_text = run(["git", "show", f"{args.base}:{args.file}"], cwd=repo)
-    branch_files = {br: run(["git", "show", f"{br}:{args.file}"], cwd=repo) for br in branches}
-
-    entries = collect_entries(
-        repo=repo,
-        base=args.base,
-        branches=branches,
-        file_rel=args.file,
-    )
-    sys.stderr.write(f"# (cov, sub) buckets with entries: {len(entries)}\n")
+    base_text = merge_set.read_file(repo, args.base, args.file) or ""
+    union = collect_entries(base_text, _branch_copies(repo, touching, args.file))
+    sys.stderr.write(f"# (cov, sub) buckets with entries: {len(union.annotations)}\n")
     sys.stderr.write(
-        f"# total filename entries:           {sum(len(v) for v in entries.values())}\n"
+        f"# total filename entries:           {sum(len(v) for v in union.annotations.values())}\n"
     )
 
-    current_text = target.read_text()
-    new_text = emit_merged(
-        current_text=current_text,
-        entries=entries,
-        branch_files=branch_files,
-        base_text=base_text,
-    )
-    target.write_text(new_text)
+    with target.open(encoding="utf-8", newline="") as fh:
+        current_text = fh.read()
+    new_text, report = emit_merged(current_text, union)
+    for note in report:
+        sys.stderr.write(f"{note}\n")
+    if new_text == current_text:
+        sys.stderr.write(f"# nothing to add; left unchanged: {target}\n")
+        return 0
+    with target.open("w", encoding="utf-8", newline="") as fh:
+        fh.write(new_text)
     sys.stderr.write(f"# wrote merged file: {target}\n")
 
     return 0

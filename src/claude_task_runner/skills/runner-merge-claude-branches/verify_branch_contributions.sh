@@ -2,19 +2,25 @@
 # Verify no per-branch model contributions were lost from a structured-
 # markdown union file (e.g. covariate-columns.md) after a bulk merge.
 #
-# Three independent checks, all gated on the same per-branch candidate set:
+# Three independent checks, all gated on the same merge set (merge_set.py):
+# the refs matching --pattern, plus any --extra-ref, that the consolidation
+# branch actually merged, each read at the commit it merged. A ref left out
+# with merge_branches.sh --exclude-ref, or pushed after the survey, has no
+# contribution to check; one whose tip moved on after the merge is checked for
+# the part that was merged. What a branch "added" is its own diff, from its
+# fork point on the base to the merged commit.
 #
 #   1. Filename check (inline): every distinct `*.R` model filename a
-#      branch added to the file (vs the base) must appear somewhere in the
-#      post-merge file. Catches lost `**Example models:**` entries whose .R
-#      is unique to the lost section.
+#      branch added to the file must appear somewhere in the post-merge
+#      file. Catches lost `**Example models:**` entries whose .R is unique
+#      to the lost section.
 #
 #   2. Section-header check (delegated to verify_section_headers.py):
 #      every brand-new `## ` or `### CANONICAL_NAME` header a branch
-#      introduces (vs the base) must appear in the post-merge file.
-#      Catches whole sections clobbered by `-X theirs` when the same .R
-#      is referenced elsewhere in the file (the filename check passes
-#      but the section is silently lost).
+#      introduces must appear in the post-merge file. Catches whole
+#      sections clobbered by `-X theirs` when the same .R is referenced
+#      elsewhere in the file (the filename check passes but the section is
+#      silently lost).
 #
 #   3. Placement check (delegated to verify_register_placement.py): every
 #      (canonical, model.R) pair a folded-in branch recorded must still be
@@ -45,7 +51,8 @@
 #      reported in one block)
 #   2  the checks could not run: a bad argument, a --base, --branch or
 #      --extra-ref that does not resolve, no worktree for --branch, no
-#      branch matching --pattern, python3 missing, or a failed git command
+#      branch matching --pattern, an empty merge set, python3 missing, or a
+#      failed git command
 set -euo pipefail
 # merge_branches.sh reads exit 1 as a verdict ("contributions missing") and
 # carries on, so an unexpected failure must not exit 1 as well.
@@ -105,27 +112,25 @@ WT="$REPO/.worktrees/$BRANCH"
 command -v python3 >/dev/null 2>&1 || die "python3 is not on PATH, so the header and placement checks cannot run"
 HEADER_SCRIPT="$SCRIPT_DIR/verify_section_headers.py"
 PLACEMENT_SCRIPT="$SCRIPT_DIR/verify_register_placement.py"
-for script in "$HEADER_SCRIPT" "$PLACEMENT_SCRIPT"; do
+MERGE_SET_SCRIPT="$SCRIPT_DIR/merge_set.py"
+for script in "$HEADER_SCRIPT" "$PLACEMENT_SCRIPT" "$MERGE_SET_SCRIPT"; do
   [[ -f "$script" ]] || die "$script is missing"
 done
 
-# Iterate the pattern (origin/claude/* etc.) plus any --extra-ref additions.
+# The candidates: the pattern (origin/claude/* etc.) plus any --extra-ref.
 refs=$(git for-each-ref --format='%(refname:short)' "refs/remotes/$PATTERN") \
   || die "git for-each-ref failed for --pattern '$PATTERN'"
-BRANCHES=()
+CANDIDATES=0
 while IFS= read -r ref; do
-  [[ -n "$ref" ]] && BRANCHES+=("$ref")
-done < <(printf '%s\n' "$refs" | sort -u)
+  [[ -n "$ref" ]] && CANDIDATES=$((CANDIDATES + 1))
+done <<< "$refs"
 for er in "${EXTRA_REFS[@]:-}"; do
   [[ -z "$er" ]] && continue
   resolves "$er" || die "--extra-ref '$er' does not resolve to a commit in $REPO"
-  # Avoid duplicates if the operator passed something already in the pattern.
-  if [[ ! " ${BRANCHES[*]:-} " =~ " ${er} " ]]; then
-    BRANCHES+=("$er")
-  fi
+  CANDIDATES=$((CANDIDATES + 1))
 done
 # Checking no branch at all would report every contribution present.
-(( ${#BRANCHES[@]} > 0 )) \
+(( CANDIDATES > 0 )) \
   || die "no branch matches --pattern '$PATTERN' and no --extra-ref was given; nothing to verify"
 
 MERGED_FILE="$WT/$FILE"
@@ -134,11 +139,28 @@ if [[ ! -f "$MERGED_FILE" ]]; then
   exit 0
 fi
 
+delegated_args=(
+  --repo "$REPO"
+  --branch "$BRANCH"
+  --base "$BASE"
+  --pattern "$PATTERN"
+)
+for er in "${EXTRA_REFS[@]:-}"; do
+  [[ -n "$er" ]] && delegated_args+=( --extra-ref "$er" )
+done
+
+# One "<ref> <merged commit> <fork point>" line per member of the merge set.
+# The delegated verifiers report what the gate left out, so this one is quiet.
+MEMBERS=$(python3 "$MERGE_SET_SCRIPT" --quiet "${delegated_args[@]}") \
+  || die "merge_set.py could not compute the merge set of '$BRANCH'"
+
 MISSING_COUNT=0
 MISSING_DETAILS=""
-for br in "${BRANCHES[@]}"; do
+while read -r br merged fork; do
+  [[ -z "$br" ]] && continue
   short=${br#origin/}
-  diff_out=$(git diff "$BASE..$br" -- "$FILE") || die "git diff $BASE..$br -- $FILE failed"
+  diff_out=$(git diff "$fork" "$merged" -- "$FILE") \
+    || die "git diff $fork $merged -- $FILE failed for $br"
   [[ -z "$diff_out" ]] && continue
   # Extract distinct *.R filenames from + (added) lines only. grep exits 1
   # when nothing matches, which is an answer here rather than an error.
@@ -158,18 +180,9 @@ for br in "${BRANCHES[@]}"; do
     MISSING_COUNT=$((MISSING_COUNT + 1))
     MISSING_DETAILS="$MISSING_DETAILS    $short:$branch_missing\n"
   fi
-done
+done <<< "$MEMBERS"
 
-delegated_args=(
-  --repo "$REPO"
-  --branch "$BRANCH"
-  --base "$BASE"
-  --pattern "$PATTERN"
-  --file "$FILE"
-)
-for er in "${EXTRA_REFS[@]:-}"; do
-  [[ -n "$er" ]] && delegated_args+=( --extra-ref "$er" )
-done
+delegated_args+=( --file "$FILE" )
 
 # Section-header check (delegated to verify_section_headers.py; catches
 # brand-new ##/### canonical-section headers a branch introduced that

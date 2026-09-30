@@ -11,11 +11,12 @@ disappears. ``verify_branch_contributions.sh`` reports the loss but does not
 repair it, which is why every large consolidation has needed a manual
 "hand-restore the new headers" pass.
 
-This script performs that pass mechanically: for each branch matching the
-pattern, it finds the ``### NAME`` blocks the branch added relative to the
-base, and re-inserts any that are missing from the merge result -- into the
-same ``## SECTION`` the branch filed them under, creating that section only if
-it does not already exist.
+This script performs that pass mechanically: for each branch in the merge set
+(merge_set.py: the refs matching the pattern that the consolidation merged,
+each read at the commit it merged), it finds the ``### NAME`` blocks the
+branch added relative to its fork point from the base, and re-inserts any that
+are missing from the merge result -- into the same ``## SECTION`` the branch
+filed them under, creating that section only if it does not already exist.
 
 Idempotent: a canonical already present is left alone, so re-running is safe.
 
@@ -28,7 +29,7 @@ Usage:
 Exit codes: 0 done (or the file is not in the worktree); 1 with --check,
 something is missing; 2 it could not run: a bad argument, a --base, --branch or
 --extra-ref that does not resolve, no worktree with --branch checked out, no
-branch matching --pattern, or a crash.
+branch matching --pattern, an empty merge set, or a crash.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+
+import merge_set
 
 HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
 NAME_RE = re.compile(r"^[A-Za-z0-9_<>]+$")
@@ -53,22 +56,6 @@ def git(args: list[str], cwd: Path) -> str:
 def fail(message: str) -> int:
     print(f"ERROR: (restore) {message}", file=sys.stderr)
     return 2
-
-
-def resolves(repo: Path, ref: str) -> bool:
-    """True when ``ref`` names a commit in ``repo``."""
-    return bool(git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], repo).strip())
-
-
-def worktree_with(repo: Path, branch: str) -> Path | None:
-    """The worktree that has ``branch`` checked out, or None."""
-    cand: Path | None = None
-    for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
-        if line.startswith("worktree "):
-            cand = Path(line[len("worktree ") :])
-        elif line == f"branch refs/heads/{branch}":
-            return cand
-    return None
 
 
 def blocks(text: str) -> dict[str, tuple[str, str, str]]:
@@ -157,19 +144,14 @@ def main() -> int:
     named = [("--base", args.base), ("--branch", args.branch)]
     named += [("--extra-ref", ref) for ref in args.extra_ref if ref]
     for flag, ref in named:
-        if not resolves(repo, ref):
+        if not merge_set.resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     # No fallback: guessing another worktree would read, and write, the wrong file.
-    worktree = worktree_with(repo, args.branch)
+    worktree = merge_set.worktree_of(repo, args.branch)
     if worktree is None:
         return fail(f"no worktree of {repo} has --branch {args.branch!r} checked out")
 
-    refs = git(
-        ["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{args.pattern}"], repo
-    ).split()
-    for ref in args.extra_ref:
-        if ref and ref not in refs:
-            refs.append(ref)
+    refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
     if not refs:
         return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
 
@@ -186,9 +168,11 @@ def main() -> int:
     # Two filters, both required. Without them this script resurrects blocks
     # that were deliberately removed, which is worse than the loss it repairs.
     #
-    # (a) ANCESTRY. Only branches actually folded into this consolidation may
-    #     contribute. The pattern also matches branches from earlier rounds and
-    #     branches pushed after the survey; neither is part of this merge.
+    # (a) THE MERGE SET (merge_set.py). Only branches actually folded into this
+    #     consolidation may contribute. The pattern also matches branches from
+    #     earlier rounds, branches left out with --exclude-ref and branches
+    #     pushed after the survey; none is part of this merge. A branch whose
+    #     tip moved on after it was merged contributes the part that was merged.
     #
     # (b) FORK POINT. Only blocks the branch ADDED count. Comparing against the
     #     CURRENT base is not enough: when main RENAMES a canonical, every
@@ -231,28 +215,22 @@ def main() -> int:
         before = blocks(git(["show", f"{sha}^:{args.file}"], repo))
         deliberately_removed.update(set(before) - set(after))
 
-    in_merge_set = []
-    for ref in refs:
-        rc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ref, args.branch],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-        ).returncode
-        if rc == 0:
-            in_merge_set.append(ref)
-    skipped_refs = len(refs) - len(in_merge_set)
+    found = merge_set.compute(repo, args.branch, args.base, refs)
+    for line in found.summary():
+        print(f"# {line}")
+    if not found.members:
+        return fail(merge_set.empty_message(args.pattern, args.branch, args.base))
 
     restored: list[tuple[str, str, str]] = []
     inherited = 0
     deliberate = 0
     lost_names: list[tuple[str, str, str]] = []
-    for ref in in_merge_set:
-        text = git(["show", f"{ref}:{args.file}"], repo)
+    for member in found.members:
+        ref = member.ref
+        text = merge_set.read_file(repo, member.merged, args.file)
         if not text:
             continue
-        fork = git(["merge-base", args.base, ref], repo).strip()
-        fork_blocks = blocks(git(["show", f"{fork}:{args.file}"], repo)) if fork else {}
+        fork_blocks = blocks(merge_set.read_file(repo, member.fork, args.file) or "")
         for name, (section, block, owner) in blocks(text).items():
             if name in base_blocks or name in merged_blocks:
                 continue
@@ -279,11 +257,6 @@ def main() -> int:
             restored.append((name, section, block))
             merged_blocks[name] = (section, block, owner)
 
-    if skipped_refs:
-        print(
-            f"# merge-set gate: {len(in_merge_set)} branch(es) are ancestors of "
-            f"{args.branch}; skipped {skipped_refs} matching the pattern but not merged"
-        )
     if deliberate:
         print(
             f"# merge-set gate: skipped {deliberate} block(s) removed by a non-merge commit "
