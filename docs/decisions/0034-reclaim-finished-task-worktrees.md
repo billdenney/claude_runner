@@ -87,8 +87,8 @@ conservative:
   There is no `git worktree prune`, and remote branches are never touched.
 
 Candidates come from the task YAMLs in `todo/`, the same source the
-orchestrator dispatches from. Worktrees that no task names are never
-considered.
+orchestrator dispatches from, and in `done/` (see the 2026-09-30 amendment).
+Worktrees that no task names are never considered.
 
 The periodic pass is off by default (`periodic = false`). When enabled it
 runs on the supervisor's first tick and then every `interval_s`, skips drain
@@ -136,6 +136,7 @@ after `tick_dispatch`, like the steady-state reaper. Each removal becomes a
 - (−) A task whose YAML has left `todo/` (for example, moved to a `done/`
   directory by hand) is invisible to the runner, and so is its worktree.
   Reclaim before moving YAMLs, or remove those worktrees by hand.
+  *Superseded for `done/` by the 2026-09-30 amendment.*
 - The dry run still fetches, which updates that one remote-tracking ref.
 - The default allow-list is testthat's snapshot directory. It never matches in
   a repository without that path. Set `discardable_untracked = []` to require
@@ -150,3 +151,28 @@ High. `periodic = false` (the default) plus not running the CLI restores the
 previous behavior exactly. Each removal is lossless by construction: every
 commit is on the remote's parent branch, and nothing uncommitted is discarded
 except the allow-listed untracked paths.
+
+## Amendment (2026-09-30) — tasks moved to `done/`
+
+**What happened.** The nlmixr2lib queue moves a task's YAML from `todo/` to
+`done/` when an operator acknowledges its closing notification. The first
+full pass of this reclaim on that queue removed 337 worktrees and saw none of
+another 107 whose YAMLs sat in `done/`, 99 of them merged and clean. The
+consequence listed above as a trade-off had become the largest single source
+of stranded worktrees, and they had to be removed by hand with the same checks
+re-implemented in a one-off script.
+
+**Change.** A new setting, `task_dirs` (default `["todo", "done"]`), names the
+queue subdirectories whose task YAMLs are read. A directory that does not
+exist is skipped, since `done/` is a queue convention the runner never
+creates. A task found in two directories is taken once, from the first listed;
+counting both copies would report its worktree as shared by two tasks and keep
+it forever. The three removal conditions are unchanged, so a YAML's location
+proves nothing on its own: a `done/` task still needs a `completed` state, a
+merged branch and a clean tree. An unparseable YAML outside `todo/` is
+reported with its directory (`done/<stem>`).
+
+**Cost.** Each pass also reads `done/`. On the nlmixr2lib queue that is 227
+YAMLs next to the 5,192 in `todo/`, about 4 % more parsing.
+
+**Reversibility.** `task_dirs = ["todo"]` restores the earlier scan exactly.

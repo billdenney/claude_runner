@@ -214,9 +214,14 @@ class TestExitCodes:
 
     def test_unparseable_task_yaml_is_noted(self, runner: CliRunner, world: World) -> None:
         (todo_dir(world.queue) / "broken.yaml").write_text("id: [\n")
+        (world.queue / "done").mkdir()
+        (world.queue / "done" / "torn.yaml").write_text("id: [\n")
         result = reclaim(runner, world)
         assert result.exit_code == 0, result.output
-        assert "note: 1 task YAML(s) in todo/ could not be parsed" in result.stderr
+        assert (
+            "note: 2 task YAML(s) could not be parsed (broken, done/torn); "
+            "their worktrees were not considered"
+        ) in result.stderr
 
 
 def test_branch_kept_by_git_is_shown_on_the_gone_line(runner: CliRunner, world: World) -> None:

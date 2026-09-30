@@ -148,8 +148,8 @@ def reclaim(
             typer.echo(f"error: {error}", err=True)
         if report.unparseable_tasks:
             typer.echo(
-                f"note: {len(report.unparseable_tasks)} task YAML(s) in todo/ could not be "
-                "parsed; their worktrees were not considered",
+                f"note: {len(report.unparseable_tasks)} task YAML(s) could not be parsed "
+                f"({', '.join(report.unparseable_tasks)}); their worktrees were not considered",
                 err=True,
             )
         if report.results:
