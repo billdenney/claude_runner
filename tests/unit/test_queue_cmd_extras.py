@@ -563,6 +563,21 @@ def test_restart_fresh_missing_state_yaml_json(runner: CliRunner, queue_dir: Pat
 # A live worker rewrites the whole state file, session fields included, when
 # it finishes, so clearing the session under it would be silently undone.
 _WORKER_MAY_OWN = ("running", "possibly_hung")
+_NO_WORKER = (
+    "pending",
+    "awaiting_sidecar",
+    "deferred",
+    "completed",
+    "failed",
+    "failed_circuit_breaker",
+    "weekly_paused",
+)
+
+
+def test_restart_fresh_status_lists_cover_every_status() -> None:
+    """A new task status must be sorted into one list before restart-fresh
+    is trusted with it (the command itself refuses unclassified ones)."""
+    assert sorted(_WORKER_MAY_OWN + _NO_WORKER) == sorted(typing.get_args(TaskStatus))
 
 
 @pytest.mark.parametrize("status", _WORKER_MAY_OWN)
@@ -587,13 +602,10 @@ def test_restart_fresh_refusal_human(runner: CliRunner, queue_dir: Path) -> None
     assert "is running" in result.stdout
 
 
-@pytest.mark.parametrize(
-    "status", [s for s in typing.get_args(TaskStatus) if s not in _WORKER_MAY_OWN]
-)
-def test_restart_fresh_clears_every_status_no_worker_owns(
+@pytest.mark.parametrize("status", _NO_WORKER)
+def test_restart_fresh_clears_a_task_no_worker_owns(
     runner: CliRunner, queue_dir: Path, status: str
 ) -> None:
-    """Every other status is cleared; a new status must be sorted into one list."""
     _seed_state(queue_dir, "t7", status=status, session_id="sess-old", session_account="work")
     result = runner.invoke(app, ["restart-fresh", "t7", "--queue", str(queue_dir), "--json"])
     assert result.exit_code == 0, result.stdout

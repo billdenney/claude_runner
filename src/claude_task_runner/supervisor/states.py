@@ -112,9 +112,11 @@ class AccountState(BaseModel):
     account ``SupervisorSnapshot`` so existing state-machine code can
     operate on an ``AccountState`` directly without further refactoring.
 
-    The ``paused`` field is operator-controllable via
-    ``claude-task-runner account pause/resume`` and gates the account
-    out of the dispatch policy without stopping the supervisor.
+    The ``paused`` field gates the account out of the dispatch policy
+    without stopping the supervisor. It is a copy, refreshed every tick,
+    of the account's pause marker, which
+    ``claude-task-runner account pause/resume`` creates and removes
+    (:mod:`claude_task_runner.supervisor.account_pause`).
 
     The ``last_capture_at`` field is when this account's usage was last
     polled: the daemon stamps it after every tick attributed to the
@@ -153,8 +155,9 @@ class AccountState(BaseModel):
     this and at its ``max_concurrency``, whichever is lower."""
 
     paused: bool = False
-    """When True, the dispatch policy skips this account. Operator-set
-    via ``claude-task-runner account pause <name>``."""
+    """When True, the dispatch policy skips this account. Set each tick from
+    the account's pause marker (``supervisor.account_pause.refresh``); never
+    write it directly, since the next refresh replaces it."""
 
     last_capture_at: datetime | None = None
     """Timestamp of the most recent ``/usage`` capture attempt for this

@@ -63,7 +63,7 @@ MAX_DURATION_MS: Final = MAX_DURATION_S * 1000
 """:data:`MAX_DURATION_S` for the settings counted in milliseconds."""
 
 
-_ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
+ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
 """Account names must be filesystem- and CLI-safe.
 
 Used as state-file keys, supervisor log fields, and `account list/pause`
@@ -566,9 +566,9 @@ class AccountSettings(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_name(self) -> AccountSettings:
-        if not _ACCOUNT_NAME_RE.match(self.name):
+        if not ACCOUNT_NAME_RE.match(self.name):
             raise ValueError(
-                f"account name {self.name!r} must match {_ACCOUNT_NAME_RE.pattern!r} "
+                f"account name {self.name!r} must match {ACCOUNT_NAME_RE.pattern!r} "
                 "(alnum / underscore / hyphen / dot, max 64 chars, must not start "
                 "with hyphen or dot)"
             )

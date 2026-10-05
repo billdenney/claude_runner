@@ -766,9 +766,21 @@ def _supervisor_is_alive(queue_dir: Path) -> bool:
     return pid is not None and pidfile_mod.is_pid_alive(pid)
 
 
-# Statuses in which a worker may still own the task: it rewrites the whole
-# state file, session fields included, when it finishes.
-_RESTART_FRESH_REFUSED = frozenset({"running", "possibly_hung"})
+# Statuses in which no worker owns the task, so its state file is safe to
+# rewrite. A live worker (``running``, ``possibly_hung``) rewrites the whole
+# file, session fields included, when it finishes. An allow-list, so a new
+# status is refused until it is classified.
+_RESTART_FRESH_ALLOWED = frozenset(
+    {
+        "pending",
+        "awaiting_sidecar",
+        "deferred",
+        "completed",
+        "failed",
+        "failed_circuit_breaker",
+        "weekly_paused",
+    }
+)
 
 
 @app.command("restart-fresh")
@@ -820,11 +832,12 @@ def restart_fresh(
             console.print(f"[bold red]{msg}[/]")
         raise typer.Exit(code=2) from exc
 
-    if state.status in _RESTART_FRESH_REFUSED:
+    if state.status not in _RESTART_FRESH_ALLOWED:
         msg = (
             f"task {task_id!r} is {state.status}: its worker may still be running and "
-            "would write its session back when it finishes. Stop the worker first "
-            "(supervisor drain, or SIGTERM its pid), then re-run restart-fresh."
+            "would write its session back when it finishes. Wait for it to finish "
+            "(`supervisor drain` waits for running tasks) or SIGTERM its pid, then "
+            "re-run restart-fresh."
         )
         if json:
             print(_json.dumps({"ok": False, "error": msg}))

@@ -130,7 +130,15 @@ def list_accounts(
     settings = load_settings(resolve_per_queue_config(config, qd))
     accounts = resolve_accounts(settings)
     snapshot = _snapshot(settings, qd)
-    paused = account_pause.paused_names(qd)
+    try:
+        paused = account_pause.paused_names(qd)
+    except OSError as exc:
+        msg = f"cannot read the account pause markers in {account_pause.pause_dir(qd)}: {exc}"
+        if json:
+            print(_json.dumps({"error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2) from exc
 
     rows = [_account_row(a, snapshot, paused) for a in accounts]
 
@@ -185,9 +193,14 @@ def _update_paused(
 
     Returns (changed, message). ``changed`` is False when the marker was
     already in the requested state (idempotent pause/resume).
-    Raises ``typer.BadParameter`` when ``name`` isn't configured.
+    Raises ``typer.BadParameter`` when ``name`` isn't configured, except
+    that a resume still removes the marker of an account taken out of
+    ``[[accounts]]``, which would otherwise pause it again if re-added.
     """
     if not any(a.name == name for a in settings.accounts):
+        if not paused and name in account_pause.paused_names(queue_dir):
+            account_pause.set_paused(queue_dir, name, paused=False)
+            return True, f"removed the pause marker of {name!r}, which is not in [[accounts]]"
         raise typer.BadParameter(
             f"account {name!r} not in [[accounts]]; configured: "
             + ", ".join(a.name for a in settings.accounts)
@@ -211,9 +224,11 @@ def pause_account(
 ) -> None:
     """Skip ``name`` from dispatch until ``account resume <name>``.
 
-    The dispatcher consults the paused flag on the next tick; in-flight
-    tasks already running against the account are NOT killed (the
-    operator can use ``queue states`` and SIGTERM if needed).
+    Creates the account's pause marker. A running supervisor stops
+    dispatching new tasks to the account within one tick, and a stopped
+    one from its next start. Tasks already running on the account are NOT
+    killed (use ``queue states`` and SIGTERM if needed), and
+    ``queue force-dispatch`` still dispatches to a paused account.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)

@@ -2,15 +2,14 @@
 
 The daemon tests pin the contract that matters operationally: a pause or
 resume made while the supervisor runs reaches its dispatch step and the
-``supervisor.json`` it writes on the next tick, although the supervisor
-rewrites that file from memory every tick. A pause recorded in
-``supervisor.json`` before the markers existed stays in force across a
-restart.
+``supervisor.json`` it writes, although the supervisor rewrites that file
+from memory every tick. A pause ``supervisor.json`` records when the
+markers are first used is kept, and only then: afterwards the file just
+echoes the markers, so a resume made while the supervisor is stopped holds.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,13 +63,9 @@ def test_paused_names_is_empty_when_nothing_was_ever_paused(tmp_path: Path) -> N
 
 
 def test_set_paused_creates_and_removes_the_marker(tmp_path: Path) -> None:
-    assert account_pause.set_paused(tmp_path, "work", paused=True, now=T0) is True
+    assert account_pause.set_paused(tmp_path, "work", paused=True) is True
     assert account_pause.paused_names(tmp_path) == frozenset({"work"})
-    marker = account_pause.marker_path(tmp_path, "work")
-    assert json.loads(marker.read_text(encoding="utf-8")) == {
-        "account": "work",
-        "paused_at": T0.isoformat(),
-    }
+    assert account_pause.marker_path(tmp_path, "work").read_bytes() == b""
     assert account_pause.set_paused(tmp_path, "work", paused=True) is False
     assert account_pause.set_paused(tmp_path, "work", paused=False) is True
     assert account_pause.paused_names(tmp_path) == frozenset()
@@ -84,6 +79,15 @@ def test_paused_names_ignores_temporary_files_and_directories(tmp_path: Path) ->
     (d / "subdir").mkdir()
     account_pause.set_paused(tmp_path, "personal", paused=True)
     assert account_pause.paused_names(tmp_path) == frozenset({"personal"})
+
+
+@pytest.mark.parametrize("name", ["../escape", ".hidden", "a/b", "", "-dash"])
+def test_marker_path_rejects_names_that_are_not_account_names(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="not an account name"):
+        account_pause.marker_path(tmp_path, name)
+    with pytest.raises(ValueError, match="not an account name"):
+        account_pause.set_paused(tmp_path, name, paused=True)
+    assert not account_pause.pause_dir(tmp_path).exists()
 
 
 def test_paused_names_raises_when_the_directory_cannot_be_read(tmp_path: Path) -> None:
@@ -118,7 +122,7 @@ def test_apply_ignores_names_without_an_account_row() -> None:
 
 def test_refresh_applies_the_markers(tmp_path: Path) -> None:
     account_pause.set_paused(tmp_path, "work", paused=True)
-    out = account_pause.refresh(_snapshot(personal=False, work=False), tmp_path)
+    out = account_pause.refresh(tmp_path, _snapshot(personal=False, work=False))
     assert out.accounts["work"].paused is True
     assert out.accounts["personal"].paused is False
 
@@ -129,15 +133,36 @@ def test_refresh_keeps_the_flags_when_the_markers_cannot_be_read(
     snap = _snapshot(personal=False, work=True)
     _make_unreadable(tmp_path)
     with caplog.at_level(logging.ERROR, logger=account_pause.__name__):
-        assert account_pause.refresh(snap, tmp_path) is snap
+        assert account_pause.refresh(tmp_path, snap) is snap
     assert "cannot read account pause markers" in caplog.text
 
 
-def test_adopt_snapshot_flags_writes_markers_for_recorded_pauses(tmp_path: Path) -> None:
+def test_adopt_snapshot_flags_writes_markers_only_once(tmp_path: Path) -> None:
     snap = _snapshot(personal=True, work=False)
     assert account_pause.adopt_snapshot_flags(tmp_path, snap) == ["personal"]
     assert account_pause.paused_names(tmp_path) == frozenset({"personal"})
+    # The operator resumes; the same snapshot must not re-pause the account.
+    account_pause.set_paused(tmp_path, "personal", paused=False)
     assert account_pause.adopt_snapshot_flags(tmp_path, snap) == []
+    assert account_pause.paused_names(tmp_path) == frozenset()
+
+
+def test_adopt_snapshot_flags_counts_a_queue_with_nothing_paused_as_adopted(
+    tmp_path: Path,
+) -> None:
+    assert account_pause.adopt_snapshot_flags(tmp_path, _snapshot(work=False)) == []
+    assert account_pause.adopt_snapshot_flags(tmp_path, _snapshot(work=True)) == []
+    assert account_pause.paused_names(tmp_path) == frozenset()
+
+
+def test_adopt_snapshot_flags_skips_a_row_that_is_not_an_account_name(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    snap = _snapshot(work=True)
+    snap = snap.model_copy(update={"accounts": {**snap.accounts, "../bad": snap.accounts["work"]}})
+    with caplog.at_level(logging.WARNING, logger=account_pause.__name__):
+        assert account_pause.adopt_snapshot_flags(tmp_path, snap) == ["work"]
+    assert "not adopting the pause of '../bad'" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -165,15 +190,6 @@ def _reading(captured_at: datetime) -> UsageReading:
     )
 
 
-@pytest.fixture
-def _isolate_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A per-test global lock, so these tests never contend with a real supervisor."""
-    monkeypatch.setattr(
-        "claude_task_runner.supervisor.pidfile.global_lock_path",
-        lambda: tmp_path / "test_global.lock",
-    )
-
-
 def _run_supervisor(
     qd: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -181,11 +197,12 @@ def _run_supervisor(
     ticks: int,
     between_ticks: dict[int, bool],
     before_dispatch: dict[int, bool] | None = None,
-) -> list[bool]:
+) -> tuple[list[bool], list[bool]]:
     """Run ``ticks`` real supervisor ticks with dispatch stubbed out.
 
-    Returns what each tick's dispatch step saw as the ``default`` account's
-    ``paused`` flag. ``between_ticks`` maps a tick number to a pause
+    Returns two lists, one entry per tick: the ``default`` account's
+    ``paused`` flag as that tick's dispatch step saw it, and as
+    ``supervisor.json`` on disk held it at that moment. ``between_ticks`` maps a tick number to a pause
     (True) or resume (False) made right after that tick's dispatch step,
     the way an operator's ``account pause`` / ``resume`` lands while the
     supervisor runs. ``before_dispatch`` does the same during that tick's
@@ -193,6 +210,7 @@ def _run_supervisor(
     before it dispatches.
     """
     seen: list[bool] = []
+    persisted: list[bool] = []
     consumed: list[int] = []
 
     def record_force_dispatch(**_kw: object) -> None:
@@ -204,6 +222,7 @@ def _run_supervisor(
         snapshot = kw["snapshot"]
         assert isinstance(snapshot, SupervisorSnapshot)
         seen.append(snapshot.accounts["default"].paused)
+        persisted.append(_persisted_paused(qd))
         if len(seen) in between_ticks:
             account_pause.set_paused(qd, "default", paused=between_ticks[len(seen)])
         return snapshot
@@ -214,14 +233,14 @@ def _run_supervisor(
     start_daemon(
         queue_dir=qd,
         settings=load_settings(None),
-        source=FakeUsageSource([_reading(T0)] * ticks),
+        source=FakeUsageSource([_reading(T0)] * max(ticks, 1)),
         pending_count_fn=lambda: 0,
         in_flight_count_fn=lambda: 0,
         clock=FakeClock(T0),
         install_signal_handlers=False,
         max_ticks=ticks,
     )
-    return seen
+    return seen, persisted
 
 
 def _persisted_paused(qd: Path) -> bool:
@@ -231,39 +250,67 @@ def _persisted_paused(qd: Path) -> bool:
 
 
 def test_pause_made_while_the_supervisor_runs_reaches_dispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolate_lock: None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
 ) -> None:
     qd = _queue(tmp_path)
-    seen = _run_supervisor(qd, monkeypatch, ticks=3, between_ticks={1: True})
+    seen, persisted = _run_supervisor(qd, monkeypatch, ticks=3, between_ticks={1: True})
     assert seen == [False, True, True]
+    assert persisted == [False, True, True]
     assert _persisted_paused(qd) is True
 
 
 def test_pause_made_just_before_dispatch_holds_that_tick(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolate_lock: None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
 ) -> None:
     """A pause landing after the tick's state write still stops that tick's dispatch."""
     qd = _queue(tmp_path)
-    seen = _run_supervisor(qd, monkeypatch, ticks=2, between_ticks={}, before_dispatch={2: True})
+    seen, _ = _run_supervisor(qd, monkeypatch, ticks=2, between_ticks={}, before_dispatch={2: True})
     assert seen == [False, True]
 
 
 def test_resume_made_while_the_supervisor_runs_reaches_dispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolate_lock: None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
 ) -> None:
     qd = _queue(tmp_path)
     account_pause.set_paused(qd, "default", paused=True)
-    seen = _run_supervisor(qd, monkeypatch, ticks=3, between_ticks={1: False})
+    seen, persisted = _run_supervisor(qd, monkeypatch, ticks=3, between_ticks={1: False})
     assert seen == [True, False, False]
+    assert persisted == [True, False, False]
     assert _persisted_paused(qd) is False
 
 
 def test_pause_recorded_in_supervisor_json_survives_a_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _isolate_lock: None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
 ) -> None:
     qd = _queue(tmp_path)
     persist_mod.write_atomic(_snapshot(default=True), persist_mod.supervisor_state_path(qd))
-    seen = _run_supervisor(qd, monkeypatch, ticks=2, between_ticks={})
+    seen, _ = _run_supervisor(qd, monkeypatch, ticks=2, between_ticks={})
     assert seen == [True, True]
     assert account_pause.paused_names(qd) == frozenset({"default"})
+    assert _persisted_paused(qd) is True
+
+
+def test_resume_made_while_the_supervisor_is_stopped_holds_at_the_next_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
+) -> None:
+    """supervisor.json still says paused after the stop; that echo must not
+    re-pause the account the operator resumed in between."""
+    qd = _queue(tmp_path)
+    account_pause.set_paused(qd, "default", paused=True)
+    seen, _ = _run_supervisor(qd, monkeypatch, ticks=1, between_ticks={})
+    assert seen == [True]
+    assert _persisted_paused(qd) is True
+    account_pause.set_paused(qd, "default", paused=False)
+    seen, persisted = _run_supervisor(qd, monkeypatch, ticks=2, between_ticks={})
+    assert seen == [False, False]
+    assert persisted == [False, False]
+    assert account_pause.paused_names(qd) == frozenset()
+
+
+def test_marker_present_at_start_reaches_the_first_supervisor_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_global_lock: Path
+) -> None:
+    qd = _queue(tmp_path)
+    account_pause.set_paused(qd, "default", paused=True)
+    _run_supervisor(qd, monkeypatch, ticks=0, between_ticks={})
     assert _persisted_paused(qd) is True

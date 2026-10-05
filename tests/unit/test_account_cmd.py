@@ -503,6 +503,50 @@ class TestAccountPauseResume:
         assert rows["personal"]["paused"] is True
         assert rows["work"]["paused"] is False
 
+    def test_resume_removes_the_marker_of_an_account_no_longer_configured(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A leftover marker would pause the account again if it were re-added."""
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", "", None)])
+        account_pause.set_paused(queue_dir, "work", paused=True)
+        result = runner.invoke(
+            app,
+            [
+                "account",
+                "resume",
+                "work",
+                "--config",
+                str(config),
+                "--queue",
+                str(queue_dir),
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        out = json.loads(result.stdout)
+        assert out["changed"] is True
+        assert "not in [[accounts]]" in out["message"]
+        assert account_pause.paused_names(queue_dir) == frozenset()
+
+    def test_list_reports_an_unreadable_marker_directory_in_one_line(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", "", None)])
+        account_pause.pause_dir(queue_dir).parent.mkdir(parents=True)
+        account_pause.pause_dir(queue_dir).write_text("not a directory", encoding="utf-8")
+        args = ["account", "list", "--config", str(config), "--queue", str(queue_dir)]
+        human = runner.invoke(app, args)
+        assert human.exit_code == 2
+        assert "cannot read the account pause markers" in human.stdout
+        assert "Traceback" not in human.output
+        as_json = runner.invoke(app, [*args, "--json"])
+        assert as_json.exit_code == 2
+        assert "cannot read the account pause markers" in json.loads(as_json.stdout)["error"]
+
 
 class TestAccountListHumanReadable:
     """Cover the non-JSON render loop in ``account list``."""

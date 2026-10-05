@@ -829,9 +829,9 @@ def start_daemon(
                 since=clk.now(),
                 account_names=account_names,
             )
-            # Operator pauses live in marker files the CLI owns
-            # (supervisor.account_pause); a pause supervisor.json already
-            # records gets a marker so the first refresh keeps it.
+            # Operator pauses live in marker files (supervisor.account_pause).
+            # On a queue's first start, pauses supervisor.json records get
+            # markers so the first refresh keeps them.
             kept_pauses = account_pause.adopt_snapshot_flags(queue_dir, snapshot)
             if kept_pauses:
                 logger.info(
@@ -839,7 +839,7 @@ def start_daemon(
                     state_path.name,
                     ", ".join(kept_pauses),
                 )
-            snapshot = account_pause.refresh(snapshot, queue_dir)
+            snapshot = account_pause.refresh(queue_dir, snapshot)
 
             # Corrupt-state quarantine (ADR-0028): MUST run before every
             # other recovery pass. A TaskState YAML left unparseable by a
@@ -1085,7 +1085,7 @@ def start_daemon(
                     notify_callback=notify_callback,
                     event_callback=event_callback,
                 )
-                snapshot = account_pause.refresh(snapshot, queue_dir)
+                snapshot = account_pause.refresh(queue_dir, snapshot)
                 persist_mod.write_atomic(snapshot, state_path)
 
                 # A stop that arrived during the usage poll ends the tick
@@ -1210,7 +1210,7 @@ def start_daemon(
                     # Read the pause markers again right before dispatch: the
                     # force-dispatch and silent-reaper steps since the last read
                     # can take long enough for a pause to land in between.
-                    snapshot = account_pause.refresh(snapshot, queue_dir)
+                    snapshot = account_pause.refresh(queue_dir, snapshot)
                     snapshot = orch_mod.tick_dispatch(
                         queue_dir=queue_dir,
                         settings=settings,

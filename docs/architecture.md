@@ -182,9 +182,11 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │                                  #   (ADR-0028)
     ├── sidecar/<id>/request-NNN.json
     ├── sidecar/<id>/response-NNN.json
-    ├── account_paused/<name>       # `account pause` markers; `account resume`
-    │                               #   removes one. Only the CLI writes them;
-    │                               #   the supervisor re-reads them every tick
+    ├── account_paused/<name>       # `account pause` markers (empty files);
+    │                               #   `account resume` removes one. The
+    │                               #   supervisor re-reads them every tick and
+    │                               #   writes them only on a queue's first
+    │                               #   start (`.adopted` records that)
     ├── force_dispatch/<id>.req     # `queue force-dispatch` requests, consumed
     │                               #   on the next supervisor tick
     ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
