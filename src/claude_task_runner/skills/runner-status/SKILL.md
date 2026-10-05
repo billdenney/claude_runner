@@ -35,7 +35,8 @@ that name no status; the rows add up to the total), todo/
 count, open-sidecar list (task_id + sequence + the outstanding
 question ids), and a **per-account
 state table** sourced from supervisor.json's v3 `accounts` map
-(state, 5h/weekly util, paused, in-flight count, throttle target,
+(state, 5h/weekly util, paused (read from the `account_paused/`
+markers, which `supervisor.json` trails by a tick), in-flight count, throttle target,
 reset + wakeup times, last-capture timestamp). The target is the
 most tasks dispatch lets the account run (below its
 `max_concurrency`): the ADR-0022 ramp while `slowing_down`, 0 while
