@@ -52,6 +52,7 @@ from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.spawn_gate import SpawnGate
+from claude_task_runner.supervisor import account_pause
 from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -828,6 +829,17 @@ def start_daemon(
                 since=clk.now(),
                 account_names=account_names,
             )
+            # Operator pauses live in marker files the CLI owns
+            # (supervisor.account_pause); a pause supervisor.json already
+            # records gets a marker so the first refresh keeps it.
+            kept_pauses = account_pause.adopt_snapshot_flags(queue_dir, snapshot)
+            if kept_pauses:
+                logger.info(
+                    "kept the account pause recorded in %s for: %s",
+                    state_path.name,
+                    ", ".join(kept_pauses),
+                )
+            snapshot = account_pause.refresh(snapshot, queue_dir)
 
             # Corrupt-state quarantine (ADR-0028): MUST run before every
             # other recovery pass. A TaskState YAML left unparseable by a
@@ -1073,6 +1085,7 @@ def start_daemon(
                     notify_callback=notify_callback,
                     event_callback=event_callback,
                 )
+                snapshot = account_pause.refresh(snapshot, queue_dir)
                 persist_mod.write_atomic(snapshot, state_path)
 
                 # A stop that arrived during the usage poll ends the tick
@@ -1194,6 +1207,10 @@ def start_daemon(
                 # current attribution. In drain mode tick_dispatch skips
                 # the dispatch step but still reaps + refreshes.
                 try:
+                    # Read the pause markers again right before dispatch: the
+                    # force-dispatch and silent-reaper steps since the last read
+                    # can take long enough for a pause to land in between.
+                    snapshot = account_pause.refresh(snapshot, queue_dir)
                     snapshot = orch_mod.tick_dispatch(
                         queue_dir=queue_dir,
                         settings=settings,

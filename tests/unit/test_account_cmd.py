@@ -4,9 +4,12 @@ Covers:
 * ``account list``: reports resolved per-account policy + observed
   state (max_concurrency, bands, 5h util, in-flight count). Defaults
   apply when ``runner-account.toml`` is absent.
-* ``account pause`` / ``account resume``: mutate the ``paused`` flag
-  in ``supervisor.json``; idempotent when already in the requested
-  state; refuses unknown account names.
+* ``account pause`` / ``account resume``: create / remove the account's
+  pause marker and never write ``supervisor.json``, which a running
+  supervisor rewrites from memory every tick; idempotent when already in
+  the requested state; refuses unknown account names.
+* ``account list`` reports ``paused`` from the markers, not from the
+  snapshot's copy of the flag.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.cli import app
+from claude_task_runner.supervisor import account_pause
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -224,7 +228,7 @@ class TestAccountList:
             tmp_path,
             accounts=[("personal", str(cfg_dir), None), ("work", "", "bw")],
         )
-        # Seed a snapshot with one account paused and one with util.
+        # Seed a snapshot with util for one account; pause the other.
         accounts = {
             "personal": AccountState(
                 state=SupervisorState.DISPATCHING,
@@ -252,6 +256,7 @@ class TestAccountList:
             ),
         ]
         _seed_snapshot(queue_dir, accounts=accounts, in_flight=in_flight)
+        account_pause.set_paused(queue_dir, "work", paused=True)
         result = runner.invoke(
             app,
             [
@@ -346,8 +351,10 @@ class TestAccountPauseResume:
         assert result.exit_code != 0
         assert "ghost" in (result.output + (result.stderr or ""))
 
-    def test_pause_seeds_snapshot_when_missing(self, runner: CliRunner, tmp_path: Path) -> None:
-        """No supervisor.json yet → pause seeds one with the flag set."""
+    def test_pause_writes_a_marker_and_no_supervisor_json(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """With no supervisor.json yet, pause creates only the marker."""
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         config = _write_queue_config(tmp_path, accounts=[("personal", "", None)])
@@ -367,23 +374,20 @@ class TestAccountPauseResume:
         assert result.exit_code == 0, result.output
         out = json.loads(result.stdout)
         assert out["changed"] is True
-        snap = persist_mod.load(persist_mod.supervisor_state_path(queue_dir))
-        assert snap is not None
-        assert snap.accounts["personal"].paused is True
-        assert snap.accounts["personal"].state is SupervisorState.NO_READING
+        assert account_pause.paused_names(queue_dir) == frozenset({"personal"})
+        assert not persist_mod.supervisor_state_path(queue_dir).exists()
 
-    def test_pause_synthesizes_a_no_reading_row_for_an_account_without_one(
+    def test_pause_leaves_supervisor_json_unchanged(
         self, runner: CliRunner, tmp_path: Path
     ) -> None:
-        """``personal`` was added to the config after supervisor.json was
-        written, so it has no row; like a seeded account it takes no tasks
-        until it is read."""
+        """The supervisor owns supervisor.json; pause must not write it,
+        or the supervisor's next tick overwrites the flag from memory."""
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         config = _write_queue_config(
             tmp_path, accounts=[("personal", "", None), ("work", "", None)]
         )
-        _seed_snapshot(
+        state_path = _seed_snapshot(
             queue_dir,
             accounts={
                 "work": AccountState(
@@ -391,16 +395,14 @@ class TestAccountPauseResume:
                 )
             },
         )
+        before = state_path.read_bytes()
         result = runner.invoke(
             app,
             ["account", "pause", "personal", "--config", str(config), "--queue", str(queue_dir)],
         )
         assert result.exit_code == 0, result.output
-        snap = persist_mod.load(persist_mod.supervisor_state_path(queue_dir))
-        assert snap is not None
-        assert snap.accounts["personal"].state is SupervisorState.NO_READING
-        assert snap.accounts["personal"].paused is True
-        assert snap.accounts["work"].state is SupervisorState.DISPATCHING
+        assert state_path.read_bytes() == before
+        assert account_pause.paused_names(queue_dir) == frozenset({"personal"})
 
     def test_pause_then_resume_flips_flag(self, runner: CliRunner, tmp_path: Path) -> None:
         queue_dir = tmp_path / "q"
@@ -431,6 +433,7 @@ class TestAccountPauseResume:
         )
         assert r1.exit_code == 0, r1.output
         assert json.loads(r1.stdout)["changed"] is True
+        assert account_pause.paused_names(queue_dir) == frozenset({"personal"})
 
         r2 = runner.invoke(
             app,
@@ -447,25 +450,13 @@ class TestAccountPauseResume:
         )
         assert r2.exit_code == 0, r2.output
         assert json.loads(r2.stdout)["changed"] is True
-
-        snap = persist_mod.load(persist_mod.supervisor_state_path(queue_dir))
-        assert snap is not None
-        assert snap.accounts["personal"].paused is False
+        assert account_pause.paused_names(queue_dir) == frozenset()
 
     def test_pause_already_paused_is_idempotent(self, runner: CliRunner, tmp_path: Path) -> None:
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         config = _write_queue_config(tmp_path, accounts=[("personal", "", None)])
-        _seed_snapshot(
-            queue_dir,
-            accounts={
-                "personal": AccountState(
-                    state=SupervisorState.IDLE,
-                    since=datetime(2026, 5, 21, tzinfo=UTC),
-                    paused=True,
-                ),
-            },
-        )
+        account_pause.set_paused(queue_dir, "personal", paused=True)
         result = runner.invoke(
             app,
             [
@@ -483,6 +474,34 @@ class TestAccountPauseResume:
         out = json.loads(result.stdout)
         assert out["changed"] is False
         assert "already paused" in out["message"]
+
+    def test_list_reports_paused_from_the_marker_not_the_snapshot(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Between a pause and the supervisor's next tick, supervisor.json
+        still has the old flag; ``account list`` must show the pause."""
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(
+            tmp_path, accounts=[("personal", "", None), ("work", "", None)]
+        )
+        since = datetime(2026, 5, 21, tzinfo=UTC)
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                "personal": AccountState(state=SupervisorState.IDLE, since=since, paused=False),
+                "work": AccountState(state=SupervisorState.IDLE, since=since, paused=True),
+            },
+        )
+        account_pause.set_paused(queue_dir, "personal", paused=True)
+        result = runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir), "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        rows = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
+        assert rows["personal"]["paused"] is True
+        assert rows["work"]["paused"] is False
 
 
 class TestAccountListHumanReadable:
@@ -531,6 +550,7 @@ class TestAccountListHumanReadable:
             ),
         }
         _seed_snapshot(queue_dir, accounts=accounts, in_flight=[])
+        account_pause.set_paused(queue_dir, "work", paused=True)
         result = runner.invoke(
             app,
             ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
@@ -539,9 +559,8 @@ class TestAccountListHumanReadable:
         assert "personal" in result.stdout
         assert "dispatching" in result.stdout
         assert "42%" in result.stdout
-        assert "work" in result.stdout
-        # Paused marker on the work account.
-        assert "(paused)" in result.stdout
+        assert "work (paused)" in result.stdout
+        assert "personal (paused)" not in result.stdout
         # linux_user line printed for the work account.
         assert "bw" in result.stdout
 
@@ -549,15 +568,12 @@ class TestAccountListHumanReadable:
 class TestAccountPauseResumeHumanReadable:
     """Cover the non-JSON output paths of ``account pause`` / ``account resume``."""
 
-    def test_pause_seeds_snapshot_and_prints_changed(
-        self, runner: CliRunner, tmp_path: Path
-    ) -> None:
+    def test_pause_prints_changed(self, runner: CliRunner, tmp_path: Path) -> None:
         cfg_dir = tmp_path / "personal"
         cfg_dir.mkdir()
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
-        # No snapshot yet: _update_paused seeds one, in NO_READING.
         result = runner.invoke(
             app,
             ["account", "pause", "personal", "--config", str(config), "--queue", str(queue_dir)],

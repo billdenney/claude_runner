@@ -156,7 +156,11 @@ in-flight count by `[concurrency]` (`initial_concurrency` until the
 queue's first completion, then `max_concurrency`); that ceiling does not
 depend on throttle state, but while it binds an account can run fewer
 tasks than its target. `claude-task-runner account list` shows each
-account's `in_flight=N/cap`.
+account's `in_flight=N/cap`. An account is paused while its
+`account_paused/<name>` marker exists; the supervisor reads the markers
+every tick, once after the state-machine step and again just before
+dispatch, so `account pause` stops new dispatches on a running supervisor
+within one tick (`supervisor.account_pause`).
 
 The math is centralised in the `throttle/` package (`curve.py`,
 `time_of_day.py`, `policy.py`, `decision.py`). All pure functions;
@@ -178,6 +182,9 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │                                  #   (ADR-0028)
     ├── sidecar/<id>/request-NNN.json
     ├── sidecar/<id>/response-NNN.json
+    ├── account_paused/<name>       # `account pause` markers; `account resume`
+    │                               #   removes one. Only the CLI writes them;
+    │                               #   the supervisor re-reads them every tick
     ├── force_dispatch/<id>.req     # `queue force-dispatch` requests, consumed
     │                               #   on the next supervisor tick
     ├── logs/<id>/                  # per-attempt worker output (ADR-0025):
@@ -187,7 +194,9 @@ all 100% test coverage in `tests/unit/test_curve.py`,
     │   │                             #   exited while no supervisor ran)
     │   └── attempt-<N>.stderr        #   paired stderr (error tail kept in state)
     ├── supervisor.json             # supervisor state machine snapshot; holds
-    │                               #   last_drift_message while in ErrorDrift
+    │                               #   last_drift_message while in ErrorDrift.
+    │                               #   Written only by the supervisor, from
+    │                               #   memory, every tick
     ├── supervisor.pid              # PID of the running supervisor
     ├── supervisor.log              # supervisor stdout/stderr, only when the
     │                               #   cron watchdog started it (see below)

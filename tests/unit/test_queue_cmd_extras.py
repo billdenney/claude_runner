@@ -8,13 +8,14 @@ coverage) to hit the lines that handle invalid input / human formatting.
 from __future__ import annotations
 
 import json
+import typing
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.cli.queue_cmd import app
-from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.queue.schema import Task, TaskState, TaskStatus
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
@@ -557,6 +558,46 @@ def test_restart_fresh_missing_state_yaml_json(runner: CliRunner, queue_dir: Pat
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
     assert "no state YAML" in payload["error"]
+
+
+# A live worker rewrites the whole state file, session fields included, when
+# it finishes, so clearing the session under it would be silently undone.
+_WORKER_MAY_OWN = ("running", "possibly_hung")
+
+
+@pytest.mark.parametrize("status", _WORKER_MAY_OWN)
+def test_restart_fresh_refuses_a_task_a_worker_may_still_own(
+    runner: CliRunner, queue_dir: Path, status: str
+) -> None:
+    seeded = _seed_state(
+        queue_dir, "t5", status=status, session_id="sess-live", session_account="work"
+    )
+    result = runner.invoke(app, ["restart-fresh", "t5", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert f"is {status}" in payload["error"]
+    assert load_state(state_path_for(queue_dir, "t5")) == seeded
+
+
+def test_restart_fresh_refusal_human(runner: CliRunner, queue_dir: Path) -> None:
+    _seed_state(queue_dir, "t6", status="running", session_id="sess-live", session_account="work")
+    result = runner.invoke(app, ["restart-fresh", "t6", "--queue", str(queue_dir)])
+    assert result.exit_code == 2
+    assert "is running" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "status", [s for s in typing.get_args(TaskStatus) if s not in _WORKER_MAY_OWN]
+)
+def test_restart_fresh_clears_every_status_no_worker_owns(
+    runner: CliRunner, queue_dir: Path, status: str
+) -> None:
+    """Every other status is cleared; a new status must be sorted into one list."""
+    _seed_state(queue_dir, "t7", status=status, session_id="sess-old", session_account="work")
+    result = runner.invoke(app, ["restart-fresh", "t7", "--queue", str(queue_dir), "--json"])
+    assert result.exit_code == 0, result.stdout
+    assert load_state(state_path_for(queue_dir, "t7")).session_id is None
 
 
 def test_restart_fresh_corrupt_state_yaml_human(runner: CliRunner, queue_dir: Path) -> None:
