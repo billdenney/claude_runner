@@ -517,5 +517,7 @@ On 2026-09-25 the nlmixr2lib queue had 305 of them, holding 36 GB.
    ```
 
    Each pass removes at most `max_per_pass` worktrees, so clear a large
-   backlog with the CLI first. A task whose YAML has left `todo/` is invisible
-   to the runner. Remove its worktree by hand, or reclaim before moving YAMLs.
+   backlog with the CLI first. Task YAMLs are read from `todo/` and `done/`
+   (`[worktree_reclaim].task_dirs`). A task whose YAML has moved anywhere else
+   is invisible to the runner: add that directory to `task_dirs`, or remove
+   its worktree by hand.

@@ -315,6 +315,11 @@ working_dir_template = ""
 #                   queue dir. Taken around the fetch and each removal so a
 #                   concurrent `git worktree add` waits instead of failing.
 #                   The nlmixr2lib hook uses ".run/setup_worktree.lock".
+#   task_dirs       queue subdirectories whose task YAMLs are read. todo/ is
+#                   the runner's; done/ is where some queues move finished
+#                   tasks' YAMLs, whose worktrees would otherwise never be
+#                   seen again. A missing directory is skipped; a task in two
+#                   directories is taken from the first one listed.
 # ---------------------------------------------------------------------------
 [worktree_reclaim]
 periodic              = false
@@ -323,6 +328,7 @@ max_per_pass          = 20
 remote                = "origin"
 parent_branch         = "main"
 branch_template       = "claude/{task_id}"
+task_dirs             = ["todo", "done"]
 discardable_untracked = ["tests/testthat/_problems/"]
 lock_file             = ""
 lock_timeout_s        = 60

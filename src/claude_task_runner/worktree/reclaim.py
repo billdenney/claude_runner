@@ -29,8 +29,12 @@ branch is deleted with ``git branch -d``, never ``-D``, so git refuses on its
 own when the branch is not merged into its upstream.
 
 Nothing else is touched: no ``git worktree prune``, no remote branches, no
-worktree that no task YAML in ``todo/`` names, and never a repository's main
-worktree or a worktree someone locked with ``git worktree lock``.
+worktree that no task YAML in the ``task_dirs`` names, and never a
+repository's main worktree or a worktree someone locked with ``git worktree
+lock``. ``task_dirs`` is ``todo/`` plus ``done/`` by default: some queues move
+a finished task's YAML to ``done/`` with their own tooling, and a pass that
+read only ``todo/`` never saw those worktrees again. Where a YAML sits is not
+evidence of anything; the three conditions above decide.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ import os
 import subprocess
 import time
 from collections import Counter, defaultdict
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -185,10 +189,14 @@ class ReclaimReport:
     remote: str
     parent_branch: str
     tasks_scanned: int
-    """Task YAMLs read from ``todo/``, parseable or not."""
+    """Task YAMLs read from the ``task_dirs`` (``todo/`` and ``done/`` by
+    default), parseable or not, counting a task found in two directories
+    twice."""
     results: tuple[ReclaimResult, ...]
     """One entry per task whose working_dir has a checkout on disk."""
     unparseable_tasks: tuple[str, ...] = ()
+    """File stems of task YAMLs that did not parse; one outside ``todo/`` is
+    prefixed with its directory (``done/broken``)."""
     errors: tuple[str, ...] = ()
     """Repository-level failures, e.g. a fetch that did not complete."""
 
@@ -481,19 +489,54 @@ def _inside(path: Path, root: Path) -> str | None:
     return rel.as_posix()
 
 
-def _task_entries(queue_dir: Path) -> tuple[list[_TaskEntry], list[str], int]:
-    """Every parseable ``todo/`` task that names a working_dir."""
+def _task_yaml_paths(queue_dir: Path, task_dirs: Sequence[str]) -> Iterator[tuple[str, Path]]:
+    """``(directory, path)`` for every task YAML in ``task_dirs``, in that order.
+
+    ``todo/`` is listed exactly as the dispatcher lists it. Any other
+    directory is skipped when it does not exist: ``done/`` is the queue's
+    own convention, not something the runner creates.
+    """
+    for name in task_dirs:
+        paths: Iterable[Path]
+        if name == "todo":
+            paths = list_pending_tasks(queue_dir)
+        else:
+            directory = queue_dir / name
+            if not directory.is_dir():
+                continue
+            paths = sorted(directory.glob("*.yaml"))
+        for path in paths:
+            yield name, path
+
+
+def _task_entries(
+    queue_dir: Path, task_dirs: Sequence[str]
+) -> tuple[list[_TaskEntry], list[str], int]:
+    """Every parseable task in ``task_dirs`` that names a working_dir, once per id."""
     entries: list[_TaskEntry] = []
     unparseable: list[str] = []
+    found_in: dict[str, str] = {}
     scanned = 0
-    for path in list_pending_tasks(queue_dir):
+    for directory, path in _task_yaml_paths(queue_dir, task_dirs):
         scanned += 1
         try:
             task = load_task(path)
         except (QueueIOError, QueueSchemaError) as exc:
             logger.warning("worktree reclaim: skipping unparseable task %s: %s", path, exc)
-            unparseable.append(path.stem)
+            unparseable.append(path.stem if directory == "todo" else f"{directory}/{path.stem}")
             continue
+        if task.id in found_in:
+            # Counting both copies would report the task's worktree as shared
+            # by two tasks and keep it forever.
+            logger.warning(
+                "worktree reclaim: task %s is in both %s/ and %s/; using the %s/ copy",
+                task.id,
+                found_in[task.id],
+                directory,
+                found_in[task.id],
+            )
+            continue
+        found_in[task.id] = directory
         if task.working_dir is None:
             continue
         working_dir = task.working_dir.expanduser()
@@ -871,7 +914,7 @@ def reclaim_worktrees(
     if limit is not None and limit < 1:
         raise ReclaimError(f"limit must be at least 1, got {limit}")
 
-    entries, unparseable, scanned = _task_entries(queue_dir)
+    entries, unparseable, scanned = _task_entries(queue_dir, settings.task_dirs)
     owners: dict[str, list[str]] = defaultdict(list)
     for entry in entries:
         owners[os.path.realpath(entry.working_dir)].append(entry.task_id)

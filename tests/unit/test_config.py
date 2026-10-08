@@ -293,6 +293,7 @@ class TestWorktreeReclaimSettings:
         assert s.max_per_pass == 20
         assert (s.remote, s.parent_branch) == ("origin", "main")
         assert s.branch_template == "claude/{task_id}"
+        assert s.task_dirs == ["todo", "done"]
         assert s.discardable_untracked == ["tests/testthat/_problems/"]
         assert s.lock_file == ""
         assert s.lock_timeout_s == 60.0
@@ -367,6 +368,47 @@ class TestWorktreeReclaimSettings:
         # anything" or point outside the worktree.
         with pytest.raises(ValidationError, match="must be a non-empty path"):
             WorktreeReclaimSettings(discardable_untracked=[entry])
+
+    @pytest.mark.parametrize(
+        "dirs", [["todo"], ["done", "todo"], ["todo", "done", "archive/2026"], ["done"]]
+    )
+    def test_task_dirs_accepted(self, dirs: list[str]) -> None:
+        assert WorktreeReclaimSettings(task_dirs=dirs).task_dirs == dirs
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "",
+            "/",
+            ".",
+            "./",
+            "/abs/path",
+            "../up",
+            "a/../b",
+            " padded",
+            "a\\b",
+            ".claude_task_runner",
+            ".claude_task_runner/state",
+        ],
+    )
+    def test_task_dirs_entries_rejected(self, entry: str) -> None:
+        # Each of these points outside the queue, at nothing, or at the
+        # runner's own state files, which are not task YAMLs.
+        with pytest.raises(ValidationError, match="must be a non-empty path relative to the queue"):
+            WorktreeReclaimSettings(task_dirs=["todo", entry])
+
+    def test_task_dirs_empty_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must name at least one queue subdirectory"):
+            WorktreeReclaimSettings(task_dirs=[])
+
+    def test_task_dirs_duplicate_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="lists a directory twice"):
+            WorktreeReclaimSettings(task_dirs=["todo", "done", "todo"])
+
+    def test_task_dirs_from_toml(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text('[worktree_reclaim]\ntask_dirs = ["todo"]\n')
+        assert load_settings(toml).worktree_reclaim.task_dirs == ["todo"]
 
     @pytest.mark.parametrize(
         ("field", "value"),

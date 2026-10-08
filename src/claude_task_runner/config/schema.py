@@ -398,6 +398,18 @@ class WorktreeReclaimSettings(_StrictModel):
     ``{task_id}`` and ``{worktree_name}`` (the working_dir's basename). A
     worktree on any other branch, or on a detached HEAD, is kept."""
 
+    task_dirs: list[str] = Field(default_factory=lambda: ["todo", "done"])
+    """Queue subdirectories whose task YAMLs name the worktrees to consider.
+
+    ``todo/`` holds every task the runner dispatches. ``done/`` is not a
+    runner directory: a queue's own tooling may move a finished task's YAML
+    there, and a pass that read only ``todo/`` would then never see that
+    task's worktree again (107 of them on the nlmixr2lib queue on
+    2026-09-30). A directory that does not exist is skipped. A task whose
+    YAML is in more than one directory is considered once, from the first
+    directory listed. Where the YAML sits proves nothing: every task still
+    needs a ``completed`` state, a merged branch and a clean tree."""
+
     discardable_untracked: list[str] = Field(default_factory=lambda: ["tests/testthat/_problems/"])
     """Untracked paths (relative to the worktree root) that may be discarded.
 
@@ -451,6 +463,30 @@ class WorktreeReclaimSettings(_StrictModel):
                 f"branch_template={value!r} must contain {{task_id}} or {{worktree_name}}"
             )
         _validate_git_name(rendered, "branch_template")
+        return value
+
+    @field_validator("task_dirs")
+    @classmethod
+    def _check_task_dirs(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("task_dirs must name at least one queue subdirectory")
+        for entry in value:
+            parts = [p for p in entry.split("/") if p]
+            if (
+                not parts
+                or entry.strip() != entry
+                or entry.startswith("/")
+                or "\\" in entry
+                or any(p in (".", "..") for p in parts)
+                or parts[0] == ".claude_task_runner"
+            ):
+                raise ValueError(
+                    f"task_dirs entry {entry!r} must be a non-empty path relative to the "
+                    "queue dir, without '.', '..', backslashes or surrounding whitespace, "
+                    "outside .claude_task_runner/"
+                )
+        if len(set(value)) != len(value):
+            raise ValueError(f"task_dirs lists a directory twice: {value!r}")
         return value
 
     @field_validator("discardable_untracked")
