@@ -8,7 +8,9 @@ were pre-rename spellings `main` had deliberately renamed away.
 
 Three things must be skipped, and each has its own test below:
 
-  (a) blocks from branches that are not ancestors of the consolidation branch
+  (a) blocks from branches outside the merge set: not merged into the
+      consolidation branch, or pushed to after it was merged (then only the
+      merged part counts; merge_set.py decides both)
   (b) blocks a branch merely INHERITED from its own fork point (so `main`
       renamed them afterwards) rather than added
   (c) blocks removed by a repair commit on the consolidation branch itself
@@ -66,7 +68,8 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
-def run(repo: Path, branch: str, base: str = "main") -> str:
+def run(repo: Path, branch: str, base: str = "main") -> tuple[int, str]:
+    """Exit code and output of a --check run: 1 means something is missing."""
     out = subprocess.run(
         [
             sys.executable,
@@ -86,7 +89,7 @@ def run(repo: Path, branch: str, base: str = "main") -> str:
         capture_output=True,
         text=True,
     )
-    return out.stdout + out.stderr
+    return out.returncode, out.stdout + out.stderr
 
 
 def make_remote_branch(repo: Path, name: str, from_ref: str, names: list[str], msg: str) -> None:
@@ -120,7 +123,8 @@ def test_inherited_rename_is_not_resurrected(repo: Path) -> None:
     # put the merged result back to main's spelling plus the branch's addition.
     write_register(repo, ["KEEP_ME", "NEW_NAME", "BRANCH_ADDED"])
     commit(repo, "reconcile")
-    out = run(repo, "consolidation")
+    rc, out = run(repo, "consolidation")
+    assert rc == 0, out
     assert "oldName" not in out, out
     assert "no dropped canonicals" in out, out
 
@@ -158,19 +162,75 @@ def test_genuine_loss_is_still_reported(repo: Path) -> None:
         "refs/remotes/origin/claude/clobbers",
     )
     assert "REALLY_NEW" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
-    out = run(repo, "consolidation")
-    assert "REALLY_NEW" in out, out
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "    REALLY_NEW  (## Section A)\n" in out, out
+
+
+def merge(repo: Path, name: str) -> None:
+    git(
+        repo,
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-edit",
+        "-X",
+        "theirs",
+        f"refs/remotes/origin/claude/{name}",
+    )
 
 
 def test_non_ancestor_branch_is_skipped(repo: Path) -> None:
     """(a) A branch matching the pattern but never folded in contributes nothing."""
+    make_remote_branch(repo, "merged", "main", ["KEEP_ME", "NEW_NAME", "THIS_ROUND"], "this")
     make_remote_branch(repo, "notmerged", "main", ["KEEP_ME", "NEW_NAME", "OTHER_ROUND"], "other")
     git(repo, "checkout", "-q", "-b", "consolidation", "main")
-    write_register(repo, ["KEEP_ME", "NEW_NAME"])
-    commit(repo, "no merges at all")
-    out = run(repo, "consolidation")
+    merge(repo, "merged")
+    rc, out = run(repo, "consolidation")
+    assert rc == 0, out
     assert "OTHER_ROUND" not in out, out
-    assert "skipped 1" in out, out
+    assert "# merge-set gate: skipped 1 branch(es) that consolidation did not merge" in out, out
+
+
+def test_a_consolidation_that_merged_nothing_is_an_error(repo: Path) -> None:
+    """With no branch in the merge set there is nothing to restore from: a wrong --branch."""
+    make_remote_branch(repo, "notmerged", "main", ["KEEP_ME", "NEW_NAME", "OTHER_ROUND"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    rc, out = run(repo, "consolidation")
+    assert rc == 2, out
+    assert out.endswith(
+        "ERROR: (restore) no branch matching --pattern 'origin/claude/*' or given with"
+        " --extra-ref is in the merge set of consolidation: it merged none of them, or main"
+        " already has them\n"
+    )
+
+
+def test_a_branch_that_moved_on_contributes_the_part_that_was_merged(repo: Path) -> None:
+    """(a) Its block lost in the merge comes back; the one it added later does not.
+
+    The ancestry gate used to skip such a branch outright, so the loss of the
+    block it had contributed went unrepaired and unreported.
+    """
+    make_remote_branch(repo, "moves", "main", ["KEEP_ME", "NEW_NAME", "MERGED_BLOCK"], "adds")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "moves")
+    merge(repo, "clobbers")
+    assert "MERGED_BLOCK" not in (repo / REGISTER).read_text(), "fixture lost nothing"
+    # The task goes on after the survey: one more block, on top of what was merged.
+    make_remote_branch(
+        repo,
+        "moves",
+        "refs/remotes/origin/claude/moves",
+        ["KEEP_ME", "NEW_NAME", "MERGED_BLOCK", "LATER_BLOCK"],
+        "adds later",
+    )
+    git(repo, "checkout", "-q", "consolidation")
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "    MERGED_BLOCK  (## Section A)\n" in out, out
+    assert "LATER_BLOCK" not in out, out
+    assert "# merge-set gate: origin/claude/moves moved on after consolidation merged it;" in out
 
 
 def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
@@ -190,6 +250,7 @@ def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
     # The merge kept OLD_SPELLING; a repair commit then renames it.
     write_register(repo, ["KEEP_ME", "NEW_NAME", "BETTER_SPELLING"])
     commit(repo, "apply operator naming ruling")
-    out = run(repo, "consolidation")
+    rc, out = run(repo, "consolidation")
+    assert rc == 0, out
     assert "OLD_SPELLING" not in out, out
     assert "deliberate rename/retire" in out, out

@@ -37,21 +37,29 @@ This script closes that gap.
 Algorithm
 ---------
 
-For each candidate branch (pattern matches + ``--extra-ref`` entries):
+For each branch in the merge set (merge_set.py: the pattern matches and
+``--extra-ref`` entries the consolidation actually merged; a branch left out
+with ``--exclude-ref`` or pushed after the survey is not checked):
 
-1. Read the file at the branch tip (``git show <branch>:<file>``).
-2. Read the file at the merge base (``git show <base>:<file>``).
+1. Read the file at the commit that was merged (the branch tip, or the part
+   of it merged before the tip moved on).
+2. Read the file at that commit's fork point from the base.
 3. Extract all ``##`` and ``###`` headers from each.
-4. Compute ``new_headers = branch_headers - base_headers``.
+4. Compute ``new_headers = branch_headers - fork_headers``: the headers the
+   branch itself added. One it inherited and main has since renamed is not
+   the branch's contribution, and is not expected in the merge.
 5. Read the merged file at ``<repo>/.worktrees/<branch>/<file>``.
 6. Extract all ``##`` and ``###`` headers from the merged file.
 7. Assert ``new_headers - merged_headers == set()``.
 
-The ``###`` regex captures only the canonical-name token (e.g.
+The ``###`` regex captures only the canonical-name tokens (e.g.
 ``WT`` from ``### WT (**canonical for body weight ...**)``) so that
 benign annotation drift between branch and merged file does NOT
 register as a regression. Section identity is the token, not the
-prose.
+prose. A header naming several canonicals (``### QTc, QTcF, QTcI``)
+yields one token per name, so a branch that adds a name to such a
+header is checked for that name, and a merged header whose list grew
+further still passes.
 
 Exit codes
 ----------
@@ -61,8 +69,9 @@ Exit codes
   from the merged file. Details printed to stdout.
 * 2 — the check could not run: a bad argument, a ``--base``, ``--branch``
   or ``--extra-ref`` that does not resolve, no worktree for ``--branch``, no
-  branch matching ``--pattern``, or a crash. Checking no branch at all would
-  report every header present, so that is an error, not a pass.
+  branch matching ``--pattern``, an empty merge set, or a crash. Checking no
+  branch at all would report every header present, so that is an error, not
+  a pass.
 
 Expected error format (sample)::
 
@@ -81,6 +90,8 @@ import sys
 import traceback
 from pathlib import Path
 
+import merge_set
+
 H2_RE = re.compile(r"^## (.+)$", re.M)
 H3_RE = re.compile(r"^### ([A-Za-z0-9_, ]+)\b", re.M)
 
@@ -97,42 +108,10 @@ def is_work_tree(repo: Path) -> bool:
     return r.returncode == 0
 
 
-def resolves(repo: Path, ref: str) -> bool:
-    """True when ``ref`` names a commit in ``repo``."""
-    r = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    return r.returncode == 0
-
-
-def show_or_empty(ref_path: str, cwd: Path) -> str:
-    r = subprocess.run(["git", "show", ref_path], cwd=cwd, capture_output=True, text=True)
-    if r.returncode != 0:
-        return ""
-    return r.stdout
-
-
 def extract_headers(text: str) -> tuple[set[str], set[str]]:
-    return set(H2_RE.findall(text)), set(H3_RE.findall(text))
-
-
-def candidate_branches(repo: Path, pattern: str, extra_refs: list[str]) -> list[str]:
-    refspec = f"refs/remotes/{pattern}"
-    r = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)", refspec],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    branches = sorted({b.strip() for b in r.stdout.splitlines() if b.strip()})
-    for ref in extra_refs or []:
-        if ref and ref not in branches:
-            branches.append(ref)
-    return branches
+    """The ``##`` headers, and the names in the ``###`` headers (one per name)."""
+    names = {name.strip() for header in H3_RE.findall(text) for name in header.split(",")}
+    return set(H2_RE.findall(text)), names - {""}
 
 
 def main(argv: list[str]) -> int:
@@ -166,12 +145,12 @@ def main(argv: list[str]) -> int:
     refs = [("--base", args.base), ("--branch", args.branch)]
     refs += [("--extra-ref", ref) for ref in args.extra_ref if ref]
     for flag, ref in refs:
-        if not resolves(repo, ref):
+        if not merge_set.resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     worktree = repo / ".worktrees" / args.branch
     if not worktree.is_dir():
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
-    branches = candidate_branches(repo, args.pattern, args.extra_ref)
+    branches = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
     if not branches:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
@@ -184,26 +163,32 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    base_text = show_or_empty(f"{args.base}:{args.file}", cwd=repo)
-    base_h2, base_h3 = extract_headers(base_text)
+    found = merge_set.compute(repo, args.branch, args.base, branches)
+    for line in found.summary():
+        print(f"    (section-verifier) {line}")
+    if not found.members:
+        return fail(
+            merge_set.empty_message(args.pattern, args.branch, args.base) + "; nothing to verify"
+        )
 
-    merged_text = merged_path.read_text()
+    merged_text = merged_path.read_text(encoding="utf-8")
     merged_h2, merged_h3 = extract_headers(merged_text)
 
     failures: list[tuple[str, set[str], set[str]]] = []
-    for br in branches:
-        branch_text = show_or_empty(f"{br}:{args.file}", cwd=repo)
+    for member in found.members:
+        branch_text = merge_set.read_file(repo, member.merged, args.file)
         if not branch_text:
             continue
         b_h2, b_h3 = extract_headers(branch_text)
-        new_h2 = b_h2 - base_h2
-        new_h3 = b_h3 - base_h3
+        f_h2, f_h3 = extract_headers(merge_set.read_file(repo, member.fork, args.file) or "")
+        new_h2 = b_h2 - f_h2
+        new_h3 = b_h3 - f_h3
         if not (new_h2 or new_h3):
             continue
         miss_h2 = new_h2 - merged_h2
         miss_h3 = new_h3 - merged_h3
         if miss_h2 or miss_h3:
-            failures.append((br, miss_h2, miss_h3))
+            failures.append((member.ref, miss_h2, miss_h3))
 
     if not failures:
         print(

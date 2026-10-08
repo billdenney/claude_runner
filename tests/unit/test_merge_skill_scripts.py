@@ -22,8 +22,14 @@ Each gets a syntax or ``--help`` run here, plus cheap known-answer cases:
   parse-checked, and run against a worktree with no vignettes, only where
   Rscript is on PATH.
 
-restore_dropped_sections.py and union_merge_news.py have their own modules for
-their logic; here they get their CLI, fail-loud and ``--extra-ref`` cases.
+* Every repair and verify helper reads only the merge set (merge_set.py): a
+  branch the pattern matches but the consolidation did not merge contributes
+  nothing and is never reported missing, and a branch whose tip moved on after
+  the merge contributes only the part that was merged.
+
+restore_dropped_sections.py, union_merge_news.py and verify_no_base_reverts.py
+have their own modules for their logic; here they get their CLI, fail-loud and
+``--extra-ref`` cases.
 """
 
 from __future__ import annotations
@@ -33,16 +39,25 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from claude_task_runner.cli.install_skills_cmd import _packaged_skill_dir
+from ._git_world import git
+from ._merge_skill_repo import (
+    SKILL_DIR,
+    commit,
+    consolidate,
+    load_helper,
+    new_repo,
+    push_more,
+    push_task_branch,
+    run,
+    run_helper,
+    update_main,
+)
 
-from ._git_world import git, isolate_git
-
-SKILL_DIR = _packaged_skill_dir("runner-merge-claude-branches")
 MERGE_BRANCHES = SKILL_DIR / "merge_branches.sh"
 VERIFY_CONTRIBUTIONS = SKILL_DIR / "verify_branch_contributions.sh"
 VIGNETTES_R = SKILL_DIR / "verify_vignettes_parallel.R"
@@ -136,43 +151,6 @@ TOOLS = (
 )
 
 
-def _run(
-    *cmd: str | Path, cwd: Path | None = None, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    """Run a script with stdin closed, so a prompt can never wait on a terminal."""
-    return subprocess.run(
-        [str(c) for c in cmd],
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-
-
-def _python(script: str, *args: str | Path) -> subprocess.CompletedProcess[str]:
-    return _run(sys.executable, SKILL_DIR / script, *args)
-
-
-def _commit(repo: Path, files: dict[str, str], message: str) -> None:
-    for rel, text in files.items():
-        path = repo / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-    git(repo, "add", *files)
-    git(repo, "commit", "-qm", message)
-
-
-def _push_task_branch(repo: Path, branch: str, files: dict[str, str], message: str) -> None:
-    """Commit ``files`` on ``branch``, cut from main, and push it as a task worker does."""
-    git(repo, "checkout", "-q", "-b", branch, "main")
-    _commit(repo, files, message)
-    git(repo, "push", "-q", "origin", branch)
-    git(repo, "checkout", "-q", "main")
-
-
 def _survey_rows(stdout: str) -> list[tuple[str, str, str, str]]:
     """(branch, ahead, files, subject) for each branch merge_branches.sh surveyed."""
     return re.findall(r"^ {6}(\S+) +ahead=(\d+)  files=(\d+)  (.*)$", stdout, re.MULTILINE)
@@ -185,44 +163,25 @@ def _build_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     out. ``claude/a`` and ``claude/b`` fork from that main, so each is one
     commit ahead and changes exactly the two files it pushed.
     """
-    isolate_git(tmp_path, monkeypatch)
-    origin = tmp_path / "origin.git"
-    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
-    repo = tmp_path / "repo"
-    git(tmp_path, "clone", "-q", str(origin), str(repo))
-    _commit(repo, {".gitignore": ".worktrees/\n", REGISTER: BASE_REGISTER}, "base")
+    repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER})
     git(repo, "checkout", "-q", "-b", "claude/merged")
-    _commit(repo, {"inst/modeldb/M_2019_m.R": "# M\n"}, "Add M 2019 model")
+    commit(repo, {"inst/modeldb/M_2019_m.R": "# M\n"}, "Add M 2019 model")
     git(repo, "checkout", "-q", "main")
     git(repo, "merge", "-q", "--no-ff", "--no-edit", "claude/merged")
     git(repo, "push", "-q", "origin", "main", "claude/merged")
-    _push_task_branch(
+    push_task_branch(
         repo,
         "claude/a",
         {REGISTER: REGISTER_A, "inst/modeldb/A_2020_a.R": "# A\n"},
         "Add A 2020 model",
     )
-    _push_task_branch(
+    push_task_branch(
         repo,
         "claude/b",
         {REGISTER: REGISTER_B, "inst/modeldb/B_2021_b.R": "# B\n"},
         "Add B 2021 model",
     )
     return repo
-
-
-def _consolidate(repo: Path, branches: Sequence[str], name: str = CONSOLIDATION) -> Path:
-    """merge_branches.sh's step 3: ``git merge --no-ff -X theirs`` per branch.
-
-    In a worktree at ``<repo>/.worktrees/<name>``, which is where every helper
-    below looks for the merged file.
-    """
-    git(repo, "fetch", "-q", "origin")
-    wt = repo / ".worktrees" / name
-    git(repo, "worktree", "add", "-q", "-b", name, str(wt), "origin/main")
-    for branch in branches:
-        git(wt, "merge", "-q", "--no-ff", "--no-edit", "-X", "theirs", branch)
-    return wt
 
 
 @pytest.fixture
@@ -233,7 +192,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def worktree(repo: Path) -> Path:
     """The consolidation worktree after folding in claude/a, then claude/b."""
-    wt = _consolidate(repo, ["origin/claude/a", "origin/claude/b"])
+    wt = consolidate(repo, ["origin/claude/a", "origin/claude/b"], CONSOLIDATION)
     assert (wt / REGISTER).read_text() == REGISTER_B, "the fixture did not reproduce the loss"
     return wt
 
@@ -243,10 +202,12 @@ def shared_repo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     """One consolidated repo for the tests that only read it.
 
     ``parked`` is a branch with no worktree, and nothing is checked out of it.
+    ``nothing`` has a worktree but merged no branch at all.
     """
     with pytest.MonkeyPatch.context() as mp:
         repo = _build_repo(tmp_path_factory.mktemp("shared"), mp)
-        _consolidate(repo, ["origin/claude/a", "origin/claude/b"])
+        consolidate(repo, ["origin/claude/a", "origin/claude/b"], CONSOLIDATION)
+        consolidate(repo, [], "nothing")
         git(repo, "branch", "parked")
         yield repo
 
@@ -294,7 +255,7 @@ def test_help_documents_every_flag_the_script_parses(script: Path) -> None:
     never in it. verify_branch_contributions.sh's help ran one line too far and
     printed ``set -euo pipefail``.
     """
-    proc = _run("bash", script, "--help")
+    proc = run("bash", script, "--help")
     assert (proc.returncode, proc.stderr) == (0, "")
     flags = _parsed_flags(script)
     assert "--help" in flags, "the argument loop was not found"
@@ -309,11 +270,11 @@ def test_help_documents_every_flag_the_script_parses(script: Path) -> None:
 
 class TestMergeBranches:
     def test_parses(self) -> None:
-        proc = _run("bash", "-n", MERGE_BRANCHES)
+        proc = run("bash", "-n", MERGE_BRANCHES)
         assert (proc.returncode, proc.stderr) == (0, "")
 
     def test_help_prints_the_whole_header(self) -> None:
-        proc = _run("bash", MERGE_BRANCHES, "--help")
+        proc = run("bash", MERGE_BRANCHES, "--help")
         assert (proc.returncode, proc.stderr) == (0, "")
         assert proc.stdout.startswith(
             "Consolidate per-task claude/* branches into one review-ready branch.\n"
@@ -324,22 +285,22 @@ class TestMergeBranches:
         )
 
     def test_unknown_argument_exits_2(self) -> None:
-        proc = _run("bash", MERGE_BRANCHES, "--no-such-flag")
+        proc = run("bash", MERGE_BRANCHES, "--no-such-flag")
         assert (proc.returncode, proc.stderr) == (2, "unknown arg: --no-such-flag\n")
 
     def test_flag_without_a_value_exits_2(self) -> None:
-        proc = _run("bash", MERGE_BRANCHES, "--repo")
+        proc = run("bash", MERGE_BRANCHES, "--repo")
         assert (proc.returncode, proc.stderr) == (2, "ERROR: --repo needs a value\n")
 
     def test_non_numeric_vignette_jobs_exits_2(self) -> None:
-        proc = _run("bash", MERGE_BRANCHES, "--vignette-jobs", "abc")
+        proc = run("bash", MERGE_BRANCHES, "--vignette-jobs", "abc")
         assert (proc.returncode, proc.stderr) == (
             2,
             "ERROR: --vignette-jobs must be a positive integer, not 'abc'\n",
         )
 
     def test_dry_run_surveys_the_unmerged_branches_and_stops(self, repo: Path) -> None:
-        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
         assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
         assert "    found 2 unmerged branch(es):\n" in proc.stdout
         assert _survey_rows(proc.stdout) == [
@@ -356,9 +317,9 @@ class TestMergeBranches:
 
     def test_survey_counts_only_the_files_a_branch_changed(self, repo: Path) -> None:
         """Main moving on after the fork must not add main's files to the count."""
-        _commit(repo, {"inst/other.txt": "later\n"}, "main moves on")
+        commit(repo, {"inst/other.txt": "later\n"}, "main moves on")
         git(repo, "push", "-q", "origin", "main")
-        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
         assert proc.returncode == 0, proc.stderr
         assert [row[:3] for row in _survey_rows(proc.stdout)] == [
             ("claude/a", "1", "2"),
@@ -375,9 +336,9 @@ class TestMergeBranches:
         model = "inst/modeldb/Wang_2019_tacrolimus.R"
         added = {"c": "# paper one\n", "d": "# paper two\n", "e": "# paper one\n"}
         for branch, text in added.items():
-            _push_task_branch(repo, f"claude/{branch}", {model: text}, f"Add Wang 2019 ({branch})")
+            push_task_branch(repo, f"claude/{branch}", {model: text}, f"Add Wang 2019 ({branch})")
 
-        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
         assert proc.returncode == 4, proc.stdout
         assert proc.stderr == (
             "ERROR: the same new path is added with different content by more than one branch:\n"
@@ -386,7 +347,7 @@ class TestMergeBranches:
             " --exclude-ref one of them, then re-run.\n"
         )
 
-        proc = _run(
+        proc = run(
             "bash",
             MERGE_BRANCHES,
             "--repo",
@@ -412,7 +373,7 @@ class TestMergeBranches:
 
     def test_unresolvable_base_is_a_preflight_error(self, repo: Path) -> None:
         """It used to make every branch 0 ahead and report nothing to do."""
-        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--base", "origin/nope", "--dry-run")
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--base", "origin/nope", "--dry-run")
         assert (proc.returncode, proc.stderr) == (
             3,
             "ERROR: --base 'origin/nope' does not resolve to a commit\n",
@@ -422,10 +383,10 @@ class TestMergeBranches:
         """Its collision check used to fail silently, so it was never checked."""
         git(repo, "checkout", "-q", "--orphan", "claude/orphan")
         git(repo, "rm", "-rq", "--cached", ".")
-        _commit(repo, {"inst/modeldb/A_2020_a.R": "# another paper\n"}, "Add A 2020 again")
+        commit(repo, {"inst/modeldb/A_2020_a.R": "# another paper\n"}, "Add A 2020 again")
         git(repo, "push", "-q", "origin", "claude/orphan")
         git(repo, "checkout", "-q", "-f", "main")
-        proc = _run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
         assert proc.returncode == 3, proc.stdout
         assert proc.stderr.endswith(
             "ERROR: cannot diff origin/claude/orphan against its merge base with origin/main"
@@ -434,7 +395,7 @@ class TestMergeBranches:
 
     def test_excluding_every_branch_is_an_error(self, repo: Path) -> None:
         """It used to leave one empty entry, surveyed as the branch ""."""
-        proc = _run(
+        proc = run(
             "bash",
             MERGE_BRANCHES,
             "--repo",
@@ -455,7 +416,7 @@ class TestMergeBranches:
 
     def test_without_a_terminal_it_stops_at_the_prompt(self, repo: Path) -> None:
         """An agent's shell: read got EOF and the run ended with exit 1, silently."""
-        proc = _run(
+        proc = run(
             "bash",
             MERGE_BRANCHES,
             "--repo",
@@ -491,7 +452,7 @@ class TestMergeBranches:
         self, missing: str, message: str, repo: Path, tmp_path: Path
     ) -> None:
         """Rscript used to be looked for only after the merges."""
-        proc = _run(
+        proc = run(
             "bash", MERGE_BRANCHES, "--repo", repo, "--yes", env=_env_without(tmp_path, missing)
         )
         assert (proc.returncode, proc.stderr) == (3, message), proc.stdout
@@ -501,7 +462,7 @@ class TestMergeBranches:
         self, repo: Path, env: dict[str, str], *extra: str
     ) -> subprocess.CompletedProcess[str]:
         """Everything but the R regeneration, devtools::check and the push."""
-        return _run(
+        return run(
             "bash",
             MERGE_BRANCHES,
             "--repo",
@@ -568,7 +529,7 @@ class TestMergeBranches:
                 f"\n### LKST (**canonical for lkst, from {name}**)\n\n"
                 f"- **Example models:** `{model}` ({name}).\n"
             )
-            _push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Register LKST ({name})")
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Register LKST ({name})")
         proc = self._full_run(
             repo,
             _env_with_first(_bin_dir(tmp_path, "bin", {})),
@@ -582,16 +543,78 @@ class TestMergeBranches:
         assert f"WARNING: verifier reported missing contributions in {REGISTER}.\n" in proc.stdout
         assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in proc.stdout
 
+    def test_a_branch_left_out_leaves_no_trace_in_the_register(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Every repair and verify step used to read it anyway.
+
+        On 2026-09-29 the 18 branches left out with --exclude-ref put 8 orphan
+        Example-models entries into covariate-columns.md, and the verifiers
+        reported their contributions missing.
+        """
+        _branch_left_out(repo)
+        proc = self._full_run(
+            repo,
+            _env_with_first(_bin_dir(tmp_path, "bin", {})),
+            "--skip-vignettes",
+            "--exclude-ref",
+            "origin/claude/c",
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (repo / ".worktrees" / CONSOLIDATION / REGISTER).read_text() == REPAIRED
+        assert VERIFIER_OK in proc.stdout
+        assert (
+            f"    (reverts) OK — nothing origin/main has in {REGISTER} was reverted by the merge\n"
+        ) in proc.stdout
+
+    def test_register_content_the_merge_reverted_stops_the_run(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """Main rewords the WT line and adds a note under it after both branches forked.
+
+        Both branches rewrote that line, so -X theirs keeps their older copy,
+        without the note. The union merger puts main's longer annotation back,
+        since it rebuilds Example-models lines, but nothing restores the note:
+        the run stops before the R steps, and repairs nothing.
+        """
+        reworded = "(base model, reworded on main).\n- **Notes:** Added on main."
+        update_main(repo, {REGISTER: BASE_REGISTER.replace("(base model).", reworded)}, "note")
+        proc = self._full_run(
+            repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes"
+        )
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 5, proc.stdout
+        assert (
+            f"\nERROR: (reverts) 1 block(s) of {REGISTER} lost content that origin/main has:\n"
+            "    ## Body size\n"
+            "    ### WT (**canonical for body weight**)\n"
+            "      missing line: - **Notes:** Added on main.\n"
+        ) in proc.stdout
+        assert proc.stderr.endswith(
+            "ERROR: the merge reverted register content origin/main has (listed above). Nothing"
+            f" was repaired: restore it by hand in {wt}, commit, and re-run"
+            " verify_no_base_reverts.py until it passes before regenerating and pushing.\n"
+        )
+        assert "==> Regenerating" not in proc.stdout
+        assert (wt / REGISTER).read_text() == (
+            BASE_REGISTER.replace(
+                "(base model).",
+                "(base model, reworded on main), `B_2021_b.R` (b note), `A_2020_a.R` (a note).",
+            )
+            + BMI_BLOCK
+            + HT_BLOCK
+        )
+
 
 class TestVerifyBranchContributions:
     """merge_branches.sh runs this one directly, so these tests do too."""
 
     def test_parses(self) -> None:
-        proc = _run("bash", "-n", VERIFY_CONTRIBUTIONS)
+        proc = run("bash", "-n", VERIFY_CONTRIBUTIONS)
         assert (proc.returncode, proc.stderr) == (0, "")
 
     def test_help(self) -> None:
-        proc = _run(VERIFY_CONTRIBUTIONS, "--help")
+        proc = run(VERIFY_CONTRIBUTIONS, "--help")
         assert (proc.returncode, proc.stderr) == (0, "")
         assert proc.stdout.startswith(
             "Verify no per-branch model contributions were lost from a structured-\n"
@@ -599,22 +622,22 @@ class TestVerifyBranchContributions:
         assert "\nUsage:\n  verify_branch_contributions.sh [OPTIONS]\n" in proc.stdout
 
     def test_branch_is_required(self) -> None:
-        proc = _run(VERIFY_CONTRIBUTIONS)
+        proc = run(VERIFY_CONTRIBUTIONS)
         assert (proc.returncode, proc.stderr) == (2, "ERROR: (verifier) --branch is required\n")
 
     def test_unknown_argument_exits_2(self) -> None:
-        proc = _run(VERIFY_CONTRIBUTIONS, "--no-such-flag")
+        proc = run(VERIFY_CONTRIBUTIONS, "--no-such-flag")
         assert (proc.returncode, proc.stderr) == (2, "unknown arg: --no-such-flag\n")
 
     def test_empty_file_disables_it(self) -> None:
-        proc = _run(VERIFY_CONTRIBUTIONS, "--branch", CONSOLIDATION, "--file", "")
+        proc = run(VERIFY_CONTRIBUTIONS, "--branch", CONSOLIDATION, "--file", "")
         assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
 
     def test_reports_the_model_and_block_the_merge_dropped(
         self, repo: Path, worktree: Path
     ) -> None:
         """All three checks fail on the post-merge file, in one report."""
-        proc = _run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
+        proc = run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
         assert (proc.returncode, proc.stderr) == (1, "")
         filename_report = (
             "\n"
@@ -632,9 +655,9 @@ class TestVerifyBranchContributions:
         self, repo: Path, worktree: Path
     ) -> None:
         """A grep with no match under pipefail used to end the run: exit 1, no output."""
-        _push_task_branch(repo, "claude/prose", {REGISTER: BASE_REGISTER + "\nA note.\n"}, "prose")
+        push_task_branch(repo, "claude/prose", {REGISTER: BASE_REGISTER + "\nA note.\n"}, "prose")
         git(repo, "fetch", "-q", "origin")
-        proc = _run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
+        proc = run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
         assert (proc.returncode, proc.stderr) == (1, "")
         assert proc.stdout.startswith(
             "\n"
@@ -643,7 +666,7 @@ class TestVerifyBranchContributions:
         )
 
     def test_a_file_the_worktree_lacks_is_skipped(self, shared_repo: Path) -> None:
-        proc = _run(
+        proc = run(
             VERIFY_CONTRIBUTIONS, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", "x.md"
         )
         merged = shared_repo / ".worktrees" / CONSOLIDATION / "x.md"
@@ -679,7 +702,7 @@ class TestVerifyBranchContributions:
         self, args: list[str], message: str, shared_repo: Path
     ) -> None:
         """Each of these used to check less than it said, or nothing, and exit 0."""
-        proc = _run(
+        proc = run(
             VERIFY_CONTRIBUTIONS,
             "--repo",
             shared_repo,
@@ -694,7 +717,7 @@ class TestVerifyBranchContributions:
 
     def test_missing_python3_exits_2(self, shared_repo: Path, tmp_path: Path) -> None:
         """It used to skip the header and placement checks and report OK."""
-        proc = _run(
+        proc = run(
             VERIFY_CONTRIBUTIONS,
             "--repo",
             shared_repo,
@@ -716,28 +739,30 @@ class TestVerifyBranchContributions:
     "script",
     [
         "dedup_canonical_headers.py",
+        "merge_set.py",
         "restore_dropped_sections.py",
         "union_merge_lines.py",
         "union_merge_news.py",
+        "verify_no_base_reverts.py",
         "verify_register_placement.py",
         "verify_section_headers.py",
     ],
 )
 def test_python_helper_help(script: str) -> None:
-    proc = _python(script, "--help")
+    proc = run_helper(script, "--help")
     assert (proc.returncode, proc.stderr) == (0, "")
     assert proc.stdout.startswith(f"usage: {script} [-h]")
 
 
 def test_section_headers_reports_the_dropped_block(repo: Path, worktree: Path) -> None:
-    proc = _python("verify_section_headers.py", *_verifier_args(repo))
+    proc = run_helper("verify_section_headers.py", *_verifier_args(repo))
     assert (proc.returncode, proc.stdout, proc.stderr) == (1, SECTION_REPORT, "")
 
 
 class TestRegisterPlacement:
     def test_reports_each_pair_the_merge_dropped(self, repo: Path, worktree: Path) -> None:
         """The WT pair is lost even though the WT block itself survived."""
-        proc = _python("verify_register_placement.py", *_verifier_args(repo))
+        proc = run_helper("verify_register_placement.py", *_verifier_args(repo))
         assert (proc.returncode, proc.stdout, proc.stderr) == (1, PLACEMENT_REPORT, "")
 
     def test_unresolvable_branch_is_an_error_not_a_pass(self, shared_repo: Path) -> None:
@@ -746,7 +771,7 @@ class TestRegisterPlacement:
         With no worktree for the branch it used to report "merged file absent;
         skipping" and exit 0, never reaching this check.
         """
-        proc = _python(
+        proc = run_helper(
             "verify_register_placement.py",
             "--repo",
             shared_repo,
@@ -769,11 +794,16 @@ WORKTREE_HELPERS = {
     "union_merge_lines.py": "union-merge",
     "restore_dropped_sections.py": "restore",
     "union_merge_news.py": "news",
+    "verify_no_base_reverts.py": "reverts",
 }
-# restore and news find the worktree with `git worktree list`; the others at
+# These find the worktree with `git worktree list`; the others at
 # <repo>/.worktrees/<branch>.
-_LISTED = {"restore_dropped_sections.py", "union_merge_news.py"}
-_VERIFIERS = {"verify_section_headers.py", "verify_register_placement.py"}
+_LISTED = {"restore_dropped_sections.py", "union_merge_news.py", "verify_no_base_reverts.py"}
+_VERIFIERS = {
+    "verify_section_headers.py",
+    "verify_register_placement.py",
+    "verify_no_base_reverts.py",
+}
 
 
 def _bad_input_cases() -> Iterator[object]:
@@ -797,13 +827,11 @@ def _bad_input_cases() -> Iterator[object]:
                 ["--extra-ref", "origin/nope"],
                 "--extra-ref 'origin/nope' does not resolve to a commit in {repo}",
             ),
-        }
-        # verify_register_placement.py takes --base but never reads it.
-        if script != "verify_register_placement.py":
-            cases["base"] = (
+            "base": (
                 ["--base", "origin/nope"],
                 "--base 'origin/nope' does not resolve to a commit in {repo}",
-            )
+            ),
+        }
         for case, (args, message) in cases.items():
             yield pytest.param(
                 script, args, f"ERROR: ({prefix}) {message}\n", id=f"{script}-{case}"
@@ -822,7 +850,7 @@ def test_worktree_helpers_refuse_inputs_that_cannot_be_right(
     with origin/claude/*.
     """
     main_copy = (shared_repo / REGISTER).read_text()
-    proc = _python(
+    proc = run_helper(
         script, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", REGISTER, *args
     )
     assert (proc.returncode, proc.stdout) == (2, "")
@@ -850,6 +878,11 @@ def test_worktree_helpers_refuse_inputs_that_cannot_be_right(
             "",
         ),
         ("union_merge_news.py", "x.md not present; nothing to do\n", ""),
+        (
+            "verify_no_base_reverts.py",
+            "    (reverts) x.md is not on origin/main; nothing to check.\n",
+            "",
+        ),
     ],
 )
 def test_worktree_helpers_skip_a_file_the_worktree_lacks(
@@ -857,7 +890,7 @@ def test_worktree_helpers_skip_a_file_the_worktree_lacks(
 ) -> None:
     """A repo without that register is legitimate: nothing to do, exit 0."""
     merged = shared_repo / ".worktrees" / CONSOLIDATION / "x.md"
-    proc = _python(script, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", "x.md")
+    proc = run_helper(script, "--repo", shared_repo, "--branch", CONSOLIDATION, "--file", "x.md")
     assert (proc.returncode, proc.stdout, proc.stderr) == (
         0,
         stdout.format(f=merged),
@@ -869,7 +902,7 @@ def test_worktree_helpers_skip_a_file_the_worktree_lacks(
 def test_union_merge_lines_restores_the_dropped_example_model(repo: Path, worktree: Path) -> None:
     """Merged order first, then each branch's new models, keeping each annotation."""
     merged = worktree / REGISTER
-    proc = _python("union_merge_lines.py", *_verifier_args(repo))
+    proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
     assert (proc.returncode, proc.stdout) == (0, "")
     assert proc.stderr == (
         f"# branches touching {REGISTER}: 2\n"
@@ -886,12 +919,12 @@ def test_union_then_restore_closes_everything_the_verifier_reported(
     repo: Path, worktree: Path
 ) -> None:
     """merge_branches.sh's repair steps, in its order, leave the verifier clean."""
-    assert _python("union_merge_lines.py", *_verifier_args(repo)).returncode == 0
-    proc = _python("restore_dropped_sections.py", *_verifier_args(repo))
+    assert run_helper("union_merge_lines.py", *_verifier_args(repo)).returncode == 0
+    proc = run_helper("restore_dropped_sections.py", *_verifier_args(repo))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (worktree / REGISTER).read_text() == REPAIRED
 
-    proc = _run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
+    proc = run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
     assert (proc.returncode, proc.stderr) == (0, "")
     assert proc.stdout == VERIFIER_OK
 
@@ -903,22 +936,22 @@ def test_restore_takes_extra_refs(repo: Path, worktree: Path) -> None:
     restore never saw such a branch.
     """
     args = [*_verifier_args(repo), "--pattern", "origin/claude/b"]
-    proc = _python("restore_dropped_sections.py", *args)
+    proc = run_helper("restore_dropped_sections.py", *args)
     assert (proc.returncode, proc.stdout) == (0, f"# no dropped canonicals in {REGISTER}\n")
     assert (worktree / REGISTER).read_text() == REGISTER_B
 
-    proc = _python("restore_dropped_sections.py", *args, "--extra-ref", "origin/claude/a")
+    proc = run_helper("restore_dropped_sections.py", *args, "--extra-ref", "origin/claude/a")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (worktree / REGISTER).read_text() == REGISTER_B + HT_BLOCK
 
 
 def test_news_union_restores_the_dropped_bullet_and_takes_extra_refs(repo: Path) -> None:
     """union_merge_news.py's first end-to-end run in a test."""
-    _commit(repo, {"NEWS.md": "# development version\n\n- Add Base 2000 x model.\n"}, "news")
+    commit(repo, {"NEWS.md": "# development version\n\n- Add Base 2000 x model.\n"}, "news")
     git(repo, "push", "-q", "origin", "main")
     for name, year in (("c", "2022"), ("d", "2023")):
         news = f"# development version\n\n- Add {name.upper()} {year} {name} model.\n\n"
-        _push_task_branch(
+        push_task_branch(
             repo,
             f"claude/{name}",
             {
@@ -927,16 +960,16 @@ def test_news_union_restores_the_dropped_bullet_and_takes_extra_refs(repo: Path)
             },
             f"Add {name}",
         )
-    wt = _consolidate(repo, ["origin/claude/c", "origin/claude/d"], name="news")
+    wt = consolidate(repo, ["origin/claude/c", "origin/claude/d"], "news")
     merged = wt / "NEWS.md"
     assert "Add C 2022" not in merged.read_text(), "the fixture did not reproduce the loss"
     args = ["--repo", repo, "--branch", "news", "--pattern", "origin/claude/d"]
 
-    proc = _python("union_merge_news.py", *args)
+    proc = run_helper("union_merge_news.py", *args)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.endswith("# NEWS.md already complete; nothing to do\n")
 
-    proc = _python("union_merge_news.py", *args, "--extra-ref", "origin/claude/c")
+    proc = run_helper("union_merge_news.py", *args, "--extra-ref", "origin/claude/c")
     assert proc.returncode == 0, proc.stderr
     assert merged.read_text() == (
         "# development version\n\n"
@@ -944,6 +977,297 @@ def test_news_union_restores_the_dropped_bullet_and_takes_extra_refs(repo: Path)
         "- Add C 2022 c model.\n\n"
         "- Add Base 2000 x model.\n"
     )
+
+
+def _empty_merge_set_message(prefix: str, suffix: str = "") -> str:
+    return (
+        f"ERROR: ({prefix}) no branch matching --pattern 'origin/claude/*' or given with"
+        " --extra-ref is in the merge set of nothing: it merged none of them, or origin/main"
+        f" already has them{suffix}\n"
+    )
+
+
+@pytest.mark.parametrize("script", sorted(WORKTREE_HELPERS))
+def test_worktree_helpers_refuse_an_empty_merge_set(script: str, shared_repo: Path) -> None:
+    """A consolidation that merged none of the refs leaves nothing to repair or check.
+
+    Passing would be the vacuous pass a verifier must never give: the branch
+    or the pattern is wrong.
+    """
+    main_copy = (shared_repo / REGISTER).read_text()
+    proc = run_helper(script, "--repo", shared_repo, "--branch", "nothing", "--file", REGISTER)
+    suffix = "; nothing to verify" if script in _VERIFIERS else ""
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stderr.endswith(_empty_merge_set_message(WORKTREE_HELPERS[script], suffix))
+    # The gate says why: claude/a and claude/b were not merged into it.
+    gate = "merge-set gate: skipped 2 branch(es) that nothing did not merge"
+    assert (proc.stdout + proc.stderr).count(gate) == 1
+    assert (shared_repo / REGISTER).read_text() == main_copy
+
+
+def test_verify_contributions_refuses_an_empty_merge_set(shared_repo: Path) -> None:
+    proc = run(
+        VERIFY_CONTRIBUTIONS, "--repo", shared_repo, "--branch", "nothing", "--file", REGISTER
+    )
+    assert (proc.returncode, proc.stdout) == (2, "")
+    assert proc.stderr == _empty_merge_set_message("merge-set") + (
+        "ERROR: (verifier) merge_set.py could not compute the merge set of 'nothing'\n"
+    )
+
+
+def _sha(repo: Path, ref: str) -> str:
+    return git(repo, "rev-parse", ref)
+
+
+class TestMergeSet:
+    """merge_set.py decides, for every helper, which refs a consolidation merged."""
+
+    def test_prints_each_member_with_its_merged_commit_and_fork_point(
+        self, shared_repo: Path
+    ) -> None:
+        """claude/merged is already on the base: not a member, and not worth a line."""
+        proc = run_helper("merge_set.py", "--repo", shared_repo, "--branch", CONSOLIDATION)
+        fork = _sha(shared_repo, "origin/main")
+        a, b = _sha(shared_repo, "origin/claude/a"), _sha(shared_repo, "origin/claude/b")
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert proc.stdout == f"origin/claude/a {a} {fork}\norigin/claude/b {b} {fork}\n"
+
+    def test_a_branch_left_out_is_skipped_and_one_that_moved_on_is_read_where_merged(
+        self, repo: Path
+    ) -> None:
+        consolidate(repo, ["origin/claude/a"], CONSOLIDATION)
+        merged = _sha(repo, "origin/claude/a")
+        push_more(repo, "claude/a", {"inst/modeldb/A_2020_z.R": "# later\n"}, "Add A 2020 z")
+        tip = _sha(repo, "origin/claude/a")
+        args = ["--repo", repo, "--branch", CONSOLIDATION]
+        proc = run_helper("merge_set.py", *args)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == f"origin/claude/a {merged} {_sha(repo, 'origin/main')}\n"
+        assert proc.stderr == (
+            "# merge-set gate: skipped 1 branch(es) that consolidation did not merge (left out"
+            " with --exclude-ref, or pushed after the survey)\n"
+            "# merge-set gate: origin/claude/a moved on after consolidation merged it; reading"
+            f" the merged commit {merged[:12]}, not its tip {tip[:12]}\n"
+        )
+        quiet = run_helper("merge_set.py", *args, "--quiet")
+        assert (quiet.returncode, quiet.stdout, quiet.stderr) == (0, proc.stdout, "")
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            (
+                ["--base", "origin/nope"],
+                "--base 'origin/nope' does not resolve to a commit in {repo}",
+            ),
+            (["--branch", "nope"], "--branch 'nope' does not resolve to a commit in {repo}"),
+            (
+                ["--pattern", "origin/none/*"],
+                "no branch matches --pattern 'origin/none/*' and no --extra-ref was given",
+            ),
+        ],
+        ids=["base", "branch", "no-match"],
+    )
+    def test_inputs_that_cannot_be_right_exit_2(
+        self, args: list[str], message: str, shared_repo: Path
+    ) -> None:
+        proc = run_helper("merge_set.py", "--repo", shared_repo, "--branch", CONSOLIDATION, *args)
+        assert (proc.returncode, proc.stdout) == (2, "")
+        assert proc.stderr == f"ERROR: (merge-set) {message.format(repo=shared_repo)}\n"
+
+
+C_ENTRY = "`C_2022_c.R` (c note)"
+AGE_BLOCK = "\n### AGE (**canonical for age**)\n\n- **Example models:** `C_2022_c.R` (age).\n"
+
+
+def _branch_left_out(repo: Path) -> None:
+    """claude/c adds a model and a canonical of its own; the consolidation leaves it out."""
+    push_task_branch(
+        repo,
+        "claude/c",
+        {REGISTER: _with_models(C_ENTRY) + AGE_BLOCK, "inst/modeldb/C_2022_c.R": "# C\n"},
+        "Add C 2022 model",
+    )
+
+
+LATER_BLOCK = "\n### LATER (**canonical pushed after the merge**)\n\n- **Example models:** `A_2020_z.R` (z).\n"
+
+
+def _branch_moves_on(repo: Path) -> None:
+    """claude/a, already merged, gets another model and canonical it was not merged with."""
+    later = _with_models(A_ENTRY, "`A_2020_z.R` (z note)") + HT_BLOCK + LATER_BLOCK
+    push_more(repo, "claude/a", {REGISTER: later}, "Add A 2020 z")
+
+
+class TestMergeSetGate:
+    """R1 of the 2026-09-29 fixes: every helper reads only what was merged.
+
+    On that round the 18 branches left out with --exclude-ref put 8 orphan
+    Example-models entries into covariate-columns.md, and the verifiers
+    reported dozens of their contributions as missing.
+    """
+
+    def test_union_ignores_a_branch_left_out_and_what_a_branch_pushed_later(
+        self, repo: Path, worktree: Path
+    ) -> None:
+        _branch_left_out(repo)
+        _branch_moves_on(repo)
+        git(repo, "fetch", "-q", "origin")
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert (proc.returncode, proc.stdout) == (0, ""), proc.stderr
+        assert (worktree / REGISTER).read_text() == _with_models(B_ENTRY, A_ENTRY) + BMI_BLOCK
+        assert proc.stderr.startswith(
+            "# merge-set gate: skipped 1 branch(es) that consolidation did not merge (left out"
+            " with --exclude-ref, or pushed after the survey)\n"
+            "# merge-set gate: origin/claude/a moved on after consolidation merged it;"
+        )
+
+    def test_verifiers_do_not_report_what_was_never_merged(
+        self, repo: Path, worktree: Path
+    ) -> None:
+        """Both would fail every check: claude/c's model and AGE, and claude/a's LATER."""
+        _branch_left_out(repo)
+        _branch_moves_on(repo)
+        git(repo, "fetch", "-q", "origin")
+        assert run_helper("union_merge_lines.py", *_verifier_args(repo)).returncode == 0
+        assert run_helper("restore_dropped_sections.py", *_verifier_args(repo)).returncode == 0
+        assert (worktree / REGISTER).read_text() == REPAIRED
+
+        proc = run(VERIFY_CONTRIBUTIONS, *_verifier_args(repo))
+        assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+        a_merged = _sha(repo, "consolidation~1^2")  # claude/a was merged first, then claude/b
+        gate = (
+            "    (placement) merge-set gate: skipped 1 branch(es) that consolidation did not"
+            " merge (left out with --exclude-ref, or pushed after the survey)\n"
+            "    (placement) merge-set gate: origin/claude/a moved on after consolidation merged"
+            f" it; reading the merged commit {a_merged[:12]}, not its tip"
+            f" {_sha(repo, 'origin/claude/a')[:12]}\n"
+        )
+        assert proc.stdout == gate + VERIFIER_OK
+
+
+NAGY = "`Nagy_2017_x.R` (quartiles -- [BLQ, 3.02], (4.87, 8.56] log10 CFU)"
+TRICKY_REGISTER = f"""\
+# Covariate columns
+
+## Body size
+
+### WT (**canonical for body weight**)
+
+- **Example models:** {NAGY}.............
+- **Notes:** A "(" that never closes, as three real annotations have.
+
+### HT (**canonical for height**)
+
+- **Example models:**
+  - `H_2020_h.R` (listed one per line).
+
+### BMI (**canonical for body-mass index**)
+
+- **Example models:** `B_2021_b.R` (b); `D_2021_d.R` (d). Reproduce it with `B_2021_b.R`.
+"""
+
+
+class TestUnionIsIdempotent:
+    """R3: re-emitting a line the union adds nothing to must leave it byte for byte.
+
+    The emitter used to rebuild every line as ", ".join(entries) + ".". Where
+    an annotation opens a "(" it never closes, the parse ran to the end of the
+    line, so the annotation took the final full stop and one more was appended:
+    one per round, until three lines of nlmixr2lib's register ended in 13 or
+    more. It also turned "; " into ", " and dropped prose after the last entry.
+    """
+
+    u = load_helper("union_merge_lines")
+
+    @pytest.mark.parametrize(
+        ("body", "entries", "tail"),
+        [
+            (
+                f"{NAGY}.............",
+                [("Nagy_2017_x.R", NAGY.split(" ", 1)[1])],
+                ".............",
+            ),
+            (
+                "`P_1998_p.R` (effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4)."
+                " The CL effect (oral only (paper p. 3)......................",
+                [
+                    (
+                        "P_1998_p.R",
+                        "(effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4). The CL"
+                        " effect (oral only (paper p. 3)",
+                    )
+                ],
+                "......................",
+            ),
+            (
+                "`A.R` (a), `B.R`, `C.R` (c (nested) note). Prose after the list.",
+                [("A.R", "(a)"), ("B.R", ""), ("C.R", "(c (nested) note)")],
+                ". Prose after the list.",
+            ),
+            ("`A.R` (a)", [("A.R", "(a)")], ""),
+        ],
+        ids=["unclosed-then-stops", "unclosed-never-closed", "prose-after", "no-final-stop"],
+    )
+    def test_the_entries_and_what_follows_them_rebuild_the_body(
+        self, body: str, entries: list[tuple[str, str]], tail: str
+    ) -> None:
+        """The text after the last entry is kept, not replaced by one full stop."""
+        assert self.u.split_example_body(body) == (entries, tail)
+        rebuilt = ", ".join(f"`{f}` {a}" if a else f"`{f}`" for f, a in entries) + tail
+        assert rebuilt == body
+
+    def test_an_unclosed_annotation_stops_before_the_final_stops_and_the_next_entry(
+        self,
+    ) -> None:
+        assert self.u.split_example_body(f"{NAGY}.............") == (
+            [("Nagy_2017_x.R", NAGY.split(" ", 1)[1])],
+            ".............",
+        )
+        assert self.u.split_example_body("`A.R` (a (b] c)..., `B.R` (b).") == (
+            [("A.R", "(a (b] c)..."), ("B.R", "(b)")],
+            ".",
+        )
+
+    def test_a_run_with_nothing_to_add_changes_no_byte(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The merged branch touched the file, so every line went through the emitter."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: TRICKY_REGISTER})
+        push_task_branch(
+            repo,
+            "claude/age",
+            {REGISTER: TRICKY_REGISTER + "\n### AGE (**canonical for age**)\n"},
+            "Register AGE",
+        )
+        wt = consolidate(repo, ["origin/claude/age"], CONSOLIDATION)
+        before = (wt / REGISTER).read_bytes()
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert (proc.returncode, proc.stdout) == (0, "")
+        assert proc.stderr.endswith(f"# nothing to add; left unchanged: {wt / REGISTER}\n")
+        assert (wt / REGISTER).read_bytes() == before
+
+    def test_running_twice_is_running_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two branches add to the line with the unclosed annotation; -X theirs keeps one."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: TRICKY_REGISTER})
+        dots = f"{NAGY}............."
+        for name, entry in (("p", "`P_2020_p.R` (p)"), ("q", "`Q_2021_q.R` (q)")):
+            text = TRICKY_REGISTER.replace(dots, f"{dots}, {entry}")
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Add {name}")
+        wt = consolidate(repo, ["origin/claude/p", "origin/claude/q"], CONSOLIDATION)
+        assert "P_2020_p.R" not in (wt / REGISTER).read_text(), "the fixture lost nothing"
+
+        first = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert first.returncode == 0, first.stderr
+        once = (wt / REGISTER).read_bytes()
+        assert once.decode() == TRICKY_REGISTER.replace(
+            dots, f"{dots}, `Q_2021_q.R` (q), `P_2020_p.R` (p)"
+        )
+        second = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert second.returncode == 0, second.stderr
+        assert second.stderr.endswith(f"# nothing to add; left unchanged: {wt / REGISTER}\n")
+        assert (wt / REGISTER).read_bytes() == once
 
 
 class TestDedupCanonicalHeaders:
@@ -991,7 +1315,7 @@ class TestDedupCanonicalHeaders:
         register = tmp_path / "compartment-names.md"
         register.write_text(self.DUPLICATED)
 
-        proc = _python("dedup_canonical_headers.py", "--check", register)
+        proc = run_helper("dedup_canonical_headers.py", "--check", register)
         assert (proc.returncode, proc.stdout) == (1, "")
         assert proc.stderr == (
             f"# DUPLICATE canonical headers (per-##-section) in {register}: 1\n"
@@ -999,7 +1323,7 @@ class TestDedupCanonicalHeaders:
         )
         assert register.read_text() == self.DUPLICATED, "--check must not edit"
 
-        proc = _python("dedup_canonical_headers.py", register)
+        proc = run_helper("dedup_canonical_headers.py", register)
         assert (proc.returncode, proc.stderr) == (0, "")
         assert proc.stdout == (
             f"deduped 1 canonical name(s) in {register}:\n"
@@ -1007,7 +1331,7 @@ class TestDedupCanonicalHeaders:
         )
         assert register.read_text() == self.DEDUPED
 
-        proc = _python("dedup_canonical_headers.py", "--check", register)
+        proc = run_helper("dedup_canonical_headers.py", "--check", register)
         assert (proc.returncode, proc.stdout) == (0, "")
         assert proc.stderr == f"# clean (no per-##-section duplicate canonicals): {register}\n"
 
@@ -1015,7 +1339,7 @@ class TestDedupCanonicalHeaders:
         """The covariate register's scope: one canonical, one block, file-wide."""
         register = tmp_path / "covariate-columns.md"
         register.write_text(self.DEDUPED)
-        proc = _python("dedup_canonical_headers.py", "--global", "--check", register)
+        proc = run_helper("dedup_canonical_headers.py", "--global", "--check", register)
         assert (proc.returncode, proc.stdout) == (1, "")
         assert proc.stderr == (
             f"# DUPLICATE canonical headers (whole-file) in {register}: 1\n"
@@ -1031,7 +1355,7 @@ class TestDedupCanonicalHeaders:
         register.write_text(self.DUPLICATED)
         missing = tmp_path / "no-such.md"
         flags = ["--check"] if check else []
-        proc = _python("dedup_canonical_headers.py", *flags, register, missing)
+        proc = run_helper("dedup_canonical_headers.py", *flags, register, missing)
         assert (proc.returncode, proc.stdout) == (2, "")
         assert proc.stderr == f"ERROR: (dedup) no such file: {missing}\n"
         assert register.read_text() == self.DUPLICATED
@@ -1050,7 +1374,7 @@ class TestVerifyVignettesParallel:
     @pytest.fixture
     def rscript_with_callr(self, rscript: str) -> str:
         """Rscript, when it can load callr: the script loads callr before anything else."""
-        probe = _run(
+        probe = run(
             rscript,
             "-e",
             'quit(status = if (requireNamespace("callr", quietly = TRUE)) 0L else 1L)',
@@ -1060,13 +1384,13 @@ class TestVerifyVignettesParallel:
         return rscript
 
     def test_parses(self, rscript: str) -> None:
-        proc = _run(rscript, "-e", "invisible(parse(file = commandArgs(TRUE)[1]))", VIGNETTES_R)
+        proc = run(rscript, "-e", "invisible(parse(file = commandArgs(TRUE)[1]))", VIGNETTES_R)
         assert (proc.returncode, proc.stderr) == (0, "")
 
     def test_no_vignettes_is_a_clean_pass(self, rscript_with_callr: str, tmp_path: Path) -> None:
         """--skip-install keeps it off the network; no results file is written."""
         results = tmp_path / "results.jsonl"
-        proc = _run(
+        proc = run(
             rscript_with_callr,
             VIGNETTES_R,
             "--worktree",
@@ -1086,7 +1410,7 @@ class TestVerifyVignettesParallel:
         self, rscript_with_callr: str, tmp_path: Path
     ) -> None:
         """A typo in --only must not look like a pass."""
-        proc = _run(
+        proc = run(
             rscript_with_callr,
             VIGNETTES_R,
             "--worktree",
