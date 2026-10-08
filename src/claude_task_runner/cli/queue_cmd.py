@@ -766,6 +766,23 @@ def _supervisor_is_alive(queue_dir: Path) -> bool:
     return pid is not None and pidfile_mod.is_pid_alive(pid)
 
 
+# Statuses in which no worker owns the task, so its state file is safe to
+# rewrite. A live worker (``running``, ``possibly_hung``) rewrites the whole
+# file, session fields included, when it finishes. An allow-list, so a new
+# status is refused until it is classified.
+_RESTART_FRESH_ALLOWED = frozenset(
+    {
+        "pending",
+        "awaiting_sidecar",
+        "deferred",
+        "completed",
+        "failed",
+        "failed_circuit_breaker",
+        "weekly_paused",
+    }
+)
+
+
 @app.command("restart-fresh")
 def restart_fresh(
     task_id: str = typer.Argument(..., help="Task id whose session to abandon."),
@@ -788,9 +805,12 @@ def restart_fresh(
     fresh session, and continues from the original task prompt
     (cached context is lost — that's the trade-off).
 
-    Exits non-zero if the task has no state YAML or the YAML cannot be
-    parsed. Idempotent: a task without a session_id is left unchanged
-    (the command reports ``noop=True`` so scripts can branch).
+    Exits non-zero if the task has no state YAML, the YAML cannot be
+    parsed, or the task is ``running`` or ``possibly_hung``: its worker
+    may still be alive, and it writes its own state, session included,
+    when it finishes, which would undo the change. Idempotent: a task
+    without a session_id is left unchanged (the command reports
+    ``noop=True`` so scripts can branch).
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -811,6 +831,19 @@ def restart_fresh(
         else:
             console.print(f"[bold red]{msg}[/]")
         raise typer.Exit(code=2) from exc
+
+    if state.status not in _RESTART_FRESH_ALLOWED:
+        msg = (
+            f"task {task_id!r} is {state.status}: its worker may still be running and "
+            "would write its session back when it finishes. Wait for it to finish "
+            "(`supervisor drain` waits for running tasks) or SIGTERM its pid, then "
+            "re-run restart-fresh."
+        )
+        if json:
+            print(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2)
 
     if state.session_id is None and state.session_account is None:
         if json:

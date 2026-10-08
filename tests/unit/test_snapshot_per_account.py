@@ -225,6 +225,57 @@ def test_paused_account_shows_yes_marker(tmp_path: Path, snapshot_script: Path) 
     assert "| personal | `idle` | 0% | 0% | yes |" in out
 
 
+def _one_idle_account(paused: bool) -> dict:
+    return _v3_accounts_payload(
+        accounts={
+            "personal": {
+                "state": "idle",
+                "since": "2026-06-09T10:00:00+00:00",
+                "last_5h_util_pct": 0,
+                "last_weekly_util_pct": 0,
+                "paused": paused,
+                "consecutive_clean_polls": 0,
+                "last_drift_message": "",
+            },
+        },
+    )
+
+
+def test_paused_column_follows_the_pause_marker(tmp_path: Path, snapshot_script: Path) -> None:
+    """A pause made since the supervisor's last tick is not in supervisor.json yet."""
+    queue = _make_queue(tmp_path)
+    _seed_supervisor_json(queue, _one_idle_account(paused=False))
+    markers = queue / ".claude_task_runner" / "account_paused"
+    markers.mkdir()
+    (markers / "personal").touch()
+    out = _run_snapshot(snapshot_script, queue)
+    assert "| personal | `idle` | 0% | 0% | yes |" in out
+
+
+def test_resumed_account_is_not_shown_paused_from_supervisor_json(
+    tmp_path: Path, snapshot_script: Path
+) -> None:
+    """supervisor.json keeps the old flag until the supervisor's next tick."""
+    queue = _make_queue(tmp_path)
+    _seed_supervisor_json(queue, _one_idle_account(paused=True))
+    markers = queue / ".claude_task_runner" / "account_paused"
+    markers.mkdir()
+    (markers / ".adopted").touch()
+    out = _run_snapshot(snapshot_script, queue)
+    assert "| personal | `idle` | 0% | 0% |  |" in out
+
+
+def test_unreadable_marker_directory_falls_back_with_a_note(
+    tmp_path: Path, snapshot_script: Path
+) -> None:
+    queue = _make_queue(tmp_path)
+    _seed_supervisor_json(queue, _one_idle_account(paused=True))
+    (queue / ".claude_task_runner" / "account_paused").write_text("x", encoding="utf-8")
+    out = _run_snapshot(snapshot_script, queue)
+    assert "| personal | `idle` | 0% | 0% | yes |" in out
+    assert "paused shows supervisor.json's copy" in out
+
+
 # ---------------------------------------------------------------------------
 # Drift surfacing
 # ---------------------------------------------------------------------------

@@ -5,24 +5,25 @@ Subcommands:
 * ``account list``   — show resolved accounts (queue-side decl + per-
   account policy) plus current per-account state (5h util, weekly util,
   in-flight count, paused?).
-* ``account pause``  — set ``paused=true`` on an account's
-  :class:`AccountState`; the dispatcher skips it until ``resume``.
-* ``account resume`` — clear ``paused``.
+* ``account pause``  — create the account's pause marker; the dispatcher
+  skips the account until ``resume``.
+* ``account resume`` — remove the marker.
 
 Skills do not import schemas directly; they invoke
 ``account list --json`` and parse the output.
 
-Pause / resume mutate ``supervisor.json``. When the supervisor is
-running it picks up the change on its next tick (no signal needed —
-the state file is the source of truth). When the supervisor is not
-running the operator can still flip the flag and the next start
-honours it.
+Pause / resume write only the marker files in
+``<queue>/.claude_task_runner/account_paused/``
+(:mod:`claude_task_runner.supervisor.account_pause`), never
+``supervisor.json``, which a running supervisor rewrites from memory every
+tick. The supervisor reads the markers every tick, before it dispatches, so
+a change reaches a running supervisor within one tick and a stopped one
+when it starts.
 """
 
 from __future__ import annotations
 
 import json as _json
-from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -36,11 +37,11 @@ from claude_task_runner.cli._helpers import (
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import account_cap, account_in_flight_count
+from claude_task_runner.supervisor import account_pause
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.states import (
     AccountState,
     SupervisorSnapshot,
-    SupervisorState,
 )
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
@@ -55,8 +56,14 @@ def _snapshot(settings: Settings, queue_dir: Path) -> SupervisorSnapshot | None:
 def _account_row(
     acct: ResolvedAccount,
     snapshot: SupervisorSnapshot | None,
+    paused: frozenset[str],
 ) -> dict[str, object]:
-    """One row in ``account list``: decl + policy + observed state."""
+    """One row in ``account list``: decl + policy + observed state.
+
+    ``paused`` is the set of names with a pause marker. It is read
+    directly rather than from ``snapshot``, whose copy of the flag lags
+    a pause or resume until the supervisor's next tick.
+    """
     state: AccountState | None = None
     in_flight_count = 0
     if snapshot is not None:
@@ -88,7 +95,7 @@ def _account_row(
             "timezone": dp.timezone,
         },
         "state": state.state.value if state is not None else None,
-        "paused": state.paused if state is not None else False,
+        "paused": acct.name in paused,
         "last_5h_util_pct": state.last_5h_util_pct if state is not None else None,
         "last_weekly_util_pct": state.last_weekly_util_pct if state is not None else None,
         "in_flight_count": in_flight_count,
@@ -123,8 +130,17 @@ def list_accounts(
     settings = load_settings(resolve_per_queue_config(config, qd))
     accounts = resolve_accounts(settings)
     snapshot = _snapshot(settings, qd)
+    try:
+        paused = account_pause.paused_names(qd)
+    except OSError as exc:
+        msg = f"cannot read the account pause markers in {account_pause.pause_dir(qd)}: {exc}"
+        if json:
+            print(_json.dumps({"error": msg}))
+        else:
+            console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2) from exc
 
-    rows = [_account_row(a, snapshot) for a in accounts]
+    rows = [_account_row(a, snapshot, paused) for a in accounts]
 
     if json:
         print(_json.dumps({"accounts": rows}, default=str, indent=2))
@@ -139,11 +155,11 @@ def list_accounts(
     # keeps the type-checker happy and avoids object-indexing dances.
     for acct, row in zip(accounts, rows, strict=True):
         state_obj = snapshot.accounts.get(acct.name) if snapshot is not None else None
-        paused = " [yellow](paused)[/]" if state_obj is not None and state_obj.paused else ""
+        paused_tag = " [yellow](paused)[/]" if row["paused"] else ""
         state_str = state_obj.state.value if state_obj is not None else "—"
         util_5h_s = f"{state_obj.last_5h_util_pct}%" if state_obj is not None else "—"
         util_w_s = f"{state_obj.last_weekly_util_pct}%" if state_obj is not None else "—"
-        console.print(f"[bold]{acct.name}[/]{paused}")
+        console.print(f"[bold]{acct.name}[/]{paused_tag}")
         console.print(f"  config_dir:      {acct.config_dir or '(default ~/.claude)'}")
         if acct.linux_user:
             console.print(f"  linux_user:      {acct.linux_user}")
@@ -173,37 +189,24 @@ def _update_paused(
     *,
     paused: bool,
 ) -> tuple[bool, str]:
-    """Persist a paused/unpaused change for ``name``.
+    """Create (pause) or remove (resume) ``name``'s pause marker.
 
-    Returns (changed, message). ``changed`` is False when the account
-    state already had the requested value (idempotent pause/resume).
-    Raises ``typer.BadParameter`` when ``name`` isn't configured.
+    Returns (changed, message). ``changed`` is False when the marker was
+    already in the requested state (idempotent pause/resume).
+    Raises ``typer.BadParameter`` when ``name`` isn't configured, except
+    that a resume still removes the marker of an account taken out of
+    ``[[accounts]]``, which would otherwise pause it again if re-added.
     """
     if not any(a.name == name for a in settings.accounts):
+        if not paused and name in account_pause.paused_names(queue_dir):
+            account_pause.set_paused(queue_dir, name, paused=False)
+            return True, f"removed the pause marker of {name!r}, which is not in [[accounts]]"
         raise typer.BadParameter(
             f"account {name!r} not in [[accounts]]; configured: "
             + ", ".join(a.name for a in settings.accounts)
         )
-    state_path = persist_mod.supervisor_state_path(queue_dir, settings.supervisor.state_file)
-    snapshot = persist_mod.load(state_path)
-    if snapshot is None:
-        # No snapshot yet (supervisor never started here): seed one
-        # with the requested account paused. Next start picks it up.
-        snapshot = persist_mod.initial_snapshot(
-            since=datetime.now(UTC),
-            account_names=[a.name for a in settings.accounts],
-        )
-    current = snapshot.accounts.get(name)
-    if current is None:
-        # Account configured but no state row: synthesize one that, like a
-        # freshly seeded account, takes no tasks until it is read.
-        current = AccountState(state=SupervisorState.NO_READING, since=datetime.now(UTC))
-    if current.paused == paused:
+    if not account_pause.set_paused(queue_dir, name, paused=paused):
         return False, f"account {name!r} already paused={paused!r}"
-    new_state = current.model_copy(update={"paused": paused})
-    new_accounts = {**snapshot.accounts, name: new_state}
-    new_snapshot = snapshot.model_copy(update={"accounts": new_accounts})
-    persist_mod.write_atomic(new_snapshot, state_path)
     return True, f"account {name!r} paused={paused!r}"
 
 
@@ -221,9 +224,11 @@ def pause_account(
 ) -> None:
     """Skip ``name`` from dispatch until ``account resume <name>``.
 
-    The dispatcher consults the paused flag on the next tick; in-flight
-    tasks already running against the account are NOT killed (the
-    operator can use ``queue states`` and SIGTERM if needed).
+    Creates the account's pause marker. A running supervisor stops
+    dispatching new tasks to the account within one tick, and a stopped
+    one from its next start. Tasks already running on the account are NOT
+    killed (use ``queue states`` and SIGTERM if needed), and
+    ``queue force-dispatch`` still dispatches to a paused account.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)

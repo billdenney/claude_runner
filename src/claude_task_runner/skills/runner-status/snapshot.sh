@@ -109,7 +109,9 @@ echo ""
 # Source the v3 supervisor.json's `accounts` map (one entry per
 # configured [[accounts]] block, populated by the multi-account
 # /usage capture round-robin from PR 8). Reports each account's
-# state, 5h util, weekly util, paused flag, per-account in-flight
+# state, 5h util, weekly util, paused (from the account_paused/
+# markers, which supervisor.json's copy trails by up to a tick; from
+# supervisor.json on a queue that has no such directory yet), per-account in-flight
 # count (derived from supervisor.json `in_flight` records'
 # `account` attribution), the throttle target that caps it
 # (`target_concurrency`: the ADR-0022 ramp while slowing_down; "—"
@@ -125,13 +127,27 @@ echo ""
 # Either way, we soft-fail with a marker line so the rest of the
 # script's epilogue (if any future sections are added) continues.
 if [[ -f "$SUP_JSON" ]]; then
-python3 - "$SUP_JSON" <<'PY'
+python3 - "$SUP_JSON" "$QUEUE/.claude_task_runner/account_paused" <<'PY'
 import json
+import os
 import sys
 from collections import Counter
 
 with open(sys.argv[1]) as f:
     d = json.load(f)
+# Pause markers are the source of truth; None means "use supervisor.json".
+pause_dir = sys.argv[2]
+pause_note = ""
+try:
+    markers = {
+        n for n in os.listdir(pause_dir)
+        if not n.startswith(".") and os.path.isfile(os.path.join(pause_dir, n))
+    }
+except FileNotFoundError:
+    markers = None
+except OSError as exc:
+    markers = None
+    pause_note = f"_paused shows supervisor.json's copy: cannot read {pause_dir}: {exc}_"
 schema_version = d.get("schema_version")
 accounts = d.get("accounts") or {}
 if not accounts:
@@ -160,7 +176,8 @@ print(
 print("|---|---|---:|---:|:-:|---:|---:|---|---|---|---|")
 for name in sorted(accounts):
     a = accounts[name]
-    paused = "yes" if a.get("paused") else ""
+    is_paused = (name in markers) if markers is not None else a.get("paused")
+    paused = "yes" if is_paused else ""
     last_cap = a.get("last_capture_at") or "—"
     wakeup = a.get("scheduled_wakeup_at") or "—"
     target = a.get("target_concurrency")
@@ -176,6 +193,9 @@ for name in sorted(accounts):
         f"| {wakeup} "
         f"| {last_cap} |"
     )
+if pause_note:
+    print()
+    print(pause_note)
 # Surface any per-account drift message separately — the table
 # would get unreadable if drift strings (often long, embedded
 # pipes) were inlined as a column. Empty-string drift means
