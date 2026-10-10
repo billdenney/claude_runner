@@ -199,3 +199,86 @@ def test_an_inherited_bullet_main_reworded_is_not_brought_back(
         "# dropping 1 bullet(s) that are neither on origin/main nor added by a merged branch:\n"
         "#   - Add Base 2000 x model.\n"
     ) in proc.stdout
+
+
+REWORD_BASE = (
+    "# development version\n\n"
+    "- Add Base 2000 x model.\n\n"
+    "- Add Old 1999 y model (doi:10.1000/wrong).\n\n"
+    "- Add Gone 1998 z model.\n"
+)
+
+
+def _reword_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, main_too: bool = False
+) -> tuple[Path, Path]:
+    """A branch that corrects one inherited bullet and deletes another, and a
+    branch that adds a model; optionally main rewords the corrected bullet too."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": REWORD_BASE})
+    fixed = (
+        REWORD_BASE.replace("doi:10.1000/wrong", "doi:10.1000/right")
+        .replace("- Add Gone 1998 z model.\n", "")
+        .rstrip("\n")
+        + "\n"
+    )
+    push_task_branch(repo, "claude/fix", {"NEWS.md": fixed}, "Correct the Old 1999 DOI")
+    # Inserted right above the bullet claude/fix corrects, so the two hunks
+    # conflict and -X theirs brings the old wording back, as on 2026-10-10.
+    added = REWORD_BASE.replace("- Add Old", "- Add New 2024 w model.\n\n- Add Old")
+    push_task_branch(repo, "claude/new", {"NEWS.md": added}, "Add New 2024")
+    if main_too:
+        update_main(
+            repo,
+            {"NEWS.md": REWORD_BASE.replace("doi:10.1000/wrong", "doi:10.1000/mains")},
+            "main rewords Old 1999",
+        )
+    wt = consolidate(repo, ["origin/claude/fix", "origin/claude/new"], "news")
+    return repo, wt
+
+
+def test_a_bullet_a_branch_reworded_is_rewritten_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading only additions kept both wordings: the base's old one in place
+    and the branch's new one at the top (seven such duplicates on 2026-10-10).
+    The branch's rewording now replaces the old bullet where it stands, and a
+    bullet it deleted is gone."""
+    repo, wt = _reword_world(tmp_path, monkeypatch)
+    assert "doi:10.1000/wrong" in (wt / "NEWS.md").read_text(), "the fixture did not reproduce it"
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news")
+    assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+    assert (wt / "NEWS.md").read_text() == (
+        "# development version\n\n"
+        "- Add New 2024 w model.\n\n"
+        "- Add Base 2000 x model.\n\n"
+        "- Add Old 1999 y model (doi:10.1000/right).\n"
+    )
+    assert (
+        "#   reworded by a merged branch: - Add Old 1999 y model (doi:10.1000/wrong)."
+        in proc.stdout
+    )
+    assert "#   deleted by a merged branch: - Add Gone 1998 z model." in proc.stdout
+    # Idempotent: a second run changes nothing.
+    again = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news", "--check")
+    assert again.returncode == 0, again.stdout
+
+
+def test_a_rewording_of_a_bullet_main_also_changed_is_added_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main rewrote the same bullet after the branch forked, so the base has
+    neither wording the branch saw. The base's wording stays, the branch's is
+    added at the top, and the run names it for review."""
+    repo, wt = _reword_world(tmp_path, monkeypatch, main_too=True)
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news")
+    assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+    news = (wt / "NEWS.md").read_text()
+    assert "- Add Old 1999 y model (doi:10.1000/mains)." in news
+    assert news.index("- Add Old 1999 y model (doi:10.1000/right).") < news.index(
+        "- Add Base 2000 x model."
+    )
+    assert (
+        "# NOTE: origin/claude/fix rewords a bullet origin/main no longer has; its new wording"
+        " is added at the top, check it against the base's own:"
+        " - Add Old 1999 y model (doi:10.1000/right)."
+    ) in proc.stdout

@@ -37,6 +37,15 @@ dropped bullets whose file stem does not spell the author and year the same
 way: a lettered year (Chen_2021a_tacrolimus.R) or a surname particle ("Le
 Marouille", Marouille_2021_palbociclib.R).
 
+A branch can also reword or delete a bullet it inherited (correcting a DOI in
+an earlier "Add ..." entry, say). Its fork and merged copies are aligned, so a
+bullet it replaced is rewritten in place in the base's history and one it
+deleted is removed. Reading only additions kept both wordings: the base's old
+one in place and the branch's new one at the top (seven such duplicates on the
+2026-10-10 merge). When the base no longer has the old wording either, main
+changed that bullet too; the branch's wording is then added at the top and
+named, so the possible duplicate is reviewed.
+
 Idempotent: a bullet already present is not added twice.
 
 Usage:
@@ -53,6 +62,7 @@ crash.
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import sys
 import traceback
@@ -71,24 +81,30 @@ DEV_HEADING = re.compile(r"^#\s+development version", re.I)
 BULLET = ("- ", "* ")
 
 
+def bullet_spans(lines: list[str]) -> list[tuple[int, int]]:
+    """(first, end) line indices of each bullet block: a `- ` / `* ` line plus
+    any wrapped continuation lines; `end` is exclusive."""
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.startswith(BULLET):
+            if start is not None:
+                spans.append((start, i))
+            start = i
+        elif start is not None and line.startswith(("  ", "\t")) and line.strip():
+            continue
+        elif start is not None:
+            spans.append((start, i))
+            start = None
+    if start is not None:
+        spans.append((start, len(lines)))
+    return spans
+
+
 def bullets(text: str) -> list[str]:
     """Bullet blocks: a `- ` / `* ` line plus any wrapped continuation lines."""
-    blocks: list[str] = []
-    cur: list[str] = []
-    for line in text.splitlines():
-        if line.startswith(BULLET):
-            if cur:
-                blocks.append("\n".join(cur).rstrip())
-            cur = [line]
-        elif cur and line.startswith(("  ", "\t")) and line.strip():
-            cur.append(line)
-        else:
-            if cur:
-                blocks.append("\n".join(cur).rstrip())
-                cur = []
-    if cur:
-        blocks.append("\n".join(cur).rstrip())
-    return blocks
+    lines = text.splitlines()
+    return ["\n".join(lines[a:b]).rstrip() for a, b in bullet_spans(lines)]
 
 
 def key(block: str) -> str:
@@ -103,13 +119,39 @@ def fail(message: str) -> int:
     return 2
 
 
-def added_by(repo: Path, member: merge_set.Member, file_rel: str) -> list[str]:
-    """The bullets ``member`` added: in its merged copy, not at its fork point."""
+def changes_by(
+    repo: Path, member: merge_set.Member, file_rel: str
+) -> tuple[list[str], list[tuple[str, str | None]]]:
+    """What ``member`` did to the bullets it inherited at its fork point.
+
+    Returns (added, rewrites). ``added`` is every bullet in its merged copy that
+    the fork point lacks, as before. ``rewrites`` pairs each fork-point bullet
+    the merged copy lacks with the bullet that took its place, or None when the
+    branch deleted it outright: the two copies are aligned bullet by bullet, and
+    a replaced stretch pairs its old and new bullets in order.
+    """
     merged = merge_set.read_file(repo, member.merged, file_rel)
     if merged is None:
-        return []
-    inherited = {key(b) for b in bullets(merge_set.read_file(repo, member.fork, file_rel) or "")}
-    return [b for b in bullets(merged) if key(b) not in inherited]
+        return [], []
+    old = bullets(merge_set.read_file(repo, member.fork, file_rel) or "")
+    new = bullets(merged)
+    old_keys = {key(b) for b in old}
+    added = [b for b in new if key(b) not in old_keys]
+    rewrites: list[tuple[str, str | None]] = []
+    matcher = difflib.SequenceMatcher(
+        None, [key(b) for b in old], [key(b) for b in new], autojunk=False
+    )
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "delete"):
+            for k in range(i1, i2):
+                j = j1 + (k - i1)
+                rewrites.append((old[k], new[j] if tag == "replace" and j < j2 else None))
+    return added, rewrites
+
+
+def added_by(repo: Path, member: merge_set.Member, file_rel: str) -> list[str]:
+    """The bullets ``member`` added: in its merged copy, not at its fork point."""
+    return changes_by(repo, member, file_rel)[0]
 
 
 def main() -> int:
@@ -159,25 +201,68 @@ def main() -> int:
     if not found.members:
         return fail(merge_set.empty_message(args.pattern, args.branch, args.base))
 
+    # Base bullets a merged branch reworded (old key -> new block) or deleted
+    # (old key -> None). The first branch to touch a bullet wins; a second that
+    # disagrees is named.
+    in_place: dict[str, str | None] = {}
+    replacements: set[str] = set()
+    notes: list[str] = []
     added: list[str] = []
-    seen = set(base_keys)
     for member in found.members:
-        for b in added_by(repo, member, args.file):
-            k = key(b)
-            if k not in seen:
-                seen.add(k)
-                added.append(b)
+        branch_added, rewrites = changes_by(repo, member, args.file)
+        for old, new in rewrites:
+            k_old = key(old)
+            if k_old not in base_keys:
+                if new is not None:
+                    notes.append(
+                        f"{member.ref} rewords a bullet {args.base} no longer has; its new wording"
+                        f" is added at the top, check it against the base's own: {new.splitlines()[0]}"
+                    )
+                continue
+            if k_old in in_place:
+                prev = in_place[k_old]
+                if (prev is None) != (new is None) or (prev and new and key(prev) != key(new)):
+                    notes.append(
+                        f"{member.ref} also changes a bullet another merged branch changed; the"
+                        f" first change is kept: {old.splitlines()[0]}"
+                    )
+                continue
+            in_place[k_old] = new
+            if new is not None:
+                replacements.add(key(new))
+        for b in branch_added:
+            added.append(b)
+
+    seen = set(base_keys) | replacements
+    top: list[str] = []
+    for b in added:
+        k = key(b)
+        if k not in seen:
+            seen.add(k)
+            top.append(b)
+    added = top
 
     current = bullets(target.read_text(encoding="utf-8"))
     current_keys = {key(b) for b in current}
-    lost_from_base = [b for b in bullets(base_text) if key(b) not in current_keys]
+    lost_from_base = [
+        b for b in bullets(base_text) if key(b) not in current_keys and key(b) not in in_place
+    ]
+    stale_in_place = [
+        b for b in bullets(base_text) if key(b) in in_place and key(b) in current_keys
+    ]
     missing_added = [b for b in added if key(b) not in current_keys]
+    missing_added += [
+        new for new in in_place.values() if new is not None and key(new) not in current_keys
+    ]
 
     print(f"# base bullets: {len(base_keys)}   branch-added: {len(added)}")
     print(f"# base bullets missing from the merge result: {len(lost_from_base)}")
     print(f"# branch bullets missing from the merge result: {len(missing_added)}")
+    print(f"# base bullets a merged branch reworded or deleted: {len(in_place)}")
+    for note in notes:
+        print(f"# NOTE: {note}")
 
-    if not lost_from_base and not missing_added:
+    if not lost_from_base and not missing_added and not stale_in_place:
         print("# NEWS.md already complete; nothing to do")
         return 0
     if args.check:
@@ -195,6 +280,25 @@ def main() -> int:
         for b in dropped:
             print(f"#   {b.splitlines()[0]}")
     lines = base_text.splitlines()
+    # Rewrite or delete, in place, the base bullets a merged branch changed.
+    # Bottom-up, so earlier spans keep their indices.
+    for first, end in reversed(bullet_spans(lines)):
+        k = key("\n".join(lines[first:end]))
+        if k not in in_place:
+            continue
+        replacement = in_place[k]
+        print(f"#   {'reworded' if replacement else 'deleted'} by a merged branch: {lines[first]}")
+        if replacement is None:
+            # Take a blank separator with it, so no double blank line is left.
+            if (
+                end < len(lines)
+                and not lines[end].strip()
+                and (first == 0 or not lines[first - 1].strip())
+            ):
+                end += 1
+            del lines[first:end]
+        else:
+            lines[first:end] = replacement.splitlines()
     for idx, line in enumerate(lines):
         if DEV_HEADING.match(line):
             insert_at = idx + 1

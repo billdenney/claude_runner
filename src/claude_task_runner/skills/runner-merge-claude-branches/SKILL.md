@@ -300,6 +300,15 @@ exists to repair. Repair, then regenerate.
    branches forked, in their old wording, beside the new. The rebuild now
    lists any bullet of the merge result it drops.
 
+   A branch can also reword or delete a bullet it inherited (the citation
+   corrections of 2026-10-10 rewrote seven "Add ..." entries). Reading only
+   additions kept both wordings: the base's old one in place, the branch's
+   new one at the top. Each branch's fork and merged copies are now aligned
+   bullet by bullet: a bullet it replaced is rewritten in place in the base's
+   history, one it deleted is removed, and both are named in the output.
+   When main had changed that bullet too, the branch's wording is added at
+   the top with a NOTE, so the possible duplicate gets reviewed.
+
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh`, which now applies THREE checks per
    branch, per register file:
