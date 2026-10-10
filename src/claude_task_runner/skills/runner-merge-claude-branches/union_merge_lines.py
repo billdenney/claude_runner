@@ -292,9 +292,20 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
                 )
                 continue
             fixes[filename] = annotation
+        # A removal counts only where the branch still has the heading: when
+        # its copy has no entries under it at all, the heading was renamed or
+        # the line rewritten, and its entries did not go anywhere.
+        my_buckets = {bucket for bucket, _ in mine}
         for entry, was in inherited.items():
-            if entry not in mine and base.get(entry) == was:
+            if entry in mine or base.get(entry) != was:
+                continue
+            if entry[0] in my_buckets:
                 union.removed.setdefault(entry[0], set()).add(entry[1])
+            else:
+                union.notes.append(
+                    f"# kept {_label(*entry)}: a merged branch has no entries under that"
+                    " heading (renamed or rewritten), so its absence is not a removal"
+                )
         # A removed entry the branch replaced where it stood (a rename) keeps
         # its place: align the bucket's names at the fork and in the branch.
         for bucket in {b for b, _ in inherited} & {b for b, _ in mine}:
@@ -328,6 +339,7 @@ def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
     out: list[str] = []
     left_alone: list[str] = []
     dropped: list[str] = []
+    emptied: list[str] = []
     for line, bucket in zip(lines, _sections(lines), strict=True):
         match = EXAMPLE_LINE_RE.match(line)
         known = union.annotations.get(bucket) if match else None
@@ -354,8 +366,13 @@ def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
         ordered += [
             name for name in union.order(bucket) if name not in ordered and name not in gone
         ]
+        if not ordered:
+            # Every entry was removed; "- **Example models:** ." helps no one.
+            emptied.append(" / ".join(part for part in bucket if part))
+            out.append(line)
+            continue
         notes = {
-            name: fixes.get(name) or _longer(own.get(name, ""), known.get(name, ""))
+            name: fixes[name] if name in fixes else _longer(own.get(name, ""), known.get(name, ""))
             for name in ordered
         }
         dropped.extend(_label(bucket, name) for name in own if name in gone)
@@ -371,6 +388,11 @@ def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
         report.append(
             f"# dropped {len(dropped)} entr{'y' if len(dropped) == 1 else 'ies'} a merged branch"
             f" removed: {'; '.join(dropped)}"
+        )
+    if emptied:
+        report.append(
+            f"# left {len(emptied)} Example-models line(s) as they are: merged branches removed"
+            f" every entry on them, so check them by hand: {'; '.join(emptied)}"
         )
     if left_alone:
         report.append(

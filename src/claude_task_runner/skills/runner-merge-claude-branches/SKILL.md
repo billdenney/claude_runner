@@ -189,7 +189,10 @@ exists to repair. Repair, then regenerate.
      when the base still has the wording the branch inherited. When main
      changed the entry too, the base's stands. Without this, a rename brought
      the old name back beside the new one, and a same-length correction
-     ("12 mg" to "21 mg") lost to the base under "longest wins".
+     ("12 mg" to "21 mg") lost to the base under "longest wins". A removal
+     counts only where the branch still has entries under that heading (a
+     renamed heading is not a removal of its entries), and a line every
+     entry of which was removed is left as it is and reported.
    - Rebuilds each Example-models line the union adds to: the line's own
      models first, then the branches' additions. The line keeps its prefix
      and the text after its last entry.
@@ -312,10 +315,16 @@ exists to repair. Repair, then regenerate.
    corrections of 2026-10-10 rewrote seven "Add ..." entries). Reading only
    additions kept both wordings: the base's old one in place, the branch's
    new one at the top. Each branch's fork and merged copies are now aligned
-   bullet by bullet: a bullet it replaced is rewritten in place in the base's
-   history, one it deleted is removed, and both are named in the output.
-   When main had changed that bullet too, the branch's wording is added at
-   the top with a NOTE, so the possible duplicate gets reviewed.
+   bullet by bullet. A bullet missing from the branch's copy is paired with
+   the most similar new bullet in the same stretch, which replaces it in
+   place in the base's history; one with no similar replacement was deleted
+   and is removed; both are named in the output. A bullet the branch only
+   moved is still in its copy and is left alone. When main had changed that
+   bullet too, the branch's wording is added at the top with a NOTE, so the
+   possible duplicate gets reviewed. A branch that deletes more than ten
+   inherited bullets, or a fifth of them, stops the run (exit 2, so
+   `merge_branches.sh` exits 5): that is a truncated file, not deliberate
+   deletions.
 
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh`, which now applies THREE checks per

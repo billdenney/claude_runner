@@ -38,9 +38,13 @@ way: a lettered year (Chen_2021a_tacrolimus.R) or a surname particle ("Le
 Marouille", Marouille_2021_palbociclib.R).
 
 A branch can also reword or delete a bullet it inherited (correcting a DOI in
-an earlier "Add ..." entry, say). Its fork and merged copies are aligned, so a
-bullet it replaced is rewritten in place in the base's history and one it
-deleted is removed. Reading only additions kept both wordings: the base's old
+an earlier "Add ..." entry, say). Its fork and merged copies are aligned: a
+bullet missing from its copy is paired with the most similar new bullet in the
+same stretch, which then replaces it in place in the base's history, and one
+with no similar replacement counts as deleted and is removed. A bullet it only
+moved is still in its copy and is left alone. A branch that deletes more than
+MAX_DELETIONS bullets, or a fifth of those it inherited, has most likely
+truncated the file, so the run stops instead. Reading only additions kept both wordings: the base's old
 one in place and the branch's new one at the top (seven such duplicates on the
 2026-10-10 merge). When the base no longer has the old wording either, main
 changed that bullet too; the branch's wording is then added at the top and
@@ -53,10 +57,11 @@ Usage:
         --pattern 'origin/claude/*' [--extra-ref REF ...] [--file NEWS.md] [--check]
 
 Exit codes: 0 done (or the file is not in the worktree); 1 with --check,
-bullets are missing; 2 it could not run: a bad argument, a --base, --branch or
---extra-ref that does not resolve, no worktree with --branch checked out, no
-branch matching --pattern, an empty merge set, an unreadable base file, or a
-crash.
+bullets are missing or a bullet a branch reworded still has its old wording;
+2 it could not run: a bad argument, a --base, --branch or --extra-ref that does
+not resolve, no worktree with --branch checked out, no branch matching
+--pattern, an empty merge set, an unreadable base file, a branch that deletes
+more bullets than MAX_DELETIONS allows, or a crash.
 """
 
 from __future__ import annotations
@@ -71,6 +76,12 @@ from pathlib import Path
 import merge_set
 
 DEV_HEADING = re.compile(r"^#\s+development version", re.I)
+# A branch deleting more inherited bullets than this (or than a fifth of them)
+# has most likely truncated or rewritten NEWS.md; applying it would erase history.
+MAX_DELETIONS = 10
+# How alike an old bullet and a new one must be (difflib ratio of their keys)
+# to count as the same entry reworded rather than one deleted and one added.
+REWORD_SIMILARITY = 0.6
 
 
 # NEWS.md files mix bullet markers -- this package's older entries use "* " and
@@ -119,23 +130,45 @@ def fail(message: str) -> int:
     return 2
 
 
+def _pair(gone: list[str], fresh: list[str]) -> list[tuple[str, str | None]]:
+    """Each removed bullet with the most similar unused new one, or None."""
+    pairs: list[tuple[str, str | None]] = []
+    used: set[int] = set()
+    for old in gone:
+        best, best_ratio = None, REWORD_SIMILARITY
+        for i, new in enumerate(fresh):
+            if i in used:
+                continue
+            ratio = difflib.SequenceMatcher(None, key(old), key(new), autojunk=False).ratio()
+            if ratio >= best_ratio:
+                best, best_ratio = i, ratio
+        if best is not None:
+            used.add(best)
+        pairs.append((old, fresh[best] if best is not None else None))
+    return pairs
+
+
 def changes_by(
     repo: Path, member: merge_set.Member, file_rel: str
-) -> tuple[list[str], list[tuple[str, str | None]]]:
+) -> tuple[list[str], list[tuple[str, str | None]], int]:
     """What ``member`` did to the bullets it inherited at its fork point.
 
-    Returns (added, rewrites). ``added`` is every bullet in its merged copy that
-    the fork point lacks, as before. ``rewrites`` pairs each fork-point bullet
-    the merged copy lacks with the bullet that took its place, or None when the
-    branch deleted it outright: the two copies are aligned bullet by bullet, and
-    a replaced stretch pairs its old and new bullets in order.
+    Returns (added, rewrites, inherited). ``added`` is every bullet in its
+    merged copy that the fork point lacks. ``rewrites`` pairs each fork-point
+    bullet the merged copy no longer has with the bullet that took its place,
+    or None when the branch deleted it: the two copies are aligned bullet by
+    bullet, and within each changed stretch a removed bullet is paired with
+    the most similar new one (see _pair). A bullet the branch only moved is
+    still in its copy and is not a rewrite. ``inherited`` counts the
+    fork-point bullets.
     """
     merged = merge_set.read_file(repo, member.merged, file_rel)
     if merged is None:
-        return [], []
+        return [], [], 0
     old = bullets(merge_set.read_file(repo, member.fork, file_rel) or "")
     new = bullets(merged)
     old_keys = {key(b) for b in old}
+    new_keys = {key(b) for b in new}
     added = [b for b in new if key(b) not in old_keys]
     rewrites: list[tuple[str, str | None]] = []
     matcher = difflib.SequenceMatcher(
@@ -143,15 +176,10 @@ def changes_by(
     )
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag in ("replace", "delete"):
-            for k in range(i1, i2):
-                j = j1 + (k - i1)
-                rewrites.append((old[k], new[j] if tag == "replace" and j < j2 else None))
-    return added, rewrites
-
-
-def added_by(repo: Path, member: merge_set.Member, file_rel: str) -> list[str]:
-    """The bullets ``member`` added: in its merged copy, not at its fork point."""
-    return changes_by(repo, member, file_rel)[0]
+            gone = [b for b in old[i1:i2] if key(b) not in new_keys]
+            fresh = [b for b in new[j1:j2] if key(b) not in old_keys] if tag == "replace" else []
+            rewrites.extend(_pair(gone, fresh))
+    return added, rewrites, len(old)
 
 
 def main() -> int:
@@ -209,11 +237,18 @@ def main() -> int:
     notes: list[str] = []
     added: list[str] = []
     for member in found.members:
-        branch_added, rewrites = changes_by(repo, member, args.file)
+        branch_added, rewrites, inherited = changes_by(repo, member, args.file)
+        deleted = sum(1 for _old, new in rewrites if new is None)
+        if deleted > max(MAX_DELETIONS, inherited // 5):
+            return fail(
+                f"{member.ref} deletes {deleted} of its {inherited} inherited bullets in {args.file};"
+                " that looks like a truncated or rewritten file, not deliberate deletions. Fix the"
+                " branch, leave it out with --exclude-ref, or merge its NEWS.md by hand."
+            )
         for old, new in rewrites:
             k_old = key(old)
             if k_old not in base_keys:
-                if new is not None:
+                if new is not None and key(new) not in base_keys:
                     notes.append(
                         f"{member.ref} rewords a bullet {args.base} no longer has; its new wording"
                         f" is added at the top, check it against the base's own: {new.splitlines()[0]}"
