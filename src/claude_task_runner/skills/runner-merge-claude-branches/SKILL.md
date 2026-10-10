@@ -182,6 +182,14 @@ exists to repair. Repair, then regenerate.
    - Buckets the entries by (covariate header, subsection) and unions them
      with the base's, keeping the most informative (longest) annotation per
      filename.
+   - Honours what a branch removed or corrected, not only what it added. An
+     entry the branch removed (a rename, a re-filing under another heading)
+     is dropped where the base still has it, and a renamed one keeps the old
+     one's place; an annotation the branch changed wins over the longest
+     when the base still has the wording the branch inherited. When main
+     changed the entry too, the base's stands. Without this, a rename brought
+     the old name back beside the new one, and a same-length correction
+     ("12 mg" to "21 mg") lost to the base under "longest wins".
    - Rebuilds each Example-models line the union adds to: the line's own
      models first, then the branches' additions. The line keeps its prefix
      and the text after its last entry.

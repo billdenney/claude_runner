@@ -29,7 +29,11 @@ This script repairs that loss after the merge:
    ones it added, or whose annotation it changed, relative to its fork
    point. An entry a branch only inherited is main's; main may have
    renamed or removed it since. The longest (most informative)
-   annotation per filename per bucket wins.
+   annotation per filename per bucket wins, except where a branch changed
+   an annotation the base still has as the branch inherited it: that
+   correction wins whatever its length. An entry a branch removed (a
+   rename, a re-filing under another heading) is dropped when the base
+   still has it, so the merge does not put the old name back.
 5. Walks the CURRENT (post-merge) file and re-emits each
    Example-models line the union adds to, keeping the line's own prefix
    and the text after its last entry. A line the union adds nothing to is
@@ -62,6 +66,7 @@ matching ``--pattern``, an empty merge set, or a failed git command.
 from __future__ import annotations
 
 import argparse
+import difflib
 import re
 import sys
 import traceback
@@ -190,6 +195,14 @@ class Union:
     """The longest annotation seen for each filename."""
     branch_order: dict[Bucket, list[str]] = field(default_factory=dict)
     base_order: dict[Bucket, list[str]] = field(default_factory=dict)
+    corrected: dict[Bucket, dict[str, str]] = field(default_factory=dict)
+    """Annotations a branch changed from the one it inherited, which the base
+    still has unchanged; these win over the longest."""
+    removed: dict[Bucket, set[str]] = field(default_factory=dict)
+    """Base entries a branch removed from the bucket."""
+    renamed: dict[Bucket, dict[str, str]] = field(default_factory=dict)
+    """A removed entry -> the entry the branch put in its place."""
+    notes: list[str] = field(default_factory=list)
 
     def order(self, bucket: Bucket) -> list[str]:
         """Filenames in the order the branches list them, then the base's."""
@@ -232,6 +245,10 @@ def _fold(
             listed.append(filename)
 
 
+def _label(bucket: Bucket, filename: str) -> str:
+    return " / ".join([part for part in bucket if part] + [filename])
+
+
 def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]) -> Union:
     """Fold the base and then what each branch changed into one :class:`Union`.
 
@@ -248,11 +265,49 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
     annotation is its model-specific note; longer non-empty annotations
     are strictly more informative. ``branch_copies`` is consumed one copy
     at a time, so a large register is never held once per branch.
+
+    A branch's removals and corrections count only where the base still has
+    what the branch inherited; when main changed the entry too, the branch's
+    view is stale and the base's stands. The first branch to correct an
+    entry wins; a second that disagrees is noted.
     """
     union = Union()
+    base = entry_map(base_text)
     _fold(base_text, union, union.base_order)
+    kept_by_branch: set[tuple[Bucket, str]] = set()
     for text, inherited in branch_copies:
         _fold(text, union, union.branch_order, inherited)
+        mine = entry_map(text)
+        kept_by_branch.update(k for k in mine if k not in inherited)
+        for entry, annotation in mine.items():
+            was = inherited.get(entry)
+            if was is None or was == annotation or base.get(entry) != was:
+                continue
+            bucket, filename = entry
+            fixes = union.corrected.setdefault(bucket, {})
+            if filename in fixes and fixes[filename] != annotation:
+                union.notes.append(
+                    f"# two merged branches correct {_label(bucket, filename)} differently;"
+                    " the first is kept"
+                )
+                continue
+            fixes[filename] = annotation
+        for entry, was in inherited.items():
+            if entry not in mine and base.get(entry) == was:
+                union.removed.setdefault(entry[0], set()).add(entry[1])
+        # A removed entry the branch replaced where it stood (a rename) keeps
+        # its place: align the bucket's names at the fork and in the branch.
+        for bucket in {b for b, _ in inherited} & {b for b, _ in mine}:
+            old = [f for b, f in inherited if b == bucket]
+            new = [f for b, f in mine if b == bucket]
+            matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "replace":
+                    for was_name, now_name in zip(old[i1:i2], new[j1:j2], strict=False):
+                        union.renamed.setdefault(bucket, {}).setdefault(was_name, now_name)
+    # An entry one branch removed and another added in the same bucket stays.
+    for bucket, names in union.removed.items():
+        names.difference_update(f for f in list(names) if (bucket, f) in kept_by_branch)
     return union
 
 
@@ -272,6 +327,7 @@ def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
     lines = current_text.split("\n")
     out: list[str] = []
     left_alone: list[str] = []
+    dropped: list[str] = []
     for line, bucket in zip(lines, _sections(lines), strict=True):
         match = EXAMPLE_LINE_RE.match(line)
         known = union.annotations.get(bucket) if match else None
@@ -286,16 +342,36 @@ def emit_merged(current_text: str, union: Union) -> tuple[str, list[str]]:
         own: dict[str, str] = {}
         for filename, annotation in entries:
             own[filename] = _longer(own.get(filename, annotation), annotation)
-        ordered = list(own) + [name for name in union.order(bucket) if name not in own]
-        notes = {name: _longer(own.get(name, ""), known.get(name, "")) for name in ordered}
-        if len(ordered) == len(own) and all(notes[name] == own[name] for name in own):
+        gone = union.removed.get(bucket, set())
+        fixes = union.corrected.get(bucket, {})
+        swaps = union.renamed.get(bucket, {})
+        ordered = []
+        for name in own:
+            if name not in gone:
+                ordered.append(name)
+            elif swaps.get(name) and swaps[name] not in own and swaps[name] not in ordered:
+                ordered.append(swaps[name])
+        ordered += [
+            name for name in union.order(bucket) if name not in ordered and name not in gone
+        ]
+        notes = {
+            name: fixes.get(name) or _longer(own.get(name, ""), known.get(name, ""))
+            for name in ordered
+        }
+        dropped.extend(_label(bucket, name) for name in own if name in gone)
+        if list(own) == ordered and all(notes[name] == own[name] for name in own):
             out.append(line)
             continue
         body = ", ".join(
             f"`{name}` {notes[name]}" if notes[name] else f"`{name}`" for name in ordered
         )
         out.append(line[: match.start(1)] + body + tail)
-    report = []
+    report = list(union.notes)
+    if dropped:
+        report.append(
+            f"# dropped {len(dropped)} entr{'y' if len(dropped) == 1 else 'ies'} a merged branch"
+            f" removed: {'; '.join(dropped)}"
+        )
     if left_alone:
         report.append(
             f"# left {len(left_alone)} Example-models line(s) with no inline list of models"

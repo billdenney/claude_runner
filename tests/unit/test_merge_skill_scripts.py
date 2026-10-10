@@ -1270,6 +1270,88 @@ class TestUnionIsIdempotent:
         assert (wt / REGISTER).read_bytes() == once
 
 
+class TestUnionHonoursWhatABranchRemovedOrCorrected:
+    """A branch's own diff can remove an entry (a rename, a re-filing) or
+    correct an annotation, not only add. The union read only additions: the
+    base's old entry came back beside the renamed one, and a same-length or
+    shorter correction lost to the base's annotation under "longest wins, the
+    base's on a tie". The NEWS union had the same blind spot for reworded
+    bullets (seven duplicates on the 2026-10-10 nlmixr2lib merge)."""
+
+    LINE = "- **Example models:** `A_2020_a.R` (a: 12 mg), `Old_2019_x.R` (old)."
+    BASE = f"# Covariates\n\n## Body size\n\n### WT (**canonical for weight**)\n\n{LINE}\n"
+
+    def _world(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixed_line: str
+    ) -> tuple[Path, Path]:
+        """claude/fix rewrites the line; claude/add appends to the same line, so
+        -X theirs keeps add's copy and fix's change is lost from the merge."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        push_task_branch(
+            repo,
+            "claude/fix",
+            {REGISTER: self.BASE.replace(self.LINE, fixed_line)},
+            "Fix the entry",
+        )
+        added = self.BASE.replace(
+            "`Old_2019_x.R` (old).", "`Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        assert fixed_line not in (wt / REGISTER).read_text(), "the fixture lost nothing"
+        return repo, wt
+
+    def test_a_renamed_entry_does_not_come_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        renamed = self.LINE.replace("`Old_2019_x.R`", "`New_2019_x.R`")
+        repo, wt = self._world(tmp_path, monkeypatch, renamed)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        line = next(x for x in (wt / REGISTER).read_text().splitlines() if "Example models" in x)
+        assert line == (
+            "- **Example models:** `A_2020_a.R` (a: 12 mg), `New_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        assert (
+            "# dropped 1 entry a merged branch removed:"
+            " Body size / WT (**canonical for weight**) / Old_2019_x.R"
+        ) in proc.stderr
+
+    def test_a_same_length_correction_wins_over_the_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        corrected = self.LINE.replace("(a: 12 mg)", "(a: 21 mg)")
+        repo, wt = self._world(tmp_path, monkeypatch, corrected)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        line = next(x for x in (wt / REGISTER).read_text().splitlines() if "Example models" in x)
+        assert line == (
+            "- **Example models:** `A_2020_a.R` (a: 21 mg), `Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+
+    def test_a_correction_to_an_annotation_main_also_changed_does_not_override_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The branch saw "12 mg"; main has since written "15 mg". The branch's
+        "21 mg" corrects text the base no longer has, so the base's stands."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        push_task_branch(
+            repo,
+            "claude/fix",
+            {REGISTER: self.BASE.replace("(a: 12 mg)", "(a: 21 mg)")},
+            "Fix the entry",
+        )
+        update_main(repo, {REGISTER: self.BASE.replace("(a: 12 mg)", "(a: 15 mg)")}, "main fix")
+        added = self.BASE.replace("(a: 12 mg)", "(a: 15 mg)").replace(
+            "`Old_2019_x.R` (old).", "`Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        assert "(a: 21 mg)" not in (wt / REGISTER).read_text()
+
+
 class TestDedupCanonicalHeaders:
     DUPLICATED = """\
 # Compartments
