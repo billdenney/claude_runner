@@ -130,8 +130,9 @@ def test_multiple_requirements_reports_only_unmet(queue_dir: Path) -> None:
 def test_unmet_details_gives_each_requirement_its_category(queue_dir: Path) -> None:
     """The category is the same for every requirement of a kind; the
     description names the element and carries the note, and is exactly what
-    ``unmet_requirements`` returns."""
-    write_request(queue_dir, _sidecar_request("t1", 1))
+    ``unmet_requirements`` returns. The open-sidecar set is passed in, as
+    the selector passes it."""
+    open_ids = {"t1"}
     task = _task(
         requires=[
             {"kind": "file", "path": "a.md", "note": "the trimmed paper"},
@@ -140,14 +141,16 @@ def test_unmet_details_gives_each_requirement_its_category(queue_dir: Path) -> N
         ]
     )
 
-    details = unmet_details(task, queue_dir)
+    details = unmet_details(task, queue_dir, open_sidecar_task_ids=open_ids)
 
     assert details == [
         UnmetRequirement("missing_file", f"missing file: {queue_dir / 'a.md'} (the trimmed paper)"),
         UnmetRequirement("awaiting_sidecar_response", "awaiting sidecar response"),
         UnmetRequirement("missing_file", f"missing file: {queue_dir / 'b.md'}"),
     ]
-    assert unmet_requirements(task, queue_dir) == [d.description for d in details]
+    assert unmet_requirements(task, queue_dir, open_sidecar_task_ids=open_ids) == [
+        d.description for d in details
+    ]
 
 
 # --- evaluator: sidecar_response gate -----------------------------------
