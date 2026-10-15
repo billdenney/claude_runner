@@ -125,12 +125,15 @@ for that account and exits 1; `supervisor status` prints it as
 loads, the log also says `no account's runner-account.toml loads (...):
 nothing is dispatched until one is fixed`.
 
-**Cause:** The account's `<config_dir>/runner-account.toml` exists but
-cannot be read, is not TOML, still has a `[throttle.*]` table, or sets a
-value the schema rejects (a `max_concurrency` of 0, an unknown key). The
+**Cause:** The account's `<config_dir>/runner-account.toml` is there but
+cannot be read, is empty (zero bytes, often a save that was cut short), is
+a symlink to a file that does not exist, is not TOML, still has a
+`[throttle.*]` table, or sets a value the schema rejects (a
+`max_concurrency` of 0, an unknown key). A `config_dir` starting with
+`~user` for a user that does not exist is reported the same way. The
 supervisor does not guess a policy for it (ADR-0035): the account takes no
 new tasks, its running tasks finish as usual, and it adds nothing to the
-queue's concurrency ceiling.
+queue's concurrency ceiling. Only an absent file means the defaults.
 
 **Steps:**
 1. Fix the file the error names. `claude-task-runner account list` exits
@@ -141,7 +144,10 @@ queue's concurrency ceiling.
    `[usage].max_reading_age_s`, the account waits for its next clean usage
    reading first, within one capture cycle.
 3. Deleting the file instead gives the account the defaults
-   (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`).
+   (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`); the log line
+   then says the file `is gone, so the defaults apply`. An empty file is
+   not the same as no file: it stays broken until it is deleted or filled
+   in.
 
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 

@@ -88,18 +88,24 @@ across all accounts without its operator having written the number down.
    - `account list` and `supervisor status` print it, plus
      `initial_concurrency` when set. Their `--json` output carries a
      `queue_ceiling` object (`ceiling`, `max_concurrency`,
-     `accounts_total`, `account_caps`, `binds`, `initial_concurrency`).
-     Both read the files on disk, so a change to `claude_runner.toml`
-     shows there before the supervisor's next SIGHUP. If an account's file
-     does not load, `supervisor status` reports the error in its place.
+     `accounts_total`, `account_caps`, `binds`, `broken_accounts`,
+     `initial_concurrency`). Both read the files on disk, so a change to
+     `claude_runner.toml` shows there before the supervisor's next SIGHUP.
+     An account whose file does not load (9) is left out of the sum and
+     named in the line and in `broken_accounts`; `supervisor status` also
+     prints an `Account error:` line for it and lists it under
+     `account_errors` in `--json`.
 
 6. **Force-dispatch** without `--over-limit` waits for a free slot. With an
    explicit `max_concurrency`, that is every in-flight task counted against
    it, as before. Without one, it waits until some account has a free slot
-   under its own cap. Neither uses the warm-up cap, and the request still
-   goes to its affined, pinned or first account, which may be a full one.
-   The daemon's policy for a usage reading it cannot attribute to an
-   account carries the reported ceiling.
+   under its own cap. Neither uses the warm-up cap. The request goes to its
+   affined or pinned account; an unbound one goes to the first account, in
+   declaration order, with a free slot under its own cap, and to the first
+   account only when none has one, which only `--over-limit` or an
+   explicit `max_concurrency` lets through. The daemon's policy for a
+   usage reading it cannot attribute to an account carries the reported
+   ceiling, with an account whose file does not load counting 0.
 
 7. **Queues that set both keys** dispatch exactly as before: the
    per-account count in 2 never admits more than `choose_account` would
@@ -120,11 +126,16 @@ across all accounts without its operator having written the number down.
 
 9. **An account whose file does not load takes no new tasks, and nothing
    stops because of it.** `config.loader.resolve_accounts` never raises
-   for a per-account file. It returns the accounts whose policy loaded (a
-   missing file still means the defaults) and, separately, a
-   `BrokenAccount` with the file and the error for each one that exists
-   but cannot be read, is not UTF-8 TOML, sets the retired `[throttle.*]`
-   or fails validation. Every caller uses that one path:
+   for a per-account file. It returns the accounts whose policy loaded (an
+   absent file, or a `config_dir` that does not exist, still means the
+   defaults) and, separately, a `BrokenAccount` with the file and the error
+   for each one that is there but does not load: it cannot be read, is
+   empty (zero bytes), is a symlink to nothing, is not UTF-8 TOML, sets the
+   retired `[throttle.*]` or fails validation. A `config_dir` whose
+   leading `~user` names no user is broken too. An empty file or a
+   dangling symlink is most often a file caught mid-save, and reading it as
+   "use the defaults" would silently give the account a cap of 1 and the
+   queue's bands. Every caller uses that one path:
    - Dispatch leaves the account out: no new task goes to it, it adds 0
      free slots and 0 to the reported ceiling, and every other account
      dispatches as usual. Its running tasks keep running and are reaped as
@@ -150,7 +161,11 @@ across all accounts without its operator having written the number down.
      `account_policies` check fails with it.
    - A force-dispatch affined or pinned to the account waits (the request
      stays) rather than going to another account; the synchronous path
-     refuses with the error.
+     refuses with the error. A task whose session or pin is on the account
+     is skipped with a reason that names the file's error, not as an
+     unknown account.
+   - When the file loads again, the INFO line says so; when it was deleted
+     instead, it says the defaults now apply.
 
 ## Alternatives considered
 
@@ -214,7 +229,27 @@ across all accounts without its operator having written the number down.
 
 ## Reversibility
 
-High. A queue that sets `[concurrency] max_concurrency = 2` and
-`initial_concurrency = 1` dispatches exactly as before, and its log says
-so, with a warning whenever 2 is below its accounts' sum. Restoring the two values to the
-packaged `settings.toml` restores it for every queue that leaves them out.
+High for the concurrency rules. A queue that sets `[concurrency]
+max_concurrency = 2` and `initial_concurrency = 1` dispatches exactly as
+before, and its log says so, with a warning whenever 2 is below its
+accounts' sum. Restoring the two values to the packaged `settings.toml`
+restores it for every queue that leaves them out.
+
+Medium for the code, because of `supervisor.json` schema v8. A build from
+before this decision refuses a file with `schema_version = 8`, so after a
+rollback `supervisor start` fails (and a watchdog keeps restarting it),
+and `account list` and `supervisor status` fail too. Two remedies, with
+the supervisor stopped:
+
+- Edit the file back to v7: set `schema_version` to 7 and delete the
+  `policy_error` key from every entry under `accounts` (it is `null`
+  unless an account's file was broken). Nothing else changed in v8, so
+  nothing is lost.
+- Or move `supervisor.json` aside. The next start writes a fresh
+  snapshot: every account starts in `no_reading` and is read again within
+  one capture cycle, and the scheduled wakeups and the last readings,
+  targets and drift messages are gone. Pauses survive, since they live in
+  the `account_paused/` markers. The previous supervisor's `in_flight`
+  list is lost, so a worker still running is adopted under its session's
+  account, or no account when it has none (a first attempt), until it
+  finishes.

@@ -170,7 +170,9 @@ start and after each successful reload, and a WARNING naming both numbers
 while an explicit value binds, once per config load and again when either
 changes (ADR-0035). Force-dispatch without `--over-limit` waits for a free
 slot: under an explicit `max_concurrency`, counted over every in-flight
-task; without one, on any account. `claude-task-runner account list` shows
+task; without one, on any account. An unbound request then goes to the
+first account, in declaration order, with a free slot under its own cap.
+`claude-task-runner account list` shows
 each account's `in_flight=N/cap` and the ceiling the files on disk give,
 which `supervisor status` also prints. An account whose
 `runner-account.toml` does not load (`config.loader.BrokenAccount`) takes
