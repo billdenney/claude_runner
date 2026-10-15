@@ -358,6 +358,37 @@ class TestDispatch:
             assert in_flight_by_account(slots) == {"personal": 5, "work": 3}
             held.release(slots)
 
+    def test_a_task_whose_session_is_on_a_broken_account_waits_and_says_why(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        two_accounts: dict[str, Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _break(two_accounts["personal"])
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        make_tasks(queue_dir, 1)
+        write_state_atomic(
+            TaskState(
+                task_id="t00",
+                status="failed",
+                session_id="s-1",
+                session_account="personal",
+                last_finished_at=datetime.now(UTC),
+            ),
+            state_path_for(queue_dir, "t00"),
+        )
+        slots: dict[str, DispatchSlot] = {}
+        with caplog.at_level(logging.INFO), HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
+            held.release(slots)
+        assert slots == {}
+        assert (
+            "dispatch skipped task t00: session affinity blocks dispatch: host account "
+            "'personal' not in [[accounts]] or its runner-account.toml does not load "
+            "(fix the file, or run `queue restart-fresh` to start a fresh session)"
+        ) in [r.getMessage() for r in caplog.records]
+
     def test_nothing_dispatches_when_no_account_loads(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:

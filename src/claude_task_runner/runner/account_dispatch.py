@@ -144,7 +144,8 @@ def choose_account(
                 account=None,
                 reason=(
                     f"session affinity blocks dispatch: host account "
-                    f"{affined_account!r} not in [[accounts]] (run "
+                    f"{affined_account!r} not in [[accounts]] or its "
+                    "runner-account.toml does not load (fix the file, or run "
                     "`queue restart-fresh` to start a fresh session)"
                 ),
             )
