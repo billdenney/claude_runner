@@ -2363,10 +2363,12 @@ def _finalize_state(
     closed on a TERMINAL disposition -- a deliverable, no commit, a clean
     worktree: the shape of a skip or defer. ``completed`` alone does not
     hold such a task down, because answering its sidecar makes it eligible
-    again and it re-derives the same verdict at full effort. Requires
-    ``queue_dir`` and a ``settings_dispatch.dispatch_block_file``; without
-    either it is a no-op, so queues not using that convention are
-    unaffected.
+    again and it re-derives the same verdict at full effort. A run that
+    left a sidecar question open is not gated (see
+    :func:`terminal_gate.awaits_answers`): it stopped to ask, and the answer
+    must be able to reach it. Requires ``queue_dir`` and a
+    ``settings_dispatch.dispatch_block_file``; without either it is a no-op,
+    so queues not using that convention are unaffected.
     """
     if cap_violation is not None:
         new_status = "failed"
