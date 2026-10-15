@@ -280,7 +280,7 @@ def request_outstanding(
     return [qid for qid in asked if qid not in answered], asked, resp_path
 
 
-def open_sidecars(queue_dir: Path) -> Iterator[OpenSidecar]:
+def open_sidecars(queue_dir: Path, *, task_id: str | None = None) -> Iterator[OpenSidecar]:
     """Yield an :class:`OpenSidecar` for every request still owed an answer.
 
     A request is open when any asked question id is missing from its
@@ -289,12 +289,16 @@ def open_sidecars(queue_dir: Path) -> Iterator[OpenSidecar]:
     ``file_and_exit`` notification) is closed by the mere presence of a
     response file, and open while none exists.
 
+    ``task_id`` limits the scan to that task's sidecar directory, so a
+    caller asking about one task reads only that task's files.
+
     Order: by task_id then sequence, both lexicographic, for determinism.
     """
     sidecar_root = queue_runtime_dir(queue_dir) / "sidecar"
     if not sidecar_root.exists():
         return
-    for task_dir in sorted(sidecar_root.iterdir()):
+    task_dirs = [sidecar_root / task_id] if task_id is not None else sorted(sidecar_root.iterdir())
+    for task_dir in task_dirs:
         if not task_dir.is_dir():
             continue
         responses: set[int] = set()

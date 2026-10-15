@@ -61,7 +61,7 @@ from claude_task_runner.runner.dispatcher import (
 )
 
 from ._git_world import git, isolate_git
-from ._sidecar_files import write_request
+from ._sidecar_files import make_request, write_request
 
 _PID = 999_001
 
@@ -829,6 +829,40 @@ def test_adopted_finalize_writes_the_terminal_close_row(queue_dir: Path, worktre
     assert outcome.new_state.status == "completed"
     rows = _block_rows(queue_dir)
     assert [(row["task"], row["block_dispatch"]) for row in rows] == [("030-gates", True)]
+
+
+@pytest.mark.parametrize("entry", ["exited", "adopted"])
+@pytest.mark.parametrize(
+    ("asks", "rows"),
+    [
+        pytest.param(True, [], id="open-question"),
+        pytest.param(False, [("030-gates", True)], id="open-notification"),
+    ],
+)
+def test_adopted_terminal_close_row_follows_what_the_sidecar_asks(
+    queue_dir: Path,
+    worktree: Path,
+    dead_pid: None,
+    entry: str,
+    asks: bool,
+    rows: list[tuple[str, bool]],
+) -> None:
+    """The ADR-0033 gate runs inside finalize, before the open sidecar parks
+    the task. A terminal close that left a question open is parked with no
+    block row, so the answer can reach it; one that left only a
+    notification is parked and gated, as on the owned finalize."""
+    pre_sha = git(worktree, "rev-parse", "HEAD")
+    (worktree / "report.md").write_text("skipped: not a model paper\n")
+    task = _worktree_task(worktree, deliverable=True)
+    if asks:
+        _open_sidecar(queue_dir, task.id)
+    else:
+        write_request(queue_dir, make_request(task.id, question_ids=()))
+
+    outcome = _finalize(queue_dir, task, pre_sha=pre_sha, entry=entry)
+
+    assert outcome.new_state.status == "awaiting_sidecar"
+    assert [(row["task"], row["block_dispatch"]) for row in _block_rows(queue_dir)] == rows
 
 
 @pytest.mark.parametrize(

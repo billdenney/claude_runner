@@ -2365,7 +2365,7 @@ def _finalize_state(
     hold such a task down, because answering its sidecar makes it eligible
     again and it re-derives the same verdict at full effort. A run that
     left a sidecar question open is not gated (see
-    :func:`terminal_gate.awaits_answers`): it stopped to ask, and the answer
+    :func:`terminal_gate.unanswered_asks`): it stopped to ask, and the answer
     must be able to reach it. Requires ``queue_dir`` and a
     ``settings_dispatch.dispatch_block_file``; without either it is a no-op,
     so queues not using that convention are unaffected.
