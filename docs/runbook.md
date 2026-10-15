@@ -192,42 +192,56 @@ flight, and `claude-task-runner supervisor status` shows an account that is
 not paused or throttled.
 
 **Steps:**
-1. Find the last line about eligible tasks in the supervisor log
+1. Confirm the supervisor is still ticking: `claude-task-runner supervisor
+   status` reports it alive, and `<queue>/.claude_task_runner/supervisor.json`,
+   which it rewrites every tick, was modified within the last poll interval
+   or two. The log line below cannot show that on its own, since it is
+   logged only when something changes.
+2. Find the last line about eligible tasks in the supervisor log
    ([where the log goes](architecture.md#supervisor-log-and-drift-evidence)),
    e.g. `journalctl --user -u claude-task-runner | grep 'eligible tasks' | tail -1`.
    If it reads like
 
    ```
-   no eligible tasks: 329 unfinished held (block_dispatch 178, readiness missing file 128, unanswered sidecar 18, depends_on 3, deferred cooldown 1, possibly_hung 1)
+   no eligible tasks: 329 unfinished held (block_dispatch 178, readiness_missing_file 128, unanswered_sidecar 18, depends_on 3, deferred_cooldown 1, possibly_hung 1)
    ```
 
-   the queue is drained, not stuck: the supervisor is ticking and
-   choosing work, and every unfinished task in `todo/` is held.
-   Completed tasks are not counted. The line is logged when the queue
-   runs dry (and on the first such tick after a supervisor start), then
-   again only when the counts change, so it can be days old on a quiet
-   queue. If the last line is `eligible tasks available again: N`
-   instead, tasks were eligible at that tick.
-2. Each count names what holds those tasks:
+   then as of that line's timestamp the queue was drained, not stuck:
+   every unfinished task in `todo/` was held. Completed tasks are not
+   counted. The line is logged when the queue runs dry (and on the first
+   such tick after a supervisor start), then again only when a count
+   other than `in_flight` changes, so it can be days old on a quiet
+   queue; step 1 is what shows the supervisor is still at work since. If
+   the last line is `eligible tasks available again: N` instead, tasks
+   were eligible at that tick.
+3. Each count names what holds those tasks:
    - `block_dispatch` — a `"block_dispatch": true` row for the task in the
      `[dispatch].dispatch_block_file` (ADR-0029). Remove the row to release it.
-   - `readiness missing file`, `readiness awaiting sidecar response` — an
-     unmet `requires` element (ADR-0030); see "A task stays `deferred`".
-   - `unanswered sidecar` — see "Sidecars piling up".
+   - `readiness_missing_file`, `readiness_awaiting_sidecar_response` — an
+     unmet `requires` element (ADR-0030); see "A task stays `deferred`". A
+     task missing elements of both kinds is counted once, under
+     `readiness_awaiting_sidecar_response+missing_file`.
+   - `unanswered_sidecar` — see "Sidecars piling up".
    - `depends_on` — a task named in `depends_on` has not completed.
-   - `deferred cooldown` — a pre-dispatch hook deferral whose
-     `next_eligible_at` has not passed; see "A task stays `deferred`".
-   - `invalid effort` — see "A task stays `deferred`".
+   - `deferred_cooldown` — a `deferred` state whose `next_eligible_at` has
+     not passed, whoever wrote it: a pre-dispatch hook deferral or a
+     deferral written by hand. See "A task stays `deferred`".
+   - `invalid_effort` — see "A task stays `deferred`".
    - A status name (`possibly_hung`, `running`, `failed_circuit_breaker`,
      `weekly_paused`, ...) — the task's state has that status, which is
      never dispatched.
-   - `in flight` — already running under this supervisor.
-   - `unparseable task`, `unparseable state` — a task or state YAML that
+   - `in_flight` — already running under this supervisor.
+   - `unparseable_task`, `unparseable_state` — a task or state YAML that
      does not load; the supervisor log names the file.
-3. No `no eligible tasks:` line since the last `dispatched task` line
-   means the ticks are not reaching candidate selection at all: every
-   account is paused, throttled or without a reading, or every slot is
-   taken. Look for `tick_dispatch failed` lines too.
+4. No `no eligible tasks:` line since the last `dispatched task` line, on a
+   supervisor that is ticking, means one of two things:
+   - the ticks are not reaching candidate selection: every account is
+     paused, throttled or without a reading, or every slot is taken;
+   - there are eligible tasks, but no account will take any of them: each
+     tick then logs `dispatch skipped task <id>: <reason>` per task, giving
+     the account cap or session affinity that refused it.
+
+   Look for `tick_dispatch failed` lines too.
 
 ## Cron / systemd watchdog not installed
 

@@ -241,8 +241,8 @@ At the default `[logging].level` of INFO, `Notify` actions appear as
 account enters `NoReading`. A tick that could dispatch (an account open, a
 slot free) but finds no eligible task logs `no eligible tasks: N unfinished
 held (...)`, counting the unfinished tasks by what holds them; it repeats
-only when those counts change, and `eligible tasks available again: N` ends
-the spell (see the runbook's "Nothing dispatches, but an account has room").
+only when a count other than `in_flight` changes, and `eligible tasks
+available again: N` ends the spell (see the runbook's "Nothing dispatches, but an account has room").
 `EmitEvent` actions (`state_transition`,
 `drift_detected`, `drift_clean_poll`, `usage_capture_error`, ...) are logged
 at DEBUG level only; set `[logging].level = "DEBUG"` in `claude_runner.toml`
