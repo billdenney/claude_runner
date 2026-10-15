@@ -817,6 +817,9 @@ def start_daemon(
     # Every dispatch thread this run starts holds this gate while it starts
     # a worker; the exit below waits for them (runner.spawn_gate).
     spawn_gate = SpawnGate()
+    # Remembers the last "no eligible tasks" summary across ticks so a
+    # drained queue logs it once per change, not once per tick.
+    idle_log = orch_mod.IdleDispatchLog()
 
     # The handlers go in before the lock is taken, so a stop during startup
     # still reaches the loop's first check, and come out after it is
@@ -1222,6 +1225,7 @@ def start_daemon(
                         notify_callback=notify_callback,
                         event_callback=event_callback,
                         spawn_gate=spawn_gate,
+                        idle_log=idle_log,
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:
