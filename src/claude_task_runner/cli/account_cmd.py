@@ -38,7 +38,12 @@ from claude_task_runner.cli._helpers import (
     require_queue_option,
     resolve_per_queue_config,
 )
-from claude_task_runner.config.loader import BrokenAccount, load_settings, resolve_accounts
+from claude_task_runner.config.loader import (
+    BrokenAccount,
+    load_settings,
+    per_account_toml_shown,
+    resolve_accounts,
+)
 from claude_task_runner.config.schema import AccountSettings, ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import (
     QueueCeiling,
@@ -109,6 +114,7 @@ def _account_row(
         "config_dir": acct.config_dir,
         "linux_user": acct.linux_user,
         "policy_error": None,
+        "policy_file": per_account_toml_shown(acct.config_dir),
         "max_concurrency": policy.concurrency.max_concurrency,
         "dispatch_pct": {
             "day": {

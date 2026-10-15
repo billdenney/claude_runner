@@ -19,6 +19,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from claude_task_runner.clock import FakeClock, RealClock
@@ -44,6 +45,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
+from claude_task_runner.runner.account_dispatch import choose_account
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.daemon import (
@@ -53,7 +55,12 @@ from claude_task_runner.supervisor.daemon import (
     run_one_tick,
 )
 from claude_task_runner.supervisor.persistence import initial_snapshot
-from claude_task_runner.supervisor.states import AccountState, SupervisorSnapshot, SupervisorState
+from claude_task_runner.supervisor.states import (
+    AccountState,
+    InFlightRecord,
+    SupervisorSnapshot,
+    SupervisorState,
+)
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
 from ._concurrency_fixtures import (
@@ -71,6 +78,9 @@ from ._concurrency_fixtures import (
 
 BAD_TOML = "max_concurrency 5\n"
 """Not TOML: a key with no ``=``."""
+
+WAIT = " takes no tasks until its runner-account.toml loads: "
+"""How a decline names an account whose file does not load."""
 
 PARSE_ERROR = "Expected '=' after a key in a key/value pair (at line 1, column 17)"
 """What :mod:`tomllib` says about :data:`BAD_TOML`."""
@@ -124,16 +134,39 @@ class TestResolveAccounts:
         assert resolution.broken_names == frozenset({"personal"})
 
     @pytest.mark.parametrize(
-        ("content", "error_start"),
+        ("content", "error"),
         [
-            ("[concurrency]\nmax_concurrency = 0\n", "Per-account policy validation failed for "),
-            ("[throttle.five_hour]\nx = 1\n", ""),
-            (b"\xff\xfe", "Invalid TOML in "),
+            (
+                "[concurrency]\nmax_concurrency = 0\n",
+                "Per-account policy validation failed for {path}: 1 validation error for "
+                "AccountPolicy\nconcurrency.max_concurrency\n  Input should be greater than "
+                "or equal to 1 [type=greater_than_equal, input_value=0, input_type=int]\n"
+                "    For further information visit "
+                "https://errors.pydantic.dev/{pydantic}/v/greater_than_equal",
+            ),
+            (
+                "[throttle.five_hour]\nx = 1\n",
+                "{path}: [throttle.*] is gone in ADR-0022; rename to [dispatch_pct.*]. "
+                "Mapping: day = {{fivehr_slowdown_pct, fivehr_stop_pct}}, night = "
+                "{{fivehr_slowdown_pct, fivehr_stop_pct, time_start, time_end}}, week = "
+                "{{early_pct, eow_pct, eow_time_switch}}. See "
+                "docs/cheatsheet.md#migration-from-throttle and "
+                "docs/decisions/0022-dispatch-pct-trace-following.md.",
+            ),
+            (
+                b"\xff\xfe",
+                "Invalid TOML in {path}: 'utf-8' codec can't decode byte 0xff in position 0: "
+                "invalid start byte",
+            ),
+            (
+                b"",
+                "{path} is empty; delete it for the defaults, or write the settings it should hold",
+            ),
         ],
-        ids=["invalid-value", "retired-throttle", "not-utf8"],
+        ids=["invalid-value", "retired-throttle", "not-utf8", "empty"],
     )
     def test_every_kind_of_failure_is_reported(
-        self, tmp_path: Path, two_accounts: dict[str, Path], content: str | bytes, error_start: str
+        self, tmp_path: Path, two_accounts: dict[str, Path], content: str | bytes, error: str
     ) -> None:
         path = two_accounts["personal"] / PER_ACCOUNT_TOML_NAME
         if isinstance(content, bytes):
@@ -141,10 +174,48 @@ class TestResolveAccounts:
         else:
             path.write_text(content, encoding="utf-8")
         resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", two_accounts))
-        (broken,) = resolution.broken
-        assert broken.name == "personal"
-        assert str(path) in broken.error
-        assert broken.error.startswith(error_start or str(path))
+        pydantic_minor = ".".join(pydantic.VERSION.split(".")[:2])
+        assert resolution.broken == (
+            BrokenAccount(
+                name="personal",
+                path=str(path),
+                error=error.format(path=path, pydantic=pydantic_minor),
+            ),
+        )
+
+    def test_a_dangling_symlink_is_broken(
+        self, tmp_path: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        path = two_accounts["personal"] / PER_ACCOUNT_TOML_NAME
+        path.unlink()
+        target = tmp_path / "saved-elsewhere.toml"
+        path.symlink_to(target)
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", two_accounts))
+        assert resolution.broken[0].error == (
+            f"{path} is a symlink to {target}, which does not exist"
+        )
+
+    def test_a_home_that_cannot_be_found_is_broken(
+        self, tmp_path: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        accounts = {
+            "personal": Path("~no-such-user-ctr-test/.claude"),
+            "work": two_accounts["work"],
+        }
+        settings = queue_toml(tmp_path / "q.toml", accounts)
+        resolution = resolve_accounts(settings)
+        assert [a.name for a in resolution.accounts] == ["work"]
+        assert resolution.broken == (
+            BrokenAccount(
+                name="personal",
+                path="~no-such-user-ctr-test/.claude/runner-account.toml",
+                error=(
+                    "Cannot find ~no-such-user-ctr-test/.claude/runner-account.toml: "
+                    "Could not determine home directory."
+                ),
+            ),
+        )
+        assert check_dispatch_pct_legacy(settings, tmp_path).status is CheckStatus.PASS
 
     def test_a_file_that_cannot_be_read_is_reported(
         self, tmp_path: Path, two_accounts: dict[str, Path]
@@ -265,6 +336,38 @@ class TestAccountFileWatch:
             "dispatched until one is fixed",
         ]
 
+    def test_no_account_loading_is_said_again_after_one_loaded(
+        self, tmp_path: Path, two_accounts: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _break(two_accounts["personal"])
+        _break(two_accounts["work"])
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.ERROR, logger=DAEMON_LOGGER):
+            watch.observe(self._resolve(tmp_path, two_accounts))
+            write_account_cap(two_accounts["work"], 3)
+            watch.observe(self._resolve(tmp_path, two_accounts))
+            _break(two_accounts["work"])
+            watch.observe(self._resolve(tmp_path, two_accounts))
+            watch.observe(self._resolve(tmp_path, two_accounts))
+        assert [m for m in _messages(caplog, logging.ERROR) if m.startswith("no account")] == [
+            "no account's runner-account.toml loads (personal, work): nothing is "
+            "dispatched until one is fixed"
+        ] * 2
+
+    def test_a_deleted_file_says_the_defaults_apply(
+        self, tmp_path: Path, two_accounts: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = _break(two_accounts["personal"])
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+            watch.observe(self._resolve(tmp_path, two_accounts))
+            path.unlink()
+            watch.observe(self._resolve(tmp_path, two_accounts))
+        assert _messages(caplog, logging.INFO) == [
+            f"account 'personal' takes tasks again: {path} is gone, so the defaults apply "
+            "(max_concurrency = 1 and the queue's [dispatch_pct.*])"
+        ]
+
 
 # ---------------------------------------------------------------------------
 # The snapshot and the throttle decision
@@ -341,6 +444,44 @@ class TestSnapshot:
 # ---------------------------------------------------------------------------
 
 
+class TestUnattributedReading:
+    def test_a_broken_account_counts_0_in_the_fallback_cap(
+        self, tmp_path: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        """A reading no account can be named for is decided against the
+        queue's ceiling: personal's 5, with work, whose file is broken,
+        counting 0 rather than its default of 1."""
+        _break(two_accounts["work"])
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        settings = settings.model_copy(
+            update={"dispatch_pct": settings.dispatch_pct.model_copy(update={"timezone": "UTC"})}
+        )
+        resolution = resolve_accounts(settings)
+        reading = UsageReading(
+            captured_at=NOW,
+            five_hour=WindowReading(
+                utilization_pct=10,
+                resets_at_raw="x",
+                resets_at=datetime(2026, 10, 15, 15, tzinfo=UTC),
+            ),
+            seven_day=WindowReading(utilization_pct=10, resets_at_raw="x", resets_at=None),
+        )
+        after, _actions = run_one_tick(
+            _two_account_snapshot(),
+            TickContext(
+                settings=settings,
+                poll_result=reading,
+                pending_count=3,
+                in_flight_count=0,
+                account_policies=resolution.policies,
+                broken_accounts=resolution.broken_names,
+            ),
+            FakeClock(NOW),
+        )
+        assert after.state is SupervisorState.DISPATCHING
+        assert after.target_concurrency == 5
+
+
 class TestDispatch:
     def test_the_other_account_fills_its_cap_and_the_broken_one_gets_nothing(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
@@ -365,7 +506,7 @@ class TestDispatch:
         two_accounts: dict[str, Path],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        _break(two_accounts["personal"])
+        path = _break(two_accounts["personal"])
         settings = queue_toml(tmp_path / "q.toml", two_accounts)
         make_tasks(queue_dir, 1)
         write_state_atomic(
@@ -385,9 +526,52 @@ class TestDispatch:
         assert slots == {}
         assert (
             "dispatch skipped task t00: session affinity blocks dispatch: host account "
-            "'personal' not in [[accounts]] or its runner-account.toml does not load "
-            "(fix the file, or run `queue restart-fresh` to start a fresh session)"
+            f"'personal'{WAIT}{_invalid_toml(path)}"
         ) in [r.getMessage() for r in caplog.records]
+
+    def test_a_task_pinned_to_a_broken_account_waits_and_says_why(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        two_accounts: dict[str, Path],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        path = _break(two_accounts["personal"])
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        task = Task.model_validate(
+            {"id": "t00", "title": "T", "prompt": "do it", "account": "personal"}
+        )
+        write_task_atomic(task, task_path_for(queue_dir, "t00"))
+        slots: dict[str, DispatchSlot] = {}
+        with caplog.at_level(logging.INFO), HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
+            held.release(slots)
+        assert slots == {}
+        assert (
+            f"dispatch skipped task t00: pinned account 'personal'{WAIT}{_invalid_toml(path)}"
+        ) in [r.getMessage() for r in caplog.records]
+
+    def test_an_unbound_decline_names_the_broken_account(
+        self, tmp_path: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        path = _break(two_accounts["personal"])
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", two_accounts))
+        work = AccountState(state=SupervisorState.DISPATCHING, since=NOW)
+        choice = choose_account(
+            task=Task.model_validate({"id": "t00", "title": "T", "prompt": "do it"}),
+            accounts={a.name: a for a in resolution.accounts},
+            account_states={"work": work},
+            in_flight=[
+                InFlightRecord(task_id=f"w{i}", account="work", started_at=NOW) for i in range(3)
+            ],
+            broken={b.name: b.error for b in resolution.broken},
+        )
+        assert choice.account is None
+        assert choice.reason == (
+            "no eligible account: personal: its runner-account.toml does not load; "
+            "work: at capacity (3/3)"
+        )
+        assert str(path) not in choice.reason
 
     def test_nothing_dispatches_when_no_account_loads(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
@@ -432,8 +616,8 @@ class TestForceDispatch:
     @pytest.mark.parametrize(
         ("pin", "session_on", "reason"),
         [
-            ("personal", None, "pinned account 'personal' takes no tasks: "),
-            (None, "personal", "session host account 'personal' takes no tasks: "),
+            ("personal", None, f"pinned account 'personal'{WAIT}"),
+            (None, "personal", f"session host account 'personal'{WAIT}"),
         ],
         ids=["pinned", "session"],
     )
@@ -468,16 +652,26 @@ class TestForceDispatch:
         assert n == 1
         assert in_flight_by_account(slots) == {"work": 1}
 
+    @pytest.mark.parametrize("concurrency", ["", "max_concurrency = 5"])
     def test_with_no_account_loading_the_request_waits(
-        self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        two_accounts: dict[str, Path],
+        caplog: pytest.LogCaptureFixture,
+        concurrency: str,
     ) -> None:
         _break(two_accounts["personal"])
         _break(two_accounts["work"])
-        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        settings = queue_toml(tmp_path / "q.toml", two_accounts, concurrency)
         self._request(queue_dir)
-        n, _slots = self._consume(queue_dir, settings)
+        with caplog.at_level(logging.WARNING):
+            n, _slots = self._consume(queue_dir, settings)
         assert n == 0
         assert fd_mod.request_path(queue_dir, "t00").exists()
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "force-dispatch t00: no account's runner-account.toml loads; leaving request"
+        ]
 
     def test_the_synchronous_path_refuses_with_the_error(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
@@ -490,7 +684,7 @@ class TestForceDispatch:
                 task_id="t00", queue_dir=queue_dir, settings=settings, clock=RealClock()
             )
         assert str(excinfo.value) == (
-            f"task t00: pinned account 'personal' takes no tasks: {_invalid_toml(path)}"
+            f"task t00: pinned account 'personal'{WAIT}{_invalid_toml(path)}"
         )
 
 
@@ -605,6 +799,8 @@ class TestCli:
         assert rows["work"]["max_concurrency"] == 3
         assert payload["queue_ceiling"]["ceiling"] == 3
         assert payload["queue_ceiling"]["broken_accounts"] == ["personal"]
+        assert set(rows["personal"]) == set(rows["work"])
+        assert rows["work"]["policy_file"] == str(two_accounts["work"] / PER_ACCOUNT_TOML_NAME)
 
     def test_account_list_exits_0_when_every_file_loads(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]

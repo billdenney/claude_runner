@@ -212,14 +212,18 @@ def tick_dispatch(
         # daemon's persist step records accurate in_flight attribution.
         return _refresh_in_flight(snapshot, in_flight_slots)
 
+    broken: dict[str, str] = {}
     if accounts is None:
         # Local import to avoid a circular at module top: loader
         # imports schema; schema is consumed by the rest of the codebase.
         from claude_task_runner.config.loader import resolve_accounts
 
         # An account whose runner-account.toml does not load is left out,
-        # so it takes no tasks; the daemon logs it (ADR-0035).
-        accounts = list(resolve_accounts(settings).accounts)
+        # so it takes no tasks; the daemon logs it (ADR-0035). Its error
+        # goes to choose_account so a decline names it.
+        resolution = resolve_accounts(settings)
+        accounts = list(resolution.accounts)
+        broken = {b.name: b.error for b in resolution.broken}
     accounts_by_name = {a.name: a for a in accounts}
 
     # Per-account dispatch gate (replaces PR 5's top-level snapshot.state
@@ -289,6 +293,7 @@ def tick_dispatch(
             account_states=dict(snapshot.accounts),
             in_flight=live_in_flight,
             affined_account=affined,
+            broken=broken,
         )
         # Session-affinity TTL (ADR-0024 extension): affinity blocked the
         # dispatch (host account busy / throttled / paused), but if the
@@ -310,6 +315,7 @@ def tick_dispatch(
                     account_states=dict(snapshot.accounts),
                     in_flight=live_in_flight,
                     affined_account=None,
+                    broken=broken,
                 )
                 if choice.account is not None:
                     logger.info(

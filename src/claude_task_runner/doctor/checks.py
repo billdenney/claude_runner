@@ -22,6 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from claude_task_runner.config.loader import (
+    ConfigError,
     per_account_toml_path,
     resolve_accounts,
 )
@@ -384,8 +385,8 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
     """Operator-visible migration check: flag lingering ``[throttle.*]`` blocks.
 
     ADR-0022 renamed ``[throttle.*]`` to ``[dispatch_pct.*]``. The loader
-    raises on the legacy block, but operators running ``doctor`` on a
-    queue that hasn't been migrated yet see this check first — it
+    refuses a queue TOML with the legacy block and reports an account
+    file with it as broken (``config.loader.BrokenAccount``); this check
     points to the exact files that need editing.
 
     Scans the queue's ``claude_runner.toml`` and every resolved
@@ -399,12 +400,13 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
     if queue_toml.exists():
         candidates.append(queue_toml)
     for acct in settings.accounts:
-        path = per_account_toml_path(acct.config_dir)
         try:
+            path = per_account_toml_path(acct.config_dir)
             present = path is not None and path.is_file()
-        except OSError:
-            # An unreadable directory; check_account_policies reports it.
-            present = False
+        except (ConfigError, OSError):
+            # No path can be built, or its directory cannot be read;
+            # check_account_policies reports it.
+            continue
         if path is not None and present:
             candidates.append(path)
 

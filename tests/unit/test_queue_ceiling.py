@@ -37,7 +37,12 @@ from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.account_dispatch import QueueCeiling, dispatch_headroom
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor.daemon import QueueCeilingWatch
-from claude_task_runner.supervisor.states import InFlightRecord
+from claude_task_runner.supervisor.states import (
+    AccountState,
+    InFlightRecord,
+    SupervisorSnapshot,
+    SupervisorState,
+)
 
 from ._concurrency_fixtures import (
     DAEMON_LOGGER,
@@ -486,6 +491,38 @@ class TestEndToEndTick:
         finally:
             stop.set()
 
+    def test_a_slowed_account_gets_exactly_its_throttle_target(
+        self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        """The headroom counts each account's max_concurrency (8 here) as an
+        upper bound; choose_account holds personal, SLOWING_DOWN at a target
+        of 2, to exactly 2."""
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 10)
+        since = datetime(2026, 10, 15, tzinfo=UTC)
+        snapshot = SupervisorSnapshot(
+            state=SupervisorState.DISPATCHING,
+            since=since,
+            accounts={
+                "personal": AccountState(
+                    state=SupervisorState.SLOWING_DOWN, since=since, target_concurrency=2
+                ),
+                "work": AccountState(state=SupervisorState.DISPATCHING, since=since),
+            },
+        )
+        assert dispatch_headroom(resolve_accounts(settings).accounts, [], None) == 8
+        slots: dict[str, DispatchSlot] = {}
+        with HeldDispatches() as held:
+            orch_mod.tick_dispatch(
+                queue_dir=queue_dir,
+                settings=settings,
+                clock=RealClock(),
+                snapshot=snapshot,
+                in_flight_slots=slots,
+            )
+            assert in_flight_by_account(slots) == {"personal": 2, "work": 3}
+            held.release(slots)
+
     def test_single_account_with_explicit_cap_is_unchanged(
         self, tmp_path: Path, queue_dir: Path
     ) -> None:
@@ -766,6 +803,42 @@ class TestForceDispatch:
                 assert n == dispatched
                 assert fd_mod.request_path(queue_dir, "t00").exists() is (dispatched == 0)
                 held.release({k: v for k, v in slots.items() if k == "t00"})
+        finally:
+            stop.set()
+
+
+class TestForceDispatchAccount:
+    @pytest.mark.parametrize(
+        ("busy", "picked"),
+        [
+            ({}, "personal"),
+            ({"personal": 5, "work": 2}, "work"),
+            ({"personal": 4, "work": 0}, "personal"),
+        ],
+        ids=["both-free-first-wins", "first-full-goes-to-second", "first-has-room"],
+    )
+    def test_an_unbound_request_goes_to_the_first_account_with_a_free_slot(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        two_accounts: dict[str, Path],
+        busy: dict[str, int],
+        picked: str,
+    ) -> None:
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 1)
+        fd_mod.write_request(queue_dir, "t00")
+        stop = threading.Event()
+        slots = busy_slots(stop, **busy)
+        try:
+            with HeldDispatches() as held:
+                n = fd_mod.tick_consume(
+                    queue_dir=queue_dir, settings=settings, clock=RealClock(), in_flight_slots=slots
+                )
+                assert n == 1
+                assert slots["t00"].account == picked
+                stop.set()
+                held.release(slots)
         finally:
             stop.set()
 

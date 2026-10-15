@@ -227,8 +227,11 @@ def test_target_concurrency_uses_max_after_first_completion(queue_dir: Path) -> 
 
 
 def test_target_concurrency_clamps_zero_or_negative_to_one(queue_dir: Path) -> None:
-    """A misconfigured settings with max=0 still returns 1 (the floor)."""
+    """A misconfigured settings with max=0 still returns 1 (the floor), for
+    the warm-up cap and, after a first completion, for max_concurrency."""
     settings = _make_settings(initial=0, max_c=0)
+    assert _target_concurrency(queue_dir, settings) == 1
+    _seed_state(queue_dir, "warmup", "completed")
     assert _target_concurrency(queue_dir, settings) == 1
 
 

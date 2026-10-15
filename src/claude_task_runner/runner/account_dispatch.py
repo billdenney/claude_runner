@@ -102,6 +102,7 @@ def choose_account(
     account_states: dict[str, AccountState],
     in_flight: list[InFlightRecord],
     affined_account: str | None = None,
+    broken: Mapping[str, str] | None = None,
 ) -> DispatchChoice:
     """Pick the account ``task`` should be dispatched through.
 
@@ -131,6 +132,11 @@ def choose_account(
         (sessions are namespaced by ``CLAUDE_CONFIG_DIR``); affinity
         is enforced as a correctness gate ahead of ``task.account``
         pinning. See ADR-0024.
+    broken
+        The declared accounts left out of ``accounts`` because their
+        ``runner-account.toml`` does not load, each with its error
+        (``config.loader.BrokenAccount``). They take no tasks; naming them
+        lets a decline say why rather than call them unknown.
 
     Returns
     -------
@@ -138,14 +144,23 @@ def choose_account(
         ``account`` names the picked account, or ``None`` when no
         account has capacity. ``reason`` is a short audit string.
     """
+    broken = broken or {}
     if affined_account is not None:
+        if affined_account in broken:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account "
+                    f"{affined_account!r} takes no tasks until its runner-account.toml "
+                    f"loads: {broken[affined_account]}"
+                ),
+            )
         if affined_account not in accounts:
             return DispatchChoice(
                 account=None,
                 reason=(
                     f"session affinity blocks dispatch: host account "
-                    f"{affined_account!r} not in [[accounts]] or its "
-                    "runner-account.toml does not load (fix the file, or run "
+                    f"{affined_account!r} not in [[accounts]] (run "
                     "`queue restart-fresh` to start a fresh session)"
                 ),
             )
@@ -190,6 +205,14 @@ def choose_account(
 
     pinned = task.account
     if pinned is not None:
+        if pinned in broken:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"pinned account {pinned!r} takes no tasks until its "
+                    f"runner-account.toml loads: {broken[pinned]}"
+                ),
+            )
         if pinned not in accounts:
             return DispatchChoice(
                 account=None,
@@ -223,7 +246,7 @@ def choose_account(
         return DispatchChoice(account=pinned, reason=f"pinned to {pinned!r}")
 
     candidates: list[tuple[tuple[int, int, str], str]] = []
-    blocked_reasons: list[str] = []
+    blocked_reasons = [f"{name}: its runner-account.toml does not load" for name in broken]
     for name, acct in accounts.items():
         maybe_state = account_states.get(name)
         if maybe_state is None:

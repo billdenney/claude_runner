@@ -31,6 +31,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 import signal
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -318,8 +319,17 @@ class AccountFileWatch:
         loaded = {acct.name for acct in resolution.accounts}
         for name in [n for n in self.logged if n not in resolution.broken_names]:
             path, _error, _stamp = self.logged.pop(name)
-            if name in loaded:
+            if name not in loaded:
+                continue
+            if os.path.lexists(path):
                 logger.info("account %r takes tasks again: %s loads", name, path)
+            else:
+                logger.info(
+                    "account %r takes tasks again: %s is gone, so the defaults apply "
+                    "(max_concurrency = 1 and the queue's [dispatch_pct.*])",
+                    name,
+                    path,
+                )
         if resolution.broken and not resolution.accounts:
             if not self.all_broken_logged:
                 self.all_broken_logged = True
@@ -342,8 +352,9 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
     synthesise a policy that carries the queue's ceiling
     (:attr:`QueueCeiling.value`: an explicit ``[concurrency].max_concurrency``
     when it binds, else the sum of the accounts' own caps, an account
-    missing from ``ctx.account_policies`` counting its default of 1) rather
-    than the per-account default of 1. ADR-0022 requires
+    missing from ``ctx.account_policies`` counting its default of 1 and one
+    in ``ctx.broken_accounts`` counting 0) rather than the per-account
+    default of 1. ADR-0022 requires
     ``max_concurrency`` never to be implicit.
     """
     if account_name is not None:
@@ -355,7 +366,9 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
         {
             acct.name: ctx.account_policies.get(acct.name, AccountPolicy())
             for acct in ctx.settings.accounts
+            if acct.name not in ctx.broken_accounts
         },
+        broken=sorted(ctx.broken_accounts),
     )
     return AccountPolicy(
         concurrency=AccountConcurrencyPolicy(max_concurrency=max(1, ceiling.value)),

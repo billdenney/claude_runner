@@ -19,6 +19,7 @@ config dir.
 from __future__ import annotations
 
 import logging
+import os
 import tomllib
 from dataclasses import dataclass
 from importlib import resources
@@ -259,45 +260,79 @@ def per_account_toml_path(config_dir: str) -> Path | None:
     Returns ``None`` when ``config_dir`` is empty (the synthesised
     legacy ``"default"`` account before the operator declares a
     non-empty config_dir). When set, returns the absolute path
-    whether or not the file exists.
+    whether or not the file exists. Raises :class:`ConfigError` when a
+    leading ``~user`` names no user, since no path can be built.
     """
     if not config_dir:
         return None
-    return Path(config_dir).expanduser() / PER_ACCOUNT_TOML_NAME
+    try:
+        return Path(config_dir).expanduser() / PER_ACCOUNT_TOML_NAME
+    except RuntimeError as exc:
+        raise ConfigError(f"Cannot find {config_dir}/{PER_ACCOUNT_TOML_NAME}: {exc}") from exc
+
+
+def per_account_toml_shown(config_dir: str) -> str | None:
+    """:func:`per_account_toml_path` as a string, as written when it cannot
+    be built, or ``None`` for an empty ``config_dir``."""
+    try:
+        path = per_account_toml_path(config_dir)
+    except ConfigError:
+        return f"{config_dir}/{PER_ACCOUNT_TOML_NAME}"
+    return None if path is None else str(path)
 
 
 def load_account_policy(config_dir: str) -> AccountPolicy:
     """Read ``<config_dir>/runner-account.toml`` and return the policy.
 
-    Missing file → all defaults: ``max_concurrency=1`` and no
+    An absent file → all defaults: ``max_concurrency=1`` and no
     ``[dispatch_pct.*]`` overrides, so :func:`throttle.policy.resolve`
     uses the queue's values. A missing ``config_dir``, or one that is not
-    a directory, counts as a missing file. Empty config_dir → defaults
+    a directory, counts as an absent file. Empty config_dir → defaults
     (used for the synthesised legacy ``"default"`` account before the
     operator declares an explicit config_dir).
 
-    A file that exists but cannot be read, is not UTF-8 TOML, sets the
-    retired ``[throttle.*]`` table or fails validation raises
-    :class:`ConfigError` naming the file. :func:`resolve_accounts` turns
-    that into a :class:`BrokenAccount` instead of letting it propagate.
+    Raises :class:`ConfigError` naming the file when it is there but does
+    not load: it cannot be read, is a symlink to nothing, is empty (zero
+    bytes), is not UTF-8 TOML, sets the retired ``[throttle.*]`` table or
+    fails validation. An empty file or a dangling symlink is usually a
+    file caught mid-save, so it is not read as "use the defaults".
+    :func:`resolve_accounts` turns the error into a :class:`BrokenAccount`
+    instead of letting it propagate.
     """
     path = per_account_toml_path(config_dir)
     if path is None:
         return AccountPolicy()
     try:
         with path.open("rb") as fh:
-            payload = tomllib.load(fh)
+            data = fh.read()
     except (FileNotFoundError, NotADirectoryError):
+        if _is_symlink(path):
+            raise ConfigError(
+                f"{path} is a symlink to {os.readlink(path)}, which does not exist"
+            ) from None
         return AccountPolicy()
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"Cannot read {path}: {exc}") from exc
+    if not data:
+        raise ConfigError(
+            f"{path} is empty; delete it for the defaults, or write the settings it should hold"
+        )
+    try:
+        payload = tomllib.loads(data.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
     _reject_legacy_throttle(payload, str(path))
     try:
         return AccountPolicy.model_validate(payload)
     except ValidationError as exc:
         raise ConfigError(f"Per-account policy validation failed for {path}: {exc}") from exc
+
+
+def _is_symlink(path: Path) -> bool:
+    try:
+        return path.is_symlink()
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -360,7 +395,7 @@ def resolve_accounts(settings: Settings) -> AccountResolution:
             broken.append(
                 BrokenAccount(
                     name=acct.name,
-                    path=str(per_account_toml_path(acct.config_dir)),
+                    path=per_account_toml_shown(acct.config_dir) or "",
                     error=str(exc),
                 )
             )

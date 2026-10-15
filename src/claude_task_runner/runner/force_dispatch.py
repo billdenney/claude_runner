@@ -47,6 +47,7 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -63,11 +64,12 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
-from claude_task_runner.runner.account_dispatch import dispatch_headroom
+from claude_task_runner.runner.account_dispatch import account_in_flight_count, dispatch_headroom
 from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
+from claude_task_runner.supervisor.states import InFlightRecord
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
@@ -240,8 +242,7 @@ def _no_free_slot(
     with every in-flight task. Without one, the request waits until some
     account has a free slot under its own ``max_concurrency``
     (:func:`runner.account_dispatch.dispatch_headroom`). Either way it is
-    not the warm-up cap, and the request then goes to its affined, pinned
-    or first account, which may be the full one.
+    not the warm-up cap. :func:`_pick_account` then chooses the account.
     """
     if configured is not None:
         return len(in_flight_slots) >= configured
@@ -259,15 +260,26 @@ class _AccountPick:
     as it stands (drop it) rather than later (leave it for a later tick)."""
 
 
-def _pick_account(task: Task, affined: str | None, resolution: AccountResolution) -> _AccountPick:
-    """Session affinity, then ``task.account`` pinning, then the first account.
+def _pick_account(
+    task: Task,
+    affined: str | None,
+    resolution: AccountResolution,
+    in_flight: Sequence[InFlightRecord] = (),
+) -> _AccountPick:
+    """Session affinity, then ``task.account`` pinning, then a free account.
+
+    An unbound request goes to the first account, in declaration order,
+    with a free slot under its own ``max_concurrency`` given ``in_flight``,
+    and to the first account when none has one (which only
+    ``--over-limit`` or an explicit ``[concurrency].max_concurrency``
+    lets through). Force bypasses throttling and pauses, not the caps.
 
     An account whose ``runner-account.toml`` does not load takes no tasks,
     forced or not: a request affined or pinned to one waits for the file to
     be fixed rather than going elsewhere, and with no account loaded at all
     every request waits. A session host no longer in ``[[accounts]]`` is
     dropped with the ``queue restart-fresh`` hint (ADR-0024). A pin to an
-    unknown account falls through to the first account.
+    unknown account falls through to the unbound choice.
     """
     by_name = {acct.name: acct for acct in resolution.accounts}
     broken = {b.name: b for b in resolution.broken}
@@ -275,7 +287,8 @@ def _pick_account(task: Task, affined: str | None, resolution: AccountResolution
         if affined in broken:
             return _AccountPick(
                 None,
-                f"session host account {affined!r} takes no tasks: {broken[affined].error}",
+                f"session host account {affined!r} takes no tasks until its "
+                f"runner-account.toml loads: {broken[affined].error}",
             )
         if affined not in by_name:
             return _AccountPick(
@@ -288,12 +301,17 @@ def _pick_account(task: Task, affined: str | None, resolution: AccountResolution
     if task.account is not None and task.account in broken:
         return _AccountPick(
             None,
-            f"pinned account {task.account!r} takes no tasks: {broken[task.account].error}",
+            f"pinned account {task.account!r} takes no tasks until its "
+            f"runner-account.toml loads: {broken[task.account].error}",
         )
     if task.account is not None and task.account in by_name:
         return _AccountPick(by_name[task.account])
     if not by_name:
         return _AccountPick(None, "no account's runner-account.toml loads")
+    in_flight = list(in_flight)
+    for acct in by_name.values():
+        if account_in_flight_count(acct.name, in_flight) < acct.policy.concurrency.max_concurrency:
+            return _AccountPick(acct)
     return _AccountPick(next(iter(by_name.values())))
 
 
@@ -420,7 +438,13 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
-        if not req.allow_over_limit and _no_free_slot(accounts, in_flight_slots, configured):
+        # With no account loaded there is no slot to wait for;
+        # _pick_account below says so.
+        if (
+            accounts
+            and not req.allow_over_limit
+            and _no_free_slot(accounts, in_flight_slots, configured)
+        ):
             logger.warning(
                 "force-dispatch %s: no free slot (in-flight=%d, %s); leaving request",
                 task.id,
@@ -451,7 +475,7 @@ def tick_consume(
         #   An account whose runner-account.toml does not load takes no
         #   tasks, forced or not (ADR-0035): a request bound to one waits.
         affined = state.session_host_account() if state is not None else None
-        pick = _pick_account(task, affined, resolution)
+        pick = _pick_account(task, affined, resolution, to_in_flight_records(in_flight_slots))
         if pick.account is None:
             if pick.drop:
                 logger.warning("force-dispatch %s: %s; dropping request", task.id, pick.reason)
