@@ -169,8 +169,8 @@ def run_one_tick(
         A poll result that still has no account (several accounts
         configured, but a source that does not name them, as after a
         SIGHUP that added an account) updates only the top-level fields,
-        with a policy carrying the queue-wide concurrency cap, and logs an
-        error each tick.
+        with a policy carrying the queue's concurrency ceiling
+        (:func:`_resolve_account_policy`), and logs an error each tick.
 
     Freshness (``[usage].max_reading_age_s``):
         Each tick reads one account, so after ``step()`` every account
@@ -226,22 +226,20 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
     :func:`runner.account_dispatch.choose_account` applies, so the
     decision's ramp scales the number dispatch really uses. Otherwise
     synthesise a policy that carries the queue's ceiling
-    (:class:`QueueCeiling`: ``[concurrency].max_concurrency`` when set,
-    else the sum of the accounts' own caps, an account missing from
-    ``ctx.account_policies`` counting its default of 1) rather than the
-    per-account default of 1. ADR-0022 requires ``max_concurrency`` never
-    to be implicit.
+    (:attr:`QueueCeiling.value`: an explicit ``[concurrency].max_concurrency``
+    when it binds, else the sum of the accounts' own caps, an account
+    missing from ``ctx.account_policies`` counting its default of 1) rather
+    than the per-account default of 1. ADR-0022 requires
+    ``max_concurrency`` never to be implicit.
     """
     if account_name is not None:
         explicit = ctx.account_policies.get(account_name)
         if explicit is not None:
             return explicit
-    ceiling = QueueCeiling(
-        configured=ctx.settings.concurrency.max_concurrency,
-        account_caps={
-            acct.name: ctx.account_policies.get(
-                acct.name, AccountPolicy()
-            ).concurrency.max_concurrency
+    ceiling = QueueCeiling.of(
+        ctx.settings.concurrency.max_concurrency,
+        {
+            acct.name: ctx.account_policies.get(acct.name, AccountPolicy())
             for acct in ctx.settings.accounts
         },
     )
@@ -251,27 +249,38 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
 
 
 @dataclass
-class QueueCeilingWarning:
-    """Warns when ``[concurrency].max_concurrency`` holds the queue below its accounts' caps.
+class QueueCeilingWatch:
+    """Logs the queue's concurrency ceiling once per config load, and warns while it binds.
 
     The supervisor keeps one for its lifetime and shows it every tick's
-    :class:`QueueCeiling`. While the ceiling binds it logs one WARNING
-    naming both numbers, and logs again only when either number changes
-    (an edit to the queue TOML or to an account's ``runner-account.toml``),
+    :class:`QueueCeiling`. The first tick after a start, and the first
     after :meth:`rearm`, which the supervisor calls on each successful
-    reload, or after a tick on which the ceiling did not bind.
+    reload, log one INFO line with :meth:`QueueCeiling.describe`. While
+    ``[concurrency].max_concurrency`` holds the queue below its accounts'
+    own caps, it logs one WARNING naming both numbers, and again only when
+    either number changes (an edit to the queue TOML or to an account's
+    ``runner-account.toml``), after :meth:`rearm`, or after a tick on which
+    the ceiling did not bind.
     """
+
+    announce: bool = True
+    """Whether the next tick logs the INFO line."""
 
     warned_for: tuple[int, int] | None = None
     """``(max_concurrency, accounts_total)`` of the last warning; ``None``
     when the next binding tick warns."""
 
     def rearm(self) -> None:
-        """Warn on the next binding tick even if the numbers are unchanged."""
+        """Log the INFO line on the next tick, and warn then if it binds,
+        even if the numbers are unchanged."""
+        self.announce = True
         self.warned_for = None
 
     def observe(self, ceiling: QueueCeiling) -> None:
-        """Log the warning if ``ceiling`` binds and has not been warned about."""
+        """Log what :meth:`rearm` or a binding ceiling calls for."""
+        if self.announce:
+            self.announce = False
+            logger.info("concurrency ceiling: %s", ceiling.describe())
         if ceiling.configured is None or not ceiling.binds:
             self.warned_for = None
             return
@@ -1096,7 +1105,7 @@ def start_daemon(
 
             ticks = 0
             last_worktree_reclaim_at: datetime | None = None
-            ceiling_warning = QueueCeilingWarning()
+            ceiling_watch = QueueCeilingWatch()
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -1113,7 +1122,7 @@ def start_daemon(
                     )
                     # A failed reload returns the config already in force.
                     if reloaded is not settings:
-                        ceiling_warning.rearm()
+                        ceiling_watch.rearm()
                     settings = reloaded
                     reload_flag["pending"] = False
 
@@ -1128,8 +1137,8 @@ def start_daemon(
 
                 resolved = resolve_accounts(settings)
                 account_policies = {a.name: a.policy for a in resolved}
-                ceiling_warning.observe(
-                    QueueCeiling.of(settings.concurrency.max_concurrency, resolved)
+                ceiling_watch.observe(
+                    QueueCeiling.of(settings.concurrency.max_concurrency, account_policies)
                 )
 
                 ctx = TickContext(

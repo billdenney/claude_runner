@@ -306,7 +306,7 @@ def _say(console: Console, message: str, style: str) -> None:
     markup, so without ``emoji=False`` a queue at ``/data/a:b:c`` printed
     with an emoji in place of ``:b:``.
     """
-    console.print(message, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
+    console.print(message, style=style, markup=False, emoji=False, highlight=False)
 
 
 def _pid_to_signal(queue_path: Path, console: Console) -> int:
@@ -609,7 +609,10 @@ def status(
     # An account's runner-account.toml that does not load is reported in
     # place of the ceiling; the rest of the status still prints.
     try:
-        ceiling = QueueCeiling.of(settings.concurrency.max_concurrency, resolve_accounts(settings))
+        ceiling = QueueCeiling.of(
+            settings.concurrency.max_concurrency,
+            {a.name: a.policy for a in resolve_accounts(settings)},
+        )
     except ConfigError as exc:
         ceiling_json: dict[str, object] = {"error": str(exc)}
         ceiling_line = f"unknown: {exc}"
@@ -659,4 +662,6 @@ def status(
             console.print(f"[red]Last drift:[/]       {snapshot.last_drift_message}")
     console.print(f"[bold]Pending:[/]          {payload['pending']}")
     console.print(f"[bold]In-flight:[/]        {payload['in_flight']}")
-    console.print(f"[bold]Queue ceiling:[/]    {escape(ceiling_line)}", highlight=False)
+    console.print(
+        f"[bold]Queue ceiling:[/]    {escape(ceiling_line)}", highlight=False, soft_wrap=True
+    )

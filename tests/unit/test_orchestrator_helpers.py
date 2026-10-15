@@ -217,21 +217,19 @@ def test_completed_task_ids_skips_unparseable(queue_dir: Path) -> None:
 def test_target_concurrency_uses_initial_before_first_completion(queue_dir: Path) -> None:
     """No completed tasks → use initial_concurrency."""
     settings = _make_settings(initial=2, max_c=5)
-    assert _target_concurrency(queue_dir, settings, _resolved(cap=8)) == 2
+    assert _target_concurrency(queue_dir, settings) == 2
 
 
 def test_target_concurrency_uses_max_after_first_completion(queue_dir: Path) -> None:
     settings = _make_settings(initial=2, max_c=5)
     _seed_state(queue_dir, "warmup", "completed")
-    assert _target_concurrency(queue_dir, settings, _resolved(cap=8)) == 5
+    assert _target_concurrency(queue_dir, settings) == 5
 
 
 def test_target_concurrency_clamps_zero_or_negative_to_one(queue_dir: Path) -> None:
     """A misconfigured settings with max=0 still returns 1 (the floor)."""
     settings = _make_settings(initial=0, max_c=0)
-    assert _target_concurrency(queue_dir, settings, _resolved(cap=8)) == 1
-    _seed_state(queue_dir, "warmup", "completed")
-    assert _target_concurrency(queue_dir, settings, _resolved(cap=8)) == 1
+    assert _target_concurrency(queue_dir, settings) == 1
 
 
 # ---------------------------------------------------------------------------

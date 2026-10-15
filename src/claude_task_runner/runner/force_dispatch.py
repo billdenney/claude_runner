@@ -17,9 +17,8 @@ supervisor (no race with the supervisor's own dispatch loop):
    throttle gate. It scans the request directory, revalidates each
    task (still in ``todo/``, still in a dispatchable status, not
    already in-flight, (model, effort) accepted, ``requires``
-   satisfied), respects the queue's concurrency ceiling
-   (:class:`runner.account_dispatch.QueueCeiling`) unless the request was
-   written with ``allow_over_limit=True``, and spawns exactly the same
+   satisfied), waits for a free slot (:func:`_no_free_slot`) unless the
+   request was written with ``allow_over_limit=True``, and spawns exactly the same
    per-task dispatch thread the orchestrator does.
 
 The bypass is scoped to the THROTTLE. The ADR-0030 ``requires`` gate is
@@ -34,7 +33,7 @@ fixture-queue debugging), :func:`dispatch_synchronously` runs one
 attempt in-process. There is no race because the host-wide lock
 isn't held by anyone else.
 
-Request files persist across ticks when the queue's ceiling is full
+Request files persist across ticks when there is no free slot
 and ``allow_over_limit=False``: the supervisor declines, leaves the
 file in place, and tries again on the next tick. Operators wanting
 the request to evaporate on capacity-decline must remove it manually.
@@ -64,15 +63,15 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
-from claude_task_runner.runner.account_dispatch import QueueCeiling
+from claude_task_runner.runner.account_dispatch import dispatch_headroom
 from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
-from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
-    from claude_task_runner.config.schema import Settings
+    from claude_task_runner.config.schema import ResolvedAccount, Settings
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +229,25 @@ def _load_state_or_none(queue_dir: Path, task_id: str) -> TaskState | None:
         ) from exc
 
 
+def _no_free_slot(
+    accounts: list[ResolvedAccount],
+    in_flight_slots: dict[str, DispatchSlot],
+    configured: int | None,
+) -> bool:
+    """Whether a force-dispatch without ``allow_over_limit`` must wait.
+
+    An explicit ``[concurrency].max_concurrency`` is the gate, compared
+    with every in-flight task. Without one, the request waits until some
+    account has a free slot under its own ``max_concurrency``
+    (:func:`runner.account_dispatch.dispatch_headroom`). Either way it is
+    not the warm-up cap, and the request then goes to its affined, pinned
+    or first account, which may be the full one.
+    """
+    if configured is not None:
+        return len(in_flight_slots) >= configured
+    return dispatch_headroom(accounts, to_in_flight_records(in_flight_slots), None) == 0
+
+
 def tick_consume(
     *,
     queue_dir: Path,
@@ -260,8 +278,7 @@ def tick_consume(
     accounts_by_name = {a.name: a for a in accounts}
 
     dispatched = 0
-    # Not the warm-up cap: a force is an explicit operator request.
-    cap = max(1, QueueCeiling.of(settings.concurrency.max_concurrency, accounts).value)
+    configured = settings.concurrency.max_concurrency
 
     for req in requests:
         task_path = task_path_for(queue_dir, req.task_id)
@@ -354,12 +371,14 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
-        if not req.allow_over_limit and len(in_flight_slots) >= cap:
+        if not req.allow_over_limit and _no_free_slot(accounts, in_flight_slots, configured):
             logger.warning(
-                "force-dispatch %s: in-flight=%d >= queue ceiling=%d; leaving request",
+                "force-dispatch %s: no free slot (in-flight=%d, %s); leaving request",
                 task.id,
                 len(in_flight_slots),
-                cap,
+                "every account at its own max_concurrency"
+                if configured is None
+                else f"[concurrency].max_concurrency={configured}",
             )
             continue
 

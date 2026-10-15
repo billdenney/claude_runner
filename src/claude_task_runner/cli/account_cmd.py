@@ -149,7 +149,9 @@ def list_accounts(
         raise typer.Exit(code=2) from exc
 
     rows = [_account_row(a, snapshot, paused) for a in accounts]
-    ceiling = QueueCeiling.of(settings.concurrency.max_concurrency, accounts)
+    ceiling = QueueCeiling.of(
+        settings.concurrency.max_concurrency, {a.name: a.policy for a in accounts}
+    )
 
     if json:
         print(
@@ -198,6 +200,7 @@ def list_accounts(
     console.print(
         f"[bold]queue ceiling:[/] {escape(queue_ceiling_text(ceiling, settings))}",
         highlight=False,
+        soft_wrap=True,
     )
 
 

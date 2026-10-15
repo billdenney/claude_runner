@@ -42,19 +42,21 @@ set. While SLOWING_DOWN that target is ADR-0022's linear ramp, the
 number the supervisor announced, so each account slows down on its own
 5h reading.
 
-:func:`choose_account` applies no queue-wide cap. The orchestrator
-separately bounds the queue's total in-flight tasks by
-:class:`QueueCeiling`: ``[concurrency].max_concurrency`` when the queue
-TOML sets it, otherwise the sum of the accounts' own ``max_concurrency``,
-which never binds (``runner.orchestrator._target_concurrency``, ADR-0035).
+:func:`choose_account` applies no queue-wide cap. Before it is asked,
+the orchestrator bounds how many tasks a tick starts by
+:func:`dispatch_headroom`: each account's free slots under its own
+``max_concurrency``, summed, and no more than an explicit
+``[concurrency]`` cap allows when the queue TOML sets one (ADR-0035).
+Without one, no account is ever held below its own cap.
+:class:`QueueCeiling` summarises the same numbers for the log and the CLI.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from claude_task_runner.config.schema import ResolvedAccount
+from claude_task_runner.config.schema import AccountPolicy, ResolvedAccount
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -309,42 +311,69 @@ def account_in_flight_count(account: str, in_flight: list[InFlightRecord]) -> in
     return sum(1 for r in in_flight if r.account == account)
 
 
+def dispatch_headroom(
+    accounts: Iterable[ResolvedAccount],
+    in_flight: Sequence[InFlightRecord],
+    queue_cap: int | None,
+) -> int:
+    """How many more tasks may start now, across all accounts.
+
+    Each declared account adds its free slots under its own
+    ``max_concurrency``. An account running more than that, because its cap
+    was lowered while its tasks ran, adds 0 rather than taking slots from
+    the others, and an in-flight task of an account no longer in
+    ``accounts`` counts against no account. ``queue_cap`` is the explicit
+    queue-wide cap in force (``runner.orchestrator._target_concurrency``),
+    ``None`` when there is none; when set, every in-flight task, declared
+    or not, counts against it.
+
+    An upper bound: :func:`choose_account` still lowers each account to
+    its throttle target and skips one that takes no tasks.
+    """
+    in_flight = list(in_flight)
+    free = sum(
+        max(
+            0,
+            acct.policy.concurrency.max_concurrency - account_in_flight_count(acct.name, in_flight),
+        )
+        for acct in accounts
+    )
+    if queue_cap is None:
+        return free
+    return max(0, min(free, queue_cap - len(in_flight)))
+
+
 @dataclass(frozen=True)
 class QueueCeiling:
-    """The cap on a queue's in-flight tasks, summed over all its accounts.
+    """The most tasks a queue can run at once, and where that number comes from.
 
     ``configured`` is the queue TOML's ``[concurrency].max_concurrency``,
     ``None`` when the key is left out. ``account_caps`` maps each account to
-    its own ``max_concurrency`` from its ``runner-account.toml``, the number
-    :func:`account_cap` starts from. Build it with :meth:`of` from the
-    accounts ``config.loader.resolve_accounts`` returned this tick, so an
-    edit to an account's file moves the ceiling within a tick.
+    its own ``max_concurrency`` from its ``runner-account.toml``. Build it
+    with :meth:`of` from the policies ``config.loader.resolve_accounts``
+    returned this tick, so an edit to an account's file shows within a tick.
 
-    ``[concurrency].initial_concurrency``'s warm-up cap is not part of it;
-    ``runner.orchestrator._target_concurrency`` applies that.
+    Dispatch itself uses :func:`dispatch_headroom`, which counts free slots
+    per account. This is the summary the supervisor's log and the CLI show,
+    and the cap the daemon gives a usage reading it cannot attribute.
+    ``[concurrency].initial_concurrency``'s warm-up cap is not part of it.
     """
 
     configured: int | None
     account_caps: Mapping[str, int]
 
     @classmethod
-    def of(cls, configured: int | None, accounts: Iterable[ResolvedAccount]) -> QueueCeiling:
-        """The ceiling for ``configured`` over ``accounts``' resolved policies."""
+    def of(cls, configured: int | None, policies: Mapping[str, AccountPolicy]) -> QueueCeiling:
+        """The ceiling for ``configured`` over ``policies``, keyed by account name."""
         return cls(
             configured=configured,
-            account_caps={a.name: a.policy.concurrency.max_concurrency for a in accounts},
+            account_caps={name: p.concurrency.max_concurrency for name, p in policies.items()},
         )
 
     @property
     def accounts_total(self) -> int:
         """The sum of the accounts' own ``max_concurrency``."""
         return sum(self.account_caps.values())
-
-    @property
-    def value(self) -> int:
-        """The number dispatch holds the queue's in-flight count under:
-        ``configured`` when set, else :attr:`accounts_total`."""
-        return self.configured if self.configured is not None else self.accounts_total
 
     @property
     def binds(self) -> bool:
@@ -356,22 +385,32 @@ class QueueCeiling:
         return self.configured is not None and self.configured < self.accounts_total
 
     @property
+    def value(self) -> int:
+        """The most tasks the queue's accounts can run at once: ``configured``
+        when it binds, else :attr:`accounts_total`."""
+        if self.configured is not None and self.binds:
+            return self.configured
+        return self.accounts_total
+
+    @property
     def breakdown(self) -> str:
         """Each account's cap, in declaration order: ``personal 5 + work 3``."""
         return " + ".join(f"{name} {cap}" for name, cap in self.account_caps.items())
 
     def describe(self) -> str:
         """The ceiling, where it comes from and whether it binds, on one line."""
-        if self.configured is None:
-            return f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
-        verdict = "binds" if self.binds else "does not bind"
-        return (
-            f"{self.configured} from [concurrency].max_concurrency, which {verdict}: "
-            f"the accounts' max_concurrency sum to {self.accounts_total} ({self.breakdown})"
-        )
+        if self.configured is not None and self.binds:
+            return (
+                f"{self.configured} from [concurrency].max_concurrency, which binds: "
+                f"the accounts' max_concurrency sum to {self.accounts_total} ({self.breakdown})"
+            )
+        text = f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
+        if self.configured is not None:
+            text += f"; [concurrency].max_concurrency = {self.configured} does not bind"
+        return text
 
     def as_json(self) -> dict[str, object]:
-        """The fields ``--json`` output carries."""
+        """The fields ``--json`` output carries. ``ceiling`` is :attr:`value`."""
         return {
             "ceiling": self.value,
             "max_concurrency": self.configured,

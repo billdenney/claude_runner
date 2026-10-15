@@ -7,10 +7,11 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the queue-wide ceiling for this tick: ``[concurrency]`` when
-   the queue TOML sets it, else the sum of the accounts' own caps.
+2. Computes how many tasks this tick may start: each account's free
+   slots under its own cap, within ``[concurrency]`` when the queue TOML
+   sets it.
 3. Picks eligible pending tasks (no ``running`` state file, all
-   ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
+   ``depends_on`` IDs are ``completed``), up to that number.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
    to pick the account to dispatch through (equal-priority across
    accounts, least 5h util wins). Skips the task when no account has
@@ -231,8 +232,9 @@ def tick_dispatch(
     if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
-    target = _target_concurrency(queue_dir, settings, accounts)
-    available = max(0, target - len(in_flight_slots))
+    available = account_dispatch_mod.dispatch_headroom(
+        accounts, to_in_flight_records(in_flight_slots), _target_concurrency(queue_dir, settings)
+    )
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -539,19 +541,14 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     return state.runs[-1].pid
 
 
-def _target_concurrency(
-    queue_dir: Path, settings: Settings, accounts: list[ResolvedAccount]
-) -> int:
-    """Queue-wide ceiling on in-flight tasks across all accounts.
+def _target_concurrency(queue_dir: Path, settings: Settings) -> int | None:
+    """The explicit queue-wide cap on in-flight tasks in force, or ``None``.
 
     ``[concurrency].initial_concurrency``, when set, until at least one
-    task has completed in this queue. Otherwise the
-    :class:`account_dispatch.QueueCeiling` of ``accounts``:
-    ``[concurrency].max_concurrency`` when set, else the sum of the
-    accounts' own ``max_concurrency``. ``accounts`` is this tick's
-    resolution, the same one :func:`account_dispatch.choose_account`
-    caps each account by, so an edit to an account's
-    ``runner-account.toml`` moves both on the same tick.
+    task has completed in this queue; otherwise
+    ``[concurrency].max_concurrency``. ``None`` when the key that applies
+    is left out: then each account's own ``max_concurrency`` is the only
+    limit (:func:`account_dispatch.dispatch_headroom`, ADR-0035).
 
     Throttling is not applied here. Each account's own cap, including
     its SLOWING_DOWN ramp target, is enforced per task by
@@ -563,8 +560,8 @@ def _target_concurrency(
     initial = settings.concurrency.initial_concurrency
     if initial is not None and not _has_any_completed(queue_dir):
         return max(1, initial)
-    ceiling = account_dispatch_mod.QueueCeiling.of(settings.concurrency.max_concurrency, accounts)
-    return max(1, ceiling.value)
+    configured = settings.concurrency.max_concurrency
+    return None if configured is None else max(1, configured)
 
 
 def _has_any_completed(queue_dir: Path) -> bool:
