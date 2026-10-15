@@ -52,7 +52,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from claude_task_runner.config.loader import resolve_accounts
+from claude_task_runner.config.loader import AccountResolution, resolve_accounts
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -248,6 +248,55 @@ def _no_free_slot(
     return dispatch_headroom(accounts, to_in_flight_records(in_flight_slots), None) == 0
 
 
+@dataclass(frozen=True)
+class _AccountPick:
+    """The account a force-dispatch goes to, or why it goes nowhere."""
+
+    account: ResolvedAccount | None
+    reason: str = ""
+    drop: bool = False
+    """When no account was picked: whether the request can never go through
+    as it stands (drop it) rather than later (leave it for a later tick)."""
+
+
+def _pick_account(task: Task, affined: str | None, resolution: AccountResolution) -> _AccountPick:
+    """Session affinity, then ``task.account`` pinning, then the first account.
+
+    An account whose ``runner-account.toml`` does not load takes no tasks,
+    forced or not: a request affined or pinned to one waits for the file to
+    be fixed rather than going elsewhere, and with no account loaded at all
+    every request waits. A session host no longer in ``[[accounts]]`` is
+    dropped with the ``queue restart-fresh`` hint (ADR-0024). A pin to an
+    unknown account falls through to the first account.
+    """
+    by_name = {acct.name: acct for acct in resolution.accounts}
+    broken = {b.name: b for b in resolution.broken}
+    if affined is not None:
+        if affined in broken:
+            return _AccountPick(
+                None,
+                f"session host account {affined!r} takes no tasks: {broken[affined].error}",
+            )
+        if affined not in by_name:
+            return _AccountPick(
+                None,
+                f"session affined to {affined!r} which is not in [[accounts]]; run "
+                f"`queue restart-fresh {task.id}` to clear the session and dispatch fresh",
+                drop=True,
+            )
+        return _AccountPick(by_name[affined])
+    if task.account is not None and task.account in broken:
+        return _AccountPick(
+            None,
+            f"pinned account {task.account!r} takes no tasks: {broken[task.account].error}",
+        )
+    if task.account is not None and task.account in by_name:
+        return _AccountPick(by_name[task.account])
+    if not by_name:
+        return _AccountPick(None, "no account's runner-account.toml loads")
+    return _AccountPick(next(iter(by_name.values())))
+
+
 def tick_consume(
     *,
     queue_dir: Path,
@@ -274,8 +323,8 @@ def tick_consume(
     if not requests:
         return 0
 
-    accounts = resolve_accounts(settings)
-    accounts_by_name = {a.name: a for a in accounts}
+    resolution = resolve_accounts(settings)
+    accounts = list(resolution.accounts)
 
     dispatched = 0
     configured = settings.concurrency.max_concurrency
@@ -399,25 +448,18 @@ def tick_consume(
         #      the next dispatch starts a fresh session.
         #   2. Task.account pinning when present and known.
         #   3. First configured account (fallback).
+        #   An account whose runner-account.toml does not load takes no
+        #   tasks, forced or not (ADR-0035): a request bound to one waits.
         affined = state.session_host_account() if state is not None else None
-        if affined is not None:
-            if affined not in accounts_by_name:
-                logger.warning(
-                    "force-dispatch %s: session affined to %r which is "
-                    "not in [[accounts]]; dropping request. Run "
-                    "`queue restart-fresh %s` to clear the session "
-                    "and dispatch fresh.",
-                    task.id,
-                    affined,
-                    task.id,
-                )
+        pick = _pick_account(task, affined, resolution)
+        if pick.account is None:
+            if pick.drop:
+                logger.warning("force-dispatch %s: %s; dropping request", task.id, pick.reason)
                 consume_request(queue_dir, task.id)
-                continue
-            picked = accounts_by_name[affined]
-        elif task.account and task.account in accounts_by_name:
-            picked = accounts_by_name[task.account]
-        else:
-            picked = next(iter(accounts_by_name.values()))
+            else:
+                logger.warning("force-dispatch %s: %s; leaving request", task.id, pick.reason)
+            continue
+        picked = pick.account
 
         consume_request(queue_dir, task.id)
         _spawn_dispatch_thread(
@@ -538,25 +580,14 @@ def dispatch_synchronously(
             f"requirement(s): {'; '.join(unmet_reqs)}"
         )
 
-    accounts = resolve_accounts(settings)
-    accounts_by_name = {a.name: a for a in accounts}
     # ADR-0024: session affinity wins over task.account pinning when
     # both are set. A session opened on account X is invisible to
     # claude running with account Y's CLAUDE_CONFIG_DIR, so this is
     # a correctness gate, not a policy choice.
-    affined = state.session_host_account()
-    if affined is not None:
-        if affined not in accounts_by_name:
-            raise ForceDispatchError(
-                f"task {task.id} session affined to {affined!r} which "
-                "is not in [[accounts]]; run `queue restart-fresh "
-                f"{task.id}` to clear the session and dispatch fresh"
-            )
-        picked = accounts_by_name[affined]
-    elif task.account and task.account in accounts_by_name:
-        picked = accounts_by_name[task.account]
-    else:
-        picked = next(iter(accounts_by_name.values()))
+    pick = _pick_account(task, state.session_host_account(), resolve_accounts(settings))
+    if pick.account is None:
+        raise ForceDispatchError(f"task {task.id}: {pick.reason}")
+    picked = pick.account
 
     plan = plan_next_spawn(task, state, settings=settings.session)
     outcome = dispatcher_mod.dispatch(

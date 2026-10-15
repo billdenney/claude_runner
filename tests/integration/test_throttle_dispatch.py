@@ -140,7 +140,7 @@ def _tick(
         poll_result=reading,
         pending_count=pending_count,
         in_flight_count=0,
-        account_policies={a.name: a.policy for a in resolve_accounts(settings)},
+        account_policies=resolve_accounts(settings).policies,
     )
     return run_one_tick(snapshot, ctx, clock)
 

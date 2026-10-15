@@ -38,8 +38,8 @@ from claude_task_runner.cli._helpers import (
     require_queue_option,
     resolve_per_queue_config,
 )
-from claude_task_runner.config.loader import load_settings, resolve_accounts
-from claude_task_runner.config.schema import ResolvedAccount, Settings
+from claude_task_runner.config.loader import BrokenAccount, load_settings, resolve_accounts
+from claude_task_runner.config.schema import AccountSettings, ResolvedAccount, Settings
 from claude_task_runner.runner.account_dispatch import (
     QueueCeiling,
     account_cap,
@@ -61,28 +61,54 @@ def _snapshot(settings: Settings, queue_dir: Path) -> SupervisorSnapshot | None:
     return persist_mod.load(path)
 
 
+def _state_fields(
+    name: str,
+    snapshot: SupervisorSnapshot | None,
+    paused: frozenset[str],
+    cap: int,
+) -> dict[str, object]:
+    """The observed-state part of an ``account list`` row.
+
+    ``paused`` is the set of names with a pause marker. It is read
+    directly rather than from ``snapshot``, whose copy of the flag lags
+    a pause or resume until the supervisor's next tick. ``cap`` is the
+    number dispatch allows the account now.
+    """
+    state: AccountState | None = None
+    in_flight_count = 0
+    if snapshot is not None:
+        state = snapshot.accounts.get(name)
+        in_flight_count = account_in_flight_count(name, snapshot.in_flight)
+    return {
+        "state": state.state.value if state is not None else None,
+        "paused": name in paused,
+        "last_5h_util_pct": state.last_5h_util_pct if state is not None else None,
+        "last_weekly_util_pct": state.last_weekly_util_pct if state is not None else None,
+        "in_flight_count": in_flight_count,
+        # The last throttle decision's cap (ADR-0022 ramp while
+        # SLOWING_DOWN), and the number dispatch actually allows:
+        # max_concurrency lowered to that target, or 0 for an account
+        # that takes no tasks, including one with no state yet.
+        "target_concurrency": state.target_concurrency if state is not None else None,
+        "dispatch_cap": cap,
+        "last_reading_at": state.last_reading_at if state is not None else None,
+    }
+
+
 def _account_row(
     acct: ResolvedAccount,
     snapshot: SupervisorSnapshot | None,
     paused: frozenset[str],
 ) -> dict[str, object]:
-    """One row in ``account list``: decl + policy + observed state.
-
-    ``paused`` is the set of names with a pause marker. It is read
-    directly rather than from ``snapshot``, whose copy of the flag lags
-    a pause or resume until the supervisor's next tick.
-    """
-    state: AccountState | None = None
-    in_flight_count = 0
-    if snapshot is not None:
-        state = snapshot.accounts.get(acct.name)
-        in_flight_count = account_in_flight_count(acct.name, snapshot.in_flight)
+    """One row in ``account list``: decl + policy + observed state."""
+    state = snapshot.accounts.get(acct.name) if snapshot is not None else None
     policy = acct.policy
     dp = policy.dispatch_pct
     return {
         "name": acct.name,
         "config_dir": acct.config_dir,
         "linux_user": acct.linux_user,
+        "policy_error": None,
         "max_concurrency": policy.concurrency.max_concurrency,
         "dispatch_pct": {
             "day": {
@@ -102,18 +128,31 @@ def _account_row(
             },
             "timezone": dp.timezone,
         },
-        "state": state.state.value if state is not None else None,
-        "paused": acct.name in paused,
-        "last_5h_util_pct": state.last_5h_util_pct if state is not None else None,
-        "last_weekly_util_pct": state.last_weekly_util_pct if state is not None else None,
-        "in_flight_count": in_flight_count,
-        # The last throttle decision's cap (ADR-0022 ramp while
-        # SLOWING_DOWN), and the number dispatch actually allows:
-        # max_concurrency lowered to that target, or 0 for an account
-        # that takes no tasks, including one with no state yet.
-        "target_concurrency": state.target_concurrency if state is not None else None,
-        "dispatch_cap": account_cap(acct, state) if state is not None else 0,
-        "last_reading_at": state.last_reading_at if state is not None else None,
+        **_state_fields(
+            acct.name, snapshot, paused, account_cap(acct, state) if state is not None else 0
+        ),
+    }
+
+
+def _broken_row(
+    decl: AccountSettings,
+    broken: BrokenAccount,
+    snapshot: SupervisorSnapshot | None,
+    paused: frozenset[str],
+) -> dict[str, object]:
+    """One row in ``account list`` for an account whose file does not load.
+
+    It has no policy to show, and dispatch allows it no tasks.
+    """
+    return {
+        "name": decl.name,
+        "config_dir": decl.config_dir,
+        "linux_user": decl.linux_user,
+        "policy_error": broken.error,
+        "policy_file": broken.path,
+        "max_concurrency": None,
+        "dispatch_pct": None,
+        **_state_fields(decl.name, snapshot, paused, 0),
     }
 
 
@@ -132,11 +171,15 @@ def list_accounts(
 
     Skills use ``--json`` for machine-parseable output; operators run
     interactively without it for a human-readable summary.
+
+    An account whose ``runner-account.toml`` does not load is listed with
+    the error in place of its policy, the others as usual, and the command
+    then exits 1.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings(resolve_per_queue_config(config, qd))
-    accounts = resolve_accounts(settings)
+    resolution = resolve_accounts(settings)
     snapshot = _snapshot(settings, qd)
     try:
         paused = account_pause.paused_names(qd)
@@ -148,9 +191,18 @@ def list_accounts(
             console.print(f"[bold red]{msg}[/]")
         raise typer.Exit(code=2) from exc
 
-    rows = [_account_row(a, snapshot, paused) for a in accounts]
+    loaded = {acct.name: acct for acct in resolution.accounts}
+    broken = {b.name: b for b in resolution.broken}
+    rows = [
+        _account_row(loaded[decl.name], snapshot, paused)
+        if decl.name in loaded
+        else _broken_row(decl, broken[decl.name], snapshot, paused)
+        for decl in settings.accounts
+    ]
     ceiling = QueueCeiling.of(
-        settings.concurrency.max_concurrency, {a.name: a.policy for a in accounts}
+        settings.concurrency.max_concurrency,
+        resolution.policies,
+        broken=(b.name for b in resolution.broken),
     )
 
     if json:
@@ -161,25 +213,43 @@ def list_accounts(
                 indent=2,
             )
         )
-        return
-
-    if not rows:
+    elif not rows:
         console.print("[dim]No accounts configured.[/]")
-        return
-    # Re-derive the per-account display fields directly from the resolved
-    # account + (optional) state. The dict-of-object rows are designed
-    # for JSON emission; pulling values straight from the model objects
-    # keeps the type-checker happy and avoids object-indexing dances.
-    for acct, row in zip(accounts, rows, strict=True):
-        state_obj = snapshot.accounts.get(acct.name) if snapshot is not None else None
-        paused_tag = " [yellow](paused)[/]" if row["paused"] else ""
-        state_str = state_obj.state.value if state_obj is not None else "—"
-        util_5h_s = f"{state_obj.last_5h_util_pct}%" if state_obj is not None else "—"
-        util_w_s = f"{state_obj.last_weekly_util_pct}%" if state_obj is not None else "—"
-        console.print(f"[bold]{acct.name}[/]{paused_tag}")
-        console.print(f"  config_dir:      {acct.config_dir or '(default ~/.claude)'}")
-        if acct.linux_user:
-            console.print(f"  linux_user:      {acct.linux_user}")
+    else:
+        for decl, row in zip(settings.accounts, rows, strict=True):
+            _print_account(console, decl, loaded.get(decl.name), broken.get(decl.name), row)
+        console.print(
+            f"[bold]queue ceiling:[/] {escape(queue_ceiling_text(ceiling, settings))}",
+            highlight=False,
+            soft_wrap=True,
+        )
+    if resolution.broken:
+        raise typer.Exit(code=1)
+
+
+def _print_account(
+    console: Console,
+    decl: AccountSettings,
+    acct: ResolvedAccount | None,
+    broken: BrokenAccount | None,
+    row: dict[str, object],
+) -> None:
+    """The human-readable lines of one ``account list`` row."""
+    paused_tag = " [yellow](paused)[/]" if row["paused"] else ""
+    state_str = row["state"] or "—"
+    util_5h_s = f"{row['last_5h_util_pct']}%" if row["state"] is not None else "—"
+    util_w_s = f"{row['last_weekly_util_pct']}%" if row["state"] is not None else "—"
+    console.print(f"[bold]{decl.name}[/]{paused_tag}")
+    console.print(f"  config_dir:      {decl.config_dir or '(default ~/.claude)'}")
+    if decl.linux_user:
+        console.print(f"  linux_user:      {decl.linux_user}")
+    if broken is not None:
+        console.print(
+            f"  [bold red]policy error:[/]    {escape(broken.error)}",
+            highlight=False,
+            soft_wrap=True,
+        )
+    if acct is not None:
         console.print(f"  max_concurrency: {acct.policy.concurrency.max_concurrency}")
         dp = acct.policy.dispatch_pct
         day_s = f"day {dp.day.fivehr_slowdown_pct or '~'}/{dp.day.fivehr_stop_pct or '~'}"
@@ -192,15 +262,10 @@ def list_accounts(
             f"@{dp.week.eow_time_switch or '~'}"
         )
         console.print(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}")
-        console.print(
-            f"  state:           {state_str}   "
-            f"5h={util_5h_s}   weekly={util_w_s}   "
-            f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
-        )
     console.print(
-        f"[bold]queue ceiling:[/] {escape(queue_ceiling_text(ceiling, settings))}",
-        highlight=False,
-        soft_wrap=True,
+        f"  state:           {state_str}   "
+        f"5h={util_5h_s}   weekly={util_w_s}   "
+        f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
     )
 
 

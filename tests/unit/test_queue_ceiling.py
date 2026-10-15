@@ -15,85 +15,52 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import signal
 import threading
-from collections import Counter
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
-from typer.testing import CliRunner
 
-from claude_task_runner.cli import app
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import (
-    PER_ACCOUNT_TOML_NAME,
-    ConfigError,
-    load_settings,
-    resolve_accounts,
-)
-from claude_task_runner.config.schema import (
-    AccountConcurrencyPolicy,
-    AccountPolicy,
-    ConcurrencySettings,
-    ResolvedAccount,
-    Settings,
-)
-from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.config.loader import ConfigError, load_settings, resolve_accounts
+from claude_task_runner.config.schema import ConcurrencySettings, Settings
+from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
     state_path_for,
-    task_path_for,
     todo_dir,
     write_state_atomic,
-    write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.account_dispatch import QueueCeiling, dispatch_headroom
 from claude_task_runner.runner.in_flight import DispatchSlot
-from claude_task_runner.supervisor.daemon import QueueCeilingWatch, start_daemon
-from claude_task_runner.supervisor.states import (
-    AccountState,
-    InFlightRecord,
-    SupervisorSnapshot,
-    SupervisorState,
-)
-from claude_task_runner.usage.models import UsageReading, WindowReading
-from claude_task_runner.usage.source import FakeUsageSource
+from claude_task_runner.supervisor.daemon import QueueCeilingWatch
+from claude_task_runner.supervisor.states import InFlightRecord
 
-DAEMON_LOGGER = "claude_task_runner.supervisor.daemon"
+from ._concurrency_fixtures import (
+    DAEMON_LOGGER,
+    HeldDispatches,
+    busy_slots,
+    dispatch_tick,
+    dispatched_by_account,
+    in_flight_by_account,
+    invoke_cli,
+    make_tasks,
+    queue_toml,
+    resolved_account,
+    run_daemon,
+    sighup_in_second_tick,
+    single_account_body,
+    single_account_queue,
+    write_account_cap,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures: a queue whose accounts' caps come from real runner-account.toml
 # files, loaded the way the supervisor loads them.
 # ---------------------------------------------------------------------------
-
-
-def _write_account_cap(config_dir: Path, cap: int) -> None:
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / PER_ACCOUNT_TOML_NAME).write_text(
-        f"[concurrency]\nmax_concurrency = {cap}\n", encoding="utf-8"
-    )
-
-
-def _queue_toml(path: Path, accounts: dict[str, Path], concurrency: str = "") -> Settings:
-    """Write and load a ``claude_runner.toml`` declaring ``accounts``.
-
-    ``concurrency`` is the body of a ``[concurrency]`` table; empty leaves the
-    table out, as an operator who relies on the per-account caps would.
-    """
-    lines: list[str] = []
-    for name, config_dir in accounts.items():
-        lines += ["[[accounts]]", f'name = "{name}"', f'config_dir = "{config_dir}"', ""]
-    if concurrency:
-        lines += ["[concurrency]", concurrency, ""]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return load_settings(path)
 
 
 @pytest.fixture
@@ -109,17 +76,9 @@ def queue_dir(tmp_path: Path) -> Path:
 def two_accounts(tmp_path: Path) -> dict[str, Path]:
     """``personal`` capped at 5 and ``work`` at 3, each in its own file."""
     dirs = {"personal": tmp_path / "personal", "work": tmp_path / "work"}
-    _write_account_cap(dirs["personal"], 5)
-    _write_account_cap(dirs["work"], 3)
+    write_account_cap(dirs["personal"], 5)
+    write_account_cap(dirs["work"], 3)
     return dirs
-
-
-def _resolved(name: str, cap: int) -> ResolvedAccount:
-    return ResolvedAccount(
-        name=name,
-        config_dir="",
-        policy=AccountPolicy(concurrency=AccountConcurrencyPolicy(max_concurrency=cap)),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +109,14 @@ class TestQueueCeiling:
         assert ceiling.binds is False
 
     def test_of_reads_each_accounts_own_cap(self) -> None:
-        policies = {a.name: a.policy for a in (_resolved("personal", 5), _resolved("work", 3))}
+        policies = {
+            a.name: a.policy for a in (resolved_account("personal", 5), resolved_account("work", 3))
+        }
         assert QueueCeiling.of(None, policies) == QueueCeiling(configured=None, account_caps=CAPS)
 
     def test_one_account_is_that_accounts_cap(self) -> None:
-        assert QueueCeiling.of(None, {"default": _resolved("default", 1).policy}).value == 1
-        assert QueueCeiling.of(None, {"default": _resolved("default", 4).policy}).value == 4
+        assert QueueCeiling.of(None, {"default": resolved_account("default", 1).policy}).value == 1
+        assert QueueCeiling.of(None, {"default": resolved_account("default", 4).policy}).value == 4
 
     @pytest.mark.parametrize(
         ("configured", "text"),
@@ -188,6 +149,7 @@ class TestQueueCeiling:
             "accounts_total": 8,
             "account_caps": {"personal": 5, "work": 3},
             "binds": True,
+            "broken_accounts": [],
         }
 
     def test_as_json_reports_the_effective_ceiling_above_the_sum(self) -> None:
@@ -197,6 +159,7 @@ class TestQueueCeiling:
             "accounts_total": 8,
             "account_caps": {"personal": 5, "work": 3},
             "binds": False,
+            "broken_accounts": [],
         }
 
 
@@ -204,7 +167,7 @@ class TestQueueCeiling:
 # dispatch_headroom: free slots per account, within an explicit cap
 # ---------------------------------------------------------------------------
 
-ACCOUNTS = [_resolved("personal", 5), _resolved("work", 3)]
+ACCOUNTS = [resolved_account("personal", 5), resolved_account("work", 3)]
 
 
 def _records(**by_account: int) -> list[InFlightRecord]:
@@ -228,7 +191,7 @@ class TestDispatchHeadroom:
 
     def test_an_account_over_its_cap_does_not_take_the_others_slots(self) -> None:
         # personal's cap lowered to 2 while 5 of its tasks run.
-        lowered = [_resolved("personal", 2), _resolved("work", 3)]
+        lowered = [resolved_account("personal", 2), resolved_account("work", 3)]
         assert dispatch_headroom(lowered, _records(personal=5), None) == 3
 
     def test_an_undeclared_accounts_tasks_count_only_against_an_explicit_cap(self) -> None:
@@ -298,7 +261,7 @@ def _target(queue_dir: Path, settings: Settings) -> int:
     """The headroom ``tick_dispatch`` computes with nothing in flight, from
     the accounts resolved this call."""
     return dispatch_headroom(
-        resolve_accounts(settings), [], orch_mod._target_concurrency(queue_dir, settings)
+        resolve_accounts(settings).accounts, [], orch_mod._target_concurrency(queue_dir, settings)
     )
 
 
@@ -312,41 +275,39 @@ class TestTargetConcurrency:
     def test_omitted_key_is_no_queue_wide_cap(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
         assert orch_mod._target_concurrency(queue_dir, settings) is None
         assert _target(queue_dir, settings) == 8
 
     def test_follows_an_account_policy_change_on_the_next_evaluation(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
         assert _target(queue_dir, settings) == 8
         # Only the account's own file changes; the queue TOML and the loaded
         # Settings stay as they were.
-        _write_account_cap(two_accounts["work"], 4)
+        write_account_cap(two_accounts["work"], 4)
         assert _target(queue_dir, settings) == 9
-        _write_account_cap(two_accounts["personal"], 2)
+        write_account_cap(two_accounts["personal"], 2)
         assert _target(queue_dir, settings) == 6
 
     def test_explicit_lower_value_caps_at_exactly_that_value(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
         assert _target(queue_dir, settings) == 5
 
     def test_explicit_higher_value_does_not_bind(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(
-            tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 10"
-        )
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 10")
         assert orch_mod._target_concurrency(queue_dir, settings) == 10
         assert _target(queue_dir, settings) == 8
 
     def test_omitted_initial_means_no_warm_up_and_no_completion_scan(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
         with patch.object(
             orch_mod, "_has_any_completed", side_effect=AssertionError("scanned state/")
         ):
@@ -357,7 +318,7 @@ class TestTargetConcurrency:
     ) -> None:
         """Only ``initial_concurrency``: its cap until a first completion,
         then the accounts' sum, since no ``max_concurrency`` applies."""
-        settings = _queue_toml(
+        settings = queue_toml(
             tmp_path / "claude_runner.toml", two_accounts, "initial_concurrency = 3"
         )
         assert _target(queue_dir, settings) == 3
@@ -369,7 +330,7 @@ class TestTargetConcurrency:
     ) -> None:
         """Only ``max_concurrency``: no warm-up cap, so its full value before
         any task completes."""
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
         assert _target(queue_dir, settings) == 5
         _seed_completed(queue_dir)
         assert _target(queue_dir, settings) == 5
@@ -387,7 +348,7 @@ class TestSingleAccount:
         return load_settings(toml)
 
     def test_explicit_values_behave_as_before(self, tmp_path: Path, queue_dir: Path) -> None:
-        _write_account_cap(tmp_path / "acct", 4)
+        write_account_cap(tmp_path / "acct", 4)
         settings = self._settings(
             tmp_path, str(tmp_path / "acct"), "max_concurrency = 3\ninitial_concurrency = 1"
         )
@@ -397,7 +358,7 @@ class TestSingleAccount:
         assert _target(queue_dir, settings) == 3
 
     def test_omitted_is_the_one_accounts_cap(self, tmp_path: Path, queue_dir: Path) -> None:
-        _write_account_cap(tmp_path / "acct", 4)
+        write_account_cap(tmp_path / "acct", 4)
         assert _target(queue_dir, self._settings(tmp_path, str(tmp_path / "acct"))) == 4
 
     def test_omitted_without_an_account_file_is_the_policy_default_of_1(
@@ -414,109 +375,29 @@ class TestSingleAccount:
 # ---------------------------------------------------------------------------
 
 
-def _make_tasks(queue_dir: Path, n: int) -> None:
-    for i in range(n):
-        task = Task.model_validate({"id": f"t{i:02d}", "title": f"Task {i}", "prompt": "do it"})
-        write_task_atomic(task, task_path_for(queue_dir, task.id))
-
-
-def _dispatching_snapshot(names: list[str]) -> SupervisorSnapshot:
-    since = datetime(2026, 10, 15, tzinfo=UTC)
-    return SupervisorSnapshot(
-        state=SupervisorState.DISPATCHING,
-        since=since,
-        accounts={
-            name: AccountState(state=SupervisorState.DISPATCHING, since=since) for name in names
-        },
-    )
-
-
-class _HeldDispatches:
-    """Patches the dispatcher so every dispatched task stays in flight until
-    :meth:`release`, the way a real worker does for minutes."""
-
-    def __init__(self) -> None:
-        self._gate = threading.Event()
-        self._patch = patch(
-            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch",
-            side_effect=lambda **_kw: self._gate.wait(timeout=30),
-        )
-
-    def __enter__(self) -> _HeldDispatches:
-        self._patch.start()
-        return self
-
-    def release(self, slots: dict[str, DispatchSlot]) -> None:
-        self._gate.set()
-        for slot in slots.values():
-            slot.thread.join(timeout=5)
-
-    def __exit__(self, *_exc: object) -> None:
-        self._gate.set()
-        self._patch.stop()
-
-
-def _busy_slots(stop: threading.Event, **by_account: int) -> dict[str, DispatchSlot]:
-    """In-flight slots, ``n`` per account, whose threads run until ``stop``:
-    tasks an earlier tick dispatched."""
-    slots: dict[str, DispatchSlot] = {}
-    for account, n in by_account.items():
-        for i in range(n):
-            thread = threading.Thread(target=stop.wait, kwargs={"timeout": 30}, daemon=True)
-            thread.start()
-            slots[f"busy-{account}-{i}"] = DispatchSlot(
-                task_id=f"busy-{account}-{i}",
-                account=account,
-                started_at=datetime(2026, 10, 15, tzinfo=UTC),
-                thread=thread,
-            )
-    return slots
-
-
-def _tick(queue_dir: Path, settings: Settings, slots: dict[str, DispatchSlot]) -> None:
-    """One dispatch pass. ``accounts`` is left to tick_dispatch, which
-    resolves them from the files, as it does under the supervisor."""
-    orch_mod.tick_dispatch(
-        queue_dir=queue_dir,
-        settings=settings,
-        clock=RealClock(),
-        snapshot=_dispatching_snapshot([a.name for a in settings.accounts]),
-        in_flight_slots=slots,
-    )
-
-
-def _by_account(slots: dict[str, DispatchSlot]) -> dict[str, int]:
-    return dict(Counter(slot.account for slot in slots.values()))
-
-
-def _new(slots: dict[str, DispatchSlot]) -> dict[str, int]:
-    """Per account, the slots this test's ticks dispatched (not ``busy-*``)."""
-    return dict(Counter(slot.account for tid, slot in slots.items() if not tid.startswith("busy-")))
-
-
 class TestEndToEndTick:
     def test_eight_in_flight_across_caps_3_and_5_with_the_key_omitted(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
-        _make_tasks(queue_dir, 10)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 10)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
             assert len(slots) == 8
-            assert _by_account(slots) == {"personal": 5, "work": 3}
+            assert in_flight_by_account(slots) == {"personal": 5, "work": 3}
             held.release(slots)
 
     def test_exactly_five_in_flight_with_an_explicit_5(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
-        _make_tasks(queue_dir, 10)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
+        make_tasks(queue_dir, 10)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
             # A second tick with the same in-flight set adds nothing.
-            _tick(queue_dir, settings, slots)
+            dispatch_tick(queue_dir, settings, slots)
             assert len(slots) == 5
             held.release(slots)
 
@@ -525,40 +406,38 @@ class TestEndToEndTick:
     ) -> None:
         """No task has completed and no ``initial_concurrency`` is set, so no
         warm-up cap holds the first tick below 5."""
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
-        _make_tasks(queue_dir, 10)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 5")
+        make_tasks(queue_dir, 10)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
             assert len(slots) == 5
             held.release(slots)
 
     def test_explicit_higher_value_leaves_the_account_caps_in_charge(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(
-            tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 10"
-        )
-        _make_tasks(queue_dir, 12)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, "max_concurrency = 10")
+        make_tasks(queue_dir, 12)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
-            assert _by_account(slots) == {"personal": 5, "work": 3}
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
+            assert in_flight_by_account(slots) == {"personal": 5, "work": 3}
             held.release(slots)
 
     def test_a_raised_account_cap_admits_one_more_on_the_next_tick(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
-        _make_tasks(queue_dir, 10)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 10)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
             assert len(slots) == 8
-            _write_account_cap(two_accounts["work"], 4)
-            _tick(queue_dir, settings, slots)
+            write_account_cap(two_accounts["work"], 4)
+            dispatch_tick(queue_dir, settings, slots)
             assert len(slots) == 9
-            assert _by_account(slots) == {"personal": 5, "work": 4}
+            assert in_flight_by_account(slots) == {"personal": 5, "work": 4}
             held.release(slots)
 
     def test_a_lowered_cap_does_not_hold_back_the_other_account(
@@ -566,15 +445,15 @@ class TestEndToEndTick:
     ) -> None:
         """personal runs 5 when its cap drops to 2: the accounts' caps now sum
         to 5 with 5 in flight, but work's 3 free slots still fill."""
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts)
-        _make_tasks(queue_dir, 6)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 6)
         stop = threading.Event()
-        slots = _busy_slots(stop, personal=5)
-        _write_account_cap(two_accounts["personal"], 2)
+        slots = busy_slots(stop, personal=5)
+        write_account_cap(two_accounts["personal"], 2)
         try:
-            with _HeldDispatches() as held:
-                _tick(queue_dir, settings, slots)
-                assert _new(slots) == {"work": 3}
+            with HeldDispatches() as held:
+                dispatch_tick(queue_dir, settings, slots)
+                assert dispatched_by_account(slots) == {"work": 3}
                 stop.set()
                 held.release(slots)
         finally:
@@ -594,14 +473,14 @@ class TestEndToEndTick:
         new: dict[str, int],
     ) -> None:
         """4 tasks still run on an account taken out of ``[[accounts]]``."""
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, concurrency)
-        _make_tasks(queue_dir, 10)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, concurrency)
+        make_tasks(queue_dir, 10)
         stop = threading.Event()
-        slots = _busy_slots(stop, retired=4)
+        slots = busy_slots(stop, retired=4)
         try:
-            with _HeldDispatches() as held:
-                _tick(queue_dir, settings, slots)
-                assert _new(slots) == new
+            with HeldDispatches() as held:
+                dispatch_tick(queue_dir, settings, slots)
+                assert dispatched_by_account(slots) == new
                 stop.set()
                 held.release(slots)
         finally:
@@ -610,18 +489,18 @@ class TestEndToEndTick:
     def test_single_account_with_explicit_cap_is_unchanged(
         self, tmp_path: Path, queue_dir: Path
     ) -> None:
-        _write_account_cap(tmp_path / "acct", 4)
+        write_account_cap(tmp_path / "acct", 4)
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(
             f'[claude]\nconfig_dir = "{tmp_path / "acct"}"\n[concurrency]\nmax_concurrency = 3\n',
             encoding="utf-8",
         )
         settings = load_settings(toml)
-        _make_tasks(queue_dir, 6)
+        make_tasks(queue_dir, 6)
         slots: dict[str, DispatchSlot] = {}
-        with _HeldDispatches() as held:
-            _tick(queue_dir, settings, slots)
-            assert _by_account(slots) == {"default": 3}
+        with HeldDispatches() as held:
+            dispatch_tick(queue_dir, settings, slots)
+            assert in_flight_by_account(slots) == {"default": 3}
             held.release(slots)
 
 
@@ -748,76 +627,6 @@ class TestQueueCeilingWatch:
 # ---------------------------------------------------------------------------
 
 
-def _reading() -> UsageReading:
-    return UsageReading(
-        captured_at=datetime(2026, 10, 15, 12, 0, 0, tzinfo=UTC),
-        five_hour=WindowReading(
-            utilization_pct=10,
-            resets_at_raw="x",
-            resets_at=datetime(2026, 10, 15, 17, 0, 0, tzinfo=UTC),
-        ),
-        seven_day=WindowReading(
-            utilization_pct=10,
-            resets_at_raw="x",
-            resets_at=datetime(2026, 10, 20, 11, 0, 0, tzinfo=UTC),
-        ),
-    )
-
-
-def _single_account_body(tmp_path: Path, concurrency: str) -> str:
-    body = f'[claude]\nconfig_dir = "{tmp_path / "acct"}"\n[usage]\npoll_interval_s = 0.01\n'
-    if concurrency:
-        body += f"[concurrency]\n{concurrency}\n"
-    return body
-
-
-def _single_account_queue(tmp_path: Path, concurrency: str) -> tuple[Path, Path]:
-    """A one-account queue whose account is capped at 3. Returns
-    ``(queue_dir, config_path)``."""
-    qd = tmp_path / "q"
-    qd.mkdir()
-    queue_runtime_dir(qd)
-    _write_account_cap(tmp_path / "acct", 3)
-    config = tmp_path / "claude_runner.toml"
-    config.write_text(_single_account_body(tmp_path, concurrency), encoding="utf-8")
-    return qd, config
-
-
-def _run_daemon(
-    qd: Path,
-    config: Path,
-    *,
-    pending_count_fn: Callable[[], int],
-    install_signal_handlers: bool,
-) -> None:
-    start_daemon(
-        queue_dir=qd,
-        settings=load_settings(config),
-        source=FakeUsageSource([_reading()]),
-        pending_count_fn=pending_count_fn,
-        in_flight_count_fn=lambda: 0,
-        install_signal_handlers=install_signal_handlers,
-        max_ticks=4,
-        config_path=config,
-    )
-
-
-def _sighup_in_second_tick(before: Callable[[], None]) -> Callable[[], int]:
-    """A ``pending_count_fn`` that runs ``before`` and sends SIGHUP during the
-    second tick. It is called once at startup and once per tick, after that
-    tick's ceiling check, so the reload runs at the start of the third."""
-    calls = {"n": 0}
-
-    def pending_count() -> int:
-        calls["n"] += 1
-        if calls["n"] == 3:
-            before()
-            os.kill(os.getpid(), signal.SIGHUP)
-        return 0
-
-    return pending_count
-
-
 SINGLE_ACCOUNT_WARNING = (
     "[concurrency].max_concurrency = 2 holds the queue below its accounts' own caps, "
     "which sum to 3 (default 3): at most 2 tasks run at once. Delete the key to make "
@@ -835,9 +644,9 @@ class TestSupervisorLog:
     def test_warns_once_and_logs_the_ceiling_once_over_several_ticks(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        qd, config = _single_account_queue(tmp_path, "max_concurrency = 2")
+        qd, config = single_account_queue(tmp_path, "max_concurrency = 2")
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
-            _run_daemon(qd, config, pending_count_fn=lambda: 0, install_signal_handlers=False)
+            run_daemon(qd, config, pending_count_fn=lambda: 0, install_signal_handlers=False)
         assert _warnings(caplog) == [SINGLE_ACCOUNT_WARNING]
         assert _ceiling_infos(caplog) == [BINDING_INFO]
 
@@ -853,9 +662,9 @@ class TestSupervisorLog:
     def test_a_ceiling_that_does_not_bind_is_logged_at_info_only(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, concurrency: str, info: str
     ) -> None:
-        qd, config = _single_account_queue(tmp_path, concurrency)
+        qd, config = single_account_queue(tmp_path, concurrency)
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
-            _run_daemon(qd, config, pending_count_fn=lambda: 0, install_signal_handlers=False)
+            run_daemon(qd, config, pending_count_fn=lambda: 0, install_signal_handlers=False)
         assert _warnings(caplog) == []
         assert _ceiling_infos(caplog) == [info]
 
@@ -863,12 +672,12 @@ class TestSupervisorLog:
     def test_a_reload_logs_both_once_more(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        qd, config = _single_account_queue(tmp_path, "max_concurrency = 2")
+        qd, config = single_account_queue(tmp_path, "max_concurrency = 2")
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
-            _run_daemon(
+            run_daemon(
                 qd,
                 config,
-                pending_count_fn=_sighup_in_second_tick(lambda: None),
+                pending_count_fn=sighup_in_second_tick(lambda: None),
                 install_signal_handlers=True,
             )
         assert any("SIGHUP received: reloaded config" in r.getMessage() for r in caplog.records)
@@ -879,16 +688,16 @@ class TestSupervisorLog:
     def test_a_failed_reload_logs_neither_again(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        qd, config = _single_account_queue(tmp_path, "max_concurrency = 2")
+        qd, config = single_account_queue(tmp_path, "max_concurrency = 2")
 
         def break_config() -> None:
             config.write_text("this is not [valid toml", encoding="utf-8")
 
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
-            _run_daemon(
+            run_daemon(
                 qd,
                 config,
-                pending_count_fn=_sighup_in_second_tick(break_config),
+                pending_count_fn=sighup_in_second_tick(break_config),
                 install_signal_handlers=True,
             )
         assert any("reload failed" in r.getMessage() for r in caplog.records)
@@ -899,16 +708,16 @@ class TestSupervisorLog:
     def test_removing_the_key_on_reload_stops_the_warning(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        qd, config = _single_account_queue(tmp_path, "max_concurrency = 2")
+        qd, config = single_account_queue(tmp_path, "max_concurrency = 2")
 
         def drop_the_key() -> None:
-            config.write_text(_single_account_body(tmp_path, ""), encoding="utf-8")
+            config.write_text(single_account_body(tmp_path, ""), encoding="utf-8")
 
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
-            _run_daemon(
+            run_daemon(
                 qd,
                 config,
-                pending_count_fn=_sighup_in_second_tick(drop_the_key),
+                pending_count_fn=sighup_in_second_tick(drop_the_key),
                 install_signal_handlers=True,
             )
         assert any("SIGHUP received: reloaded config" in r.getMessage() for r in caplog.records)
@@ -944,13 +753,13 @@ class TestForceDispatch:
         busy: dict[str, int],
         dispatched: int,
     ) -> None:
-        settings = _queue_toml(tmp_path / "claude_runner.toml", two_accounts, concurrency)
-        _make_tasks(queue_dir, 1)
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, concurrency)
+        make_tasks(queue_dir, 1)
         fd_mod.write_request(queue_dir, "t00")
         stop = threading.Event()
-        slots = _busy_slots(stop, **busy)
+        slots = busy_slots(stop, **busy)
         try:
-            with _HeldDispatches() as held:
+            with HeldDispatches() as held:
                 n = fd_mod.tick_consume(
                     queue_dir=queue_dir, settings=settings, clock=RealClock(), in_flight_slots=slots
                 )
@@ -966,17 +775,13 @@ class TestForceDispatch:
 # ---------------------------------------------------------------------------
 
 
-def _invoke(argv: list[str], columns: int = 1000) -> Any:
-    return CliRunner().invoke(app, argv, env={"COLUMNS": str(columns)})
-
-
 class TestCli:
     def test_account_list_json_carries_the_ceiling(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
         config = tmp_path / "claude_runner.toml"
-        _queue_toml(config, two_accounts, "max_concurrency = 5")
-        result = _invoke(
+        queue_toml(config, two_accounts, "max_concurrency = 5")
+        result = invoke_cli(
             ["account", "list", "--config", str(config), "--queue", str(queue_dir), "--json"]
         )
         assert result.exit_code == 0, result.output
@@ -986,6 +791,7 @@ class TestCli:
             "accounts_total": 8,
             "account_caps": {"personal": 5, "work": 3},
             "binds": True,
+            "broken_accounts": [],
             "initial_concurrency": None,
         }
 
@@ -994,8 +800,8 @@ class TestCli:
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path], columns: int
     ) -> None:
         config = tmp_path / "claude_runner.toml"
-        _queue_toml(config, two_accounts, "initial_concurrency = 2")
-        result = _invoke(
+        queue_toml(config, two_accounts, "initial_concurrency = 2")
+        result = invoke_cli(
             ["account", "list", "--config", str(config), "--queue", str(queue_dir)], columns
         )
         assert result.exit_code == 0, result.output
@@ -1008,8 +814,8 @@ class TestCli:
     def test_supervisor_status_prints_the_ceiling_on_one_line(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path], columns: int
     ) -> None:
-        _queue_toml(queue_dir / "claude_runner.toml", two_accounts, "max_concurrency = 5")
-        text = _invoke(["supervisor", "status", "--queue", str(queue_dir)], columns)
+        queue_toml(queue_dir / "claude_runner.toml", two_accounts, "max_concurrency = 5")
+        text = invoke_cli(["supervisor", "status", "--queue", str(queue_dir)], columns)
         assert text.exit_code == 0, text.output
         assert (
             "Queue ceiling:    5 from [concurrency].max_concurrency, which binds: the "
@@ -1019,8 +825,8 @@ class TestCli:
     def test_supervisor_status_json_carries_the_ceiling(
         self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
     ) -> None:
-        _queue_toml(queue_dir / "claude_runner.toml", two_accounts, "max_concurrency = 10")
-        result = _invoke(["supervisor", "status", "--queue", str(queue_dir), "--json"])
+        queue_toml(queue_dir / "claude_runner.toml", two_accounts, "max_concurrency = 10")
+        result = invoke_cli(["supervisor", "status", "--queue", str(queue_dir), "--json"])
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout)["queue_ceiling"] == {
             "ceiling": 8,
@@ -1028,15 +834,6 @@ class TestCli:
             "accounts_total": 8,
             "account_caps": {"personal": 5, "work": 3},
             "binds": False,
+            "broken_accounts": [],
             "initial_concurrency": None,
         }
-
-    def test_supervisor_status_reports_an_unreadable_account_file(
-        self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
-    ) -> None:
-        _queue_toml(queue_dir / "claude_runner.toml", two_accounts)
-        (two_accounts["work"] / PER_ACCOUNT_TOML_NAME).write_text("not [toml", encoding="utf-8")
-        result = _invoke(["supervisor", "status", "--queue", str(queue_dir), "--json"])
-        assert result.exit_code == 0, result.output
-        error = json.loads(result.stdout)["queue_ceiling"]["error"]
-        assert str(two_accounts["work"] / PER_ACCOUNT_TOML_NAME) in error

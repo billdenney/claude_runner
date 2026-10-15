@@ -606,19 +606,15 @@ def status(
     snapshot = persist_mod.load(state_path)
     pid = pidfile_mod.read_existing_pid(pid_path)
     alive = pid is not None and pidfile_mod.is_pid_alive(pid)
-    # An account's runner-account.toml that does not load is reported in
-    # place of the ceiling; the rest of the status still prints.
-    try:
-        ceiling = QueueCeiling.of(
-            settings.concurrency.max_concurrency,
-            {a.name: a.policy for a in resolve_accounts(settings)},
-        )
-    except ConfigError as exc:
-        ceiling_json: dict[str, object] = {"error": str(exc)}
-        ceiling_line = f"unknown: {exc}"
-    else:
-        ceiling_json = queue_ceiling_json(ceiling, settings)
-        ceiling_line = queue_ceiling_text(ceiling, settings)
+    # An account whose runner-account.toml does not load is listed with its
+    # error and counts 0 toward the ceiling; the rest of the status prints.
+    resolution = resolve_accounts(settings)
+    ceiling = QueueCeiling.of(
+        settings.concurrency.max_concurrency,
+        resolution.policies,
+        broken=(b.name for b in resolution.broken),
+    )
+    account_errors = [{"name": b.name, "path": b.path, "error": b.error} for b in resolution.broken]
 
     payload: dict[str, object] = {
         "queue_dir": str(queue_path),
@@ -627,7 +623,8 @@ def status(
         "snapshot": snapshot.model_dump(mode="json") if snapshot else None,
         "pending": _count_pending(queue_path),
         "in_flight": _count_in_flight(queue_path),
-        "queue_ceiling": ceiling_json,
+        "queue_ceiling": queue_ceiling_json(ceiling, settings),
+        "account_errors": account_errors,
     }
 
     if json:
@@ -663,5 +660,13 @@ def status(
     console.print(f"[bold]Pending:[/]          {payload['pending']}")
     console.print(f"[bold]In-flight:[/]        {payload['in_flight']}")
     console.print(
-        f"[bold]Queue ceiling:[/]    {escape(ceiling_line)}", highlight=False, soft_wrap=True
+        f"[bold]Queue ceiling:[/]    {escape(queue_ceiling_text(ceiling, settings))}",
+        highlight=False,
+        soft_wrap=True,
     )
+    for b in resolution.broken:
+        console.print(
+            f"[bold red]Account error:[/]    {escape(b.name)}: {escape(b.error)}",
+            highlight=False,
+            soft_wrap=True,
+        )

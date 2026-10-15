@@ -7,7 +7,8 @@ Two-layer load:
 * :func:`resolve_accounts` walks ``settings.accounts`` and reads each
   account's own ``<config_dir>/runner-account.toml`` for the per-
   account dispatch policy. Composes a :class:`ResolvedAccount` per
-  account. Missing per-account file → defaults.
+  account, or a :class:`BrokenAccount` for one whose file does not load.
+  Missing per-account file → defaults.
 
 The split keeps the queue config slim (it only declares *which*
 accounts to use) while each account owner controls their own
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import tomllib
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -269,19 +271,28 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
 
     Missing file → all defaults: ``max_concurrency=1`` and no
     ``[dispatch_pct.*]`` overrides, so :func:`throttle.policy.resolve`
-    uses the queue's values. Present but unparseable → ConfigError.
-    Empty config_dir → defaults (used for the synthesised legacy
-    ``"default"`` account before the operator declares an explicit
-    config_dir).
+    uses the queue's values. A missing ``config_dir``, or one that is not
+    a directory, counts as a missing file. Empty config_dir → defaults
+    (used for the synthesised legacy ``"default"`` account before the
+    operator declares an explicit config_dir).
+
+    A file that exists but cannot be read, is not UTF-8 TOML, sets the
+    retired ``[throttle.*]`` table or fails validation raises
+    :class:`ConfigError` naming the file. :func:`resolve_accounts` turns
+    that into a :class:`BrokenAccount` instead of letting it propagate.
     """
     path = per_account_toml_path(config_dir)
-    if path is None or not path.exists():
+    if path is None:
         return AccountPolicy()
     try:
         with path.open("rb") as fh:
             payload = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
+    except (FileNotFoundError, NotADirectoryError):
+        return AccountPolicy()
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {path}: {exc}") from exc
     _reject_legacy_throttle(payload, str(path))
     try:
         return AccountPolicy.model_validate(payload)
@@ -289,21 +300,71 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
         raise ConfigError(f"Per-account policy validation failed for {path}: {exc}") from exc
 
 
-def resolve_accounts(settings: Settings) -> list[ResolvedAccount]:
+@dataclass(frozen=True)
+class BrokenAccount:
+    """A declared account whose ``runner-account.toml`` does not load.
+
+    It takes no new tasks until the file loads again. No policy stands in
+    for the file, neither defaults nor the last one that loaded, so a
+    half-edited file is never read as something its owner did not write
+    (ADR-0035).
+    """
+
+    name: str
+    path: str
+    """The ``runner-account.toml`` that failed."""
+    error: str
+    """The :class:`ConfigError` message, which names the file."""
+
+
+@dataclass(frozen=True)
+class AccountResolution:
+    """What :func:`resolve_accounts` found, in declaration order.
+
+    Every declared account is in exactly one of the two tuples.
+    """
+
+    accounts: tuple[ResolvedAccount, ...]
+    """The accounts whose policy loaded (or whose file is missing)."""
+    broken: tuple[BrokenAccount, ...]
+    """The accounts whose file exists but does not load."""
+
+    @property
+    def policies(self) -> dict[str, AccountPolicy]:
+        """Each loaded account's policy, keyed by name."""
+        return {acct.name: acct.policy for acct in self.accounts}
+
+    @property
+    def broken_names(self) -> frozenset[str]:
+        return frozenset(b.name for b in self.broken)
+
+
+def resolve_accounts(settings: Settings) -> AccountResolution:
     """Compose each account's queue-side declaration with its per-account policy.
 
     Walks ``settings.accounts`` in declaration order; for each entry,
     reads ``<config_dir>/runner-account.toml`` via
-    :func:`load_account_policy` and produces a
-    :class:`ResolvedAccount`. The returned list preserves order so
-    callers that tie-break alphabetically can do so explicitly.
-
-    Raises :class:`ConfigError` if any per-account file is unparseable
-    or invalid. A missing file is *not* an error — the defaults apply.
+    :func:`load_account_policy`. An account whose file loads, or is
+    missing (the defaults apply), becomes a :class:`ResolvedAccount`; one
+    whose file exists but does not load becomes a :class:`BrokenAccount`.
+    Never raises for a per-account file, so one broken file cannot stop
+    the supervisor, a dispatch or a CLI listing: each caller decides what a
+    broken account means for it.
     """
     resolved: list[ResolvedAccount] = []
+    broken: list[BrokenAccount] = []
     for acct in settings.accounts:
-        policy = load_account_policy(acct.config_dir)
+        try:
+            policy = load_account_policy(acct.config_dir)
+        except ConfigError as exc:
+            broken.append(
+                BrokenAccount(
+                    name=acct.name,
+                    path=str(per_account_toml_path(acct.config_dir)),
+                    error=str(exc),
+                )
+            )
+            continue
         resolved.append(
             ResolvedAccount(
                 name=acct.name,
@@ -312,4 +373,4 @@ def resolve_accounts(settings: Settings) -> list[ResolvedAccount]:
                 policy=policy,
             )
         )
-    return resolved
+    return AccountResolution(accounts=tuple(resolved), broken=tuple(broken))

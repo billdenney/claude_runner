@@ -353,6 +353,10 @@ class QueueCeiling:
     with :meth:`of` from the policies ``config.loader.resolve_accounts``
     returned this tick, so an edit to an account's file shows within a tick.
 
+    ``broken`` names the accounts whose ``runner-account.toml`` does not
+    load (``config.loader.BrokenAccount``). They take no tasks, so they add
+    nothing to the sum; :meth:`describe` names them.
+
     Dispatch itself uses :func:`dispatch_headroom`, which counts free slots
     per account. This is the summary the supervisor's log and the CLI show,
     and the cap the daemon gives a usage reading it cannot attribute.
@@ -361,13 +365,20 @@ class QueueCeiling:
 
     configured: int | None
     account_caps: Mapping[str, int]
+    broken: tuple[str, ...] = ()
 
     @classmethod
-    def of(cls, configured: int | None, policies: Mapping[str, AccountPolicy]) -> QueueCeiling:
+    def of(
+        cls,
+        configured: int | None,
+        policies: Mapping[str, AccountPolicy],
+        broken: Iterable[str] = (),
+    ) -> QueueCeiling:
         """The ceiling for ``configured`` over ``policies``, keyed by account name."""
         return cls(
             configured=configured,
             account_caps={name: p.concurrency.max_concurrency for name, p in policies.items()},
+            broken=tuple(broken),
         )
 
     @property
@@ -394,19 +405,23 @@ class QueueCeiling:
 
     @property
     def breakdown(self) -> str:
-        """Each account's cap, in declaration order: ``personal 5 + work 3``."""
-        return " + ".join(f"{name} {cap}" for name, cap in self.account_caps.items())
+        """Each account's cap, in declaration order: ``personal 5 + work 3``,
+        or ``none`` when no account's policy loaded."""
+        return " + ".join(f"{name} {cap}" for name, cap in self.account_caps.items()) or "none"
 
     def describe(self) -> str:
         """The ceiling, where it comes from and whether it binds, on one line."""
         if self.configured is not None and self.binds:
-            return (
+            text = (
                 f"{self.configured} from [concurrency].max_concurrency, which binds: "
                 f"the accounts' max_concurrency sum to {self.accounts_total} ({self.breakdown})"
             )
-        text = f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
-        if self.configured is not None:
-            text += f"; [concurrency].max_concurrency = {self.configured} does not bind"
+        else:
+            text = f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
+            if self.configured is not None:
+                text += f"; [concurrency].max_concurrency = {self.configured} does not bind"
+        if self.broken:
+            text += f"; not counted until its runner-account.toml loads: {', '.join(self.broken)}"
         return text
 
     def as_json(self) -> dict[str, object]:
@@ -417,4 +432,5 @@ class QueueCeiling:
             "accounts_total": self.accounts_total,
             "account_caps": dict(self.account_caps),
             "binds": self.binds,
+            "broken_accounts": list(self.broken),
         }

@@ -177,7 +177,8 @@ def tick_dispatch(
     so the daemon can persist it without recomputing.
 
     ``accounts`` (when ``None``) is resolved from ``settings`` on the
-    spot; pass it explicitly to share one resolution across multiple
+    spot, without the accounts whose ``runner-account.toml`` does not
+    load; pass it explicitly to share one resolution across multiple
     callers per tick.
 
     ``draining`` (PR 11): when ``True``, the function reaps finished
@@ -216,7 +217,9 @@ def tick_dispatch(
         # imports schema; schema is consumed by the rest of the codebase.
         from claude_task_runner.config.loader import resolve_accounts
 
-        accounts = resolve_accounts(settings)
+        # An account whose runner-account.toml does not load is left out,
+        # so it takes no tasks; the daemon logs it (ADR-0035).
+        accounts = list(resolve_accounts(settings).accounts)
     accounts_by_name = {a.name: a for a in accounts}
 
     # Per-account dispatch gate (replaces PR 5's top-level snapshot.state
