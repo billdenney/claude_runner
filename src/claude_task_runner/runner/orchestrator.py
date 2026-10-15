@@ -140,35 +140,39 @@ def planned_dispatch_order(queue_dir: Path) -> list[Task]:
 #                               will lift this when the window opens.
 _DISPATCHABLE_STATUSES = frozenset({"pending", "failed"})
 
-# Categories the selector reports a skipped task under (see
-# :func:`_selector_hold`); they are the names the "no eligible tasks" line
-# prints. A task skipped for a status that is never dispatched is reported
-# under the status itself (``running``, ``possibly_hung``, ...), and one
-# held by readiness under ``_HOLD_READINESS_PREFIX`` plus the categories of
-# its unmet requirements (``readiness missing file``).
-_HOLD_UNPARSEABLE_TASK = "unparseable task"
-_HOLD_BLOCK_DISPATCH = "block_dispatch"
-_HOLD_IN_FLIGHT = "in flight"
-_HOLD_UNPARSEABLE_STATE = "unparseable state"
-_HOLD_UNANSWERED_SIDECAR = "unanswered sidecar"
-_HOLD_DEFERRED_COOLDOWN = "deferred cooldown"
-_HOLD_INVALID_EFFORT = "invalid effort"
-_HOLD_DEPENDS_ON = "depends_on"
-_HOLD_READINESS_PREFIX = "readiness "
+# Categories the selector counts a skipped task under (see
+# :func:`_skip_category`); they are the names the "no eligible tasks" line
+# prints. Every category is one snake_case word, so the line reads as
+# ``name count`` pairs and greps cleanly: the task-state or register name
+# where one exists (a status that is never dispatched is reported as the
+# status itself, ``running``, ``possibly_hung``, ...; ``block_dispatch``;
+# ``depends_on``), a snake_case phrase otherwise. A task held by readiness
+# is ``readiness_`` plus the categories of its unmet requirements, sorted
+# and joined by ``+`` (``readiness_missing_file``,
+# ``readiness_awaiting_sidecar_response+missing_file``).
+_SKIP_UNPARSEABLE_TASK = "unparseable_task"
+_SKIP_BLOCK_DISPATCH = "block_dispatch"
+_SKIP_IN_FLIGHT = "in_flight"
+_SKIP_UNPARSEABLE_STATE = "unparseable_state"
+_SKIP_UNANSWERED_SIDECAR = "unanswered_sidecar"
+_SKIP_DEFERRED_COOLDOWN = "deferred_cooldown"
+_SKIP_INVALID_EFFORT = "invalid_effort"
+_SKIP_DEPENDS_ON = "depends_on"
+_SKIP_READINESS_PREFIX = "readiness_"
 # Finished, not held: left out of the summary's unfinished count.
 _COMPLETED = "completed"
 
 
-def _unfinished_holds(holds: Mapping[str, int]) -> dict[str, int]:
-    """``holds`` (category -> count, as :func:`_eligible_candidates` fills it)
-    without the ``completed`` count and without zero counts."""
-    return {name: n for name, n in holds.items() if name != _COMPLETED and n > 0}
+def _unfinished_skips(skips: Mapping[str, int]) -> dict[str, int]:
+    """``skips`` (category -> count, as :func:`_eligible_candidates` fills it)
+    without the ``completed`` count."""
+    return {name: n for name, n in skips.items() if name != _COMPLETED}
 
 
 def _idle_summary(breakdown: Mapping[str, int]) -> str:
     """The log line for a tick whose selector admitted no task.
 
-    ``breakdown`` is :func:`_unfinished_holds` of the selector's counts.
+    ``breakdown`` is :func:`_unfinished_skips` of the selector's counts.
     Categories are listed largest first, ties by name, so the same breakdown
     always prints the same line.
     """
@@ -191,26 +195,34 @@ class IdleDispatchLog:
     selector admits none, one INFO line (:func:`_idle_summary`) breaks the
     unfinished tasks down by what holds them. Later empty ticks log nothing
     until that breakdown changes, so a queue that stays drained costs one
-    line, not one per tick. The first tick that finds candidates after an
-    empty spell logs that it did.
+    line, not one per tick. The ``in_flight`` count is printed but is not a
+    change on its own: it moves whenever a running task starts or finishes,
+    which says nothing new about why the rest are held. The first tick that
+    finds candidates after an empty spell logs that it did.
     """
 
     last_breakdown: dict[str, int] | None = None
     """The unfinished-task breakdown last logged; ``None`` when the last
     tick that chose candidates found some (or none has run yet)."""
 
-    def observe(self, n_eligible: int, holds: Mapping[str, int]) -> None:
-        """Record one selector pass: ``n_eligible`` admitted, the rest in ``holds``."""
+    def observe(self, n_eligible: int, skips: Mapping[str, int]) -> None:
+        """Record one selector pass: ``n_eligible`` admitted, the rest in ``skips``."""
         if n_eligible > 0:
             if self.last_breakdown is not None:
                 logger.info("eligible tasks available again: %d", n_eligible)
                 self.last_breakdown = None
             return
-        breakdown = _unfinished_holds(holds)
-        if breakdown == self.last_breakdown:
+        breakdown = _unfinished_skips(skips)
+        last = self.last_breakdown
+        if last is not None and _without_in_flight(breakdown) == _without_in_flight(last):
             return
         self.last_breakdown = breakdown
         logger.info("%s", _idle_summary(breakdown))
+
+
+def _without_in_flight(breakdown: Mapping[str, int]) -> dict[str, int]:
+    """``breakdown`` without the ``in_flight`` count, for change detection."""
+    return {name: n for name, n in breakdown.items() if name != _SKIP_IN_FLIGHT}
 
 
 def tick_dispatch(
@@ -328,7 +340,7 @@ def tick_dispatch(
     # ``getattr`` tolerates the SimpleNamespace settings stubs some
     # tests pass; the real strict ``Settings`` always carries the field.
     block_file = getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None)
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
     candidates = _eligible_candidates(
         queue_dir,
         in_flight_slots,
@@ -336,10 +348,10 @@ def tick_dispatch(
         now=clock.now(),
         block_file=block_file,
         effort_levels=settings.effort_levels,
-        holds=holds,
+        skips=skips,
     )
     if idle_log is not None:
-        idle_log.observe(len(candidates), holds)
+        idle_log.observe(len(candidates), skips)
     if not candidates:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -816,13 +828,12 @@ def _park_deferred(
     Makes a hold VISIBLE. Without this a gate is silent: the selector
     skips the task on every tick with only a debug log, so ``queue states``
     still shows it ``pending`` and an operator investigating "why has this
-    never run?" has nothing to read. That gap is what forced hand-parking
-    five refharvest tasks with a hand-written ``deferred_reason`` on
-    2026-08-06.
+    never run?" has nothing to read, and has to park the task by hand to
+    leave any trace.
 
     Deliberately writes NO ``next_eligible_at``. A cooldown would break the
     ADR-0030 promise that a held task dispatches the first tick after its
-    element appears: the `deferred` branch in :func:`_selector_hold`
+    element appears: the `deferred` branch in :func:`_skip_category`
     falls straight through when ``next_eligible_at`` is unset, so the gates
     themselves stay the only thing holding the task and re-admission is
     immediate.
@@ -909,7 +920,7 @@ def _eligible_candidates(
     block_file: str | None = None,
     *,
     effort_levels: dict[str, list[str]],
-    holds: Counter[str] | None = None,
+    skips: Counter[str] | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -920,13 +931,13 @@ def _eligible_candidates(
     # gate checks each task's (model, effort) against. Required, with no
     # default: a caller that forgot it must fail, not skip the check.
     #
-    # ``holds``, when given, is incremented once for every task YAML in
+    # ``skips``, when given, is incremented once for every task YAML in
     # ``todo/`` that is NOT returned, under the category that held it (see
-    # :func:`_selector_hold`). A task whose state is ``completed`` is counted
+    # :func:`_skip_category`). A task whose state is ``completed`` is counted
     # under ``completed`` whichever check skipped it first, so every other
     # category counts unfinished work only. The returned tasks plus the
     # counts added here equal the number of task YAMLs read.
-    tally: Counter[str] = holds if holds is not None else Counter()
+    tally: Counter[str] = skips if skips is not None else Counter()
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots.keys())
 
@@ -948,9 +959,9 @@ def _eligible_candidates(
             task = load_task(path)
         except Exception as exc:
             logger.warning("skipping unparseable task at %s: %s", path, exc)
-            tally[_HOLD_UNPARSEABLE_TASK] += 1
+            tally[_SKIP_UNPARSEABLE_TASK] += 1
             continue
-        hold = _selector_hold(
+        category = _skip_category(
             task,
             queue_dir=queue_dir,
             in_flight_ids=in_flight_ids,
@@ -960,14 +971,14 @@ def _eligible_candidates(
             now=now,
             effort_levels=effort_levels,
         )
-        if hold is None:
+        if category is None:
             out.append(task)
         else:
-            tally[_COMPLETED if task.id in completed_ids else hold] += 1
+            tally[_COMPLETED if task.id in completed_ids else category] += 1
     return out
 
 
-def _selector_hold(
+def _skip_category(
     task: Task,
     *,
     queue_dir: Path,
@@ -981,9 +992,9 @@ def _selector_hold(
     """Decide whether the selector admits ``task`` this tick.
 
     Returns ``None`` when the task is eligible. Otherwise returns the
-    category of what holds it: one of the ``_HOLD_*`` names, the name of a
+    category of what holds it: one of the ``_SKIP_*`` names, the name of a
     status that is never dispatched (``running``, ``possibly_hung``,
-    ``completed``, ...), or :data:`_HOLD_READINESS_PREFIX` followed by the
+    ``completed``, ...), or :data:`_SKIP_READINESS_PREFIX` followed by the
     categories of the unmet requirements. Admission and the reason for a
     refusal come from this one decision, so the summary
     :class:`IdleDispatchLog` prints cannot disagree with what the selector
@@ -1001,9 +1012,9 @@ def _selector_hold(
         # briefly re-occupying the only slot) every cooldown for a
         # task known to be blocked. The hook remains the enforcing
         # backstop for any task that slips through. (ADR-0029)
-        return _HOLD_BLOCK_DISPATCH
+        return _SKIP_BLOCK_DISPATCH
     if task.id in in_flight_ids:
-        return _HOLD_IN_FLIGHT
+        return _SKIP_IN_FLIGHT
 
     # ``state`` stays in scope past this block: the effort and readiness
     # gates below need it to record / clear a hold, and they must apply to
@@ -1024,7 +1035,7 @@ def _selector_hold(
             # check) must delete or rebuild the state file. Surfacing
             # this via doctor is tracked separately.
             logger.error("skipping task %s: unparseable state %s: %s", task.id, sp, exc)
-            return _HOLD_UNPARSEABLE_STATE
+            return _SKIP_UNPARSEABLE_STATE
         if state.status not in _DISPATCHABLE_STATUSES:
             # Special case: awaiting_sidecar tasks become
             # dispatchable AGAIN once every sidecar request has
@@ -1032,31 +1043,26 @@ def _selector_hold(
             # that stopped to ask an operator question stays
             # stuck forever — the operator's response file is
             # written but the orchestrator never re-evaluates.
-            # Fixed 2026-05-15 after live observation that 5
-            # answered sidecars on the popPK queue had stayed
-            # in awaiting_sidecar for >90 minutes despite
-            # response-001.json files being in place.
             if state.status == "awaiting_sidecar" and task.id in open_sidecar_task_ids:
                 # A request is still unanswered — keep the task
                 # ineligible until the operator responds.
-                return _HOLD_UNANSWERED_SIDECAR
+                return _SKIP_UNANSWERED_SIDECAR
             if state.status == "deferred":
-                # A task parked by a pre-dispatch hook deferral (exit
-                # 1 — e.g. an input awaiting operator re-acquisition
-                # or a pending trim) becomes dispatchable again once
-                # its re-check cooldown elapses. Re-dispatch re-runs
-                # the hook: if the input is ready it proceeds,
-                # otherwise the dispatcher re-parks it with a fresh
-                # cooldown. The cooldown is what keeps a still-blocked
-                # task from being re-picked every tick — the original
-                # reason exit-1 deferrals were (wrongly) force-counted
-                # toward the circuit breaker.
+                # A deferred task becomes dispatchable again once its
+                # ``next_eligible_at`` passes, whoever wrote it: the
+                # pre-dispatch hook (exit 1 — e.g. an input awaiting
+                # operator re-acquisition or a pending trim) or an
+                # operator by hand. Re-dispatch re-runs the hook: if the
+                # input is ready it proceeds, otherwise the dispatcher
+                # re-parks it with a fresh cooldown. The cooldown is what
+                # keeps a still-blocked task from being re-picked every
+                # tick.
                 if (
                     now is not None
                     and state.next_eligible_at is not None
                     and now < state.next_eligible_at
                 ):
-                    return _HOLD_DEFERRED_COOLDOWN
+                    return _SKIP_DEFERRED_COOLDOWN
                 # cooldown elapsed (or unset) → fall through, re-attempt.
             elif state.status != "awaiting_sidecar":
                 # Any other non-dispatchable status (running,
@@ -1090,12 +1096,12 @@ def _selector_hold(
                 effort_reason,
             )
             _park_deferred(queue_dir, task.id, state, effort_reason)
-        return _HOLD_INVALID_EFFORT
+        return _SKIP_INVALID_EFFORT
     state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
 
     unmet = [d for d in task.depends_on if d not in completed_ids]
     if unmet:
-        return _HOLD_DEPENDS_ON
+        return _SKIP_DEPENDS_ON
 
     # Mechanical readiness gates (ADR-0030): a task waiting on a file
     # (or any no-AI precondition) is kept OUT of the candidate set until
@@ -1125,7 +1131,7 @@ def _selector_hold(
         _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(descriptions))
         # Sorted and de-duplicated, so tasks missing the same kinds of
         # element share one category whatever order their `requires` lists.
-        return _HOLD_READINESS_PREFIX + " + ".join(sorted({u.category for u in unmet_reqs}))
+        return _SKIP_READINESS_PREFIX + "+".join(sorted({u.category for u in unmet_reqs}))
 
     # Satisfied — if THIS gate is what parked the task, un-park it so the
     # state stops advertising a block that has cleared.

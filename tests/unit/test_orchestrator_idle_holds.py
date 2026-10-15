@@ -1,8 +1,8 @@
-"""Why the selector admitted nothing: the hold breakdown and its log line.
+"""Why the selector admitted nothing: the skip breakdown and its log line.
 
 ``_eligible_candidates`` counts every task YAML it does not return under the
 category that held it, from the same per-task decision that refuses it
-(``_selector_hold``). ``tick_dispatch`` hands those counts to the supervisor's
+(``_skip_category``). ``tick_dispatch`` hands those counts to the supervisor's
 ``IdleDispatchLog``, which logs one INFO line when a tick that reached
 candidate selection found nothing to dispatch, stays quiet while the
 breakdown is unchanged, and logs again when it changes or when tasks become
@@ -12,7 +12,6 @@ the same silent log.
 
 from __future__ import annotations
 
-import datetime as dt
 import functools
 import logging
 import threading
@@ -105,7 +104,7 @@ def _request(task_id: str, seq: int = 1) -> SidecarRequest:
         schema_version=CURRENT_SCHEMA_VERSION,
         task_id=task_id,
         sequence=seq,
-        created_at=dt.datetime(2026, 10, 1, tzinfo=UTC),
+        created_at=datetime(2026, 10, 1, tzinfo=UTC),
         summary="placeholder",
         context="placeholder",
         questions=[
@@ -128,7 +127,7 @@ def _response(task_id: str, seq: int = 1) -> SidecarResponse:
         schema_version=CURRENT_SCHEMA_VERSION,
         task_id=task_id,
         sequence=seq,
-        responded_at=dt.datetime(2026, 10, 2, tzinfo=UTC),
+        responded_at=datetime(2026, 10, 2, tzinfo=UTC),
         answers=[SidecarAnswer(id="q1", value="A")],
         notes="",
     )
@@ -208,23 +207,23 @@ def _build_mixed_queue(qd: Path, missing_file: Path) -> None:
     write_response(qd, _response("sidecar-answered"))
 
 
-MIXED_EXPECTED_HOLDS = Counter(
+MIXED_EXPECTED_SKIPS = Counter(
     {
-        "unparseable task": 1,
+        "unparseable_task": 1,
         "block_dispatch": 1,
-        "in flight": 1,
-        "unparseable state": 1,
-        "unanswered sidecar": 1,
-        "deferred cooldown": 1,
+        "in_flight": 1,
+        "unparseable_state": 1,
+        "unanswered_sidecar": 1,
+        "deferred_cooldown": 1,
         "running": 1,
         "possibly_hung": 1,
         "failed_circuit_breaker": 1,
         "weekly_paused": 1,
-        "invalid effort": 1,
+        "invalid_effort": 1,
         "depends_on": 1,
-        "readiness missing file": 1,
-        "readiness awaiting sidecar response": 1,
-        "readiness awaiting sidecar response + missing file": 1,
+        "readiness_missing_file": 1,
+        "readiness_awaiting_sidecar_response": 1,
+        "readiness_awaiting_sidecar_response+missing_file": 1,
         "completed": 2,
     }
 )
@@ -242,14 +241,14 @@ def _in_flight(task_id: str) -> dict[str, DispatchSlot]:
     }
 
 
-def _select(qd: Path, holds: Counter[str] | None) -> list[str]:
+def _select(qd: Path, skips: Counter[str] | None) -> list[str]:
     eligible = _eligible_candidates(
         qd,
         _in_flight("inflight"),
         {"blocked-done", "done"},
         now=NOW,
         block_file=BLOCK_FILE,
-        holds=holds,
+        skips=skips,
     )
     return sorted(t.id for t in eligible)
 
@@ -259,24 +258,24 @@ def _select(qd: Path, holds: Counter[str] | None) -> list[str]:
 
 def test_every_hold_category_is_counted_exactly(queue_dir: Path, tmp_path: Path) -> None:
     _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
 
-    assert _select(queue_dir, holds) == MIXED_EXPECTED_ELIGIBLE
-    assert holds == MIXED_EXPECTED_HOLDS
+    assert _select(queue_dir, skips) == MIXED_EXPECTED_ELIGIBLE
+    assert skips == MIXED_EXPECTED_SKIPS
 
 
 def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path) -> None:
-    """Returned tasks plus counted holds account for every YAML in todo/.
+    """Returned tasks plus counted skips account for every YAML in todo/.
 
     A skip that records no category makes the sum fall short."""
     _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
 
-    eligible = _select(queue_dir, holds)
+    eligible = _select(queue_dir, skips)
 
     n_yamls = len(list(todo_dir(queue_dir).glob("*.yaml")))
     assert n_yamls == 20
-    assert len(eligible) + sum(holds.values()) == n_yamls
+    assert len(eligible) + sum(skips.values()) == n_yamls
 
 
 def test_breakdown_is_stable_across_ticks(queue_dir: Path, tmp_path: Path) -> None:
@@ -284,29 +283,30 @@ def test_breakdown_is_stable_across_ticks(queue_dir: Path, tmp_path: Path) -> No
     still put each under the gate that holds it, not under the park."""
     _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
     _select(queue_dir, Counter())
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
 
-    assert _select(queue_dir, holds) == MIXED_EXPECTED_ELIGIBLE
-    assert holds == MIXED_EXPECTED_HOLDS
+    assert _select(queue_dir, skips) == MIXED_EXPECTED_ELIGIBLE
+    assert skips == MIXED_EXPECTED_SKIPS
 
 
-def test_counting_holds_does_not_change_selection_or_state(tmp_path: Path) -> None:
-    """Same queue twice: once without ``holds``, once with. Same tasks
-    returned, and the state files the gates wrote are byte-identical."""
+def test_counting_skips_has_no_side_effects(tmp_path: Path) -> None:
+    """Counting is side-effect free: the same queue selected once without
+    ``skips`` and once with returns the same tasks, and the gates write
+    byte-identical state files."""
     missing = tmp_path / "absent" / "paper.md"
-    without, with_holds = tmp_path / "without", tmp_path / "with"
-    for qd in (without, with_holds):
+    without, with_skips = tmp_path / "without", tmp_path / "with"
+    for qd in (without, with_skips):
         qd.mkdir()
         queue_runtime_dir(qd)
         todo_dir(qd)
         _build_mixed_queue(qd, missing)
 
-    assert _select(without, None) == _select(with_holds, Counter())
+    assert _select(without, None) == _select(with_skips, Counter())
 
     def states(qd: Path) -> dict[str, bytes]:
         return {p.name: p.read_bytes() for p in state_path_for(qd, "x").parent.glob("*.yaml")}
 
-    assert states(without) == states(with_holds)
+    assert states(without) == states(with_skips)
     assert set(states(without)) >= {"needs-file.yaml", "bad-effort.yaml"}
 
 
@@ -320,7 +320,7 @@ def test_completed_whichever_check_skips_it(queue_dir: Path) -> None:
     (queue_dir / BLOCK_FILE).write_text(
         '{"task": "blocked-done", "block_dispatch": true}\n', encoding="utf-8"
     )
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
 
     eligible = _eligible_candidates(
         queue_dir,
@@ -328,11 +328,11 @@ def test_completed_whichever_check_skips_it(queue_dir: Path) -> None:
         {"blocked-done", "inflight-done"},
         now=NOW,
         block_file=BLOCK_FILE,
-        holds=holds,
+        skips=skips,
     )
 
     assert eligible == []
-    assert holds == Counter({"completed": 2})
+    assert skips == Counter({"completed": 2})
 
 
 def test_readiness_category_ignores_requires_order(queue_dir: Path, tmp_path: Path) -> None:
@@ -345,10 +345,10 @@ def test_readiness_category_ignores_requires_order(queue_dir: Path, tmp_path: Pa
     )
     write_request(queue_dir, _request("a"))
     write_request(queue_dir, _request("b"))
-    holds: Counter[str] = Counter()
+    skips: Counter[str] = Counter()
 
-    assert _eligible_candidates(queue_dir, {}, set(), now=NOW, holds=holds) == []
-    assert holds == Counter({"readiness awaiting sidecar response + missing file": 2})
+    assert _eligible_candidates(queue_dir, {}, set(), now=NOW, skips=skips) == []
+    assert skips == Counter({"readiness_awaiting_sidecar_response+missing_file": 2})
 
 
 # --- the summary line ---------------------------------------------------
@@ -356,15 +356,15 @@ def test_readiness_category_ignores_requires_order(queue_dir: Path, tmp_path: Pa
 
 def test_summary_lists_largest_first_then_by_name() -> None:
     line = orchestrator_mod._idle_summary(
-        orchestrator_mod._unfinished_holds(
+        orchestrator_mod._unfinished_skips(
             Counter(
                 {
                     "block_dispatch": 178,
-                    "readiness missing file": 128,
-                    "unanswered sidecar": 18,
+                    "readiness_missing_file": 128,
+                    "unanswered_sidecar": 18,
                     "depends_on": 3,
                     "possibly_hung": 1,
-                    "deferred cooldown": 1,
+                    "deferred_cooldown": 1,
                     "completed": 5071,
                 }
             )
@@ -372,13 +372,13 @@ def test_summary_lists_largest_first_then_by_name() -> None:
     )
     assert line == (
         "no eligible tasks: 329 unfinished held (block_dispatch 178, "
-        "readiness missing file 128, unanswered sidecar 18, depends_on 3, "
-        "deferred cooldown 1, possibly_hung 1)"
+        "readiness_missing_file 128, unanswered_sidecar 18, depends_on 3, "
+        "deferred_cooldown 1, possibly_hung 1)"
     )
 
 
 def test_summary_when_only_completed_tasks_remain() -> None:
-    breakdown = orchestrator_mod._unfinished_holds(Counter({"completed": 12}))
+    breakdown = orchestrator_mod._unfinished_skips(Counter({"completed": 12}))
     assert breakdown == {}
     assert (
         orchestrator_mod._idle_summary(breakdown)
@@ -483,7 +483,7 @@ def test_logs_on_entry_change_and_recovery_only(
     assert _idle_lines(caplog) == [
         (
             logging.INFO,
-            "no eligible tasks: 2 unfinished held (deferred cooldown 1, depends_on 1)",
+            "no eligible tasks: 2 unfinished held (deferred_cooldown 1, depends_on 1)",
         )
     ]
     _tick(queue_dir, idle_log)
@@ -505,7 +505,7 @@ def test_logs_on_entry_change_and_recovery_only(
     assert _idle_lines(caplog) == [
         (
             logging.INFO,
-            "no eligible tasks: 2 unfinished held (deferred cooldown 1, depends_on 1)",
+            "no eligible tasks: 2 unfinished held (deferred_cooldown 1, depends_on 1)",
         )
     ]
 
@@ -528,6 +528,29 @@ def test_completed_tasks_change_nothing_in_the_line(
     _state(queue_dir, "done-2", "completed")
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == []
+
+
+def test_in_flight_alone_is_not_a_change(caplog: pytest.LogCaptureFixture) -> None:
+    """``in_flight`` moves whenever a running task starts or finishes; it is
+    printed, but only a change in another category logs the line again."""
+    caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
+    idle_log = IdleDispatchLog()
+
+    idle_log.observe(0, Counter({"depends_on": 1}))
+    idle_log.observe(0, Counter({"depends_on": 1, "in_flight": 1}))
+    idle_log.observe(0, Counter({"depends_on": 1, "in_flight": 2}))
+    idle_log.observe(0, Counter({"depends_on": 1}))
+    assert _idle_lines(caplog) == [
+        (logging.INFO, "no eligible tasks: 1 unfinished held (depends_on 1)")
+    ]
+
+    idle_log.observe(0, Counter({"depends_on": 1, "in_flight": 1, "deferred_cooldown": 1}))
+    assert _idle_lines(caplog) == [
+        (
+            logging.INFO,
+            "no eligible tasks: 3 unfinished held (deferred_cooldown 1, depends_on 1, in_flight 1)",
+        )
+    ]
 
 
 def test_silent_when_no_account_can_dispatch(

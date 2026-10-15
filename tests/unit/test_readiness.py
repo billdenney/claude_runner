@@ -143,9 +143,9 @@ def test_unmet_details_gives_each_requirement_its_category(queue_dir: Path) -> N
     details = unmet_details(task, queue_dir)
 
     assert details == [
-        UnmetRequirement("missing file", f"missing file: {queue_dir / 'a.md'} (the trimmed paper)"),
-        UnmetRequirement("awaiting sidecar response", "awaiting sidecar response"),
-        UnmetRequirement("missing file", f"missing file: {queue_dir / 'b.md'}"),
+        UnmetRequirement("missing_file", f"missing file: {queue_dir / 'a.md'} (the trimmed paper)"),
+        UnmetRequirement("awaiting_sidecar_response", "awaiting sidecar response"),
+        UnmetRequirement("missing_file", f"missing file: {queue_dir / 'b.md'}"),
     ]
     assert unmet_requirements(task, queue_dir) == [d.description for d in details]
 

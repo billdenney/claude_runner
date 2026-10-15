@@ -1,11 +1,11 @@
 """Mechanical (no-AI, no-dispatch) task readiness gates. See ADR-0030.
 
 The supervisor's candidate selector (:func:`runner.orchestrator
-._selector_hold`, once per task) calls :func:`unmet_details` for every
-otherwise-eligible task on each tick. Every check here is a cheap, pure, in-process
-probe — a filesystem ``exists()`` or a set membership test — so it is safe to
-run for the whole pending pool every tick. Nothing here spawns a worker, runs
-a hook subprocess, writes state, or consults an LLM.
+._skip_category`, once per task) calls :func:`unmet_details` for every
+otherwise-eligible task on each tick. Every check here is a cheap, pure,
+in-process probe — a filesystem ``exists()`` or a set membership test — so it
+is safe to run for the whole pending pool every tick. Nothing here spawns a
+worker, runs a hook subprocess, writes state, or consults an LLM.
 
 The gate binds on EVERY dispatch decision, not just the first. Three call
 sites enforce it, and each exists because a task can reach a spawn without
@@ -65,9 +65,10 @@ class UnmetRequirement(NamedTuple):
     """One unmet readiness requirement, as :func:`unmet_details` reports it."""
 
     category: str
-    """What kind of element is missing, the same for every requirement of a
-    kind (``"missing file"``, ``"awaiting sidecar response"``). The selector
-    groups held tasks by it in its "no eligible tasks" summary."""
+    """What kind of element is missing, one snake_case word that is the same
+    for every requirement of a kind (``missing_file``,
+    ``awaiting_sidecar_response``). The selector groups held tasks by it in
+    its "no eligible tasks" summary."""
     description: str
     """The operator-facing reason for this one requirement, naming the
     element (``"missing file: /q/papers/x.md"``) and ending with the
@@ -102,21 +103,29 @@ def unmet_details(
             assert req.path is not None
             target = _resolve(queue_dir, req.path)
             if not target.exists():
-                category = "missing file"
-                unmet.append(UnmetRequirement(category, _describe(req, f"{category}: {target}")))
+                unmet.append(
+                    UnmetRequirement("missing_file", _describe(req, f"missing file: {target}"))
+                )
         elif req.kind == "sidecar_response":
             if open_sidecar_task_ids is None:
                 open_sidecar_task_ids = {tid for tid, _seq, _p in list_open_sidecars(queue_dir)}
             if task.id in open_sidecar_task_ids:
-                category = "awaiting sidecar response"
-                unmet.append(UnmetRequirement(category, _describe(req, category)))
+                unmet.append(
+                    UnmetRequirement(
+                        "awaiting_sidecar_response", _describe(req, "awaiting sidecar response")
+                    )
+                )
         else:  # pragma: no cover - unreachable while ReadinessKind is exhaustive
             # Fail closed: an unrecognised kind blocks dispatch (loudly) rather
             # than being silently treated as satisfied. Reaching here means the
             # schema Literal grew a kind this evaluator wasn't taught.
             logger.error("task %s: unknown readiness kind %r; treating as unmet", task.id, req.kind)
-            category = "unknown requirement kind"
-            unmet.append(UnmetRequirement(category, _describe(req, f"{category}: {req.kind}")))
+            unmet.append(
+                UnmetRequirement(
+                    "unknown_requirement_kind",
+                    _describe(req, f"unknown requirement kind: {req.kind}"),
+                )
+            )
     return unmet
 
 
