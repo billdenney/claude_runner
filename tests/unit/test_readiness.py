@@ -24,7 +24,7 @@ from claude_task_runner.runner.readiness import (
     unmet_requirements,
 )
 
-from ._sidecar_files import write_request
+from ._sidecar_files import make_request, write_request
 
 
 def _task(**overrides: object) -> Task:
@@ -135,7 +135,7 @@ def test_sidecar_response_ready_when_no_open_request(queue_dir: Path) -> None:
 
 def test_sidecar_response_unmet_when_request_open(queue_dir: Path) -> None:
     # An unanswered request makes t1 "sidecar-open".
-    write_request(queue_dir, _sidecar_request("t1", 1))
+    write_request(queue_dir, make_request("t1", 1))
     task = _task(requires=[{"kind": "sidecar_response"}])
     reasons = unmet_requirements(task, queue_dir)
     assert reasons == ["awaiting sidecar response"]
@@ -162,7 +162,7 @@ def test_sidecar_response_unmet_when_only_some_questions_answered(queue_dir: Pat
     from claude_task_runner.queue.schema import SidecarAnswer, SidecarResponse
     from claude_task_runner.queue.sidecar import write_response
 
-    write_request(queue_dir, _sidecar_request("t1", 1, question_ids=("q1", "q2")))
+    write_request(queue_dir, make_request("t1", 1, question_ids=("q1", "q2")))
     write_response(
         queue_dir,
         SidecarResponse(
@@ -182,7 +182,7 @@ def test_sidecar_response_ready_once_every_question_answered(queue_dir: Path) ->
     from claude_task_runner.queue.schema import SidecarAnswer, SidecarResponse
     from claude_task_runner.queue.sidecar import write_response
 
-    write_request(queue_dir, _sidecar_request("t1", 1, question_ids=("q1", "q2")))
+    write_request(queue_dir, make_request("t1", 1, question_ids=("q1", "q2")))
     write_response(
         queue_dir,
         SidecarResponse(
@@ -193,39 +193,6 @@ def test_sidecar_response_ready_once_every_question_answered(queue_dir: Path) ->
         ),
     )
     assert unmet_requirements(_task(requires=[{"kind": "sidecar_response"}]), queue_dir) == []
-
-
-def _sidecar_request(task_id: str, seq: int, question_ids: tuple[str, ...] = ("q1",)):
-    from datetime import UTC, datetime
-
-    from claude_task_runner.queue.schema import (
-        CURRENT_SCHEMA_VERSION,
-        SidecarOption,
-        SidecarQuestion,
-        SidecarRequest,
-    )
-
-    return SidecarRequest(
-        schema_version=CURRENT_SCHEMA_VERSION,
-        task_id=task_id,
-        sequence=seq,
-        created_at=datetime(2026, 7, 8, tzinfo=UTC),
-        summary="s",
-        context="c",
-        questions=[
-            SidecarQuestion(
-                id=qid,
-                prompt="?",
-                options=[
-                    SidecarOption(value="A", label="a", description=""),
-                    SidecarOption(value="B", label="b", description=""),
-                ],
-                recommended="A",
-                multi_select=False,
-            )
-            for qid in question_ids
-        ],
-    )
 
 
 # --- Hold-reason vocabulary ---------------------------------------------
