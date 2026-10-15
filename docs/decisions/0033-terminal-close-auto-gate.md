@@ -4,7 +4,9 @@ Status: Accepted (2026-09-04)
 
 - **Related:** ADR-0020 (gate `completed` on an observable output artifact —
   this reuses its evidence), ADR-0029 (the `block_dispatch` register the
-  selector reads), ADR-0032 (unpushed-commit gate, the sibling case).
+  selector reads), ADR-0031 (sidecar openness per question, which the
+  2026-10-15 amendment reads), ADR-0032 (unpushed-commit gate, the sibling
+  case).
 
 ## Context
 
@@ -86,8 +88,8 @@ one-line query.
 
 ## Amendment (2026-10-15) — a run that asked a question is not a terminal close
 
-**What happened.** On the nlmixr2lib queue on 2026-10-15, 110 unfinished
-tasks carried an `AUTO_GATED` row. 102 of them were `awaiting_sidecar` on
+**What happened.** As of 2026-10-15, 110 unfinished tasks on the nlmixr2lib
+queue carried an `AUTO_GATED` row. 102 of them were `awaiting_sidecar` on
 sidecars that asked real questions, and the operator had already answered
 them; 84 of those answers called for more work (naming rulings, encoding
 choices, "extract both models"). None of the 102 had run since September.
@@ -106,22 +108,46 @@ did not encode it.
 
 **Decision.** `terminal_gate.ensure_terminal_gate` writes no row while the
 task has an open sidecar request with at least one question outstanding,
-counted per question as in ADR-0031 (`queue.sidecar.open_sidecars`). A
-request that cannot be read well enough to tell counts as asking too: it
-stays open until an operator repairs it, and may be asking something. The
-row is still written as before:
+counted per question as in ADR-0031 (`queue.sidecar.open_sidecars`, read for
+this task only). A request counts as asking too when it or its response
+cannot be read well enough to tell what is answered: it stays open until an
+operator repairs it, and may be asking something. The row is still written
+as before:
 
 - when the run leaves no open sidecar, including a rerun after the answer
   (e.g. "skip") that closes without asking again, which is a real terminal
   close;
-- when the only open sidecar is a zero-question notification, since
+- when the only open sidecar is a request with no questions, since
   acknowledging it would otherwise re-dispatch a task with nothing left to
   do, which is the case this ADR exists for.
 
 Task status, the ADR-0020 evidence and every other branch of
 `_finalize_state` are unchanged.
 
-**Consequences.** A run that asks is gated, if at all, by the run after the
-answer, when that run closes without asking again. Rows written before this
-change stay in the register until removed. They carry `status: AUTO_GATED`,
-so the ones on tasks still `awaiting_sidecar` can be found by query.
+**Assumption: a request with no questions is a notification.** The v2
+request schema has no notification marker; asks are filed as `questions`,
+as the agent-stop-and-ask skill specifies. Free-form asks outside
+`questions` existed. As of 2026-10-15 the queue held 184 question-less
+requests among 2,331. 53 carried a free-form ask key (`options`,
+`decisions_requested`, `sidecar_ask`, `question_to_operator`, ...); 44 of
+those held a value, and the files of 43 of the 44 date from May or June
+2026, the last from 2026-06-27. The 44th (dated 2026-09-08) is a completion
+notice phrased as a question. The other 9 set those keys to null, an
+explicit "no question". Every one of the 53 was answered. A schema test would not separate the two
+kinds: only 9 of the 184 question-less requests validate as v2 at all,
+because notifications carry their own extra keys (`kind`, `status`,
+`verdict`, ...). If free-form asks come back, this assumption is the thing
+to revisit.
+
+**Finding the rows written before this change.** They stay in the register
+until removed. The ones this amendment would not have written are the rows
+with `status: AUTO_GATED` whose task is `awaiting_sidecar`, whose newest
+sidecar request asks at least one question, and which has no open request
+(`claude-task-runner sidecar list` does not list it). Removing such a row,
+or setting its `block_dispatch` to false, lets the selector dispatch the
+task with the answer it is waiting for.
+
+**Reversibility.** Removing the `unanswered_asks` check from
+`ensure_terminal_gate` restores the earlier gate exactly. The row format and
+the register are unchanged, so rows written before and after this change
+read the same.
