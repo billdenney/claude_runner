@@ -240,7 +240,7 @@ class TestMigrationV3ToV4:
         path = self._write_v3(queue_dir, v2)
         snap = load(path)
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.state is SupervisorState.NO_READING
         assert snap.accounts["default"].state is SupervisorState.NO_READING
 
@@ -282,7 +282,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.state is SupervisorState.NO_READING
         assert snap.accounts["a"].state is SupervisorState.NO_READING
         # Other states, their wakeups and in-flight tasks are untouched.
@@ -300,7 +300,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.state is SupervisorState.THROTTLED_5H
         assert snap.scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
 
@@ -310,7 +310,7 @@ class TestMigrationV4ToV5:
         v3 = {"schema_version": 3, "state": "stopped", "since": "2026-09-25T12:00:00+00:00"}
         snap = load(self._write(queue_dir, v3))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.state is SupervisorState.NO_READING
 
     def test_malformed_account_entry_still_fails_loud(self, queue_dir: Path) -> None:
@@ -354,7 +354,7 @@ class TestMigrationV5ToV6:
         }
         snap = load(self._write(queue_dir, v5))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.target_concurrency is None
         assert snap.accounts["a"].target_concurrency is None
         # Nothing else changes meaning, so nothing else is rewritten.
@@ -396,10 +396,10 @@ class TestMigrationV5ToV6:
         with pytest.raises(SupervisorPersistenceError, match="target_concurrency"):
             load(self._write(queue_dir, v6))
 
-    def test_written_snapshot_is_v7(self, queue_dir: Path) -> None:
+    def test_written_snapshot_is_v8(self, queue_dir: Path) -> None:
         path = supervisor_state_path(queue_dir)
         write_atomic(initial_snapshot(since=datetime(2026, 9, 25, 12, 0, tzinfo=UTC)), path)
-        assert json.loads(path.read_text())["schema_version"] == 7
+        assert json.loads(path.read_text())["schema_version"] == 8
 
 
 class TestMigrationV6ToV7:
@@ -440,7 +440,7 @@ class TestMigrationV6ToV7:
         v6 = {"schema_version": 6, **entry, "accounts": {"a": dict(entry)}}
         snap = load(self._write(queue_dir, v6))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         rewritten = loaded_state is SupervisorState.NO_READING
         for view in (snap, snap.accounts["a"]):
             assert view.state is loaded_state
@@ -503,7 +503,7 @@ class TestMigrationV6ToV7:
         }
         snap = load(self._write(queue_dir, v5))
         assert snap is not None
-        assert snap.schema_version == 7
+        assert snap.schema_version == 8
         assert snap.state is SupervisorState.THROTTLED_WEEKLY
         for name in ("personal", "work"):
             loaded = snap.accounts[name]
@@ -546,3 +546,43 @@ class TestMigrationV6ToV7:
         assert loaded is not None
         assert loaded.last_reading_at == read_at
         assert loaded.accounts["a"].last_reading_at == read_at
+
+
+class TestMigrationV7ToV8:
+    """v8 adds ``AccountState.policy_error``; a v7 file needs no rewrite."""
+
+    def _write(self, queue_dir: Path, payload: dict) -> Path:
+        path = supervisor_state_path(queue_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_v7_loads_with_no_policy_error_and_nothing_else_changed(self, queue_dir: Path) -> None:
+        entry = {
+            "state": "dispatching",
+            "since": "2026-10-15T12:00:00+00:00",
+            "target_concurrency": 3,
+            "last_reading_at": "2026-10-15T12:00:00+00:00",
+        }
+        v7 = {"schema_version": 7, **entry, "accounts": {"a": dict(entry)}}
+        snap = load(self._write(queue_dir, v7))
+        assert snap is not None
+        assert snap.schema_version == 8
+        assert snap.accounts["a"].policy_error is None
+        assert snap.accounts["a"].state is SupervisorState.DISPATCHING
+        assert snap.accounts["a"].target_concurrency == 3
+
+    def test_policy_error_round_trips(self, queue_dir: Path) -> None:
+        path = supervisor_state_path(queue_dir)
+        snap = initial_snapshot(since=datetime(2026, 10, 15, tzinfo=UTC), account_names=["a"])
+        error = "Invalid TOML in /x/runner-account.toml: Expected '=' (at line 1, column 5)"
+        snap = snap.model_copy(
+            update={
+                "accounts": {"a": snap.accounts["a"].model_copy(update={"policy_error": error})}
+            }
+        )
+        write_atomic(snap, path)
+        loaded = load(path)
+        assert loaded is not None
+        assert loaded.accounts["a"].policy_error == error
+        assert json.loads(path.read_text())["accounts"]["a"]["policy_error"] == error

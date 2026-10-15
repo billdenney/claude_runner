@@ -17,8 +17,8 @@ supervisor (no race with the supervisor's own dispatch loop):
    throttle gate. It scans the request directory, revalidates each
    task (still in ``todo/``, still in a dispatchable status, not
    already in-flight, (model, effort) accepted, ``requires``
-   satisfied), respects ``max_concurrency`` unless the request was
-   written with ``allow_over_limit=True``, and spawns exactly the same
+   satisfied), waits for a free slot (:func:`_no_free_slot`) unless the
+   request was written with ``allow_over_limit=True``, and spawns exactly the same
    per-task dispatch thread the orchestrator does.
 
 The bypass is scoped to the THROTTLE. The ADR-0030 ``requires`` gate is
@@ -33,7 +33,7 @@ fixture-queue debugging), :func:`dispatch_synchronously` runs one
 attempt in-process. There is no race because the host-wide lock
 isn't held by anyone else.
 
-Request files persist across ticks when ``max_concurrency`` is full
+Request files persist across ticks when there is no free slot
 and ``allow_over_limit=False``: the supervisor declines, leaves the
 file in place, and tries again on the next tick. Operators wanting
 the request to evaporate on capacity-decline must remove it manually.
@@ -47,12 +47,13 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from claude_task_runner.config.loader import resolve_accounts
+from claude_task_runner.config.loader import AccountResolution, resolve_accounts
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -63,14 +64,16 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
+from claude_task_runner.runner.account_dispatch import account_in_flight_count, dispatch_headroom
 from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
-from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
+from claude_task_runner.supervisor.states import InFlightRecord
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
-    from claude_task_runner.config.schema import Settings
+    from claude_task_runner.config.schema import ResolvedAccount, Settings
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +231,90 @@ def _load_state_or_none(queue_dir: Path, task_id: str) -> TaskState | None:
         ) from exc
 
 
+def _no_free_slot(
+    accounts: list[ResolvedAccount],
+    in_flight_slots: dict[str, DispatchSlot],
+    configured: int | None,
+) -> bool:
+    """Whether a force-dispatch without ``allow_over_limit`` must wait.
+
+    An explicit ``[concurrency].max_concurrency`` is the gate, compared
+    with every in-flight task. Without one, the request waits until some
+    account has a free slot under its own ``max_concurrency``
+    (:func:`runner.account_dispatch.dispatch_headroom`). Either way it is
+    not the warm-up cap. :func:`_pick_account` then chooses the account.
+    """
+    if configured is not None:
+        return len(in_flight_slots) >= configured
+    return dispatch_headroom(accounts, to_in_flight_records(in_flight_slots), None) == 0
+
+
+@dataclass(frozen=True)
+class _AccountPick:
+    """The account a force-dispatch goes to, or why it goes nowhere."""
+
+    account: ResolvedAccount | None
+    reason: str = ""
+    drop: bool = False
+    """When no account was picked: whether the request can never go through
+    as it stands (drop it) rather than later (leave it for a later tick)."""
+
+
+def _pick_account(
+    task: Task,
+    affined: str | None,
+    resolution: AccountResolution,
+    in_flight: Sequence[InFlightRecord] = (),
+) -> _AccountPick:
+    """Session affinity, then ``task.account`` pinning, then a free account.
+
+    An unbound request goes to the first account, in declaration order,
+    with a free slot under its own ``max_concurrency`` given ``in_flight``,
+    and to the first account when none has one (which only
+    ``--over-limit`` or an explicit ``[concurrency].max_concurrency``
+    lets through). Force bypasses throttling and pauses, not the caps.
+
+    An account whose ``runner-account.toml`` does not load takes no tasks,
+    forced or not: a request affined or pinned to one waits for the file to
+    be fixed rather than going elsewhere, and with no account loaded at all
+    every request waits. A session host no longer in ``[[accounts]]`` is
+    dropped with the ``queue restart-fresh`` hint (ADR-0024). A pin to an
+    unknown account falls through to the unbound choice.
+    """
+    by_name = {acct.name: acct for acct in resolution.accounts}
+    broken = {b.name: b for b in resolution.broken}
+    if affined is not None:
+        if affined in broken:
+            return _AccountPick(
+                None,
+                f"session host account {affined!r} takes no tasks until its "
+                f"runner-account.toml loads: {broken[affined].error}",
+            )
+        if affined not in by_name:
+            return _AccountPick(
+                None,
+                f"session affined to {affined!r} which is not in [[accounts]]; run "
+                f"`queue restart-fresh {task.id}` to clear the session and dispatch fresh",
+                drop=True,
+            )
+        return _AccountPick(by_name[affined])
+    if task.account is not None and task.account in broken:
+        return _AccountPick(
+            None,
+            f"pinned account {task.account!r} takes no tasks until its "
+            f"runner-account.toml loads: {broken[task.account].error}",
+        )
+    if task.account is not None and task.account in by_name:
+        return _AccountPick(by_name[task.account])
+    if not by_name:
+        return _AccountPick(None, "no account's runner-account.toml loads")
+    in_flight = list(in_flight)
+    for acct in by_name.values():
+        if account_in_flight_count(acct.name, in_flight) < acct.policy.concurrency.max_concurrency:
+            return _AccountPick(acct)
+    return _AccountPick(next(iter(by_name.values())))
+
+
 def tick_consume(
     *,
     queue_dir: Path,
@@ -254,11 +341,11 @@ def tick_consume(
     if not requests:
         return 0
 
-    accounts = resolve_accounts(settings)
-    accounts_by_name = {a.name: a for a in accounts}
+    resolution = resolve_accounts(settings)
+    accounts = list(resolution.accounts)
 
     dispatched = 0
-    cap = max(1, settings.concurrency.max_concurrency)
+    configured = settings.concurrency.max_concurrency
 
     for req in requests:
         task_path = task_path_for(queue_dir, req.task_id)
@@ -351,12 +438,20 @@ def tick_consume(
             consume_request(queue_dir, task.id)
             continue
 
-        if not req.allow_over_limit and len(in_flight_slots) >= cap:
+        # With no account loaded there is no slot to wait for;
+        # _pick_account below says so.
+        if (
+            accounts
+            and not req.allow_over_limit
+            and _no_free_slot(accounts, in_flight_slots, configured)
+        ):
             logger.warning(
-                "force-dispatch %s: in-flight=%d >= max_concurrency=%d; leaving request",
+                "force-dispatch %s: no free slot (in-flight=%d, %s); leaving request",
                 task.id,
                 len(in_flight_slots),
-                cap,
+                "every account at its own max_concurrency"
+                if configured is None
+                else f"[concurrency].max_concurrency={configured}",
             )
             continue
 
@@ -377,25 +472,18 @@ def tick_consume(
         #      the next dispatch starts a fresh session.
         #   2. Task.account pinning when present and known.
         #   3. First configured account (fallback).
+        #   An account whose runner-account.toml does not load takes no
+        #   tasks, forced or not (ADR-0035): a request bound to one waits.
         affined = state.session_host_account() if state is not None else None
-        if affined is not None:
-            if affined not in accounts_by_name:
-                logger.warning(
-                    "force-dispatch %s: session affined to %r which is "
-                    "not in [[accounts]]; dropping request. Run "
-                    "`queue restart-fresh %s` to clear the session "
-                    "and dispatch fresh.",
-                    task.id,
-                    affined,
-                    task.id,
-                )
+        pick = _pick_account(task, affined, resolution, to_in_flight_records(in_flight_slots))
+        if pick.account is None:
+            if pick.drop:
+                logger.warning("force-dispatch %s: %s; dropping request", task.id, pick.reason)
                 consume_request(queue_dir, task.id)
-                continue
-            picked = accounts_by_name[affined]
-        elif task.account and task.account in accounts_by_name:
-            picked = accounts_by_name[task.account]
-        else:
-            picked = next(iter(accounts_by_name.values()))
+            else:
+                logger.warning("force-dispatch %s: %s; leaving request", task.id, pick.reason)
+            continue
+        picked = pick.account
 
         consume_request(queue_dir, task.id)
         _spawn_dispatch_thread(
@@ -516,25 +604,14 @@ def dispatch_synchronously(
             f"requirement(s): {'; '.join(unmet_reqs)}"
         )
 
-    accounts = resolve_accounts(settings)
-    accounts_by_name = {a.name: a for a in accounts}
     # ADR-0024: session affinity wins over task.account pinning when
     # both are set. A session opened on account X is invisible to
     # claude running with account Y's CLAUDE_CONFIG_DIR, so this is
     # a correctness gate, not a policy choice.
-    affined = state.session_host_account()
-    if affined is not None:
-        if affined not in accounts_by_name:
-            raise ForceDispatchError(
-                f"task {task.id} session affined to {affined!r} which "
-                "is not in [[accounts]]; run `queue restart-fresh "
-                f"{task.id}` to clear the session and dispatch fresh"
-            )
-        picked = accounts_by_name[affined]
-    elif task.account and task.account in accounts_by_name:
-        picked = accounts_by_name[task.account]
-    else:
-        picked = next(iter(accounts_by_name.values()))
+    pick = _pick_account(task, state.session_host_account(), resolve_accounts(settings))
+    if pick.account is None:
+        raise ForceDispatchError(f"task {task.id}: {pick.reason}")
+    picked = pick.account
 
     plan = plan_next_spawn(task, state, settings=settings.session)
     outcome = dispatcher_mod.dispatch(

@@ -42,16 +42,21 @@ set. While SLOWING_DOWN that target is ADR-0022's linear ramp, the
 number the supervisor announced, so each account slows down on its own
 5h reading.
 
-This module applies no queue-wide cap. The orchestrator separately
-bounds the queue's total in-flight tasks by ``[concurrency]``
-(``runner.orchestrator._target_concurrency``).
+:func:`choose_account` applies no queue-wide cap. Before it is asked,
+the orchestrator bounds how many tasks a tick starts by
+:func:`dispatch_headroom`: each account's free slots under its own
+``max_concurrency``, summed, and no more than an explicit
+``[concurrency]`` cap allows when the queue TOML sets one (ADR-0035).
+Without one, no account is ever held below its own cap.
+:class:`QueueCeiling` summarises the same numbers for the log and the CLI.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from claude_task_runner.config.schema import ResolvedAccount
+from claude_task_runner.config.schema import AccountPolicy, ResolvedAccount
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -97,6 +102,7 @@ def choose_account(
     account_states: dict[str, AccountState],
     in_flight: list[InFlightRecord],
     affined_account: str | None = None,
+    broken: Mapping[str, str] | None = None,
 ) -> DispatchChoice:
     """Pick the account ``task`` should be dispatched through.
 
@@ -126,6 +132,11 @@ def choose_account(
         (sessions are namespaced by ``CLAUDE_CONFIG_DIR``); affinity
         is enforced as a correctness gate ahead of ``task.account``
         pinning. See ADR-0024.
+    broken
+        The declared accounts left out of ``accounts`` because their
+        ``runner-account.toml`` does not load, each with its error
+        (``config.loader.BrokenAccount``). They take no tasks; naming them
+        lets a decline say why rather than call them unknown.
 
     Returns
     -------
@@ -133,7 +144,17 @@ def choose_account(
         ``account`` names the picked account, or ``None`` when no
         account has capacity. ``reason`` is a short audit string.
     """
+    broken = broken or {}
     if affined_account is not None:
+        if affined_account in broken:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"session affinity blocks dispatch: host account "
+                    f"{affined_account!r} takes no tasks until its runner-account.toml "
+                    f"loads: {broken[affined_account]}"
+                ),
+            )
         if affined_account not in accounts:
             return DispatchChoice(
                 account=None,
@@ -184,6 +205,14 @@ def choose_account(
 
     pinned = task.account
     if pinned is not None:
+        if pinned in broken:
+            return DispatchChoice(
+                account=None,
+                reason=(
+                    f"pinned account {pinned!r} takes no tasks until its "
+                    f"runner-account.toml loads: {broken[pinned]}"
+                ),
+            )
         if pinned not in accounts:
             return DispatchChoice(
                 account=None,
@@ -217,7 +246,7 @@ def choose_account(
         return DispatchChoice(account=pinned, reason=f"pinned to {pinned!r}")
 
     candidates: list[tuple[tuple[int, int, str], str]] = []
-    blocked_reasons: list[str] = []
+    blocked_reasons = [f"{name}: its runner-account.toml does not load" for name in broken]
     for name, acct in accounts.items():
         maybe_state = account_states.get(name)
         if maybe_state is None:
@@ -304,3 +333,128 @@ def account_in_flight_count(account: str, in_flight: list[InFlightRecord]) -> in
     orchestrator's eligibility check both need it.
     """
     return sum(1 for r in in_flight if r.account == account)
+
+
+def dispatch_headroom(
+    accounts: Iterable[ResolvedAccount],
+    in_flight: Sequence[InFlightRecord],
+    queue_cap: int | None,
+) -> int:
+    """How many more tasks may start now, across all accounts.
+
+    Each declared account adds its free slots under its own
+    ``max_concurrency``. An account running more than that, because its cap
+    was lowered while its tasks ran, adds 0 rather than taking slots from
+    the others, and an in-flight task of an account no longer in
+    ``accounts`` counts against no account. ``queue_cap`` is the explicit
+    queue-wide cap in force (``runner.orchestrator._target_concurrency``),
+    ``None`` when there is none; when set, every in-flight task, declared
+    or not, counts against it.
+
+    An upper bound: :func:`choose_account` still lowers each account to
+    its throttle target and skips one that takes no tasks.
+    """
+    in_flight = list(in_flight)
+    free = sum(
+        max(
+            0,
+            acct.policy.concurrency.max_concurrency - account_in_flight_count(acct.name, in_flight),
+        )
+        for acct in accounts
+    )
+    if queue_cap is None:
+        return free
+    return max(0, min(free, queue_cap - len(in_flight)))
+
+
+@dataclass(frozen=True)
+class QueueCeiling:
+    """The most tasks a queue can run at once, and where that number comes from.
+
+    ``configured`` is the queue TOML's ``[concurrency].max_concurrency``,
+    ``None`` when the key is left out. ``account_caps`` maps each account to
+    its own ``max_concurrency`` from its ``runner-account.toml``. Build it
+    with :meth:`of` from the policies ``config.loader.resolve_accounts``
+    returned this tick, so an edit to an account's file shows within a tick.
+
+    ``broken`` names the accounts whose ``runner-account.toml`` does not
+    load (``config.loader.BrokenAccount``). They take no tasks, so they add
+    nothing to the sum; :meth:`describe` names them.
+
+    Dispatch itself uses :func:`dispatch_headroom`, which counts free slots
+    per account. This is the summary the supervisor's log and the CLI show,
+    and the cap the daemon gives a usage reading it cannot attribute.
+    ``[concurrency].initial_concurrency``'s warm-up cap is not part of it.
+    """
+
+    configured: int | None
+    account_caps: Mapping[str, int]
+    broken: tuple[str, ...] = ()
+
+    @classmethod
+    def of(
+        cls,
+        configured: int | None,
+        policies: Mapping[str, AccountPolicy],
+        broken: Iterable[str] = (),
+    ) -> QueueCeiling:
+        """The ceiling for ``configured`` over ``policies``, keyed by account name."""
+        return cls(
+            configured=configured,
+            account_caps={name: p.concurrency.max_concurrency for name, p in policies.items()},
+            broken=tuple(broken),
+        )
+
+    @property
+    def accounts_total(self) -> int:
+        """The sum of the accounts' own ``max_concurrency``."""
+        return sum(self.account_caps.values())
+
+    @property
+    def binds(self) -> bool:
+        """Whether ``configured`` holds the queue below its accounts' own caps.
+
+        A value equal to or above :attr:`accounts_total` never limits
+        dispatch, because no account runs more than its own cap.
+        """
+        return self.configured is not None and self.configured < self.accounts_total
+
+    @property
+    def value(self) -> int:
+        """The most tasks the queue's accounts can run at once: ``configured``
+        when it binds, else :attr:`accounts_total`."""
+        if self.configured is not None and self.binds:
+            return self.configured
+        return self.accounts_total
+
+    @property
+    def breakdown(self) -> str:
+        """Each account's cap, in declaration order: ``personal 5 + work 3``,
+        or ``none`` when no account's policy loaded."""
+        return " + ".join(f"{name} {cap}" for name, cap in self.account_caps.items()) or "none"
+
+    def describe(self) -> str:
+        """The ceiling, where it comes from and whether it binds, on one line."""
+        if self.configured is not None and self.binds:
+            text = (
+                f"{self.configured} from [concurrency].max_concurrency, which binds: "
+                f"the accounts' max_concurrency sum to {self.accounts_total} ({self.breakdown})"
+            )
+        else:
+            text = f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
+            if self.configured is not None:
+                text += f"; [concurrency].max_concurrency = {self.configured} does not bind"
+        if self.broken:
+            text += f"; not counted until its runner-account.toml loads: {', '.join(self.broken)}"
+        return text
+
+    def as_json(self) -> dict[str, object]:
+        """The fields ``--json`` output carries. ``ceiling`` is :attr:`value`."""
+        return {
+            "ceiling": self.value,
+            "max_concurrency": self.configured,
+            "accounts_total": self.accounts_total,
+            "account_caps": dict(self.account_caps),
+            "binds": self.binds,
+            "broken_accounts": list(self.broken),
+        }

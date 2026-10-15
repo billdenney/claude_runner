@@ -205,3 +205,16 @@ adopted path's, and it now runs the owned path's post-run steps too:
   On the owned path, a hook that could not start used to raise out of the
   dispatch after the run was recorded. For a worker that exited in the
   restart gap, the hook runs during startup, before the first tick.
+
+## Update (2026-10-15)
+
+An adopted worker's slot now names the account it runs on from the same
+sources as the exited-worker finalize: the previous supervisor's persisted
+`in_flight` record for the task when the queue declares that account, then
+the state's session host account, then the only account of a
+single-account queue. It used the session host alone, so a first attempt
+(no session yet) was counted against an account named `default`, which a
+multi-account queue does not have: after a restart its real account could
+be dispatched past its own `max_concurrency` until the worker finished.
+When no source names an account the slot names `(unknown)`, which counts
+against no account's cap, and a WARNING says so (ADR-0035).

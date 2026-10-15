@@ -15,7 +15,8 @@ single-account fields; v4 (ADR-0022) drops the ``paused_weekly`` and
 entered; v6 adds ``target_concurrency``, the per-account dispatch cap
 from the last throttle decision; v7 adds the ``no_reading`` state and
 ``last_reading_at``, so an account takes tasks only on a recent clean
-reading. The legacy top-level fields remain populated (mirrored from
+reading; v8 adds ``policy_error``, set while an account's
+``runner-account.toml`` does not load. The legacy top-level fields remain populated (mirrored from
 ``accounts[<active>]`` after each tick).
 """
 
@@ -26,7 +27,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SUPERVISOR_SCHEMA_VERSION = 7
+SUPERVISOR_SCHEMA_VERSION = 8
 """Supervisor.json schema version.
 
 Bumped from 3 to 4 (ADR-0022) when ``paused_weekly`` and
@@ -51,7 +52,12 @@ added. An older file records no reading time, so none of its decisions
 can be shown to be recent: the persistence layer rewrites every
 dispatchable state (``idle``, ``dispatching``, ``slowing_down``) to
 ``no_reading``, and each account is read again within one round-robin
-cycle."""
+cycle.
+
+Bumped from 7 to 8 when ``policy_error`` was added to
+:class:`AccountState`. A v7 file needs no rewrite: the field starts as
+``None`` and the next tick sets it from the account's file. As with v6,
+the bump makes an older supervisor refuse the file with a version error."""
 
 
 class SupervisorState(StrEnum):
@@ -158,6 +164,12 @@ class AccountState(BaseModel):
     """When True, the dispatch policy skips this account. Set each tick from
     the account's pause marker (``supervisor.account_pause.refresh``); never
     write it directly, since the next refresh replaces it."""
+
+    policy_error: str | None = None
+    """Why this account's ``runner-account.toml`` does not load, or ``None``
+    when it loads (or is missing). While set, the account takes no new tasks
+    and its readings make no throttle decision (ADR-0035). Set each tick from
+    :func:`config.loader.resolve_accounts`; never write it directly."""
 
     last_capture_at: datetime | None = None
     """Timestamp of the most recent ``/usage`` capture attempt for this

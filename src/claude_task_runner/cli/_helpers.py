@@ -16,7 +16,9 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.store import require_queue_dir
+from claude_task_runner.runner.account_dispatch import QueueCeiling
 
 PER_QUEUE_CONFIG_NAME = "claude_runner.toml"
 """Conventional filename for a per-queue runner config sitting at
@@ -98,3 +100,20 @@ def require_queue_option(queue_dir: Path, console: Console, *, json: bool = Fals
         else:
             console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=2) from exc
+
+
+def queue_ceiling_text(ceiling: QueueCeiling, settings: Settings) -> str:
+    """The queue's concurrency ceiling on one line, with its warm-up cap when set.
+
+    ``account list`` and ``supervisor status`` print it.
+    """
+    text = ceiling.describe()
+    initial = settings.concurrency.initial_concurrency
+    if initial is not None:
+        text += f"; initial_concurrency {initial} until a first task completes"
+    return text
+
+
+def queue_ceiling_json(ceiling: QueueCeiling, settings: Settings) -> dict[str, object]:
+    """The ``queue_ceiling`` object of ``--json`` output, with the warm-up cap."""
+    return {**ceiling.as_json(), "initial_concurrency": settings.concurrency.initial_concurrency}

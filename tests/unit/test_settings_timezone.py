@@ -79,7 +79,8 @@ def test_an_absent_queue_timezone_is_the_system_local_time(tmp_path: Path) -> No
 
 
 def test_an_absent_account_timezone_inherits_the_queue_one(tmp_path: Path) -> None:
-    (tmp_path / "runner-account.toml").write_text("", encoding="utf-8")
+    # A file with no keys; a zero-byte one is reported as broken (ADR-0035).
+    (tmp_path / "runner-account.toml").write_text("# no timezone\n", encoding="utf-8")
     assert load_account_policy(str(tmp_path)).dispatch_pct.timezone is None
 
 

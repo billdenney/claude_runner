@@ -261,7 +261,7 @@ class TestResolveAccounts:
     def test_resolves_single_default_with_empty_policy(self) -> None:
         """Loader's synthesised legacy default → ResolvedAccount with default policy."""
         s = load_settings(None)
-        resolved = resolve_accounts(s)
+        resolved = resolve_accounts(s).accounts
         assert len(resolved) == 1
         assert isinstance(resolved[0], ResolvedAccount)
         assert resolved[0].name == "default"
@@ -297,13 +297,15 @@ class TestResolveAccounts:
             encoding="utf-8",
         )
         s = load_settings(toml)
-        resolved = resolve_accounts(s)
+        resolution = resolve_accounts(s)
+        assert resolution.broken == ()
+        resolved = resolution.accounts
         assert [r.name for r in resolved] == ["personal", "work"]
         assert resolved[0].policy.concurrency.max_concurrency == 5
         assert resolved[1].policy.concurrency.max_concurrency == 1
         assert resolved[1].linux_user == "bw"
 
-    def test_resolve_propagates_per_account_error(self, tmp_path: Path) -> None:
+    def test_resolve_reports_a_per_account_error_without_raising(self, tmp_path: Path) -> None:
         bad = tmp_path / "bad"
         bad.mkdir()
         (bad / "runner-account.toml").write_text("] not toml [", encoding="utf-8")
@@ -313,5 +315,10 @@ class TestResolveAccounts:
             encoding="utf-8",
         )
         s = load_settings(toml)
-        with pytest.raises(ConfigError):
-            resolve_accounts(s)
+        resolution = resolve_accounts(s)
+        assert resolution.accounts == ()
+        assert [b.name for b in resolution.broken] == ["bad"]
+        assert resolution.broken[0].path == str(bad / "runner-account.toml")
+        assert resolution.broken[0].error.startswith(
+            f"Invalid TOML in {bad / 'runner-account.toml'}: "
+        )

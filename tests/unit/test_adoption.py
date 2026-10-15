@@ -41,6 +41,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.supervisor.adoption import (
+    UNATTRIBUTED_ACCOUNT,
     ExitedWorkerResult,
     adopt_running_workers,
     finalize_exited_workers,
@@ -646,3 +647,111 @@ def test_finalize_exited_stands_down_for_concurrent_writer(
 
     assert results == []
     assert load_state(state_path_for(queue_dir, "409-race")) == other
+
+
+@pytest.mark.parametrize(
+    ("prior_account", "session_account", "two_accounts", "expected"),
+    [
+        pytest.param("personal", None, True, "personal", id="first-attempt-from-prior-record"),
+        pytest.param("personal", "work", True, "personal", id="prior-record-beats-old-session"),
+        pytest.param("default", "work", True, "work", id="undeclared-prior-record-ignored"),
+        pytest.param(None, "work", True, "work", id="no-record-falls-back-to-session"),
+        pytest.param(None, None, False, "default", id="single-account-is-the-only-account"),
+        pytest.param(None, None, True, UNATTRIBUTED_ACCOUNT, id="nothing-known"),
+    ],
+)
+def test_adopted_worker_counts_against_the_account_it_runs_on(
+    queue_dir: Path,
+    stub_worker: list[str],
+    caplog: pytest.LogCaptureFixture,
+    prior_account: str | None,
+    session_account: str | None,
+    two_accounts: bool,
+    expected: str,
+) -> None:
+    """A running attempt's state YAML records no account (a run's account is
+    written when it finalizes), so a first attempt's slot must come from the
+    previous supervisor's in-flight record, or the slot counts against no
+    account and that account can be dispatched past its own cap after a
+    restart."""
+    log = _make_log(queue_dir, "410-adopt")
+    _seed_running(
+        queue_dir,
+        "410-adopt",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(seconds=120),
+        last_heartbeat_at=_NOW - timedelta(seconds=10),
+    )
+    if session_account is not None:
+        state = load_state(state_path_for(queue_dir, "410-adopt"))
+        write_state_atomic(
+            state.model_copy(update={"session_id": "sess-old", "session_account": session_account}),
+            state_path_for(queue_dir, "410-adopt"),
+        )
+    prior = (
+        [InFlightRecord(task_id="410-adopt", account=prior_account, started_at=_NOW)]
+        if prior_account is not None
+        else []
+    )
+    slots: dict[str, DispatchSlot] = {}
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.adoption"):
+        adopt_running_workers(
+            queue_dir,
+            settings=_two_account_settings() if two_accounts else _settings(),
+            clock=FakeClock(_NOW),
+            in_flight_slots=slots,
+            prior_in_flight=prior,
+        )
+    slots["410-adopt"].thread.join(timeout=2)
+    assert slots["410-adopt"].account == expected
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warned == (
+        [
+            "adoption: no record names the account task 410-adopt's worker (pid 4321) "
+            "runs on; it counts against no account's max_concurrency until it finishes"
+        ]
+        if expected == UNATTRIBUTED_ACCOUNT
+        else []
+    )
+
+
+@pytest.mark.usefixtures("private_global_lock")
+def test_the_supervisor_hands_adoption_the_previous_in_flight_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adoption runs before reconcile_orphans clears the old ``in_flight``
+    records, and the supervisor passes them on, so a first attempt's worker
+    is attributed to the account it was dispatched through."""
+    from claude_task_runner.supervisor import adoption as adoption_mod
+    from claude_task_runner.supervisor import persistence as persist_mod
+    from claude_task_runner.supervisor.daemon import start_daemon
+    from claude_task_runner.usage.source import FakeUsageSource
+
+    from ._concurrency_fixtures import usage_reading
+
+    qd = tmp_path / "q"
+    qd.mkdir()
+    queue_runtime_dir(qd)
+    prior = [InFlightRecord(task_id="411-wired", account="work", started_at=_NOW)]
+    snap = persist_mod.initial_snapshot(since=_NOW, account_names=["work", "personal"])
+    persist_mod.write_atomic(
+        snap.model_copy(update={"in_flight": prior}), persist_mod.supervisor_state_path(qd)
+    )
+    seen: list[object] = []
+
+    def _record(*_args: object, **kwargs: object) -> list[object]:
+        seen.append(kwargs.get("prior_in_flight"))
+        return []
+
+    monkeypatch.setattr(adoption_mod, "adopt_running_workers", _record)
+    start_daemon(
+        queue_dir=qd,
+        settings=_two_account_settings(),
+        source=FakeUsageSource([usage_reading()]),
+        pending_count_fn=lambda: 0,
+        in_flight_count_fn=lambda: 0,
+        install_signal_handlers=False,
+        max_ticks=0,
+    )
+    assert seen == [prior]

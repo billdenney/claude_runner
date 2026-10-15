@@ -23,8 +23,8 @@ from pathlib import Path
 
 from claude_task_runner.config.loader import (
     ConfigError,
-    load_account_policy,
     per_account_toml_path,
+    resolve_accounts,
 )
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import registry as registry_mod
@@ -323,9 +323,9 @@ def _current_username() -> str:
 def check_account_policies(settings: Settings) -> CheckResult:
     """Each account's ``<config_dir>/runner-account.toml`` parses; report resolved policy.
 
-    Walks ``settings.accounts``; for each one tries to load the per-
-    account policy. A missing file is informational (defaults apply);
-    a present-but-unparseable file is FAIL. The detail string is a
+    Reads every account through :func:`config.loader.resolve_accounts`. A
+    missing file is informational (defaults apply); a file that exists
+    but does not load is FAIL, with the error. The detail string is a
     one-line-per-account summary of resolved ``max_concurrency`` and
     band thresholds so the operator can verify what the supervisor
     will use.
@@ -337,16 +337,13 @@ def check_account_policies(settings: Settings) -> CheckResult:
             detail="no [[accounts]] configured (defaults apply)",
         )
 
-    fails: list[str] = []
+    resolution = resolve_accounts(settings)
+    fails = [f"{b.name}: {b.error}" for b in resolution.broken]
     rows: list[str] = []
-    for acct in settings.accounts:
+    for acct in resolution.accounts:
+        policy = acct.policy
         path = per_account_toml_path(acct.config_dir)
-        try:
-            policy = load_account_policy(acct.config_dir)
-        except ConfigError as exc:
-            fails.append(f"{acct.name}: {exc}")
-            continue
-        source = "defaults" if path is None or not path.exists() else str(path)
+        source = "defaults" if path is None or not path.is_file() else str(path)
 
         def _fmt(v: object) -> str:
             """Render a per-account override field, treating None as 'inherit'.
@@ -388,8 +385,8 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
     """Operator-visible migration check: flag lingering ``[throttle.*]`` blocks.
 
     ADR-0022 renamed ``[throttle.*]`` to ``[dispatch_pct.*]``. The loader
-    raises on the legacy block, but operators running ``doctor`` on a
-    queue that hasn't been migrated yet see this check first — it
+    refuses a queue TOML with the legacy block and reports an account
+    file with it as broken (``config.loader.BrokenAccount``); this check
     points to the exact files that need editing.
 
     Scans the queue's ``claude_runner.toml`` and every resolved
@@ -403,8 +400,14 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
     if queue_toml.exists():
         candidates.append(queue_toml)
     for acct in settings.accounts:
-        path = per_account_toml_path(acct.config_dir)
-        if path is not None and path.exists():
+        try:
+            path = per_account_toml_path(acct.config_dir)
+            present = path is not None and path.is_file()
+        except (ConfigError, OSError):
+            # No path can be built, or its directory cannot be read;
+            # check_account_policies reports it.
+            continue
+        if path is not None and present:
             candidates.append(path)
 
     offenders: list[str] = []
@@ -412,9 +415,9 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
         try:
             with path.open("rb") as fh:
                 payload = tomllib.load(fh)
-        except tomllib.TOMLDecodeError:
-            # The check_account_policies / loader path surfaces parse
-            # errors; we only care about the legacy throttle key here.
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
+            # check_account_policies reports a file that does not load;
+            # only the legacy throttle key matters here.
             continue
         if "throttle" in payload:
             offenders.append(str(path))

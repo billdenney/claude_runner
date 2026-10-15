@@ -111,8 +111,24 @@ class UsageSettings(_StrictModel):
 
 
 class ConcurrencySettings(_StrictModel):
-    max_concurrency: int = Field(ge=1)
-    initial_concurrency: int = Field(ge=1)
+    """Optional queue-wide caps on in-flight tasks, counted over every account.
+
+    Each account's own ``max_concurrency`` (its ``runner-account.toml``) is
+    the limit that normally applies. Both keys here are optional; see
+    :func:`runner.account_dispatch.dispatch_headroom` and ADR-0035.
+    """
+
+    max_concurrency: int | None = Field(default=None, ge=1)
+    """A global cap on the queue's in-flight tasks. ``None`` (left out)
+    means no queue-wide cap: each account runs up to its own
+    ``max_concurrency``, re-read every tick, so the queue runs up to their
+    sum and no account is held below its own cap. A value below that sum
+    holds the accounts below their caps, and the supervisor logs a warning
+    saying so."""
+
+    initial_concurrency: int | None = Field(default=None, ge=1)
+    """The cap until a first task completes in this queue. ``None`` (left
+    out) means no warm-up cap."""
 
 
 class SessionSettings(_StrictModel):
@@ -571,9 +587,10 @@ class AccountSettings(_StrictModel):
 
     All accounts are equal priority. The dispatcher picks the least-
     utilized account (by 5h utilization, tie-broken by weekly util
-    then name) when multiple have free capacity. There is intentionally
-    no queue-wide concurrency ceiling — operators choose per-account
-    caps such that their sum is acceptable.
+    then name) when multiple have free capacity. By default the
+    per-account caps are the only limit: the queue can run their sum.
+    The queue's optional ``[concurrency].max_concurrency`` adds a
+    global cap on top (:class:`ConcurrencySettings`).
 
     ``linux_user`` (when set) opts the account into multi-user spawning:
     the supervisor invokes ``claude`` for this account via
@@ -933,7 +950,7 @@ class Settings(_StrictModel):
     dispatch_pct: DispatchPctSettings
     """ADR-0022 ``[dispatch_pct.*]`` tree. Variant-C trace-following
     dispatch policy."""
-    concurrency: ConcurrencySettings
+    concurrency: ConcurrencySettings = Field(default_factory=ConcurrencySettings)
     effort_levels: dict[str, list[str]]
     session: SessionSettings
     failure_classifier: FailureClassifierSettings

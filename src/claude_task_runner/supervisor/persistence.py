@@ -30,6 +30,9 @@ Migrates an older file one way at load time, one version at a time:
   a recent clean reading before an account takes tasks, and an older
   file records no reading time. Throttled and ``error_drift`` states
   take no tasks already and are kept, as are in-flight tasks.
+* v7 → v8: only the version changes. The new ``policy_error`` field
+  starts as ``None`` until the next tick reads each account's
+  ``runner-account.toml``.
 """
 
 from __future__ import annotations
@@ -224,6 +227,17 @@ def _migrate_v6_to_v7(payload: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v7_to_v8(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v7 supervisor.json payload to v8.
+
+    v8 only adds the optional ``policy_error`` field to each account, which
+    a v7 file lacks and so loads as ``None``. Nothing else changes meaning.
+    """
+    migrated = dict(payload)
+    migrated["schema_version"] = 8
+    return migrated
+
+
 def load(path: Path) -> SupervisorSnapshot | None:
     """Read a persisted snapshot, or ``None`` if the file doesn't exist.
 
@@ -231,7 +245,7 @@ def load(path: Path) -> SupervisorSnapshot | None:
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
 
-    An older file is migrated one way (v2 → v3 → v4 → v5 → v6 → v7) before
+    An older file is migrated one way (v2 → v3 → ... → v8) before
     it is validated; the module docstring describes each step.
     """
     if not path.exists():
@@ -263,6 +277,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if sv == 6:
         payload = _migrate_v6_to_v7(payload)
         sv = 7
+    if sv == 7:
+        payload = _migrate_v7_to_v8(payload)
+        sv = 8
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"

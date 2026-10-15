@@ -77,3 +77,11 @@ first task completes in the queue, then `max_concurrency`. Each account's
 `runner-account.toml` caps its own share with `max_concurrency`. The
 ADR-0022 `[dispatch_pct.*]` policy throttles all of it from the
 utilization `/usage` reports.
+
+## Update (2026-10-15)
+
+ADR-0035 made both `[concurrency]` keys optional and dropped them from the
+packaged defaults. Each account's `max_concurrency` is now the only limit
+unless the queue TOML sets `[concurrency].max_concurrency` as a global
+cap; `initial_concurrency`, when set, still caps the queue until its first
+completion.

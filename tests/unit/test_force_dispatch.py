@@ -999,8 +999,8 @@ class TestForceDispatchCLI:
         assert result.stdout == (
             f"request written: {request}\n"
             "supervisor will pick it up on the next tick (allow_over_limit=False).\n"
-            "task t1 still not running after 1.0s — the supervisor may be honouring "
-            "max_concurrency. The request file persists; the task will dispatch on the "
+            "task t1 still not running after 1.0s — the queue's concurrency ceiling "
+            "may be full. The request file persists; the task will dispatch on the "
             "next free slot.\n"
         )
 

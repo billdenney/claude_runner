@@ -151,12 +151,35 @@ Per task, `runner.account_dispatch.choose_account` skips an account
 whose state is not `Dispatching`, `SlowingDown` or `Idle`, or which is
 paused, and caps each account at `account_cap`: its `max_concurrency`
 lowered to its `target_concurrency`. Each account slows down on its own
-5h reading. Separately, the orchestrator bounds the whole queue's
-in-flight count by `[concurrency]` (`initial_concurrency` until the
-queue's first completion, then `max_concurrency`); that ceiling does not
-depend on throttle state, but while it binds an account can run fewer
-tasks than its target. `claude-task-runner account list` shows each
-account's `in_flight=N/cap`. An account is paused while its
+5h reading. Before that, the orchestrator bounds how many tasks a tick
+may start with `runner.account_dispatch.dispatch_headroom`: each declared
+account's free slots under its own `max_concurrency`, from the same
+per-tick resolution `choose_account` uses, summed. An account running more
+than its cap (lowered while its tasks ran) adds 0 rather than taking the
+others' slots, and tasks of an account no longer in `[[accounts]]` count
+against none. When the queue TOML sets `[concurrency].max_concurrency`,
+every in-flight task counts against it as well, and
+`[concurrency].initial_concurrency`, when set, does the same until the
+queue's first completion. Without those keys no account is held below its
+own cap, and an edit to an account's `runner-account.toml` takes effect
+within a tick. This bound does not depend on throttle state, but while an
+explicit value below the accounts' sum binds, an account can run fewer
+tasks than its target. `runner.account_dispatch.QueueCeiling` summarises
+it: the supervisor logs `concurrency ceiling: ...` at INFO at
+start and after each successful reload, and a WARNING naming both numbers
+while an explicit value binds, once per config load and again when either
+changes (ADR-0035). Force-dispatch without `--over-limit` waits for a free
+slot: under an explicit `max_concurrency`, counted over every in-flight
+task; without one, on any account. An unbound request then goes to the
+first account, in declaration order, with a free slot under its own cap.
+`claude-task-runner account list` shows
+each account's `in_flight=N/cap` and the ceiling the files on disk give,
+which `supervisor status` also prints. An account whose
+`runner-account.toml` does not load (`config.loader.BrokenAccount`) takes
+no new tasks and adds nothing to any of these numbers, with no policy
+standing in for its file; the supervisor logs it once per error, records
+it as `policy_error` in `supervisor.json`, and keeps every other account
+dispatching (ADR-0035). An account is paused while its
 `account_paused/<name>` marker exists; the supervisor reads the markers
 every tick, once after the state-machine step and again just before
 dispatch, so `account pause` stops new dispatches on a running supervisor

@@ -27,6 +27,7 @@ from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
     AccountSettings,
+    ConcurrencySettings,
 )
 from claude_task_runner.supervisor.actions import Notify
 from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
@@ -422,8 +423,18 @@ def test_alternating_readings_throttle_only_attributed_account_per_tick() -> Non
 
 _POLICY_MAX_4 = {"default": AccountPolicy(concurrency=AccountConcurrencyPolicy(max_concurrency=4))}
 """The ``default`` account's own policy. Its cap of 4 differs from the
-queue-wide default of 2, so a decision that used the queue-wide cap
-instead would show up in ``target_concurrency``."""
+queue-wide cap of 2 that :func:`_settings_with_queue_cap_2` sets, so a
+decision that used the queue-wide cap instead would show up in
+``target_concurrency``."""
+
+
+def _settings_with_queue_cap_2():
+    """:func:`_utc_settings` with ``[concurrency].max_concurrency = 2``. Left
+    out, the queue's ceiling for one account is that account's own cap, so
+    it could not tell the two apart."""
+    return _utc_settings().model_copy(
+        update={"concurrency": ConcurrencySettings(max_concurrency=2)}
+    )
 
 
 @pytest.mark.parametrize(
@@ -445,7 +456,7 @@ def test_unnamed_reading_updates_the_sole_account(
     new_snap, _ = run_one_tick(
         snap,
         TickContext(
-            settings=_utc_settings(),  # one account: the legacy "default"
+            settings=_settings_with_queue_cap_2(),  # one account: the legacy "default"
             poll_result=_reading_5h_only(account=None, util_5h=util_5h, util_7d=20),
             pending_count=3,
             in_flight_count=0,
@@ -556,17 +567,29 @@ def test_previous_target_comes_from_the_account() -> None:
     assert not any(isinstance(a, Notify) for a in actions)
 
 
-def test_unnamed_reading_with_several_accounts_updates_only_the_top_level() -> None:
+@pytest.mark.parametrize(
+    ("max_concurrency", "target"),
+    [
+        # Left out: the queue's ceiling is the accounts' caps summed, 5 + 1.
+        (None, 6),
+        (2, 2),
+    ],
+    ids=["omitted", "explicit"],
+)
+def test_unnamed_reading_with_several_accounts_updates_only_the_top_level(
+    max_concurrency: int | None, target: int
+) -> None:
     """With two accounts configured an unnamed reading cannot be placed:
-    it updates the top-level view alone, decided against the queue-wide
-    ``[concurrency].max_concurrency`` (2 by default)."""
+    it updates the top-level view alone, decided against the queue's
+    concurrency ceiling (``[concurrency].max_concurrency`` when set)."""
     base = _utc_settings()
     settings = base.model_copy(
         update={
             "accounts": [
                 AccountSettings(name="personal", config_dir=""),
                 AccountSettings(name="work", config_dir=""),
-            ]
+            ],
+            "concurrency": ConcurrencySettings(max_concurrency=max_concurrency),
         }
     )
     clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
@@ -585,5 +608,5 @@ def test_unnamed_reading_with_several_accounts_updates_only_the_top_level() -> N
     )
 
     assert new_snap.state is SupervisorState.DISPATCHING
-    assert new_snap.target_concurrency == 2
+    assert new_snap.target_concurrency == target
     assert new_snap.accounts == snap.accounts

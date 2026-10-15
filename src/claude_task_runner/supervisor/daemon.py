@@ -31,6 +31,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 import signal
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -41,7 +42,12 @@ from pathlib import Path
 from types import FrameType
 
 from claude_task_runner.clock import Clock, RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.loader import (
+    AccountResolution,
+    ConfigError,
+    load_settings,
+    resolve_accounts,
+)
 from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
@@ -50,6 +56,7 @@ from claude_task_runner.config.schema import (
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
+from claude_task_runner.runner.account_dispatch import QueueCeiling
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor import account_pause
@@ -117,9 +124,14 @@ class TickContext:
     account sets overrides the queue's value, and its ``max_concurrency``
     is the cap the decision ramps down from. An account missing from the
     dict, or a result attributed to no account, gets the queue-wide
-    ``[dispatch_pct.*]`` and ``[concurrency].max_concurrency``
+    ``[dispatch_pct.*]`` and the queue's concurrency ceiling
     (:func:`_resolve_account_policy`), so the empty default applies the
     queue-wide policy to every tick.
+
+    ``broken_accounts`` names the accounts whose ``runner-account.toml``
+    does not load (:class:`config.loader.BrokenAccount`). A poll result
+    attributed to one makes no throttle decision, since its policy is
+    unknown and nothing stands in for it (ADR-0035).
     """
 
     settings: Settings
@@ -127,6 +139,7 @@ class TickContext:
     pending_count: int
     in_flight_count: int
     account_policies: dict[str, AccountPolicy] = field(default_factory=dict)
+    broken_accounts: frozenset[str] = frozenset()
 
 
 def run_one_tick(
@@ -168,8 +181,14 @@ def run_one_tick(
         A poll result that still has no account (several accounts
         configured, but a source that does not name them, as after a
         SIGHUP that added an account) updates only the top-level fields,
-        with a policy carrying the queue-wide concurrency cap, and logs an
-        error each tick.
+        with a policy carrying the queue's concurrency ceiling
+        (:func:`_resolve_account_policy`), and logs an error each tick.
+
+    Accounts whose ``runner-account.toml`` does not load
+    (``ctx.broken_accounts``):
+        A poll result attributed to one makes no decision: only its
+        ``last_capture_at`` moves, so the round robin goes on to the next
+        account, and its last reading ages as usual.
 
     Freshness (``[usage].max_reading_age_s``):
         Each tick reads one account, so after ``step()`` every account
@@ -186,6 +205,16 @@ def run_one_tick(
             "reading is over [usage].max_reading_age_s old. Restart the supervisor "
             "after changing [[accounts]].",
             len(ctx.settings.accounts),
+        )
+    if account_name is not None and account_name in ctx.broken_accounts:
+        # Its runner-account.toml does not load, so no decision can be made
+        # for it without guessing its policy. Record the capture so the
+        # round robin moves on; its reading ages as usual.
+        new_snapshot = _record_capture_only(snapshot, account_name, clock)
+        return sm_mod.expire_stale_readings(
+            new_snapshot,
+            now=clock.now(),
+            max_reading_age_s=ctx.settings.usage.max_reading_age_s,
         )
     focused = _focus_on_account(snapshot, account_name)
 
@@ -217,6 +246,102 @@ def run_one_tick(
     return new_snapshot, actions + expiry_actions
 
 
+def _record_capture_only(
+    snapshot: SupervisorSnapshot, account_name: str, clock: Clock
+) -> SupervisorSnapshot:
+    """``snapshot`` with ``accounts[account_name].last_capture_at`` set to now."""
+    acct = snapshot.accounts.get(account_name)
+    if acct is None:
+        return snapshot
+    accounts = dict(snapshot.accounts)
+    accounts[account_name] = acct.model_copy(update={"last_capture_at": clock.now()})
+    return snapshot.model_copy(update={"accounts": accounts})
+
+
+def apply_policy_errors(
+    snapshot: SupervisorSnapshot, resolution: AccountResolution
+) -> SupervisorSnapshot:
+    """``snapshot`` with each account's ``policy_error`` set from ``resolution``.
+
+    The error for an account whose ``runner-account.toml`` does not load,
+    ``None`` for every other account in the snapshot.
+    """
+    errors = {b.name: b.error for b in resolution.broken}
+    accounts = {
+        name: acct
+        if acct.policy_error == errors.get(name)
+        else acct.model_copy(update={"policy_error": errors.get(name)})
+        for name, acct in snapshot.accounts.items()
+    }
+    if accounts == snapshot.accounts:
+        return snapshot
+    return snapshot.model_copy(update={"accounts": accounts})
+
+
+def _file_stamp(path: str) -> tuple[int, int] | None:
+    """``(mtime_ns, size)`` of ``path``, or ``None`` when it cannot be read."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+@dataclass
+class AccountFileWatch:
+    """Logs each account whose ``runner-account.toml`` does not load, and its recovery.
+
+    The supervisor keeps one for its lifetime and shows it every tick's
+    :class:`config.loader.AccountResolution`. For a broken account it logs
+    one ERROR naming the account and the error (which names the file), and
+    again only when the error or the file changes, so an edit that leaves
+    it broken is reported too. When the file loads again it logs one INFO
+    line. While no declared account loads it also logs, once, an ERROR
+    saying nothing can dispatch.
+    """
+
+    logged: dict[str, tuple[str, str, tuple[int, int] | None]] = field(default_factory=dict)
+    """Per broken account: ``(path, error, file stamp)`` of the last ERROR."""
+
+    all_broken_logged: bool = False
+
+    def observe(self, resolution: AccountResolution) -> None:
+        for broken in resolution.broken:
+            key = (broken.path, broken.error, _file_stamp(broken.path))
+            if self.logged.get(broken.name) == key:
+                continue
+            self.logged[broken.name] = key
+            logger.error(
+                "account %r takes no new tasks until its runner-account.toml loads: %s",
+                broken.name,
+                broken.error,
+            )
+        loaded = {acct.name for acct in resolution.accounts}
+        for name in [n for n in self.logged if n not in resolution.broken_names]:
+            path, _error, _stamp = self.logged.pop(name)
+            if name not in loaded:
+                continue
+            if os.path.lexists(path):
+                logger.info("account %r takes tasks again: %s loads", name, path)
+            else:
+                logger.info(
+                    "account %r takes tasks again: %s is gone, so the defaults apply "
+                    "(max_concurrency = 1 and the queue's [dispatch_pct.*])",
+                    name,
+                    path,
+                )
+        if resolution.broken and not resolution.accounts:
+            if not self.all_broken_logged:
+                self.all_broken_logged = True
+                logger.error(
+                    "no account's runner-account.toml loads (%s): nothing is dispatched "
+                    "until one is fixed",
+                    ", ".join(b.name for b in resolution.broken),
+                )
+        else:
+            self.all_broken_logged = False
+
+
 def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> AccountPolicy:
     """Pick the :class:`AccountPolicy` to compose into the ResolvedPolicy.
 
@@ -224,19 +349,82 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
     return it verbatim: its ``max_concurrency`` is the cap
     :func:`runner.account_dispatch.choose_account` applies, so the
     decision's ramp scales the number dispatch really uses. Otherwise
-    synthesise a policy that carries the queue-wide
-    ``[concurrency].max_concurrency`` rather than the per-account default
-    of 1. ADR-0022 requires ``max_concurrency`` never to be implicit.
+    synthesise a policy that carries the queue's ceiling
+    (:attr:`QueueCeiling.value`: an explicit ``[concurrency].max_concurrency``
+    when it binds, else the sum of the accounts' own caps, an account
+    missing from ``ctx.account_policies`` counting its default of 1 and one
+    in ``ctx.broken_accounts`` counting 0) rather than the per-account
+    default of 1. ADR-0022 requires
+    ``max_concurrency`` never to be implicit.
     """
     if account_name is not None:
         explicit = ctx.account_policies.get(account_name)
         if explicit is not None:
             return explicit
-    return AccountPolicy(
-        concurrency=AccountConcurrencyPolicy(
-            max_concurrency=ctx.settings.concurrency.max_concurrency
-        ),
+    ceiling = QueueCeiling.of(
+        ctx.settings.concurrency.max_concurrency,
+        {
+            acct.name: ctx.account_policies.get(acct.name, AccountPolicy())
+            for acct in ctx.settings.accounts
+            if acct.name not in ctx.broken_accounts
+        },
+        broken=sorted(ctx.broken_accounts),
     )
+    return AccountPolicy(
+        concurrency=AccountConcurrencyPolicy(max_concurrency=max(1, ceiling.value)),
+    )
+
+
+@dataclass
+class QueueCeilingWatch:
+    """Logs the queue's concurrency ceiling once per config load, and warns while it binds.
+
+    The supervisor keeps one for its lifetime and shows it every tick's
+    :class:`QueueCeiling`. The first tick after a start, and the first
+    after :meth:`rearm`, which the supervisor calls on each successful
+    reload, log one INFO line with :meth:`QueueCeiling.describe`. While
+    ``[concurrency].max_concurrency`` holds the queue below its accounts'
+    own caps, it logs one WARNING naming both numbers, and again only when
+    either number changes (an edit to the queue TOML or to an account's
+    ``runner-account.toml``), after :meth:`rearm`, or after a tick on which
+    the ceiling did not bind.
+    """
+
+    announce: bool = True
+    """Whether the next tick logs the INFO line."""
+
+    warned_for: tuple[int, int] | None = None
+    """``(max_concurrency, accounts_total)`` of the last warning; ``None``
+    when the next binding tick warns."""
+
+    def rearm(self) -> None:
+        """Log the INFO line on the next tick, and warn then if it binds,
+        even if the numbers are unchanged."""
+        self.announce = True
+        self.warned_for = None
+
+    def observe(self, ceiling: QueueCeiling) -> None:
+        """Log what :meth:`rearm` or a binding ceiling calls for."""
+        if self.announce:
+            self.announce = False
+            logger.info("concurrency ceiling: %s", ceiling.describe())
+        if ceiling.configured is None or not ceiling.binds:
+            self.warned_for = None
+            return
+        key = (ceiling.configured, ceiling.accounts_total)
+        if key == self.warned_for:
+            return
+        self.warned_for = key
+        logger.warning(
+            "[concurrency].max_concurrency = %d holds the queue below its accounts' "
+            "own caps, which sum to %d (%s): at most %d tasks run at once. Delete "
+            "the key to make each account's max_concurrency the only limit, or "
+            "keep it as a deliberate global cap",
+            ceiling.configured,
+            ceiling.accounts_total,
+            ceiling.breakdown,
+            ceiling.configured,
+        )
 
 
 def _reading_account(poll_result: object) -> str | None:
@@ -970,6 +1158,7 @@ def start_daemon(
                 settings=settings,
                 clock=clk,
                 in_flight_slots=in_flight_slots,
+                prior_in_flight=snapshot.in_flight,
             )
             adopted_ids = {a.task_id for a in adopted}
             for adoption in adopted:
@@ -1044,6 +1233,8 @@ def start_daemon(
 
             ticks = 0
             last_worktree_reclaim_at: datetime | None = None
+            ceiling_watch = QueueCeilingWatch()
+            account_file_watch = AccountFileWatch()
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -1052,25 +1243,35 @@ def start_daemon(
                 wake_flag["pending"] = False
 
                 if reload_flag["pending"]:
-                    settings, prior_pending = _apply_sighup_reload(
+                    reloaded, prior_pending = _apply_sighup_reload(
                         current=settings,
                         config_path=config_path,
                         prior_pending=prior_pending,
                         pending_count_fn=pending_count_fn,
                     )
+                    # A failed reload returns the config already in force.
+                    if reloaded is not settings:
+                        ceiling_watch.rearm()
+                    settings = reloaded
                     reload_flag["pending"] = False
 
                 # Resolve account policies each tick so per-account
                 # runner-account.toml edits are picked up live (matches
                 # the live-config posture of `resolve_accounts` already
-                # called per-tick from tick_dispatch). Local import to
-                # avoid a circular at module top (config.loader imports
-                # config.schema which the supervisor package depends on
-                # via its own state types).
-                from claude_task_runner.config.loader import resolve_accounts
-
-                resolved = resolve_accounts(settings)
-                account_policies = {a.name: a.policy for a in resolved}
+                # called per-tick from tick_dispatch). An account whose
+                # file does not load is reported, recorded in the snapshot
+                # and left out of the policies; it never stops the loop.
+                resolution = resolve_accounts(settings)
+                account_policies = resolution.policies
+                account_file_watch.observe(resolution)
+                snapshot = apply_policy_errors(snapshot, resolution)
+                ceiling_watch.observe(
+                    QueueCeiling.of(
+                        settings.concurrency.max_concurrency,
+                        account_policies,
+                        broken=(b.name for b in resolution.broken),
+                    )
+                )
 
                 ctx = TickContext(
                     settings=settings,
@@ -1078,6 +1279,7 @@ def start_daemon(
                     pending_count=pending_count_fn(),
                     in_flight_count=in_flight_count_fn(),
                     account_policies=account_policies,
+                    broken_accounts=resolution.broken_names,
                 )
                 snapshot, actions = run_one_tick(snapshot, ctx, clk)
                 execute_actions(

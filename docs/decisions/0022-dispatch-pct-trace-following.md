@@ -325,3 +325,10 @@ per-account dispatch gate (2026-05-22), `THROTTLED_5H`,
 `THROTTLED_WEEKLY` and `ERROR_DRIFT` therefore did not stop a
 single-account queue from dispatching. Such readings now belong to the
 queue's only account.
+
+## Update (2026-10-15)
+
+The queue-wide `[concurrency]` ceiling the update above says remains is now
+optional (ADR-0035). Left out, a tick may start each account's free slots
+under its own `max_concurrency`, and the per-account ramp described above
+is the only thing that lowers them.

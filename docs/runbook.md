@@ -68,6 +68,87 @@ the usage source, so an account added that way is never read.
    as it bypasses the throttle.
 4. After changing `[[accounts]]`, restart the supervisor.
 
+## Fewer tasks in flight than the accounts' caps allow
+
+**Symptom:** The accounts are dispatching, not paused, and tasks are
+eligible, but the queue's total in flight stops at one number below the sum
+of the accounts' caps: `claude-task-runner account list` shows an account
+with free slots (`in_flight=2/5`) that receives nothing.
+
+**Cause:** `[concurrency].max_concurrency` in `claude_runner.toml` is set
+below the sum of the accounts' own `max_concurrency` (their
+`runner-account.toml` files), and caps the whole queue. Without that key,
+the per-account caps are the only limit (ADR-0035). The supervisor log has
+a line like this once per config load, and again whenever either number
+changes:
+
+```
+[concurrency].max_concurrency = 5 holds the queue below its accounts' own caps, which sum to 8 (personal 5 + work 3): at most 5 tasks run at once. ...
+```
+
+Before a first task completes in the queue, a set
+`[concurrency].initial_concurrency` caps it the same way.
+
+**Steps:**
+1. Find the ceiling the supervisor uses: it logs
+   `concurrency ceiling: ...` at INFO at start and after each SIGHUP
+   reload, e.g. `concurrency ceiling: 5 from
+   [concurrency].max_concurrency, which binds: the accounts'
+   max_concurrency sum to 8 (personal 5 + work 3)`. `claude-task-runner
+   supervisor status` (or `account list`) prints the same line for the
+   files as they are on disk now.
+2. To let each account run up to its own cap, delete `max_concurrency` (and
+   `initial_concurrency`, if set) from `[concurrency]` in
+   `claude_runner.toml`, then send the supervisor SIGHUP (`kill -HUP` the
+   PID in `<queue>/.claude_task_runner/supervisor.pid`); it applies the
+   change on its next tick and logs `concurrency ceiling: 8, the sum
+   of the accounts' max_concurrency (...)`.
+3. To change one account's share, edit that account's
+   `<config_dir>/runner-account.toml`. The supervisor re-reads it every
+   tick; no SIGHUP is needed.
+4. Keep `max_concurrency` only as a deliberate global cap. The warning
+   repeats on each reload while it binds.
+
+## An account file is broken
+
+**Symptom:** One account gets no new tasks while the others dispatch as
+usual. The supervisor log has, once per error (and again after each edit
+that leaves the file broken):
+
+```
+account 'work' takes no new tasks until its runner-account.toml loads: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
+```
+
+`claude-task-runner account list` prints `policy error:` with the same text
+for that account and exits 1; `supervisor status` prints it as
+`Account error:`; `doctor` fails `account_policies`. When no account's file
+loads, the log also says `no account's runner-account.toml loads (...):
+nothing is dispatched until one is fixed`.
+
+**Cause:** The account's `<config_dir>/runner-account.toml` is there but
+cannot be read, is empty (zero bytes, often a save that was cut short), is
+a symlink to a file that does not exist, is not TOML, still has a
+`[throttle.*]` table, or sets a value the schema rejects (a
+`max_concurrency` of 0, an unknown key). A `config_dir` starting with
+`~user` for a user that does not exist is reported the same way. The
+supervisor does not guess a policy for it (ADR-0035): the account takes no
+new tasks, its running tasks finish as usual, and it adds nothing to the
+queue's concurrency ceiling. Only an absent file means the defaults.
+
+**Steps:**
+1. Fix the file the error names. `claude-task-runner account list` exits
+   0 again once every account's file loads.
+2. Nothing else is needed: the supervisor re-reads the file every tick,
+   logs that the account `takes tasks again: <path> loads`, and dispatches
+   to it on that tick. If the file was broken for longer than
+   `[usage].max_reading_age_s`, the account waits for its next clean usage
+   reading first, within one capture cycle.
+3. Deleting the file instead gives the account the defaults
+   (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`); the log line
+   then says the file `is gone, so the defaults apply`. An empty file is
+   not the same as no file: it stays broken until it is deleted or filled
+   in.
+
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 
 **Symptom:** `~/.claude_task_runner/watchdog.log` shows multiple restarts

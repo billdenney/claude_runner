@@ -7,9 +7,11 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the queue-wide ceiling for this tick (``[concurrency]``).
+2. Computes how many tasks this tick may start: each account's free
+   slots under its own cap, within ``[concurrency]`` when the queue TOML
+   sets it.
 3. Picks eligible pending tasks (no ``running`` state file, all
-   ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
+   ``depends_on`` IDs are ``completed``), up to that number.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
    to pick the account to dispatch through (equal-priority across
    accounts, least 5h util wins). Skips the task when no account has
@@ -175,7 +177,8 @@ def tick_dispatch(
     so the daemon can persist it without recomputing.
 
     ``accounts`` (when ``None``) is resolved from ``settings`` on the
-    spot; pass it explicitly to share one resolution across multiple
+    spot, without the accounts whose ``runner-account.toml`` does not
+    load; pass it explicitly to share one resolution across multiple
     callers per tick.
 
     ``draining`` (PR 11): when ``True``, the function reaps finished
@@ -209,12 +212,18 @@ def tick_dispatch(
         # daemon's persist step records accurate in_flight attribution.
         return _refresh_in_flight(snapshot, in_flight_slots)
 
+    broken: dict[str, str] = {}
     if accounts is None:
         # Local import to avoid a circular at module top: loader
         # imports schema; schema is consumed by the rest of the codebase.
         from claude_task_runner.config.loader import resolve_accounts
 
-        accounts = resolve_accounts(settings)
+        # An account whose runner-account.toml does not load is left out,
+        # so it takes no tasks; the daemon logs it (ADR-0035). Its error
+        # goes to choose_account so a decline names it.
+        resolution = resolve_accounts(settings)
+        accounts = list(resolution.accounts)
+        broken = {b.name: b.error for b in resolution.broken}
     accounts_by_name = {a.name: a for a in accounts}
 
     # Per-account dispatch gate (replaces PR 5's top-level snapshot.state
@@ -230,8 +239,9 @@ def tick_dispatch(
     if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
-    target = _target_concurrency(queue_dir, settings)
-    available = max(0, target - len(in_flight_slots))
+    available = account_dispatch_mod.dispatch_headroom(
+        accounts, to_in_flight_records(in_flight_slots), _target_concurrency(queue_dir, settings)
+    )
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -283,6 +293,7 @@ def tick_dispatch(
             account_states=dict(snapshot.accounts),
             in_flight=live_in_flight,
             affined_account=affined,
+            broken=broken,
         )
         # Session-affinity TTL (ADR-0024 extension): affinity blocked the
         # dispatch (host account busy / throttled / paused), but if the
@@ -304,6 +315,7 @@ def tick_dispatch(
                     account_states=dict(snapshot.accounts),
                     in_flight=live_in_flight,
                     affined_account=None,
+                    broken=broken,
                 )
                 if choice.account is not None:
                     logger.info(
@@ -538,11 +550,14 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     return state.runs[-1].pid
 
 
-def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
-    """Queue-wide ceiling on in-flight tasks across all accounts.
+def _target_concurrency(queue_dir: Path, settings: Settings) -> int | None:
+    """The explicit queue-wide cap on in-flight tasks in force, or ``None``.
 
-    ``[concurrency].initial_concurrency`` until at least one task has
-    completed in this queue, then ``[concurrency].max_concurrency``.
+    ``[concurrency].initial_concurrency``, when set, until at least one
+    task has completed in this queue; otherwise
+    ``[concurrency].max_concurrency``. ``None`` when the key that applies
+    is left out: then each account's own ``max_concurrency`` is the only
+    limit (:func:`account_dispatch.dispatch_headroom`, ADR-0035).
 
     Throttling is not applied here. Each account's own cap, including
     its SLOWING_DOWN ramp target, is enforced per task by
@@ -551,13 +566,11 @@ def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
     the ramp the supervisor announced and, with several accounts,
     depended on which account had been captured last.
     """
-    have_warmup = _has_any_completed(queue_dir)
-    base = (
-        settings.concurrency.max_concurrency
-        if have_warmup
-        else settings.concurrency.initial_concurrency
-    )
-    return max(1, base)
+    initial = settings.concurrency.initial_concurrency
+    if initial is not None and not _has_any_completed(queue_dir):
+        return max(1, initial)
+    configured = settings.concurrency.max_concurrency
+    return None if configured is None else max(1, configured)
 
 
 def _has_any_completed(queue_dir: Path) -> bool:
