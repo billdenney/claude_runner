@@ -86,12 +86,29 @@ class ExitedWorkerResult:
     stop_reason: str | None
 
 
+UNATTRIBUTED_ACCOUNT = "(unknown)"
+"""The account an adopted worker's slot names when no record says which
+account it runs on. Not a valid account name, so it counts against no
+account's ``max_concurrency``, only against an explicit
+``[concurrency].max_concurrency``."""
+
+
+def _prior_accounts(
+    settings: Settings, prior_in_flight: Sequence[InFlightRecord]
+) -> dict[str, str]:
+    """Task id → the account the previous supervisor's in-flight record names,
+    for records naming an account the queue declares."""
+    declared = {acct.name for acct in settings.accounts}
+    return {r.task_id: r.account for r in prior_in_flight if r.account in declared}
+
+
 def adopt_running_workers(
     queue_dir: Path,
     *,
     settings: Settings,
     clock: Clock,
     in_flight_slots: dict[str, DispatchSlot],
+    prior_in_flight: Sequence[InFlightRecord] = (),
 ) -> list[AdoptionResult]:
     """Adopt HEALTHY restart-survivable workers; return what was adopted.
 
@@ -101,6 +118,15 @@ def adopt_running_workers(
     the caller can (a) shield them from ``reconcile_orphans`` and (b)
     surface them to the operator.
 
+    The slot names the account the worker runs on, so the account's own
+    ``max_concurrency`` counts it. A running attempt's state YAML does not
+    record that account (a run's account is written when it finalizes),
+    so the first source is ``prior_in_flight``, the previous supervisor's
+    persisted ``in_flight`` list, as for :func:`finalize_exited_workers`.
+    Then the state's session host account (a resumed attempt runs on it),
+    then the only account of a single-account queue. With none of those,
+    the slot names :data:`UNATTRIBUTED_ACCOUNT` and a WARNING says so.
+
     No-op (returns ``[]``) when ``[supervisor].adopt_workers`` is off —
     the legacy demote-on-restart path then applies unchanged.
     """
@@ -109,6 +135,8 @@ def adopt_running_workers(
 
     results: list[AdoptionResult] = []
     now = clock.now()
+    prior_accounts = _prior_accounts(settings, prior_in_flight)
+    sole_account = settings.accounts[0].name if len(settings.accounts) == 1 else None
 
     for state_path in list_state_files(queue_dir):
         try:
@@ -137,7 +165,14 @@ def adopt_running_workers(
             )
             continue
 
-        account = state.session_host_account()
+        account = prior_accounts.get(state.task_id) or state.session_host_account() or sole_account
+        if account is None:
+            logger.warning(
+                "adoption: no record names the account task %s's worker (pid %s) runs on; "
+                "it counts against no account's max_concurrency until it finishes",
+                state.task_id,
+                state.pid,
+            )
         thread = threading.Thread(
             target=_adopt_one_safely,
             args=(task, state, queue_dir, clock, settings, account),
@@ -152,7 +187,7 @@ def adopt_running_workers(
         thread.start()
         in_flight_slots[state.task_id] = DispatchSlot(
             task_id=state.task_id,
-            account=account or "default",
+            account=account or UNATTRIBUTED_ACCOUNT,
             started_at=state.last_started_at if state.last_started_at is not None else now,
             thread=thread,
         )
@@ -252,8 +287,7 @@ def finalize_exited_workers(
     if not settings.supervisor.adopt_workers:
         return []
 
-    declared = {acct.name for acct in settings.accounts}
-    prior_accounts = {r.task_id: r.account for r in prior_in_flight if r.account in declared}
+    prior_accounts = _prior_accounts(settings, prior_in_flight)
     results: list[ExitedWorkerResult] = []
 
     for state_path in list_state_files(queue_dir):
