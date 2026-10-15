@@ -109,6 +109,40 @@ Before a first task completes in the queue, a set
 4. Keep `max_concurrency` only as a deliberate global cap. The warning
    repeats on each reload while it binds.
 
+## An account file is broken
+
+**Symptom:** One account gets no new tasks while the others dispatch as
+usual. The supervisor log has, once per error (and again after each edit
+that leaves the file broken):
+
+```
+account 'work' takes no new tasks until its runner-account.toml loads: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
+```
+
+`claude-task-runner account list` prints `policy error:` with the same text
+for that account and exits 1; `supervisor status` prints it as
+`Account error:`; `doctor` fails `account_policies`. When no account's file
+loads, the log also says `no account's runner-account.toml loads (...):
+nothing is dispatched until one is fixed`.
+
+**Cause:** The account's `<config_dir>/runner-account.toml` exists but
+cannot be read, is not TOML, still has a `[throttle.*]` table, or sets a
+value the schema rejects (a `max_concurrency` of 0, an unknown key). The
+supervisor does not guess a policy for it (ADR-0035): the account takes no
+new tasks, its running tasks finish as usual, and it adds nothing to the
+queue's concurrency ceiling.
+
+**Steps:**
+1. Fix the file the error names. `claude-task-runner account list` exits
+   0 again once every account's file loads.
+2. Nothing else is needed: the supervisor re-reads the file every tick,
+   logs that the account `takes tasks again: <path> loads`, and dispatches
+   to it on that tick. If the file was broken for longer than
+   `[usage].max_reading_age_s`, the account waits for its next clean usage
+   reading first, within one capture cycle.
+3. Deleting the file instead gives the account the defaults
+   (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`).
+
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 
 **Symptom:** `~/.claude_task_runner/watchdog.log` shows multiple restarts

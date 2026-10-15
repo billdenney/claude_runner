@@ -27,6 +27,13 @@ all, but `[concurrency].max_concurrency = 5` held the total at 5, so
 discover the cap. They asked: "Make the limit not 5 queue-wide but each
 account can have its own maximum limit."
 
+Making each account's file the only limit also made a broken file matter
+more. `config.loader.resolve_accounts` raised on the first account whose
+`runner-account.toml` did not parse or validate, and nothing caught it:
+the supervisor's tick loop died on the next tick, `account list` printed a
+traceback, and force-dispatch failed, all because of one account. The
+operator asked to "make failing account files fail loud but not fatal".
+
 The queue-wide value duplicated the per-account caps and had to be kept in
 step with them by hand. An account owner who raised their own cap got
 nothing, and a queue that relied on the packaged defaults was capped at 2
@@ -111,6 +118,40 @@ across all accounts without its operator having written the number down.
    `runner-account.toml` raises it. An empty `config_dir` has no such file,
    so its account stays at 1.
 
+9. **An account whose file does not load takes no new tasks, and nothing
+   stops because of it.** `config.loader.resolve_accounts` never raises
+   for a per-account file. It returns the accounts whose policy loaded (a
+   missing file still means the defaults) and, separately, a
+   `BrokenAccount` with the file and the error for each one that exists
+   but cannot be read, is not UTF-8 TOML, sets the retired `[throttle.*]`
+   or fails validation. Every caller uses that one path:
+   - Dispatch leaves the account out: no new task goes to it, it adds 0
+     free slots and 0 to the reported ceiling, and every other account
+     dispatches as usual. Its running tasks keep running and are reaped as
+     usual. A usage reading for it makes no throttle decision, since its
+     bands are unknown; only its capture time moves, so the round robin
+     goes on.
+   - No policy stands in for the file: neither the defaults nor the last
+     policy that loaded. A half-edited file must not be read as something
+     its owner did not write, and a guessed `max_concurrency` could put
+     more tasks on the account than its owner allows.
+   - The supervisor logs an ERROR naming the account and the error (which
+     names the file), once, and again only when the error or the file
+     changes. While no account loads, one more ERROR says nothing is
+     dispatched. When the file loads again, the next tick restores the
+     account and logs one INFO line. This holds at startup as well: a
+     supervisor started with a broken file starts and disables that
+     account. The queue's own `claude_runner.toml` failing to load is
+     still fatal.
+   - `supervisor.json` (schema v8) records the error in the account's
+     `policy_error`. `supervisor status` prints it and lists it under
+     `account_errors` in `--json`. `account list` prints it in place of the
+     account's policy, lists the others as usual, and exits 1. The doctor's
+     `account_policies` check fails with it.
+   - A force-dispatch affined or pinned to the account waits (the request
+     stays) rather than going to another account; the synchronous path
+     refuses with the error.
+
 ## Alternatives considered
 
 - **Keep both keys required and only warn when they bind.** Makes the
@@ -131,6 +172,14 @@ across all accounts without its operator having written the number down.
   after any edit to an account's file.
 - **Warn on every tick that binds.** A deliberate global cap would write
   one warning per poll interval for as long as it is set.
+- **Keep using the last policy that loaded, or the defaults, while a file
+  is broken.** The account would keep working, but on numbers its owner
+  did not write: a cap they were lowering when they made the typo, or a
+  default that ignores their bands. Stopping new work on that account
+  only, loudly, is the smaller surprise.
+- **Exit on a broken account file, as before.** One account's typo would
+  stop every account's dispatch and leave the watchdog restarting a
+  supervisor that dies on its next tick.
 - **Warn when `initial_concurrency` binds.** It is a warm-up cap that ends
   at the first completion by design; the CLI shows it instead.
 
@@ -153,8 +202,15 @@ across all accounts without its operator having written the number down.
 - (-) Force-dispatch on a queue without an explicit `max_concurrency`
   waits for a free slot on some account, not for fewer than 2 tasks in
   flight.
+- (+) A broken account file stops only that account, and says so in the
+  log, `supervisor.json`, the CLI and the doctor.
+- (-) `account list` exits 1 while any account's file does not load, which
+  a script that only checked for success will notice.
 - (neutral) `account list --json` and `supervisor status --json` gain a
-  `queue_ceiling` key; existing keys are unchanged.
+  `queue_ceiling` key, `account list --json` rows gain `policy_error`, and
+  `supervisor status --json` gains `account_errors`; existing keys are
+  unchanged. `supervisor.json` moves to schema v8, which an older
+  supervisor refuses to load.
 
 ## Reversibility
 

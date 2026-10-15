@@ -172,7 +172,12 @@ changes (ADR-0035). Force-dispatch without `--over-limit` waits for a free
 slot: under an explicit `max_concurrency`, counted over every in-flight
 task; without one, on any account. `claude-task-runner account list` shows
 each account's `in_flight=N/cap` and the ceiling the files on disk give,
-which `supervisor status` also prints. An account is paused while its
+which `supervisor status` also prints. An account whose
+`runner-account.toml` does not load (`config.loader.BrokenAccount`) takes
+no new tasks and adds nothing to any of these numbers, with no policy
+standing in for its file; the supervisor logs it once per error, records
+it as `policy_error` in `supervisor.json`, and keeps every other account
+dispatching (ADR-0035). An account is paused while its
 `account_paused/<name>` marker exists; the supervisor reads the markers
 every tick, once after the state-machine step and again just before
 dispatch, so `account pause` stops new dispatches on a running supervisor
