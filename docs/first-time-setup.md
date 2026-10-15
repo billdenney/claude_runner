@@ -83,10 +83,6 @@ A working minimum:
                     # also reads from this dir, so the throttle math is
                     # measured against the correct account's quota.
 
-[concurrency]
-max_concurrency     = 2
-initial_concurrency = 1   # cap until a first task completes in this queue
-
 [hooks]
 # Pre-dispatch: create the worktree (or any other per-task setup).
 # Env vars exposed: $TASK_ID, $TASK_WORKING_DIR, $TASK_MODEL, $ATTEMPT, $SESSION_ID.
@@ -101,6 +97,27 @@ That's enough. The 5h and weekly throttle thresholds (`[dispatch_pct.*]`)
 and every other setting come from the defaults. There is no plan setting:
 the throttle works from the utilization percentages `claude /usage`
 reports, which are already relative to the account's tier.
+
+How many tasks run at once is set per account, not in this file. Each
+account reads `<config_dir>/runner-account.toml`, and its
+`[concurrency].max_concurrency` (1 when the file or the key is missing)
+caps the tasks that run through that account. The queue runs up to the sum
+of its accounts' caps, re-read every tick. To let a single-account queue run
+three tasks at once:
+
+```toml
+# <config_dir>/runner-account.toml
+[concurrency]
+max_concurrency = 3
+```
+
+An empty `config_dir` has no such file, so its account stays at 1.
+`claude_runner.toml` may still set `[concurrency].max_concurrency` as a
+global cap on the whole queue, and `initial_concurrency` as a cap until a
+first task completes, but neither is needed. A global cap below the
+accounts' sum holds them under their own caps, so the supervisor logs a
+warning naming both numbers, and `claude-task-runner account list` and
+`supervisor status` print the ceiling in force (ADR-0035).
 
 If your pre-dispatch hook creates a git worktree per task, the runner will not
 remove those worktrees on its own. `claude-task-runner worktree reclaim`

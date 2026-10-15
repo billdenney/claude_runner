@@ -68,6 +68,44 @@ the usage source, so an account added that way is never read.
    as it bypasses the throttle.
 4. After changing `[[accounts]]`, restart the supervisor.
 
+## Fewer tasks in flight than the accounts' caps allow
+
+**Symptom:** The accounts are dispatching, not paused, and tasks are
+eligible, but the queue's total in flight stops at one number below the sum
+of the accounts' caps: `claude-task-runner account list` shows an account
+with free slots (`in_flight=2/5`) that receives nothing.
+
+**Cause:** `[concurrency].max_concurrency` in `claude_runner.toml` is set
+below the sum of the accounts' own `max_concurrency` (their
+`runner-account.toml` files), and caps the whole queue. Without that key,
+the per-account caps are the only limit (ADR-0035). The supervisor log has
+a line like this once per config load, and again whenever either number
+changes:
+
+```
+[concurrency].max_concurrency = 5 holds the queue below its accounts' own caps, which sum to 8 (personal 5 + work 3): at most 5 tasks run at once. ...
+```
+
+Before a first task completes in the queue, a set
+`[concurrency].initial_concurrency` caps it the same way.
+
+**Steps:**
+1. Run `claude-task-runner supervisor status` (or `account list`). Its
+   queue ceiling line says where the ceiling comes from and whether it
+   binds, e.g. `5 from [concurrency].max_concurrency, which binds: the
+   accounts' max_concurrency sum to 8 (personal 5 + work 3)`.
+2. To let each account run up to its own cap, delete `max_concurrency` (and
+   `initial_concurrency`, if set) from `[concurrency]` in
+   `claude_runner.toml`, then send the supervisor SIGHUP (`kill -HUP` the
+   PID in `<queue>/.claude_task_runner/supervisor.pid`); it applies the
+   change on its next tick. The ceiling line then reads `8, the sum of the
+   accounts' max_concurrency (...)`.
+3. To change one account's share, edit that account's
+   `<config_dir>/runner-account.toml`. The supervisor re-reads it every
+   tick; no SIGHUP is needed.
+4. Keep `max_concurrency` only as a deliberate global cap. The warning
+   repeats on each reload while it binds.
+
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 
 **Symptom:** `~/.claude_task_runner/watchdog.log` shows multiple restarts
