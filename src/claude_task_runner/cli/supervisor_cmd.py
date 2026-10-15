@@ -306,7 +306,7 @@ def _say(console: Console, message: str, style: str) -> None:
     markup, so without ``emoji=False`` a queue at ``/data/a:b:c`` printed
     with an emoji in place of ``:b:``.
     """
-    console.print(message, style=style, markup=False, emoji=False, highlight=False)
+    console.print(message, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
 
 
 def _pid_to_signal(queue_path: Path, console: Console) -> int:
