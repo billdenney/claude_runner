@@ -83,3 +83,45 @@ whether the right disposition was PERMANENT_SKIP or DEFER. An operator
 reviewing the deliverable should replace it with a curated row carrying the
 real disposition — and because auto rows are marked, finding them is a
 one-line query.
+
+## Amendment (2026-10-15) — a run that asked a question is not a terminal close
+
+**What happened.** On the nlmixr2lib queue on 2026-10-15, 110 unfinished
+tasks carried an `AUTO_GATED` row. 102 of them were `awaiting_sidecar` on
+sidecars that asked real questions, and the operator had already answered
+them; 84 of those answers called for more work (naming rulings, encoding
+choices, "extract both models"). None of the 102 had run since September.
+The answers never reached them.
+
+**Why.** The decision above keys the gate on the run's output alone: a
+deliverable, no commit, a clean worktree. That is also the shape of an
+ordinary stop-and-ask, where the agent writes its report, files a request
+with questions and ends its turn. `_finalize_state` wrote the row, and
+`_apply_open_sidecar` then parked the task `awaiting_sidecar`. Once the
+response arrived the sidecar-resume path would have admitted the task, but
+the selector skips a task with a `block_dispatch` row before it looks at
+anything else. The non-finding in the Context above already said that
+re-dispatch after an answered question is the system working; the heuristic
+did not encode it.
+
+**Decision.** `terminal_gate.ensure_terminal_gate` writes no row while the
+task has an open sidecar request with at least one question outstanding,
+counted per question as in ADR-0031 (`queue.sidecar.open_sidecars`). A
+request that cannot be read well enough to tell counts as asking too: it
+stays open until an operator repairs it, and may be asking something. The
+row is still written as before:
+
+- when the run leaves no open sidecar, including a rerun after the answer
+  (e.g. "skip") that closes without asking again, which is a real terminal
+  close;
+- when the only open sidecar is a zero-question notification, since
+  acknowledging it would otherwise re-dispatch a task with nothing left to
+  do, which is the case this ADR exists for.
+
+Task status, the ADR-0020 evidence and every other branch of
+`_finalize_state` are unchanged.
+
+**Consequences.** A run that asks is gated, if at all, by the run after the
+answer, when that run closes without asking again. Rows written before this
+change stay in the register until removed. They carry `status: AUTO_GATED`,
+so the ones on tasks still `awaiting_sidecar` can be found by query.
