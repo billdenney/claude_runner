@@ -19,8 +19,10 @@ from claude_task_runner.queue.schema import ReadinessRequirement, Task
 from claude_task_runner.queue.store import queue_runtime_dir
 from claude_task_runner.runner.readiness import (
     HOLD_REASON_PREFIX,
+    UnmetRequirement,
     hold_reason,
     is_hold_reason,
+    unmet_details,
     unmet_requirements,
 )
 
@@ -123,6 +125,29 @@ def test_multiple_requirements_reports_only_unmet(queue_dir: Path) -> None:
     reasons = unmet_requirements(task, queue_dir)
     assert len(reasons) == 2
     assert all("missing_" in r for r in reasons)
+
+
+def test_unmet_details_gives_each_requirement_its_category(queue_dir: Path) -> None:
+    """The category is the same for every requirement of a kind; the
+    description names the element and carries the note, and is exactly what
+    ``unmet_requirements`` returns."""
+    write_request(queue_dir, _sidecar_request("t1", 1))
+    task = _task(
+        requires=[
+            {"kind": "file", "path": "a.md", "note": "the trimmed paper"},
+            {"kind": "sidecar_response"},
+            {"kind": "file", "path": "b.md"},
+        ]
+    )
+
+    details = unmet_details(task, queue_dir)
+
+    assert details == [
+        UnmetRequirement("missing file", f"missing file: {queue_dir / 'a.md'} (the trimmed paper)"),
+        UnmetRequirement("awaiting sidecar response", "awaiting sidecar response"),
+        UnmetRequirement("missing file", f"missing file: {queue_dir / 'b.md'}"),
+    ]
+    assert unmet_requirements(task, queue_dir) == [d.description for d in details]
 
 
 # --- evaluator: sidecar_response gate -----------------------------------

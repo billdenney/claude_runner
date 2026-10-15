@@ -1,8 +1,8 @@
 """Mechanical (no-AI, no-dispatch) task readiness gates. See ADR-0030.
 
 The supervisor's candidate selector (:func:`runner.orchestrator
-._eligible_candidates`) calls :func:`unmet_requirements` for every otherwise-
-eligible task on each tick. Every check here is a cheap, pure, in-process
+._selector_hold`, once per task) calls :func:`unmet_details` for every
+otherwise-eligible task on each tick. Every check here is a cheap, pure, in-process
 probe — a filesystem ``exists()`` or a set membership test — so it is safe to
 run for the whole pending pool every tick. Nothing here spawns a worker, runs
 a hook subprocess, writes state, or consults an LLM.
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_task_runner.queue.schema import ReadinessRequirement, Task
 from claude_task_runner.queue.sidecar import list_open_sidecars
@@ -60,16 +61,28 @@ def _describe(req: ReadinessRequirement, reason: str) -> str:
     return reason + (f" ({req.note})" if req.note else "")
 
 
-def unmet_requirements(
+class UnmetRequirement(NamedTuple):
+    """One unmet readiness requirement, as :func:`unmet_details` reports it."""
+
+    category: str
+    """What kind of element is missing, the same for every requirement of a
+    kind (``"missing file"``, ``"awaiting sidecar response"``). The selector
+    groups held tasks by it in its "no eligible tasks" summary."""
+    description: str
+    """The operator-facing reason for this one requirement, naming the
+    element (``"missing file: /q/papers/x.md"``) and ending with the
+    requirement's note, if it has one."""
+
+
+def unmet_details(
     task: Task,
     queue_dir: Path,
     *,
     open_sidecar_task_ids: set[str] | None = None,
-) -> list[str]:
-    """Return descriptions of ``task``'s UNMET readiness requirements.
+) -> list[UnmetRequirement]:
+    """Return ``task``'s UNMET readiness requirements, each with its category.
 
-    Empty list ⇒ the task is mechanically ready to dispatch. Each returned
-    string is a short operator-facing reason (e.g. ``"missing file: …"``).
+    Empty list ⇒ the task is mechanically ready to dispatch.
 
     Pure and cheap: only ``Path.exists()`` probes and a set lookup, so this is
     safe to call for every candidate on every supervisor tick. It never
@@ -81,7 +94,7 @@ def unmet_requirements(
     when ``None`` and a ``sidecar_response`` requirement is present, it is
     computed on demand.
     """
-    unmet: list[str] = []
+    unmet: list[UnmetRequirement] = []
     for req in task.requires:
         if req.kind == "file":
             # ``path`` is guaranteed non-empty for kind="file" by
@@ -89,19 +102,41 @@ def unmet_requirements(
             assert req.path is not None
             target = _resolve(queue_dir, req.path)
             if not target.exists():
-                unmet.append(_describe(req, f"missing file: {target}"))
+                category = "missing file"
+                unmet.append(UnmetRequirement(category, _describe(req, f"{category}: {target}")))
         elif req.kind == "sidecar_response":
             if open_sidecar_task_ids is None:
                 open_sidecar_task_ids = {tid for tid, _seq, _p in list_open_sidecars(queue_dir)}
             if task.id in open_sidecar_task_ids:
-                unmet.append(_describe(req, "awaiting sidecar response"))
+                category = "awaiting sidecar response"
+                unmet.append(UnmetRequirement(category, _describe(req, category)))
         else:  # pragma: no cover - unreachable while ReadinessKind is exhaustive
             # Fail closed: an unrecognised kind blocks dispatch (loudly) rather
             # than being silently treated as satisfied. Reaching here means the
             # schema Literal grew a kind this evaluator wasn't taught.
             logger.error("task %s: unknown readiness kind %r; treating as unmet", task.id, req.kind)
-            unmet.append(_describe(req, f"unknown requirement kind: {req.kind}"))
+            category = "unknown requirement kind"
+            unmet.append(UnmetRequirement(category, _describe(req, f"{category}: {req.kind}")))
     return unmet
+
+
+def unmet_requirements(
+    task: Task,
+    queue_dir: Path,
+    *,
+    open_sidecar_task_ids: set[str] | None = None,
+) -> list[str]:
+    """Return descriptions of ``task``'s UNMET readiness requirements.
+
+    Empty list ⇒ the task is mechanically ready to dispatch. Each returned
+    string is a short operator-facing reason (e.g. ``"missing file: …"``).
+    The descriptions of :func:`unmet_details`, which this wraps; see it for
+    ``open_sidecar_task_ids`` and the cost.
+    """
+    return [
+        u.description
+        for u in unmet_details(task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids)
+    ]
 
 
 #: Marker every runner-written readiness hold reason starts with. It is what
