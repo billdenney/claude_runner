@@ -185,6 +185,50 @@ task that does not run.
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.
 
+## Nothing dispatches, but an account has room
+
+**Symptom:** No task has been dispatched for hours or days, nothing is in
+flight, and `claude-task-runner supervisor status` shows an account that is
+not paused or throttled.
+
+**Steps:**
+1. Find the last line about eligible tasks in the supervisor log
+   ([where the log goes](architecture.md#supervisor-log-and-drift-evidence)),
+   e.g. `journalctl --user -u claude-task-runner | grep 'eligible tasks' | tail -1`.
+   If it reads like
+
+   ```
+   no eligible tasks: 329 unfinished held (block_dispatch 178, readiness missing file 128, unanswered sidecar 18, depends_on 3, deferred cooldown 1, possibly_hung 1)
+   ```
+
+   the queue is drained, not stuck: the supervisor is ticking and
+   choosing work, and every unfinished task in `todo/` is held.
+   Completed tasks are not counted. The line is logged when the queue
+   runs dry (and on the first such tick after a supervisor start), then
+   again only when the counts change, so it can be days old on a quiet
+   queue. If the last line is `eligible tasks available again: N`
+   instead, tasks were eligible at that tick.
+2. Each count names what holds those tasks:
+   - `block_dispatch` — a `"block_dispatch": true` row for the task in the
+     `[dispatch].dispatch_block_file` (ADR-0029). Remove the row to release it.
+   - `readiness missing file`, `readiness awaiting sidecar response` — an
+     unmet `requires` element (ADR-0030); see "A task stays `deferred`".
+   - `unanswered sidecar` — see "Sidecars piling up".
+   - `depends_on` — a task named in `depends_on` has not completed.
+   - `deferred cooldown` — a pre-dispatch hook deferral whose
+     `next_eligible_at` has not passed; see "A task stays `deferred`".
+   - `invalid effort` — see "A task stays `deferred`".
+   - A status name (`possibly_hung`, `running`, `failed_circuit_breaker`,
+     `weekly_paused`, ...) — the task's state has that status, which is
+     never dispatched.
+   - `in flight` — already running under this supervisor.
+   - `unparseable task`, `unparseable state` — a task or state YAML that
+     does not load; the supervisor log names the file.
+3. No `no eligible tasks:` line since the last `dispatched task` line
+   means the ticks are not reaching candidate selection at all: every
+   account is paused, throttled or without a reading, or every slot is
+   taken. Look for `tick_dispatch failed` lines too.
+
 ## Cron / systemd watchdog not installed
 
 **Symptom:** Supervisor died once (e.g., after a reboot) and didn't
