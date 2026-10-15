@@ -90,16 +90,19 @@ Before a first task completes in the queue, a set
 `[concurrency].initial_concurrency` caps it the same way.
 
 **Steps:**
-1. Run `claude-task-runner supervisor status` (or `account list`). Its
-   queue ceiling line says where the ceiling comes from and whether it
-   binds, e.g. `5 from [concurrency].max_concurrency, which binds: the
-   accounts' max_concurrency sum to 8 (personal 5 + work 3)`.
+1. Find the ceiling the supervisor uses: it logs
+   `concurrency ceiling: ...` at INFO at start and after each SIGHUP
+   reload, e.g. `concurrency ceiling: 5 from
+   [concurrency].max_concurrency, which binds: the accounts'
+   max_concurrency sum to 8 (personal 5 + work 3)`. `claude-task-runner
+   supervisor status` (or `account list`) prints the same line for the
+   files as they are on disk now.
 2. To let each account run up to its own cap, delete `max_concurrency` (and
    `initial_concurrency`, if set) from `[concurrency]` in
    `claude_runner.toml`, then send the supervisor SIGHUP (`kill -HUP` the
    PID in `<queue>/.claude_task_runner/supervisor.pid`); it applies the
-   change on its next tick. The ceiling line then reads `8, the sum of the
-   accounts' max_concurrency (...)`.
+   change on its next tick and logs `concurrency ceiling: 8, the sum
+   of the accounts' max_concurrency (...)`.
 3. To change one account's share, edit that account's
    `<config_dir>/runner-account.toml`. The supervisor re-reads it every
    tick; no SIGHUP is needed.

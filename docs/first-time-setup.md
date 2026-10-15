@@ -116,8 +116,12 @@ An empty `config_dir` has no such file, so its account stays at 1.
 global cap on the whole queue, and `initial_concurrency` as a cap until a
 first task completes, but neither is needed. A global cap below the
 accounts' sum holds them under their own caps, so the supervisor logs a
-warning naming both numbers, and `claude-task-runner account list` and
-`supervisor status` print the ceiling in force (ADR-0035).
+warning naming both numbers. The supervisor logs the ceiling it uses at
+start and after each SIGHUP reload. `claude-task-runner account list` and
+`supervisor status` print the ceiling the files on disk give: an edit to
+an account's `runner-account.toml` reaches the supervisor within a tick,
+but an edit to `claude_runner.toml` only after a SIGHUP or a restart
+(ADR-0035).
 
 If your pre-dispatch hook creates a git worktree per task, the runner will not
 remove those worktrees on its own. `claude-task-runner worktree reclaim`

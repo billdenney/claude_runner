@@ -38,46 +38,78 @@ across all accounts without its operator having written the number down.
    `settings.toml` no longer sets them. Each still rejects 0, negative
    and non-integer values.
 
-2. **The ceiling is `runner.account_dispatch.QueueCeiling`.** It is
-   `[concurrency].max_concurrency` when the queue TOML sets it, and
-   otherwise the sum of the accounts' own `max_concurrency`. The sum comes
-   from the accounts `config.loader.resolve_accounts` returned on the same
-   tick, the resolution `choose_account` caps each account by, so an edit
-   to an account's `runner-account.toml` moves both within a tick, with no
-   SIGHUP and no change to the queue TOML. Left out, the ceiling never
-   binds: no account can run more than its own cap, so the sum is never
-   reached early.
+2. **Dispatch counts free slots per account.** A tick may start
+   `runner.account_dispatch.dispatch_headroom` tasks: each declared
+   account's free slots under its own `max_concurrency`, summed. The caps
+   come from the accounts `config.loader.resolve_accounts` returned on the
+   same tick, the resolution `choose_account` caps each account by, so an
+   edit to an account's `runner-account.toml` takes effect within a tick,
+   with no SIGHUP and no change to the queue TOML. An account running more
+   than its cap, because the cap was lowered while its tasks ran, adds 0
+   rather than taking the others' slots, and the tasks of an account no
+   longer in `[[accounts]]` count against no account. With the
+   `[concurrency]` keys left out, no account is ever held below its own
+   cap. A single queue-wide number (`max_concurrency`, else the sum of the
+   caps, minus every in-flight task) would not hold that: with `personal`
+   lowered from 5 to 2 while 5 of its tasks run, the sum is 5 with 5 in
+   flight, and `work`'s 3 free slots would stay empty until `personal`
+   drained.
 
 3. **`initial_concurrency`** keeps its meaning when set: the cap until a
    first task completes in the queue. Left out, there is no warm-up cap,
    and the orchestrator does not scan `state/` for a completion.
 
 4. **An explicit `max_concurrency` is still honoured as a global cap.**
-   One below the accounts' sum binds, and the supervisor logs a WARNING
-   naming both numbers and each account's cap. It logs it on the first
-   tick that binds after a start, again on the first tick after each
-   successful SIGHUP reload, and again whenever either number changes while
-   it binds, such as an account's file edited so that the cap starts to
-   bind. Not on every tick. A failed reload keeps the old config and does
-   not repeat the warning.
+   Every in-flight task counts against it, declared account or not, on top
+   of the per-account count in 2. One below the accounts' sum binds, and
+   the supervisor logs a WARNING naming both numbers and each account's
+   cap. It logs it on the first tick that binds after a start, again on the
+   first tick after each successful SIGHUP reload, and again whenever
+   either number changes while it binds, such as an account's file edited
+   so that the cap starts to bind. Not on every tick. A failed reload
+   keeps the old config and does not repeat the warning.
 
-5. **The CLI shows the ceiling.** `account list` and `supervisor status`
-   print it with its source and whether it binds, plus
-   `initial_concurrency` when set; their `--json` output carries a
-   `queue_ceiling` object (`ceiling`, `max_concurrency`, `accounts_total`,
-   `account_caps`, `binds`, `initial_concurrency`). If an account's file
-   does not load, `supervisor status` reports the error in its place.
+5. **The ceiling is reported.** `runner.account_dispatch.QueueCeiling`
+   summarises the numbers in 2 and 4: the most tasks the accounts can run
+   at once, which is an explicit `max_concurrency` when it binds and the
+   accounts' sum otherwise (an explicit 10 over a sum of 8 reports 8),
+   where that number comes from, and whether the explicit value binds.
+   - The supervisor logs it at INFO (`concurrency ceiling: ...`)
+     once at start and once after each successful SIGHUP reload, whether
+     or not it binds, so a queue whose limit changed with this decision
+     says so in its log.
+   - `account list` and `supervisor status` print it, plus
+     `initial_concurrency` when set. Their `--json` output carries a
+     `queue_ceiling` object (`ceiling`, `max_concurrency`,
+     `accounts_total`, `account_caps`, `binds`, `initial_concurrency`).
+     Both read the files on disk, so a change to `claude_runner.toml`
+     shows there before the supervisor's next SIGHUP. If an account's file
+     does not load, `supervisor status` reports the error in its place.
 
-6. **Force-dispatch** without `--over-limit` waits for a slot under the same
-   ceiling, without the warm-up cap, as it did under `max_concurrency`.
+6. **Force-dispatch** without `--over-limit` waits for a free slot. With an
+   explicit `max_concurrency`, that is every in-flight task counted against
+   it, as before. Without one, it waits until some account has a free slot
+   under its own cap. Neither uses the warm-up cap, and the request still
+   goes to its affined, pinned or first account, which may be a full one.
    The daemon's policy for a usage reading it cannot attribute to an
-   account carries the ceiling too.
+   account carries the reported ceiling.
 
-7. **Single-account queues** (one `[[accounts]]` entry, or the `default`
-   account synthesised from `[claude].config_dir`) that set the keys
-   behave exactly as before. Left out, the ceiling is that one account's
-   cap: 1 unless its `runner-account.toml` raises it. An empty
-   `config_dir` has no such file, so its account stays at 1.
+7. **Queues that set both keys** dispatch exactly as before: the
+   per-account count in 2 never admits more than `choose_account` would
+   have. **Queues that set one key** change, because the packaged default
+   that filled the other (`initial_concurrency = 1`, `max_concurrency = 2`)
+   is gone:
+   - Only `max_concurrency = N`: there is no warm-up cap, so up to N tasks
+     run from the first tick, where before only 1 ran until a first task
+     completed.
+   - Only `initial_concurrency = N`: N until a first task completes, then
+     the accounts' sum, where before it was 2.
+
+8. **Single-account queues** (one `[[accounts]]` entry, or the `default`
+   account synthesised from `[claude].config_dir`) follow the same rules.
+   Left out, the limit is that one account's cap: 1 unless its
+   `runner-account.toml` raises it. An empty `config_dir` has no such file,
+   so its account stays at 1.
 
 ## Alternatives considered
 
@@ -89,6 +121,10 @@ across all accounts without its operator having written the number down.
   loading, and a global cap still has a use that per-account caps do not
   cover: limiting the host's load (CPU, memory, disk per worker) whatever
   the accounts allow.
+- **One queue-wide number for dispatch, the sum of the caps when
+  `max_concurrency` is left out.** Simpler, but it counts the tasks of an
+  account over its own cap, or of an account no longer declared, against
+  the others: the shortfall in 2.
 - **Fill an omitted `max_concurrency` with the sum when the settings
   load.** The sum would then change only on SIGHUP or restart, while each
   account's own cap changes on the next tick, so the two would disagree
@@ -104,18 +140,25 @@ across all accounts without its operator having written the number down.
   change takes effect within a tick.
 - (+) A global cap that holds accounts below their own caps is reported in
   the log and by the CLI, instead of being found by reading the code.
+- (+) Lowering one account's cap, or taking an account out of
+  `[[accounts]]` while its tasks run, no longer holds the other accounts
+  below their caps.
 - (-) A queue that relied on the packaged defaults (1 until the first
   completion, then 2) now runs up to the sum of its accounts' caps from the
   start. For accounts left at the default cap of 1 that is one task per
-  account, as before for a single account. A queue that wants the old
-  numbers sets them in `[concurrency]`.
-- (-) Force-dispatch's ceiling on such a queue is the accounts' sum, not 2.
+  account, as before for a single account. Its log says so: the INFO line
+  at start names the ceiling and where it comes from. A queue that wants
+  the old numbers sets them in `[concurrency]`.
+- (-) A queue that set only one of the two keys changes as in 7.
+- (-) Force-dispatch on a queue without an explicit `max_concurrency`
+  waits for a free slot on some account, not for fewer than 2 tasks in
+  flight.
 - (neutral) `account list --json` and `supervisor status --json` gain a
   `queue_ceiling` key; existing keys are unchanged.
 
 ## Reversibility
 
 High. A queue that sets `[concurrency] max_concurrency = 2` and
-`initial_concurrency = 1` gets the old behaviour exactly, with a warning
-whenever 2 is below its accounts' sum. Restoring the two values to the
+`initial_concurrency = 1` dispatches exactly as before, and its log says
+so, with a warning whenever 2 is below its accounts' sum. Restoring the two values to the
 packaged `settings.toml` restores it for every queue that leaves them out.

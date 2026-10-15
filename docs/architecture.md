@@ -151,21 +151,28 @@ Per task, `runner.account_dispatch.choose_account` skips an account
 whose state is not `Dispatching`, `SlowingDown` or `Idle`, or which is
 paused, and caps each account at `account_cap`: its `max_concurrency`
 lowered to its `target_concurrency`. Each account slows down on its own
-5h reading. Separately, the orchestrator bounds the whole queue's
-in-flight count by `runner.account_dispatch.QueueCeiling`: the queue
-TOML's `[concurrency].max_concurrency` when it is set, otherwise the sum of
-the accounts' own `max_concurrency` from the same per-tick resolution
-`choose_account` uses, so an edit to an account's `runner-account.toml`
-moves both within a tick. Left out, the ceiling never binds and the
-per-account caps are the only limit. `[concurrency].initial_concurrency`,
-when set, caps the queue until its first completion. The ceiling does not
-depend on throttle state, but while an explicit value below the accounts'
-sum binds, an account can run fewer tasks than its target; the supervisor
-logs a WARNING naming both numbers once per config load, and again when
-either changes (ADR-0035). Force-dispatch without `--over-limit` waits
-under the same ceiling. `claude-task-runner account list` shows each
-account's `in_flight=N/cap` and the queue ceiling, which
-`supervisor status` also prints. An account is paused while its
+5h reading. Before that, the orchestrator bounds how many tasks a tick
+may start with `runner.account_dispatch.dispatch_headroom`: each declared
+account's free slots under its own `max_concurrency`, from the same
+per-tick resolution `choose_account` uses, summed. An account running more
+than its cap (lowered while its tasks ran) adds 0 rather than taking the
+others' slots, and tasks of an account no longer in `[[accounts]]` count
+against none. When the queue TOML sets `[concurrency].max_concurrency`,
+every in-flight task counts against it as well, and
+`[concurrency].initial_concurrency`, when set, does the same until the
+queue's first completion. Without those keys no account is held below its
+own cap, and an edit to an account's `runner-account.toml` takes effect
+within a tick. This bound does not depend on throttle state, but while an
+explicit value below the accounts' sum binds, an account can run fewer
+tasks than its target. `runner.account_dispatch.QueueCeiling` summarises
+it: the supervisor logs `concurrency ceiling: ...` at INFO at
+start and after each successful reload, and a WARNING naming both numbers
+while an explicit value binds, once per config load and again when either
+changes (ADR-0035). Force-dispatch without `--over-limit` waits for a free
+slot: under an explicit `max_concurrency`, counted over every in-flight
+task; without one, on any account. `claude-task-runner account list` shows
+each account's `in_flight=N/cap` and the ceiling the files on disk give,
+which `supervisor status` also prints. An account is paused while its
 `account_paused/<name>` marker exists; the supervisor reads the markers
 every tick, once after the state-machine step and again just before
 dispatch, so `account pause` stops new dispatches on a running supervisor
