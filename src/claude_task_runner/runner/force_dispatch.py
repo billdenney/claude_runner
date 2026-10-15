@@ -17,7 +17,8 @@ supervisor (no race with the supervisor's own dispatch loop):
    throttle gate. It scans the request directory, revalidates each
    task (still in ``todo/``, still in a dispatchable status, not
    already in-flight, (model, effort) accepted, ``requires``
-   satisfied), respects ``max_concurrency`` unless the request was
+   satisfied), respects the queue's concurrency ceiling
+   (:class:`runner.account_dispatch.QueueCeiling`) unless the request was
    written with ``allow_over_limit=True``, and spawns exactly the same
    per-task dispatch thread the orchestrator does.
 
@@ -33,7 +34,7 @@ fixture-queue debugging), :func:`dispatch_synchronously` runs one
 attempt in-process. There is no race because the host-wide lock
 isn't held by anyone else.
 
-Request files persist across ticks when ``max_concurrency`` is full
+Request files persist across ticks when the queue's ceiling is full
 and ``allow_over_limit=False``: the supervisor declines, leaves the
 file in place, and tries again on the next tick. Operators wanting
 the request to evaporate on capacity-decline must remove it manually.
@@ -63,6 +64,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
+from claude_task_runner.runner.account_dispatch import QueueCeiling
 from claude_task_runner.runner.effort_levels import UnknownEffortLevel, validate_effort
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.session import plan_next_spawn
@@ -258,7 +260,8 @@ def tick_consume(
     accounts_by_name = {a.name: a for a in accounts}
 
     dispatched = 0
-    cap = max(1, settings.concurrency.max_concurrency)
+    # Not the warm-up cap: a force is an explicit operator request.
+    cap = max(1, QueueCeiling.of(settings.concurrency.max_concurrency, accounts).value)
 
     for req in requests:
         task_path = task_path_for(queue_dir, req.task_id)
@@ -353,7 +356,7 @@ def tick_consume(
 
         if not req.allow_over_limit and len(in_flight_slots) >= cap:
             logger.warning(
-                "force-dispatch %s: in-flight=%d >= max_concurrency=%d; leaving request",
+                "force-dispatch %s: in-flight=%d >= queue ceiling=%d; leaving request",
                 task.id,
                 len(in_flight_slots),
                 cap,

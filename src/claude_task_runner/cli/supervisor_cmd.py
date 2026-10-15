@@ -19,15 +19,18 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    queue_ceiling_json,
+    queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.loader import ConfigError, load_settings, resolve_accounts
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.store import (
     list_pending_tasks,
@@ -35,6 +38,7 @@ from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
 )
+from claude_task_runner.runner.account_dispatch import QueueCeiling
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor.daemon import start_daemon
@@ -602,6 +606,16 @@ def status(
     snapshot = persist_mod.load(state_path)
     pid = pidfile_mod.read_existing_pid(pid_path)
     alive = pid is not None and pidfile_mod.is_pid_alive(pid)
+    # An account's runner-account.toml that does not load is reported in
+    # place of the ceiling; the rest of the status still prints.
+    try:
+        ceiling = QueueCeiling.of(settings.concurrency.max_concurrency, resolve_accounts(settings))
+    except ConfigError as exc:
+        ceiling_json: dict[str, object] = {"error": str(exc)}
+        ceiling_line = f"unknown: {exc}"
+    else:
+        ceiling_json = queue_ceiling_json(ceiling, settings)
+        ceiling_line = queue_ceiling_text(ceiling, settings)
 
     payload: dict[str, object] = {
         "queue_dir": str(queue_path),
@@ -610,6 +624,7 @@ def status(
         "snapshot": snapshot.model_dump(mode="json") if snapshot else None,
         "pending": _count_pending(queue_path),
         "in_flight": _count_in_flight(queue_path),
+        "queue_ceiling": ceiling_json,
     }
 
     if json:
@@ -644,3 +659,4 @@ def status(
             console.print(f"[red]Last drift:[/]       {snapshot.last_drift_message}")
     console.print(f"[bold]Pending:[/]          {payload['pending']}")
     console.print(f"[bold]In-flight:[/]        {payload['in_flight']}")
+    console.print(f"[bold]Queue ceiling:[/]    {escape(ceiling_line)}", highlight=False)

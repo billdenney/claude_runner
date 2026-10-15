@@ -42,13 +42,16 @@ set. While SLOWING_DOWN that target is ADR-0022's linear ramp, the
 number the supervisor announced, so each account slows down on its own
 5h reading.
 
-This module applies no queue-wide cap. The orchestrator separately
-bounds the queue's total in-flight tasks by ``[concurrency]``
-(``runner.orchestrator._target_concurrency``).
+:func:`choose_account` applies no queue-wide cap. The orchestrator
+separately bounds the queue's total in-flight tasks by
+:class:`QueueCeiling`: ``[concurrency].max_concurrency`` when the queue
+TOML sets it, otherwise the sum of the accounts' own ``max_concurrency``,
+which never binds (``runner.orchestrator._target_concurrency``, ADR-0035).
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from claude_task_runner.config.schema import ResolvedAccount
@@ -304,3 +307,75 @@ def account_in_flight_count(account: str, in_flight: list[InFlightRecord]) -> in
     orchestrator's eligibility check both need it.
     """
     return sum(1 for r in in_flight if r.account == account)
+
+
+@dataclass(frozen=True)
+class QueueCeiling:
+    """The cap on a queue's in-flight tasks, summed over all its accounts.
+
+    ``configured`` is the queue TOML's ``[concurrency].max_concurrency``,
+    ``None`` when the key is left out. ``account_caps`` maps each account to
+    its own ``max_concurrency`` from its ``runner-account.toml``, the number
+    :func:`account_cap` starts from. Build it with :meth:`of` from the
+    accounts ``config.loader.resolve_accounts`` returned this tick, so an
+    edit to an account's file moves the ceiling within a tick.
+
+    ``[concurrency].initial_concurrency``'s warm-up cap is not part of it;
+    ``runner.orchestrator._target_concurrency`` applies that.
+    """
+
+    configured: int | None
+    account_caps: Mapping[str, int]
+
+    @classmethod
+    def of(cls, configured: int | None, accounts: Iterable[ResolvedAccount]) -> QueueCeiling:
+        """The ceiling for ``configured`` over ``accounts``' resolved policies."""
+        return cls(
+            configured=configured,
+            account_caps={a.name: a.policy.concurrency.max_concurrency for a in accounts},
+        )
+
+    @property
+    def accounts_total(self) -> int:
+        """The sum of the accounts' own ``max_concurrency``."""
+        return sum(self.account_caps.values())
+
+    @property
+    def value(self) -> int:
+        """The number dispatch holds the queue's in-flight count under:
+        ``configured`` when set, else :attr:`accounts_total`."""
+        return self.configured if self.configured is not None else self.accounts_total
+
+    @property
+    def binds(self) -> bool:
+        """Whether ``configured`` holds the queue below its accounts' own caps.
+
+        A value equal to or above :attr:`accounts_total` never limits
+        dispatch, because no account runs more than its own cap.
+        """
+        return self.configured is not None and self.configured < self.accounts_total
+
+    @property
+    def breakdown(self) -> str:
+        """Each account's cap, in declaration order: ``personal 5 + work 3``."""
+        return " + ".join(f"{name} {cap}" for name, cap in self.account_caps.items())
+
+    def describe(self) -> str:
+        """The ceiling, where it comes from and whether it binds, on one line."""
+        if self.configured is None:
+            return f"{self.value}, the sum of the accounts' max_concurrency ({self.breakdown})"
+        verdict = "binds" if self.binds else "does not bind"
+        return (
+            f"{self.configured} from [concurrency].max_concurrency, which {verdict}: "
+            f"the accounts' max_concurrency sum to {self.accounts_total} ({self.breakdown})"
+        )
+
+    def as_json(self) -> dict[str, object]:
+        """The fields ``--json`` output carries."""
+        return {
+            "ceiling": self.value,
+            "max_concurrency": self.configured,
+            "accounts_total": self.accounts_total,
+            "account_caps": dict(self.account_caps),
+            "binds": self.binds,
+        }

@@ -4,7 +4,8 @@ Subcommands:
 
 * ``account list``   — show resolved accounts (queue-side decl + per-
   account policy) plus current per-account state (5h util, weekly util,
-  in-flight count, paused?).
+  in-flight count, paused?), and the queue-wide ceiling those caps add up
+  to (:class:`runner.account_dispatch.QueueCeiling`).
 * ``account pause``  — create the account's pause marker; the dispatcher
   skips the account until ``resume``.
 * ``account resume`` — remove the marker.
@@ -28,15 +29,22 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    queue_ceiling_json,
+    queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.config.loader import load_settings, resolve_accounts
 from claude_task_runner.config.schema import ResolvedAccount, Settings
-from claude_task_runner.runner.account_dispatch import account_cap, account_in_flight_count
+from claude_task_runner.runner.account_dispatch import (
+    QueueCeiling,
+    account_cap,
+    account_in_flight_count,
+)
 from claude_task_runner.supervisor import account_pause
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.states import (
@@ -141,9 +149,16 @@ def list_accounts(
         raise typer.Exit(code=2) from exc
 
     rows = [_account_row(a, snapshot, paused) for a in accounts]
+    ceiling = QueueCeiling.of(settings.concurrency.max_concurrency, accounts)
 
     if json:
-        print(_json.dumps({"accounts": rows}, default=str, indent=2))
+        print(
+            _json.dumps(
+                {"accounts": rows, "queue_ceiling": queue_ceiling_json(ceiling, settings)},
+                default=str,
+                indent=2,
+            )
+        )
         return
 
     if not rows:
@@ -180,6 +195,10 @@ def list_accounts(
             f"5h={util_5h_s}   weekly={util_w_s}   "
             f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
         )
+    console.print(
+        f"[bold]queue ceiling:[/] {escape(queue_ceiling_text(ceiling, settings))}",
+        highlight=False,
+    )
 
 
 def _update_paused(

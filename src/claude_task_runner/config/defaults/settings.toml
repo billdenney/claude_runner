@@ -43,9 +43,9 @@ config_dir = ""        # LEGACY single-account alias; superseded by [[accounts]]
 #
 # Dispatch policy: all accounts equal priority. The dispatcher picks the
 # least-utilized account (by 5h utilization, tie-broken by weekly util
-# then name) when multiple have free capacity. There is no queue-wide
-# concurrency cap — operators choose per-account caps such that their
-# sum is acceptable.
+# then name) when multiple have free capacity. Unless [concurrency] below
+# sets a global cap, the per-account caps are the only limit: the queue
+# runs up to their sum.
 #
 # Example two-account setup (personal + work; work runs under a separate
 # Linux user for audit clarity):
@@ -154,10 +154,23 @@ eow_time_switch = "40h"       # length of EOW segment (~2 nights)
 
 # ---------------------------------------------------------------------------
 # Concurrency
+#
+# Each account's `max_concurrency`, in its own runner-account.toml (1 when
+# the file or the key is missing), caps the tasks that run through it at
+# once. By default those caps are the only limit: the queue runs up to their
+# sum, re-read every tick, so an edit to an account's file takes effect
+# within a tick. A single-account queue's limit is its one account's cap.
+#
+# Both keys below are optional and apply to the whole queue, across all
+# accounts. `max_concurrency` is a global cap on in-flight tasks; set below
+# the accounts' sum it holds them under their own caps, and the supervisor
+# logs a WARNING naming both numbers. `initial_concurrency` is the cap until
+# a first task completes in this queue; unset, there is no warm-up cap.
+# Neither may be 0 or negative. See ADR-0035.
 # ---------------------------------------------------------------------------
 [concurrency]
-max_concurrency             = 2
-initial_concurrency         = 1
+# max_concurrency     = 8
+# initial_concurrency = 1
 
 # ---------------------------------------------------------------------------
 # Effort levels per model (varies; updated as Anthropic adds/removes levels).

@@ -7,7 +7,8 @@ but the original codebase does not wire the supervisor to
 the daemon calls :func:`tick_dispatch`, which:
 
 1. Reaps finished dispatch threads from the in-flight set.
-2. Computes the queue-wide ceiling for this tick (``[concurrency]``).
+2. Computes the queue-wide ceiling for this tick: ``[concurrency]`` when
+   the queue TOML sets it, else the sum of the accounts' own caps.
 3. Picks eligible pending tasks (no ``running`` state file, all
    ``depends_on`` IDs are ``completed``) up to ``target - in_flight``.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
@@ -230,7 +231,7 @@ def tick_dispatch(
     if not _any_account_dispatchable(snapshot, accounts_by_name):
         return _refresh_in_flight(snapshot, in_flight_slots)
 
-    target = _target_concurrency(queue_dir, settings)
+    target = _target_concurrency(queue_dir, settings, accounts)
     available = max(0, target - len(in_flight_slots))
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots)
@@ -538,11 +539,19 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     return state.runs[-1].pid
 
 
-def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
+def _target_concurrency(
+    queue_dir: Path, settings: Settings, accounts: list[ResolvedAccount]
+) -> int:
     """Queue-wide ceiling on in-flight tasks across all accounts.
 
-    ``[concurrency].initial_concurrency`` until at least one task has
-    completed in this queue, then ``[concurrency].max_concurrency``.
+    ``[concurrency].initial_concurrency``, when set, until at least one
+    task has completed in this queue. Otherwise the
+    :class:`account_dispatch.QueueCeiling` of ``accounts``:
+    ``[concurrency].max_concurrency`` when set, else the sum of the
+    accounts' own ``max_concurrency``. ``accounts`` is this tick's
+    resolution, the same one :func:`account_dispatch.choose_account`
+    caps each account by, so an edit to an account's
+    ``runner-account.toml`` moves both on the same tick.
 
     Throttling is not applied here. Each account's own cap, including
     its SLOWING_DOWN ramp target, is enforced per task by
@@ -551,13 +560,11 @@ def _target_concurrency(queue_dir: Path, settings: Settings) -> int:
     the ramp the supervisor announced and, with several accounts,
     depended on which account had been captured last.
     """
-    have_warmup = _has_any_completed(queue_dir)
-    base = (
-        settings.concurrency.max_concurrency
-        if have_warmup
-        else settings.concurrency.initial_concurrency
-    )
-    return max(1, base)
+    initial = settings.concurrency.initial_concurrency
+    if initial is not None and not _has_any_completed(queue_dir):
+        return max(1, initial)
+    ceiling = account_dispatch_mod.QueueCeiling.of(settings.concurrency.max_concurrency, accounts)
+    return max(1, ceiling.value)
 
 
 def _has_any_completed(queue_dir: Path) -> bool:

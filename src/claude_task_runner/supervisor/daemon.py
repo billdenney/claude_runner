@@ -50,6 +50,7 @@ from claude_task_runner.config.schema import (
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
+from claude_task_runner.runner.account_dispatch import QueueCeiling
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor import account_pause
@@ -117,7 +118,7 @@ class TickContext:
     account sets overrides the queue's value, and its ``max_concurrency``
     is the cap the decision ramps down from. An account missing from the
     dict, or a result attributed to no account, gets the queue-wide
-    ``[dispatch_pct.*]`` and ``[concurrency].max_concurrency``
+    ``[dispatch_pct.*]`` and the queue's concurrency ceiling
     (:func:`_resolve_account_policy`), so the empty default applies the
     queue-wide policy to every tick.
     """
@@ -224,19 +225,70 @@ def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> Accou
     return it verbatim: its ``max_concurrency`` is the cap
     :func:`runner.account_dispatch.choose_account` applies, so the
     decision's ramp scales the number dispatch really uses. Otherwise
-    synthesise a policy that carries the queue-wide
-    ``[concurrency].max_concurrency`` rather than the per-account default
-    of 1. ADR-0022 requires ``max_concurrency`` never to be implicit.
+    synthesise a policy that carries the queue's ceiling
+    (:class:`QueueCeiling`: ``[concurrency].max_concurrency`` when set,
+    else the sum of the accounts' own caps, an account missing from
+    ``ctx.account_policies`` counting its default of 1) rather than the
+    per-account default of 1. ADR-0022 requires ``max_concurrency`` never
+    to be implicit.
     """
     if account_name is not None:
         explicit = ctx.account_policies.get(account_name)
         if explicit is not None:
             return explicit
-    return AccountPolicy(
-        concurrency=AccountConcurrencyPolicy(
-            max_concurrency=ctx.settings.concurrency.max_concurrency
-        ),
+    ceiling = QueueCeiling(
+        configured=ctx.settings.concurrency.max_concurrency,
+        account_caps={
+            acct.name: ctx.account_policies.get(
+                acct.name, AccountPolicy()
+            ).concurrency.max_concurrency
+            for acct in ctx.settings.accounts
+        },
     )
+    return AccountPolicy(
+        concurrency=AccountConcurrencyPolicy(max_concurrency=max(1, ceiling.value)),
+    )
+
+
+@dataclass
+class QueueCeilingWarning:
+    """Warns when ``[concurrency].max_concurrency`` holds the queue below its accounts' caps.
+
+    The supervisor keeps one for its lifetime and shows it every tick's
+    :class:`QueueCeiling`. While the ceiling binds it logs one WARNING
+    naming both numbers, and logs again only when either number changes
+    (an edit to the queue TOML or to an account's ``runner-account.toml``),
+    after :meth:`rearm`, which the supervisor calls on each successful
+    reload, or after a tick on which the ceiling did not bind.
+    """
+
+    warned_for: tuple[int, int] | None = None
+    """``(max_concurrency, accounts_total)`` of the last warning; ``None``
+    when the next binding tick warns."""
+
+    def rearm(self) -> None:
+        """Warn on the next binding tick even if the numbers are unchanged."""
+        self.warned_for = None
+
+    def observe(self, ceiling: QueueCeiling) -> None:
+        """Log the warning if ``ceiling`` binds and has not been warned about."""
+        if ceiling.configured is None or not ceiling.binds:
+            self.warned_for = None
+            return
+        key = (ceiling.configured, ceiling.accounts_total)
+        if key == self.warned_for:
+            return
+        self.warned_for = key
+        logger.warning(
+            "[concurrency].max_concurrency = %d holds the queue below its accounts' "
+            "own caps, which sum to %d (%s): at most %d tasks run at once. Delete "
+            "the key to make each account's max_concurrency the only limit, or "
+            "keep it as a deliberate global cap",
+            ceiling.configured,
+            ceiling.accounts_total,
+            ceiling.breakdown,
+            ceiling.configured,
+        )
 
 
 def _reading_account(poll_result: object) -> str | None:
@@ -1044,6 +1096,7 @@ def start_daemon(
 
             ticks = 0
             last_worktree_reclaim_at: datetime | None = None
+            ceiling_warning = QueueCeilingWarning()
             while not stop_flag["stop"]:
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -1052,12 +1105,16 @@ def start_daemon(
                 wake_flag["pending"] = False
 
                 if reload_flag["pending"]:
-                    settings, prior_pending = _apply_sighup_reload(
+                    reloaded, prior_pending = _apply_sighup_reload(
                         current=settings,
                         config_path=config_path,
                         prior_pending=prior_pending,
                         pending_count_fn=pending_count_fn,
                     )
+                    # A failed reload returns the config already in force.
+                    if reloaded is not settings:
+                        ceiling_warning.rearm()
+                    settings = reloaded
                     reload_flag["pending"] = False
 
                 # Resolve account policies each tick so per-account
@@ -1071,6 +1128,9 @@ def start_daemon(
 
                 resolved = resolve_accounts(settings)
                 account_policies = {a.name: a.policy for a in resolved}
+                ceiling_warning.observe(
+                    QueueCeiling.of(settings.concurrency.max_concurrency, resolved)
+                )
 
                 ctx = TickContext(
                     settings=settings,

@@ -905,9 +905,9 @@ def force_dispatch(
         False,
         "--over-limit",
         help=(
-            "Allow exceeding max_concurrency for this one dispatch. Without "
-            "this flag the supervisor waits for a free slot before honouring "
-            "the request."
+            "Allow exceeding the queue's concurrency ceiling for this one "
+            "dispatch. Without this flag the supervisor waits for a free slot "
+            "before honouring the request."
         ),
     ),
     wait_seconds: float = typer.Option(
@@ -931,8 +931,8 @@ def force_dispatch(
     * **Supervisor running.** Writes a request file under
       ``<queue>/.claude_task_runner/force_dispatch/<task_id>.req``;
       the supervisor consumes it on the next tick (typically <30 s).
-      Without ``--over-limit`` the supervisor declines if all
-      ``max_concurrency`` slots are taken and the request file persists
+      Without ``--over-limit`` the supervisor declines while the queue's
+      concurrency ceiling is reached and the request file persists
       for a later tick. It deletes the file when it dispatches the task,
       and when it drops a request whose task it can no longer dispatch,
       logging a WARNING. The pre-dispatch hook runs as normal.
@@ -1036,7 +1036,7 @@ def force_dispatch(
             if path.exists():
                 msg = (
                     f"task {task_id} still not running after {wait_seconds}s — "
-                    "the supervisor may be honouring max_concurrency. The request "
+                    "the queue's concurrency ceiling may be full. The request "
                     "file persists; the task will dispatch on the next free slot."
                 )
             else:
