@@ -475,6 +475,9 @@ class _Failure:
     error: str
     retry_at: datetime
     delay_s: float
+    cap_violation: caps_mod.CapViolation | None = None
+    """The duration cap the worker was stopped at, kept so the retry
+    records the run as killed by it, not as a crash."""
 
 
 _PARKED_MARKER = dispatcher_mod.LIVE_WORKER_STOP_REASON.encode()
@@ -559,7 +562,7 @@ class ParkedWorkerTracker:
             account = record.account if record.account != UNATTRIBUTED_ACCOUNT else None
             if dispatcher_mod.probe_recorded_worker(state, queue_dir) is not WorkerProbe.ALIVE:
                 if not self._waiting(state.task_id, now):
-                    jobs.append(ParkedFinalize(state, account, None))
+                    jobs.append(ParkedFinalize(state, account, self._stopped_at_cap(state)))
                 continue
             violation = self._past_cap(queue_dir, state, settings, now)
             if violation is None or self._waiting(state.task_id, now):
@@ -579,6 +582,7 @@ class ParkedWorkerTracker:
                         state.task_id,
                         f"worker pid={state.pid} survived its duration-cap terminate",
                         now,
+                        cap_violation=violation,
                     )
                 records.append(record)
                 continue
@@ -628,11 +632,23 @@ class ParkedWorkerTracker:
             )
         except _RecordFailed as exc:
             with self._lock:
-                self._fail(job.state.task_id, str(exc), clock.now(), cause=exc.__cause__)
+                self._fail(
+                    job.state.task_id,
+                    str(exc),
+                    clock.now(),
+                    cause=exc.__cause__,
+                    cap_violation=job.cap_violation,
+                )
             return
         except Exception as exc:
             with self._lock:
-                self._fail(job.state.task_id, f"recording raised {exc!r}", clock.now(), cause=exc)
+                self._fail(
+                    job.state.task_id,
+                    f"recording raised {exc!r}",
+                    clock.now(),
+                    cause=exc,
+                    cap_violation=job.cap_violation,
+                )
             return
         with self._lock:
             self._failures.pop(job.state.task_id, None)
@@ -655,12 +671,28 @@ class ParkedWorkerTracker:
             failure = self._failures.get(task_id)
         return failure is not None and now < failure.retry_at
 
+    def _stopped_at_cap(self, state: TaskState) -> caps_mod.CapViolation | None:
+        """The duration cap a failed attempt to record ``state``'s run had
+        stopped its worker at (:attr:`_Failure.cap_violation`), or ``None``."""
+        with self._lock:
+            failure = self._failures.get(state.task_id)
+        return failure.cap_violation if failure is not None else None
+
     def _fail(
-        self, task_id: str, error: str, now: datetime, cause: BaseException | None = None
+        self,
+        task_id: str,
+        error: str,
+        now: datetime,
+        cause: BaseException | None = None,
+        cap_violation: caps_mod.CapViolation | None = None,
     ) -> None:
         """Back off ``task_id``; log the error when it is new for the task.
-        The caller holds the lock."""
+        A ``cap_violation`` (the worker was stopped at its duration cap) is
+        kept for the retry, as is one an earlier failure kept. The caller
+        holds the lock."""
         previous = self._failures.get(task_id)
+        if cap_violation is None and previous is not None:
+            cap_violation = previous.cap_violation
         if previous is not None and previous.error == error:
             delay = min(previous.delay_s * 2, self.RETRY_MAX_S)
         else:
@@ -673,7 +705,9 @@ class ParkedWorkerTracker:
                 delay,
                 exc_info=cause,
             )
-        self._failures[task_id] = _Failure(error, now + timedelta(seconds=delay), delay)
+        self._failures[task_id] = _Failure(
+            error, now + timedelta(seconds=delay), delay, cap_violation
+        )
 
     @staticmethod
     def _past_cap(

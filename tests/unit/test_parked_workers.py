@@ -619,6 +619,63 @@ def test_a_capped_worker_that_survives_keeps_its_slot_and_backs_off(
     ]
 
 
+def test_a_capped_runs_retry_is_still_recorded_as_killed_by_the_cap(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is stopped at its 10-minute cap, but its run cannot be
+    recorded at once (its Task YAML is missing for a while). The retry,
+    after the delay, records it as killed by the duration cap, not as a
+    worker that crashed."""
+    _park(queue_dir, cap_s=600)
+
+    def terminate(_pid: int) -> bool:
+        worker["alive"] = False
+        return True
+
+    monkeypatch.setattr(reconcile_silent, "terminate_worker", terminate)
+    tracker = ParkedWorkerTracker()
+    settings = _settings(["work"])
+
+    (job,) = _track(queue_dir, ["work"], tracker=tracker).to_finalize
+    task_path_for(queue_dir, "t-parked").unlink()
+    tracker.finalize(job, queue_dir, settings=settings, clock=FakeClock(_NOW))
+    _task(queue_dir, "t-parked", 600)
+    later = _NOW + timedelta(seconds=61)
+    (retry,) = tracker.tick(
+        queue_dir, settings=settings, clock=FakeClock(later), prior_in_flight=[], owned_ids=()
+    ).to_finalize
+    tracker.finalize(retry, queue_dir, settings=settings, clock=FakeClock(later))
+
+    assert retry.cap_violation == job.cap_violation
+    state = load_state(state_path_for(queue_dir, "t-parked"))
+    assert (state.status, [r.killed_by_cap for r in state.runs]) == ("failed", ["duration"])
+
+
+def test_a_worker_that_survived_the_cap_terminate_and_then_exits_is_killed_by_the_cap(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The terminate cannot confirm the kill, and the worker exits before
+    the retry: its run is recorded as killed by the duration cap."""
+    _park(queue_dir, cap_s=600)
+    monkeypatch.setattr(reconcile_silent, "terminate_worker", lambda _pid: False)
+    tracker = ParkedWorkerTracker()
+    settings = _settings(["work"])
+
+    first = _track(queue_dir, ["work"], tracker=tracker)
+    worker["alive"] = False
+    later = _NOW + timedelta(seconds=61)
+    (job,) = tracker.tick(
+        queue_dir, settings=settings, clock=FakeClock(later), prior_in_flight=[], owned_ids=()
+    ).to_finalize
+    tracker.finalize(job, queue_dir, settings=settings, clock=FakeClock(later))
+
+    assert first.to_finalize == []
+    assert job.cap_violation is not None
+    assert (job.cap_violation.which, job.cap_violation.cap) == ("duration", 600.0)
+    state = load_state(state_path_for(queue_dir, "t-parked"))
+    assert (state.status, [r.killed_by_cap for r in state.runs]) == ("failed", ["duration"])
+
+
 # ---------------------------------------------------------------------------
 # A run that cannot be recorded is logged once and retried later
 # ---------------------------------------------------------------------------
