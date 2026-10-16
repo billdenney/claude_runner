@@ -33,7 +33,12 @@ from typing import get_args
 import pytest
 
 from claude_task_runner.cli.install_skills_cmd import _packaged_skill_dir
-from claude_task_runner.config.loader import PER_ACCOUNT_TOML_NAME, load_settings, resolve_accounts
+from claude_task_runner.config.loader import (
+    PER_ACCOUNT_TOML_NAME,
+    ConfigError,
+    load_settings,
+    resolve_accounts,
+)
 from claude_task_runner.observability import _reset_for_tests as _reset_logging_for_tests
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.schema import ReadinessKind, Task, TaskStatus
@@ -81,6 +86,20 @@ LOGIN_REJECTED = "OAuth bearer rejected by https://api.anthropic.com/v1/messages
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def report_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """The report's time, fixed when the test starts. snapshot.sh takes it
+    from RS_NOW, and supervisor.json is saved relative to it, so how long
+    the CLI calls take, on a loaded machine too, cannot age the state."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    monkeypatch.setenv("RS_NOW", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return now
+
+
+def _report_now() -> datetime:
+    return datetime.strptime(os.environ["RS_NOW"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
 @pytest.fixture
@@ -177,7 +196,7 @@ def _supervisor_json(
     )
     path = persist_mod.supervisor_state_path(queue)
     persist_mod.write_atomic(snapshot, path)
-    when = (datetime.now(UTC) - saved_ago).timestamp()
+    when = (_report_now() - saved_ago).timestamp()
     os.utime(path, (when, when))
 
 
@@ -742,11 +761,15 @@ def test_some_tasks_held_to_their_sessions_account(
 
 
 def test_weekly_throttle_whose_catch_up_has_passed(
-    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
 ) -> None:
     """Use at the last reading is back under plan by now; the account stays
     throttled until the supervisor reads it again."""
-    now = datetime.now(UTC)
+    now = report_now
     recheck = now + timedelta(minutes=10)
     _two_accounts(
         queue,
@@ -912,6 +935,80 @@ def test_poll_interval_is_the_supervisors_own(
     summary = _summary(queue, bin_dir)
     assert summary.startswith(RUNNING), summary
     assert "may be stuck" not in summary
+
+
+TEN_SECOND_POLLS = "[usage]\npoll_interval_s = 10\n"
+
+
+@pytest.mark.parametrize(
+    ("saved_ago", "expected"),
+    [
+        pytest.param(
+            30,
+            RUNNING
+            + _accounts(
+                "personal: taking tasks, 0 of 5 slots in use",
+                "work: taking tasks, 0 of 3 slots in use",
+            )
+            + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+            "- **Tasks:** 0 finished.\n" + NO_QUESTIONS + NORMAL,
+            id="three-polls-is-running",
+        ),
+        pytest.param(
+            31,
+            "- **Supervisor:** its process is running, but it last saved its state 31 seconds "
+            "ago.\n"
+            + _accounts(
+                "personal: taking tasks, 0 of 5 slots in use",
+                "work: taking tasks, 0 of 3 slots in use",
+                heading="Accounts (as of the supervisor's last record)",
+            )
+            + f"- **How many can run:** {EIGHT}\n"
+            "- **Tasks:** 0 finished.\n"
+            + NO_QUESTIONS
+            + _attention(
+                "The supervisor has not saved its state for 31 seconds (it normally does every "
+                "10 seconds), so it may be stuck. Look at its log; if it stays this way, restart "
+                "it."
+            ),
+            id="a-second-past-is-stuck",
+        ),
+    ],
+)
+def test_stuck_after_three_polls_exactly(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    saved_ago: int,
+    expected: str,
+) -> None:
+    """The report's time is RS_NOW, so the age is exact however long the
+    CLI calls take."""
+    _config(queue, tmp_path, {"personal": 5, "work": 3}, TEN_SECOND_POLLS)
+    states = {
+        "personal": _state(SupervisorState.DISPATCHING),
+        "work": _state(SupervisorState.DISPATCHING),
+    }
+    _supervisor_json(queue, states, saved_ago=timedelta(seconds=saved_ago))
+    supervisor()
+    assert _summary(queue, bin_dir) == expected
+
+
+def test_without_the_poll_interval_the_age_is_given(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """With the task selection unreadable there is no poll interval to judge
+    by, so the summary gives the age and judges nothing."""
+    _two_accounts(queue, tmp_path)
+    path = persist_mod.supervisor_state_path(queue)
+    when = (_report_now() - timedelta(seconds=7)).timestamp()
+    os.utime(path, (when, when))
+    _cli_with(bin_dir, queue=("", CRASH, 3))
+    supervisor()
+    assert _summary(queue, bin_dir).startswith(
+        "- **Supervisor:** running (it last saved its state 7 seconds ago).\n"
+    )
 
 
 def test_two_polls_late_is_not_stuck(
@@ -1122,6 +1219,33 @@ def test_queue_settings_file_cannot_be_read(queue: Path, bin_dir: Path, rc: str)
             "watchdog, if installed, restarts it within a few minutes.",
             f"The queue settings file cannot be read: {said} Until it can, what each account is "
             "doing and what holds the tasks are unknown.",
+        )
+    )
+
+
+def test_a_queue_toml_that_does_not_load(queue: Path, bin_dir: Path) -> None:
+    """The real CLI on a queue TOML whose content is wrong: account list and
+    queue holds both exit 78 with ``{"ok": false}``."""
+    config = queue / "claude_runner.toml"
+    config.write_text("this is not [valid toml", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_settings(config)
+    detail = "; ".join(line.strip() for line in str(caught.value).splitlines() if line.strip())
+
+    assert _summary(queue, bin_dir) == (
+        "- **Supervisor:** not running.\n"
+        "- **Accounts:** unknown (the queue settings file cannot be read).\n"
+        "- **Tasks:** unknown (the queue settings file cannot be read).\n"
+        + NO_QUESTIONS
+        + _attention(
+            "The supervisor is not running, so no new tasks start and finished tasks are not "
+            f"recorded. Start it with `claude-task-runner supervisor start --queue {queue}`; a "
+            "watchdog, if installed, restarts it within a few minutes.",
+            f"The queue settings file cannot be read: {detail.rstrip('.')}. Its content is wrong "
+            "and needs fixing: a supervisor started with it refuses to start, and a running one "
+            "keeps the settings it loaded before. Fix the file, then send the supervisor SIGHUP "
+            "to load it. Until it can, what each account is doing and what holds the tasks are "
+            "unknown.",
         )
     )
 

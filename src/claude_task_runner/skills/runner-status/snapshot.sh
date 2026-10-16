@@ -61,7 +61,9 @@ if [[ ! -d "$QUEUE/todo" ]]; then
   exit 2
 fi
 
-NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The report's time: RS_NOW when it is set (ISO 8601 UTC, so a report can be
+# reproduced, as the tests do), otherwise the clock's.
+NOW="${RS_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
