@@ -294,3 +294,60 @@ def test_exited_worker_finalize_matches_owned_finalize(
     assert exited.new_state.session_id == owned.new_state.session_id == "sess-owned"
     for field in ("stop_reason", "error", "usage", "cost_usd", "killed_by_cap", "attempt", "pid"):
         assert getattr(exited.run_record, field) == getattr(owned.run_record, field), field
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+def test_running_state_never_carries_an_earlier_attempts_worker(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    adopt: bool,
+) -> None:
+    """A state demoted at a restart keeps its old worker's pid and log. The
+    next attempt's running writes must carry no trace of them: none before
+    the spawn, and its own pid with its own log (None when pipe-backed)
+    after. Otherwise the worker probe compares the new pipe-backed worker's
+    stdout with the old log and calls it a different process."""
+    import claude_task_runner.runner.dispatcher as dmod
+
+    old_log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
+    stale = TaskState(
+        task_id=task.id,
+        status="failed",
+        attempts=1,
+        pid=4_000_001,
+        log_path=str(old_log),
+        stop_reason="orphaned_by_supervisor_restart",
+    )
+    write_state_atomic(stale, state_path_for(queue_dir, task.id))
+    running_writes: list[tuple[int | None, str | None]] = []
+    real_write = dmod.write_state_atomic
+
+    def _spy(state: TaskState, path: Path) -> None:
+        if state.status == "running":
+            running_writes.append((state.pid, state.log_path))
+        real_write(state, path)
+
+    monkeypatch.setattr(dmod, "write_state_atomic", _spy)
+
+    outcome = dispatch(
+        task=task,
+        state=stale,
+        plan=fresh_plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=_caps(),
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+    )
+
+    new_log = str(queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-2.stream.jsonl")
+    assert running_writes[0] == (None, None)
+    worker_pid = outcome.run_record.pid
+    assert worker_pid is not None and worker_pid != 4_000_001
+    assert running_writes[1] == (worker_pid, new_log if adopt else None)
+    assert all(pid in (None, worker_pid) for pid, _log in running_writes)
+    assert all(log in (None, new_log) for _pid, log in running_writes)

@@ -1645,6 +1645,11 @@ def dispatch(
             "attempts": state.attempts + 1,
             "last_started_at": started_at,
             "pre_dispatch_sha": pre_sha,
+            # A state demoted at a restart keeps its old worker's pid and
+            # log. Until this attempt's own are recorded below, the state
+            # must not point at that worker.
+            "pid": None,
+            "log_path": None,
         }
     )
     if persist_state:
@@ -1836,9 +1841,13 @@ def dispatch(
     # reapable by pid.
     if persist_state:
         try:
-            pid_update: dict[str, object] = {"pid": process.pid}
-            if stdout_log_path is not None:
-                pid_update["log_path"] = str(stdout_log_path)
+            # log_path is always written, None for a pipe-backed worker:
+            # the worker probe compares a recorded log with the pid's
+            # stdout, so an earlier attempt's log must not stay on record.
+            pid_update: dict[str, object] = {
+                "pid": process.pid,
+                "log_path": str(stdout_log_path) if stdout_log_path is not None else None,
+            }
             new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
         except Exception as exc:
