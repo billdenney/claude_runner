@@ -23,8 +23,15 @@ One tick:
    whether another process holds ``global.lock``; and ask
    :func:`cron.backoff.decide`, with the config's ``[watchdog]``,
    whether to act.
-6. On RESTART verdict: spawn ``claude-task-runner supervisor start``
-   detached, with ``--config`` naming the same file.
+6. On RESTART verdict: read every account's ``runner-account.toml`` as
+   ``supervisor start`` does. If one does not load, the supervisor would
+   refuse to start, so log a line naming each file in place of the
+   verdict line, start nothing and count no restart. That line is an
+   ERROR, and the tick exits 1 after step 7, unless every problem may
+   clear up by itself (a mount not up yet): then it is a WARNING, and the
+   next tick reads the files again. Otherwise spawn
+   ``claude-task-runner supervisor start`` detached, with ``--config``
+   naming the same file.
 7. Save the state, unless ``--dry-run``.
 
 Output is structured logs to stdout (the cron wrapper redirects to
@@ -49,14 +56,26 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import typer
+from rich.console import Console
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
+    resolve_per_queue_config,
+)
 from claude_task_runner.clock import Clock, RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings
-from claude_task_runner.config.schema import WatchdogSettings
+from claude_task_runner.config.loader import (
+    AccountResolution,
+    ConfigError,
+    load_settings,
+    resolve_accounts,
+)
+from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
@@ -127,8 +146,16 @@ def tick(
     ``[watchdog]`` settings hold it back after a recent restart or after
     repeated crashes.
 
-    Exits 1 when the queue's config does not load, after logging an
-    ERROR line; the supervisor is then neither checked nor restarted.
+    When the queue's config does not load, the supervisor is neither
+    checked nor restarted. When a restart is due but an account's
+    ``runner-account.toml`` does not load, nothing is started, no restart
+    is counted, and the logged line names each file. Either way the tick
+    logs an ERROR and exits 1 when the problem is in a file's content or
+    path, which only a fix helps. When the problem may clear up by itself
+    (a file that cannot be opened for now, say a mount not up yet), it
+    logs a WARNING and exits 0, until the problem has lasted
+    ``[watchdog].transient_config_escalation_s``; from then on it is an
+    ERROR and exit 1, and the line says how long it has lasted.
     """
     clock = RealClock()
     state_path = backoff_mod.watchdog_state_path()
@@ -182,17 +209,26 @@ def tick(
         try:
             settings = load_settings(queue_config)
         except ConfigError as exc:
-            # A supervisor started with this config would fail to load it too.
-            config_failed = True
+            # A supervisor started with this config would fail to load it
+            # too. With the queue's own [watchdog] unreadable, the packaged
+            # escalation time applies.
+            hold = _config_hold(
+                state,
+                transient=exc.transient,
+                now=clock.now(),
+                escalation_s=load_settings(None).watchdog.transient_config_escalation_s,
+            )
+            new_state, config_failed = hold.state, hold.failed
             sys.stdout.write(
-                f"{ts} watchdog: ERROR queue={queue_dir} config={queue_config} does not "
-                f"load, so its supervisor was not checked or restarted: {_one_line(exc)}\n"
+                f"{ts} watchdog: {hold.level} queue={queue_dir} config={queue_config} does not "
+                f"load, so its supervisor was not checked or restarted{hold.note}: "
+                f"{_one_line(str(exc))}\n"
             )
         else:
-            new_state = _decide_and_act(
+            new_state, config_failed = _decide_and_act(
                 queue_dir=queue_dir,
                 queue_config=queue_config,
-                watchdog=settings.watchdog,
+                settings=settings,
                 state=state,
                 clock=clock,
                 ts=ts,
@@ -207,12 +243,83 @@ def tick(
         raise typer.Exit(code=1)
 
 
-def _one_line(exc: Exception) -> str:
-    """``exc``'s message on one line, so each watchdog.log entry stays one line.
+def _one_line(text: str) -> str:
+    """``text`` on one line, so each watchdog.log entry stays one line.
 
     A pydantic validation error spans several lines; they are joined
     with ``"; "``, and spaces within a line are kept."""
-    return "; ".join(line.strip() for line in str(exc).splitlines() if line.strip())
+    return "; ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+@dataclass(frozen=True)
+class _ConfigHold:
+    """How a tick reports a configuration error that keeps the supervisor down."""
+
+    level: str
+    """``ERROR`` or ``WARNING``."""
+    failed: bool
+    """Whether the tick exits 1."""
+    state: backoff_mod.WatchdogState
+    """The state to save: the start of a transient spell recorded or cleared."""
+    note: str
+    """Appended to the line's verdict: empty for a content error."""
+
+
+def _config_hold(
+    state: backoff_mod.WatchdogState, *, transient: bool, now: datetime, escalation_s: float
+) -> _ConfigHold:
+    """Report a content error as an ERROR at once, and a transient one as a
+    WARNING until it has lasted ``escalation_s``, then as an ERROR.
+
+    A content error cannot clear up by itself, so the tick fails. A
+    transient one (a mount not up yet) may, so the tick only warns and
+    tries again, but one that does not clear up within
+    ``[watchdog].transient_config_escalation_s`` is an ERROR as well. Its
+    start is kept in ``state.transient_config_since``.
+    """
+    if not transient:
+        return _ConfigHold(
+            "ERROR", True, state.model_copy(update={"transient_config_since": None}), ""
+        )
+    since = state.transient_config_since or now
+    spell = state.model_copy(update={"transient_config_since": since})
+    lasted = (now - since).total_seconds()
+    if lasted >= escalation_s:
+        return _ConfigHold(
+            "ERROR",
+            True,
+            spell,
+            f"; this may clear up by itself, but has lasted {_duration(lasted)}",
+        )
+    return _ConfigHold(
+        "WARNING", False, spell, "; this may clear up by itself, and the next tick tries again"
+    )
+
+
+def _duration(seconds: float) -> str:
+    """``seconds`` for a log line: ``12 min``, or ``40 s`` under a minute."""
+    return f"{int(seconds // 60)} min" if seconds >= 60 else f"{int(seconds)} s"
+
+
+def _held_back_line(
+    ts: str,
+    queue_dir: Path,
+    alive: bool,
+    pid: int | None,
+    resolution: AccountResolution,
+    hold: _ConfigHold,
+) -> str:
+    """The log line for a restart held back because account files do not load.
+
+    Its level comes from ``hold`` (:func:`_config_hold`), and each account's
+    error says what failed, errno and all.
+    """
+    listed = "; ".join(f"{b.name}: {_one_line(b.error)}" for b in resolution.broken)
+    return (
+        f"{ts} watchdog: {hold.level} queue={queue_dir} alive={alive} pid={pid} the "
+        f"runner-account.toml of {len(resolution.broken)} account(s) does not load, so its "
+        f"supervisor was not restarted{hold.note}: {listed}\n"
+    )
 
 
 def _queue_config(
@@ -236,16 +343,27 @@ def _decide_and_act(
     *,
     queue_dir: Path,
     queue_config: Path | None,
-    watchdog: WatchdogSettings,
+    settings: Settings,
     state: backoff_mod.WatchdogState,
     clock: Clock,
     ts: str,
     dry_run: bool,
-) -> backoff_mod.WatchdogState:
+) -> tuple[backoff_mod.WatchdogState, bool]:
     """Decide for ``queue_dir`` with its ``[watchdog]``, restart it if approved.
 
-    Returns the state to save. A restart passes ``queue_config`` to the
-    supervisor, so it runs with the settings the decision used."""
+    Returns the state to save, and whether a configuration error held the
+    restart back. A restart passes ``queue_config`` to the supervisor, so
+    it runs with the settings the decision used.
+
+    Before a restart, every account's ``runner-account.toml`` is read as
+    ``supervisor start`` reads it. When one does not load, the supervisor
+    would refuse to start, so nothing is spawned and the restart is not
+    counted; a line naming each file is logged in place of the verdict
+    line (:func:`_held_back_line`), at the level :func:`_config_hold`
+    gives it, which also says whether the tick fails. A running supervisor,
+    and a restart held back for cooldown or backoff, are left alone: the
+    files are read only when a restart is due."""
+    watchdog = settings.watchdog
     alive, pid = _supervisor_is_alive(queue_dir)
     lock_held, lock_pid = False, None
     if not alive:
@@ -260,6 +378,19 @@ def _decide_and_act(
         settings=watchdog,
         clock=clock,
     )
+
+    if decision.verdict is backoff_mod.WatchdogVerdict.RESTART:
+        resolution = resolve_accounts(settings)
+        if resolution.broken:
+            hold = _config_hold(
+                state,
+                transient=resolution.only_transient,
+                now=clock.now(),
+                escalation_s=watchdog.transient_config_escalation_s,
+            )
+            # Logged in place of the verdict line, which would say "restart".
+            sys.stdout.write(_held_back_line(ts, queue_dir, alive, pid, resolution, hold))
+            return hold.state, hold.failed
 
     sys.stdout.write(
         f"{ts} watchdog queue={queue_dir} alive={alive} pid={pid} "
@@ -276,7 +407,7 @@ def _decide_and_act(
             sys.stdout.write(
                 f"{ts} watchdog: spawned supervisor for {queue_dir} as pid={new_pid}{with_config}\n"
             )
-    return decision.new_state
+    return decision.new_state.model_copy(update={"transient_config_since": None}), False
 
 
 def _probe_global_lock(ts: str) -> pidfile_mod.GlobalLockProbe:
@@ -329,11 +460,11 @@ def register(
     refused here, since every tick would fail on it.
     """
     recorded = config.absolute() if config is not None else None
-    try:
-        load_settings(resolve_per_queue_config(recorded, queue_dir.resolve()))
-    except ConfigError as exc:
-        print(f"register failed: {exc}", file=sys.stderr)
-        raise typer.Exit(code=2) from exc
+    load_settings_or_exit(
+        resolve_per_queue_config(recorded, queue_dir.resolve()),
+        Console(stderr=True),
+        lead="register failed",
+    )
     try:
         replaced = registry_mod.register_queue(queue_dir, config=recorded)
     except OSError as exc:

@@ -138,7 +138,7 @@ class TestExecStartRoundTrip:
                 "claude_task_runner.cli.supervisor_cmd.require_queue_option",
                 return_value=Path(_QUEUE),
             ) as require_queue_option,
-            patch("claude_task_runner.cli.supervisor_cmd.load_settings"),
+            patch("claude_task_runner.cli.supervisor_cmd.load_settings_or_exit"),
             patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
             patch("claude_task_runner.cli.supervisor_cmd.queue_runtime_dir"),
             patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as start_daemon,

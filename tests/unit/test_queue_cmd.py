@@ -220,16 +220,17 @@ class TestList:
         assert row["effort_error"] is None
 
     @pytest.mark.parametrize("as_json", [True, False])
-    def test_unloadable_config_exits_2(
+    def test_unloadable_config_exits_as_supervisor_start_would(
         self, runner: CliRunner, queue_dir: Path, tmp_path: Path, as_json: bool
     ) -> None:
         """No silent fallback to the package defaults: those could accept a
-        pair the queue's own table rejects, or reject one it accepts."""
+        pair the queue's own table rejects, or reject one it accepts. A
+        missing file may come back, so it is exit 1."""
         _seed_task(queue_dir, "001-a")
         missing = tmp_path / "missing.toml"
         args = ["list", "--queue", str(queue_dir), "--config", str(missing)]
         result = runner.invoke(app, [*args, "--json"] if as_json else args)
-        assert result.exit_code == 2
+        assert result.exit_code == 1
         message = (
             "cannot load the queue's settings to check effort levels: "
             f"Settings file not found: {missing}"

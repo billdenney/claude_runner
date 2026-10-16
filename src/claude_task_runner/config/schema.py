@@ -14,6 +14,12 @@ from typing import Final, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from claude_task_runner.config.duration import DurationParseError, parse_duration
+from claude_task_runner.config.paths import (
+    ConfigDirError,
+    TaskPathError,
+    expand_config_dir,
+    expand_task_path,
+)
 
 UsageSourceMode = Literal["tty", "api", "api_then_tty"]
 """Which production :class:`UsageSource` the daemon should use.
@@ -282,6 +288,13 @@ class WatchdogSettings(_StrictModel):
     restart_cooldown_s: float = Field(gt=0, le=MAX_DURATION_S)
     restart_backoff_max_s: float = Field(gt=0, le=MAX_DURATION_S)
     crash_loop_threshold: int = Field(ge=1)
+    transient_config_escalation_s: float = Field(default=600.0, ge=0, le=MAX_DURATION_S)
+    """How long the cron watchdog reports a configuration file that cannot
+    be read, but may come back (a mount not up yet), as a WARNING before it
+    reports it as an ERROR and the tick exits 1 (seconds). It holds the
+    restart back either way. 0 reports it as an ERROR from the first tick.
+    When the queue TOML itself cannot be read, the packaged default
+    applies."""
 
 
 class SupervisorSettings(_StrictModel):
@@ -439,7 +452,8 @@ class WorktreeReclaimSettings(_StrictModel):
     """``flock`` file shared with the pre-dispatch hook, relative to the queue
     dir (or absolute). Held around the fetch and around each worktree removal,
     so a concurrent ``git worktree add`` waits instead of failing on git's
-    repository locks. Empty (the default) takes no lock."""
+    repository locks. Empty (the default) takes no lock. A leading ``~user``
+    that names no user fails validation."""
 
     lock_timeout_s: float = Field(default=60.0, gt=0, le=MAX_DURATION_S)
     """How long to wait for ``lock_file``. A worktree whose lock wait times out
@@ -448,6 +462,16 @@ class WorktreeReclaimSettings(_StrictModel):
     git_timeout_s: float = Field(default=300.0, gt=0, le=MAX_DURATION_S)
     """Timeout for each ``git`` invocation (the fetch, a status probe, one
     ``git worktree remove`` of a large tree)."""
+
+    @field_validator("lock_file")
+    @classmethod
+    def _check_lock_file(cls, value: str) -> str:
+        if value.strip():
+            try:
+                expand_task_path(value.strip(), "[worktree_reclaim].lock_file")
+            except TaskPathError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
 
     @field_validator("remote")
     @classmethod
@@ -561,11 +585,23 @@ class ClaudeSettings(_StrictModel):
     single account named ``"default"`` from this field for backwards
     compatibility. When both are present, ``[[accounts]]`` wins and this
     field is ignored. Empty string means "use claude's default"
-    (``~/.claude``).
+    (``~/.claude``). A ``config_dir`` whose leading ``~user`` names no
+    user fails validation whenever it is set, since the usage source of a
+    queue with at most one account reads it.
     """
 
     executable: str = "claude"
     config_dir: str = ""
+
+    @field_validator("config_dir")
+    @classmethod
+    def _check_config_dir(cls, value: str) -> str:
+        if value:
+            try:
+                expand_config_dir(value)
+            except ConfigDirError as exc:
+                raise ValueError(f"[claude].{exc}") from exc
+        return value
 
 
 class AccountSettings(_StrictModel):
@@ -609,7 +645,9 @@ class AccountSettings(_StrictModel):
     config_dir: str
     """``CLAUDE_CONFIG_DIR`` for this account. Empty string targets
     claude's default ``~/.claude``. The loader also reads per-account
-    dispatch policy from ``<config_dir>/runner-account.toml``."""
+    dispatch policy from ``<config_dir>/runner-account.toml``. A leading
+    ``~user`` that names no user fails validation, so the queue TOML does
+    not load."""
 
     linux_user: str | None = None
     """Optional Linux uid name to spawn claude as. When set, the
@@ -627,6 +665,11 @@ class AccountSettings(_StrictModel):
             )
         if self.linux_user is not None and not self.linux_user.strip():
             raise ValueError("linux_user must be a non-empty Linux username when set")
+        if self.config_dir:
+            try:
+                expand_config_dir(self.config_dir)
+            except ConfigDirError as exc:
+                raise ValueError(f"account {self.name!r}: {exc}") from exc
         return self
 
 

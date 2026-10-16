@@ -12,8 +12,10 @@
 #      WARNING line. A managed path that is not an existing directory is
 #      skipped with an ERROR line.
 #   2. If the supervisor is dead, no other process holds global.lock AND
-#      backoff allows (cron.backoff.decide): restarts it via
-#      `claude-task-runner supervisor start --queue ...`.
+#      backoff allows (cron.backoff.decide): reads every account's
+#      runner-account.toml, as the supervisor's start would, and when they
+#      all load restarts it via `claude-task-runner supervisor start --queue ...`.
+#      When one does not, it logs which and starts nothing.
 #   3. Logs to ~/.claude_task_runner/watchdog.log.
 #
 # Why a shell script and not direct cron invocation: ensures stdout/

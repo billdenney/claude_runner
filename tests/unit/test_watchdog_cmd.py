@@ -173,7 +173,7 @@ class TestRegisterCommand:
         toml.write_text("[watchdog\n", encoding="utf-8")
         args = ["register", "--queue", str(queue)] + (["--config", str(toml)] if given else [])
         result = runner.invoke(app, args)
-        assert result.exit_code == 2
+        assert result.exit_code == 78
         assert result.stderr.startswith(f"register failed: Invalid TOML in {toml}: ")
         assert result.stdout == ""
         assert not queues_registry_path().exists()
@@ -825,24 +825,131 @@ class TestTickSettingsSource:
         assert state.queue == queue.resolve()
         assert state.recent_restarts == []
 
-    def test_a_recorded_config_that_is_gone_fails_the_tick(
+    def test_a_recorded_config_that_is_gone_is_a_warning(
         self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The tick does not fall back to the queue's own TOML or to the defaults."""
+        """The tick does not fall back to the queue's own TOML or to the defaults.
+
+        A file that is gone may come back (a mount not up yet), so the tick
+        warns, exits 0, and records when the problem was first seen."""
         queue = isolated_home / "q"
         _toml(queue / "claude_runner.toml", "")
         recorded = _toml(isolated_home / "cfg" / "b.toml", "")
         register_queue(queue, config=recorded)
         recorded.unlink()
         spawned = _record_spawn_configs(monkeypatch)
+        before = datetime.now(UTC)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout.split(" ", 1)[1] == (
+            f"watchdog: WARNING queue={queue.resolve()} config={recorded} does not load, so "
+            "its supervisor was not checked or restarted; this may clear up by itself, and "
+            f"the next tick tries again: Settings file not found: {recorded}\n"
+        )
+        assert spawned == []
+        since = load_state(watchdog_state_path()).transient_config_since
+        assert since is not None
+        assert before <= since <= datetime.now(UTC)
+
+    @pytest.mark.parametrize(
+        ("minutes_ago", "level", "exit_code", "note"),
+        [
+            pytest.param(
+                9,
+                "WARNING",
+                0,
+                "this may clear up by itself, and the next tick tries again",
+                id="under-ten-minutes",
+            ),
+            pytest.param(
+                11,
+                "ERROR",
+                1,
+                "this may clear up by itself, but has lasted 11 min",
+                id="over-ten-minutes",
+            ),
+        ],
+    )
+    def test_a_gone_config_is_an_error_once_it_has_lasted(
+        self,
+        runner: CliRunner,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        minutes_ago: int,
+        level: str,
+        exit_code: int,
+        note: str,
+    ) -> None:
+        """Past the packaged ``transient_config_escalation_s`` (600 s) it is an
+        ERROR: the queue's own ``[watchdog]`` cannot be read to say otherwise.
+        The start of the problem is kept, not moved to this tick."""
+        queue = isolated_home / "q"
+        recorded = isolated_home / "cfg" / "b.toml"
+        queue.mkdir()
+        register_queue(queue, config=recorded)
+        since = datetime.now(UTC) - timedelta(minutes=minutes_ago, seconds=5)
+        write_state_atomic(
+            WatchdogState(queue=queue.resolve(), transient_config_since=since),
+            watchdog_state_path(),
+        )
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == exit_code, result.output
+        assert result.stdout.split(" ", 1)[1] == (
+            f"watchdog: {level} queue={queue.resolve()} config={recorded} does not load, so "
+            f"its supervisor was not checked or restarted; {note}: "
+            f"Settings file not found: {recorded}\n"
+        )
+        assert spawned == []
+        assert load_state(watchdog_state_path()).transient_config_since == since
+
+    def test_a_content_error_ends_a_transient_spell(
+        self, runner: CliRunner, isolated_home: Path
+    ) -> None:
+        """A content error is an ERROR at once; the record of a file that could
+        not be read is cleared, so a later such problem starts its own count."""
+        queue = isolated_home / "q"
+        _toml(queue / "claude_runner.toml", "[watchdog\n")
+        register_queue(queue)
+        write_state_atomic(
+            WatchdogState(
+                queue=queue.resolve(),
+                transient_config_since=datetime.now(UTC) - timedelta(minutes=3),
+            ),
+            watchdog_state_path(),
+        )
 
         result = runner.invoke(app, ["tick"])
 
         assert result.exit_code == 1
-        assert (
-            _config_error(queue.resolve(), recorded) + f"Settings file not found: {recorded}\n"
-        ) in result.stdout
-        assert spawned == []
+        assert " watchdog: ERROR " in result.stdout
+        assert load_state(watchdog_state_path()).transient_config_since is None
+
+    def test_a_config_that_loads_ends_a_transient_spell(
+        self, runner: CliRunner, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = isolated_home / "q"
+        _toml(queue / "claude_runner.toml", "")
+        register_queue(queue)
+        write_state_atomic(
+            WatchdogState(
+                queue=queue.resolve(),
+                transient_config_since=datetime.now(UTC) - timedelta(minutes=30),
+            ),
+            watchdog_state_path(),
+        )
+        spawned = _record_spawn_configs(monkeypatch)
+
+        result = runner.invoke(app, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        assert "verdict=restart" in result.stdout
+        assert len(spawned) == 1
+        assert load_state(watchdog_state_path()).transient_config_since is None
 
     def test_a_bad_config_is_reported_while_the_supervisor_runs(
         self, runner: CliRunner, isolated_home: Path

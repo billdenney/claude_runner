@@ -23,8 +23,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.cli._helpers import load_settings_or_exit
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import load_settings
 from claude_task_runner.usage import capture as capture_mod
 from claude_task_runner.usage import parser as parser_mod
 from claude_task_runner.usage import whoami as whoami_mod
@@ -67,7 +67,7 @@ def _root(
 
     With no subcommand, runs ``render``.
     """
-    settings = load_settings(config)
+    settings = load_settings_or_exit(config, Console())
     ctx.ensure_object(dict)
     ctx.obj["settings"] = settings
     ctx.obj["captures_dir"] = _default_captures_dir()

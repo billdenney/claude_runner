@@ -29,7 +29,7 @@ from claude_task_runner.cli.supervisor_cmd import (
     _count_pending,
     app,
 )
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, ConfigError, load_settings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -794,17 +794,20 @@ def test_drain_reads_no_settings_without_the_default_wait(
 
 def _settings_error(path: Path) -> str:
     """What ``load_settings`` raises for ``path``."""
-    with pytest.raises((ConfigError, OSError)) as exc_info:
+    with pytest.raises(ConfigError) as exc_info:
         load_settings(path)
     return str(exc_info.value)
 
 
-@pytest.mark.parametrize("where", ["--config", "queue", "missing", "directory"])
+@pytest.mark.parametrize(
+    ("where", "status"), [("--config", 78), ("queue", 78), ("missing", 1), ("directory", 78)]
+)
 def test_waiting_drain_refuses_settings_that_do_not_load(
-    runner: CliRunner, queue_dir: Path, tmp_path: Path, where: str
+    runner: CliRunner, queue_dir: Path, tmp_path: Path, where: str, status: int
 ) -> None:
-    """Refused with exit 2 before anything is signalled, since the
-    default wait needs the cap."""
+    """Refused before anything is signalled, since the default wait needs
+    the cap, with the status ``supervisor start`` gives the config: 1 for
+    a file that may come back, 78 otherwise."""
     config = queue_dir / "claude_runner.toml" if where == "queue" else tmp_path / "c.toml"
     if where in ("--config", "queue"):
         config.write_text(_BROKEN_TOML, encoding="utf-8")
@@ -814,10 +817,10 @@ def test_waiting_drain_refuses_settings_that_do_not_load(
     clock = _FakeClock()
     with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
         result = _invoke(runner, ["drain", "--queue", str(queue_dir), *extra])
-    assert result.exit_code == 2, result.output
+    assert result.exit_code == status, result.output
     assert _plain(result.stdout) == (
-        f"cannot load the settings for the default --timeout: {_settings_error(config)}. "
-        "Pass --timeout <seconds>, or --no-wait, to drain without them.\n"
+        "cannot load the settings for the default --timeout (pass --timeout <seconds>, "
+        f"or --no-wait, to drain without them): {_settings_error(config)}\n"
     )
     kill.assert_not_called()
     assert clock.sleeps == []
@@ -906,12 +909,12 @@ def test_start_refuses_a_queue_with_an_unknown_timezone(runner: CliRunner, tmp_p
         patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as mock_start,
     ):
         result = runner.invoke(app, ["start", "--queue", str(queue)])
-    assert result.exit_code == 1
-    assert isinstance(result.exception, ConfigError)
-    assert "dispatch_pct.timezone" in str(result.exception)
-    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in str(
-        result.exception
+    assert result.exit_code == CONFIG_ERROR_EXIT_STATUS
+    assert result.stdout.startswith(
+        "supervisor not started: Settings validation failed: 1 validation error for "
+        "Settings\ndispatch_pct.timezone\n"
     )
+    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in result.stdout
     mock_start.assert_not_called()
 
 

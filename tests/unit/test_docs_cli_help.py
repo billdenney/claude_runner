@@ -555,11 +555,12 @@ class TestLayout:
             "\n  Exit codes:\n"
             "    0  supervisor exited (or --no-wait and signal delivered)\n"
             "    1  no supervisor to signal: no PID file, one that holds no PID,\n"
-            "       or a PID that is not alive\n"
-            "    2  --queue is not an existing directory, the settings for the\n"
-            "       default --timeout did not load, or signal delivery rejected\n"
+            "       or a PID that is not alive; or the settings for the default\n"
+            "       --timeout could not be read for now (the message says which)\n"
+            "    2  --queue is not an existing directory, or signal delivery rejected\n"
             "       (permission) or refused (a PID of 1 or less, or this command's own)\n"
             "    4  --wait timed out (the supervisor is still draining)\n"
+            "   78  the settings for the default --timeout have wrong content\n"
         ) in _render_help(app, ("supervisor", "drain"))
 
     @pytest.mark.parametrize("path", _command_paths(), ids=_path_id)

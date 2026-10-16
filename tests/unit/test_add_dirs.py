@@ -108,6 +108,29 @@ class TestResolveAddDirs:
         # Warning mentions the missing path so the operator can fix it.
         assert any("nope" in rec.message for rec in caplog.records)
 
+    def test_an_entry_that_cannot_be_expanded_warns_and_skips(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A ``~user`` that names no user narrows the sandbox like a missing
+        path; it does not end the dispatch thread with a RuntimeError."""
+        queue = tmp_path / "queue"
+        queue.mkdir()
+        present = tmp_path / "real"
+        present.mkdir()
+        gone = Path("~no-such-user-ctr-test/data")
+
+        with caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.add_dirs"):
+            result = resolve_add_dirs(_task(additional_dirs=[gone, present]), queue)
+
+        assert result == [queue.resolve(), present.resolve()]
+        assert [rec.getMessage() for rec in caplog.records] == [
+            "task t1: --add-dir skips an entry: additional_dirs entry "
+            "'~no-such-user-ctr-test/data' cannot be expanded: Could not determine "
+            "home directory."
+        ]
+
     def test_file_instead_of_dir_warns_and_skips(
         self,
         tmp_path: Path,

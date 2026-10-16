@@ -56,6 +56,7 @@ from typing import IO
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
+from claude_task_runner.config.paths import ConfigDirError, TaskPathError, expand_config_dir
 from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
@@ -1533,7 +1534,10 @@ def dispatch(
     # token is in use for an account.
     spawn_env: dict[str, str] | None = None
     if claude_config_dir:
-        config_path = Path(claude_config_dir).expanduser()
+        try:
+            config_path = expand_config_dir(claude_config_dir)
+        except ConfigDirError as exc:
+            raise DispatchError(str(exc)) from exc
         if not config_path.exists():
             raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
@@ -1588,7 +1592,10 @@ def dispatch(
     from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
 
     _trust_dir = task.working_dir if task.working_dir else Path.cwd()
-    _ensure_claude_init(claude_config_dir or None, _trust_dir)
+    try:
+        _ensure_claude_init(claude_config_dir or None, _trust_dir)
+    except TaskPathError as exc:
+        raise DispatchError(f"task {task.id}: {exc}") from exc
 
     # ADR-0025: file-backed output. When adoption is on (and we have a
     # state YAML to record the log path on), redirect the worker's

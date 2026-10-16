@@ -34,11 +34,11 @@ from rich.console import Console
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -192,15 +192,12 @@ def list_tasks(
     console = Console()
     out: list[dict[str, object]] = []
     qd = require_queue_option(queue_dir, console, json=json)
-    try:
-        settings = load_settings(resolve_per_queue_config(config, qd))
-    except ConfigError as exc:
-        message = f"cannot load the queue's settings to check effort levels: {exc}"
-        if json:
-            print(_json.dumps({"ok": False, "error": message}))
-        else:
-            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
-        raise typer.Exit(code=2) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, qd),
+        console,
+        json=json,
+        lead="cannot load the queue's settings to check effort levels",
+    )
 
     if order_by_dispatch:
         ordered_tasks = planned_dispatch_order(qd)
@@ -545,7 +542,7 @@ def add_task(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console)
 
     if not _ID_RE.match(task_id):
         console.print(f"[bold red]invalid task id:[/] {task_id!r} (allowed: {_ID_RE.pattern})")
@@ -680,7 +677,7 @@ def backfill_working_dir(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
 
     template = settings.queue.working_dir_template
     if not template.strip():
@@ -950,7 +947,7 @@ def force_dispatch(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     queue_runtime_dir(qd)
 
     task_path = task_path_for(qd, task_id)
