@@ -23,6 +23,7 @@ from claude_task_runner.queue.store import (
     todo_dir,
     write_state_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.supervisor.reconcile import (
     LIVE_WORKER_STOP_REASON,
     ORPHAN_STOP_REASON,
@@ -274,3 +275,47 @@ def test_live_pipe_backed_worker_is_parked_and_a_reused_pid_is_demoted(
         f"pid {live_worker_pid} is not the worker of the attempt started at "
         f"{(now - timedelta(hours=1)).isoformat()} (log None): the process started +"
     )
+
+
+def test_keeps_the_in_flight_records_of_parked_live_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous supervisor's in_flight records go, except those of tasks
+    parked with a live worker: they are the only record of the account
+    each worker runs on, which the per-tick parked-worker pass keeps
+    counting. A task parked at this restart keeps its record too."""
+    qd = _queue(tmp_path)
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == 4_300_001)
+    when = datetime(2026, 10, 16, tzinfo=UTC)
+    write_state_atomic(
+        dispatcher_mod.park_live_worker(
+            TaskState(task_id="t-old-park", status="running", pid=4_300_002),
+            why="after an earlier restart",
+        ),
+        state_path_for(qd, "t-old-park"),
+    )
+    write_state_atomic(
+        TaskState(task_id="t-new-park", status="running", last_started_at=when, pid=4_300_001),
+        state_path_for(qd, "t-new-park"),
+    )
+    write_state_atomic(
+        TaskState(task_id="t-dead", status="running", last_started_at=when, pid=4_300_003),
+        state_path_for(qd, "t-dead"),
+    )
+    records = [
+        InFlightRecord(task_id=tid, account=acct, started_at=when)
+        for tid, acct in [("t-dead", "work"), ("t-new-park", "personal"), ("t-old-park", "work")]
+    ]
+    snap = _empty_snapshot().model_copy(
+        update={"in_flight": records, "in_flight_task_ids": [r.task_id for r in records]}
+    )
+
+    new_snap, demoted, parked = reconcile_orphans(qd, snap)
+
+    assert demoted == ["t-dead"]
+    assert [p.task_id for p in parked] == ["t-new-park"]
+    assert [(r.task_id, r.account) for r in new_snap.in_flight] == [
+        ("t-new-park", "personal"),
+        ("t-old-park", "work"),
+    ]
+    assert new_snap.in_flight_task_ids == ["t-new-park", "t-old-park"]
