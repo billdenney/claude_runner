@@ -52,7 +52,11 @@ introduces a new on-disk file MUST update this document in the same PR.
    `[logging].level` of INFO; no `events.ndjson` file is written today.
    See [Supervisor log and drift evidence](#supervisor-log-and-drift-evidence).
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
-   after `task_caps.heartbeat_silence_alert_s` seconds of silence.
+   after `task_caps.heartbeat_silence_alert_s` seconds of silence. The agent
+   heartbeat does not count `tool_progress`, so it stands still through a
+   long tool call; the silent-orphan reaper and startup adoption also count
+   the monitor's `dispatcher_alive_at` and the worker's writes to its stream
+   log (`supervisor.reconcile_silent.liveness_verdict`).
 6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**
@@ -296,6 +300,10 @@ These properties are never violated; tests and assertions enforce them.
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs, and records a worker that exited in the meantime from its log.
+   A worker that is still running is never set to a dispatchable status: one
+   the restart cannot adopt is parked `possibly_hung` (ADR-0025, amended
+   2026-10-16), and `runner.dispatcher.probe_worker` decides whether a
+   recorded pid is still its worker.
    Before a stopping supervisor releases its lock, it waits, briefly, for any
    dispatch thread that has started a worker to record its pid
    (`runner.spawn_gate`), so a restart can find every worker.

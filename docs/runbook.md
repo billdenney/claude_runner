@@ -213,6 +213,51 @@ N hours old.
 4. If hangs are common, reduce `task_caps.heartbeat_silence_kill_s` from
    default 0 (off) to e.g. 600 to auto-kill silent tasks.
 
+## After a restart, a task is `failed` or `possibly_hung` while its worker still runs
+
+**Symptom:** after `systemctl --user restart claude-task-runner` (or any
+supervisor restart), `claude-task-runner queue states` shows a task as
+`possibly_hung` with stop reason `worker_still_running` or
+`silent_on_restart`, but its `claude` worker is still running and its
+stream log is still growing. A runner older than 2026-10-16 showed such a
+task as `failed` with stop reason `orphaned_by_supervisor_restart`, and
+dispatched it again beside the running worker.
+
+**Cause:** workers survive a restart (`KillMode=process`) and the new
+supervisor adopts each one that showed a sign of life within
+`[task_caps].heartbeat_silence_alert_s` (300 s by default): an agent event,
+a monitor tick from the previous supervisor, or a write to its stream log.
+A worker that showed none for longer than that, for instance in a long
+Bash call after a long downtime, or every live worker when
+`[supervisor].adopt_workers` is off, is parked instead: a `failed` task
+would be dispatched again, and two workers in one worktree corrupt its
+branch. Nothing monitors a parked worker, so its task stays `possibly_hung`
+after the worker exits.
+
+**Steps:**
+1. Find the worker. The state's `error` names its pid
+   (`claude-task-runner queue show <id>`). Check that the pid is still the
+   worker: `readlink /proc/<pid>/fd/1` prints the attempt's log,
+   `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl`.
+2. Check for a second worker on the same task. Every worker's working
+   directory is the task's worktree:
+   `for p in $(pgrep -f 'claude --print'); do echo "$p $(readlink /proc/$p/cwd)"; done`.
+   If two share the worktree, first add a `"block_dispatch": true` row for
+   the task to the `[dispatch].dispatch_block_file` (ADR-0029), so the
+   supervisor does not dispatch it a third time, then stop the newer
+   worker (its log has the higher attempt number) with `kill -TERM -<pid>`
+   (the minus signals its process group). Remove the row once the task is
+   recorded (step 4).
+3. Let the worker finish: `tail -f` its log until it writes a `result`
+   event, and wait for the pid to exit.
+4. Record the run. Stop the supervisor, set `status: running` in
+   `<queue>/.claude_task_runner/state/<id>.yaml` (a `worker_still_running`
+   park keeps `pid` and `log_path`, which is what the next step needs), and
+   start the supervisor. Its startup pass records the run from the log's
+   `result` event, as for any worker that exited during a restart. A
+   `silent_on_restart` park has no `pid` left; set it to `failed` instead,
+   and the supervisor resumes the session.
+
 ## Weekly throttled, no dispatch resuming
 
 **Symptom:** Supervisor in `ThrottledWeekly`, observed weekly
