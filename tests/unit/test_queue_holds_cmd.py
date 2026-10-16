@@ -19,7 +19,14 @@ from pathlib import Path
 
 import pytest
 
-from claude_task_runner.queue.store import queue_runtime_dir, state_path_for, todo_dir
+from claude_task_runner.queue.store import (
+    load_state,
+    queue_runtime_dir,
+    state_path_for,
+    todo_dir,
+)
+from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -37,6 +44,7 @@ from ._mixed_queue import (
     build_mixed_queue,
     forbid_selector_writes,
 )
+from ._worker_probe_stubs import fake_proc, ticks_between
 
 SINCE = datetime(2026, 10, 16, tzinfo=UTC)
 
@@ -131,6 +139,7 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
                 "next_eligible_at": "2027-10-14T12:00:00+00:00",
             }
         ],
+        "unread_states": [],
         "supervisor_json_error": None,
     }
 
@@ -455,3 +464,142 @@ def test_creates_nothing_in_a_queue_without_todo(tmp_path: Path) -> None:
 
     assert (holds["todo_tasks"], holds["eligible"]["count"]) == (0, 0)
     assert sorted(p.relative_to(bare) for p in bare.rglob("*")) == []
+
+
+_SUDO_PID = 4_700_001
+_BOOT = datetime(2026, 10, 15, tzinfo=UTC)
+
+
+def _worker_under_another_user(
+    queue: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    process_started: datetime,
+    recorded_started: datetime,
+    identity_started: datetime,
+) -> None:
+    """Park ``sudo`` with a worker, ``_SUDO_PID``, whose fd 1 cannot be read,
+    as for a worker run as another Linux user. The process started at
+    ``process_started``; the state records ``recorded_started``, and the
+    attempt's identity file a process started at ``identity_started``."""
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == _SUDO_PID)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(tmp_path / "proc", _SUDO_PID, started=process_started, boot=_BOOT),
+    )
+    _config(queue)
+    log = tmp_path / "sudo.log"
+    log.write_text("")
+    add_task(queue, "sudo")
+    add_state(
+        queue,
+        "sudo",
+        "possibly_hung",
+        stop_reason="worker_still_running",
+        pid=_SUDO_PID,
+        attempts=1,
+        log_path=str(log),
+        last_started_at=recorded_started,
+    )
+    identity = dispatcher_mod.worker_identity_path(queue, "sudo", 1)
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_text(
+        json.dumps(
+            {
+                "pid": _SUDO_PID,
+                "boot_id": "boot-a",
+                "start_ticks": ticks_between(_BOOT, identity_started),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_a_parked_worker_is_judged_by_its_spawn_identity(
+    queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The identity file names the running process, which started three
+    hours before the attempt's recorded start: still the worker, running."""
+    _worker_under_another_user(
+        queue,
+        tmp_path,
+        monkeypatch,
+        process_started=_BOOT + timedelta(hours=1),
+        recorded_started=_BOOT + timedelta(hours=4),
+        identity_started=_BOOT + timedelta(hours=1),
+    )
+
+    [parked] = _holds(queue)["parked_workers"]
+
+    assert (parked["task_id"], parked["running"]) == ("sudo", True)
+
+
+def test_a_parked_workers_reused_pid_is_not_running(
+    queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process with the pid started when the attempt did, but not at
+    the tick the identity file records: another process, so the worker is
+    not running."""
+    _worker_under_another_user(
+        queue,
+        tmp_path,
+        monkeypatch,
+        process_started=_BOOT + timedelta(hours=4),
+        recorded_started=_BOOT + timedelta(hours=4),
+        identity_started=_BOOT + timedelta(hours=1),
+    )
+
+    [parked] = _holds(queue)["parked_workers"]
+
+    assert (parked["task_id"], parked["running"]) == ("sudo", False)
+
+
+def test_a_state_changed_after_the_selection_is_noted_not_raised(
+    queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between the selection and the details, one parked task's state is
+    removed and one cooling-down task's state stops parsing. Both are left
+    out of the details and listed with their errors; the command succeeds."""
+    _config(queue)
+    started = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    due = started + timedelta(hours=1)
+    gone = _exited_pid()
+    for task_id in ("gone-parked", "torn-retry", "kept-retry"):
+        add_task(queue, task_id)
+    add_state(queue, "kept-retry", "deferred", deferred_reason="waiting", next_eligible_at=due)
+    real_preview = orch_mod.preview_selection
+
+    def preview_then_change(*args: object, **kwargs: object) -> orch_mod.SelectionPreview:
+        _parked(queue, "gone-parked", gone, None, started)
+        add_state(queue, "torn-retry", "deferred", deferred_reason="waiting", next_eligible_at=due)
+        preview = real_preview(*args, **kwargs)  # type: ignore[arg-type]
+        state_path_for(queue, "gone-parked").unlink(missing_ok=True)
+        state_path_for(queue, "torn-retry").write_text("{not: [yaml", encoding="utf-8")
+        return preview
+
+    monkeypatch.setattr(orch_mod, "preview_selection", preview_then_change)
+
+    holds = _holds(queue)
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)])
+
+    errors: dict[str, str] = {}
+    for task_id in ("gone-parked", "torn-retry"):
+        with pytest.raises((OSError, ValueError)) as exc:
+            load_state(state_path_for(queue, task_id))
+        errors[task_id] = str(exc.value)
+    assert holds["held"] == {"deferred_cooldown": 2, "possibly_hung": 1}
+    assert holds["parked_workers"] == []
+    assert [item["task_id"] for item in holds["retrying"]] == ["kept-retry"]
+    assert holds["unread_states"] == [
+        {"task_id": "gone-parked", "error": errors["gone-parked"]},
+        {"task_id": "torn-retry", "error": errors["torn-retry"]},
+    ]
+    assert text.exit_code == 0, text.output
+    # A YAML error runs over several lines; each note starts on its own.
+    unread_lines = [line for line in text.stdout.splitlines() if " not read, " in line]
+    assert unread_lines == [
+        f"state of {task_id} not read, so not detailed above: {error.splitlines()[0]}"
+        for task_id, error in errors.items()
+    ]

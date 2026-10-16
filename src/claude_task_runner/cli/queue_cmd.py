@@ -29,6 +29,7 @@ import json as _json
 import re
 import sys
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -442,7 +443,10 @@ def holds(
     whether it is still ``running``, its ``duration_cap_s`` (0: none) and
     whether it has run ``past_cap``.
     ``retrying``: the ``deferred_cooldown`` tasks, each with its
-    ``deferred_reason`` and ``next_eligible_at``.
+    ``deferred_reason`` and ``next_eligible_at``. A task whose state no
+    longer loads when these details are read (removed or rewritten since
+    the selection read it) is left out of them and listed under
+    ``unread_states`` with the error.
 
     \b
     Exit codes:
@@ -467,8 +471,9 @@ def holds(
         by_status[status] = by_status.get(status, 0) + 1
     can_start_now = sum(1 for account in preview.routes.values() if account is not None)
     now = RealClock().now()
-    parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now)
-    retrying = _retrying(qd, preview.held.get("deferred_cooldown", []))
+    unread: list[dict[str, str]] = []
+    parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
+    retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -486,6 +491,7 @@ def holds(
         "warming_up": preview.warming_up,
         "parked_workers": parked,
         "retrying": retrying,
+        "unread_states": unread,
         "supervisor_json_error": snapshot_error,
     }
     if json:
@@ -526,6 +532,13 @@ def holds(
             highlight=False,
             markup=False,
         )
+    for item in unread:
+        console.print(
+            f"state of {item['task_id']} not read, so not detailed above: {item['error']}",
+            style="yellow",
+            highlight=False,
+            markup=False,
+        )
     if snapshot_error:
         console.print(
             f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
@@ -533,16 +546,29 @@ def holds(
         )
 
 
+def _held_states(
+    qd: Path, tasks: list[Task], unread: list[dict[str, str]]
+) -> Iterator[tuple[Task, TaskState]]:
+    """Each of ``tasks`` with its state. The selector has just read every
+    one; a state that no longer loads (removed or rewritten since) is left
+    out and noted in ``unread``."""
+    for task in tasks:
+        try:
+            yield task, load_state(state_file_path(qd, task.id))
+        except (OSError, ValueError) as exc:
+            unread.append({"task_id": task.id, "error": str(exc)})
+
+
 def _parked_workers(
-    qd: Path, settings: Settings, tasks: list[Task], now: datetime
+    qd: Path, settings: Settings, tasks: list[Task], now: datetime, unread: list[dict[str, str]]
 ) -> list[dict[str, object]]:
     """Of ``tasks`` (held ``possibly_hung``), those parked because a worker
     the supervisor does not watch was running: when it started, whether it
-    still runs (:func:`runner.dispatcher.probe_worker`) and whether it has
-    run past the task's duration cap."""
+    still runs (:func:`runner.dispatcher.probe_recorded_worker`, as the
+    supervisor's own passes ask) and whether it has run past the task's
+    duration cap."""
     out: list[dict[str, object]] = []
-    for task in tasks:
-        state = load_state(state_file_path(qd, task.id))
+    for task, state in _held_states(qd, tasks, unread):
         if state.stop_reason != LIVE_WORKER_STOP_REASON:
             continue
         started = state.last_started_at or (state.runs[-1].started_at if state.runs else None)
@@ -552,10 +578,7 @@ def _parked_workers(
                 "task_id": task.id,
                 "pid": state.pid,
                 "started_at": started.isoformat() if started else None,
-                "running": state.pid is not None
-                and dispatcher_mod.probe_worker(
-                    state.pid, log_path=state.log_path, started_at=state.last_started_at
-                )
+                "running": dispatcher_mod.probe_recorded_worker(state, qd)
                 is dispatcher_mod.WorkerProbe.ALIVE,
                 "duration_cap_s": cap,
                 "past_cap": bool(
@@ -566,12 +589,11 @@ def _parked_workers(
     return out
 
 
-def _retrying(qd: Path, tasks: list[Task]) -> list[dict[str, object]]:
+def _retrying(qd: Path, tasks: list[Task], unread: list[dict[str, str]]) -> list[dict[str, object]]:
     """``tasks`` (held ``deferred_cooldown``) with why each was deferred
     and when the supervisor tries it again."""
     out: list[dict[str, object]] = []
-    for task in tasks:
-        state = load_state(state_file_path(qd, task.id))
+    for task, state in _held_states(qd, tasks, unread):
         due = state.next_eligible_at
         out.append(
             {
