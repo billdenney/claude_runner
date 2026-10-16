@@ -374,18 +374,54 @@ def test_broken_account_file(
     assert _summary(queue, bin_dir) == (
         RUNNING
         + _accounts(
-            "personal: takes no tasks, because its settings file has an error",
+            "personal: takes no tasks until a problem with it is fixed",
             "work: taking tasks, 3 of 3 slots in use",
         )
         + "- **How many can run:** up to 3 at once (work 3; no queue-wide cap). Not counted: "
-        "personal (settings file error). Right now 3 running, with no room for more.\n"
+        "personal (cannot take tasks). Right now 3 running, with no room for more.\n"
         "- **Tasks:** 3 running; 1 can start as soon as a slot is free; 0 finished.\n"
         + NO_QUESTIONS
         + _attention(
-            f"personal takes no tasks because its settings file has an error: {broken.error}. "
-            "Fix the file; personal takes tasks again within a minute."
+            f"personal takes no tasks until this is fixed: {broken.error.rstrip('.')}. Once it "
+            "is, personal takes tasks again within a minute."
         )
     )
+
+
+def test_an_account_that_cannot_take_tasks_for_another_reason(queue: Path, bin_dir: Path) -> None:
+    """The runner's error says what is wrong, which need not be the account's
+    runner-account.toml (a linux_user without sudo, say), so it is given
+    as the runner words it, with no file put in front of it."""
+    row = {
+        "name": "work",
+        "state": None,
+        "dispatch_cap": 0,
+        "in_flight_count": 0,
+        "max_concurrency": None,
+        "paused": False,
+        "policy_file": "/home/svc/.claude/runner-account.toml",
+        "policy_error": "linux_user='svc' requested but sudo not on PATH",
+    }
+    ceiling = {
+        "ceiling": 0,
+        "max_concurrency": None,
+        "accounts_total": 0,
+        "account_caps": {},
+        "binds": False,
+        "broken_accounts": ["work"],
+    }
+    listing = json.dumps({"accounts": [row], "queue_ceiling": ceiling})
+    _cli_with(bin_dir, account=(listing, "", 1))
+    summary = _summary(queue, bin_dir)
+    assert "  - work: takes no tasks until a problem with it is fixed.\n" in summary
+    assert (
+        "- **How many can run:** up to 0 at once (no account; no queue-wide cap). Not counted: "
+        "work (cannot take tasks).\n"
+    ) in summary
+    assert (
+        "- work takes no tasks until this is fixed: linux_user='svc' requested but sudo not on "
+        "PATH. Once it is, work takes tasks again within a minute.\n"
+    ) in summary
 
 
 def test_binding_queue_wide_cap(
