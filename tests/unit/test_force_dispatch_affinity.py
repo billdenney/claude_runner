@@ -97,10 +97,13 @@ def _account(name: str, *, cap: int = 5, config_dir: str = "") -> ResolvedAccoun
 # --- builders for the force_dispatch entry points ----------------------------
 
 
-def _multi_account_settings() -> Any:
+def _multi_account_settings(queue_dir: Path) -> Any:
     """Two-account settings shape. ``work`` is the session host;
     ``personal`` is first-configured (the fallback) and is also where a
-    naive task.account pin would point."""
+    naive task.account pin would point. Each account's config_dir is
+    created beside ``queue_dir``: one that does not exist is broken."""
+    for name in (".claude_personal", ".claude_work"):
+        (queue_dir.parent / name).mkdir(exist_ok=True)
     return SimpleNamespace(
         concurrency=SimpleNamespace(initial_concurrency=1, max_concurrency=2),
         task_caps=SimpleNamespace(),
@@ -111,8 +114,8 @@ def _multi_account_settings() -> Any:
         claude=SimpleNamespace(executable="claude", config_dir=""),
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
         accounts=[
-            AccountSettings(name="personal", config_dir="/tmp/.claude_personal"),
-            AccountSettings(name="work", config_dir="/tmp/.claude_work"),
+            AccountSettings(name="personal", config_dir=str(queue_dir.parent / ".claude_personal")),
+            AccountSettings(name="work", config_dir=str(queue_dir.parent / ".claude_work")),
         ],
     )
 
@@ -195,7 +198,7 @@ class TestTickConsumeOverLimitAffinity:
         _make_task(queue_dir, "t1", account="personal")
         _seed_sessioned_state(queue_dir, "t1", session_id="sess-1", session_account="work")
         fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
-        settings = _multi_account_settings()
+        settings = _multi_account_settings(queue_dir)
         in_flight: dict[str, DispatchSlot] = {}
 
         captured: dict[str, str] = {}
@@ -215,7 +218,7 @@ class TestTickConsumeOverLimitAffinity:
         assert n == 1
         # Affinity beats BOTH the task.account pin and first-configured.
         assert captured["account"] == "work"
-        assert captured["config_dir"] == "/tmp/.claude_work"
+        assert captured["config_dir"] == str(queue_dir.parent / ".claude_work")
 
 
 class TestDispatchSynchronouslyOverLimitAffinity:
@@ -226,7 +229,7 @@ class TestDispatchSynchronouslyOverLimitAffinity:
     def test_routes_to_affined_not_pinned(self, queue_dir: Path) -> None:
         _make_task(queue_dir, "t1", account="personal")
         _seed_sessioned_state(queue_dir, "t1", session_id="sess-1", session_account="work")
-        settings = _multi_account_settings()
+        settings = _multi_account_settings(queue_dir)
 
         captured: dict[str, str] = {}
 
@@ -248,4 +251,4 @@ class TestDispatchSynchronouslyOverLimitAffinity:
 
         assert out.status == "completed"
         assert captured["account"] == "work"
-        assert captured["config_dir"] == "/tmp/.claude_work"
+        assert captured["config_dir"] == str(queue_dir.parent / ".claude_work")

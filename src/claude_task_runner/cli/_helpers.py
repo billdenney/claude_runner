@@ -16,6 +16,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from claude_task_runner.config.loader import (
+    AccountResolution,
+    ConfigError,
+    config_error_exit_status,
+    load_settings,
+)
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.store import require_queue_dir
 from claude_task_runner.runner.account_dispatch import QueueCeiling
@@ -50,7 +56,11 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
        exists, return it. This is the auto-discovery that fixes the
        common pitfall of running ``claude-task-runner account list
        --queue <dir>`` and silently getting package defaults instead
-       of the accounts declared in the queue's TOML.
+       of the accounts declared in the queue's TOML. A symlink there
+       whose target is missing (on a mount not up yet, say) or that
+       loops is returned too, so ``load_settings`` reports it, as a
+       file that may come back or as a symlink loop, rather than the
+       defaults and their default account applying.
     3. Otherwise, return ``None`` — caller hands that to
        ``load_settings`` which falls back to package defaults
        (matches the historical no-config behaviour).
@@ -74,7 +84,7 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
     if config is not None:
         return config
     candidate = queue_dir / PER_QUEUE_CONFIG_NAME
-    if candidate.is_file():
+    if candidate.is_file() or (candidate.is_symlink() and not candidate.exists()):
         return candidate
     return None
 
@@ -117,3 +127,66 @@ def queue_ceiling_text(ceiling: QueueCeiling, settings: Settings) -> str:
 def queue_ceiling_json(ceiling: QueueCeiling, settings: Settings) -> dict[str, object]:
     """The ``queue_ceiling`` object of ``--json`` output, with the warm-up cap."""
     return {**ceiling.as_json(), "initial_concurrency": settings.concurrency.initial_concurrency}
+
+
+def broken_accounts_message(
+    resolution: AccountResolution,
+    *,
+    refused: str = "supervisor not started",
+    then: str = "start the supervisor again",
+    if_transient: str = "so this start exits 1 and systemd tries again; fix it if it does not",
+) -> str:
+    """Why a command refuses to go on: every account file that does not load.
+
+    ``supervisor start`` uses the defaults; ``install`` passes its own
+    ``refused``, ``then`` and ``if_transient``. The line saying each may
+    clear up by itself appears when ``resolution.only_transient``, the
+    test the caller's exit status follows.
+    """
+    broken = resolution.broken
+    noun = "account" if len(broken) == 1 else "accounts"
+    lines = [f"{refused}: the runner-account.toml of {len(broken)} {noun} does not load:"]
+    lines += [f"  {b.name}: {b.error}" for b in broken]
+    if resolution.only_transient:
+        lines.append(
+            "Each may clear up by itself (a config_dir on a mount that is not up yet, "
+            f"say), {if_transient}."
+        )
+    lines.append(
+        f"Fix each file, or delete it for the defaults, then {then}. "
+        "Once the supervisor runs, a file that breaks only stops new tasks on its account."
+    )
+    return "\n".join(lines)
+
+
+def load_settings_or_exit(
+    config: Path | None,
+    console: Console,
+    *,
+    json: bool = False,
+    lead: str = "configuration error",
+) -> Settings:
+    """``load_settings(config)``, or print why it failed and exit.
+
+    Exits 78 when the configuration's content is wrong and 1 when a file
+    could not be read and may come back (:attr:`ConfigError.transient`),
+    the rule ``supervisor start`` follows. The error is printed whole
+    without a traceback, after ``lead``; with ``json`` it goes to stdout
+    as ``{"ok": false, "error": ...}``.
+    """
+    try:
+        return load_settings(config)
+    except ConfigError as exc:
+        message = f"{lead}: {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": message}))
+        else:
+            console.print(
+                message,
+                style="bold red",
+                markup=False,
+                emoji=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+        raise typer.Exit(code=config_error_exit_status(transient=exc.transient)) from exc

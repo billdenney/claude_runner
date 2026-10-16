@@ -229,6 +229,7 @@ bash_poll_antipattern_kill       = true  # master switch: /proc-walk detection o
 restart_cooldown_s          = 30
 restart_backoff_max_s       = 600
 crash_loop_threshold        = 5
+transient_config_escalation_s = 600   # cron: a config file that may come back is a WARNING this long, then an ERROR
 
 # ---------------------------------------------------------------------------
 # Supervisor scheduling

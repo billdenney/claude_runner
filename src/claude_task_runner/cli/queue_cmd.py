@@ -8,6 +8,8 @@ Subcommands:
 
 * ``queue list``                  — list pending tasks (``todo/`` YAMLs).
 * ``queue states``                — list TaskState YAMLs, optionally filtered by status.
+* ``queue holds``                 — run the supervisor's task selection once, read-only:
+                                    what can start now and what holds the rest.
 * ``queue show ID``               — show one task's input + state + runs.
 * ``queue add``                   — write a new Task YAML from CLI args.
 * ``queue backfill-working-dir``  — populate ``working_dir`` on existing
@@ -34,11 +36,11 @@ from rich.console import Console
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -54,11 +56,13 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import force_dispatch as fd_mod
+from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
     validate_effort,
 )
+from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
@@ -192,15 +196,12 @@ def list_tasks(
     console = Console()
     out: list[dict[str, object]] = []
     qd = require_queue_option(queue_dir, console, json=json)
-    try:
-        settings = load_settings(resolve_per_queue_config(config, qd))
-    except ConfigError as exc:
-        message = f"cannot load the queue's settings to check effort levels: {exc}"
-        if json:
-            print(_json.dumps({"ok": False, "error": message}))
-        else:
-            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
-        raise typer.Exit(code=2) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, qd),
+        console,
+        json=json,
+        lead="cannot load the queue's settings to check effort levels",
+    )
 
     if order_by_dispatch:
         ordered_tasks = planned_dispatch_order(qd)
@@ -397,6 +398,79 @@ def list_states(
             console.print(f"  [dim]error:[/] {item['error']}")
 
 
+@app.command("holds")
+def holds(
+    *,
+    config: Path | None = typer.Option(
+        None, "--config", "-c", help="Per-queue claude_runner.toml."
+    ),
+    queue_dir: Path = typer.Option(
+        Path.cwd, "--queue", help="Queue directory.", show_default=CWD_DEFAULT_LABEL
+    ),
+    json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show what can start now and what holds the rest.
+
+    Runs the supervisor's own candidate selection once, read-only: no task
+    is parked or un-parked and no state file is written. The tasks in flight
+    are the ones ``supervisor.json`` records.
+
+    Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
+    (it starts as soon as an account has a free slot), ``held`` under the
+    category that holds it (``block_dispatch``, ``depends_on``,
+    ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
+    status such as ``possibly_hung``, ...), or ``completed``.
+    ``poll_interval_s`` is how often the supervisor runs this selection, and
+    ``queue_cap`` the queue-wide cap on tasks in flight now (the warm-up
+    cap while ``warming_up``), ``null`` when there is none.
+    """
+    console = Console()
+    qd = require_queue_option(queue_dir, console, json=json)
+    settings = load_settings(resolve_per_queue_config(config, qd))
+    state_path = persist_mod.supervisor_state_path(qd, settings.supervisor.state_file)
+    snapshot_error: str | None = None
+    try:
+        snapshot = persist_mod.load(state_path)
+    except persist_mod.SupervisorPersistenceError as exc:
+        snapshot, snapshot_error = None, str(exc)
+    in_flight_ids = {r.task_id for r in snapshot.in_flight} if snapshot is not None else set()
+    preview = orch_mod.preview_selection(
+        qd, settings, in_flight_ids=in_flight_ids, now=RealClock().now()
+    )
+    held = {k: n for k, n in sorted(preview.skips.items()) if k != "completed"}
+    by_status: dict[str, int] = {}
+    for status in preview.eligible_statuses.values():
+        by_status[status] = by_status.get(status, 0) + 1
+    payload: dict[str, object] = {
+        "eligible": {
+            "count": len(preview.eligible),
+            "task_ids": [t.id for t in preview.eligible],
+            "by_status": dict(sorted(by_status.items())),
+        },
+        "held": held,
+        "completed": preview.skips.get("completed", 0),
+        "todo_tasks": len(preview.eligible) + sum(preview.skips.values()),
+        "poll_interval_s": settings.usage.poll_interval_s,
+        "queue_cap": preview.queue_cap,
+        "warming_up": preview.warming_up,
+        "supervisor_json_error": snapshot_error,
+    }
+    if json:
+        print(_json.dumps(payload, indent=2))
+        return
+    console.print(f"[bold]eligible now:[/] {len(preview.eligible)}", highlight=False)
+    for task in preview.eligible:
+        console.print(f"  {task.id} ({preview.eligible_statuses[task.id]})", highlight=False)
+    for category, n in held.items():
+        console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
+    console.print(f"[bold]completed:[/] {payload['completed']}", highlight=False)
+    if snapshot_error:
+        console.print(
+            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
+            highlight=False,
+        )
+
+
 @app.command("show")
 def show_task(
     task_id: str = typer.Argument(..., help="Task ID (filename stem)."),
@@ -545,7 +619,7 @@ def add_task(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console)
 
     if not _ID_RE.match(task_id):
         console.print(f"[bold red]invalid task id:[/] {task_id!r} (allowed: {_ID_RE.pattern})")
@@ -680,7 +754,7 @@ def backfill_working_dir(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
 
     template = settings.queue.working_dir_template
     if not template.strip():
@@ -961,7 +1035,7 @@ def force_dispatch(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     queue_runtime_dir(qd)
 
     task_path = task_path_for(qd, task_id)

@@ -48,6 +48,7 @@ from claude_task_runner.supervisor.states import (
 from claude_task_runner.throttle.decision import Decision, decide
 from claude_task_runner.throttle.policy import ResolvedPolicy
 from claude_task_runner.usage.drift import (
+    AUTH_FAILURE_PREFIX,
     UsageApiAuthExpired,
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
@@ -266,7 +267,7 @@ def step(
             new_snap = snapshot.model_copy(
                 update={
                     "consecutive_clean_polls": 0,
-                    "last_drift_message": str(inp.reading),
+                    "last_drift_message": f"{AUTH_FAILURE_PREFIX}{inp.reading}",
                 }
             )
         else:
@@ -277,12 +278,12 @@ def step(
                 reading=None,
                 target_concurrency=None,
                 consecutive_clean_polls=0,
-                last_drift_message=str(inp.reading),
+                last_drift_message=f"{AUTH_FAILURE_PREFIX}{inp.reading}",
             )
             actions.append(
                 Notify(
                     level="error",
-                    message=f"OAuth bearer rejected: {inp.reading}",
+                    message=f"{AUTH_FAILURE_PREFIX}{inp.reading}",
                 )
             )
         actions.append(StopDispatch())

@@ -312,7 +312,7 @@ class AccountFileWatch:
                 continue
             self.logged[broken.name] = key
             logger.error(
-                "account %r takes no new tasks until its runner-account.toml loads: %s",
+                "account %r takes no new tasks until this is fixed: %s",
                 broken.name,
                 broken.error,
             )
@@ -324,9 +324,11 @@ class AccountFileWatch:
             if os.path.lexists(path):
                 logger.info("account %r takes tasks again: %s loads", name, path)
             else:
+                # Deleted, or never there: a config_dir that did not exist
+                # (a mount not up yet) and now does without the file.
                 logger.info(
-                    "account %r takes tasks again: %s is gone, so the defaults apply "
-                    "(max_concurrency = 1 and the queue's [dispatch_pct.*])",
+                    "account %r takes tasks again: %s does not exist, so the defaults "
+                    "apply (max_concurrency = 1 and the queue's [dispatch_pct.*])",
                     name,
                     path,
                 )
@@ -1581,9 +1583,13 @@ def _apply_sighup_reload(
 ) -> tuple[Settings, int]:
     """Apply a SIGHUP-triggered reload; return ``(new_settings, new_pending)``.
 
-    On any failure (TOML parse error, schema violation, OS error) we log
-    a warning and return ``(current, prior_pending)`` — the old config
-    stays active and the operator sees the failure in the journal.
+    On any failure (TOML parse error, a file that is not UTF-8 or cannot
+    be read, schema violation; all a :class:`ConfigError`) we log
+    an ERROR and return ``(current, prior_pending)`` — the old config
+    stays active and the operator sees the failure in the journal. The
+    edit the operator made is not in force, so it is an error, not a
+    warning. Account files are not checked here: they are re-read every
+    tick, and one that does not load disables only its account.
     The orchestrator rescans ``todo/`` on every tick already, so the
     only "rescan" work this function does is recount ``prior_pending``
     so the summary line can report how many new tasks appeared.
@@ -1591,14 +1597,9 @@ def _apply_sighup_reload(
     try:
         new_settings = load_settings(config_path)
     except ConfigError as exc:
-        logger.warning("SIGHUP received: reload failed (%s); keeping old config", exc)
-        return current, prior_pending
-    except OSError as exc:
-        logger.warning(
-            "SIGHUP received: cannot read %s (%s); keeping old config",
-            config_path,
-            exc,
-        )
+        # load_settings raises ConfigError for an unreadable or non-UTF-8
+        # file too, so nothing here can end the tick loop.
+        logger.error("SIGHUP received: reload failed (%s); keeping old config", exc)
         return current, prior_pending
 
     changes = _diff_settings(current, new_settings)

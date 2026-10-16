@@ -34,6 +34,7 @@ import logging
 import re
 from pathlib import Path
 
+from claude_task_runner.config.paths import TaskPathError, expand_task_path
 from claude_task_runner.queue.schema import Task
 
 logger = logging.getLogger(__name__)
@@ -45,18 +46,26 @@ slash, and hyphen. The negative lookbehind ``(?<![\\w])`` prevents
 matching mid-word slashes inside URLs or already-quoted strings."""
 
 
-def _normalize(path: Path) -> Path:
+def _normalize(task_id: str, path: Path, what: str) -> Path | None:
     """Return the resolved, absolute form for dedup comparisons.
 
     ``Path.resolve(strict=False)`` collapses ``..`` and symlinks where
     possible without raising on missing components. We don't need
     ``strict=True`` here because the existence check is a separate
-    step.
+    step. A path that cannot be expanded (a ``~user`` that names no
+    user, a NUL byte) is ``None`` with a warning naming it as ``what``:
+    like a missing path, it narrows the sandbox rather than failing the
+    dispatch.
     """
     try:
-        return path.expanduser().resolve(strict=False)
+        expanded = expand_task_path(path, what)
+    except TaskPathError as exc:
+        logger.warning("task %s: --add-dir skips an entry: %s", task_id, exc)
+        return None
+    try:
+        return expanded.resolve(strict=False)
     except OSError:
-        return path.expanduser().absolute()
+        return expanded.absolute()
 
 
 def _existing_dir(path: Path) -> bool:
@@ -101,16 +110,16 @@ def resolve_add_dirs(
        ``task.prompt`` that resolve to existing directories (in first-
        seen order, dedup'd against everything above).
 
-    Non-existent or non-directory paths in ``task.additional_dirs``
-    emit a warning and are skipped. Auto-detected non-matches are
+    Non-existent or non-directory paths in ``task.additional_dirs``,
+    and paths that cannot be expanded, emit a warning and are skipped. Auto-detected non-matches are
     silently skipped (the regex catches many strings that aren't
     real dirs; warning each would be noise).
     """
-    queue_norm = _normalize(queue_dir)
+    queue_norm = _normalize(task.id, queue_dir, "queue_dir")
     out: list[Path] = []
     seen_norm: set[Path] = set()
 
-    if _existing_dir(queue_norm):
+    if queue_norm is not None and _existing_dir(queue_norm):
         out.append(queue_norm)
         seen_norm.add(queue_norm)
     else:
@@ -121,8 +130,8 @@ def resolve_add_dirs(
         )
 
     for raw in task.additional_dirs:
-        norm = _normalize(raw)
-        if norm in seen_norm:
+        norm = _normalize(task.id, raw, "additional_dirs entry")
+        if norm is None or norm in seen_norm:
             continue
         if not _existing_dir(norm):
             logger.warning(
@@ -140,7 +149,8 @@ def resolve_add_dirs(
             # (e.g. ``/queue/papers/X/X.pdf``); the agent needs read
             # access to the *containing directory*. Walk up until we
             # hit an existing directory, then dedup.
-            walked = _walk_to_existing_dir(_normalize(candidate))
+            normalized = _normalize(task.id, candidate, "path in the prompt")
+            walked = None if normalized is None else _walk_to_existing_dir(normalized)
             if walked is None:
                 continue
             if walked in seen_norm:

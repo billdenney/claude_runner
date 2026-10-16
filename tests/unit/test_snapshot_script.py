@@ -44,6 +44,8 @@ from claude_task_runner.queue.schema import (
 from ._cli_on_path import (
     EMPTY_LISTING,
     LISTING_FAILURES,
+    account_list_call,
+    calls_in,
     make_bin,
     real_cli,
     run_script,
@@ -73,6 +75,12 @@ def queue(tmp_path: Path) -> Path:
 
 def _run(bin_dir: Path, *args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return run_script(SNAPSHOT, bin_dir, *args, cwd=cwd)
+
+
+def snapshot_calls(queue: Path) -> list[str]:
+    """The CLI calls one snapshot makes, sorted: it runs them side by side."""
+    holds = f"queue\nholds\n--queue\n{queue}\n--json\n--\n"
+    return sorted([account_list_call(queue), holds, sidecar_list_call(queue)])
 
 
 # ---------------------------------------------------------------------------
@@ -139,34 +147,20 @@ def test_directory_that_is_not_a_queue_exits_2_and_is_left_alone(
 # A queue whose supervisor has never run
 # ---------------------------------------------------------------------------
 
-FRESH_QUEUE_REPORT = """
-**Supervisor**: NOT RUNNING (no pidfile at {runtime}/supervisor.pid)
+IDLE_SECTION = "**Last idle report**\n\n_When the supervisor finds no task it can start, it logs one `no eligible tasks:` line counting what holds the unfinished tasks, and logs again only when those counts change; `eligible tasks available again:` ends such a spell. The line describes the queue at its own time, which may be long ago; What holds the tasks, above, is now._\n\nnot available: no supervisor is running to look up in the journal, and there is no supervisor.log in the queue\n\n"
+"""The section before **Open sidecars** on a queue with no supervisor and no log."""
 
-**supervisor.json**: missing at {runtime}/supervisor.json
+SIDECARS_EXPLAINED = "_Requests tasks have filed that still wait for your answer. One request can hold several questions; one with no questions is a notice to acknowledge. Answer them with /runner-answer-sidecar. A task keeps the status awaiting_sidecar after you answer, until it runs again, so that status alone does not mean a question is open._\n"
 
-
-**Queue counts**
-
-| field | value |
-|---|---|
-| state.pending | 0 |
-| state.running | 0 |
-| state.awaiting_sidecar | 0 |
-| state.deferred | 0 |
-| state.possibly_hung | 0 |
-| state.completed | 0 |
-| state.failed | 0 |
-| state.failed_circuit_breaker | 0 |
-| state.weekly_paused | 0 |
-| state files unreadable or without a status | 0 |
-| state files (total) | 0 |
-| todo/*.yaml | 2 |
-
-**Open sidecars**: 0 request(s), 0 unanswered question(s)
-
-(none)
-
-"""
+FRESH_QUEUE_REPORT = (
+    '\n### In plain words\n\n- **Supervisor:** not running.\n- **Accounts:**\n  - default: not taking tasks, because it has no recent usage reading.\n- **How many can run:** up to 1 at once (default 1; no queue-wide cap).\n- **Tasks:** 2 have task files that cannot be read; 0 finished.\n- **Questions for you:** none.\n\n**Not normal right now:**\n\n- The supervisor is not running, so no new tasks start and finished tasks are not recorded. Start it with `claude-task-runner supervisor start --queue {queue}`; a watchdog, if installed, restarts it within a few minutes.\n- Task files in todo/ that cannot be read: 2. `claude-task-runner doctor --queue {queue}` lists the files.\n\n### Details\n\n**Supervisor**: NOT RUNNING (no pidfile at {runtime}/supervisor.pid)\n\n_The supervisor is the background process that starts tasks, watches each account\'s usage and records progress. Nothing new starts while it is not running._\n\n**supervisor.json**: missing at {runtime}/supervisor.json\n\n**Accounts and concurrency** (from `claude-task-runner account list --json`)\n\n_Each account runs at most its own limit (`max_concurrency` in its runner-account.toml). "Allowed now" is what it may run at the moment: lower while it slows down to save its 5-hour allowance, 0 while it is throttled, paused, without a usage reading, or its settings file is broken. "In flight" means running now. "Resumes about" is when a weekly-throttled account\'s use falls back under plan. The queue ceiling is the most tasks the whole queue may run at once._\n\n| account | limit | allowed now | in flight | paused | resumes about | settings file | error |\n|---|---:|---:|---:|:-:|---|---|---|\n| default | 1 | 0 | 0 |  | — | — | — |\n\nQueue ceiling: 1 (accounts\' own limits: default 1 = 1; queue-wide cap [concurrency].max_concurrency: not set; warm-up cap [concurrency].initial_concurrency: not set; broken account files: none)\n\n**What holds the tasks** (from `claude-task-runner queue holds --json`)\n\n_The supervisor\'s own selection, run once without changing anything: every task in todo/ either can start as soon as an account has a free slot, is held for one reason, or is finished. A task that asked a question stays awaiting_sidecar until it runs again, so an answered one counts here as able to start._\n\n| category | tasks |\n|---|---:|\n| can start (none) | 0 |\n| unparseable_task | 2 |\n| completed | 0 |\n| todo/ tasks (total) | 2 |\n\n**Queue counts**\n\n_How many tasks the runner has a record of in each state, finished ones too. pending: not started yet; running: being worked on now; awaiting_sidecar: stopped to ask a question, and stays so until it runs again, so it may already be answered and waiting for a slot; deferred: on hold until a file appears, a retry time passes or a setting is fixed; possibly_hung: running but silent for a long time; completed: done; failed: failed once and will be retried; failed_circuit_breaker: failed repeatedly and will not be retried; weekly_paused: held by the weekly limit. todo/*.yaml counts the task files in todo/._\n\n| field | value |\n|---|---|\n| state.pending | 0 |\n| state.running | 0 |\n| state.awaiting_sidecar | 0 |\n| state.deferred | 0 |\n| state.possibly_hung | 0 |\n| state.completed | 0 |\n| state.failed | 0 |\n| state.failed_circuit_breaker | 0 |\n| state.weekly_paused | 0 |\n| state files unreadable or without a status | 0 |\n| state files (total) | 0 |\n| todo/*.yaml | 2 |\n\n'
+    + IDLE_SECTION
+    + "**Open sidecars**: 0 request(s), 0 unanswered question(s)\n\n"
+    + SIDECARS_EXPLAINED
+    + "\n(none)\n\n"
+)
+"""The whole report for a queue with only todo/: its two task files are not
+valid tasks (no title or prompt), which the selector reports as unreadable."""
 
 
 @pytest.mark.parametrize("pass_queue", [True, False], ids=["--queue", "working-directory"])
@@ -183,8 +177,8 @@ def test_fresh_queue_gets_the_whole_report(pass_queue: bool, queue: Path, bin_di
     assert (proc.returncode, proc.stderr) == (0, "")
     stamp, report = proc.stdout.split("\n", 1)
     assert re.fullmatch(r"## Queue status — \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", stamp)
-    assert report == FRESH_QUEUE_REPORT.format(runtime=queue / ".claude_task_runner")
-    assert log.read_text() == sidecar_list_call(queue)
+    assert report == FRESH_QUEUE_REPORT.format(queue=queue, runtime=queue / ".claude_task_runner")
+    assert calls_in(log) == snapshot_calls(queue)
 
 
 def test_queue_counts_have_a_row_for_every_status_and_add_up(queue: Path, bin_dir: Path) -> None:
@@ -246,13 +240,13 @@ def test_open_request_is_listed_with_its_outstanding_question(queue: Path, bin_d
     assert (proc.returncode, proc.stderr) == (0, "")
     assert proc.stdout.endswith(
         "\n**Open sidecars**: 1 request(s), 1 unanswered question(s)\n"
-        "\n"
+        "\n" + SIDECARS_EXPLAINED + "\n"
         "| task_id | sequence | outstanding | state |\n"
         "|---|---|---|---|\n"
         "| t-001 | 1 | encoding | unanswered |\n"
         "\n"
     )
-    assert log.read_text() == sidecar_list_call(queue)
+    assert calls_in(log) == snapshot_calls(queue)
 
 
 @pytest.mark.parametrize(("stdout", "stderr", "code", "why", "shown"), LISTING_FAILURES)
@@ -273,16 +267,13 @@ def test_sidecars_that_could_not_be_listed_are_never_reported_as_none(
     head, section = proc.stdout.split("**Open sidecars**", 1)
     assert section == f": could not list: {why}\n\n```\n{shown}\n```\n\n"
     # The report before the section is complete.
-    assert head.endswith("| todo/*.yaml | 0 |\n\n")
-    assert log.read_text() == sidecar_list_call(queue)
+    assert head.endswith("| todo/*.yaml | 0 |\n\n" + IDLE_SECTION)
+    assert calls_in(log) == snapshot_calls(queue)
 
 
 def test_cli_missing_from_path_is_could_not_list(queue: Path, bin_dir: Path) -> None:
     proc = _run(bin_dir, "--queue", str(queue), cwd=queue.parent)
     assert (proc.returncode, proc.stderr) == (1, INCOMPLETE)
     assert proc.stdout.endswith(
-        "| todo/*.yaml | 0 |\n"
-        "\n"
-        "**Open sidecars**: could not list: claude-task-runner is not on PATH\n"
-        "\n"
+        IDLE_SECTION + "**Open sidecars**: could not list: claude-task-runner is not on PATH\n\n"
     )

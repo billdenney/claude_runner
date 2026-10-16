@@ -26,6 +26,7 @@ from claude_task_runner.config.loader import (
     per_account_toml_path,
     resolve_accounts,
 )
+from claude_task_runner.config.paths import expand_config_dir
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
@@ -212,7 +213,8 @@ def check_accounts(settings: Settings) -> CheckResult:
         if not acct.config_dir:
             oks.append(f"{acct.name} (default ~/.claude)")
             continue
-        path = Path(acct.config_dir).expanduser()
+        # load_settings refused a config_dir that cannot be expanded.
+        path = expand_config_dir(acct.config_dir)
         if not path.exists():
             fails.append(
                 f"{acct.name}: CLAUDE_CONFIG_DIR does not exist: {path}\n"
@@ -324,8 +326,10 @@ def check_account_policies(settings: Settings) -> CheckResult:
     """Each account's ``<config_dir>/runner-account.toml`` parses; report resolved policy.
 
     Reads every account through :func:`config.loader.resolve_accounts`. A
-    missing file is informational (defaults apply); a file that exists
-    but does not load is FAIL, with the error. The detail string is a
+    ``config_dir`` that exists without the file means the defaults, and
+    says so. A file that does not load, and a ``config_dir`` that does not
+    exist, are FAIL, with the error: the supervisor gives that account no
+    new tasks, and refuses to start. The detail string is a
     one-line-per-account summary of resolved ``max_concurrency`` and
     band thresholds so the operator can verify what the supervisor
     will use.
@@ -371,7 +375,10 @@ def check_account_policies(settings: Settings) -> CheckResult:
         return CheckResult(
             name="account_policies",
             status=CheckStatus.FAIL,
-            detail=f"{len(fails)} of {len(settings.accounts)} per-account policies invalid",
+            detail=(
+                f"the runner-account.toml of {len(fails)} of {len(settings.accounts)} "
+                "accounts does not load"
+            ),
             remediation="\n".join(fails),
         )
     return CheckResult(

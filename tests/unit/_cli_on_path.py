@@ -36,9 +36,19 @@ def make_bin(tmp_path: Path) -> Path:
 
 
 def _log_calls(bin_dir: Path) -> tuple[Path, str]:
-    """Return the call log's path and a shell line that appends ``$@`` to it."""
+    """Return the call log's path and a shell line that appends ``$@`` to it.
+
+    The record is appended in one write, so calls a script runs side by side
+    do not interleave."""
     log = bin_dir.parent / "calls.log"
-    return log, f'printf "%s\\n" "$@" -- >> {shlex.quote(str(log))}\n'
+    return log, (
+        f'record="$(printf "%s\\n" "$@" --)"\nprintf "%s\\n" "$record" >> {shlex.quote(str(log))}\n'
+    )
+
+
+def calls_in(log: Path) -> list[str]:
+    """The calls in a call log, one string each, sorted."""
+    return sorted(f"{call}--\n" for call in log.read_text().split("--\n") if call)
 
 
 def real_cli(bin_dir: Path) -> Path:
@@ -96,6 +106,17 @@ EMPTY_LISTING = '{"sidecars": [], "n_open": 0, "n_outstanding_questions": 0}\n'
 def sidecar_list_call(queue: Path) -> str:
     """The call log after one ``sidecar list --queue <queue> --json``."""
     return f"sidecar\nlist\n--queue\n{queue}\n--json\n--\n"
+
+
+def account_list_call(queue: Path) -> str:
+    """The call log after one ``account list --queue <queue> --json``."""
+    return f"account\nlist\n--queue\n{queue}\n--json\n--\n"
+
+
+def stub_journalctl(bin_dir: Path, output: str = "") -> None:
+    """Install a ``journalctl`` that prints ``output`` whatever it is asked,
+    so a script's journal search sees no machine's real journal."""
+    _write_exe(bin_dir / "journalctl", f"printf %s {shlex.quote(output)}\n")
 
 
 _LIST = "`claude-task-runner sidecar list --json`"

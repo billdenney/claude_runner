@@ -9,8 +9,9 @@ documented in :mod:`claude_task_runner.worktree.reclaim`.
 
 Exit codes: 0 when the pass ran cleanly (kept worktrees are not an error);
 1 when a fetch, a git probe or a removal failed; 2 when the command could
-not run at all (not a queue directory, invalid config, unreadable
-``supervisor.json``).
+not run at all (not a queue directory, unreadable ``supervisor.json``). A
+queue config that does not load exits as ``supervisor start`` would: 78
+when its content is wrong, 1 when it could not be read for now.
 """
 
 from __future__ import annotations
@@ -19,9 +20,13 @@ import json as _json
 from pathlib import Path
 
 import typer
+from rich.console import Console
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
+    resolve_per_queue_config,
+)
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.worktree import reclaim as reclaim_mod
@@ -116,9 +121,11 @@ def reclaim(
     """
     try:
         qd = reclaim_mod.require_queue_dir(queue_dir)
-        settings = load_settings(resolve_per_queue_config(config, qd))
-    except (reclaim_mod.ReclaimError, ConfigError) as exc:
+    except reclaim_mod.ReclaimError as exc:
         raise _fail(str(exc), json=json) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, qd), Console(stderr=True), json=json
+    )
     try:
         in_flight = supervisor_in_flight(qd, settings)
     except persist_mod.SupervisorPersistenceError as exc:

@@ -1057,9 +1057,9 @@ class TestSourcesMatchCli:
             Mention(6, ("watchdog", "tick")),
             Mention(9, ("watchdog", "register")),
             Mention(10, ("watchdog", "unregister")),
-            Mention(16, ("supervisor", "start", "--queue", "...")),
-            Mention(35, ()),
-            Mention(40, ("watchdog", "tick")),
+            Mention(17, ("supervisor", "start", "--queue", "...")),
+            Mention(37, ()),
+            Mention(42, ("watchdog", "tick")),
         ]
 
     def test_scan_finds_the_fetch_all_invocations(self) -> None:

@@ -99,6 +99,14 @@ class WatchdogState(BaseModel):
     """The restarts since the supervisor last stayed up, oldest first,
     none older than 24 h (see :func:`decide`)."""
 
+    transient_config_since: datetime | None = None
+    """When the tick first found a configuration file (the queue TOML or an
+    account's ``runner-account.toml``) that cannot be read but may come
+    back, in the spell that is still going; ``None`` when there is no such
+    spell. ``watchdog tick`` reports the spell as a WARNING until
+    ``[watchdog].transient_config_escalation_s`` has passed, then as an
+    ERROR. Absent from a file written before the field existed."""
+
 
 RETIRED_STATE_KEYS = frozenset({"last_backoff_alerted_at"})
 """Keys a state file written by an older version may hold, which

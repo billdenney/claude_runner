@@ -24,13 +24,19 @@ from rich.markup import escape
 from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    broken_accounts_message,
+    load_settings_or_exit,
     queue_ceiling_json,
     queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings, resolve_accounts
+from claude_task_runner.config.loader import (
+    config_error_exit_status,
+    resolve_accounts,
+)
+from claude_task_runner.config.paths import ConfigDirError
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.store import (
     list_pending_tasks,
@@ -149,7 +155,14 @@ def _build_per_account_source(
     # don't need it (keeps the CLI startup graph slim).
     from claude_task_runner.usage.oauth_token_file import oauth_token_path
 
-    long_lived = oauth_token_path(config_dir).exists()
+    try:
+        long_lived = oauth_token_path(config_dir).exists()
+    except (ConfigDirError, OSError) as exc:
+        # The user behind a ~user config_dir was removed after the settings
+        # loaded, or the file cannot be checked: build the composite source,
+        # whose captures then fail for this account alone, loudly.
+        logger.warning("cannot check %s for a long-lived token: %s", config_dir, exc)
+        long_lived = False
 
     if mode == "tty":
         # Long-lived bearer + tty-only source: still build the TTY
@@ -258,10 +271,21 @@ def start(
       keep running with their already-built command-line; the new
       config applies to the NEXT dispatch. Malformed TOML is logged
       and the previous config stays active.
+
+    Refuses to start, before it touches the queue, when its
+    configuration does not load: ``claude_runner.toml``, or any
+    account's ``runner-account.toml``. It prints every such error and
+    exits 78 (``EX_CONFIG``) when the content is wrong, which the systemd
+    unit does not restart on, or 1 when every problem is a file or
+    directory that could not be read and may come back (a mount not up
+    yet), which systemd retries. Once it runs, an account file that
+    breaks disables only that account (ADR-0035).
     """
     console = Console()
     queue_path = require_queue_option(queue_dir, console)
-    settings = load_settings(resolve_per_queue_config(config, queue_path))
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path), console, lead="supervisor not started"
+    )
     # Re-apply logging settings now that the queue's [logging] block has
     # been read. The CLI entry point's early configure runs before Typer
     # parses arguments (so it can use env-var overrides) with safe
@@ -269,6 +293,11 @@ def start(
     # format. No-op when the settings happen to match the env-var
     # defaults.
     configure_logging(level=settings.logging.level, fmt=settings.logging.format)
+
+    resolution = resolve_accounts(settings)
+    if resolution.broken:
+        _say(console, broken_accounts_message(resolution), "bold red")
+        raise typer.Exit(code=config_error_exit_status(transient=resolution.only_transient))
 
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
@@ -377,18 +406,17 @@ def _default_drain_wait(config: Path | None, queue_path: Path, console: Console)
 
     Reads the queue's settings as ``supervisor start`` does: ``--config``,
     or ``<queue>/claude_runner.toml`` when it exists. When they do not
-    load, exits 2 before anything is signalled.
+    load, exits as ``supervisor start`` would (78, or 1 for a file that
+    may come back) before anything is signalled.
     """
-    try:
-        settings = load_settings(resolve_per_queue_config(config, queue_path))
-    except (ConfigError, OSError) as exc:
-        _say(
-            console,
-            f"cannot load the settings for the default --timeout: {exc}. "
-            "Pass --timeout <seconds>, or --no-wait, to drain without them.",
-            "bold red",
-        )
-        raise typer.Exit(code=2) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path),
+        console,
+        lead=(
+            "cannot load the settings for the default --timeout (pass --timeout "
+            "<seconds>, or --no-wait, to drain without them)"
+        ),
+    )
     cap = settings.task_caps.max_duration_s_per_task
     if cap == 0:
         return None
@@ -535,9 +563,10 @@ def drain(
     picks up the queue without double-dispatching anything.
 
     A drained supervisor exits 0, and under systemd it stays down. The
-    unit is ``Restart=on-failure`` with ``RestartPreventExitStatus=0``,
+    unit is ``Restart=on-failure`` with ``RestartPreventExitStatus=0 78``,
     so systemd restarts the supervisor only when it fails, never after
-    a clean exit. To restart under systemd without losing work, run
+    a clean exit (or a start refused for a configuration error, 78). To
+    restart under systemd without losing work, run
     ``systemctl --user restart claude-task-runner`` instead of
     ``drain``. It runs the unit's ``ExecStop`` and then starts a new
     supervisor. ``ExecStop`` is ``supervisor drain --no-wait`` only
@@ -557,19 +586,20 @@ def drain(
     With a cap of 0 it waits without limit. That default is the only
     thing drain reads the queue's settings for, so a
     ``claude_runner.toml`` that does not load stops only a waiting
-    drain without ``--timeout``, with exit 2 before anything is
-    signalled. Pass ``--timeout`` for a task whose override is longer
-    than the cap.
+    drain without ``--timeout``, before anything is signalled, with the
+    exit status ``supervisor start`` gives that config. Pass
+    ``--timeout`` for a task whose override is longer than the cap.
 
     \b
     Exit codes:
       0  supervisor exited (or --no-wait and signal delivered)
       1  no supervisor to signal: no PID file, one that holds no PID,
-         or a PID that is not alive
-      2  --queue is not an existing directory, the settings for the
-         default --timeout did not load, or signal delivery rejected
+         or a PID that is not alive; or the settings for the default
+         --timeout could not be read for now (the message says which)
+      2  --queue is not an existing directory, or signal delivery rejected
          (permission) or refused (a PID of 1 or less, or this command's own)
       4  --wait timed out (the supervisor is still draining)
+     78  the settings for the default --timeout have wrong content
     """
     console = Console()
     queue_path = require_queue_option(queue_dir, console)
@@ -599,7 +629,9 @@ def status(
     """Show the supervisor's current state and recent activity."""
     console = Console()
     queue_path = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, queue_path))
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path), console, json=json
+    )
     state_path = persist_mod.supervisor_state_path(queue_path, settings.supervisor.state_file)
     pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
 

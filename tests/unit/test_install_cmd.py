@@ -25,7 +25,7 @@ from claude_task_runner.cli.install_cmd import (
     _watchdog_script_path,
     app,
 )
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, load_settings
 from claude_task_runner.config.schema import WatchdogSettings
 from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.cron.registry import (
@@ -990,9 +990,9 @@ def test_install_systemd_value_the_schema_rejects_fails_before_writing(
     (queue / "claude_runner.toml").write_text(f"[{table}]\n{key} = {value}\n", encoding="utf-8")
     with _systemd_install_patched() as mock_apply:
         result = runner.invoke(app, ["--yes", "--queue", str(queue)])
-    assert result.exit_code == 1
-    assert isinstance(result.exception, ConfigError)
-    assert f"{table}.{key}" in str(result.exception)
+    assert result.exit_code == CONFIG_ERROR_EXIT_STATUS
+    assert result.stdout.startswith("not installed: Settings validation failed:")
+    assert f"{table}.{key}" in result.stdout
     mock_apply.assert_not_called()
 
 

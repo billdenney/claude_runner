@@ -34,6 +34,7 @@ RUN_BY: dict[str, str] = {
     f"{MERGE_SKILL}/verify_register_placement.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/verify_section_headers.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/verify_vignettes_parallel.R": "test_merge_skill_scripts.py",
+    "src/claude_task_runner/skills/runner-status/report.py": "test_runner_status_summary.py",
     "src/claude_task_runner/skills/runner-status/snapshot.sh": "test_snapshot_per_account.py",
 }
 

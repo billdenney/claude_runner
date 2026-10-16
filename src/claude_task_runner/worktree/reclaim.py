@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from claude_task_runner.config.paths import TaskPathError, expand_task_path
 from claude_task_runner.config.schema import WorktreeReclaimSettings
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -539,7 +540,12 @@ def _task_entries(
         found_in[task.id] = directory
         if task.working_dir is None:
             continue
-        working_dir = task.working_dir.expanduser()
+        try:
+            working_dir = expand_task_path(task.working_dir, "working_dir")
+        except TaskPathError as exc:
+            # Its worktree cannot be found, so it is kept.
+            logger.error("worktree reclaim: skipping task %s: %s", task.id, exc)
+            continue
         if not working_dir.is_absolute():
             logger.warning(
                 "worktree reclaim: task %s has a relative working_dir %s; skipped",
@@ -547,8 +553,9 @@ def _task_entries(
                 working_dir,
             )
             continue
+        # An absolute path has no leading "~" to expand.
         inside = (
-            _inside(d.expanduser() if d.is_absolute() else working_dir / d, working_dir)
+            _inside(d if d.is_absolute() else working_dir / d, working_dir)
             for d in task.deliverable_paths
         )
         entries.append(
@@ -565,7 +572,10 @@ def _lock_path(queue_dir: Path, settings: WorktreeReclaimSettings) -> Path | Non
     raw = settings.lock_file.strip()
     if not raw:
         return None
-    path = Path(raw).expanduser()
+    try:
+        path = expand_task_path(raw, "[worktree_reclaim].lock_file")
+    except TaskPathError as exc:
+        raise ReclaimError(str(exc)) from exc
     return path if path.is_absolute() else queue_dir / path
 
 

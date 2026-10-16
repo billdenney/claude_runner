@@ -17,7 +17,7 @@ import logging
 import threading
 from collections import Counter
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,24 +31,11 @@ from claude_task_runner.config.schema import (
     AccountPolicy,
     ResolvedAccount,
 )
-from claude_task_runner.queue.schema import (
-    CURRENT_SCHEMA_VERSION,
-    SidecarAnswer,
-    SidecarOption,
-    SidecarQuestion,
-    SidecarRequest,
-    SidecarResponse,
-    Task,
-    TaskState,
-)
-from claude_task_runner.queue.sidecar import write_response
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
     state_path_for,
     task_path_for,
     todo_dir,
-    write_state_atomic,
-    write_task_atomic,
 )
 from claude_task_runner.runner import orchestrator as orchestrator_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
@@ -63,11 +50,18 @@ from claude_task_runner.supervisor.states import (
 from claude_task_runner.usage.models import UsageReading, WindowReading
 from claude_task_runner.usage.source import FakeUsageSource
 
-from ._sidecar_files import write_request
+from ._mixed_queue import (
+    BLOCK_FILE,
+    MIXED_EXPECTED_ELIGIBLE,
+    MIXED_EXPECTED_SKIPS,
+    NOW,
+    add_state,
+    add_task,
+    build_mixed_queue,
+)
+from ._sidecar_files import make_request, write_request
 
 ORCHESTRATOR_LOGGER = "claude_task_runner.runner.orchestrator"
-NOW = datetime(2026, 10, 14, 12, 0, 0, tzinfo=UTC)
-BLOCK_FILE = "needs_acquisition.jsonl"
 
 _eligible_candidates = functools.partial(
     orchestrator_mod._eligible_candidates, effort_levels=load_defaults()["effort_levels"]
@@ -81,153 +75,6 @@ def queue_dir(tmp_path: Path) -> Path:
     queue_runtime_dir(qd)
     todo_dir(qd)
     return qd
-
-
-# --- queue builders -----------------------------------------------------
-
-
-def _task(qd: Path, task_id: str, **fields: Any) -> Task:
-    task = Task.model_validate(
-        {"id": task_id, "title": f"Task {task_id}", "prompt": "do the thing", **fields}
-    )
-    write_task_atomic(task, task_path_for(qd, task_id))
-    return task
-
-
-def _state(qd: Path, task_id: str, status: str, **fields: Any) -> None:
-    state = TaskState.model_validate({"task_id": task_id, "status": status, **fields})
-    write_state_atomic(state, state_path_for(qd, task_id))
-
-
-def _request(task_id: str, seq: int = 1) -> SidecarRequest:
-    return SidecarRequest(
-        schema_version=CURRENT_SCHEMA_VERSION,
-        task_id=task_id,
-        sequence=seq,
-        created_at=datetime(2026, 10, 1, tzinfo=UTC),
-        summary="placeholder",
-        context="placeholder",
-        questions=[
-            SidecarQuestion(
-                id="q1",
-                prompt="proceed?",
-                options=[
-                    SidecarOption(value="A", label="yes", description=""),
-                    SidecarOption(value="B", label="no", description=""),
-                ],
-                recommended="A",
-                multi_select=False,
-            )
-        ],
-    )
-
-
-def _response(task_id: str, seq: int = 1) -> SidecarResponse:
-    return SidecarResponse(
-        schema_version=CURRENT_SCHEMA_VERSION,
-        task_id=task_id,
-        sequence=seq,
-        responded_at=datetime(2026, 10, 2, tzinfo=UTC),
-        answers=[SidecarAnswer(id="q1", value="A")],
-        notes="",
-    )
-
-
-def _build_mixed_queue(qd: Path, missing_file: Path) -> None:
-    """One task per way the selector can hold a task, plus completed and
-    eligible ones. ``missing_file`` is an absolute path that does not exist,
-    so two copies of this queue write identical readiness reasons."""
-    (todo_dir(qd) / "broken.yaml").write_text("not: valid: yaml: [\n", encoding="utf-8")
-
-    # block_dispatch row; the second id's task is completed, so it counts
-    # as completed rather than held.
-    _task(qd, "blocked")
-    _task(qd, "blocked-done")
-    _state(qd, "blocked-done", "completed")
-    (qd / BLOCK_FILE).write_text(
-        '{"task": "blocked", "block_dispatch": true}\n'
-        '{"task": "blocked-done", "block_dispatch": true}\n',
-        encoding="utf-8",
-    )
-
-    _task(qd, "inflight")
-
-    _task(qd, "corrupt-state")
-    state_path_for(qd, "corrupt-state").write_text("not yaml: ][[", encoding="utf-8")
-
-    _task(qd, "sidecar-open")
-    _state(qd, "sidecar-open", "awaiting_sidecar")
-    write_request(qd, _request("sidecar-open"))
-
-    _task(qd, "cooldown")
-    _state(
-        qd,
-        "cooldown",
-        "deferred",
-        deferred_reason="pre-dispatch hook deferred (exit 1): waiting",
-        next_eligible_at=NOW + timedelta(days=365),
-    )
-
-    for status in ("running", "possibly_hung", "failed_circuit_breaker", "weekly_paused"):
-        _task(qd, f"status-{status}")
-        _state(qd, f"status-{status}", status)
-
-    _task(qd, "done")
-    _state(qd, "done", "completed")
-
-    _task(qd, "bad-effort", model="claude-sonnet-4-6", effort="max")
-
-    _task(qd, "waits-on-upstream", depends_on=["never-finishes"])
-
-    _task(qd, "needs-file", requires=[{"kind": "file", "path": str(missing_file)}])
-
-    _task(qd, "needs-answer", requires=[{"kind": "sidecar_response"}])
-    write_request(qd, _request("needs-answer"))
-
-    _task(
-        qd,
-        "needs-both",
-        requires=[{"kind": "sidecar_response"}, {"kind": "file", "path": str(missing_file)}],
-    )
-    write_request(qd, _request("needs-both"))
-
-    # Eligible: no state, a deferral past its cooldown, an answered sidecar.
-    _task(qd, "ready")
-    _task(qd, "cooldown-over")
-    _state(
-        qd,
-        "cooldown-over",
-        "deferred",
-        deferred_reason="pre-dispatch hook deferred (exit 1): waiting",
-        next_eligible_at=NOW - timedelta(minutes=1),
-    )
-    _task(qd, "sidecar-answered")
-    _state(qd, "sidecar-answered", "awaiting_sidecar")
-    write_request(qd, _request("sidecar-answered"))
-    write_response(qd, _response("sidecar-answered"))
-
-
-MIXED_EXPECTED_SKIPS = Counter(
-    {
-        "unparseable_task": 1,
-        "block_dispatch": 1,
-        "in_flight": 1,
-        "unparseable_state": 1,
-        "unanswered_sidecar": 1,
-        "deferred_cooldown": 1,
-        "running": 1,
-        "possibly_hung": 1,
-        "failed_circuit_breaker": 1,
-        "weekly_paused": 1,
-        "invalid_effort": 1,
-        "depends_on": 1,
-        "readiness_missing_file": 1,
-        "readiness_awaiting_sidecar_response": 1,
-        "readiness_awaiting_sidecar_response+missing_file": 1,
-        "completed": 2,
-    }
-)
-MIXED_EXPECTED_ELIGIBLE = ["cooldown-over", "ready", "sidecar-answered"]
 
 
 def _in_flight(task_id: str) -> dict[str, DispatchSlot]:
@@ -257,7 +104,7 @@ def _select(qd: Path, skips: Counter[str] | None) -> list[str]:
 
 
 def test_every_hold_category_is_counted_exactly(queue_dir: Path, tmp_path: Path) -> None:
-    _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
+    build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
     skips: Counter[str] = Counter()
 
     assert _select(queue_dir, skips) == MIXED_EXPECTED_ELIGIBLE
@@ -268,7 +115,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
     """Returned tasks plus counted skips account for every YAML in todo/.
 
     A skip that records no category makes the sum fall short."""
-    _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
+    build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
     skips: Counter[str] = Counter()
 
     eligible = _select(queue_dir, skips)
@@ -281,7 +128,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
 def test_breakdown_is_stable_across_ticks(queue_dir: Path, tmp_path: Path) -> None:
     """The first pass parks held tasks as deferred; the second pass must
     still put each under the gate that holds it, not under the park."""
-    _build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
+    build_mixed_queue(queue_dir, tmp_path / "absent" / "paper.md")
     _select(queue_dir, Counter())
     skips: Counter[str] = Counter()
 
@@ -299,7 +146,7 @@ def test_counting_skips_has_no_side_effects(tmp_path: Path) -> None:
         qd.mkdir()
         queue_runtime_dir(qd)
         todo_dir(qd)
-        _build_mixed_queue(qd, missing)
+        build_mixed_queue(qd, missing)
 
     assert _select(without, None) == _select(with_skips, Counter())
 
@@ -310,13 +157,68 @@ def test_counting_skips_has_no_side_effects(tmp_path: Path) -> None:
     assert set(states(without)) >= {"needs-file.yaml", "bad-effort.yaml"}
 
 
+def _queue_copy(root: Path, missing: Path) -> Path:
+    root.mkdir()
+    queue_runtime_dir(root)
+    todo_dir(root)
+    build_mixed_queue(root, missing)
+    (root / "claude_runner.toml").write_text(
+        f'[dispatch]\ndispatch_block_file = "{BLOCK_FILE}"\n', encoding="utf-8"
+    )
+    return root
+
+
+def _state_bytes(qd: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in state_path_for(qd, "x").parent.glob("*.yaml")}
+
+
+def test_preview_is_the_selector_without_its_side_effects(tmp_path: Path) -> None:
+    """``preview_selection`` admits and counts exactly what a supervisor
+    tick's selection does, and writes nothing. The tick's pass, on a second
+    copy of the queue, does park tasks, so the comparison can tell."""
+    missing = tmp_path / "absent" / "paper.md"
+    previewed = _queue_copy(tmp_path / "previewed", missing)
+    ticked = _queue_copy(tmp_path / "ticked", missing)
+    before = _state_bytes(previewed)
+
+    preview = orchestrator_mod.preview_selection(
+        previewed,
+        load_settings(previewed / "claude_runner.toml"),
+        in_flight_ids={"inflight"},
+        now=NOW,
+    )
+    skips: Counter[str] = Counter()
+    ticked_ids = sorted(
+        t.id
+        for t in _eligible_candidates(
+            ticked,
+            _in_flight("inflight"),
+            {"blocked-done", "done"},
+            now=NOW,
+            block_file=BLOCK_FILE,
+            skips=skips,
+        )
+    )
+
+    assert [t.id for t in preview.eligible] == ticked_ids == MIXED_EXPECTED_ELIGIBLE
+    assert preview.skips == skips == MIXED_EXPECTED_SKIPS
+    assert preview.eligible_statuses == {
+        "cooldown-over": "deferred",
+        "ready": "new",
+        "sidecar-answered": "awaiting_sidecar",
+    }
+    assert (preview.queue_cap, preview.warming_up) == (None, False)
+    assert _state_bytes(previewed) == before
+    assert _state_bytes(ticked) != before
+
+
 def test_completed_whichever_check_skips_it(queue_dir: Path) -> None:
     """A completed task the block-list or the in-flight set skips first is
     still reported as completed, never as held."""
-    _task(queue_dir, "blocked-done")
-    _task(queue_dir, "inflight-done")
+    add_task(queue_dir, "blocked-done")
+    add_task(queue_dir, "inflight-done")
     for tid in ("blocked-done", "inflight-done"):
-        _state(queue_dir, tid, "completed")
+        add_state(queue_dir, tid, "completed")
     (queue_dir / BLOCK_FILE).write_text(
         '{"task": "blocked-done", "block_dispatch": true}\n', encoding="utf-8"
     )
@@ -337,14 +239,14 @@ def test_completed_whichever_check_skips_it(queue_dir: Path) -> None:
 
 def test_readiness_category_ignores_requires_order(queue_dir: Path, tmp_path: Path) -> None:
     missing = str(tmp_path / "absent.md")
-    _task(
+    add_task(
         queue_dir, "a", requires=[{"kind": "file", "path": missing}, {"kind": "sidecar_response"}]
     )
-    _task(
+    add_task(
         queue_dir, "b", requires=[{"kind": "sidecar_response"}, {"kind": "file", "path": missing}]
     )
-    write_request(queue_dir, _request("a"))
-    write_request(queue_dir, _request("b"))
+    write_request(queue_dir, make_request("a"))
+    write_request(queue_dir, make_request("b"))
     skips: Counter[str] = Counter()
 
     assert _eligible_candidates(queue_dir, {}, set(), now=NOW, skips=skips) == []
@@ -465,7 +367,7 @@ def test_logs_on_entry_change_and_recovery_only(
 ) -> None:
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
-    _task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_task(queue_dir, "waits", depends_on=["never-finishes"])
 
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [
@@ -477,8 +379,8 @@ def test_logs_on_entry_change_and_recovery_only(
     assert _idle_lines(caplog) == []
 
     # Breakdown changes: logged again.
-    _task(queue_dir, "later")
-    _state(queue_dir, "later", "deferred", next_eligible_at=NOW + timedelta(hours=1))
+    add_task(queue_dir, "later")
+    add_state(queue_dir, "later", "deferred", next_eligible_at=NOW + timedelta(hours=1))
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [
         (
@@ -490,7 +392,7 @@ def test_logs_on_entry_change_and_recovery_only(
     assert _idle_lines(caplog) == []
 
     # A candidate appears: one recovery line, and it is dispatched.
-    _task(queue_dir, "ready")
+    add_task(queue_dir, "ready")
     slots = _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [(logging.INFO, "eligible tasks available again: 1")]
     assert list(slots) == ["ready"]
@@ -515,8 +417,8 @@ def test_completed_tasks_change_nothing_in_the_line(
 ) -> None:
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
-    _task(queue_dir, "done-1")
-    _state(queue_dir, "done-1", "completed")
+    add_task(queue_dir, "done-1")
+    add_state(queue_dir, "done-1", "completed")
 
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [
@@ -524,8 +426,8 @@ def test_completed_tasks_change_nothing_in_the_line(
     ]
 
     # Another task completes: the unfinished breakdown is unchanged.
-    _task(queue_dir, "done-2")
-    _state(queue_dir, "done-2", "completed")
+    add_task(queue_dir, "done-2")
+    add_state(queue_dir, "done-2", "completed")
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == []
 
@@ -558,7 +460,7 @@ def test_silent_when_no_account_can_dispatch(
 ) -> None:
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
-    _task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_task(queue_dir, "waits", depends_on=["never-finishes"])
 
     _tick(queue_dir, idle_log, snapshot=_snapshot(SupervisorState.THROTTLED_WEEKLY))
 
@@ -571,7 +473,7 @@ def test_silent_when_every_slot_is_taken(
 ) -> None:
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
-    _task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_task(queue_dir, "waits", depends_on=["never-finishes"])
     release = threading.Event()
     busy = threading.Thread(target=release.wait)
     busy.start()
@@ -622,7 +524,7 @@ def test_supervisor_logs_a_drained_queue_once(
     summary once: the daemon passes the same IdleDispatchLog every tick."""
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     monkeypatch.setattr(daemon_mod, "sleep_for_next_poll", lambda **kw: None)
-    _task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_task(queue_dir, "waits", depends_on=["never-finishes"])
 
     start_daemon(
         queue_dir=queue_dir,
