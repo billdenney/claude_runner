@@ -102,10 +102,10 @@ def read_long_lived_token(config_dir: str) -> str | None:
     one stat + small read).
     """
     path = oauth_token_path(config_dir)
-    if not path.exists():
-        return None
     try:
         text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
     except OSError as exc:
         logger.warning("could not read long-lived OAuth token file %s: %s", path, exc)
         return None

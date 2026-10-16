@@ -1014,6 +1014,10 @@ def force_dispatch(
       blocks until the attempt finishes. ``--over-limit`` is implied
       (no in-flight slots to conflict with) and ignored.
 
+    A ``deferred`` task can be forced, skipping its cooldown: once the
+    cause of ``cannot start the worker: ...`` is fixed, say. When the
+    worker still cannot be started, both paths print why.
+
     Exits non-zero if the task YAML is missing from ``todo/``, if its
     current status is not dispatchable (``running``,
     ``awaiting_sidecar``, ``completed``, ``failed_circuit_breaker``,
@@ -1052,7 +1056,7 @@ def force_dispatch(
             current_status = load_state(state_path).status
         except (QueueIOError, QueueSchemaError):
             current_status = None
-    if current_status not in (None, "pending", "failed"):
+    if current_status not in fd_mod.FORCE_DISPATCHABLE:
         msg = f"task {task_id} status={current_status!r} is not dispatchable"
         if json:
             print(_json.dumps({"ok": False, "error": msg, "status": current_status}))
@@ -1084,6 +1088,7 @@ def force_dispatch(
         raise typer.Exit(code=2)
 
     if _supervisor_is_alive(qd):
+        requested_at = RealClock().now()
         path = fd_mod.write_request(qd, task_id, allow_over_limit=over_limit)
         if not json:
             console.print(
@@ -1092,12 +1097,16 @@ def force_dispatch(
                 f"(allow_over_limit={over_limit}).[/]"
             )
         picked_up = _poll_until_running(qd, task_id, wait_seconds)
+        not_started = (
+            None if picked_up else fd_mod.unstarted_reason(qd, task_id, since=requested_at)
+        )
         payload = {
             "ok": True,
             "mode": "supervised",
             "request_path": str(path),
             "running": picked_up,
             "allow_over_limit": over_limit,
+            "deferred_reason": not_started,
         }
         if json:
             print(_json.dumps(payload))
@@ -1107,7 +1116,14 @@ def force_dispatch(
             # The supervisor deletes the request both when it dispatches the
             # task and when it drops the request, so only a file still on
             # disk means the request is waiting.
-            if path.exists():
+            if not_started is not None:
+                msg = (
+                    f"task {task_id} was dispatched, but its worker could not be "
+                    f"started, so it is deferred again: {not_started}. Fix that, then "
+                    "force-dispatch it again; the supervisor also retries it once its "
+                    "cooldown has passed."
+                )
+            elif path.exists():
                 msg = (
                     f"task {task_id} still not running after {wait_seconds}s — "
                     "the queue's concurrency ceiling may be full. The request "
@@ -1150,6 +1166,9 @@ def force_dispatch(
                     "status": new_state.status,
                     "attempts": new_state.attempts,
                     "stop_reason": new_state.stop_reason,
+                    "deferred_reason": new_state.deferred_reason
+                    if new_state.status == "deferred"
+                    else None,
                 }
             )
         )
@@ -1159,6 +1178,15 @@ def force_dispatch(
         f"[{color}]task {task_id} finished with status={new_state.status}"
         f", attempts={new_state.attempts}, stop_reason={new_state.stop_reason}[/]"
     )
+    if new_state.status == "deferred" and new_state.deferred_reason:
+        console.print(
+            f"deferred: {new_state.deferred_reason}",
+            style=color,
+            markup=False,
+            emoji=False,
+            highlight=False,
+            soft_wrap=True,
+        )
 
 
 def _poll_until_running(queue_dir: Path, task_id: str, wait_seconds: float) -> bool:

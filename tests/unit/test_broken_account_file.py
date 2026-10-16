@@ -18,8 +18,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pydantic
 import pytest
@@ -81,7 +83,7 @@ from ._concurrency_fixtures import (
 BAD_TOML = "max_concurrency 5\n"
 """Not TOML: a key with no ``=``."""
 
-WAIT = " takes no tasks until its runner-account.toml loads: "
+WAIT = " takes no tasks until this is fixed: "
 """How a decline names an account whose file does not load."""
 
 PARSE_ERROR = "Expected '=' after a key in a key/value pair (at line 1, column 17)"
@@ -284,6 +286,60 @@ class TestResolveAccounts:
         assert resolution.only_transient is False
 
 
+class TestLinuxUser:
+    """An account whose ``linux_user`` needs ``sudo`` while ``sudo`` is not on
+    PATH cannot start a worker, so it is a broken account like one whose file
+    does not load: it takes no tasks, and ``supervisor start`` refuses."""
+
+    def _with_linux_user(self, settings: Settings, name: str, linux_user: str) -> Settings:
+        return settings.model_copy(
+            update={
+                "accounts": [
+                    a.model_copy(update={"linux_user": linux_user}) if a.name == name else a
+                    for a in settings.accounts
+                ]
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("linux_user", "sudo", "broken"),
+        [
+            ("bill-work", None, True),
+            ("bill-work", "/usr/bin/sudo", False),
+            ("bill", None, False),
+        ],
+        ids=["another-user-no-sudo", "another-user-sudo", "own-user-no-sudo"],
+    )
+    def test_resolve_accounts(
+        self,
+        tmp_path: Path,
+        two_accounts: dict[str, Path],
+        linux_user: str,
+        sudo: str | None,
+        broken: bool,
+    ) -> None:
+        settings = self._with_linux_user(
+            queue_toml(tmp_path / "q.toml", two_accounts), "work", linux_user
+        )
+        with (
+            patch("claude_task_runner.config.linux_user.current_username", return_value="bill"),
+            patch("claude_task_runner.config.linux_user.shutil.which", return_value=sudo),
+        ):
+            resolution = resolve_accounts(settings)
+        if broken:
+            assert resolution.broken == (
+                BrokenAccount(
+                    name="work",
+                    path=str(two_accounts["work"] / PER_ACCOUNT_TOML_NAME),
+                    error="linux_user='bill-work' requested but sudo not on PATH",
+                ),
+            )
+            assert [a.name for a in resolution.accounts] == ["personal"]
+        else:
+            assert resolution.broken == ()
+            assert [a.name for a in resolution.accounts] == ["personal", "work"]
+
+
 # ---------------------------------------------------------------------------
 # AccountFileWatch: the ERROR and INFO lines
 # ---------------------------------------------------------------------------
@@ -376,8 +432,7 @@ class TestAccountFileWatch:
         assert _messages(caplog, logging.ERROR) == [
             _error_line("personal", personal),
             _error_line("work", work),
-            "no account's runner-account.toml loads (personal, work): nothing is "
-            "dispatched until one is fixed",
+            "no account can take tasks (personal, work): nothing is dispatched until one is fixed",
         ]
 
     def test_no_account_loading_is_said_again_after_one_loaded(
@@ -394,8 +449,7 @@ class TestAccountFileWatch:
             watch.observe(self._resolve(tmp_path, two_accounts))
             watch.observe(self._resolve(tmp_path, two_accounts))
         assert [m for m in _messages(caplog, logging.ERROR) if m.startswith("no account")] == [
-            "no account's runner-account.toml loads (personal, work): nothing is "
-            "dispatched until one is fixed"
+            "no account can take tasks (personal, work): nothing is dispatched until one is fixed"
         ] * 2
 
     def test_a_deleted_file_says_the_defaults_apply(
@@ -566,6 +620,37 @@ class TestDispatch:
             assert in_flight_by_account(slots) == {"personal": 5, "work": 3}
             held.release(slots)
 
+    @pytest.mark.parametrize("problem", ["config-dir-removed", "no-sudo-for-linux-user"])
+    def test_an_account_that_cannot_start_a_worker_gets_no_tasks(
+        self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path], problem: str
+    ) -> None:
+        """The account is left out when tasks are routed, so tasks go to the
+        other account instead of each being parked on this one."""
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        if problem == "config-dir-removed":
+            shutil.rmtree(two_accounts["personal"])
+        else:
+            settings = settings.model_copy(
+                update={
+                    "accounts": [
+                        a.model_copy(update={"linux_user": "bill-personal"})
+                        if a.name == "personal"
+                        else a
+                        for a in settings.accounts
+                    ]
+                }
+            )
+        make_tasks(queue_dir, 10)
+        slots: dict[str, DispatchSlot] = {}
+        with (
+            patch("claude_task_runner.config.linux_user.current_username", return_value="bill"),
+            patch("claude_task_runner.config.linux_user.shutil.which", return_value=None),
+            HeldDispatches() as held,
+        ):
+            dispatch_tick(queue_dir, settings, slots)
+            assert in_flight_by_account(slots) == {"work": 3}
+            held.release(slots)
+
     def test_a_task_whose_session_is_on_a_broken_account_waits_and_says_why(
         self,
         tmp_path: Path,
@@ -635,7 +720,7 @@ class TestDispatch:
         )
         assert choice.account is None
         assert choice.reason == (
-            "no eligible account: personal: its runner-account.toml does not load; "
+            "no eligible account: personal: takes no tasks until its error is fixed; "
             "work: at capacity (3/3)"
         )
         assert str(path) not in choice.reason
@@ -737,7 +822,7 @@ class TestForceDispatch:
         assert n == 0
         assert fd_mod.request_path(queue_dir, "t00").exists()
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
-            "force-dispatch t00: no account's runner-account.toml loads; leaving request"
+            "force-dispatch t00: no account can take tasks; leaving request"
         ]
 
     def test_the_synchronous_path_refuses_with_the_error(
@@ -773,13 +858,12 @@ class TestSupervisor:
             run_daemon(qd, config, pending_count_fn=lambda: 0, install_signal_handlers=False)
         assert _messages(caplog, logging.ERROR) == [
             _error_line("default", path),
-            "no account's runner-account.toml loads (default): nothing is dispatched "
-            "until one is fixed",
+            "no account can take tasks (default): nothing is dispatched until one is fixed",
         ]
         assert not any("tick_dispatch failed" in r.getMessage() for r in caplog.records)
         assert (
             "concurrency ceiling: 0, the sum of the accounts' max_concurrency (none); "
-            "not counted until its runner-account.toml loads: default"
+            "not counted until fixed: default"
         ) in _messages(caplog, logging.INFO)
         snap = persist_mod.load(persist_mod.supervisor_state_path(qd))
         assert snap is not None
@@ -843,7 +927,7 @@ class TestCli:
         assert result.stdout.count("max_concurrency: ") == 1
         assert (
             "queue ceiling: 3, the sum of the accounts' max_concurrency (work 3); "
-            "not counted until its runner-account.toml loads: personal\n"
+            "not counted until fixed: personal\n"
         ) in result.stdout
 
     def test_account_list_json_marks_the_broken_account_and_exits_1(
@@ -889,7 +973,7 @@ class TestCli:
         assert f"Account error:    personal: {_invalid_toml(path)}\n" in text.stdout
         assert (
             "Queue ceiling:    3, the sum of the accounts' max_concurrency (work 3); "
-            "not counted until its runner-account.toml loads: personal\n"
+            "not counted until fixed: personal\n"
         ) in text.stdout
         as_json = invoke_cli(["supervisor", "status", "--queue", str(queue_dir), "--json"])
         assert as_json.exit_code == 0, as_json.output
@@ -905,7 +989,7 @@ class TestDoctor:
         path = _break(two_accounts["personal"])
         result = check_account_policies(queue_toml(tmp_path / "q.toml", two_accounts))
         assert result.status is CheckStatus.FAIL
-        assert result.detail == "the runner-account.toml of 1 of 2 accounts does not load"
+        assert result.detail == "1 of 2 accounts cannot take tasks"
         assert result.remediation == f"personal: {_invalid_toml(path)}"
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")

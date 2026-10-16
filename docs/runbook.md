@@ -54,14 +54,21 @@ events, and they don't count as readings, so after
 `[usage].max_reading_age_s` (600 s by default) the account stops taking
 tasks. Other causes: the supervisor was down for longer than the limit, or
 `[[accounts]]` changed and only a SIGHUP followed. A reload doesn't rebuild
-the usage source, so an account added that way is never read.
+the usage source, so an account added that way is never read. With
+`[usage].source = "api_then_tty"`, an account with a long-lived token
+(`<config_dir>/oauth-token`, ADR-0021) is read through the API alone, the
+only account of a one-account queue included: a revoked token shows as
+failed readings rather than falling back to `claude /usage`.
 
 **Steps:**
 1. Set `[logging].level = "DEBUG"` and look for `usage_capture_error`
    events.
 2. Capture as that account by hand: `CLAUDE_CONFIG_DIR=<its config_dir>
-   claude /usage`. On a single-account queue,
-   `claude-task-runner usage healthcheck` does the same.
+   claude /usage`, or `claude-task-runner usage --config
+   <queue>/claude_runner.toml --account <name> healthcheck` (on a
+   one-account queue `--account` can be left out). Both read the
+   account's own `config_dir`, as the supervisor does; `[claude].config_dir`
+   counts only when the queue declares no `[[accounts]]`.
 3. Fix what the capture shows (login, network, the config directory). The
    account leaves `no_reading` at its next clean capture. Meanwhile
    `claude-task-runner queue force-dispatch <task_id>` bypasses this check,
@@ -112,21 +119,24 @@ Before a first task completes in the queue, a set
 ## An account file is broken
 
 A broken account file is fatal when the supervisor starts and non-fatal
-while it runs (ADR-0035, amendment of 2026-10-16).
+while it runs (ADR-0035, amendment of 2026-10-16). The same holds for an
+account whose `linux_user` needs `sudo` while `sudo` is not on PATH: no
+worker could start for it.
 
 **Symptom at start:** The supervisor does not start. `supervisor start`
-prints every account whose file does not load:
+prints every account that cannot take tasks:
 
 ```
-supervisor not started: the runner-account.toml of 1 account does not load:
+supervisor not started: 1 account cannot take tasks:
   work: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
-Fix each file, or delete it for the defaults, then start the supervisor again. Once the supervisor runs, a file that breaks only stops new tasks on its account.
+Fix each one (a runner-account.toml can also be deleted for the defaults), then start the supervisor again. Once the supervisor runs, a problem like this only stops new tasks on its account.
 ```
 
 It exits 78 when the content or the path is wrong, which only a fix helps:
 a parse or validation error, an empty file, `[throttle.*]`, a directory
 where the file belongs, a symlink loop, a name too long, a path through
-something that is not a directory. Under
+something that is not a directory, a FIFO or device where the file
+belongs, a `linux_user` that needs a missing `sudo`. Under
 systemd, `systemctl --user status claude-task-runner` then shows the unit
 `failed` with `status=78`, the message is in `journalctl --user -u
 claude-task-runner`, and the unit is not restarted (its
@@ -140,8 +150,8 @@ retries that, up to `StartLimitBurst`, so a late mount recovers by itself.
 
 Under the cron watchdog, `~/.claude_task_runner/watchdog.log` has, in
 place of the verdict line when a restart is due, `watchdog: ERROR
-queue=... the runner-account.toml of N account(s) does not load, so its
-supervisor was not restarted: ...`, the tick exits 1, and no restart is
+queue=... N account(s) cannot take tasks, so its supervisor was not
+restarted: ...`, the tick exits 1, and no restart is
 counted. For the kind that may clear up, the line is a WARNING ending
 `this may clear up by itself, and the next tick tries again`, and the tick
 exits 0, until the problem has lasted
@@ -179,9 +189,9 @@ for that account (with `--json`, in that row's `policy_error`) and exits 1;
 output with `"ok": false` is an error instead of a listing, since exit 1
 also means the queue TOML could not be read for now. `supervisor status`
 prints it as
-`Account error:`; `doctor` fails `account_policies`. When no account's file
-loads, the log also says `no account's runner-account.toml loads (...):
-nothing is dispatched until one is fixed`. If a user named by a `~user`
+`Account error:`; `doctor` fails `account_policies`. When no account can
+take tasks, the log also says `no account can take tasks (...): nothing is
+dispatched until one is fixed`. If a user named by a `~user`
 `config_dir` is removed while the supervisor runs, the supervisor reports
 that account the same way, but the commands that reload the queue TOML
 (`account list`, `supervisor status`, `doctor`) refuse it with exit 78, as
@@ -192,7 +202,9 @@ cannot be read, is empty (zero bytes, often a save that was cut short), is
 a symlink to a file that does not exist, is not TOML, still has a
 `[throttle.*]` table, or sets a value the schema rejects (a
 `max_concurrency` of 0, an unknown key); or the `config_dir` itself does
-not exist. The supervisor does not guess a policy for it (ADR-0035): while
+not exist or cannot be searched; or the account's `linux_user` needs `sudo`
+and `sudo` is not on PATH. The supervisor does not guess a policy for it
+(ADR-0035): while
 it runs, the account takes no new tasks, its running tasks finish as
 usual, and it adds nothing to the queue's concurrency ceiling. Only a
 `config_dir` that exists without the file means the defaults.
@@ -386,6 +398,18 @@ task that does not run.
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
      `next_eligible_at` printed below the reason has passed, the supervisor
      tries the task again and runs the hook again.
+   - `cannot start the worker:` — the supervisor could not start `claude`
+     for the task: the `claude` binary is not on PATH, the account's
+     `config_dir` does not exist or names an unknown `~user`, `sudo` is
+     missing for the account's `linux_user`, or the task's `working_dir`
+     cannot be expanded or does not exist (the pre-dispatch hook did not
+     create it). The supervisor log has the same text as an ERROR, `task
+     <id>: cannot start the worker: ...; deferred, next try in N s`, and
+     the stop reason is `worker_start_deferred`. No attempt is counted and
+     the circuit breaker is not fed. Fix the cause; the supervisor tries
+     again once `next_eligible_at` has passed
+     (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
+     default), and the task runs.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.

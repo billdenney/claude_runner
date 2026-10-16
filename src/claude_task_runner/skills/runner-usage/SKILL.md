@@ -43,7 +43,10 @@ For "/runner-format-check" / "did the parser break?" prompts:
 1. Run `claude-task-runner usage healthcheck`. Exit codes signal:
    - `0` clean
    - `1` parse drift (TUI layout changed)
-   - `2` capture timeout (claude didn't respond)
+   - `2` capture timeout (claude didn't respond), or a usage error:
+     with `--config` for a queue of several accounts, `--account` is
+     missing or names no account (the output says `Invalid value for
+     '--account'`)
    - `3` spawn error (claude binary missing)
 
    With `--config`, every `usage` command loads that TOML first. When
@@ -69,12 +72,19 @@ about whose usage is being shown, run
 (team / pro / max20 / etc.) and the welcome panel's org label so the
 user can confirm.
 
+`usage` reads one account. With `--config <queue>/claude_runner.toml`
+that is the queue's only `[[accounts]]` entry; a queue of several needs
+`--account <name>` before the subcommand (`usage --config ... --account
+work whoami`), and without it the command stops with a usage error
+(exit 2) naming the accounts.
+
 ## Settings to know
 
-- `[claude].config_dir` selects which Claude config directory's
-  credentials are used — empty means `~/.claude` (default account);
-  set to a path like `/home/bill/.claude_personal` to read a separate
-  account.
+- Each `[[accounts]]` entry's `config_dir` selects whose credentials
+  are used, for the supervisor's polls and for `usage`. With no
+  `[[accounts]]`, the legacy `[claude].config_dir` does (empty means
+  `~/.claude`); once `[[accounts]]` is declared, `[claude].config_dir`
+  is ignored.
 - `[usage].capture_post_data_pad_ms` (default 4000) is how long we
   wait after the placeholder for the OAuth response to land. If the
   user reports stale numbers, suggest bumping this.

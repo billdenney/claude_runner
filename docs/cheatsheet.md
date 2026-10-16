@@ -15,7 +15,7 @@ links to the decision log under [decisions/](decisions/) explain the
 | Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` (counts per question, not per file — see `n_outstanding_questions`) |
 | Supervisor log (throttle / drift notices) | `journalctl --user -f -u claude-task-runner` under the systemd unit, or `tail -F <queue>/.claude_task_runner/supervisor.log` when the cron watchdog started the supervisor (see [where the log goes](architecture.md#supervisor-log-and-drift-evidence)) |
 | Parser drift | `claude-task-runner supervisor status` shows state `error_drift` and a `Last drift:` line; with the TTY usage source the capture that failed to parse is the newest `<queue>/.claude_task_runner/usage_captures/<ts>.cap` |
-| Usage capture failures (timeout / spawn) | Not logged at the default INFO level; set `[logging].level = "DEBUG"` to log `usage_capture_error` events, or reproduce with `claude-task-runner usage healthcheck` (exit 2 = timeout, 3 = spawn error) |
+| Usage capture failures (timeout / spawn) | Not logged at the default INFO level; set `[logging].level = "DEBUG"` to log `usage_capture_error` events, or reproduce with `claude-task-runner usage healthcheck` (exit 2 = timeout, or a usage error such as a queue of several accounts without `--account`; 3 = spawn error) |
 
 ## Configuration precedence
 

@@ -99,11 +99,31 @@ class ForceDispatchRequest:
     allow_over_limit: bool = False
 
 
-# A task in any of these states (or with no state file at all) is
-# eligible to be force-dispatched. Anything else means the supervisor
-# (or the dispatcher) is already operating on the task, and we refuse
-# to overlap.
-_FORCE_DISPATCHABLE = frozenset({None, "pending", "failed"})
+FORCE_DISPATCHABLE = frozenset({None, "pending", "failed", "deferred"})
+"""The statuses a task may have (``None``: no state file) to be
+force-dispatched. Anything else means the supervisor (or the dispatcher)
+is already operating on the task, or it is finished, and a force would
+overlap. A ``deferred`` task is accepted, skipping its cooldown: that is
+how an operator retries one at once after fixing what parked it, such as
+a worker that could not be started."""
+
+
+def unstarted_reason(queue_dir: Path, task_id: str, *, since: datetime) -> str | None:
+    """Why a dispatch at or after ``since`` could not start ``task_id``'s
+    worker (its ``deferred_reason``), or ``None`` when none did."""
+    try:
+        state = _load_state_or_none(queue_dir, task_id)
+    except ForceDispatchError:
+        return None
+    if (
+        state is None
+        or state.status != "deferred"
+        or state.stop_reason != dispatcher_mod.UNSTARTABLE_STOP_REASON
+        or state.last_finished_at is None
+        or state.last_finished_at < since
+    ):
+        return None
+    return state.deferred_reason
 
 
 def force_dispatch_dir(queue_dir: Path) -> Path:
@@ -287,8 +307,8 @@ def _pick_account(
         if affined in broken:
             return _AccountPick(
                 None,
-                f"session host account {affined!r} takes no tasks until its "
-                f"runner-account.toml loads: {broken[affined].error}",
+                f"session host account {affined!r} takes no tasks until this is fixed: "
+                f"{broken[affined].error}",
             )
         if affined not in by_name:
             return _AccountPick(
@@ -301,13 +321,13 @@ def _pick_account(
     if task.account is not None and task.account in broken:
         return _AccountPick(
             None,
-            f"pinned account {task.account!r} takes no tasks until its "
-            f"runner-account.toml loads: {broken[task.account].error}",
+            f"pinned account {task.account!r} takes no tasks until this is fixed: "
+            f"{broken[task.account].error}",
         )
     if task.account is not None and task.account in by_name:
         return _AccountPick(by_name[task.account])
     if not by_name:
-        return _AccountPick(None, "no account's runner-account.toml loads")
+        return _AccountPick(None, "no account can take tasks")
     in_flight = list(in_flight)
     for acct in by_name.values():
         if account_in_flight_count(acct.name, in_flight) < acct.policy.concurrency.max_concurrency:
@@ -390,7 +410,7 @@ def tick_consume(
             )
             continue
         status = state.status if state is not None else None
-        if status not in _FORCE_DISPATCHABLE:
+        if status not in FORCE_DISPATCHABLE:
             logger.warning(
                 "force-dispatch %s: status %s is not dispatchable; dropping request",
                 task.id,
@@ -472,8 +492,9 @@ def tick_consume(
         #      the next dispatch starts a fresh session.
         #   2. Task.account pinning when present and known.
         #   3. First configured account (fallback).
-        #   An account whose runner-account.toml does not load takes no
-        #   tasks, forced or not (ADR-0035): a request bound to one waits.
+        #   An account that cannot take tasks (a runner-account.toml that
+        #   does not load, say) takes none, forced or not (ADR-0035): a
+        #   request bound to one waits.
         affined = state.session_host_account() if state is not None else None
         pick = _pick_account(task, affined, resolution, to_in_flight_records(in_flight_slots))
         if pick.account is None:
@@ -584,7 +605,7 @@ def dispatch_synchronously(
         raise ForceDispatchError(f"cannot parse task {task_id}: {exc}") from exc
 
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
-    if state.status not in _FORCE_DISPATCHABLE:
+    if state.status not in FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
 
     # ADR-0010, same reasoning as tick_consume: force overrides the throttle,

@@ -330,12 +330,16 @@ miss; a supervisor that does not start is not. The split is now:
     pins both statuses, and `test_cli_settings_gate.py` fails on any other
     `load_settings` call under `cli/` except `watchdog tick`'s, which logs
     instead (below).
-  - A `<queue>/claude_runner.toml` symlink whose target does not exist (or
-    that loops) is loaded, and so reported, instead of being passed over
-    for the package defaults, whose default account is `~/.claude`.
+  - Anything at `<queue>/claude_runner.toml` is loaded, and so reported,
+    instead of being passed over for the package defaults, whose default
+    account is `~/.claude`: a symlink whose target does not exist (exit
+    1), one that loops, a directory, a FIFO, a device or a socket (78).
+    Both loaders open a configuration file without blocking and check it
+    is a regular file before reading it, so a FIFO with no writer cannot
+    hang a command or the supervisor's tick.
 - **Unknown `~user`.** `config.schema.AccountSettings`, and
-  `ClaudeSettings` for `[claude].config_dir` whenever it is set (the usage
-  source of a queue with at most one account reads it), refuse a
+  `ClaudeSettings` for `[claude].config_dir` whenever it is set (with no
+  `[[accounts]]` it is the `default` account's), refuse a
   `config_dir` whose leading `~user` names no user, so the queue TOML does
   not load: start exits 78 naming the account, and a SIGHUP reload carrying
   one is rejected and the old config kept. A rejected reload, for this or
@@ -347,18 +351,64 @@ miss; a supervisor that does not start is not. The split is now:
   are not a `config_dir`. Each caller that can meet a user removed while
   the supervisor runs turns the error into its own (an account broken in
   `resolve_accounts`, a usage capture spawn error, missing API
-  credentials, a dispatch error, a warning in the usage source builder),
+  credentials, a task parked as `cannot start the worker`, a warning in
+  the usage source builder),
   so that fails that account and cannot end the tick loop. A `config_dir`
   holding a NUL byte is refused the same way, at load and later.
 - **Every other path from a task or the settings.** `expand_task_path`
   in the same module raises `TaskPathError` for a task's `working_dir`
   or `additional_dirs` entry and for `[worktree_reclaim].lock_file`. A
-  dispatch whose `working_dir` cannot be expanded fails that task with a
-  `DispatchError`; `--add-dir` skips such an entry with a WARNING, as it
+  dispatch whose `working_dir` cannot be expanded parks that task (next
+  bullet); `--add-dir` skips such an entry with a WARNING, as it
   skips a missing one; a reclaim pass skips such a task with an ERROR and
   keeps its worktree; and the queue TOML refuses such a `lock_file`. The
   gate on `expanduser` (`test_expanduser_gate.py`) now allows no site
   outside `config/paths.py`, counting aliases and uncalled references.
+- **A worker that cannot be started parks its task.** `dispatch` checks
+  everything that can stop `claude` from starting before it writes the
+  `running` state: the binary on PATH and the account's
+  `CLAUDE_CONFIG_DIR` (expandable, present and searchable) and `sudo` for
+  a `linux_user` before the pre-dispatch hook runs, then the task's
+  `working_dir` (expandable). A failure of any kind (an `OSError` such as
+  a parent that denies access included), or anything raised while the
+  attempt's log files are opened or `Popen` starts the worker after that
+  write, parks the task `deferred`
+  from the state it had before, with `deferred_reason` `cannot start the
+  worker: ...`, stop reason `worker_start_deferred`, an ERROR in the
+  log, and `next_eligible_at` one `deferral_recheck_cooldown_s` away,
+  the helper the pre-dispatch hook's exit 1 uses (ADR-0026). Not
+  `failed`: the cause is configuration, a fix clears it, and counting it
+  toward the circuit breaker would leave the task
+  `failed_circuit_breaker` for the operator to reset after the fix. No
+  attempt is counted, and the session (`session_id`, `session_account`,
+  `resume_attempts`) is kept, so the try after the fix resumes it.
+  `queue force-dispatch` accepts a `deferred` task, for a retry before
+  the cooldown once the cause is fixed. Before, the task stayed
+  `running` with no pid
+  (the exception ended only the dispatch thread) until the silent
+  reaper made it `possibly_hung`, which nothing dispatches again.
+- **Every account read uses the account's own `config_dir`.** The
+  supervisor's usage source for a one-account queue read
+  `[claude].config_dir`, so a queue whose single `[[accounts]]` entry
+  named a `config_dir` but left that field empty polled `~/.claude`, and
+  throttled on another account's numbers. It is now built like each
+  account's of several, from that account (long-lived token rule
+  included). The `usage` commands read the queue's only account, or the
+  one `--account` names; a queue of several without `--account` is a
+  usage error, never a guess. With no `[[accounts]]` the loader's
+  `default` account carries `[claude].config_dir`, so a legacy TOML reads
+  what it always did.
+- **An account that cannot start a worker is a broken account.** Besides
+  a `runner-account.toml` that does not load (or a `config_dir` that does
+  not exist or cannot be searched), `resolve_accounts` reports an account
+  whose `linux_user` needs `sudo` while `sudo` is not on PATH
+  (`config.linux_user.sudo_problem`), a content error. So routing leaves
+  such an account out, and `supervisor start` refuses it, instead of each
+  task routed to it being parked one by one. The messages that named the
+  file now say the account "cannot take tasks" (a refused start prints
+  `1 account cannot take tasks:`; a decline, `takes no tasks until this
+  is fixed:`), and the error says why. `dispatch` checks the account again, before the
+  pre-dispatch hook, for one that breaks between routing and the dispatch.
 - **What is content though it may be passing.** Two errors are classed as
   content (78) although a retry could succeed. A `~user` looked up through
   NSS (LDAP, SSSD) before the directory service answers at boot raises

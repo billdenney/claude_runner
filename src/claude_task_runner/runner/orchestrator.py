@@ -310,7 +310,8 @@ def tick_dispatch(
         # imports schema; schema is consumed by the rest of the codebase.
         from claude_task_runner.config.loader import resolve_accounts
 
-        # An account whose runner-account.toml does not load is left out,
+        # An account that cannot take tasks (a runner-account.toml that does
+        # not load, a linux_user that cannot be reached) is left out,
         # so it takes no tasks; the daemon logs it (ADR-0035). Its error
         # goes to choose_account so a decline names it.
         resolution = resolve_accounts(settings)
@@ -1085,12 +1086,13 @@ def _skip_category(
                 # A deferred task becomes dispatchable again once its
                 # ``next_eligible_at`` passes, whoever wrote it: the
                 # pre-dispatch hook (exit 1 — e.g. an input awaiting
-                # operator re-acquisition or a pending trim) or an
-                # operator by hand. Re-dispatch re-runs the hook: if the
-                # input is ready it proceeds, otherwise the dispatcher
-                # re-parks it with a fresh cooldown. The cooldown is what
-                # keeps a still-blocked task from being re-picked every
-                # tick.
+                # operator re-acquisition or a pending trim), the
+                # dispatcher for a worker it could not start
+                # (``worker_start_deferred``), or an operator by hand.
+                # Re-dispatch re-runs the hook and the checks: if they
+                # pass it proceeds, otherwise the dispatcher re-parks it
+                # with a fresh cooldown. The cooldown is what keeps a
+                # still-blocked task from being re-picked every tick.
                 if (
                     now is not None
                     and state.next_eligible_at is not None

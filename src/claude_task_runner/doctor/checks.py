@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from claude_task_runner.config.linux_user import current_username
 from claude_task_runner.config.loader import (
     ConfigError,
     per_account_toml_path,
@@ -303,23 +304,14 @@ def _looks_like_legacy_default(acct: object, legacy_config_dir: str) -> bool:
 
 
 def _current_username() -> str:
-    """Return the supervisor's own Linux username; empty if unknown.
+    """The supervisor's own Linux username; empty if unknown.
 
-    Best-effort: the username is only used to render advisory text in
-    ``check_account_sudo`` (the suggested sudoers snippet) and to skip
-    same-user sudo probes. A lookup failure (no ``pwd`` module on a
-    non-POSIX host, an unmapped uid in a container) must not abort the
-    doctor run, so we fall back to an empty string. The failure is
-    logged at DEBUG so an operator chasing a "<unknown>" in the sudo
-    remediation can see why.
+    Only renders advisory text in ``check_account_sudo`` (the suggested
+    sudoers snippet) and skips same-user sudo probes, so a failed lookup
+    must not abort the doctor run: :func:`config.linux_user.current_username`
+    returns an empty string and logs why at DEBUG.
     """
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception as exc:
-        logger.debug("could not resolve current username: %s", exc)
-        return ""
+    return current_username()
 
 
 def check_account_policies(settings: Settings) -> CheckResult:
@@ -375,10 +367,7 @@ def check_account_policies(settings: Settings) -> CheckResult:
         return CheckResult(
             name="account_policies",
             status=CheckStatus.FAIL,
-            detail=(
-                f"the runner-account.toml of {len(fails)} of {len(settings.accounts)} "
-                "accounts does not load"
-            ),
+            detail=f"{len(fails)} of {len(settings.accounts)} accounts cannot take tasks",
             remediation="\n".join(fails),
         )
     return CheckResult(

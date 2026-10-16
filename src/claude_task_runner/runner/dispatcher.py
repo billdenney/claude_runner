@@ -57,7 +57,8 @@ from typing import IO
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
-from claude_task_runner.config.paths import ConfigDirError, TaskPathError, expand_config_dir
+from claude_task_runner.config.linux_user import current_username as _resolve_self_user
+from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
@@ -704,23 +705,6 @@ def _boot_time() -> datetime | None:
             except (ValueError, OverflowError, OSError):
                 return None
     return None
-
-
-def _resolve_self_user() -> str:
-    """Return the supervisor's own Linux username; empty string on lookup failure.
-
-    Mirrored from :mod:`doctor.checks._current_username`. The
-    dispatcher uses it to decide whether ``linux_user`` requires a
-    sudo prefix: if the configured target equals the supervisor's
-    own user, no sudo is needed and we spawn directly.
-    """
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception as exc:
-        logger.debug("self-user lookup failed (%s); treating as unknown", exc)
-        return ""
 
 
 def _build_run_record(
@@ -1550,6 +1534,11 @@ def dispatch(
     * Writes pre-run state with ``status="running"``.
     * Writes post-run state with appended :class:`RunRecord`, updated
       ``status``, and refreshed ``session_id``.
+    * When the worker cannot be started (no ``claude`` binary,
+      :func:`_account_spawn`'s and :func:`_task_spawn`'s checks, or opening the log files or
+      ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
+      it was, and returns that outcome (:func:`_defer_unstartable`); no
+      attempt is counted.
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
@@ -1572,8 +1561,28 @@ def dispatch(
     that, and after the supervisor has closed it a daemon thread starts
     no worker. ``None`` (callers outside the supervisor) skips it.
     """
+    # A worker that cannot be started parks the task (_defer_unstartable):
+    # the checks run before the ``running`` write below, and a process that
+    # fails to start after it replaces that write, so no task is left
+    # ``running`` with no worker.
+    unstartable = _UnstartableContext(
+        task=task,
+        state=state,
+        plan=plan,
+        queue_dir=queue_dir,
+        clock=clock,
+        persist_state=persist_state,
+        settings_failure_classifier=settings_failure_classifier,
+        account=account,
+    )
     if shutil.which(claude_executable) is None:
-        raise DispatchError(f"claude binary not found: {claude_executable}")
+        return _defer_unstartable(unstartable, f"claude binary not found: {claude_executable}")
+    # The account's checks run before the pre-dispatch hook, so an account
+    # that cannot start a worker does not run the hook for every task.
+    try:
+        spawn_env, sudo_prefix = _account_spawn(claude_config_dir, linux_user)
+    except Exception as exc:
+        return _defer_unstartable(unstartable, _start_error(exc))
 
     # Pre-dispatch hook. Run with cwd=queue_dir (or None), NOT
     # task.working_dir: the hook's job is often to *create*
@@ -1639,6 +1648,19 @@ def dispatch(
     # restart (ADR-0025) can apply the same gates.
     pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
 
+    try:
+        argv, resolved_add_dirs = _task_spawn(
+            task,
+            plan,
+            queue_dir,
+            settings_dispatch=settings_dispatch,
+            claude_executable=claude_executable,
+            claude_config_dir=claude_config_dir,
+            sudo_prefix=sudo_prefix,
+        )
+    except Exception as exc:
+        return _defer_unstartable(unstartable, _start_error(exc))
+
     started_at = clock.now()
     new_state = state.model_copy(
         update={
@@ -1651,22 +1673,6 @@ def dispatch(
     if persist_state:
         write_state_atomic(new_state, state_path_for(queue_dir, task.id))
 
-    # Resolve --add-dir scope: queue dir is always added; per-task
-    # additional_dirs are merged in; prompt auto-detect is opt-in.
-    auto_detect = (
-        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
-    )
-    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
-        task,
-        queue_dir,
-        auto_detect=auto_detect,
-    )
-    argv = build_argv(
-        task,
-        plan,
-        claude_executable=claude_executable,
-        add_dirs=resolved_add_dirs,
-    )
     logger.info(
         "[dispatch] task_id=%s model=%s effort=%s attempt=%d add_dirs=%s",
         task.id,
@@ -1675,88 +1681,6 @@ def dispatch(
         new_state.attempts,
         _truncate_paths_for_log(resolved_add_dirs),
     )
-
-    # Build the subprocess env. When `claude_config_dir` is set (per-queue
-    # config selects a non-default Claude account, e.g. ~/.claude_personal),
-    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
-    # subprocess reads the same credentials the supervisor's /usage capture
-    # uses. Without this, the supervisor sees personal-account utilization
-    # while every dispatched task hits the default ~/.claude account --
-    # which may be at a different / depleted quota.
-    #
-    # PR 14: when the account is on a long-lived OAuth token (file at
-    # `<config_dir>/oauth-token`, produced by `claude setup-token`),
-    # also export `CLAUDE_CODE_OAUTH_TOKEN` so the CLI bypasses
-    # `.credentials.json` and uses the long-lived bearer instead. This
-    # is the same env-var contract documented for GitHub Actions; the
-    # CLI honours it as the auth source when present. The file lookup
-    # is shared with `ApiUsageSource` (PR 14) so the supervisor's
-    # usage capture and the dispatched subprocess always agree on which
-    # token is in use for an account.
-    spawn_env: dict[str, str] | None = None
-    if claude_config_dir:
-        try:
-            config_path = expand_config_dir(claude_config_dir)
-        except ConfigDirError as exc:
-            raise DispatchError(str(exc)) from exc
-        if not config_path.exists():
-            raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
-        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
-        # Local import — keeps `oauth_token_file` out of the dispatcher's
-        # cold-start path for single-account / pre-PR-14 deployments.
-        from claude_task_runner.usage.oauth_token_file import read_long_lived_token
-
-        long_lived = read_long_lived_token(claude_config_dir)
-        if long_lived is not None:
-            spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
-
-    # Multi-Linux-user dispatch: when the resolved account has a
-    # `linux_user` set and it differs from the supervisor's own user,
-    # wrap argv with `sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=...`.
-    # The doctor's check_account_sudo runs `sudo -n -u <linux_user>
-    # /bin/true` as a precondition at startup, so we don't re-check
-    # here; -n keeps a misconfigured run from hanging on a password
-    # prompt. ENV inheritance across sudo's user transition needs the
-    # explicit ``env`` wrapper because sudo defaults strip the
-    # supervisor's environment from the target's session.
-    if linux_user and _resolve_self_user() != linux_user:
-        sudo_path = shutil.which("sudo")
-        if sudo_path is None:
-            raise DispatchError(f"linux_user={linux_user!r} requested but sudo not on PATH")
-        env_pairs: list[str] = []
-        if spawn_env is not None:
-            env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
-            # PR 14: propagate the long-lived OAuth token across the
-            # sudo boundary too — sudo's default env_reset would strip
-            # CLAUDE_CODE_OAUTH_TOKEN. Without this the per-account
-            # token would only affect the supervisor's own dispatches,
-            # not the multi-Linux-user spawn (PR 3) target shells.
-            if "CLAUDE_CODE_OAUTH_TOKEN" in spawn_env:
-                env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
-        # Propagate explicit env via `env` so sudo's default
-        # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
-        prefix: list[str] = [sudo_path, "-n", "-u", linux_user]
-        if env_pairs:
-            prefix.extend(["env", *env_pairs])
-        argv = [*prefix, *argv]
-        # Once the subprocess transitions to <linux_user>, the
-        # supervisor's own env stops mattering — the env=... arg to
-        # Popen below would only apply to the sudo invocation itself.
-        # Clear it so we don't fight the sudo prefix.
-        spawn_env = None
-
-    # Pre-trust the task's working_dir (and mark onboarding complete) in the
-    # target .claude.json. Idempotent — only writes when a flag changes.
-    # ``--print`` mode doesn't paint the TUI trust prompt, but the trust
-    # state is still consulted; without this entry a fresh config_dir can
-    # bounce the dispatch on first use.
-    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
-
-    _trust_dir = task.working_dir if task.working_dir else Path.cwd()
-    try:
-        _ensure_claude_init(claude_config_dir or None, _trust_dir)
-    except TaskPathError as exc:
-        raise DispatchError(f"task {task.id}: {exc}") from exc
 
     # ADR-0025: file-backed output. When adoption is on (and we have a
     # state YAML to record the log path on), redirect the worker's
@@ -1812,6 +1736,13 @@ def dispatch(
             # git/Rscript). Without this the children survive as orphans.
             start_new_session=True,
         )
+    except Exception as exc:
+        # No worker started: a working_dir that is not there, a log file
+        # that cannot be opened (OSError), an argument Popen refuses
+        # (ValueError). The deferral replaces the ``running`` write.
+        if spawn_gate is not None:
+            spawn_gate.leave(task.id)
+        return _defer_unstartable(unstartable, _start_error(exc))
     except BaseException:
         # No worker started, so there is no pid to wait for.
         if spawn_gate is not None:
@@ -2703,6 +2634,146 @@ def _finalize_state(
     return new_state, run
 
 
+def _account_spawn(
+    claude_config_dir: str, linux_user: str | None
+) -> tuple[dict[str, str] | None, list[str]]:
+    """The worker's environment (``None``: the supervisor's) and the
+    ``sudo`` prefix of its command line (empty: none), for its account.
+
+    Raises :class:`DispatchError` when the account cannot start a worker:
+    its ``CLAUDE_CONFIG_DIR`` cannot be expanded, does not exist or cannot
+    be checked, or its ``linux_user`` needs ``sudo`` and it is not on
+    PATH. :func:`config.loader.resolve_accounts` already keeps such an
+    account from being chosen; this is the check at the moment of the
+    dispatch. :func:`dispatch` makes it before the pre-dispatch hook runs.
+    """
+    # Build the subprocess env. When `claude_config_dir` is set (per-queue
+    # config selects a non-default Claude account, e.g. ~/.claude_personal),
+    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
+    # subprocess reads the same credentials the supervisor's /usage capture
+    # uses. Without this, the supervisor sees personal-account utilization
+    # while every dispatched task hits the default ~/.claude account --
+    # which may be at a different / depleted quota.
+    #
+    # PR 14: when the account is on a long-lived OAuth token (file at
+    # `<config_dir>/oauth-token`, produced by `claude setup-token`),
+    # also export `CLAUDE_CODE_OAUTH_TOKEN` so the CLI bypasses
+    # `.credentials.json` and uses the long-lived bearer instead. This
+    # is the same env-var contract documented for GitHub Actions; the
+    # CLI honours it as the auth source when present. The file lookup
+    # is shared with `ApiUsageSource` (PR 14) so the supervisor's
+    # usage capture and the dispatched subprocess always agree on which
+    # token is in use for an account.
+    spawn_env: dict[str, str] | None = None
+    if claude_config_dir:
+        try:
+            config_path = existing_config_dir(claude_config_dir)
+        except ConfigDirError as exc:
+            raise DispatchError(str(exc)) from exc
+        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+        # Local import — keeps `oauth_token_file` out of the dispatcher's
+        # cold-start path for single-account / pre-PR-14 deployments.
+        from claude_task_runner.usage.oauth_token_file import read_long_lived_token
+
+        long_lived = read_long_lived_token(claude_config_dir)
+        if long_lived is not None:
+            spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
+
+    # Multi-Linux-user dispatch: when the resolved account has a
+    # `linux_user` set and it differs from the supervisor's own user,
+    # wrap argv with `sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=...`.
+    # The doctor's check_account_sudo runs `sudo -n -u <linux_user>
+    # /bin/true` as a precondition at startup, so we don't re-check
+    # here; -n keeps a misconfigured run from hanging on a password
+    # prompt. ENV inheritance across sudo's user transition needs the
+    # explicit ``env`` wrapper because sudo defaults strip the
+    # supervisor's environment from the target's session.
+    prefix: list[str] = []
+    if linux_user and _resolve_self_user() != linux_user:
+        sudo_path = shutil.which("sudo")
+        if sudo_path is None:
+            raise DispatchError(f"linux_user={linux_user!r} requested but sudo not on PATH")
+        env_pairs: list[str] = []
+        if spawn_env is not None:
+            env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
+            # PR 14: propagate the long-lived OAuth token across the
+            # sudo boundary too — sudo's default env_reset would strip
+            # CLAUDE_CODE_OAUTH_TOKEN. Without this the per-account
+            # token would only affect the supervisor's own dispatches,
+            # not the multi-Linux-user spawn (PR 3) target shells.
+            if "CLAUDE_CODE_OAUTH_TOKEN" in spawn_env:
+                env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
+        # Propagate explicit env via `env` so sudo's default
+        # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
+        prefix = [sudo_path, "-n", "-u", linux_user]
+        if env_pairs:
+            prefix.extend(["env", *env_pairs])
+        # Once the subprocess transitions to <linux_user>, the
+        # supervisor's own env stops mattering — the env=... arg to
+        # Popen below would only apply to the sudo invocation itself.
+        # Clear it so we don't fight the sudo prefix.
+        spawn_env = None
+    return spawn_env, prefix
+
+
+def _task_spawn(
+    task: Task,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    *,
+    settings_dispatch: DispatchSettings | None,
+    claude_executable: str,
+    claude_config_dir: str,
+    sudo_prefix: list[str],
+) -> tuple[list[str], list[Path]]:
+    """The worker's argv, behind ``sudo_prefix``, and its ``--add-dir``
+    list, with the target ``.claude.json`` prepared for the task.
+
+    Raises :class:`DispatchError` when the task's ``working_dir`` cannot
+    be expanded. :func:`dispatch` calls it after the pre-dispatch hook,
+    which may create the ``working_dir``, and before it writes the
+    ``running`` state.
+    """
+    # Resolve --add-dir scope: queue dir is always added; per-task
+    # additional_dirs are merged in; prompt auto-detect is opt-in.
+    auto_detect = (
+        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
+    )
+    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
+        task,
+        queue_dir,
+        auto_detect=auto_detect,
+    )
+    argv = build_argv(
+        task,
+        plan,
+        claude_executable=claude_executable,
+        add_dirs=resolved_add_dirs,
+    )
+
+    # Pre-trust the task's working_dir (and mark onboarding complete) in the
+    # target .claude.json. Idempotent — only writes when a flag changes.
+    # ``--print`` mode doesn't paint the TUI trust prompt, but the trust
+    # state is still consulted; without this entry a fresh config_dir can
+    # bounce the dispatch on first use.
+    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
+
+    _trust_dir = task.working_dir if task.working_dir else Path.cwd()
+    try:
+        _ensure_claude_init(claude_config_dir or None, _trust_dir)
+    except TaskPathError as exc:
+        raise DispatchError(str(exc)) from exc
+
+    return [*sudo_prefix, *argv], resolved_add_dirs
+
+
+def _start_error(exc: Exception) -> str:
+    """How a reason names an exception that kept a worker from starting."""
+    if isinstance(exc, DispatchError | OSError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _record_pre_dispatch_deferral(
     *,
     task: Task,
@@ -2736,16 +2807,51 @@ def _record_pre_dispatch_deferral(
     the cooldown elapses — a still-blocked hook re-checks on a cadence
     instead of being re-picked at every tick and starving ready work.
     """
-    now = clock.now()
     reason = "pre-dispatch hook deferred (exit 1)" + (
         f": {hook_result.stderr.strip()}" if hook_result.stderr.strip() else ""
     )
-    # For the attempt log only — NOT appended to state.runs (see docstring).
+    return _record_deferral(
+        task=task,
+        state=state,
+        plan=plan,
+        queue_dir=queue_dir,
+        reason=reason,
+        stop_reason="pre_dispatch_deferred",
+        clock=clock,
+        persist_state=persist_state,
+        settings_failure_classifier=settings_failure_classifier,
+        account=account,
+    )
+
+
+def _record_deferral(
+    *,
+    task: Task,
+    state: TaskState,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    reason: str,
+    stop_reason: str,
+    clock: Clock,
+    persist_state: bool,
+    settings_failure_classifier: FailureClassifierSettings | None,
+    account: str | None,
+) -> DispatchOutcome:
+    """Park ``task`` in ``deferred`` with ``reason``, re-checked after the
+    cooldown, without counting an attempt.
+
+    Built on ``state`` as it was before the dispatch, so it also replaces
+    a ``running`` state written for a worker that never started. See
+    :func:`_record_pre_dispatch_deferral` for why nothing is appended to
+    ``runs``.
+    """
+    now = clock.now()
+    # For the attempt log only — NOT appended to state.runs.
     run = RunRecord(
         attempt=state.attempts + 1,
         started_at=now,
         finished_at=now,
-        stop_reason="pre_dispatch_deferred",
+        stop_reason=stop_reason,
         error=reason,
         usage=TokenUsage(),
         cost_usd=0.0,
@@ -2753,11 +2859,7 @@ def _record_pre_dispatch_deferral(
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
         account=account,
     )
-    cooldown_s = (
-        settings_failure_classifier.deferral_recheck_cooldown_s
-        if settings_failure_classifier is not None
-        else 900.0
-    )
+    cooldown_s = _deferral_cooldown_s(settings_failure_classifier)
     new_state = state.model_copy(
         update={
             "status": "deferred",
@@ -2766,7 +2868,7 @@ def _record_pre_dispatch_deferral(
             "next_eligible_at": now + timedelta(seconds=cooldown_s),
             "last_started_at": now,
             "last_finished_at": now,
-            "stop_reason": "pre_dispatch_deferred",
+            "stop_reason": stop_reason,
             "error": None,
         }
     )
@@ -2777,6 +2879,64 @@ def _record_pre_dispatch_deferral(
         run_record=run,
         new_state=new_state,
         summary=StreamSummary(),
+    )
+
+
+def _deferral_cooldown_s(settings_failure_classifier: FailureClassifierSettings | None) -> float:
+    """``[failure_classifier].deferral_recheck_cooldown_s``, 900 s without settings."""
+    if settings_failure_classifier is None:
+        return 900.0
+    return settings_failure_classifier.deferral_recheck_cooldown_s
+
+
+@dataclass(frozen=True)
+class _UnstartableContext:
+    """What :func:`_defer_unstartable` needs from one :func:`dispatch` call."""
+
+    task: Task
+    state: TaskState
+    """The state before the dispatch, never the ``running`` one."""
+    plan: SpawnPlan
+    queue_dir: Path
+    clock: Clock
+    persist_state: bool
+    settings_failure_classifier: FailureClassifierSettings | None
+    account: str | None
+
+
+UNSTARTABLE_STOP_REASON = "worker_start_deferred"
+"""``stop_reason`` of a task parked because its worker could not be started."""
+
+
+def _defer_unstartable(ctx: _UnstartableContext, error: str) -> DispatchOutcome:
+    """Park a task whose worker cannot be started, and log it as an ERROR.
+
+    ``deferred``, not ``failed``: the cause is configuration (no ``claude``
+    binary, a ``CLAUDE_CONFIG_DIR`` that is missing or cannot be expanded,
+    ``sudo`` missing for a ``linux_user``, a ``working_dir`` that cannot
+    be expanded or does not exist), which a fix clears, so it counts no
+    attempt and never feeds the circuit breaker. The task is tried again
+    after ``deferral_recheck_cooldown_s``, and runs once the cause is
+    fixed, with no operator step.
+    """
+    reason = f"cannot start the worker: {error}"
+    logger.error(
+        "task %s: %s; deferred, next try in %.0f s",
+        ctx.task.id,
+        reason,
+        _deferral_cooldown_s(ctx.settings_failure_classifier),
+    )
+    return _record_deferral(
+        task=ctx.task,
+        state=ctx.state,
+        plan=ctx.plan,
+        queue_dir=ctx.queue_dir,
+        reason=reason,
+        stop_reason=UNSTARTABLE_STOP_REASON,
+        clock=ctx.clock,
+        persist_state=ctx.persist_state,
+        settings_failure_classifier=ctx.settings_failure_classifier,
+        account=ctx.account,
     )
 
 

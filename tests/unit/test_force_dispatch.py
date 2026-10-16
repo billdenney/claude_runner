@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +18,7 @@ from claude_task_runner.clock import FakeClock, RealClock
 from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
+    load_state,
     queue_runtime_dir,
     state_path_for,
     task_path_for,
@@ -602,6 +603,7 @@ class TestForceDispatchCLI:
             "status": "completed",
             "attempts": 1,
             "stop_reason": "end_turn",
+            "deferred_reason": None,
         }
         mock_sync.assert_called_once()
 
@@ -1012,7 +1014,7 @@ class TestForceDispatchCLI:
     ) -> None:
         """The request file is gone, so the note must not say it persists.
 
-        The task was parked after the CLI checked its status, so the
+        The task finished after the CLI checked its status, so the
         supervisor's tick drops the request as no longer dispatchable, and
         the task never reaches ``running``.
         """
@@ -1022,7 +1024,7 @@ class TestForceDispatchCLI:
 
         def supervisor_tick(qd: Path, task_id: str, wait_seconds: float) -> bool:
             write_state_atomic(
-                TaskState(task_id=task_id, status="deferred", deferred_reason="parked by hand"),
+                TaskState(task_id=task_id, status="completed"),
                 state_path_for(qd, task_id),
             )
             fd_mod.tick_consume(
@@ -1269,6 +1271,7 @@ class TestForceDispatchReadinessGate:
             "request_path": str(request),
             "running": False,
             "allow_over_limit": False,
+            "deferred_reason": None,
         }
         assert request.exists()
         sync.assert_not_called()
@@ -1301,6 +1304,7 @@ class TestForceDispatchReadinessGate:
             "status": "completed",
             "attempts": 1,
             "stop_reason": "end_turn",
+            "deferred_reason": None,
         }
         sync.assert_called_once_with(
             task_id="t1",
@@ -1428,3 +1432,124 @@ class TestForceDispatchEffortGate:
         assert " ".join(result.stdout.split()) == (
             f"task t1 has an invalid effort: {SONNET_MAX_ERROR}"
         )
+
+
+class TestAWorkerThatCannotStart:
+    """``force-dispatch`` retries a ``deferred`` task at once, and says why a
+    worker could not be started instead of a bare ``status=deferred``."""
+
+    @pytest.fixture
+    def runner_cli(self) -> CliRunner:
+        return CliRunner()
+
+    def _queue_toml(self, queue_dir: Path, tmp_path: Path) -> Path:
+        acct = tmp_path / "acct"
+        acct.mkdir()
+        config = queue_dir / "claude_runner.toml"
+        config.write_text(
+            '[claude]\nexecutable = "no-such-claude-binary-ctr-test"\n\n'
+            f'[[accounts]]\nname = "work"\nconfig_dir = "{acct}"\n',
+            encoding="utf-8",
+        )
+        return config
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+    def test_the_synchronous_path_prints_the_reason(
+        self, queue_dir: Path, tmp_path: Path, runner_cli: CliRunner, as_json: bool
+    ) -> None:
+        """A task already parked for this reason is accepted (``deferred`` is
+        dispatchable here), tried again, and parked again."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        self._queue_toml(queue_dir, tmp_path)
+        _make_task(queue_dir, "t1")
+        write_state_atomic(
+            TaskState(
+                task_id="t1",
+                status="deferred",
+                deferral_count=1,
+                deferred_reason="cannot start the worker: earlier",
+                next_eligible_at=datetime.now(UTC) + timedelta(hours=1),
+            ),
+            state_path_for(queue_dir, "t1"),
+        )
+        args = ["force-dispatch", "t1", "--queue", str(queue_dir)]
+        result = runner_cli.invoke(
+            app, [*args, "--json"] if as_json else args, env={"COLUMNS": "1000"}
+        )
+        reason = "cannot start the worker: claude binary not found: no-such-claude-binary-ctr-test"
+        assert result.exit_code == 0, result.output
+        if as_json:
+            assert json.loads(result.stdout) == {
+                "ok": True,
+                "mode": "synchronous",
+                "status": "deferred",
+                "attempts": 0,
+                "stop_reason": "worker_start_deferred",
+                "deferred_reason": reason,
+            }
+        else:
+            assert result.stdout == (
+                "task t1 finished with status=deferred, attempts=0, "
+                "stop_reason=worker_start_deferred\n"
+                f"deferred: {reason}\n"
+            )
+        state = load_state(state_path_for(queue_dir, "t1"))
+        assert (state.status, state.deferral_count, state.deferred_reason) == (
+            "deferred",
+            2,
+            reason,
+        )
+
+    @pytest.mark.parametrize(
+        ("when", "says_why"),
+        [("after-the-request", True), ("before-the-request", False)],
+    )
+    def test_the_supervised_path_says_the_worker_could_not_start(
+        self, queue_dir: Path, runner_cli: CliRunner, when: str, says_why: bool
+    ) -> None:
+        """Only a deferral written for this request is reported as its outcome."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        reason = "cannot start the worker: CLAUDE_CONFIG_DIR does not exist: /mnt/acct"
+
+        def supervisor_tick(qd: Path, task_id: str, wait_seconds: float) -> bool:
+            fd_mod.consume_request(qd, task_id)
+            finished = datetime.now(UTC) - (
+                timedelta(hours=1) if when == "before-the-request" else timedelta(0)
+            )
+            write_state_atomic(
+                TaskState(
+                    task_id=task_id,
+                    status="deferred",
+                    deferred_reason=reason,
+                    stop_reason="worker_start_deferred",
+                    last_finished_at=finished,
+                ),
+                state_path_for(qd, task_id),
+            )
+            return False
+
+        with (
+            patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=True),
+            patch(
+                "claude_task_runner.cli.queue_cmd._poll_until_running",
+                side_effect=supervisor_tick,
+            ),
+        ):
+            result = runner_cli.invoke(
+                app,
+                ["force-dispatch", "t1", "--queue", str(queue_dir), "--wait-seconds", "1"],
+                env={"COLUMNS": "1000"},
+            )
+        assert result.exit_code == 0, result.stdout
+        last = result.stdout.splitlines()[-1]
+        if says_why:
+            assert last == (
+                "task t1 was dispatched, but its worker could not be started, so it is "
+                f"deferred again: {reason}. Fix that, then force-dispatch it again; the "
+                "supervisor also retries it once its cooldown has passed."
+            )
+        else:
+            assert last.startswith("task t1 still not running after 1.0s, and its request")

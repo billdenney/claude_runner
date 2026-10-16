@@ -102,6 +102,10 @@ config_dir = ""        # LEGACY single-account alias; superseded by [[accounts]]
 #                      so the next tick returns to the API path.
 #                      Recommended once API readings have been
 #                      validated to match TTY for the operator's plan.
+#                      An account with a long-lived token
+#                      (<config_dir>/oauth-token, ADR-0021) uses the
+#                      API path alone, in a one-account queue as in one
+#                      of several: TTY cannot recover a revoked token.
 # ---------------------------------------------------------------------------
 [usage]
 source                      = "tty"     # "tty" | "api" | "api_then_tty"

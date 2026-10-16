@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -62,14 +63,19 @@ def test_falls_back_to_none_when_neither_present(tmp_path: Path) -> None:
     assert resolve_per_queue_config(None, queue_dir) is None
 
 
-def test_per_queue_config_must_be_a_file_not_a_directory(tmp_path: Path) -> None:
-    """Defensive: if something at ``<queue>/claude_runner.toml`` is a
-    directory (unusual but possible if an operator hand-crafts the queue
-    layout wrong), don't return it — fall through to None."""
+@pytest.mark.parametrize("linked", [False, True], ids=["directory", "symlink-to-directory"])
+def test_a_directory_at_the_per_queue_name_is_returned(tmp_path: Path, linked: bool) -> None:
+    """Not the defaults, whose default account is ``~/.claude``:
+    ``load_settings`` then refuses it as a content error."""
     queue_dir = tmp_path / "q"
     queue_dir.mkdir()
-    (queue_dir / PER_QUEUE_CONFIG_NAME).mkdir()  # directory, not a file
-    assert resolve_per_queue_config(None, queue_dir) is None
+    per_queue = queue_dir / PER_QUEUE_CONFIG_NAME
+    if linked:
+        (tmp_path / "elsewhere").mkdir()
+        per_queue.symlink_to(tmp_path / "elsewhere")
+    else:
+        per_queue.mkdir()
+    assert resolve_per_queue_config(None, queue_dir) == per_queue
 
 
 @pytest.mark.parametrize("target", ["missing", "loop"])
@@ -82,6 +88,20 @@ def test_a_symlink_to_no_file_is_returned(tmp_path: Path, target: str) -> None:
     per_queue.symlink_to(
         tmp_path / "unmounted" / "claude_runner.toml" if target == "missing" else per_queue
     )
+    assert resolve_per_queue_config(None, queue_dir) == per_queue
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dev-null"])
+def test_anything_else_at_the_per_queue_name_is_returned(tmp_path: Path, kind: str) -> None:
+    """``load_settings`` refuses what is not a regular file; the lookup itself
+    does not open it, so a FIFO cannot block it."""
+    queue_dir = tmp_path / "q"
+    queue_dir.mkdir()
+    per_queue = queue_dir / PER_QUEUE_CONFIG_NAME
+    if kind == "fifo":
+        os.mkfifo(per_queue)
+    else:
+        per_queue.symlink_to("/dev/null")
     assert resolve_per_queue_config(None, queue_dir) == per_queue
 
 
