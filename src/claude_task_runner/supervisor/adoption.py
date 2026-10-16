@@ -40,10 +40,14 @@ Tasks that do NOT qualify keep today's reaper behaviour:
   ``reconcile_orphans`` parks it ``possibly_hung``, since a ``failed``
   task would be dispatched while the worker still runs.
 
-The reaper and this pass use one classifier so they cannot disagree: a
-worker the reaper leaves ``running`` is one this pass adopts. The agent
-heartbeat alone does not do: the dispatcher does not advance it during a
-long tool call (see :mod:`runner.stream`).
+The reaper and this pass grade a worker by one classifier, the agent
+heartbeat and the signs of life (the agent heartbeat alone does not do:
+the dispatcher does not advance it during a long tool call, see
+:mod:`runner.stream`). The reaper also keeps running a worker whose
+worktree had a file written recently (it records that time as the
+heartbeat) and one it cannot grade; this pass adopts such a worker only
+if that recorded heartbeat is within the alert window, and
+``reconcile_orphans`` parks the rest whose worker runs.
 
 A worker can also finish in the restart gap, after one supervisor stops
 and before the next starts. :func:`finalize_exited_workers` runs first of
