@@ -31,7 +31,7 @@ import pytest
 from typer.testing import CliRunner
 
 from claude_task_runner.clock import FakeClock
-from claude_task_runner.config.loader import load_defaults
+from claude_task_runner.config.loader import load_defaults, load_settings
 from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
@@ -111,7 +111,7 @@ def live_worker(queue_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 def _settings() -> Any:
     return SimpleNamespace(
         concurrency=SimpleNamespace(initial_concurrency=None, max_concurrency=None),
-        task_caps=SimpleNamespace(),
+        task_caps=load_settings(None).task_caps,
         session=SimpleNamespace(),
         effort_levels=load_defaults()["effort_levels"],
         hooks=SimpleNamespace(),
@@ -327,7 +327,7 @@ def test_untracked_worker_is_parked_at_restart_and_not_dispatched(
     called, _slots = _tick(queue_dir)
 
     assert demoted == []
-    assert parked == [ParkedWorker(_TASK, _PID, str(live_worker))]
+    assert parked == [ParkedWorker(_TASK, _PID, str(live_worker), "and was not adopted")]
     assert called == []
     _assert_parked(queue_dir, live_worker)
 
@@ -542,3 +542,83 @@ def test_synchronous_force_dispatch_refuses_a_live_worker(
         fd_mod.dispatch_synchronously(
             task_id=_TASK, queue_dir=queue_dir, settings=_settings(), clock=FakeClock(_NOW)
         )
+
+
+# ---------------------------------------------------------------------------
+# A parked worker: force-dispatch names it and how to release it
+# ---------------------------------------------------------------------------
+
+
+def _parked(queue_dir: Path, log: Path) -> None:
+    write_state_atomic(
+        dispatcher_mod.park_live_worker(
+            TaskState(task_id=_TASK, status="running", attempts=1, pid=_PID, log_path=str(log)),
+            why="and was not adopted by this supervisor",
+        ),
+        state_path_for(queue_dir, _TASK),
+    )
+
+
+_PARKED_MESSAGE = (
+    f"task {_TASK}: its worker pid={_PID} is still running, parked possibly_hung "
+    "(worker_still_running); a second worker would share its worktree. It is released, "
+    "and its run recorded, when it exits or reaches its duration cap; to release it "
+    f"sooner, kill -TERM -{_PID} (its process group) and the supervisor records the run "
+    "within a tick"
+)
+
+
+@pytest.mark.parametrize("override", [[], ["--allow-live-worker"]])
+def test_force_dispatch_cli_refuses_a_parked_worker_even_with_the_override(
+    queue_dir: Path, live_worker: Path, override: list[str]
+) -> None:
+    from claude_task_runner.cli.queue_cmd import app
+
+    _parked(queue_dir, live_worker)
+    with (
+        patch("claude_task_runner.cli.queue_cmd._supervisor_is_alive", return_value=False),
+        patch("claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously") as sync,
+    ):
+        result = CliRunner().invoke(
+            app, ["force-dispatch", _TASK, "--queue", str(queue_dir), "--json", *override]
+        )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {"ok": False, "error": _PARKED_MESSAGE, "pid": _PID}
+    sync.assert_not_called()
+
+
+def test_supervisor_drops_a_force_request_for_a_parked_worker(
+    queue_dir: Path, live_worker: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _parked(queue_dir, live_worker)
+    fd_mod.write_request(queue_dir, _TASK, allow_live_worker=True)
+    slots: dict[str, DispatchSlot] = {}
+    with (
+        caplog.at_level(logging.WARNING),
+        patch(
+            "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch", return_value=None
+        ) as dispatch,
+    ):
+        n = fd_mod.tick_consume(
+            queue_dir=queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
+        )
+
+    assert (n, slots, dispatch.call_count) == (0, {}, 0)
+    assert not fd_mod.request_path(queue_dir, _TASK).exists()
+    assert f"force-dispatch: {_PARKED_MESSAGE}; dropping request" in _warnings(caplog)
+
+
+def test_synchronous_force_dispatch_refuses_a_parked_worker(
+    queue_dir: Path, live_worker: Path
+) -> None:
+    _parked(queue_dir, live_worker)
+    with pytest.raises(fd_mod.ForceDispatchError) as exc_info:
+        fd_mod.dispatch_synchronously(
+            task_id=_TASK,
+            queue_dir=queue_dir,
+            settings=_settings(),
+            clock=FakeClock(_NOW),
+            allow_live_worker=True,
+        )
+    assert str(exc_info.value) == _PARKED_MESSAGE

@@ -60,6 +60,7 @@ from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_recor
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
 from claude_task_runner.supervisor import adoption as adoption_mod
+from claude_task_runner.supervisor import reconcile as reconcile_mod
 from claude_task_runner.supervisor.states import InFlightRecord, SupervisorState
 
 if TYPE_CHECKING:
@@ -71,6 +72,9 @@ logger = logging.getLogger(__name__)
 
 NotifyCallback = Callable[[str, str], None]
 EventCallback = Callable[[str, dict[str, Any]], None]
+ParkCallback = Callable[[TaskState, str], None]
+"""Receives a task just parked with its live worker on record, and the words
+that complete "worker pid=N is still running ..." for it."""
 
 
 _PRIORITY_ORDER = {"high": 0, "normal": 1, "low": 2}
@@ -243,6 +247,7 @@ def tick_dispatch(
     event_callback: EventCallback | None = None,
     spawn_gate: SpawnGate | None = None,
     idle_log: IdleDispatchLog | None = None,
+    parked_tracker: adoption_mod.ParkedWorkerTracker | None = None,
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
@@ -289,6 +294,17 @@ def tick_dispatch(
     reaches candidate selection reports to it how many tasks the selector
     admitted and what held the rest, and it logs a summary when none were
     admitted. ``None`` skips that report; dispatch is the same either way.
+
+    ``parked_tracker`` is the supervisor's
+    :class:`supervisor.adoption.ParkedWorkerTracker`, kept across ticks for
+    its retry delays and the parks and recorded runs it queues between
+    ticks; ``None`` uses a fresh one. Each parked worker that still runs
+    counts against its account (``held``); a parked worker that has exited,
+    or was stopped at its duration cap, has its run recorded on a thread
+    that holds its task's slot. A task the selector parks this tick counts
+    from this tick on. Every park made here, or by a dispatch thread since
+    the previous tick, is reported (a ``warning`` notify and a
+    ``live_worker_parked`` event).
     """
     _reap_finished(
         in_flight_slots,
@@ -298,10 +314,18 @@ def tick_dispatch(
         event_callback=event_callback,
     )
 
+    # ADR-0025 thread lifetime: daemon when adoption is on (fast stop need
+    # not join), non-daemon otherwise (drain joins). ``getattr`` tolerates
+    # the lightweight ``SimpleNamespace`` settings stubs some tests pass
+    # (which omit ``supervisor``); the real strict ``Settings`` always
+    # carries the field, so production reads the operator's value.
+    adopt_on = bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False))
+
     # A worker parked with no monitor thread (runner.dispatcher
     # .park_live_worker) still runs on an account: count it against that
     # account like a slot, and record its run once it exits.
-    parked = adoption_mod.track_parked_workers(
+    tracker = parked_tracker if parked_tracker is not None else adoption_mod.ParkedWorkerTracker()
+    parked = tracker.tick(
         queue_dir,
         settings=settings,
         clock=clock,
@@ -309,7 +333,10 @@ def tick_dispatch(
         owned_ids=in_flight_slots.keys(),
     )
     _report_finished_parked(parked.finished, notify_callback, event_callback)
-    held = parked.in_flight
+    _report_parks(tracker.drain_parks(), notify_callback, event_callback)
+    for job in parked.to_finalize:
+        _start_parked_finalize(job, tracker, queue_dir, settings, clock, in_flight_slots, adopt_on)
+    held = list(parked.in_flight)
 
     if draining:
         # Drain mode: skip both the candidate enumeration and
@@ -354,13 +381,6 @@ def tick_dispatch(
     if available == 0:
         return _refresh_in_flight(snapshot, in_flight_slots, held)
 
-    # ADR-0025 thread lifetime: daemon when adoption is on (fast stop need
-    # not join), non-daemon otherwise (drain joins). ``getattr`` tolerates
-    # the lightweight ``SimpleNamespace`` settings stubs some tests pass
-    # (which omit ``supervisor``); the real strict ``Settings`` always
-    # carries the field, so production reads the operator's value.
-    adopt_on = bool(getattr(getattr(settings, "supervisor", None), "adopt_workers", False))
-
     completed_ids = _completed_task_ids(queue_dir)
     # Opt-in dispatch block-list (ADR-0029): a queue-relative JSONL of
     # `block_dispatch: true` task ids the selector skips outright.
@@ -376,7 +396,29 @@ def tick_dispatch(
         block_file=block_file,
         effort_levels=settings.effort_levels,
         skips=skips,
+        on_park=tracker.note_park,
     )
+    # A task the selector just parked (or a dispatch thread did since the
+    # tick began) holds its account's slot from now on, not from next tick.
+    newly_parked = tracker.drain_parks()
+    _report_parks(newly_parked, notify_callback, event_callback)
+    new_records = [
+        tracker.record_for(
+            state, settings=settings, prior_in_flight=snapshot.in_flight, now=clock.now()
+        )
+        for state, _why in newly_parked
+        if state.task_id not in in_flight_slots
+    ]
+    if new_records:
+        held = sorted([*held, *new_records], key=lambda r: r.task_id)
+        available = min(
+            available,
+            account_dispatch_mod.dispatch_headroom(
+                accounts,
+                [*to_in_flight_records(in_flight_slots), *held],
+                _target_concurrency(queue_dir, settings),
+            ),
+        )
     if idle_log is not None:
         idle_log.observe(len(candidates), skips)
     if not candidates:
@@ -456,7 +498,7 @@ def tick_dispatch(
                 acct.linux_user,
                 choice.account,
             ),
-            kwargs={"spawn_gate": spawn_gate},
+            kwargs={"spawn_gate": spawn_gate, "on_park": tracker.note_park},
             name=f"dispatch-{task.id}",
             # ADR-0025: daemon when adoption is on so a fast stop need not
             # join the worker thread; the file-backed worker survives as
@@ -529,6 +571,48 @@ def _report_finished_parked(
                     "stop_reason": ex.stop_reason,
                 },
             )
+
+
+def _report_parks(
+    parks: Sequence[tuple[TaskState, str]],
+    notify_callback: NotifyCallback | None,
+    event_callback: EventCallback | None,
+) -> None:
+    """Report each live-worker park, as the daemon reports one at startup."""
+    for state, why in parks:
+        assert state.pid is not None  # a park records its worker
+        reconcile_mod.report_park(
+            reconcile_mod.ParkedWorker(state.task_id, state.pid, state.log_path, why),
+            notify_callback,
+            event_callback,
+        )
+
+
+def _start_parked_finalize(
+    job: adoption_mod.ParkedFinalize,
+    tracker: adoption_mod.ParkedWorkerTracker,
+    queue_dir: Path,
+    settings: Settings,
+    clock: Clock,
+    in_flight_slots: dict[str, DispatchSlot],
+    daemon: bool,
+) -> None:
+    """Record a parked worker's run on a thread that holds its task's slot,
+    as a dispatch thread holds it through its post-dispatch hook."""
+    thread = threading.Thread(
+        target=tracker.finalize,
+        args=(job, queue_dir),
+        kwargs={"settings": settings, "clock": clock},
+        name=f"record-parked-{job.state.task_id}",
+        daemon=daemon,
+    )
+    thread.start()
+    in_flight_slots[job.state.task_id] = DispatchSlot(
+        task_id=job.state.task_id,
+        account=job.account or adoption_mod.UNATTRIBUTED_ACCOUNT,
+        started_at=clock.now(),
+        thread=thread,
+    )
 
 
 def _any_account_dispatchable(
@@ -992,6 +1076,7 @@ def _eligible_candidates(
     effort_levels: dict[str, list[str]],
     skips: Counter[str] | None = None,
     read_only: bool = False,
+    on_park: ParkCallback | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -1047,6 +1132,7 @@ def _eligible_candidates(
             now=now,
             effort_levels=effort_levels,
             read_only=read_only,
+            on_park=on_park,
         )
         if category is None:
             out.append(task)
@@ -1066,6 +1152,7 @@ def _skip_category(
     now: datetime | None,
     effort_levels: dict[str, list[str]],
     read_only: bool = False,
+    on_park: ParkCallback | None = None,
 ) -> str | None:
     """Decide whether the selector admits ``task`` this tick.
 
@@ -1164,7 +1251,7 @@ def _skip_category(
             is dispatcher_mod.WorkerProbe.ALIVE
         ):
             if not read_only:
-                _park_live_worker(queue_dir, state)
+                _park_live_worker(queue_dir, state, _SELECTOR_PARK, on_park)
             return _SKIP_LIVE_WORKER
 
     # Effort gate (ADR-0010): a task whose (model, effort) pair the merged
@@ -1237,12 +1324,17 @@ def _skip_category(
     return None
 
 
-def _park_live_worker(queue_dir: Path, live: TaskState) -> None:
+_SELECTOR_PARK = "though its task was dispatchable"
+_BACKSTOP_PARK = "when its task was about to be dispatched again"
+
+
+def _park_live_worker(
+    queue_dir: Path, live: TaskState, why: str, on_park: ParkCallback | None
+) -> None:
     """Refuse to dispatch ``live``'s task: its worker still runs. Park it
-    (:func:`runner.dispatcher.park_live_worker`) and log a WARNING."""
-    parked = dispatcher_mod.park_live_worker(
-        live, why="while its task was about to be dispatched again"
-    )
+    (:func:`runner.dispatcher.park_live_worker`), log a WARNING, and hand the
+    park to ``on_park`` to be reported and counted."""
+    parked = dispatcher_mod.park_live_worker(live, why=why)
     try:
         write_state_atomic(parked, state_path_for(queue_dir, live.task_id))
     except Exception as exc:
@@ -1262,6 +1354,8 @@ def _park_live_worker(queue_dir: Path, live: TaskState) -> None:
         live.log_path,
         parked.stop_reason,
     )
+    if on_park is not None:
+        on_park(parked, why)
 
 
 @dataclass(frozen=True)
@@ -1340,6 +1434,7 @@ def _dispatch_one_safely(
     account: str,
     spawn_gate: SpawnGate | None = None,
     allow_live_worker: bool = False,
+    on_park: ParkCallback | None = None,
 ) -> None:
     """Thread entrypoint — load state, plan spawn, call dispatch, log errors.
 
@@ -1370,7 +1465,8 @@ def _dispatch_one_safely(
     parked with that worker on record and a WARNING. Two workers in one
     worktree corrupt its branch, so this holds for every path, whatever
     produced the state. ``allow_live_worker`` (``queue force-dispatch
-    --allow-live-worker``) is the operator's override.
+    --allow-live-worker``) is the operator's override. ``on_park`` receives
+    the park, to be reported at the next tick.
     """
     sp = state_path_for(queue_dir, task.id)
     if sp.exists():
@@ -1384,7 +1480,7 @@ def _dispatch_one_safely(
     if not allow_live_worker:
         live = dispatcher_mod.live_worker_record(state, queue_dir)
         if live is not None:
-            _park_live_worker(queue_dir, live)
+            _park_live_worker(queue_dir, live, _BACKSTOP_PARK, on_park)
             return
 
     effort_reason = _effort_hold_reason(task, settings.effort_levels)

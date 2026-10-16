@@ -751,7 +751,7 @@ startup, alive after a reaper's terminate, or found running when its task
 was about to be dispatched again. ``possibly_hung`` is never dispatched,
 so the task gets no second worker. Each tick, the parked worker holds a
 slot of the account it runs on, and once it exits its run is recorded
-from its log (``supervisor.adoption.track_parked_workers``)."""
+from its log (``supervisor.adoption.ParkedWorkerTracker``)."""
 
 
 def park_live_worker(state: TaskState, *, why: str) -> TaskState:
@@ -2479,6 +2479,7 @@ def finalize_exited_worker(
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
     require_result: bool = True,
+    cap_violation: caps_mod.CapViolation | None = None,
 ) -> DispatchOutcome | None:
     """Record the run of a file-backed worker that exited with no supervisor watching.
 
@@ -2499,11 +2500,12 @@ def finalize_exited_worker(
     :func:`park_live_worker` (no later pass handles a parked task), such a
     run is recorded as a crash instead, as :func:`adopt_worker` records a
     worker whose pid vanished; a worker with no log (pipe-backed) is
-    recorded the same way.
+    recorded the same way. ``cap_violation`` records a worker the caller
+    stopped at its cap as killed by that cap.
 
     The caller has established that ``state.pid`` is dead, so nothing here
-    signals or waits on a process. No cap is applied: caps stop a live
-    worker, and this one ended on its own.
+    signals or waits on a process. It applies no cap itself: a caller that
+    stopped the worker at its cap passes ``cap_violation``.
     """
     log_path = Path(state.log_path) if state.log_path is not None else None
     summary = _reparse_stdout_file(log_path) if log_path is not None else StreamSummary()
@@ -2516,7 +2518,7 @@ def finalize_exited_worker(
         task=task,
         prior=state,
         summary=summary,
-        cap_violation=None,
+        cap_violation=cap_violation,
         started_at=started_at,
         finished_at=(
             _log_finished_at(log_path, started_at=started_at, now=now)

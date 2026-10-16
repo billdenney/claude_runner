@@ -243,6 +243,18 @@ def live_worker_of(queue_dir: Path, task_id: str, state: TaskState | None) -> Ta
     return dispatcher_mod.live_worker_record(state or TaskState(task_id=task_id), queue_dir)
 
 
+def parked_worker_message(state: TaskState) -> str:
+    """Why force-dispatch refuses a task parked with its live worker, and how
+    the operator releases it. ``--allow-live-worker`` does not apply."""
+    return (
+        f"task {state.task_id}: its worker pid={state.pid} is still running, parked "
+        f"possibly_hung ({dispatcher_mod.LIVE_WORKER_STOP_REASON}); a second worker would "
+        "share its worktree. It is released, and its run recorded, when it exits or "
+        f"reaches its duration cap; to release it sooner, kill -TERM -{state.pid} (its "
+        "process group) and the supervisor records the run within a tick"
+    )
+
+
 def live_worker_message(live: TaskState) -> str:
     """Why force-dispatch refuses ``live``'s task."""
     return (
@@ -411,6 +423,10 @@ def tick_consume(
             )
             continue
         status = state.status if state is not None else None
+        if state is not None and dispatcher_mod.is_parked_live_worker(state):
+            logger.warning("force-dispatch: %s; dropping request", parked_worker_message(state))
+            consume_request(queue_dir, task.id)
+            continue
         if status not in _FORCE_DISPATCHABLE:
             logger.warning(
                 "force-dispatch %s: status %s is not dispatchable; dropping request",
@@ -623,6 +639,8 @@ def dispatch_synchronously(
         raise ForceDispatchError(f"cannot parse task {task_id}: {exc}") from exc
 
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
+    if dispatcher_mod.is_parked_live_worker(state):
+        raise ForceDispatchError(parked_worker_message(state))
     if state.status not in _FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
     live = live_worker_of(queue_dir, task.id, state)

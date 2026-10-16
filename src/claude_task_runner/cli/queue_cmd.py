@@ -55,6 +55,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner import readiness as readiness_mod
@@ -988,9 +989,11 @@ def force_dispatch(
         False,
         "--allow-live-worker",
         help=(
-            "Dispatch even though a worker of the task is still running. Without "
-            "this flag the command refuses: a second worker in the task's worktree "
-            "corrupts its branch."
+            "Dispatch a pending or failed task even though a worker of it is still "
+            "running, one no state records (found writing the task's stream log). "
+            "Without this flag the command refuses: a second worker in the task's "
+            "worktree corrupts its branch. A task parked with its worker "
+            "(possibly_hung, worker_still_running) is refused either way."
         ),
     ),
     wait_seconds: float = typer.Option(
@@ -1064,6 +1067,13 @@ def force_dispatch(
         except (QueueIOError, QueueSchemaError):
             current_state = None
     current_status = current_state.status if current_state is not None else None
+    if current_state is not None and dispatcher_mod.is_parked_live_worker(current_state):
+        msg = fd_mod.parked_worker_message(current_state)
+        if json:
+            print(_json.dumps({"ok": False, "error": msg, "pid": current_state.pid}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2)
     if current_status not in (None, "pending", "failed"):
         msg = f"task {task_id} status={current_status!r} is not dispatchable"
         if json:

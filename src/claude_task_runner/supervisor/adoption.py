@@ -63,7 +63,7 @@ import logging
 import threading
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from claude_task_runner.clock import Clock
@@ -75,6 +75,7 @@ from claude_task_runner.queue.store import (
     load_task,
     task_path_for,
 )
+from claude_task_runner.runner import caps as caps_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import WorkerProbe
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
@@ -277,7 +278,7 @@ def finalize_exited_workers(
     A task parked by :func:`runner.dispatcher.park_live_worker` whose
     worker has exited since is recorded too, whatever its log holds (a
     crash without a ``result`` event), since no later pass handles a
-    parked task; :func:`track_parked_workers` does the same every tick.
+    parked task; :class:`ParkedWorkerTracker` does the same every tick.
 
     Must run before :func:`supervisor.reconcile_silent.reconcile_silent_orphans`.
     A finished worker's heartbeat is as stale as a hung one's, so the
@@ -315,17 +316,33 @@ def finalize_exited_workers(
 
         if not _has_exited(state, queue_dir):
             continue
-        result = _record_exited(
-            queue_dir,
-            state,
-            settings=settings,
-            clock=clock,
-            account=prior_accounts.get(state.task_id) or state.session_host_account(),
-        )
+        try:
+            result = _record_exited(
+                queue_dir,
+                state,
+                settings=settings,
+                clock=clock,
+                account=prior_accounts.get(state.task_id) or state.session_host_account(),
+            )
+        except _RecordFailed as exc:
+            # One task must not keep the supervisor from starting.
+            logger.warning(
+                "exited-worker finalize: task %s's worker pid=%s exited, but its run "
+                "was not recorded: %s; leaving its state as it is",
+                state.task_id,
+                state.pid,
+                exc,
+                exc_info=exc.__cause__,
+            )
+            continue
         if result is not None:
             results.append(result)
 
     return results
+
+
+class _RecordFailed(Exception):
+    """Recording an exited worker's run failed; the message says why."""
 
 
 def _record_exited(
@@ -335,6 +352,7 @@ def _record_exited(
     settings: Settings,
     clock: Clock,
     account: str | None,
+    cap_violation: caps_mod.CapViolation | None = None,
 ) -> ExitedWorkerResult | None:
     """Record the run of ``state``'s worker, which has exited, from its log.
 
@@ -342,21 +360,17 @@ def _record_exited(
     worker crashed; the silent-orphan reaper and ``reconcile_orphans``
     handle it). A task parked by :func:`runner.dispatcher.park_live_worker`
     has no later pass, so its run is recorded whatever the log holds: a
-    crash without a ``result`` event, or with no log at all. ``None`` when
-    nothing was recorded.
+    crash without a ``result`` event, or with no log at all.
+    ``cap_violation`` marks a worker stopped at its duration cap. ``None``
+    when nothing was recorded; :class:`_RecordFailed` when the Task YAML
+    cannot be loaded or the finalize raises.
     """
     assert state.pid is not None  # narrowed by the callers
     try:
         task = load_task(task_path_for(queue_dir, state.task_id))
     except Exception as exc:
         # The finalize needs the Task for the ADR-0020 output gate.
-        logger.warning(
-            "exited-worker finalize: task %s's worker exited but its Task "
-            "YAML could not be loaded (%s); leaving its state as it is",
-            state.task_id,
-            exc,
-        )
-        return None
+        raise _RecordFailed(f"its Task YAML could not be loaded ({exc})") from exc
 
     try:
         outcome = dispatcher_mod.finalize_exited_worker(
@@ -369,14 +383,10 @@ def _record_exited(
             settings_failure_classifier=settings.failure_classifier,
             account=account,
             require_result=not dispatcher_mod.is_parked_live_worker(state),
+            cap_violation=cap_violation,
         )
-    except Exception:
-        # One task must not keep the supervisor from starting or ticking.
-        logger.exception(
-            "exited-worker finalize failed for task %s; leaving its state as it is",
-            state.task_id,
-        )
-        return None
+    except Exception as exc:
+        raise _RecordFailed(f"its finalize raised {exc!r}") from exc
     if outcome is None:
         logger.info(
             "task %s: worker pid=%s exited with no result event in %s; "
@@ -431,86 +441,260 @@ def _has_exited(state: TaskState, queue_dir: Path) -> bool:
 
 
 @dataclass(frozen=True)
+class ParkedFinalize:
+    """A parked worker whose run is to be recorded, off the tick thread
+    (:meth:`ParkedWorkerTracker.finalize`): it exited, or it was stopped at
+    its duration cap."""
+
+    state: TaskState
+    account: str | None
+    """The account the run is recorded under, or ``None`` when no record
+    says."""
+    cap_violation: caps_mod.CapViolation | None
+
+
+@dataclass(frozen=True)
 class ParkedWorkers:
-    """What :func:`track_parked_workers` found this tick."""
+    """What :meth:`ParkedWorkerTracker.tick` found."""
 
     in_flight: list[InFlightRecord]
     """One record per parked worker still running, naming the account it
     runs on (:data:`UNATTRIBUTED_ACCOUNT` when no record says), sorted by
     task id."""
+    to_finalize: list[ParkedFinalize]
+    """Parked workers that have exited or were stopped at their duration
+    cap, whose runs are to be recorded."""
     finished: list[ExitedWorkerResult]
-    """The parked workers that had exited, whose runs were recorded."""
+    """Runs recorded off the tick thread since the previous tick."""
+
+
+@dataclass
+class _Failure:
+    """A parked task whose run could not be recorded, and when to retry."""
+
+    error: str
+    retry_at: datetime
+    delay_s: float
 
 
 _PARKED_MARKER = dispatcher_mod.LIVE_WORKER_STOP_REASON.encode()
 
 
-def track_parked_workers(
-    queue_dir: Path,
-    *,
-    settings: Settings,
-    clock: Clock,
-    prior_in_flight: Sequence[InFlightRecord],
-    owned_ids: Collection[str],
-) -> ParkedWorkers:
-    """Per tick: count each parked live worker against its account; record
-    the run of each that has exited.
+class ParkedWorkerTracker:
+    """The per-tick pass over workers parked by
+    :func:`runner.dispatcher.park_live_worker`, kept for a supervisor run.
 
-    A worker parked by :func:`runner.dispatcher.park_live_worker` has no
-    monitor thread, so no slot in ``in_flight_slots``. It still runs on an
-    account, so while :func:`runner.dispatcher.probe_recorded_worker` says
-    it runs, this returns an :class:`InFlightRecord` for it, which the
-    orchestrator adds to the slots' records for ``dispatch_headroom``,
-    ``choose_account`` and the persisted ``in_flight`` list. The account
-    comes from the sources adoption uses: the previous tick's
-    ``prior_in_flight`` record for the task (the previous supervisor's,
-    after a restart; ``reconcile_orphans`` keeps it), then the state's
-    session host account, then the only account of a single-account queue.
-    With none of those, the record names :data:`UNATTRIBUTED_ACCOUNT` and
-    counts against an explicit ``[concurrency].max_concurrency`` only.
+    A parked worker has no monitor thread, so no slot in
+    ``in_flight_slots``. It still runs on an account, so while
+    :func:`runner.dispatcher.probe_recorded_worker` says it runs, :meth:`tick`
+    returns an :class:`InFlightRecord` for it, which the orchestrator adds to
+    the slots' records for ``dispatch_headroom``, ``choose_account`` and the
+    persisted ``in_flight`` list. The account comes from the sources
+    adoption uses (:meth:`record_for`).
 
-    Once the probe says the worker is gone, its run is recorded from its
-    log as at startup (:func:`finalize_exited_workers`), and its record
-    goes with it. Tasks in ``owned_ids`` (with a thread in this supervisor,
-    such as a task a reaper parked while its dispatch thread still waits on
-    the worker) are left to that thread.
+    A parked worker is held to its task's duration cap
+    (``runner.caps.effective_duration_cap_s``) like a monitored one: past it,
+    :meth:`tick` terminates its process group through
+    :func:`supervisor.reconcile_silent.terminate_worker` and records the run
+    as killed by the cap. Once a worker has exited, or been stopped, its run
+    is recorded from its log, as at startup, by :meth:`finalize`, which the
+    orchestrator runs on a thread holding the task's slot (the
+    post-dispatch hook can take minutes); its record goes with it. A run
+    that cannot be recorded (the Task YAML missing, the finalize raising)
+    is logged once per distinct error and retried after a growing delay
+    (:data:`RETRY_FIRST_S` doubling to :data:`RETRY_MAX_S`).
 
-    Only state files whose text names the park's stop reason are parsed, so
-    a tick on a queue of thousands of tasks reads each file but parses few.
+    Tasks in ``owned_ids`` (with a thread in this supervisor: a task a
+    reaper parked while its dispatch thread still waits on the worker, or a
+    run being recorded) are left to that thread. Only state files whose text
+    names the park's stop reason are parsed, so a tick on a queue of
+    thousands of tasks reads each file but parses few.
+
+    It also queues parks made outside it (:meth:`note_park`, from the
+    dispatch guards' threads) for the orchestrator to report.
     """
-    paths = [p for p in list_state_files(queue_dir) if p.stem not in owned_ids and _names_park(p)]
-    if not paths:
-        return ParkedWorkers(in_flight=[], finished=[])
 
-    prior_accounts = _prior_accounts(settings, prior_in_flight)
-    sole_account = settings.accounts[0].name if len(settings.accounts) == 1 else None
-    records: list[InFlightRecord] = []
-    finished: list[ExitedWorkerResult] = []
-    for state_path in paths:
-        try:
-            state = load_state(state_path)
-        except Exception as exc:
-            logger.debug("parked-worker pass: skipping %s: %s", state_path, exc)
-            continue
-        if not dispatcher_mod.is_parked_live_worker(state):
-            continue
-        account = prior_accounts.get(state.task_id) or state.session_host_account()
-        if dispatcher_mod.probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE:
-            records.append(
-                InFlightRecord(
-                    task_id=state.task_id,
-                    account=account or sole_account or UNATTRIBUTED_ACCOUNT,
-                    started_at=(
-                        state.last_started_at if state.last_started_at is not None else clock.now()
-                    ),
-                )
+    RETRY_FIRST_S = 60.0
+    RETRY_MAX_S = 3600.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._finished: list[ExitedWorkerResult] = []
+        self._failures: dict[str, _Failure] = {}
+        self._parks: list[tuple[TaskState, str]] = []
+
+    def tick(
+        self,
+        queue_dir: Path,
+        *,
+        settings: Settings,
+        clock: Clock,
+        prior_in_flight: Sequence[InFlightRecord],
+        owned_ids: Collection[str],
+    ) -> ParkedWorkers:
+        """This tick's parked workers: see the class docstring."""
+        with self._lock:
+            finished, self._finished = self._finished, []
+        paths = [
+            p for p in list_state_files(queue_dir) if p.stem not in owned_ids and _names_park(p)
+        ]
+        if not paths:
+            return ParkedWorkers(in_flight=[], to_finalize=[], finished=finished)
+
+        now = clock.now()
+        records: list[InFlightRecord] = []
+        jobs: list[ParkedFinalize] = []
+        for state_path in paths:
+            try:
+                state = load_state(state_path)
+            except Exception as exc:
+                logger.debug("parked-worker pass: skipping %s: %s", state_path, exc)
+                continue
+            if not dispatcher_mod.is_parked_live_worker(state):
+                continue
+            assert state.pid is not None  # narrowed by is_parked_live_worker
+            record = self.record_for(
+                state, settings=settings, prior_in_flight=prior_in_flight, now=now
             )
-            continue
-        result = _record_exited(queue_dir, state, settings=settings, clock=clock, account=account)
-        if result is not None:
-            finished.append(result)
-    records.sort(key=lambda r: r.task_id)
-    return ParkedWorkers(in_flight=records, finished=finished)
+            account = record.account if record.account != UNATTRIBUTED_ACCOUNT else None
+            if dispatcher_mod.probe_recorded_worker(state, queue_dir) is not WorkerProbe.ALIVE:
+                if not self._waiting(state.task_id, now):
+                    jobs.append(ParkedFinalize(state, account, None))
+                continue
+            violation = self._past_cap(queue_dir, state, settings, now)
+            if violation is None or self._waiting(state.task_id, now):
+                records.append(record)
+                continue
+            logger.warning(
+                "task %s: parked worker pid=%s has run %.0fs, past its duration cap of "
+                "%.0fs; terminating its process group",
+                state.task_id,
+                state.pid,
+                violation.observed,
+                violation.cap,
+            )
+            if not reconcile_silent.terminate_worker(state.pid):
+                with self._lock:
+                    self._fail(
+                        state.task_id,
+                        f"worker pid={state.pid} survived its duration-cap terminate",
+                        now,
+                    )
+                records.append(record)
+                continue
+            jobs.append(ParkedFinalize(state, account, violation))
+        records.sort(key=lambda r: r.task_id)
+        return ParkedWorkers(in_flight=records, to_finalize=jobs, finished=finished)
+
+    def record_for(
+        self,
+        state: TaskState,
+        *,
+        settings: Settings,
+        prior_in_flight: Sequence[InFlightRecord],
+        now: datetime,
+    ) -> InFlightRecord:
+        """The in-flight record of ``state``'s parked worker.
+
+        The account is the previous tick's ``prior_in_flight`` record for the
+        task (the previous supervisor's, after a restart:
+        ``reconcile_orphans`` keeps it), then the state's session host
+        account, then the only account of a single-account queue; with none,
+        :data:`UNATTRIBUTED_ACCOUNT`, which counts against an explicit
+        ``[concurrency].max_concurrency`` only.
+        """
+        sole = settings.accounts[0].name if len(settings.accounts) == 1 else None
+        account = (
+            _prior_accounts(settings, prior_in_flight).get(state.task_id)
+            or state.session_host_account()
+            or sole
+            or UNATTRIBUTED_ACCOUNT
+        )
+        started = state.last_started_at if state.last_started_at is not None else now
+        return InFlightRecord(task_id=state.task_id, account=account, started_at=started)
+
+    def finalize(
+        self, job: ParkedFinalize, queue_dir: Path, *, settings: Settings, clock: Clock
+    ) -> None:
+        """Record ``job``'s run (thread entry point); report it at the next tick."""
+        try:
+            result = _record_exited(
+                queue_dir,
+                job.state,
+                settings=settings,
+                clock=clock,
+                account=job.account,
+                cap_violation=job.cap_violation,
+            )
+        except _RecordFailed as exc:
+            with self._lock:
+                self._fail(job.state.task_id, str(exc), clock.now(), cause=exc.__cause__)
+            return
+        except Exception as exc:
+            with self._lock:
+                self._fail(job.state.task_id, f"recording raised {exc!r}", clock.now(), cause=exc)
+            return
+        with self._lock:
+            self._failures.pop(job.state.task_id, None)
+            if result is not None:
+                self._finished.append(result)
+
+    def note_park(self, state: TaskState, why: str) -> None:
+        """Queue a park made outside this pass, for the orchestrator to report."""
+        with self._lock:
+            self._parks.append((state, why))
+
+    def drain_parks(self) -> list[tuple[TaskState, str]]:
+        """The parks noted since the last call, each once."""
+        with self._lock:
+            parks, self._parks = self._parks, []
+        return parks
+
+    def _waiting(self, task_id: str, now: datetime) -> bool:
+        with self._lock:
+            failure = self._failures.get(task_id)
+        return failure is not None and now < failure.retry_at
+
+    def _fail(
+        self, task_id: str, error: str, now: datetime, cause: BaseException | None = None
+    ) -> None:
+        """Back off ``task_id``; log the error when it is new for the task.
+        The caller holds the lock."""
+        previous = self._failures.get(task_id)
+        if previous is not None and previous.error == error:
+            delay = min(previous.delay_s * 2, self.RETRY_MAX_S)
+        else:
+            delay = self.RETRY_FIRST_S
+            logger.warning(
+                "parked task %s: its run could not be recorded: %s; retrying in %.0fs, "
+                "and not logging this error again for it",
+                task_id,
+                error,
+                delay,
+                exc_info=cause,
+            )
+        self._failures[task_id] = _Failure(error, now + timedelta(seconds=delay), delay)
+
+    @staticmethod
+    def _past_cap(
+        queue_dir: Path, state: TaskState, settings: Settings, now: datetime
+    ) -> caps_mod.CapViolation | None:
+        """The duration-cap violation of ``state``'s worker, or ``None``.
+        ``None`` too when the Task YAML or the start time is unknown."""
+        if state.last_started_at is None or now < state.last_started_at:
+            return None
+        try:
+            task = load_task(task_path_for(queue_dir, state.task_id))
+        except Exception:
+            return None
+        violation = caps_mod.evaluate_caps(
+            settings=settings.task_caps,
+            task=task,
+            cumulative_tokens=0,
+            started_at=state.last_started_at,
+            now=now,
+        )
+        return violation if violation is not None and violation.which == "duration" else None
 
 
 def _names_park(state_path: Path) -> bool:
@@ -553,8 +737,9 @@ def _adopt_one_safely(
 __all__ = [
     "AdoptionResult",
     "ExitedWorkerResult",
+    "ParkedFinalize",
+    "ParkedWorkerTracker",
     "ParkedWorkers",
     "adopt_running_workers",
     "finalize_exited_workers",
-    "track_parked_workers",
 ]

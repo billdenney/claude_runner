@@ -14,7 +14,9 @@ The startup exited-worker finalize records them too.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -48,11 +50,13 @@ from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import tick_dispatch
 from claude_task_runner.supervisor import daemon as daemon_mod
 from claude_task_runner.supervisor import persistence as persist_mod
+from claude_task_runner.supervisor import reconcile_silent
 from claude_task_runner.supervisor.adoption import (
     UNATTRIBUTED_ACCOUNT,
     ExitedWorkerResult,
+    ParkedWorkers,
+    ParkedWorkerTracker,
     finalize_exited_workers,
-    track_parked_workers,
 )
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.states import (
@@ -63,6 +67,8 @@ from claude_task_runner.supervisor.states import (
 )
 from claude_task_runner.usage.models import UsageReading, WindowReading
 from claude_task_runner.usage.source import FakeUsageSource
+
+from ._worker_probe_stubs import fake_proc
 
 _NOW = datetime(2026, 10, 16, 14, 0, tzinfo=UTC)
 _PID = 4_200_007
@@ -107,9 +113,10 @@ def _resolved(name: str, cap: int) -> ResolvedAccount:
     )
 
 
-def _task(queue_dir: Path, task_id: str) -> None:
+def _task(queue_dir: Path, task_id: str, cap_s: float | None = None) -> None:
     write_task_atomic(
-        Task(id=task_id, title="t", prompt="p", working_dir=None), task_path_for(queue_dir, task_id)
+        Task(id=task_id, title="t", prompt="p", working_dir=None, max_duration_s_override=cap_s),
+        task_path_for(queue_dir, task_id),
     )
 
 
@@ -119,9 +126,11 @@ def _park(
     *,
     lines: tuple[str, ...] = (_INIT,),
     session_account: str | None = None,
+    cap_s: float | None = None,
 ) -> TaskState:
-    """A task parked while its worker, ``_PID``, ran, writing ``lines``."""
-    _task(queue_dir, task_id)
+    """A task parked while its worker, ``_PID``, ran, writing ``lines``.
+    ``cap_s`` is the task's duration cap (the queue's 4 h by default)."""
+    _task(queue_dir, task_id, cap_s)
     log = queue_dir / ".claude_task_runner" / "logs" / task_id / "attempt-1.stream.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("".join(line + "\n" for line in lines))
@@ -168,8 +177,13 @@ def _tick(
     snapshot: SupervisorSnapshot,
     accounts: list[ResolvedAccount],
     events: list[tuple[str, dict[str, Any]]] | None = None,
+    *,
+    tracker: ParkedWorkerTracker | None = None,
+    slots: dict[str, DispatchSlot] | None = None,
+    notes: list[tuple[str, str]] | None = None,
 ) -> tuple[SupervisorSnapshot, dict[str, DispatchSlot]]:
-    slots: dict[str, DispatchSlot] = {}
+    """One tick with the dispatcher stubbed; joins every slot's thread."""
+    slots = {} if slots is None else slots
     with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch", return_value=None):
         snap = tick_dispatch(
             queue_dir=queue_dir,
@@ -179,10 +193,28 @@ def _tick(
             in_flight_slots=slots,
             accounts=accounts,
             event_callback=(lambda k, p: events.append((k, p))) if events is not None else None,
+            notify_callback=(lambda lvl, m: notes.append((lvl, m))) if notes is not None else None,
+            parked_tracker=tracker,
         )
         for slot in slots.values():
-            slot.thread.join(timeout=5)
+            slot.thread.join(timeout=10)
     return snap, slots
+
+
+def _track(
+    queue_dir: Path,
+    names: list[str],
+    prior: list[InFlightRecord] | None = None,
+    tracker: ParkedWorkerTracker | None = None,
+    owned: set[str] | None = None,
+) -> ParkedWorkers:
+    return (tracker or ParkedWorkerTracker()).tick(
+        queue_dir,
+        settings=_settings(names),
+        clock=FakeClock(_NOW),
+        prior_in_flight=prior or [],
+        owned_ids=owned or set(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,18 +255,39 @@ def test_parked_live_worker_holds_its_accounts_slot(
 def test_parked_worker_releases_its_slot_and_is_recorded_when_it_exits(
     queue_dir: Path, worker: dict[str, bool]
 ) -> None:
-    """The worker finished: the next tick records its run from the log
-    (completed, one RunRecord), drops its record, and work's slot goes to
-    a pending task."""
+    """The worker finished. The tick records its run from the log
+    (completed, one RunRecord) on a thread that holds work's slot, as a
+    dispatch thread holds it through its post-dispatch hook; the next tick
+    reaps that thread, reports the run, and gives the slot to a pending
+    task."""
     _park(queue_dir, lines=(_INIT, _SUCCESS))
     _task(queue_dir, "t-a")
     names = ["work"]
     prior = [InFlightRecord(task_id="t-parked", account="work", started_at=_STARTED)]
     worker["alive"] = False
     events: list[tuple[str, dict[str, Any]]] = []
+    tracker = ParkedWorkerTracker()
 
     snap, slots = _tick(
-        queue_dir, _settings(names), _snapshot(names, prior), [_resolved("work", 1)], events
+        queue_dir,
+        _settings(names),
+        _snapshot(names, prior),
+        [_resolved("work", 1)],
+        events,
+        tracker=tracker,
+    )
+    assert [(tid, s.account) for tid, s in slots.items()] == [("t-parked", "work")]
+    assert [(r.task_id, r.account) for r in snap.in_flight] == [("t-parked", "work")]
+    assert events == []
+
+    snap, slots = _tick(
+        queue_dir,
+        _settings(names),
+        snap,
+        [_resolved("work", 1)],
+        events,
+        tracker=tracker,
+        slots=slots,
     )
 
     done = load_state(state_path_for(queue_dir, "t-parked"))
@@ -273,19 +326,21 @@ def test_parked_worker_that_crashed_is_recorded_as_failed(
     again with its session."""
     _park(queue_dir, lines=(_INIT,))
     worker["alive"] = False
+    tracker = ParkedWorkerTracker()
 
-    parked = track_parked_workers(
-        queue_dir,
-        settings=_settings(["work"]),
-        clock=FakeClock(_NOW),
-        prior_in_flight=[],
-        owned_ids=(),
+    parked = _track(queue_dir, ["work"], tracker=tracker)
+    assert parked.in_flight == []
+    assert [(j.state.task_id, j.account, j.cap_violation) for j in parked.to_finalize] == [
+        ("t-parked", "work", None)
+    ]
+    tracker.finalize(
+        parked.to_finalize[0], queue_dir, settings=_settings(["work"]), clock=FakeClock(_NOW)
     )
 
-    assert parked.in_flight == []
-    assert [(f.task_id, f.status, f.stop_reason) for f in parked.finished] == [
-        ("t-parked", "failed", "process_exit_nonzero")
-    ]
+    assert [
+        (f.task_id, f.status, f.stop_reason)
+        for f in _track(queue_dir, ["work"], tracker=tracker).finished
+    ] == [("t-parked", "failed", "process_exit_nonzero")]
     state = load_state(state_path_for(queue_dir, "t-parked"))
     assert (state.status, state.pid, len(state.runs)) == ("failed", None, 1)
 
@@ -313,18 +368,12 @@ def test_parked_worker_account_comes_from_adoptions_sources(
         [InFlightRecord(task_id="t-parked", account=prior, started_at=_STARTED)] if prior else []
     )
 
-    parked = track_parked_workers(
-        queue_dir,
-        settings=_settings(names),
-        clock=FakeClock(_NOW),
-        prior_in_flight=records,
-        owned_ids=(),
-    )
+    parked = _track(queue_dir, names, records)
 
     assert parked.in_flight == [
         InFlightRecord(task_id="t-parked", account=expected, started_at=_STARTED)
     ]
-    assert parked.finished == []
+    assert (parked.to_finalize, parked.finished) == ([], [])
 
 
 def test_unattributed_parked_worker_counts_against_the_queue_cap_only(
@@ -353,14 +402,9 @@ def test_task_with_a_monitor_thread_is_left_to_it(queue_dir: Path, worker: dict[
     """A task a reaper parked while its dispatch thread still waits on the
     worker has a slot already, and its thread records the run."""
     _park(queue_dir)
-    parked = track_parked_workers(
-        queue_dir,
-        settings=_settings(["work"]),
-        clock=FakeClock(_NOW),
-        prior_in_flight=[],
-        owned_ids={"t-parked"},
-    )
-    assert parked == type(parked)(in_flight=[], finished=[])
+    worker["alive"] = False
+    parked = _track(queue_dir, ["work"], owned={"t-parked"})
+    assert parked == ParkedWorkers(in_flight=[], to_finalize=[], finished=[])
 
 
 def test_other_possibly_hung_tasks_are_not_counted(
@@ -377,13 +421,7 @@ def test_other_possibly_hung_tasks_are_not_counted(
         ),
         state_path_for(queue_dir, "t-silent"),
     )
-    parked = track_parked_workers(
-        queue_dir,
-        settings=_settings(["work"]),
-        clock=FakeClock(_NOW),
-        prior_in_flight=[],
-        owned_ids=(),
-    )
+    parked = _track(queue_dir, ["work"])
     assert parked.in_flight == []
 
 
@@ -481,3 +519,292 @@ def test_daemon_persists_the_parked_worker_and_account_list_counts_it(
     row = account_cmd._state_fields("default", snap, frozenset(), cap=1)
     assert row["in_flight_count"] == 1
     assert load_state(state_path_for(queue_dir, "t-parked")).stop_reason == LIVE_WORKER_STOP_REASON
+
+
+# ---------------------------------------------------------------------------
+# S-1: a parked worker is held to its task's duration cap
+# ---------------------------------------------------------------------------
+
+
+def test_parked_worker_past_its_duration_cap_is_stopped_and_recorded(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Started 40 minutes ago with a 10-minute cap: the pass terminates the
+    worker's process group, and its run is recorded as killed by the
+    duration cap; it no longer holds a slot."""
+    _park(queue_dir, cap_s=600)
+    terminated: list[int] = []
+
+    def terminate(pid: int) -> bool:
+        terminated.append(pid)
+        worker["alive"] = False
+        return True
+
+    monkeypatch.setattr(reconcile_silent, "terminate_worker", terminate)
+    tracker = ParkedWorkerTracker()
+
+    parked = _track(queue_dir, ["work"], tracker=tracker)
+
+    assert terminated == [_PID]
+    assert parked.in_flight == []
+    (job,) = parked.to_finalize
+    assert job.cap_violation is not None
+    assert (job.cap_violation.which, job.cap_violation.observed, job.cap_violation.cap) == (
+        "duration",
+        2400.0,
+        600.0,
+    )
+    tracker.finalize(job, queue_dir, settings=_settings(["work"]), clock=FakeClock(_NOW))
+    state = load_state(state_path_for(queue_dir, "t-parked"))
+    assert (state.status, state.pid, [r.killed_by_cap for r in state.runs]) == (
+        "failed",
+        None,
+        ["duration"],
+    )
+
+
+def test_parked_worker_within_its_cap_is_left_running(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _park(queue_dir, cap_s=3600)
+    monkeypatch.setattr(
+        reconcile_silent,
+        "terminate_worker",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("terminated within its cap")),
+    )
+    parked = _track(queue_dir, ["work"])
+    assert [r.task_id for r in parked.in_flight] == ["t-parked"]
+    assert parked.to_finalize == []
+
+
+def test_a_capped_worker_that_survives_keeps_its_slot_and_backs_off(
+    queue_dir: Path,
+    worker: dict[str, bool],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The terminate cannot confirm the kill (a D-state, say): the worker
+    keeps its slot, the failure is logged once, and the next attempt waits
+    out the retry delay."""
+    _park(queue_dir, cap_s=600)
+    attempts: list[int] = []
+    monkeypatch.setattr(
+        reconcile_silent, "terminate_worker", lambda pid: attempts.append(pid) or False
+    )
+    tracker = ParkedWorkerTracker()
+
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.adoption"):
+        first = _track(queue_dir, ["work"], tracker=tracker)
+        second = _track(queue_dir, ["work"], tracker=tracker)
+
+    assert attempts == [_PID]
+    assert (
+        [r.task_id for r in first.in_flight]
+        == [r.task_id for r in second.in_flight]
+        == ["t-parked"]
+    )
+    assert first.to_finalize == second.to_finalize == []
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "could not be recorded" in r.getMessage()
+    ] == [
+        f"parked task t-parked: its run could not be recorded: worker pid={_PID} survived "
+        "its duration-cap terminate; retrying in 60s, and not logging this error again for it"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# N-5: a run that cannot be recorded is logged once and retried later
+# ---------------------------------------------------------------------------
+
+
+def test_unrecordable_parked_run_is_logged_once_and_backs_off(
+    queue_dir: Path, worker: dict[str, bool], caplog: pytest.LogCaptureFixture
+) -> None:
+    _park(queue_dir)
+    task_path_for(queue_dir, "t-parked").unlink()
+    worker["alive"] = False
+    tracker = ParkedWorkerTracker()
+    settings = _settings(["work"])
+
+    def tick_at(when: datetime) -> ParkedWorkers:
+        return tracker.tick(
+            queue_dir, settings=settings, clock=FakeClock(when), prior_in_flight=[], owned_ids=()
+        )
+
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.adoption"):
+        (job,) = tick_at(_NOW).to_finalize
+        tracker.finalize(job, queue_dir, settings=settings, clock=FakeClock(_NOW))
+        waiting = tick_at(_NOW + timedelta(seconds=59)).to_finalize
+        (retry,) = tick_at(_NOW + timedelta(seconds=61)).to_finalize
+        tracker.finalize(
+            retry, queue_dir, settings=settings, clock=FakeClock(_NOW + timedelta(seconds=61))
+        )
+        still_waiting = tick_at(_NOW + timedelta(seconds=61 + 119)).to_finalize
+        (again,) = tick_at(_NOW + timedelta(seconds=61 + 121)).to_finalize
+
+    assert waiting == still_waiting == []
+    assert again.state.task_id == "t-parked"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "parked task t-parked: its run could not be recorded: its Task YAML could not be loaded"
+    )
+    assert load_state(state_path_for(queue_dir, "t-parked")).status == "possibly_hung"
+
+
+# ---------------------------------------------------------------------------
+# N-6: recording a parked run runs off the tick thread, holding the slot
+# ---------------------------------------------------------------------------
+
+
+def test_a_slow_post_dispatch_hook_does_not_stall_the_tick(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _park(queue_dir, lines=(_INIT, _SUCCESS))
+    worker["alive"] = False
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow_hook(*_args: object, **_kwargs: object) -> None:
+        entered.set()
+        release.wait(timeout=30)
+
+    monkeypatch.setattr(dispatcher_mod, "_run_post_dispatch_hook", slow_hook)
+    slots: dict[str, DispatchSlot] = {}
+    names = ["work"]
+    with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch", return_value=None):
+        tick_dispatch(
+            queue_dir=queue_dir,
+            settings=_settings(names),
+            clock=FakeClock(_NOW),
+            snapshot=_snapshot(names, []),
+            in_flight_slots=slots,
+            accounts=[_resolved("work", 1)],
+        )
+    try:
+        assert entered.wait(timeout=10)
+        assert list(slots) == ["t-parked"]
+        assert slots["t-parked"].thread.is_alive()
+    finally:
+        release.set()
+        slots["t-parked"].thread.join(timeout=10)
+    assert load_state(state_path_for(queue_dir, "t-parked")).status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# N-4, N-10: a park made by the selector or a dispatch thread is reported
+# once and counted from the tick it happens in
+# ---------------------------------------------------------------------------
+
+
+def test_selector_park_is_reported_once_and_counted_the_same_tick(
+    queue_dir: Path, worker: dict[str, bool]
+) -> None:
+    """A failed task whose recorded worker still runs takes work's only
+    slot the tick the selector parks it, so the pending task waits; the
+    park is reported that tick and not again."""
+    _task(queue_dir, "t-failed")
+    log = queue_dir / ".claude_task_runner" / "logs" / "t-failed" / "attempt-1.stream.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    write_state_atomic(
+        TaskState(
+            task_id="t-failed",
+            status="failed",
+            attempts=1,
+            last_started_at=_STARTED,
+            pid=_PID,
+            log_path=str(log),
+        ),
+        state_path_for(queue_dir, "t-failed"),
+    )
+    _task(queue_dir, "t-new")
+    names = ["work"]
+    events: list[tuple[str, dict[str, Any]]] = []
+    notes: list[tuple[str, str]] = []
+    tracker = ParkedWorkerTracker()
+
+    snap, slots = _tick(
+        queue_dir,
+        _settings(names),
+        _snapshot(names, []),
+        [_resolved("work", 1)],
+        events,
+        tracker=tracker,
+        notes=notes,
+    )
+
+    assert slots == {}
+    assert [(r.task_id, r.account) for r in snap.in_flight] == [("t-failed", "work")]
+    assert events == [
+        ("live_worker_parked", {"task_id": "t-failed", "pid": _PID, "log_path": str(log)})
+    ]
+    assert notes == [
+        (
+            "warning",
+            f"task t-failed: worker pid={_PID} is still running though its task was "
+            "dispatchable; parked possibly_hung, not dispatched again",
+        )
+    ]
+
+    _tick(queue_dir, _settings(names), snap, [_resolved("work", 1)], events, tracker=tracker)
+    assert len(events) == 1
+
+
+def test_backstop_park_is_reported_at_the_next_tick(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No state records the worker, so the selector admits the task and the
+    dispatch thread's backstop parks it; the next tick reports the park."""
+    _task(queue_dir, "t-untracked")
+    log = queue_dir / ".claude_task_runner" / "logs" / "t-untracked" / "attempt-1.stream.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            _PID,
+            started=_STARTED,
+            boot=_NOW - timedelta(days=1),
+            stdout=log,
+        ),
+    )
+    names = ["work"]
+    events: list[tuple[str, dict[str, Any]]] = []
+    tracker = ParkedWorkerTracker()
+
+    snap, slots = _tick(
+        queue_dir,
+        _settings(names),
+        _snapshot(names, []),
+        [_resolved("work", 2)],
+        events,
+        tracker=tracker,
+    )
+    assert events == []
+    snap, slots = _tick(
+        queue_dir,
+        _settings(names),
+        snap,
+        [_resolved("work", 2)],
+        events,
+        tracker=tracker,
+        slots=slots,
+    )
+    _tick(
+        queue_dir,
+        _settings(names),
+        snap,
+        [_resolved("work", 2)],
+        events,
+        tracker=tracker,
+        slots=slots,
+    )
+
+    assert events == [
+        ("live_worker_parked", {"task_id": "t-untracked", "pid": _PID, "log_path": str(log)})
+    ]

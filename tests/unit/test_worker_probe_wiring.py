@@ -250,7 +250,9 @@ def test_adoption_monitor_stops_at_another_process(
         state=state,
         queue_dir=queue_dir,
         clock=RealClock(),
-        settings_caps=settings.task_caps,
+        # No duration cap: the attempt's fixed start is hours before the
+        # wall clock this test runs at.
+        settings_caps=settings.task_caps.model_copy(update={"max_duration_s_per_task": 0}),
         settings_dispatch=settings.dispatch,
         settings_hooks=settings.hooks,
         sleep_fn=no_sleep,
@@ -312,7 +314,7 @@ def test_default_terminate_reports_a_survivor(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         dispatcher_mod, "probe_worker", lambda _pid, **_kw: dispatcher_mod.WorkerProbe.ALIVE
     )
-    assert rs._default_terminate_pg(_PID) is False
+    assert rs.terminate_worker(_PID) is False
 
 
 def test_default_terminate_reports_a_failed_escalation(
@@ -323,7 +325,7 @@ def test_default_terminate_reports_a_failed_escalation(
 
     monkeypatch.setattr(dispatcher_mod, "_terminate_by_pid", refused)
     with caplog.at_level(logging.WARNING):
-        assert rs._default_terminate_pg(_PID) is False
+        assert rs.terminate_worker(_PID) is False
     assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
         f"silent-orphan reaper: _terminate_by_pid(pid={_PID}) raised "
         "[Errno 1] Operation not permitted; reporting unconfirmed kill"
@@ -345,7 +347,7 @@ def test_default_terminate_counts_a_zombie_as_gone(
     monkeypatch.setattr(dispatcher_mod, "_signal_group_by_pid", lambda pid, sig: sent.append(sig))
     start = time.monotonic()
 
-    assert rs._default_terminate_pg(_PID) is True
+    assert rs.terminate_worker(_PID) is True
     # Gone at the first check: no wait out the 5 s grace period, no SIGKILL.
     assert len(sent) == 1
     assert time.monotonic() - start < 2.0
@@ -356,4 +358,4 @@ def test_default_terminate_confirms_a_worker_that_exits(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         dispatcher_mod, "probe_worker", lambda _pid, **_kw: dispatcher_mod.WorkerProbe.DEAD
     )
-    assert rs._default_terminate_pg(_PID) is True
+    assert rs.terminate_worker(_PID) is True

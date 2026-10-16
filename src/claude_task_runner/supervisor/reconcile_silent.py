@@ -67,7 +67,7 @@ is still the recorded worker. A SILENT worker that still runs, and a
 worker that survives a kill, are parked ``possibly_hung`` with the worker
 on record (:func:`runner.dispatcher.park_live_worker`): the worker holds
 its account's slot, and its run is recorded once it exits
-(``supervisor.adoption.track_parked_workers``). A ``failed`` task is
+(``supervisor.adoption.ParkedWorkerTracker``). A ``failed`` task is
 dispatched again, and two workers would share its worktree. The SILENT
 park of a task whose worker is gone keeps the pass's own stop reason, and
 its ``error`` gives each sign of life's age.
@@ -774,7 +774,7 @@ def reconcile_silent_orphans(
         Terminates the worker's process group (SIGTERM, then SIGKILL)
         and returns ``True`` iff the worker is confirmed gone; used on a
         KILL verdict and on a stuck sleep loop. Defaults to
-        :func:`_default_terminate_pg`. Tests inject a recorder.
+        :func:`terminate_worker`. Tests inject a recorder.
     worker_probe_fn
         Whether a state's recorded pid is still its worker. Defaults to
         :func:`runner.dispatcher.probe_recorded_worker` for ``queue_dir``.
@@ -792,7 +792,7 @@ def reconcile_silent_orphans(
     if stuck_loop_detect_fn is None:
         stuck_loop_detect_fn = _detect_stuck_sleep_loop
     if terminate_fn is None:
-        terminate_fn = _default_terminate_pg
+        terminate_fn = terminate_worker
     if worker_probe_fn is None:
         worker_probe_fn = functools.partial(
             dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
@@ -882,7 +882,7 @@ def reap_silent_orphans_tick(
     if stuck_loop_detect_fn is None:
         stuck_loop_detect_fn = _detect_stuck_sleep_loop
     if terminate_fn is None:
-        terminate_fn = _default_terminate_pg
+        terminate_fn = terminate_worker
     if worker_probe_fn is None:
         worker_probe_fn = functools.partial(
             dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
@@ -1504,7 +1504,7 @@ def _maybe_kill_stuck_sleep_loop(
 
     # Terminate the worker's whole process group: SIGTERM → grace →
     # SIGKILL → post-verify (the same escalation the dispatcher's cap-kill
-    # uses; see :func:`_default_terminate_pg`). ``state.pid`` is the
+    # uses; see :func:`terminate_worker`). ``state.pid`` is the
     # worker (claude --print), spawned ``start_new_session=True`` so it
     # leads its own group; signalling the group reaps the bash + sleep
     # descendants that a bare ``os.kill(state.pid, …)`` would orphan. The
@@ -1572,7 +1572,7 @@ def _maybe_kill_stuck_sleep_loop(
     )
 
 
-def _default_terminate_pg(pid: int) -> bool:
+def terminate_worker(pid: int) -> bool:
     """SIGTERM → grace → SIGKILL → post-verify the process group led by
     ``pid``; return ``True`` iff the worker is confirmed gone afterward.
 
@@ -1629,4 +1629,5 @@ __all__ = [
     "liveness_verdict",
     "reap_silent_orphans_tick",
     "reconcile_silent_orphans",
+    "terminate_worker",
 ]

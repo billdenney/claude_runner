@@ -79,8 +79,10 @@ Edge cases:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
@@ -104,12 +106,37 @@ this specific phrase to find restarts that orphaned work)."""
 
 @dataclass(frozen=True)
 class ParkedWorker:
-    """A running orphan :func:`reconcile_orphans` parked because its worker
-    still runs; the daemon reports each one."""
+    """A task parked because its worker still runs, to report
+    (:func:`report_park`)."""
 
     task_id: str
     pid: int
     log_path: str | None
+    why: str
+    """Completes "worker pid=N is still running ..."."""
+
+
+_UNADOPTED = "and was not adopted"
+
+
+def report_park(
+    parked: ParkedWorker,
+    notify_callback: Callable[[str, str], None] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """Tell the operator about a live-worker park: a ``warning`` notify and a
+    ``live_worker_parked`` event."""
+    if notify_callback is not None:
+        notify_callback(
+            "warning",
+            f"task {parked.task_id}: worker pid={parked.pid} is still running "
+            f"{parked.why}; parked possibly_hung, not dispatched again",
+        )
+    if event_callback is not None:
+        event_callback(
+            "live_worker_parked",
+            {"task_id": parked.task_id, "pid": parked.pid, "log_path": parked.log_path},
+        )
 
 
 def reconcile_orphans(
@@ -128,7 +155,7 @@ def reconcile_orphans(
        previous supervisor's view; this supervisor has its own
        empty slot map), except the records of tasks parked with a live
        worker: they name the account each one runs on, which
-       ``supervisor.adoption.track_parked_workers`` keeps counting.
+       ``supervisor.adoption.ParkedWorkerTracker`` keeps counting.
     2. The list of task IDs whose state was demoted.
     3. A :class:`ParkedWorker` for each running orphan whose recorded
        worker still runs. Such a task is never demoted: it is parked
@@ -183,7 +210,7 @@ def reconcile_orphans(
         if live is not None:
             if _park_unadopted(live, state_path):
                 assert live.pid is not None  # live_worker_record records a pid
-                parked.append(ParkedWorker(live.task_id, live.pid, live.log_path))
+                parked.append(ParkedWorker(live.task_id, live.pid, live.log_path, _UNADOPTED))
             continue
         demoted = state.model_copy(
             update={
@@ -244,7 +271,7 @@ def _is_parked(queue_dir: Path, task_id: str) -> bool:
 def _park_unadopted(state: TaskState, state_path: Path) -> bool:
     """Park a running orphan whose worker still runs, with a WARNING.
     ``False`` when the state could not be written."""
-    parked = park_live_worker(state, why="and was not adopted by this supervisor")
+    parked = park_live_worker(state, why=f"{_UNADOPTED} by this supervisor")
     try:
         write_state_atomic(parked, state_path)
     except Exception as exc:
@@ -275,4 +302,5 @@ __all__ = [
     "ParkedWorker",
     "park_live_worker",
     "reconcile_orphans",
+    "report_park",
 ]
