@@ -1203,9 +1203,21 @@ def start_daemon(
             # have time to mark possibly_hung). Adopted tasks (ADR-0025)
             # are shielded — they have a live worker + monitor thread — and
             # one whose worker still runs unadopted is parked possibly_hung.
-            snapshot, orphan_ids = reconcile_mod.reconcile_orphans(
+            snapshot, orphan_ids, parked = reconcile_mod.reconcile_orphans(
                 queue_dir, snapshot, adopted_ids=adopted_ids
             )
+            for p in parked:
+                if notify_callback is not None:
+                    notify_callback(
+                        "warning",
+                        f"task {p.task_id}: worker pid={p.pid} is still running and was "
+                        "not adopted; parked possibly_hung, not dispatched again",
+                    )
+                if event_callback is not None:
+                    event_callback(
+                        "live_worker_parked",
+                        {"task_id": p.task_id, "pid": p.pid, "log_path": p.log_path},
+                    )
             if orphan_ids:
                 logger.info(
                     "reconciled %d orphan task(s) for session resume: %s",

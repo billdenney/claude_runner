@@ -90,7 +90,7 @@ def test_running_task_demoted_to_failed(tmp_path: Path) -> None:
     _seed(qd, "t-running", status="running", session_id="sess-abc")
 
     snap = _empty_snapshot()
-    _new_snap, orphans = reconcile_orphans(qd, snap)
+    _new_snap, orphans, _parked = reconcile_orphans(qd, snap)
 
     assert orphans == ["t-running"]
     # Re-read from disk to confirm the write was persisted.
@@ -112,7 +112,7 @@ def test_running_task_with_no_session_id_still_demoted(tmp_path: Path) -> None:
     qd = _queue(tmp_path)
     _seed(qd, "t-no-session", status="running", session_id=None)
 
-    _new_snap, orphans = reconcile_orphans(qd, _empty_snapshot())
+    _new_snap, orphans, _parked = reconcile_orphans(qd, _empty_snapshot())
     assert orphans == ["t-no-session"]
 
     from claude_task_runner.queue.store import load_state
@@ -133,7 +133,7 @@ def test_does_not_touch_pending_completed_or_failed(tmp_path: Path) -> None:
     _seed(qd, "t-completed", status="completed")
     _seed(qd, "t-already-failed", status="failed", session_id="sess-x")
 
-    _, orphans = reconcile_orphans(qd, _empty_snapshot())
+    _, orphans, _parked = reconcile_orphans(qd, _empty_snapshot())
     assert orphans == []
 
     from claude_task_runner.queue.store import load_state
@@ -155,7 +155,7 @@ def test_does_not_touch_awaiting_sidecar(tmp_path: Path) -> None:
     qd = _queue(tmp_path)
     _seed(qd, "t-sidecar", status="awaiting_sidecar", session_id="sess-x")
 
-    _, orphans = reconcile_orphans(qd, _empty_snapshot())
+    _, orphans, _parked = reconcile_orphans(qd, _empty_snapshot())
     assert orphans == []
 
     from claude_task_runner.queue.store import load_state
@@ -178,7 +178,7 @@ def test_clears_stale_snapshot_in_flight_records(tmp_path: Path) -> None:
     assert len(snap.in_flight) == 1
     assert len(snap.in_flight_task_ids) == 1
 
-    new_snap, _ = reconcile_orphans(qd, snap)
+    new_snap, _, _parked = reconcile_orphans(qd, snap)
     assert new_snap.in_flight == []
     assert new_snap.in_flight_task_ids == []
     # Other fields are untouched.
@@ -197,7 +197,7 @@ def test_unparseable_state_file_skipped(tmp_path: Path) -> None:
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text("not yaml: ][", encoding="utf-8")
 
-    _, orphans = reconcile_orphans(qd, _empty_snapshot())
+    _, orphans, _parked = reconcile_orphans(qd, _empty_snapshot())
     assert orphans == ["t-good"]
 
 
@@ -213,7 +213,7 @@ def test_multiple_orphans_all_demoted(tmp_path: Path) -> None:
     _seed(qd, "t3", status="running", session_id=None)
     _seed(qd, "t4", status="completed")  # control
 
-    _, orphans = reconcile_orphans(qd, _empty_snapshot())
+    _, orphans, _parked = reconcile_orphans(qd, _empty_snapshot())
     assert sorted(orphans) == ["t1", "t2", "t3"]
 
 
@@ -247,7 +247,7 @@ def test_live_pipe_backed_worker_is_parked_and_a_reused_pid_is_demoted(
         )
 
     with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.reconcile"):
-        _snap, demoted = reconcile_orphans(qd, _empty_snapshot())
+        _snap, demoted, _parked = reconcile_orphans(qd, _empty_snapshot())
 
     assert demoted == ["t-reused"]
     reused = load_state(state_path_for(qd, "t-reused"))

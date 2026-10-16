@@ -75,6 +75,7 @@ Edge cases:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_task_runner.queue.schema import TaskState
@@ -84,6 +85,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner.dispatcher import LIVE_WORKER_STOP_REASON, park_live_worker
 from claude_task_runner.supervisor.states import SupervisorSnapshot
 
 logger = logging.getLogger(__name__)
@@ -94,31 +96,15 @@ ORPHAN_STOP_REASON = "orphaned_by_supervisor_restart"
 task's previous run is marked failed (and can grep journals for
 this specific phrase to find restarts that orphaned work)."""
 
-LIVE_WORKER_STOP_REASON = "worker_still_running"
-"""Stop reason recorded on a task parked ``possibly_hung`` because its
-worker is still running and no supervisor monitors it: not adopted at
-startup, or alive after a reaper's terminate. ``possibly_hung`` is never
-dispatched, so the task gets no second worker; the operator resumes it
-once the pid named in ``error`` has exited."""
 
+@dataclass(frozen=True)
+class ParkedWorker:
+    """A running orphan :func:`reconcile_orphans` parked because its worker
+    still runs; the daemon reports each one."""
 
-def park_live_worker(state: TaskState, *, why: str) -> TaskState:
-    """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
-    still runs. ``why`` completes "worker pid=N is still running ...".
-
-    Keeps ``pid`` and ``log_path``, so the operator, and the error, can
-    find the worker.
-    """
-    return state.model_copy(
-        update={
-            "status": "possibly_hung",
-            "stop_reason": LIVE_WORKER_STOP_REASON,
-            "error": (
-                f"worker pid={state.pid} is still running {why}; parked so the task "
-                f"is not dispatched again while it runs"
-            ),
-        }
-    )
+    task_id: str
+    pid: int
+    log_path: str | None
 
 
 def reconcile_orphans(
@@ -126,7 +112,7 @@ def reconcile_orphans(
     snapshot: SupervisorSnapshot,
     *,
     adopted_ids: set[str] | None = None,
-) -> tuple[SupervisorSnapshot, list[str]]:
+) -> tuple[SupervisorSnapshot, list[str], list[ParkedWorker]]:
     """Demote orphan ``"running"`` TaskStates to ``"failed"``.
 
     Called by ``start_daemon`` once at startup, after the snapshot is
@@ -137,10 +123,10 @@ def reconcile_orphans(
        previous supervisor's view; this supervisor has its own
        empty slot map).
     2. The list of task IDs whose state was demoted.
-
-    A running orphan whose recorded worker still runs is never demoted:
-    it is parked ``possibly_hung`` with :data:`LIVE_WORKER_STOP_REASON`
-    and logged at WARNING, and is not in the returned list.
+    3. A :class:`ParkedWorker` for each running orphan whose recorded
+       worker still runs. Such a task is never demoted: it is parked
+       ``possibly_hung`` with :data:`LIVE_WORKER_STOP_REASON` and logged at
+       WARNING, and the daemon notifies the operator.
 
     Writes are atomic per TaskState via
     :func:`queue.store.write_state_atomic`. The snapshot is returned
@@ -165,6 +151,7 @@ def reconcile_orphans(
     """
     shielded = adopted_ids or set()
     orphan_ids: list[str] = []
+    parked: list[ParkedWorker] = []
     for state_path in list_state_files(queue_dir):
         try:
             state = load_state(state_path)
@@ -186,7 +173,9 @@ def reconcile_orphans(
             )
             continue
         if dispatcher_mod.probe_recorded_worker(state) is dispatcher_mod.WorkerProbe.ALIVE:
-            _park_unadopted(state, state_path)
+            if _park_unadopted(state, state_path):
+                assert state.pid is not None  # narrowed by the probe
+                parked.append(ParkedWorker(state.task_id, state.pid, state.log_path))
             continue
         demoted = state.model_copy(
             update={
@@ -227,11 +216,12 @@ def reconcile_orphans(
             "in_flight_task_ids": [],
         }
     )
-    return new_snapshot, orphan_ids
+    return new_snapshot, orphan_ids, parked
 
 
-def _park_unadopted(state: TaskState, state_path: Path) -> None:
-    """Park a running orphan whose worker still runs, with a WARNING."""
+def _park_unadopted(state: TaskState, state_path: Path) -> bool:
+    """Park a running orphan whose worker still runs, with a WARNING.
+    ``False`` when the state could not be written."""
     parked = park_live_worker(state, why="and was not adopted by this supervisor")
     try:
         write_state_atomic(parked, state_path)
@@ -244,7 +234,7 @@ def _park_unadopted(state: TaskState, state_path: Path) -> None:
             state_path,
             exc,
         )
-        return
+        return False
     logger.warning(
         "reconcile_orphans: task %s's worker pid=%s is still running and was not "
         "adopted; parked possibly_hung (stop_reason=%s), not failed, so it is not "
@@ -254,11 +244,13 @@ def _park_unadopted(state: TaskState, state_path: Path) -> None:
         LIVE_WORKER_STOP_REASON,
         state.log_path,
     )
+    return True
 
 
 __all__ = [
     "LIVE_WORKER_STOP_REASON",
     "ORPHAN_STOP_REASON",
+    "ParkedWorker",
     "park_live_worker",
     "reconcile_orphans",
 ]

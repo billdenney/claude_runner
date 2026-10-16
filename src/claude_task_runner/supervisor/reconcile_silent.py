@@ -60,7 +60,7 @@ one adoption takes.
 Neither pass signals a pid, or sets a task whose worker is still running
 to ``failed``, before :func:`runner.dispatcher.probe_worker` says the pid
 is still the recorded worker. A kill the worker survives parks the task
-``possibly_hung`` (:func:`supervisor.reconcile.park_live_worker`); a
+``possibly_hung`` (:func:`runner.dispatcher.park_live_worker`); a
 ``failed`` task is dispatched again, and two workers would share its
 worktree.
 
@@ -196,12 +196,11 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
-from claude_task_runner.runner.dispatcher import WorkerProbe
+from claude_task_runner.runner.dispatcher import WorkerProbe, park_live_worker
 from claude_task_runner.runner.heartbeat import (
     HeartbeatVerdict,
     evaluate,
 )
-from claude_task_runner.supervisor.reconcile import park_live_worker
 
 logger = logging.getLogger(__name__)
 

@@ -203,11 +203,33 @@ def test_daemon_kill_switch_adopts_nothing(
         lambda **_kw: (_ for _ in ()).throw(AssertionError("adoption disabled")),
     )
 
-    _run_daemon(qd, _settings(adopt=False), monkeypatch)
+    notifications, events = _run_daemon(qd, _settings(adopt=False), monkeypatch)
 
     reloaded = load_state(state_path_for(qd, "t-off"))
     assert reloaded.status == status
     assert reloaded.stop_reason == stop_reason
+    # A park is reported to the operator; a demotion is not.
+    parked_notes = [
+        (lvl, msg) for lvl, msg in notifications if "still running and was not adopted" in msg
+    ]
+    parked_events = [(k, p) for k, p in events if k == "live_worker_parked"]
+    if alive:
+        assert parked_notes == [
+            (
+                "warning",
+                "task t-off: worker pid=4321 is still running and was not adopted; "
+                "parked possibly_hung, not dispatched again",
+            )
+        ]
+        assert parked_events == [
+            (
+                "live_worker_parked",
+                {"task_id": "t-off", "pid": 4321, "log_path": reloaded.log_path},
+            )
+        ]
+    else:
+        assert parked_notes == []
+        assert parked_events == []
 
 
 # ---------------------------------------------------------------------------

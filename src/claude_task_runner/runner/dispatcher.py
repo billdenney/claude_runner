@@ -681,6 +681,45 @@ def probe_recorded_worker(state: TaskState) -> WorkerProbe:
     )
 
 
+LIVE_WORKER_STOP_REASON = "worker_still_running"
+"""Stop reason recorded on a task parked ``possibly_hung`` because its
+worker still runs with no supervisor thread monitoring it: not adopted at
+startup, alive after a reaper's terminate, or found running when its task
+was about to be dispatched again. ``possibly_hung`` is never dispatched,
+so the task gets no second worker. Each tick, the parked worker holds a
+slot of the account it runs on, and once it exits its run is recorded
+from its log (``supervisor.adoption.track_parked_workers``)."""
+
+
+def park_live_worker(state: TaskState, *, why: str) -> TaskState:
+    """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
+    still runs. ``why`` completes "worker pid=N is still running ...".
+
+    Keeps ``pid``, ``log_path`` and the spawn identity: they are how the
+    parked worker is probed each tick and its run recorded once it exits.
+    """
+    return state.model_copy(
+        update={
+            "status": "possibly_hung",
+            "stop_reason": LIVE_WORKER_STOP_REASON,
+            "error": (
+                f"worker pid={state.pid} is still running {why}; parked so the task "
+                f"is not dispatched again while it runs"
+            ),
+        }
+    )
+
+
+def is_parked_live_worker(state: TaskState) -> bool:
+    """Whether ``state`` was parked by :func:`park_live_worker` and still
+    records the worker's pid."""
+    return (
+        state.status == "possibly_hung"
+        and state.stop_reason == LIVE_WORKER_STOP_REASON
+        and state.pid is not None
+    )
+
+
 def _process_identity(pid: int) -> tuple[str | None, int | None]:
     """``(boot_id, start_ticks)`` of the running process ``pid``, for
     :func:`probe_worker`; ``(None, None)`` when ``/proc`` cannot say."""
@@ -2283,6 +2322,7 @@ def finalize_exited_worker(
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
+    require_result: bool = True,
 ) -> DispatchOutcome | None:
     """Record the run of a file-backed worker that exited with no supervisor watching.
 
@@ -2299,16 +2339,19 @@ def finalize_exited_worker(
     Returns ``None`` and writes nothing when the log holds no terminal
     ``result`` event. That worker crashed or was killed mid-run, and the
     startup reaper and ``reconcile_orphans`` handle it as they always have.
+    With ``require_result=False``, for a worker parked by
+    :func:`park_live_worker` (no later pass handles a parked task), such a
+    run is recorded as a crash instead, as :func:`adopt_worker` records a
+    worker whose pid vanished; a worker with no log (pipe-backed) is
+    recorded the same way.
 
     The caller has established that ``state.pid`` is dead, so nothing here
     signals or waits on a process. No cap is applied: caps stop a live
     worker, and this one ended on its own.
     """
-    if state.log_path is None:
-        return None
-    log_path = Path(state.log_path)
-    summary = _reparse_stdout_file(log_path)
-    if summary.final_result is None:
+    log_path = Path(state.log_path) if state.log_path is not None else None
+    summary = _reparse_stdout_file(log_path) if log_path is not None else StreamSummary()
+    if require_result and summary.final_result is None:
         return None
 
     now = clock.now()
@@ -2319,8 +2362,14 @@ def finalize_exited_worker(
         summary=summary,
         cap_violation=None,
         started_at=started_at,
-        finished_at=_log_finished_at(log_path, started_at=started_at, now=now),
-        stderr_tail=_read_stderr_tail(_stderr_path_for_stdout_log(log_path)),
+        finished_at=(
+            _log_finished_at(log_path, started_at=started_at, now=now)
+            if log_path is not None
+            else now
+        ),
+        stderr_tail=(
+            _read_stderr_tail(_stderr_path_for_stdout_log(log_path)) if log_path is not None else ""
+        ),
         account=account,
         queue_dir=queue_dir,
         settings_failure_classifier=settings_failure_classifier,
@@ -2380,7 +2429,9 @@ def _finalize_adopted(
     The terminal write uses the same recheck guard as the silent-orphan
     reaper: if the on-disk status is no longer ``"running"`` a concurrent
     reaper finalized first, so we stand down rather than clobber its
-    record (ADR-0025 concurrency note).
+    record (ADR-0025 concurrency note). A task parked by
+    :func:`park_live_worker` for this same worker is the exception: the
+    park only waited for the worker to exit, so its run is recorded.
     """
     # No terminal result ⇒ infer a crash via a non-zero synthetic exit
     # code so _build_run_record records ``process_exit_nonzero``. A present result
@@ -2466,7 +2517,9 @@ def _finalize_adopted(
         )
         write_state_atomic(final_state, state_path)
     else:
-        if current.status == "running":
+        if current.status == "running" or (
+            is_parked_live_worker(current) and current.pid == prior.pid
+        ):
             write_state_atomic(final_state, state_path)
         else:
             logger.info(

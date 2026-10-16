@@ -96,7 +96,8 @@ class ExitedWorkerResult:
 
     task_id: str
     pid: int
-    log_path: str
+    log_path: str | None
+    """``None`` for a parked pipe-backed worker, which left no log."""
     status: str
     """The status the finalize wrote, e.g. ``completed`` or ``failed``."""
     stop_reason: str | None
@@ -269,6 +270,11 @@ def finalize_exited_workers(
     A log without one is left alone. That worker crashed, and the silent-orphan reaper and
     ``reconcile_orphans`` handle it as before.
 
+    A task parked by :func:`runner.dispatcher.park_live_worker` whose
+    worker has exited since is recorded too, whatever its log holds (a
+    crash without a ``result`` event), since no later pass handles a
+    parked task.
+
     Must run before :func:`supervisor.reconcile_silent.reconcile_silent_orphans`.
     A finished worker's heartbeat is as stale as a hung one's, so the
     reaper would park it ``possibly_hung``, or ``reconcile_orphans`` would
@@ -305,91 +311,117 @@ def finalize_exited_workers(
 
         if not _has_exited(state):
             continue
-
-        assert state.pid is not None  # narrowed by _has_exited
-        assert state.log_path is not None  # narrowed by _has_exited
-
-        try:
-            task = load_task(task_path_for(queue_dir, state.task_id))
-        except Exception as exc:
-            # The finalize needs the Task for the ADR-0020 output gate.
-            logger.warning(
-                "exited-worker finalize: task %s's worker exited but its Task "
-                "YAML could not be loaded (%s); leaving it for reconcile_orphans",
-                state.task_id,
-                exc,
-            )
-            continue
-
-        try:
-            outcome = dispatcher_mod.finalize_exited_worker(
-                task=task,
-                state=state,
-                queue_dir=queue_dir,
-                clock=clock,
-                settings_dispatch=settings.dispatch,
-                settings_hooks=settings.hooks,
-                settings_failure_classifier=settings.failure_classifier,
-                account=prior_accounts.get(state.task_id) or state.session_host_account(),
-            )
-        except Exception:
-            # One task must not keep the supervisor from starting. The
-            # later passes still demote it, as before this pass existed.
-            logger.exception(
-                "exited-worker finalize failed for task %s; leaving it for the "
-                "silent-orphan reaper and reconcile_orphans",
-                state.task_id,
-            )
-            continue
-        if outcome is None:
-            logger.info(
-                "task %s: worker pid=%s exited with no result event in %s; "
-                "leaving it to the silent-orphan reaper and reconcile_orphans",
-                state.task_id,
-                state.pid,
-                state.log_path,
-            )
-            continue
-        if outcome.new_state.runs[-1:] != [outcome.run_record]:
-            # The recheck guard found the task already off "running" and
-            # stood down, so the new state is the other writer's, not ours.
-            continue
-
-        results.append(
-            ExitedWorkerResult(
-                task_id=state.task_id,
-                pid=state.pid,
-                log_path=state.log_path,
-                status=outcome.new_state.status,
-                stop_reason=outcome.new_state.stop_reason,
-            )
+        result = _record_exited(
+            queue_dir,
+            state,
+            settings=settings,
+            clock=clock,
+            account=prior_accounts.get(state.task_id) or state.session_host_account(),
         )
-        logger.info(
-            "recorded exited worker for task %s from its log (pid=%s, log=%s): "
-            "status=%s stop_reason=%s",
-            state.task_id,
-            state.pid,
-            state.log_path,
-            outcome.new_state.status,
-            outcome.new_state.stop_reason,
-        )
+        if result is not None:
+            results.append(result)
 
     return results
 
 
-def _has_exited(state: TaskState) -> bool:
-    """True iff ``state`` is a file-backed ``running`` task whose worker is gone.
+def _record_exited(
+    queue_dir: Path,
+    state: TaskState,
+    *,
+    settings: Settings,
+    clock: Clock,
+    account: str | None,
+) -> ExitedWorkerResult | None:
+    """Record the run of ``state``'s worker, which has exited, from its log.
 
-    Gone means no process has the pid, or another process does
-    (:func:`runner.dispatcher.probe_worker`). Needs a recorded ``pid`` to
-    probe. Without one there is no telling whether the worker still runs,
-    so the task stays with the later passes.
+    A ``running`` task whose log has no ``result`` event is left alone (the
+    worker crashed; the silent-orphan reaper and ``reconcile_orphans``
+    handle it). A task parked by :func:`runner.dispatcher.park_live_worker`
+    has no later pass, so its run is recorded whatever the log holds: a
+    crash without a ``result`` event, or with no log at all. ``None`` when
+    nothing was recorded.
     """
-    if state.status != "running":
+    assert state.pid is not None  # narrowed by the callers
+    try:
+        task = load_task(task_path_for(queue_dir, state.task_id))
+    except Exception as exc:
+        # The finalize needs the Task for the ADR-0020 output gate.
+        logger.warning(
+            "exited-worker finalize: task %s's worker exited but its Task "
+            "YAML could not be loaded (%s); leaving its state as it is",
+            state.task_id,
+            exc,
+        )
+        return None
+
+    try:
+        outcome = dispatcher_mod.finalize_exited_worker(
+            task=task,
+            state=state,
+            queue_dir=queue_dir,
+            clock=clock,
+            settings_dispatch=settings.dispatch,
+            settings_hooks=settings.hooks,
+            settings_failure_classifier=settings.failure_classifier,
+            account=account,
+            require_result=not dispatcher_mod.is_parked_live_worker(state),
+        )
+    except Exception:
+        # One task must not keep the supervisor from starting or ticking.
+        logger.exception(
+            "exited-worker finalize failed for task %s; leaving its state as it is",
+            state.task_id,
+        )
+        return None
+    if outcome is None:
+        logger.info(
+            "task %s: worker pid=%s exited with no result event in %s; "
+            "leaving it to the silent-orphan reaper and reconcile_orphans",
+            state.task_id,
+            state.pid,
+            state.log_path,
+        )
+        return None
+    if outcome.new_state.runs[-1:] != [outcome.run_record]:
+        # The recheck guard found the task already off "running" and
+        # stood down, so the new state is the other writer's, not ours.
+        return None
+
+    logger.info(
+        "recorded exited worker for task %s from its log (pid=%s, log=%s): "
+        "status=%s stop_reason=%s",
+        state.task_id,
+        state.pid,
+        state.log_path,
+        outcome.new_state.status,
+        outcome.new_state.stop_reason,
+    )
+    return ExitedWorkerResult(
+        task_id=state.task_id,
+        pid=state.pid,
+        log_path=state.log_path,
+        status=outcome.new_state.status,
+        stop_reason=outcome.new_state.stop_reason,
+    )
+
+
+def _has_exited(state: TaskState) -> bool:
+    """True iff ``state``'s recorded worker is gone and its run is unrecorded.
+
+    That is a file-backed ``running`` task, or a task parked by
+    :func:`runner.dispatcher.park_live_worker` (whose ``pid`` and
+    ``log_path`` are kept for this), whose worker no longer runs: no
+    process has the pid, or another process does
+    (:func:`runner.dispatcher.probe_recorded_worker`). Needs a recorded
+    ``pid`` to probe. Without one there is no telling whether the worker
+    still runs, so the task stays with the later passes.
+    """
+    if state.pid is None:
         return False
-    if state.pid is None or state.log_path is None:
-        return False
-    if not Path(state.log_path).exists():
+    if state.status == "running":
+        if state.log_path is None or not Path(state.log_path).exists():
+            return False
+    elif not dispatcher_mod.is_parked_live_worker(state):
         return False
     return dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE
 
