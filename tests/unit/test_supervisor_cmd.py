@@ -315,7 +315,9 @@ def test_stop_has_no_timeout_option(runner: CliRunner, queue_dir: Path) -> None:
     with _live_supervisor(queue_dir, clock, exits_after=None) as (kill, _):
         result = _invoke(runner, ["stop", "--queue", str(queue_dir), "--timeout", "5"])
     assert result.exit_code == 2
-    assert "No such option: --timeout" in _plain(result.output)
+    # click < 8.4 prints "No such option: --timeout"; 8.4 prints
+    # "No such option '--timeout'.".
+    assert re.search(r"No such option(: --timeout|\s+'--timeout')", _plain(result.output))
     kill.assert_not_called()
 
 
