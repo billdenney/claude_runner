@@ -38,7 +38,9 @@ non-specialist can read in ten seconds, as five short lines:
 - **Accounts**: one line each: taking tasks (slots in use out of the slots
   it is allowed now), or not, and why (paused, its 5-hour allowance used
   up, using its weekly allowance faster than planned, no recent usage
-  reading, its usage could not be read, a broken settings file).
+  reading, its usage could not be read, or a problem that stops it taking
+  tasks at all until fixed, such as a runner-account.toml that does not
+  load).
 - **How many can run**: the concurrency ceiling (the most tasks the queue
   may run at once), where it comes from (the sum of the accounts' own
   `max_concurrency`, or a queue-wide `[concurrency].max_concurrency` that
@@ -53,8 +55,8 @@ non-specialist can read in ten seconds, as five short lines:
   acknowledge.
 
 Then **Not normal right now**: one sentence per condition that needs the
-operator, saying what it means and what to do (a broken account settings
-file, a paused account, an expired login or an unreadable usage page, a
+operator, saying what it means and what to do (an account that cannot take
+tasks until a problem is fixed, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
 read, tasks whose worker could not be started, an unwatched worker past
 its time limit or one that exited unrecorded, unreadable sidecar requests,
@@ -105,9 +107,10 @@ with a line saying what it shows and defining its terms:
   time). `scheduled_wakeup` is the supervisor's next re-check, not when a
   throttled account resumes.
 - **Accounts and concurrency**: each account's own limit, how many it is
-  allowed now (0 while paused, throttled, without a reading, or broken),
-  in flight, paused, when a weekly-throttled account resumes, its settings
-  file and any error in it; then the queue ceiling with its parts.
+  allowed now (0 while paused, throttled, without a reading, or unable to
+  take tasks), in flight, paused, when a weekly-throttled account resumes,
+  its settings file and any problem that stops it taking tasks; then the
+  queue ceiling with its parts.
 - **Per-account state**, from supervisor.json's `accounts` map: state,
   5h/weekly util, paused (read from the `account_paused/` markers, which
   `supervisor.json` trails by a tick), in-flight count, throttle target,
@@ -152,9 +155,10 @@ with a line saying what it shows and defining its terms:
    **For your information** items.
 2. **Then the details**, section by section, each with one sentence on
    what it means, including the concurrency ceiling (its value, where it
-   comes from, whether the queue-wide cap binds) and any broken account
-   settings file (which file, the error, and that the account takes tasks
-   again within a tick of the fix).
+   comes from, whether the queue-wide cap binds) and any account that
+   cannot take tasks (the runner's error, which names the file when its
+   runner-account.toml is at fault, and that the account takes tasks again
+   within a tick of the fix).
 3. If a section could not be gathered it says "unknown", "could not list"
    or "unavailable"; say its facts are unknown, never empty or healthy.
 

@@ -461,7 +461,7 @@ def _account_line(row: dict[str, Any]) -> tuple[str, bool]:
     state = row.get("state")
     still = f"; {in_flight} still running" if in_flight else ""
     if row.get("policy_error"):
-        return f"takes no tasks, because its settings file has an error{still}", False
+        return f"takes no tasks until a problem with it is fixed{still}", False
     if row.get("paused"):
         return f"paused{still}", False
     if state == "throttled_5h":
@@ -516,8 +516,8 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
         )
     error = row.get("policy_error")
     if error:
-        path = row.get("policy_file")
-        where = "" if not path or path in error else f"{path}: "
+        # The runner's error names what is wrong: its runner-account.toml
+        # (which it names) or, for instance, its linux_user.
         poll_s = facts.poll_s
         within = (
             f"within {_duration(timedelta(seconds=poll_s))}"
@@ -525,8 +525,8 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
             else "within a minute"
         )
         notes.attention.append(
-            f"{name} takes no tasks because its settings file has an error: {where}{error}. "
-            f"Fix the file; {name} takes tasks again {within}."
+            f"{name} takes no tasks until this is fixed: {error.rstrip('.')}. Once it is, "
+            f"{name} takes tasks again {within}."
         )
         return
     if row.get("paused"):
@@ -668,7 +668,7 @@ def _capacity(
         text = f"up to {value} at once ({breakdown}; the queue-wide cap of {configured} is higher)."
     broken = ceiling.get("broken_accounts") or []
     if broken:
-        text += f" Not counted: {', '.join(broken)} (settings file error)."
+        text += f" Not counted: {', '.join(broken)} (cannot take tasks)."
     holds = facts.holds.data or {}
     queue_cap = holds.get("queue_cap")
     if holds.get("warming_up") and isinstance(queue_cap, int) and queue_cap < value:
@@ -1095,7 +1095,8 @@ def accounts_section(facts: Facts) -> str:
         "_Each account runs at most its own limit (`max_concurrency` in its "
         'runner-account.toml). "Allowed now" is what it may run at the moment: lower while it '
         "slows down to save its 5-hour allowance, 0 while it is throttled, paused, without a "
-        'usage reading, or its settings file is broken. "In flight" means running now. '
+        "usage reading, or when it cannot take tasks at all (its runner-account.toml does not "
+        'load, for one: "problem" says what). "In flight" means running now. '
         '"Resumes about" is when a weekly-throttled account\'s use falls back under plan. The '
         "queue ceiling is the most tasks the whole queue may run at once._",
         "",
@@ -1106,7 +1107,7 @@ def accounts_section(facts: Facts) -> str:
         return "\n".join(out) + "\n"
     out.append(
         "| account | limit | allowed now | in flight | paused | resumes about | settings file "
-        "| error |"
+        "| problem |"
     )
     out.append("|---|---:|---:|---:|:-:|---|---|---|")
     for row in data.get("accounts") or []:
@@ -1133,7 +1134,7 @@ def accounts_section(facts: Facts) -> str:
             f"{'not set' if configured is None else configured}"
             f"{', which binds' if ceiling.get('binds') else ''}; "
             f"warm-up cap [concurrency].initial_concurrency: "
-            f"{'not set' if initial is None else initial}; broken account files: {broken})"
+            f"{'not set' if initial is None else initial}; accounts that cannot take tasks: {broken})"
         )
     return "\n".join(out) + "\n"
 
