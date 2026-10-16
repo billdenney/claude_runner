@@ -36,7 +36,7 @@ import json
 import logging
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -927,13 +927,14 @@ def _effort_hold_reason(task: Task, effort_levels: dict[str, list[str]]) -> str 
 
 def _eligible_candidates(
     queue_dir: Path,
-    in_flight_slots: dict[str, DispatchSlot],
+    in_flight_slots: Collection[str],
     completed_ids: set[str],
     now: datetime | None = None,
     block_file: str | None = None,
     *,
     effort_levels: dict[str, list[str]],
     skips: Counter[str] | None = None,
+    read_only: bool = False,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -950,9 +951,14 @@ def _eligible_candidates(
     # under ``completed`` whichever check skipped it first, so every other
     # category counts unfinished work only. The returned tasks plus the
     # counts added here equal the number of task YAMLs read.
+    #
+    # ``in_flight_slots`` is read for its task ids only (a slot map's keys).
+    # ``read_only`` turns off the gates' bookkeeping (see
+    # :func:`_skip_category`): the same tasks are returned and counted, and
+    # no state file is written.
     tally: Counter[str] = skips if skips is not None else Counter()
     out: list[Task] = []
-    in_flight_ids = set(in_flight_slots.keys())
+    in_flight_ids = set(in_flight_slots)
 
     # Cache the open-sidecar set once per call rather than scanning the
     # sidecar directory inside every per-task branch. A task is
@@ -983,6 +989,7 @@ def _eligible_candidates(
             blocked_ids=blocked_ids,
             now=now,
             effort_levels=effort_levels,
+            read_only=read_only,
         )
         if category is None:
             out.append(task)
@@ -1001,6 +1008,7 @@ def _skip_category(
     blocked_ids: set[str],
     now: datetime | None,
     effort_levels: dict[str, list[str]],
+    read_only: bool = False,
 ) -> str | None:
     """Decide whether the selector admits ``task`` this tick.
 
@@ -1015,6 +1023,9 @@ def _skip_category(
 
     The effort and readiness gates also park a held task as ``deferred`` and
     un-park it once its hold clears (see :func:`_park_deferred`).
+    ``read_only`` skips that bookkeeping and its warning, for a caller that
+    only wants to know what the selector would do (:func:`preview_selection`);
+    the category returned is the same.
     """
     if task.id in blocked_ids:
         # An operator has flagged this task `block_dispatch: true`
@@ -1100,7 +1111,7 @@ def _skip_category(
     # queued, not only once its dependencies finish.
     effort_reason = _effort_hold_reason(task, effort_levels)
     if effort_reason is not None:
-        if not _is_parked_with(state, effort_reason):
+        if not read_only and not _is_parked_with(state, effort_reason):
             # Once per transition, not once per tick.
             logger.warning(
                 "parking task %s as deferred: %s. Fix the task's model or effort, "
@@ -1110,7 +1121,8 @@ def _skip_category(
             )
             _park_deferred(queue_dir, task.id, state, effort_reason)
         return _SKIP_INVALID_EFFORT
-    state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
+    if not read_only:
+        state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
 
     unmet = [d for d in task.depends_on if d not in completed_ids]
     if unmet:
@@ -1141,16 +1153,83 @@ def _skip_category(
             len(descriptions),
             "; ".join(descriptions),
         )
-        _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(descriptions))
+        if not read_only:
+            _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(descriptions))
         # Sorted and de-duplicated, so tasks missing the same kinds of
         # element share one category whatever order their `requires` lists.
         return _SKIP_READINESS_PREFIX + "+".join(sorted({u.category for u in unmet_reqs}))
 
     # Satisfied — if THIS gate is what parked the task, un-park it so the
     # state stops advertising a block that has cleared.
-    _unpark(queue_dir, task.id, state, readiness_mod.is_hold_reason)
+    if not read_only:
+        _unpark(queue_dir, task.id, state, readiness_mod.is_hold_reason)
 
     return None
+
+
+@dataclass(frozen=True)
+class SelectionPreview:
+    """What the dispatch selector would do now: :func:`preview_selection`."""
+
+    eligible: list[Task]
+    """The tasks it would admit, in dispatch order."""
+    eligible_statuses: dict[str, str]
+    """Each admitted task's state status, ``new`` when it has no state file
+    yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    skips: Counter[str]
+    """Every other task YAML in ``todo/``, counted under the category that
+    holds it, ``completed`` included (see :func:`_eligible_candidates`)."""
+    queue_cap: int | None
+    """The queue-wide cap on tasks in flight now (:func:`_target_concurrency`):
+    ``[concurrency].initial_concurrency`` while warming up, else
+    ``[concurrency].max_concurrency``; ``None`` when neither applies."""
+    warming_up: bool
+    """Whether ``queue_cap`` is the warm-up cap: ``initial_concurrency`` is
+    set and no task has completed yet."""
+
+
+def preview_selection(
+    queue_dir: Path,
+    settings: Settings,
+    *,
+    in_flight_ids: Collection[str],
+    now: datetime,
+) -> SelectionPreview:
+    """Run the dispatch selector once without any of its side effects.
+
+    The same :func:`_eligible_candidates` pass a supervisor tick runs, with
+    the queue's settings, its block-list and ``now``, but read-only: no task
+    is parked or un-parked and no state file is written, so a status command
+    can show what holds each task. ``in_flight_ids`` stands in for the
+    supervisor's slot map (``supervisor.json``'s ``in_flight`` records).
+    """
+    skips: Counter[str] = Counter()
+    eligible = _eligible_candidates(
+        queue_dir,
+        in_flight_ids,
+        _completed_task_ids(queue_dir),
+        now=now,
+        block_file=getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None),
+        effort_levels=settings.effort_levels,
+        skips=skips,
+        read_only=True,
+    )
+    eligible.sort(key=priority_sort_key)
+    statuses: dict[str, str] = {}
+    for task in eligible:
+        sp = state_path_for(queue_dir, task.id)
+        # The selector loaded this state a moment ago, so it parses.
+        statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+    return SelectionPreview(
+        eligible=eligible,
+        eligible_statuses=statuses,
+        skips=skips,
+        queue_cap=_target_concurrency(queue_dir, settings),
+        warming_up=(
+            settings.concurrency.initial_concurrency is not None
+            and not _has_any_completed(queue_dir)
+        ),
+    )
 
 
 def _dispatch_one_safely(
