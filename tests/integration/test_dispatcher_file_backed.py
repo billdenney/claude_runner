@@ -351,3 +351,35 @@ def test_running_state_never_carries_an_earlier_attempts_worker(
     assert running_writes[1] == (worker_pid, new_log if adopt else None)
     assert all(pid in (None, worker_pid) for pid, _log in running_writes)
     assert all(log in (None, new_log) for _pid, log in running_writes)
+
+
+@pytest.mark.usefixtures("real_proc")
+def test_spawn_records_the_workers_boot_and_start_tick(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+) -> None:
+    """The running state written with the pid names this boot and the
+    worker's start tick, and finalizing clears both."""
+    import claude_task_runner.runner.dispatcher as dmod
+
+    identities: list[tuple[int | None, str | None, int | None]] = []
+    real_write = dmod.write_state_atomic
+
+    def _spy(state: TaskState, path: Path) -> None:
+        if state.status == "running" and state.pid is not None:
+            identities.append((state.pid, state.worker_boot_id, state.worker_start_ticks))
+        real_write(state, path)
+
+    monkeypatch.setattr(dmod, "write_state_atomic", _spy)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=True)
+
+    pid, boot_id, ticks = identities[0]
+    assert pid == outcome.run_record.pid  # type: ignore[attr-defined]
+    assert boot_id == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    assert isinstance(ticks, int) and ticks > 0
+    final = load_state(state_path_for(queue_dir, task.id))
+    assert (final.worker_boot_id, final.worker_start_ticks) == (None, None)

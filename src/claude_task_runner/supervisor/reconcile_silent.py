@@ -769,8 +769,7 @@ def reconcile_silent_orphans(
         :func:`_default_terminate_pg`. Tests inject a recorder.
     worker_probe_fn
         Whether a state's recorded pid is still its worker. Defaults to
-        :func:`runner.dispatcher.probe_worker` on the state's pid, log
-        and start time.
+        :func:`runner.dispatcher.probe_recorded_worker`.
 
     Returns
     -------
@@ -787,7 +786,7 @@ def reconcile_silent_orphans(
     if terminate_fn is None:
         terminate_fn = _default_terminate_pg
     if worker_probe_fn is None:
-        worker_probe_fn = _probe_recorded_worker
+        worker_probe_fn = dispatcher_mod.probe_recorded_worker
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -875,7 +874,7 @@ def reap_silent_orphans_tick(
     if terminate_fn is None:
         terminate_fn = _default_terminate_pg
     if worker_probe_fn is None:
-        worker_probe_fn = _probe_recorded_worker
+        worker_probe_fn = dispatcher_mod.probe_recorded_worker
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -989,15 +988,6 @@ def liveness_verdict(
         ).verdict
     except ValueError:
         return None
-
-
-def _probe_recorded_worker(state: TaskState) -> WorkerProbe:
-    """:func:`runner.dispatcher.probe_worker` on ``state``'s recorded worker."""
-    if state.pid is None:
-        return WorkerProbe.DEAD
-    return dispatcher_mod.probe_worker(
-        state.pid, log_path=state.log_path, started_at=state.last_started_at
-    )
 
 
 def _classify_and_act(

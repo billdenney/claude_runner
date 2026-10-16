@@ -185,13 +185,7 @@ def reconcile_orphans(
                 state.task_id,
             )
             continue
-        if (
-            state.pid is not None
-            and dispatcher_mod.probe_worker(
-                state.pid, log_path=state.log_path, started_at=state.last_started_at
-            )
-            is dispatcher_mod.WorkerProbe.ALIVE
-        ):
+        if dispatcher_mod.probe_recorded_worker(state) is dispatcher_mod.WorkerProbe.ALIVE:
             _park_unadopted(state, state_path)
             continue
         demoted = state.model_copy(

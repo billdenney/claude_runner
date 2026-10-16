@@ -237,12 +237,7 @@ def _is_adoptable(state: TaskState, *, now: datetime, settings: Settings) -> boo
         return False
     if not Path(state.log_path).exists():
         return False
-    if (
-        dispatcher_mod.probe_worker(
-            state.pid, log_path=state.log_path, started_at=state.last_started_at
-        )
-        is not WorkerProbe.ALIVE
-    ):
+    if dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE:
         return False
     verdict = reconcile_silent.liveness_verdict(state, settings=settings.task_caps, now=now)
     if verdict is not HeartbeatVerdict.HEALTHY:
@@ -396,12 +391,7 @@ def _has_exited(state: TaskState) -> bool:
         return False
     if not Path(state.log_path).exists():
         return False
-    return (
-        dispatcher_mod.probe_worker(
-            state.pid, log_path=state.log_path, started_at=state.last_started_at
-        )
-        is not WorkerProbe.ALIVE
-    )
+    return dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE
 
 
 def _adopt_one_safely(

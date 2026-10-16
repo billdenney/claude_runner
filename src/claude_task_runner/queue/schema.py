@@ -363,6 +363,20 @@ class TaskState(_StrictBase):
     dispatch finalization. ``None`` on legacy state YAMLs, on tasks that
     have not been dispatched, on finalized tasks, and whenever adoption
     is disabled (the pipe-backed path records no log file)."""
+    worker_boot_id: str | None = None
+    """``/proc/sys/kernel/random/boot_id`` when the current attempt's worker
+    was spawned. With :attr:`worker_start_ticks` it identifies the worker
+    exactly, so ``runner.dispatcher.probe_worker`` can tell it from a
+    process given its pid later without comparing wall-clock times, which
+    clock steps move.
+
+    Written with ``pid`` right after ``Popen`` and cleared on dispatch
+    finalization. ``None`` where ``/proc`` cannot be read, on finalized
+    tasks, and on state YAMLs written before this field existed."""
+    worker_start_ticks: int | None = Field(default=None, ge=0)
+    """The worker's start time in clock ticks after boot (field 22 of
+    ``/proc/<pid>/stat``), read right after ``Popen``. See
+    :attr:`worker_boot_id`; written and cleared with it."""
     pre_dispatch_sha: str | None = None
     """``HEAD`` of the task's ``working_dir`` when the current attempt was
     dispatched. The output-evidence gate (ADR-0020) counts a commit made

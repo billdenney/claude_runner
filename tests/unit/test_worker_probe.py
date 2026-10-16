@@ -15,20 +15,23 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import (
     WORKER_START_SLACK_AFTER_S,
     WORKER_START_SLACK_BEFORE_S,
     WorkerProbe,
+    probe_recorded_worker,
     probe_worker,
 )
 
-from ._worker_probe_stubs import fake_proc
+from ._worker_probe_stubs import fake_proc, ticks_between
 
 _PID = 4242
 _BOOT = datetime(2026, 10, 1, tzinfo=UTC)
@@ -44,6 +47,7 @@ def _fake_proc(
     stdout: Path | None = None,
     boot: datetime | None = _BOOT,
     with_stat: bool = True,
+    boot_id: str | None = "boot-a",
 ) -> Path:
     """A fake ``/proc`` holding ``_PID`` (see :func:`._worker_probe_stubs.fake_proc`)."""
     return fake_proc(
@@ -54,6 +58,7 @@ def _fake_proc(
         stdout=stdout,
         state=state,
         with_stat=with_stat,
+        boot_id=boot_id,
     )
 
 
@@ -217,6 +222,113 @@ def test_without_a_start_time_or_readable_stdout_existence_decides(
     assert probe_worker(_PID, log_path=None, started_at=None) is WorkerProbe.ALIVE
 
 
+# ---------------------------------------------------------------------------
+# The identity recorded at the spawn: boot id and start ticks
+# ---------------------------------------------------------------------------
+
+_SPAWN_TICKS = ticks_between(_BOOT, _STARTED)
+
+
+@pytest.mark.usefixtures("alive")
+def test_recorded_identity_survives_a_wall_clock_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clock was stepped two hours after the spawn, so the start time
+    read against ``last_started_at`` is far outside the window. The boot id
+    and start ticks recorded at the spawn do not move with the clock: the
+    worker is still recognised."""
+    _use(monkeypatch, _fake_proc(tmp_path))
+    stepped = _STARTED - timedelta(hours=2)
+    assert probe_worker(_PID, log_path=None, started_at=stepped) is WorkerProbe.REUSED
+    assert (
+        probe_worker(
+            _PID,
+            log_path=None,
+            started_at=stepped,
+            boot_id="boot-a",
+            start_ticks=_SPAWN_TICKS,
+        )
+        is WorkerProbe.ALIVE
+    )
+
+
+@pytest.mark.usefixtures("alive")
+@pytest.mark.parametrize(
+    ("boot_id", "start_ticks", "why"),
+    [
+        (
+            "boot-a",
+            _SPAWN_TICKS - 1,
+            f"the process started {_SPAWN_TICKS} ticks after boot, "
+            f"the worker {_SPAWN_TICKS - 1} ticks after it",
+        ),
+        ("boot-z", _SPAWN_TICKS, "the worker started in boot boot-z, and this is boot boot-a"),
+    ],
+)
+def test_recorded_identity_mismatch_is_reused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    boot_id: str,
+    start_ticks: int,
+    why: str,
+) -> None:
+    """A process one tick off, or in another boot, is not the worker, even
+    when its start falls inside the wall-clock window."""
+    _use(monkeypatch, _fake_proc(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        assert (
+            probe_worker(
+                _PID,
+                log_path=None,
+                started_at=_STARTED,
+                boot_id=boot_id,
+                start_ticks=start_ticks,
+            )
+            is WorkerProbe.REUSED
+        )
+    assert _warnings(caplog) == [
+        f"pid {_PID} is not the worker of the attempt started at 2026-10-16T13:11:19+00:00 "
+        f"(log None): {why}, so the worker exited and its pid now belongs to another process"
+    ]
+
+
+@pytest.mark.usefixtures("alive")
+def test_unreadable_boot_id_falls_back_to_the_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _use(monkeypatch, _fake_proc(tmp_path, boot_id=None, started=_STARTED + timedelta(hours=1)))
+    assert (
+        probe_worker(
+            _PID, log_path=None, started_at=_STARTED, boot_id="boot-a", start_ticks=_SPAWN_TICKS
+        )
+        is WorkerProbe.REUSED
+    )
+
+
+@pytest.mark.usefixtures("alive")
+@pytest.mark.parametrize(
+    ("ticks", "expected"),
+    [(_SPAWN_TICKS, WorkerProbe.ALIVE), (_SPAWN_TICKS + 5, WorkerProbe.REUSED)],
+)
+def test_probe_recorded_worker_passes_the_whole_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ticks: int, expected: WorkerProbe
+) -> None:
+    """The state-level probe hands the recorded spawn identity on: a start
+    tick that differs from the process's is a different process."""
+    _use(monkeypatch, _fake_proc(tmp_path))
+    state = TaskState(
+        task_id="t",
+        status="running",
+        last_started_at=_STARTED,
+        pid=_PID,
+        worker_boot_id="boot-a",
+        worker_start_ticks=ticks,
+    )
+    assert probe_recorded_worker(state) is expected
+    assert probe_recorded_worker(state.model_copy(update={"pid": None})) is WorkerProbe.DEAD
+
+
 def test_pid_one_is_refused_and_dead() -> None:
     """Init is never a worker; the probe refuses it before reading anything."""
     assert probe_worker(1, log_path=None, started_at=None) is WorkerProbe.DEAD
@@ -258,6 +370,7 @@ def test_real_worker_writing_its_log_is_alive_until_it_exits(log: Path, tmp_path
         deadline = datetime.now(UTC) + timedelta(seconds=10)
         while Path(f"/proc/{child.pid}/stat").read_text().split(")")[-1].split()[0] != "Z":
             assert datetime.now(UTC) < deadline, "child never became a zombie"
+            time.sleep(0.01)
         assert dispatcher_mod._pid_alive(child.pid) is True
         assert probe_worker(child.pid, log_path=str(log), started_at=started_at) is (
             WorkerProbe.DEAD
@@ -266,3 +379,31 @@ def test_real_worker_writing_its_log_is_alive_until_it_exits(log: Path, tmp_path
         child.kill()
         child.wait(timeout=10)
     assert probe_worker(child.pid, log_path=str(log), started_at=started_at) is WorkerProbe.DEAD
+
+
+@pytest.mark.usefixtures("real_proc")
+def test_real_process_identity_is_recognised_across_a_clock_step() -> None:
+    """The identity read from the host's ``/proc`` for a real process is
+    this boot's id and the process's own start tick, and it recognises the
+    process although ``started_at`` is two hours off."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        boot_id, ticks = dispatcher_mod._process_identity(child.pid)
+        assert boot_id == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        stat = Path(f"/proc/{child.pid}/stat").read_text()
+        assert ticks == int(stat[stat.rfind(")") + 1 :].split()[19])
+        assert (
+            probe_worker(
+                child.pid,
+                log_path=None,
+                started_at=datetime.now(UTC) - timedelta(hours=2),
+                boot_id=boot_id,
+                start_ticks=ticks,
+            )
+            is WorkerProbe.ALIVE
+        )
+    finally:
+        child.kill()
+        child.wait(timeout=10)

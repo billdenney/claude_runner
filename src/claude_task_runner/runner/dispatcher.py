@@ -579,13 +579,22 @@ start may read and still be its worker. :func:`dispatch` records
 absorbs clock steps."""
 
 
-def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None) -> WorkerProbe:
-    """Whether the worker recorded on a task's state as ``pid`` still runs.
+def probe_worker(
+    pid: int,
+    *,
+    log_path: str | None,
+    started_at: datetime | None,
+    boot_id: str | None = None,
+    start_ticks: int | None = None,
+) -> WorkerProbe:
+    """Whether the worker recorded as ``pid`` still runs.
 
-    Every pass that acts on a recorded worker asks this, so they agree on
-    whether it runs: the startup exited-worker finalize and adoption, an
-    adoption monitor's tail, the silent-orphan reapers, ``reconcile_orphans``
-    and the orchestrator's leak check. :func:`_pid_alive` says only that some
+    Every pass that acts on a recorded worker asks this, through
+    :func:`probe_recorded_worker` where it has the task's state, so they
+    agree on whether it runs: the startup exited-worker finalize and
+    adoption, an adoption monitor's tail, the silent-orphan reapers,
+    ``reconcile_orphans``, the parked-worker pass, the dispatch guards and
+    the orchestrator's leak check. :func:`_pid_alive` says only that some
     process has the pid. After a reboot, or once pids wrap, that can be a
     different process, which a reaper would then signal and adoption would
     watch in place of the worker.
@@ -598,23 +607,27 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
        the same file (device and inode) for the worker and not for anything
        else. This settles it when both can be read, which needs the worker
        to run as this user.
-    3. With ``started_at`` (the state's ``last_started_at``): the process
-       must have started within :data:`WORKER_START_SLACK_BEFORE_S` before
-       and :data:`WORKER_START_SLACK_AFTER_S` after it, in the current boot.
+    3. With ``boot_id`` and ``start_ticks`` (recorded at the spawn): the
+       process must be in that boot and have started at exactly that tick.
        This covers a worker under another Linux user (``sudo``, whose fd
-       table is unreadable) and a pipe-backed one (no log).
+       table is unreadable) and a pipe-backed one (no log), and no clock
+       step moves either value.
+    4. Otherwise, with ``started_at`` (the state's ``last_started_at``),
+       for a state recorded without (3): the process must have started in
+       the current boot, within :data:`WORKER_START_SLACK_BEFORE_S` before
+       and :data:`WORKER_START_SLACK_AFTER_S` after it.
 
     A check that fails proves :attr:`~WorkerProbe.REUSED`, logged at
     WARNING. When ``/proc/<pid>/stat`` cannot be read (no ``/proc``, or
     ``hidepid`` hides another user's process) only existence is known, and
-    the answer is :attr:`~WorkerProbe.ALIVE`, as before this check existed.
+    the answer is :attr:`~WorkerProbe.ALIVE`.
     """
     if not _pid_alive(pid):
         return WorkerProbe.DEAD
     stat = _read_proc_stat(pid)
     if stat is None:
         return WorkerProbe.ALIVE
-    proc_state, start_ticks = stat
+    proc_state, proc_ticks = stat
     if proc_state in ("Z", "X"):
         return WorkerProbe.DEAD
     if log_path is not None:
@@ -629,19 +642,62 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
                 log_path,
             )
             return WorkerProbe.REUSED
-    if started_at is not None:
-        mismatch = _start_mismatch(start_ticks, started_at)
-        if mismatch is not None:
-            logger.warning(
-                "pid %s is not the worker of the attempt started at %s (log %s): %s, "
-                "so the worker exited and its pid now belongs to another process",
-                pid,
-                started_at.isoformat(),
-                log_path,
-                mismatch,
+    mismatch: str | None = None
+    current_boot = _read_boot_id() if boot_id is not None and start_ticks is not None else None
+    if current_boot is not None:
+        if current_boot != boot_id:
+            mismatch = f"the worker started in boot {boot_id}, and this is boot {current_boot}"
+        elif proc_ticks != start_ticks:
+            mismatch = (
+                f"the process started {proc_ticks} ticks after boot, "
+                f"the worker {start_ticks} ticks after it"
             )
-            return WorkerProbe.REUSED
+    elif started_at is not None:
+        mismatch = _start_mismatch(proc_ticks, started_at)
+    if mismatch is not None:
+        logger.warning(
+            "pid %s is not the worker of the attempt started at %s (log %s): %s, "
+            "so the worker exited and its pid now belongs to another process",
+            pid,
+            started_at.isoformat() if started_at is not None else None,
+            log_path,
+            mismatch,
+        )
+        return WorkerProbe.REUSED
     return WorkerProbe.ALIVE
+
+
+def probe_recorded_worker(state: TaskState) -> WorkerProbe:
+    """:func:`probe_worker` on the worker ``state`` records: its pid, log,
+    start time and spawn identity. :attr:`~WorkerProbe.DEAD` with no pid."""
+    if state.pid is None:
+        return WorkerProbe.DEAD
+    return probe_worker(
+        state.pid,
+        log_path=state.log_path,
+        started_at=state.last_started_at,
+        boot_id=state.worker_boot_id,
+        start_ticks=state.worker_start_ticks,
+    )
+
+
+def _process_identity(pid: int) -> tuple[str | None, int | None]:
+    """``(boot_id, start_ticks)`` of the running process ``pid``, for
+    :func:`probe_worker`; ``(None, None)`` when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot_id = _read_boot_id()
+    if stat is None or boot_id is None:
+        return None, None
+    return boot_id, stat[1]
+
+
+def _read_boot_id() -> str | None:
+    """This boot's id from ``/proc/sys/kernel/random/boot_id``, or ``None``."""
+    try:
+        text = (_PROC_ROOT / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
 
 
 def _read_proc_stat(pid: int) -> tuple[str, int] | None:
@@ -1650,6 +1706,8 @@ def dispatch(
             # must not point at that worker.
             "pid": None,
             "log_path": None,
+            "worker_boot_id": None,
+            "worker_start_ticks": None,
         }
     )
     if persist_state:
@@ -1844,9 +1902,12 @@ def dispatch(
             # log_path is always written, None for a pipe-backed worker:
             # the worker probe compares a recorded log with the pid's
             # stdout, so an earlier attempt's log must not stay on record.
+            boot_id, start_ticks = _process_identity(process.pid)
             pid_update: dict[str, object] = {
                 "pid": process.pid,
                 "log_path": str(stdout_log_path) if stdout_log_path is not None else None,
+                "worker_boot_id": boot_id,
+                "worker_start_ticks": start_ticks,
             }
             new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
@@ -2169,10 +2230,7 @@ def adopt_worker(
     alive_monitor.start()
 
     def _alive() -> bool:
-        return (
-            probe_worker(pid, log_path=state.log_path, started_at=state.last_started_at)
-            is WorkerProbe.ALIVE
-        )
+        return probe_recorded_worker(state) is WorkerProbe.ALIVE
 
     def _terminate_adopted() -> None:
         # The pid may have passed to another process since the last poll.
@@ -2697,6 +2755,8 @@ def _finalize_state(
             # The next dispatch records a new log_path. No-op for the
             # pipe path, where log_path was never set.
             "log_path": None,
+            "worker_boot_id": None,
+            "worker_start_ticks": None,
             # The attempt's pre-dispatch HEAD has served the output gate;
             # the next dispatch snapshots its own.
             "pre_dispatch_sha": None,
