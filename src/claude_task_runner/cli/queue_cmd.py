@@ -426,7 +426,7 @@ def holds(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     state_path = persist_mod.supervisor_state_path(qd, settings.supervisor.state_file)
     snapshot_error: str | None = None
     try:
