@@ -253,3 +253,56 @@ the supervisor stopped:
   list is lost, so a worker still running is adopted under its session's
   account, or no account when it has none (a first attempt), until it
   finishes.
+
+## Amendment (2026-10-16) — a broken account file stops the supervisor from starting
+
+**Decision change.** Decision 9 said a supervisor started with a broken
+account file starts and disables that account. The operator revisited it:
+"a broken account file should stop the supervisor from starting so that it
+will be immediately seen and fixed", and a `config_dir` that cannot be
+expanded should stop it too. A disabled account at startup is easy to
+miss; a supervisor that does not start is not. The split is now:
+
+- **At start, fatal.** `supervisor start` reads every declared account's
+  `runner-account.toml` through `config.loader.resolve_accounts`, the same
+  path as everywhere else, right after the queue TOML loads and before it
+  creates the queue's runtime directory, takes the lock, adopts workers,
+  writes `supervisor.json` or captures usage. When any account is broken
+  it prints every one, with its file and error, and exits 78
+  (`config.loader.CONFIG_ERROR_EXIT_STATUS`, `EX_CONFIG` in sysexits.h). A
+  queue TOML that does not load now exits 78 the same way, with its error
+  printed instead of a traceback.
+- **While running, non-fatal, as decision 9 says.** A file that breaks
+  after the supervisor started disables only its account, with the ERROR,
+  `policy_error`, CLI and doctor reporting and the INFO line on recovery.
+  Stopping every account's work for one account's typo is still the wrong
+  trade once work is running. `start_daemon` itself still tolerates a
+  broken file from its first tick, for one that breaks between the check
+  and that tick.
+- **Unknown `~user`.** `config.schema.AccountSettings` refuses a
+  `config_dir` whose leading `~user` names no user, so the queue TOML does
+  not load: `supervisor start` exits 78 naming the account, and a SIGHUP
+  reload carrying one is rejected and the old config kept. A rejected
+  reload, for this or any other reason, is now logged as an ERROR rather
+  than a WARNING, since the operator's edit is not in force. Every later
+  expansion of a `config_dir` goes through `config.paths.expand_config_dir`,
+  which raises `ConfigDirError` instead of `RuntimeError`; each caller turns
+  it into its own error (an account broken in `resolve_accounts`, a usage
+  capture spawn error, missing API credentials, a dispatch error, a doctor
+  failure), so a user removed while the supervisor runs fails that account
+  and cannot end the tick loop.
+- **No crash loop.** The systemd unit now has
+  `RestartPreventExitStatus=0 78`: a refused start leaves the unit
+  `failed`, with the reason in the journal, instead of being restarted
+  until `StartLimitBurst` stops it. The cron watchdog reads the account
+  files before a restart, as `supervisor start` would; when one does not
+  load it logs an ERROR naming each, starts nothing, counts no restart and
+  exits 1, as it already did for a queue TOML that does not load. It
+  leaves a running supervisor alone.
+
+**Consequences.** (+) A broken file or an unknown home at start is seen at
+once, in the journal or `supervisor.log`, and the unit or watchdog stops
+retrying. (-) An account file left broken across a restart (a reboot, a
+deploy) now keeps every account from running until it is fixed or
+deleted. (neutral) An existing unit file keeps `RestartPreventExitStatus=0`
+until `claude-task-runner install` rewrites it or the line is edited.

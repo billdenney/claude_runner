@@ -179,7 +179,15 @@ which `supervisor status` also prints. An account whose
 no new tasks and adds nothing to any of these numbers, with no policy
 standing in for its file; the supervisor logs it once per error, records
 it as `policy_error` in `supervisor.json`, and keeps every other account
-dispatching (ADR-0035). An account is paused while its
+dispatching (ADR-0035). That is while it runs. `supervisor start` reads
+every account's file before it touches the queue and refuses to start
+when one does not load, listing each, with exit 78
+(`config.loader.CONFIG_ERROR_EXIT_STATUS`), as it does for a queue TOML
+that does not load; the systemd unit does not restart on 78, and the cron
+watchdog holds back the restart (ADR-0035, amendment of 2026-10-16). A
+`config_dir` whose `~user` names no user fails the queue TOML at load;
+later expansions go through `config.paths.expand_config_dir`, so a user
+removed while the supervisor runs fails only that account. An account is paused while its
 `account_paused/<name>` marker exists; the supervisor reads the markers
 every tick, once after the state-machine step and again just before
 dispatch, so `account pause` stops new dispatches on a running supervisor

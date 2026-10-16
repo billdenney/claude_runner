@@ -111,9 +111,32 @@ Before a first task completes in the queue, a set
 
 ## An account file is broken
 
-**Symptom:** One account gets no new tasks while the others dispatch as
-usual. The supervisor log has, once per error (and again after each edit
-that leaves the file broken):
+A broken account file is fatal when the supervisor starts and non-fatal
+while it runs (ADR-0035, amendment of 2026-10-16).
+
+**Symptom at start:** The supervisor does not start. `supervisor start`
+exits 78 and prints every account whose file does not load:
+
+```
+supervisor not started: the runner-account.toml of 1 account does not load:
+  work: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
+Fix each file, or delete it for the defaults, then start the supervisor again. Once the supervisor runs, a file that breaks only stops new tasks on its account.
+```
+
+Under systemd, `systemctl --user status claude-task-runner` shows the unit
+`failed` with `status=78`, the message is in `journalctl --user -u
+claude-task-runner`, and the unit is not restarted (its
+`RestartPreventExitStatus=` lists 78). Under the cron watchdog,
+`~/.claude_task_runner/watchdog.log` has `watchdog: ERROR queue=... the
+runner-account.toml of N account(s) does not load, so its supervisor was
+not restarted: ...` on each tick, and no restart is counted. A queue TOML
+that does not load, including an account whose `config_dir` starts with
+`~user` for a user that does not exist, stops the start the same way, with
+exit 78 and the queue TOML's own error (`Settings validation failed: ...`).
+
+**Symptom while running:** One account gets no new tasks while the others
+dispatch as usual. The supervisor log has, once per error (and again after
+each edit that leaves the file broken):
 
 ```
 account 'work' takes no new tasks until its runner-account.toml loads: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
@@ -123,27 +146,31 @@ account 'work' takes no new tasks until its runner-account.toml loads: Invalid T
 for that account and exits 1; `supervisor status` prints it as
 `Account error:`; `doctor` fails `account_policies`. When no account's file
 loads, the log also says `no account's runner-account.toml loads (...):
-nothing is dispatched until one is fixed`.
+nothing is dispatched until one is fixed`. A user removed from the system
+while the supervisor runs shows the same way for each account whose
+`config_dir` starts with `~` and that user's name.
 
 **Cause:** The account's `<config_dir>/runner-account.toml` is there but
 cannot be read, is empty (zero bytes, often a save that was cut short), is
 a symlink to a file that does not exist, is not TOML, still has a
 `[throttle.*]` table, or sets a value the schema rejects (a
-`max_concurrency` of 0, an unknown key). A `config_dir` starting with
-`~user` for a user that does not exist is reported the same way. The
-supervisor does not guess a policy for it (ADR-0035): the account takes no
-new tasks, its running tasks finish as usual, and it adds nothing to the
-queue's concurrency ceiling. Only an absent file means the defaults.
+`max_concurrency` of 0, an unknown key). The supervisor does not guess a
+policy for it (ADR-0035): while it runs, the account takes no new tasks,
+its running tasks finish as usual, and it adds nothing to the queue's
+concurrency ceiling. Only an absent file means the defaults.
 
 **Steps:**
 1. Fix the file the error names. `claude-task-runner account list` exits
    0 again once every account's file loads.
-2. Nothing else is needed: the supervisor re-reads the file every tick,
-   logs that the account `takes tasks again: <path> loads`, and dispatches
-   to it on that tick. If the file was broken for longer than
-   `[usage].max_reading_age_s`, the account waits for its next clean usage
-   reading first, within one capture cycle.
-3. Deleting the file instead gives the account the defaults
+2. If the supervisor refused to start, start it again: `systemctl --user
+   start claude-task-runner` (a unit stopped by exit 78 is not restarted
+   on its own), or wait for the next cron watchdog tick.
+3. If it was running, nothing else is needed: the supervisor re-reads the
+   file every tick, logs that the account `takes tasks again: <path>
+   loads`, and dispatches to it on that tick. If the file was broken for
+   longer than `[usage].max_reading_age_s`, the account waits for its next
+   clean usage reading first, within one capture cycle.
+4. Deleting the file instead gives the account the defaults
    (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`); the log line
    then says the file `is gone, so the defaults apply`. An empty file is
    not the same as no file: it stays broken until it is deleted or filled
@@ -164,7 +191,10 @@ supervisor with the same file. A change applies from the next tick.
 Under the systemd unit, systemd
 restarts the supervisor itself (`Restart=on-failure`), `RestartSec` after
 each crash, and stops once it has started the unit more than
-`StartLimitBurst` times within `StartLimitIntervalSec`. `install` writes
+`StartLimitBurst` times within `StartLimitIntervalSec`. It does not
+restart a supervisor that exited 0 (a stop or a finished drain) or 78 (it
+refused to start because its configuration does not load; see "An account
+file is broken"). `install` writes
 those three from the queue's `[watchdog].restart_cooldown_s`,
 `[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
 (30 s, 5 and 600 s by default). After changing them, re-run
