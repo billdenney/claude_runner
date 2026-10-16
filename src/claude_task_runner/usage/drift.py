@@ -37,20 +37,29 @@ class UsageCaptureSpawnError(RuntimeError):
     """`claude` could not be spawned (binary missing, permission denied, etc.)."""
 
 
-AUTH_FAILURE_PREFIX = "OAuth bearer rejected: "
-"""Starts the ``last_drift_message`` the state machine records when a
-:class:`UsageApiAuthExpired` puts an account in ERROR_DRIFT, so a reader of
-``supervisor.json`` can tell a login that needs renewing from parser drift
-(:func:`usage_error_kind`)."""
+AUTH_FAILURE_MARKERS = ("OAuth", ".credentials.json")
+"""Text one of which every :class:`UsageApiAuthExpired` message the runner
+records carries, and no format-drift message does: the API source names the
+OAuth bearer, token or credentials file in each of its login failures, and
+:func:`auth_failure_message` adds the first marker to any message that
+lacks both. A reader of ``supervisor.json`` tells a login that needs
+renewing from a changed usage page by them (:func:`usage_error_kind`),
+including the messages an older supervisor recorded unchanged."""
+
+
+def auth_failure_message(exc: Exception) -> str:
+    """The ``last_drift_message`` to record for a login failure ``exc``."""
+    message = str(exc)
+    return message if usage_error_kind(message) == "auth" else f"OAuth login failed: {message}"
 
 
 def usage_error_kind(message: str) -> str:
     """``auth`` for a recorded login failure, ``format`` for anything else.
 
-    ``message`` is an account's ``last_drift_message``. Only messages the
-    state machine wrote with :data:`AUTH_FAILURE_PREFIX` read as ``auth``.
+    ``message`` is an account's ``last_drift_message``; see
+    :data:`AUTH_FAILURE_MARKERS`.
     """
-    return "auth" if message.startswith(AUTH_FAILURE_PREFIX) else "format"
+    return "auth" if any(marker in message for marker in AUTH_FAILURE_MARKERS) else "format"
 
 
 class UsageApiAuthExpired(UsageCaptureSpawnError):

@@ -48,11 +48,11 @@ from claude_task_runner.supervisor.states import (
 from claude_task_runner.throttle.decision import Decision, decide
 from claude_task_runner.throttle.policy import ResolvedPolicy
 from claude_task_runner.usage.drift import (
-    AUTH_FAILURE_PREFIX,
     UsageApiAuthExpired,
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
     UsageFormatDrift,
+    auth_failure_message,
 )
 from claude_task_runner.usage.models import UsageReading
 
@@ -267,7 +267,7 @@ def step(
             new_snap = snapshot.model_copy(
                 update={
                     "consecutive_clean_polls": 0,
-                    "last_drift_message": f"{AUTH_FAILURE_PREFIX}{inp.reading}",
+                    "last_drift_message": auth_failure_message(inp.reading),
                 }
             )
         else:
@@ -278,12 +278,12 @@ def step(
                 reading=None,
                 target_concurrency=None,
                 consecutive_clean_polls=0,
-                last_drift_message=f"{AUTH_FAILURE_PREFIX}{inp.reading}",
+                last_drift_message=auth_failure_message(inp.reading),
             )
             actions.append(
                 Notify(
                     level="error",
-                    message=f"{AUTH_FAILURE_PREFIX}{inp.reading}",
+                    message=f"usage login failed: {inp.reading}",
                 )
             )
         actions.append(StopDispatch())

@@ -29,6 +29,7 @@ import json as _json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -41,15 +42,17 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     QueueIOError,
     QueueSchemaError,
+    iter_state_files,
     list_pending_tasks,
-    list_state_files,
     load_state,
     load_task,
     queue_runtime_dir,
+    state_file_path,
     state_path_for,
     task_path_for,
     write_state_atomic,
@@ -59,12 +62,14 @@ from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner import readiness as readiness_mod
+from claude_task_runner.runner.caps import effective_duration_cap_s
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
     validate_effort,
 )
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
@@ -349,7 +354,9 @@ def list_states(
     qd = require_queue_option(queue_dir, console, json=json)
     filter_set = set(status_filter)
     out: list[dict[str, object]] = []
-    for path in list_state_files(qd):
+    # Read-only: a queue whose supervisor never ran has no state directory,
+    # and listing its states must not create one.
+    for path in iter_state_files(qd):
         payload = _safe_load_state(path)
         if payload is None:
             out.append({"id": path.stem, "path": str(path), "error": "unparseable"})
@@ -413,63 +420,167 @@ def holds(
     """Show what can start now and what holds the rest.
 
     Runs the supervisor's own candidate selection once, read-only: no task
-    is parked or un-parked and no state file is written. The tasks in flight
+    is parked or un-parked, no session is cleared, and nothing is written
+    or created under the queue. The tasks in flight and the account states
     are the ones ``supervisor.json`` records.
 
     Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
     (it starts as soon as an account has a free slot), ``held`` under the
     category that holds it (``block_dispatch``, ``depends_on``,
     ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
-    status such as ``possibly_hung``, ...), or ``completed``.
-    ``poll_interval_s`` is how often the supervisor runs this selection, and
-    ``queue_cap`` the queue-wide cap on tasks in flight now (the warm-up
-    cap while ``warming_up``), ``null`` when there is none.
+    status such as ``possibly_hung``, ...), or ``completed``. Of the
+    eligible, ``can_start_now`` have an account that takes them now, and
+    ``waiting_for_their_account`` are held to the account their session
+    runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
+    lets another. ``poll_interval_s`` is how often the supervisor runs this
+    selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
+    (the warm-up cap while ``warming_up``), ``null`` when there is none.
+
+    Two holds carry their tasks' details. ``parked_workers``: the
+    ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
+    ``worker_still_running``), each with its ``pid``, ``started_at``,
+    whether it is still ``running``, its ``duration_cap_s`` (0: none) and
+    whether it has run ``past_cap``.
+    ``retrying``: the ``deferred_cooldown`` tasks, each with its
+    ``deferred_reason`` and ``next_eligible_at``.
+
+    \b
+    Exit codes:
+      0  listed
+      1  the queue TOML could not be read ("ok": false), which may clear up
+      2  --queue is not an existing directory
+     78  the queue TOML's content is wrong ("ok": false)
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
     settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
-    state_path = persist_mod.supervisor_state_path(qd, settings.supervisor.state_file)
+    state_path = persist_mod.supervisor_state_file(qd, settings.supervisor.state_file)
     snapshot_error: str | None = None
     try:
         snapshot = persist_mod.load(state_path)
     except persist_mod.SupervisorPersistenceError as exc:
         snapshot, snapshot_error = None, str(exc)
-    in_flight_ids = {r.task_id for r in snapshot.in_flight} if snapshot is not None else set()
-    preview = orch_mod.preview_selection(
-        qd, settings, in_flight_ids=in_flight_ids, now=RealClock().now()
-    )
+    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=RealClock().now())
     held = {k: n for k, n in sorted(preview.skips.items()) if k != "completed"}
     by_status: dict[str, int] = {}
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
+    can_start_now = sum(1 for account in preview.routes.values() if account is not None)
+    now = RealClock().now()
+    parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now)
+    retrying = _retrying(qd, preview.held.get("deferred_cooldown", []))
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
             "task_ids": [t.id for t in preview.eligible],
             "by_status": dict(sorted(by_status.items())),
+            "can_start_now": can_start_now,
+            "waiting_for_their_account": len(preview.affinity_held),
         },
         "held": held,
         "completed": preview.skips.get("completed", 0),
         "todo_tasks": len(preview.eligible) + sum(preview.skips.values()),
         "poll_interval_s": settings.usage.poll_interval_s,
+        "affinity_ttl_s": settings.dispatch.affinity_ttl_seconds,
         "queue_cap": preview.queue_cap,
         "warming_up": preview.warming_up,
+        "parked_workers": parked,
+        "retrying": retrying,
         "supervisor_json_error": snapshot_error,
     }
     if json:
         print(_json.dumps(payload, indent=2))
         return
-    console.print(f"[bold]eligible now:[/] {len(preview.eligible)}", highlight=False)
+    console.print(
+        f"[bold]eligible:[/] {len(preview.eligible)} ({can_start_now} can start now, "
+        f"{len(preview.affinity_held)} waiting for the account their session runs on)",
+        highlight=False,
+    )
     for task in preview.eligible:
-        console.print(f"  {task.id} ({preview.eligible_statuses[task.id]})", highlight=False)
+        route = preview.routes[task.id] or "no account now"
+        console.print(
+            f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})", highlight=False
+        )
     for category, n in held.items():
         console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
     console.print(f"[bold]completed:[/] {payload['completed']}", highlight=False)
+    cap = "none" if preview.queue_cap is None else str(preview.queue_cap)
+    if preview.warming_up:
+        cap += " (warm-up, until a first task completes)"
+    console.print(f"[bold]queue-wide cap:[/] {cap}", highlight=False)
+    console.print(
+        f"[bold]selection runs every:[/] {settings.usage.poll_interval_s:g} s", highlight=False
+    )
+    for worker in parked:
+        cap = "past its time limit" if worker["past_cap"] else "within its time limit"
+        state = "still running" if worker["running"] else "exited"
+        console.print(
+            f"[bold]parked worker:[/] {worker['task_id']} pid {worker['pid']} since "
+            f"{worker['started_at']}, {state} ({cap})",
+            highlight=False,
+        )
+    for item in retrying:
+        console.print(
+            f"[bold]retries at {item['next_eligible_at']}:[/] {item['task_id']}: "
+            f"{item['deferred_reason']}",
+            highlight=False,
+            markup=False,
+        )
     if snapshot_error:
         console.print(
             f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
             highlight=False,
         )
+
+
+def _parked_workers(
+    qd: Path, settings: Settings, tasks: list[Task], now: datetime
+) -> list[dict[str, object]]:
+    """Of ``tasks`` (held ``possibly_hung``), those parked because a worker
+    the supervisor does not watch was running: when it started, whether it
+    still runs (:func:`runner.dispatcher.probe_worker`) and whether it has
+    run past the task's duration cap."""
+    out: list[dict[str, object]] = []
+    for task in tasks:
+        state = load_state(state_file_path(qd, task.id))
+        if state.stop_reason != LIVE_WORKER_STOP_REASON:
+            continue
+        started = state.last_started_at or (state.runs[-1].started_at if state.runs else None)
+        cap = effective_duration_cap_s(settings.task_caps, task)
+        out.append(
+            {
+                "task_id": task.id,
+                "pid": state.pid,
+                "started_at": started.isoformat() if started else None,
+                "running": state.pid is not None
+                and dispatcher_mod.probe_worker(
+                    state.pid, log_path=state.log_path, started_at=state.last_started_at
+                )
+                is dispatcher_mod.WorkerProbe.ALIVE,
+                "duration_cap_s": cap,
+                "past_cap": bool(
+                    cap > 0 and started is not None and (now - started).total_seconds() > cap
+                ),
+            }
+        )
+    return out
+
+
+def _retrying(qd: Path, tasks: list[Task]) -> list[dict[str, object]]:
+    """``tasks`` (held ``deferred_cooldown``) with why each was deferred
+    and when the supervisor tries it again."""
+    out: list[dict[str, object]] = []
+    for task in tasks:
+        state = load_state(state_file_path(qd, task.id))
+        due = state.next_eligible_at
+        out.append(
+            {
+                "task_id": task.id,
+                "deferred_reason": state.deferred_reason,
+                "next_eligible_at": due.isoformat() if due else None,
+            }
+        )
+    return out
 
 
 @app.command("show")

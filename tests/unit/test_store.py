@@ -35,12 +35,15 @@ from claude_task_runner.queue.store import (
     QueueSchemaError,
     _load_yaml,
     _yaml_loader,
+    iter_state_files,
     list_pending_tasks,
     list_state_files,
     load_state,
     load_task,
     queue_runtime_dir,
     require_queue_dir,
+    runtime_path,
+    state_file_path,
     state_path_for,
     task_path_for,
     todo_dir,
@@ -717,6 +720,7 @@ class TestRequireQueueDir:
 
 
 _QUEUE_DIR_EXTRA_ARGS: dict[str, tuple[str, ...]] = {
+    "state_file_path": ("t1",),
     "state_path_for": ("t1",),
     "task_path_for": ("t1",),
 }
@@ -747,11 +751,14 @@ class TestNeverCreatesTheQueue:
         # Equality, so that a new function is looked at: it may need
         # arguments in _QUEUE_DIR_EXTRA_ARGS.
         assert set(_queue_dir_functions()) == {
+            "iter_state_files",
             "list_pending_tasks",
             "list_state_files",
             "queue_runtime_dir",
             "require_queue_dir",
+            "runtime_path",
             "state_dir",
+            "state_file_path",
             "state_path_for",
             "task_path_for",
             "todo_dir",
@@ -779,6 +786,16 @@ class TestNeverCreatesTheQueue:
             if inspect.isgenerator(result):
                 list(result)
         assert sorted(p.name for p in base.iterdir()) == before
+
+    def test_the_readers_create_nothing_in_a_queue(self, tmp_path: Path) -> None:
+        """A queue with no runtime directory yet has no state files, and
+        reading it that way leaves it so."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+        assert runtime_path(queue) == queue / ".claude_task_runner"
+        assert state_file_path(queue, "t1") == queue / ".claude_task_runner" / "state" / "t1.yaml"
+        assert list(iter_state_files(queue)) == []
+        assert list(queue.iterdir()) == []
 
     def test_existing_queue_gets_its_subdirectories(self, queue_dir: Path) -> None:
         todo_dir(queue_dir)

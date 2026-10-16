@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -33,7 +33,12 @@ from typing import get_args
 import pytest
 
 from claude_task_runner.cli.install_skills_cmd import _packaged_skill_dir
-from claude_task_runner.config.loader import PER_ACCOUNT_TOML_NAME, load_settings, resolve_accounts
+from claude_task_runner.config.loader import (
+    PER_ACCOUNT_TOML_NAME,
+    ConfigError,
+    load_settings,
+    resolve_accounts,
+)
 from claude_task_runner.observability import _reset_for_tests as _reset_logging_for_tests
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.schema import ReadinessKind, Task, TaskStatus
@@ -48,7 +53,6 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
-from claude_task_runner.usage.drift import AUTH_FAILURE_PREFIX
 
 from ._cli_on_path import (
     account_list_call,
@@ -76,11 +80,26 @@ RUNNING = "- **Supervisor:** running.\n"
 NO_QUESTIONS = "- **Questions for you:** none.\n"
 EIGHT = "up to 8 at once (personal 5 + work 3; no queue-wide cap)."
 CRASH = "Traceback (most recent call last):\nRuntimeError: boom\n"
+LOGIN_REJECTED = "OAuth bearer rejected by https://api.anthropic.com/v1/messages (HTTP 401)"
 
 
 # ---------------------------------------------------------------------------
 # Fixture builders
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def report_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """The report's time, fixed when the test starts. snapshot.sh takes it
+    from RS_NOW, and supervisor.json is saved relative to it, so how long
+    the CLI calls take, on a loaded machine too, cannot age the state."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    monkeypatch.setenv("RS_NOW", now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return now
+
+
+def _report_now() -> datetime:
+    return datetime.strptime(os.environ["RS_NOW"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
 @pytest.fixture
@@ -105,12 +124,17 @@ def supervisor(queue: Path) -> Iterator[Callable[..., int]]:
     command line, named by the queue's PID file. Killed at teardown."""
     children: list[subprocess.Popen[bytes]] = []
 
-    def start(config: Path | None = None) -> int:
+    def start(
+        config: Path | None = None, *, args: Sequence[str] = (), cwd: Path | None = None
+    ) -> int:
+        # The interpreter's own -c comes before `supervisor start`, as in a
+        # `python -c` launcher; the script must not take it for --config.
         argv = [sys.executable, "-c", "import time; time.sleep(600)"]
         argv += ["supervisor", "start", "--queue", str(queue)]
         if config is not None:
             argv += ["--config", str(config)]
-        child = subprocess.Popen(argv, start_new_session=True)
+        argv += args
+        child = subprocess.Popen(argv, start_new_session=True, cwd=cwd)
         children.append(child)
         (queue / ".claude_task_runner" / "supervisor.pid").write_text(f"{child.pid}\n")
         return child.pid
@@ -172,7 +196,7 @@ def _supervisor_json(
     )
     path = persist_mod.supervisor_state_path(queue)
     persist_mod.write_atomic(snapshot, path)
-    when = (datetime.now(UTC) - saved_ago).timestamp()
+    when = (_report_now() - saved_ago).timestamp()
     os.utime(path, (when, when))
 
 
@@ -529,9 +553,7 @@ def test_no_reading_and_both_kinds_of_usage_error(
         queue,
         {
             "personal": _state(SupervisorState.NO_READING),
-            "work": _state(
-                SupervisorState.ERROR_DRIFT, last_drift_message=f"{AUTH_FAILURE_PREFIX}HTTP 401"
-            ),
+            "work": _state(SupervisorState.ERROR_DRIFT, last_drift_message=LOGIN_REJECTED),
             "spare": _state(
                 SupervisorState.ERROR_DRIFT, last_drift_message="5-hour usage block not found"
             ),
@@ -555,9 +577,9 @@ def test_no_reading_and_both_kinds_of_usage_error(
             "personal has no recent usage reading (it has never had one), so it takes no tasks. "
             "This clears by itself within a few minutes of a supervisor start; if it lasts, see "
             'the runbook section "An account stays in `no_reading`".',
-            "work takes no tasks because its login was rejected when it read its usage (OAuth "
-            f"bearer rejected: HTTP 401). Log it in again: `CLAUDE_CONFIG_DIR={dirs['work']} "
-            "claude /login`, or renew its long-lived token with `claude setup-token`.",
+            f"work takes no tasks because its login was rejected when it read its usage "
+            f"({LOGIN_REJECTED}). Log it in again: `CLAUDE_CONFIG_DIR={dirs['work']} claude "
+            "/login`, or renew its long-lived token with `claude setup-token`.",
             "spare takes no tasks because its usage page could not be read (5-hour usage block "
             "not found); the page's format may have changed. Run /runner-usage to check the "
             "usage reader.",
@@ -655,6 +677,314 @@ def test_nothing_running_although_tasks_can_start(
     )
 
 
+def test_tasks_held_to_their_sessions_account(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """A task whose session runs on a throttled account can start only
+    there: work's free slots are no reason to call the queue stalled."""
+    wakeup = datetime(2026, 10, 16, 19, 5, tzinfo=UTC)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_5H,
+            last_5h_util_pct=97,
+            target_concurrency=0,
+            scheduled_wakeup_at=wakeup,
+        ),
+    )
+    add_task(queue, "resumes")
+    add_state(
+        queue,
+        "resumes",
+        "pending",
+        session_id="session-1",
+        session_account="personal",
+        last_finished_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    supervisor()
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: not taking new tasks, because its 5-hour allowance is used up (97% used)",
+            "work: taking tasks, 0 of 3 slots in use",
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 3 more.\n"
+        "- **Tasks:** 1 can start only on the account its session runs on; 0 finished.\n"
+        + NO_QUESTIONS
+        + _info(
+            f"personal starts again about {_when(wakeup)}, when its 5-hour usage window resets. "
+            "Nothing to do.",
+            "1 task can start only on the account its session runs on, which cannot take it "
+            "now; it moves to any account after 90 minutes without running. Nothing to do.",
+        )
+    )
+
+
+def test_some_tasks_held_to_their_sessions_account(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """Nothing runs while one task can start on work: that is not normal,
+    and the count leaves out the two held to personal."""
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(SupervisorState.THROTTLED_5H, last_5h_util_pct=97, target_concurrency=0),
+    )
+    _tasks(queue, new=1)
+    for task_id in ("resumes-0", "resumes-1"):
+        add_task(queue, task_id)
+        add_state(
+            queue,
+            task_id,
+            "pending",
+            session_id=f"session-{task_id}",
+            session_account="personal",
+            last_finished_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+    supervisor()
+
+    summary = _summary(queue, bin_dir)
+    assert (
+        "- **Tasks:** 3 can start as soon as a slot is free (2 of them only on the account "
+        "their session runs on); 0 finished.\n"
+    ) in summary
+    assert (
+        "- Nothing is running although 1 task can start and there is room for 3. If this lasts "
+        "beyond the supervisor's next check, look in its log for `dispatch skipped task` lines.\n"
+    ) in summary
+    assert (
+        "- 2 tasks can start only on the account their session runs on, which cannot take them "
+        "now; they move to any account after 90 minutes without running. Nothing to do.\n"
+    ) in summary
+
+
+def test_weekly_throttle_whose_catch_up_has_passed(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
+) -> None:
+    """Use at the last reading is back under plan by now; the account stays
+    throttled until the supervisor reads it again."""
+    now = report_now
+    recheck = now + timedelta(minutes=10)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_WEEKLY,
+            last_weekly_util_pct=30,
+            last_weekly_reset_at=now + timedelta(hours=102),
+            target_concurrency=0,
+            scheduled_wakeup_at=recheck,
+        ),
+        running={"work": 3},
+    )
+    supervisor()
+    assert _summary(queue, bin_dir).endswith(
+        _info(
+            "personal's weekly use should be back under plan by now, so it should start again at "
+            f"its next check (about {_when(recheck)}). Nothing to do."
+        )
+    )
+
+
+def test_unreadable_supervisor_json(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    _config(queue, tmp_path, {"personal": 5, "work": 3})
+    path = persist_mod.supervisor_state_path(queue)
+    path.write_text("{not json", encoding="utf-8")
+    supervisor()
+
+    summary = _summary(queue, bin_dir)
+    assert (
+        f"- The supervisor's record ({path}) cannot be read (Expecting property name enclosed in "
+        "double quotes: line 1 column 2 (char 1)), so which tasks are running and what each "
+        "account's last usage reading said are unknown. A running supervisor rewrites it at "
+        "every check; if this lasts, look at the file and the supervisor's log.\n"
+    ) in summary
+
+
+def test_supervisor_json_details_count_the_in_flight_records(
+    queue: Path, tmp_path: Path, bin_dir: Path
+) -> None:
+    """``in_flight`` holds the supervisor's records; ``in_flight_task_ids``
+    is a legacy copy that need not match."""
+    _two_accounts(queue, tmp_path, running={"personal": 2})
+    path = persist_mod.supervisor_state_path(queue)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["in_flight_task_ids"] = []
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert "\n| in_flight | `2` |\n" in _run(queue, bin_dir).stdout
+
+
+@pytest.fixture
+def worker() -> Iterator[Callable[[Path], int]]:
+    """Start a stand-in worker writing to ``log``, as the dispatcher's
+    workers write to their attempt's log. Killed at teardown."""
+    children: list[subprocess.Popen[bytes]] = []
+
+    def start(log: Path) -> int:
+        with log.open("wb") as out:
+            child = subprocess.Popen(["sleep", "600"], stdout=out, start_new_session=True)
+        children.append(child)
+        return child.pid
+
+    yield start
+    for child in children:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def _parked(queue: Path, task_id: str, pid: int, log: Path | None, started: datetime) -> None:
+    add_state(
+        queue,
+        task_id,
+        "possibly_hung",
+        stop_reason="worker_still_running",
+        pid=pid,
+        log_path=None if log is None else str(log),
+        last_started_at=started,
+    )
+
+
+def test_parked_workers_and_a_worker_that_could_not_start(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    worker: Callable[[Path], int],
+    report_now: datetime,
+) -> None:
+    """A task parked while an unwatched worker runs is not stuck: within
+    its time limit it is for your information, past it or after the worker
+    exited it is not normal. A worker that could not be started says why
+    and when it is tried again."""
+    _two_accounts(queue, tmp_path)
+    started = report_now - timedelta(minutes=10)
+    logs = {name: tmp_path / f"{name}.log" for name in ("within", "past")}
+    pids = {name: worker(log) for name, log in logs.items()}
+    add_task(queue, "within")
+    _parked(queue, "within", pids["within"], logs["within"], started)
+    add_task(queue, "past", max_duration_s_override=300)
+    _parked(queue, "past", pids["past"], logs["past"], started)
+    done = subprocess.Popen(["true"])
+    done.wait(timeout=10)
+    add_task(queue, "exited")
+    _parked(queue, "exited", done.pid, None, started)
+    add_task(queue, "silent")
+    add_state(queue, "silent", "possibly_hung", stop_reason="silent_on_restart")
+    due = report_now + timedelta(minutes=15)
+    add_task(queue, "no-config-dir")
+    add_state(
+        queue,
+        "no-config-dir",
+        "deferred",
+        stop_reason="worker_start_deferred",
+        deferred_reason="cannot start the worker: config_dir /gone does not exist",
+        next_eligible_at=due,
+    )
+    supervisor()
+
+    kill = "`kill -TERM -<pid>` (the minus signals its process group)"
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 1 waits for a retry time; 1 looks stuck; 2 have a worker running that the "
+        "supervisor does not watch; 1 waits for an exited worker's run to be recorded; 0 "
+        "finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "1 task has a worker the supervisor does not watch that has run past the task's time "
+            f"limit (past, pid {pids['past']}). Stop it with {kill}.",
+            "1 task was held while a worker the supervisor does not watch ran, and the worker "
+            f"has exited (exited, pid {done.pid}), so it waits only for the run to be recorded. "
+            "If this lasts past the supervisor's next check, record the run as the runbook "
+            "describes for a worker that ran on after a restart.",
+            "1 task could not start its worker (no-config-dir: config_dir /gone does not exist; "
+            f"retries about {_when(due)}). Fix what each names; the supervisor tries again at the "
+            f"time given, or `claude-task-runner queue force-dispatch <id> --queue {queue}` "
+            "starts one at once after the fix.",
+            "Tasks that have gone quiet while running and may be stuck: 1. See the runbook "
+            'section "Task `possibly_hung` for hours".',
+        )
+        + _info(
+            "1 task has a worker still running that the supervisor does not watch, left from "
+            "before a restart or still alive after it was stopped (within, pid "
+            f"{pids['within']}). No second worker starts for it meanwhile. Nothing to do; to "
+            f"end one sooner, stop it with {kill}.",
+            "No task can start right now: every unfinished task is held, as Tasks shows.",
+        )
+    )
+
+
+def test_details_group_the_retry_reasons_and_list_parked_workers(
+    queue: Path, bin_dir: Path
+) -> None:
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"deferred_cooldown": 4, "possibly_hung": 1},
+        "completed": 0,
+        "todo_tasks": 5,
+        "retrying": [
+            {
+                "task_id": "a",
+                "deferred_reason": "pre-dispatch hook deferred (exit 1): paper missing",
+                "next_eligible_at": "2026-10-16T12:30:00+00:00",
+            },
+            {
+                "task_id": "b",
+                "deferred_reason": "pre-dispatch hook deferred (exit 1): other",
+                "next_eligible_at": "2026-10-16T12:10:00+00:00",
+            },
+            {
+                "task_id": "c",
+                "deferred_reason": "cannot start the worker: sudo not found",
+                "next_eligible_at": "2026-10-16T12:20:00+00:00",
+            },
+            {
+                "task_id": "e",
+                "deferred_reason": "PARKED by hand. Its `requires: ok | see notes",
+                "next_eligible_at": "2027-01-01T00:00:00+00:00",
+            },
+        ],
+        "parked_workers": [
+            {
+                "task_id": "d",
+                "pid": 4242,
+                "started_at": "2026-10-16T10:00:00+00:00",
+                "running": True,
+                "duration_cap_s": 14400.0,
+                "past_cap": False,
+            }
+        ],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    _, _, details = proc.stdout.partition("**What holds the tasks**")
+    section = details.split("\n**Queue counts**")[0]
+    assert section.endswith(
+        "| todo/ tasks (total) | 5 |\n\n"
+        "_Why the tasks waiting for a retry time were deferred:_\n\n"
+        "- the pre-dispatch hook asked to wait: 2, the first retried about 2026-10-16 12:10 "
+        "UTC\n"
+        "- set by hand or by another tool: 1, the first retried about 2027-01-01 00:00 UTC\n"
+        "- the worker could not be started: 1, the first retried about 2026-10-16 12:20 UTC\n\n"
+        "_Counted under possibly_hung, parked while a worker the supervisor does not watch "
+        "ran:_\n\n"
+        "| task | pid | started | still running | past its time limit |\n"
+        "|---|---:|---|:-:|:-:|\n"
+        "| d | 4242 | 2026-10-16T10:00:00+00:00 | yes | no |\n"
+    ), section
+
+
 def test_notice_and_unreadable_sidecar_request(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:
@@ -687,12 +1017,14 @@ def test_notice_and_unreadable_sidecar_request(
 
 @pytest.mark.parametrize("pid", ["missing", "stale"])
 def test_supervisor_not_running(queue: Path, tmp_path: Path, bin_dir: Path, pid: str) -> None:
-    """The account states are its last record, so no usage item is raised on
-    the strength of them, and nothing is said about room now."""
+    """The account states and the tasks in flight are its last record, so no
+    usage item is raised on the strength of them, the tasks it was running
+    are not said to run now, and nothing is said about room now."""
     _two_accounts(
         queue,
         tmp_path,
         personal=_state(SupervisorState.THROTTLED_5H, last_5h_util_pct=97, target_concurrency=0),
+        running={"work": 2},
     )
     _tasks(queue, new=5)
     if pid == "stale":
@@ -702,11 +1034,12 @@ def test_supervisor_not_running(queue: Path, tmp_path: Path, bin_dir: Path, pid:
         "- **Supervisor:** not running.\n"
         + _accounts(
             "personal: not taking new tasks, because its 5-hour allowance is used up (97% used)",
-            "work: taking tasks, 0 of 3 slots in use",
+            "work: taking tasks, 2 of 3 slots in use",
             heading="Accounts (as of the supervisor's last record)",
         )
         + f"- **How many can run:** {EIGHT}\n"
-        "- **Tasks:** 5 can start as soon as a slot is free; 0 finished.\n"
+        "- **Tasks:** 2 were running at the supervisor's last record; 5 can start as soon as a "
+        "slot is free; 0 finished.\n"
         + NO_QUESTIONS
         + _attention(
             "The supervisor is not running, so no new tasks start and finished tasks are not "
@@ -735,7 +1068,7 @@ def test_supervisor_that_stopped_saving_its_state(
             heading="Accounts (as of the supervisor's last record)",
         )
         + f"- **How many can run:** {EIGHT}\n"
-        "- **Tasks:** 1 running; 0 finished.\n"
+        "- **Tasks:** 1 was running at the supervisor's last record; 0 finished.\n"
         + NO_QUESTIONS
         + _attention(
             "The supervisor has not saved its state for 30 minutes (it normally does every 60 "
@@ -765,6 +1098,80 @@ def test_poll_interval_is_the_supervisors_own(
     summary = _summary(queue, bin_dir)
     assert summary.startswith(RUNNING), summary
     assert "may be stuck" not in summary
+
+
+TEN_SECOND_POLLS = "[usage]\npoll_interval_s = 10\n"
+
+
+@pytest.mark.parametrize(
+    ("saved_ago", "expected"),
+    [
+        pytest.param(
+            30,
+            RUNNING
+            + _accounts(
+                "personal: taking tasks, 0 of 5 slots in use",
+                "work: taking tasks, 0 of 3 slots in use",
+            )
+            + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+            "- **Tasks:** 0 finished.\n" + NO_QUESTIONS + NORMAL,
+            id="three-polls-is-running",
+        ),
+        pytest.param(
+            31,
+            "- **Supervisor:** its process is running, but it last saved its state 31 seconds "
+            "ago.\n"
+            + _accounts(
+                "personal: taking tasks, 0 of 5 slots in use",
+                "work: taking tasks, 0 of 3 slots in use",
+                heading="Accounts (as of the supervisor's last record)",
+            )
+            + f"- **How many can run:** {EIGHT}\n"
+            "- **Tasks:** 0 finished.\n"
+            + NO_QUESTIONS
+            + _attention(
+                "The supervisor has not saved its state for 31 seconds (it normally does every "
+                "10 seconds), so it may be stuck. Look at its log; if it stays this way, restart "
+                "it."
+            ),
+            id="a-second-past-is-stuck",
+        ),
+    ],
+)
+def test_stuck_after_three_polls_exactly(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    saved_ago: int,
+    expected: str,
+) -> None:
+    """The report's time is RS_NOW, so the age is exact however long the
+    CLI calls take."""
+    _config(queue, tmp_path, {"personal": 5, "work": 3}, TEN_SECOND_POLLS)
+    states = {
+        "personal": _state(SupervisorState.DISPATCHING),
+        "work": _state(SupervisorState.DISPATCHING),
+    }
+    _supervisor_json(queue, states, saved_ago=timedelta(seconds=saved_ago))
+    supervisor()
+    assert _summary(queue, bin_dir) == expected
+
+
+def test_without_the_poll_interval_the_age_is_given(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """With the task selection unreadable there is no poll interval to judge
+    by, so the summary gives the age and judges nothing."""
+    _two_accounts(queue, tmp_path)
+    path = persist_mod.supervisor_state_path(queue)
+    when = (_report_now() - timedelta(seconds=7)).timestamp()
+    os.utime(path, (when, when))
+    _cli_with(bin_dir, queue=("", CRASH, 3))
+    supervisor()
+    assert _summary(queue, bin_dir).startswith(
+        "- **Supervisor:** running (it last saved its state 7 seconds ago).\n"
+    )
 
 
 def test_two_polls_late_is_not_stuck(
@@ -859,20 +1266,166 @@ def test_cli_calls(queue: Path, bin_dir: Path) -> None:
     assert calls_in(log) == sorted([account_list_call(queue), holds, sidecar_list_call(queue)])
 
 
-def test_cli_calls_carry_the_supervisors_config(
-    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
-) -> None:
-    log = real_cli(bin_dir)
-    other = tmp_path / "other.toml"
-    other.write_text("", encoding="utf-8")
-    supervisor(config=other)
-    _run(queue, bin_dir)
-    assert calls_in(log) == sorted(
+def _config_calls(queue: Path, config: Path | None) -> list[str]:
+    """The three CLI calls, with ``config`` as the --config of the two that
+    read settings."""
+    given = "" if config is None else f"--config\n{config}\n"
+    return sorted(
         [
-            f"account\nlist\n--queue\n{queue}\n--config\n{other}\n--json\n--\n",
-            f"queue\nholds\n--queue\n{queue}\n--config\n{other}\n--json\n--\n",
+            f"account\nlist\n--queue\n{queue}\n{given}--json\n--\n",
+            f"queue\nholds\n--queue\n{queue}\n{given}--json\n--\n",
             sidecar_list_call(queue),
         ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param(["--config", "{abs}"], "{abs}", id="absolute"),
+        pytest.param(["--config", "conf/other.toml"], "{cwd}/conf/other.toml", id="relative"),
+        pytest.param(["--config=conf/other.toml"], "{cwd}/conf/other.toml", id="equals"),
+        pytest.param(["-c", "conf/other.toml"], "{cwd}/conf/other.toml", id="short"),
+        pytest.param(["--config", "my conf/o t.toml"], "{cwd}/my conf/o t.toml", id="spaces"),
+        pytest.param([], None, id="none-the-interpreters-own-c-is-not-it"),
+    ],
+)
+def test_cli_calls_carry_the_supervisors_config(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    args: list[str],
+    expected: str | None,
+) -> None:
+    """A relative --config is the supervisor's, relative to its working
+    directory, which here has a space in it."""
+    log = real_cli(bin_dir)
+    cwd = tmp_path / "supervisor cwd"
+    cwd.mkdir()
+    absolute = tmp_path / "with space" / "other.toml"
+    fill = {"abs": str(absolute), "cwd": str(cwd.resolve())}
+    supervisor(args=[a.format(**fill) for a in args], cwd=cwd)
+    _run(queue, bin_dir)
+    config = None if expected is None else Path(expected.format(**fill))
+    assert calls_in(log) == _config_calls(queue, config)
+
+
+def test_relative_config_with_an_unreadable_working_directory(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """Without the supervisor's working directory its relative --config
+    cannot be followed: no --config is passed, and the summary says so."""
+    log = real_cli(bin_dir)
+    for tool in ("readlink", "lsof"):
+        stub = bin_dir / tool
+        stub.write_text("#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+    _two_accounts(queue, tmp_path)
+    supervisor(args=["--config", "conf/other.toml"], cwd=tmp_path)
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 0 finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "The supervisor was started with the relative settings path `--config "
+            "conf/other.toml`, and its working directory cannot be read, so which settings file "
+            "it uses is unknown; the facts below come from the queue's own settings file "
+            "instead. Run /runner-status as the user the supervisor runs as, or start the "
+            "supervisor with an absolute --config path."
+        )
+    )
+    assert calls_in(log) == _config_calls(queue, None)
+
+
+SETTINGS_ERRORS = {
+    "78": (
+        "Settings validation failed: 1 validation error for Settings\n"
+        "concurrency.max_concurrency\n"
+        "  Input should be greater than or equal to 1 [type=greater_than_equal, input_value=0]",
+        "Settings validation failed: 1 validation error for Settings; "
+        "concurrency.max_concurrency; Input should be greater than or equal to 1 "
+        "[type=greater_than_equal, input_value=0]. Its content is wrong and needs fixing: a "
+        "supervisor started with it refuses to start, and a running one keeps the settings it "
+        "loaded before. Fix the file, then send the supervisor SIGHUP to load it.",
+    ),
+    "1": (
+        "Cannot read /q/claude_runner.toml: [Errno 13] Permission denied.",
+        "Cannot read /q/claude_runner.toml: [Errno 13] Permission denied. It could not be read "
+        "just now, which may clear up by itself (a mount or permission that comes back). If it "
+        "lasts, check that the file is there and readable.",
+    ),
+}
+
+
+@pytest.mark.parametrize("rc", sorted(SETTINGS_ERRORS))
+def test_queue_settings_file_cannot_be_read(queue: Path, bin_dir: Path, rc: str) -> None:
+    """``{"ok": false}`` with nothing listed: one item, whichever call met
+    it, saying whether it needs fixing (78) or may clear up (1)."""
+    error, said = SETTINGS_ERRORS[rc]
+    out = json.dumps({"ok": False, "error": f"configuration error: {error}"})
+    _cli_with(bin_dir, account=(out, "", int(rc)), queue=(out, "", int(rc)))
+
+    assert _summary(queue, bin_dir) == (
+        "- **Supervisor:** not running.\n"
+        "- **Accounts:** unknown (the queue settings file cannot be read).\n"
+        "- **Tasks:** unknown (the queue settings file cannot be read).\n"
+        + NO_QUESTIONS
+        + _attention(
+            "The supervisor is not running, so no new tasks start and finished tasks are not "
+            f"recorded. Start it with `claude-task-runner supervisor start --queue {queue}`; a "
+            "watchdog, if installed, restarts it within a few minutes.",
+            f"The queue settings file cannot be read: {said} Until it can, what each account is "
+            "doing and what holds the tasks are unknown.",
+        )
+    )
+
+
+def test_a_queue_toml_that_does_not_load(queue: Path, bin_dir: Path) -> None:
+    """The real CLI on a queue TOML whose content is wrong: account list and
+    queue holds both exit 78 with ``{"ok": false}``."""
+    config = queue / "claude_runner.toml"
+    config.write_text("this is not [valid toml", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_settings(config)
+    detail = "; ".join(line.strip() for line in str(caught.value).splitlines() if line.strip())
+
+    assert _summary(queue, bin_dir) == (
+        "- **Supervisor:** not running.\n"
+        "- **Accounts:** unknown (the queue settings file cannot be read).\n"
+        "- **Tasks:** unknown (the queue settings file cannot be read).\n"
+        + NO_QUESTIONS
+        + _attention(
+            "The supervisor is not running, so no new tasks start and finished tasks are not "
+            f"recorded. Start it with `claude-task-runner supervisor start --queue {queue}`; a "
+            "watchdog, if installed, restarts it within a few minutes.",
+            f"The queue settings file cannot be read: {detail.rstrip('.')}. Its content is wrong "
+            "and needs fixing: a supervisor started with it refuses to start, and a running one "
+            "keeps the settings it loaded before. Fix the file, then send the supervisor SIGHUP "
+            "to load it. Until it can, what each account is doing and what holds the tasks are "
+            "unknown.",
+        )
+    )
+
+
+def test_only_the_task_selection_meets_the_settings_error(queue: Path, bin_dir: Path) -> None:
+    out = json.dumps({"ok": False, "error": "configuration error: gone"})
+    _cli_with(
+        bin_dir,
+        account=(json.dumps({"accounts": [], "queue_ceiling": None}), "", 0),
+        queue=(out, "", 1),
+    )
+    summary = _summary(queue, bin_dir)
+    assert "- **Tasks:** unknown (the queue settings file cannot be read).\n" in summary
+    assert summary.endswith(
+        "- The queue settings file cannot be read: gone. It could not be read just now, which "
+        "may clear up by itself (a mount or permission that comes back). If it lasts, check "
+        "that the file is there and readable. Until it can, what holds the tasks is unknown.\n"
     )
 
 

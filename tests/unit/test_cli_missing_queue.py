@@ -369,3 +369,30 @@ class TestMissingQueue:
             f"CREATES_MISSING_QUEUE is stale for {stale}: these commands no "
             "longer create a missing queue; delete their entries."
         )
+
+
+READ_ONLY: tuple[tuple[str, ...], ...] = (
+    ("account", "list"),
+    ("queue", "holds"),
+    ("queue", "list"),
+    ("queue", "states"),
+    ("sidecar", "list"),
+)
+"""Commands that only read the queue, so must not create anything in it."""
+
+
+class TestBareQueue:
+    """A read-only command on a queue that has only ``todo/`` leaves it so:
+    ``.claude_task_runner/``, its ``state/`` and ``sidecar/`` and
+    ``supervisor.json`` are read where they exist and never created."""
+
+    @pytest.mark.parametrize("output", [(), ("--json",)], ids=["text", "json"])
+    @pytest.mark.parametrize("path", READ_ONLY, ids=_path_id)
+    def test_creates_nothing(
+        self, path: tuple[str, ...], output: tuple[str, ...], tmp_path: Path
+    ) -> None:
+        queue = tmp_path / "queue"
+        (queue / "todo").mkdir(parents=True)
+        result = _run(path, queue, tmp_path, *output)
+        assert result.exit_code == 0, result.output
+        assert [p.relative_to(queue).as_posix() for p in queue.rglob("*")] == ["todo"]

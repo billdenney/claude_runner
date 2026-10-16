@@ -120,6 +120,40 @@ def queue_runtime_dir(queue_dir: Path) -> Path:
     return runtime
 
 
+def runtime_path(queue_dir: Path) -> Path:
+    """``<queue>/.claude_task_runner/``, without creating it.
+
+    For callers that only read: a status command reports a queue as it is,
+    and must not create the runtime tree to look at it. Writers use
+    :func:`queue_runtime_dir`, which creates it. A queue directory that is
+    not there raises as :func:`queue_runtime_dir` does, so a missing
+    runtime directory never stands for a missing queue.
+
+    Raises
+    ------
+    FileNotFoundError
+        ``queue_dir`` is missing, or a symlink to nothing.
+    NotADirectoryError
+        ``queue_dir`` is not a directory.
+    """
+    if not queue_dir.is_dir():
+        if queue_dir.exists():
+            raise NotADirectoryError(f"not a directory: {queue_dir}")
+        raise FileNotFoundError(f"no such directory: {queue_dir}")
+    return queue_dir / ".claude_task_runner"
+
+
+def state_file_path(queue_dir: Path, task_id: str) -> Path:
+    """Like :func:`state_path_for`, without creating any directory."""
+    return runtime_path(queue_dir) / "state" / f"{task_id}.yaml"
+
+
+def iter_state_files(queue_dir: Path) -> Iterator[Path]:
+    """Like :func:`list_state_files`, without creating the state directory:
+    a queue that has none has no state files."""
+    yield from sorted((runtime_path(queue_dir) / "state").glob("*.yaml"))
+
+
 def todo_dir(queue_dir: Path) -> Path:
     """Resolve ``<queue>/todo/`` and ensure it exists.
 

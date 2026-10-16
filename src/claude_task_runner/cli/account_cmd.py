@@ -66,8 +66,9 @@ app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 def _snapshot(settings: Settings, queue_dir: Path) -> SupervisorSnapshot | None:
-    """Load supervisor.json or return None when it doesn't exist."""
-    path = persist_mod.supervisor_state_path(queue_dir, settings.supervisor.state_file)
+    """Load supervisor.json or return None when it doesn't exist. Read-only:
+    no runtime directory is created to look for it."""
+    path = persist_mod.supervisor_state_file(queue_dir, settings.supervisor.state_file)
     return persist_mod.load(path)
 
 
@@ -328,6 +329,20 @@ def _print_account(
         f"5h={util_5h_s}   weekly={util_w_s}   "
         f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
     )
+    if row["weekly_catch_up_at"] is not None:
+        console.print(
+            f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "
+            "under plan; scheduled_wakeup_at is only the next re-check)",
+            highlight=False,
+        )
+    usage_error = row["usage_error"]
+    if isinstance(usage_error, dict):
+        fix = "log it in again" if usage_error["kind"] == "auth" else "the usage page changed"
+        console.print(
+            f"  [bold red]usage error:[/]     {escape(usage_error['message'])} ({fix})",
+            highlight=False,
+            soft_wrap=True,
+        )
 
 
 def _update_paused(

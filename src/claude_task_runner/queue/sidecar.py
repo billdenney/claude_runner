@@ -48,6 +48,7 @@ from claude_task_runner.queue.store import (
     QueueIOError,
     QueueSchemaError,
     queue_runtime_dir,
+    runtime_path,
 )
 
 _REQUEST_RE = re.compile(r"^request-(\d+)\.json$")
@@ -294,7 +295,9 @@ def open_sidecars(queue_dir: Path, *, task_id: str | None = None) -> Iterator[Op
 
     Order: by task_id then sequence, both lexicographic, for determinism.
     """
-    sidecar_root = queue_runtime_dir(queue_dir) / "sidecar"
+    # Read-only: a queue with no sidecar directory has no open sidecars, and
+    # listing them must not create one.
+    sidecar_root = runtime_path(queue_dir) / "sidecar"
     if not sidecar_root.exists():
         return
     task_dirs = [sidecar_root / task_id] if task_id is not None else sorted(sidecar_root.iterdir())

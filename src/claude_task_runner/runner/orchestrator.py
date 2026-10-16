@@ -45,10 +45,11 @@ from typing import TYPE_CHECKING, Any
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    iter_state_files,
     list_pending_tasks,
-    list_state_files,
     load_state,
     load_task,
+    state_file_path,
     state_path_for,
     write_state_atomic,
 )
@@ -66,7 +67,11 @@ from claude_task_runner.supervisor.states import InFlightRecord, SupervisorState
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
     from claude_task_runner.config.schema import ResolvedAccount, Settings
-    from claude_task_runner.supervisor.states import SupervisorSnapshot
+    from claude_task_runner.supervisor.states import (
+        AccountState,
+        InFlightRecord,
+        SupervisorSnapshot,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -431,58 +436,19 @@ def tick_dispatch(
     for task in candidates:
         if dispatched >= available:
             break
-        # Resolve the affined account from the task's state YAML so
-        # choose_account can honour session affinity (ADR-0024):
-        # multi-account queues must resume a Claude session on the
-        # account that created it — sessions are namespaced by
-        # CLAUDE_CONFIG_DIR. ``session_host_account`` returns None
-        # when the task has no session yet (first attempt) or when
-        # state load fails (which falls back to a fresh dispatch on
-        # whichever account choose_account picks).
-        affined = _affined_account_for_task(queue_dir, task.id)
         # Build the per-tick view of attributed in-flight tasks so
         # choose_account sees each newly-dispatched slot as it lands.
-        live_in_flight = [*to_in_flight_records(in_flight_slots), *held]
-        choice = account_dispatch_mod.choose_account(
-            task=task,
-            accounts=accounts_by_name,
+        choice = _route(
+            task,
+            queue_dir=queue_dir,
+            settings=settings,
+            accounts_by_name=accounts_by_name,
             account_states=dict(snapshot.accounts),
-            in_flight=live_in_flight,
-            affined_account=affined,
+            in_flight=[*to_in_flight_records(in_flight_slots), *held],
             broken=broken,
+            now=clock.now(),
+            read_only=False,
         )
-        # Session-affinity TTL (ADR-0024 extension): affinity blocked the
-        # dispatch (host account busy / throttled / paused), but if the
-        # session has been idle past the affinity TTL its resume/cache
-        # value is spent — so clear it and re-select on any eligible
-        # account rather than leaving the task stranded on its throttled
-        # host. Clearing first (session_id -> None) is what makes the
-        # cross-account dispatch safe: the next spawn starts FRESH instead
-        # of trying to resume a session that lives under the old account's
-        # CLAUDE_CONFIG_DIR. Affinity is still honoured while the host has
-        # capacity and for sessions younger than the TTL.
-        if choice.account is None and affined is not None:
-            ttl = getattr(getattr(settings, "dispatch", None), "affinity_ttl_seconds", 5400.0)
-            if _session_affinity_expired(queue_dir, task.id, now=clock.now(), ttl_seconds=ttl):
-                _clear_session_for_fresh_dispatch(queue_dir, task.id)
-                choice = account_dispatch_mod.choose_account(
-                    task=task,
-                    accounts=accounts_by_name,
-                    account_states=dict(snapshot.accounts),
-                    in_flight=live_in_flight,
-                    affined_account=None,
-                    broken=broken,
-                )
-                if choice.account is not None:
-                    logger.info(
-                        "task %s: session affinity expired (idle > %.0fs on "
-                        "host %r); cleared session, dispatching fresh via "
-                        "account=%s",
-                        task.id,
-                        ttl,
-                        affined,
-                        choice.account,
-                    )
         if choice.account is None:
             logger.info("dispatch skipped task %s: %s", task.id, choice.reason)
             continue
@@ -523,6 +489,84 @@ def tick_dispatch(
         )
 
     return _refresh_in_flight(snapshot, in_flight_slots, held)
+
+
+def _route(
+    task: Task,
+    *,
+    queue_dir: Path,
+    settings: Settings,
+    accounts_by_name: dict[str, ResolvedAccount],
+    account_states: dict[str, AccountState],
+    in_flight: list[InFlightRecord],
+    broken: Mapping[str, str] | None,
+    now: datetime,
+    read_only: bool,
+) -> account_dispatch_mod.DispatchChoice:
+    """The account ``task`` would be dispatched through now, honouring
+    session affinity and its TTL.
+
+    Resolves the affined account from the task's state YAML so
+    choose_account can honour session affinity (ADR-0024): multi-account
+    queues must resume a Claude session on the account that created it —
+    sessions are namespaced by CLAUDE_CONFIG_DIR. ``session_host_account``
+    returns None when the task has no session yet (first attempt) or when
+    state load fails (which falls back to a fresh dispatch on whichever
+    account choose_account picks).
+
+    Session-affinity TTL (ADR-0024 extension): when affinity blocks the
+    dispatch (host account busy / throttled / paused) but the session has
+    been idle past the affinity TTL, its resume/cache value is spent — so
+    clear it and re-select on any eligible account rather than leaving the
+    task stranded on its throttled host. Clearing first (session_id ->
+    None) is what makes the cross-account dispatch safe: the next spawn
+    starts FRESH instead of trying to resume a session that lives under the
+    old account's CLAUDE_CONFIG_DIR. Affinity is still honoured while the
+    host has capacity and for sessions younger than the TTL.
+
+    ``read_only`` re-selects without clearing the session or logging, for
+    a caller that only wants to know where the task would go
+    (:func:`preview_selection`).
+    """
+    affined = _affined_account_for_task(queue_dir, task.id)
+    choice = account_dispatch_mod.choose_account(
+        task=task,
+        accounts=accounts_by_name,
+        account_states=account_states,
+        in_flight=in_flight,
+        affined_account=affined,
+        broken=broken,
+    )
+    if choice.account is None and affined is not None:
+        ttl = _affinity_ttl_s(settings)
+        if _session_affinity_expired(queue_dir, task.id, now=now, ttl_seconds=ttl):
+            if not read_only:
+                _clear_session_for_fresh_dispatch(queue_dir, task.id)
+            choice = account_dispatch_mod.choose_account(
+                task=task,
+                accounts=accounts_by_name,
+                account_states=account_states,
+                in_flight=in_flight,
+                affined_account=None,
+                broken=broken,
+            )
+            if choice.account is not None and not read_only:
+                logger.info(
+                    "task %s: session affinity expired (idle > %.0fs on "
+                    "host %r); cleared session, dispatching fresh via "
+                    "account=%s",
+                    task.id,
+                    ttl,
+                    affined,
+                    choice.account,
+                )
+    return choice
+
+
+def _affinity_ttl_s(settings: Settings) -> float:
+    """``[dispatch].affinity_ttl_seconds``. ``getattr`` tolerates the
+    SimpleNamespace settings stubs some tests pass."""
+    return float(getattr(getattr(settings, "dispatch", None), "affinity_ttl_seconds", 5400.0))
 
 
 def _refresh_in_flight(
@@ -812,7 +856,7 @@ def _target_concurrency(queue_dir: Path, settings: Settings) -> int | None:
 
 
 def _has_any_completed(queue_dir: Path) -> bool:
-    for sp in list_state_files(queue_dir):
+    for sp in iter_state_files(queue_dir):
         try:
             state = load_state(sp)
         except Exception as exc:
@@ -825,7 +869,7 @@ def _has_any_completed(queue_dir: Path) -> bool:
 
 def _completed_task_ids(queue_dir: Path) -> set[str]:
     ids: set[str] = set()
-    for sp in list_state_files(queue_dir):
+    for sp in iter_state_files(queue_dir):
         try:
             state = load_state(sp)
         except Exception as exc:
@@ -845,7 +889,7 @@ def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
     ``None`` as "no affinity constraint" — the next attempt starts
     fresh on whichever account ``choose_account`` picks.
     """
-    sp = state_path_for(queue_dir, task_id)
+    sp = state_file_path(queue_dir, task_id)
     if not sp.exists():
         return None
     try:
@@ -873,7 +917,7 @@ def _session_affinity_expired(
     """
     if ttl_seconds <= 0:
         return False
-    sp = state_path_for(queue_dir, task_id)
+    sp = state_file_path(queue_dir, task_id)
     if not sp.exists():
         return False
     try:
@@ -1076,6 +1120,7 @@ def _eligible_candidates(
     *,
     effort_levels: dict[str, list[str]],
     skips: Counter[str] | None = None,
+    held: dict[str, list[Task]] | None = None,
     read_only: bool = False,
     on_park: ParkCallback | None = None,
 ) -> list[Task]:
@@ -1093,7 +1138,8 @@ def _eligible_candidates(
     # :func:`_skip_category`). A task whose state is ``completed`` is counted
     # under ``completed`` whichever check skipped it first, so every other
     # category counts unfinished work only. The returned tasks plus the
-    # counts added here equal the number of task YAMLs read.
+    # counts added here equal the number of task YAMLs read. ``held``, when
+    # given, gets each unfinished task not returned under its category.
     #
     # ``in_flight_slots`` is read for its task ids only (a slot map's keys).
     # ``read_only`` turns off the gates' bookkeeping (see
@@ -1137,8 +1183,12 @@ def _eligible_candidates(
         )
         if category is None:
             out.append(task)
+        elif task.id in completed_ids:
+            tally[_COMPLETED] += 1
         else:
-            tally[_COMPLETED if task.id in completed_ids else category] += 1
+            tally[category] += 1
+            if held is not None:
+                held.setdefault(category, []).append(task)
     return out
 
 
@@ -1152,7 +1202,7 @@ def _skip_category(
     blocked_ids: set[str],
     now: datetime | None,
     effort_levels: dict[str, list[str]],
-    read_only: bool = False,
+    read_only: bool,
     on_park: ParkCallback | None = None,
 ) -> str | None:
     """Decide whether the selector admits ``task`` this tick.
@@ -1190,7 +1240,7 @@ def _skip_category(
     # a task that has no state file yet (never dispatched) exactly as they
     # do to one resuming from awaiting_sidecar, deferred, or failed.
     state: TaskState | None = None
-    sp = state_path_for(queue_dir, task.id)
+    sp = state_file_path(queue_dir, task.id)
     if sp.exists():
         try:
             state = load_state(sp)
@@ -1369,9 +1419,20 @@ class SelectionPreview:
     eligible_statuses: dict[str, str]
     """Each admitted task's state status, ``new`` when it has no state file
     yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    routes: dict[str, str | None]
+    """For each admitted task, the account a tick would dispatch it through
+    now (:func:`_route`, session affinity and its TTL included), or ``None``
+    when no account takes it now."""
+    affinity_held: list[str]
+    """Admitted tasks no account takes now only because their session
+    belongs to an account that cannot take them; another account could.
+    They wait for that account, or for the affinity TTL to lapse."""
     skips: Counter[str]
     """Every other task YAML in ``todo/``, counted under the category that
     holds it, ``completed`` included (see :func:`_eligible_candidates`)."""
+    held: dict[str, list[Task]]
+    """The unfinished tasks ``skips`` counts, by category; a task file that
+    cannot be read has no :class:`Task` and is only counted."""
     queue_cap: int | None
     """The queue-wide cap on tasks in flight now (:func:`_target_concurrency`):
     ``[concurrency].initial_concurrency`` while warming up, else
@@ -1385,38 +1446,77 @@ def preview_selection(
     queue_dir: Path,
     settings: Settings,
     *,
-    in_flight_ids: Collection[str],
+    snapshot: SupervisorSnapshot | None,
     now: datetime,
 ) -> SelectionPreview:
     """Run the dispatch selector once without any of its side effects.
 
     The same :func:`_eligible_candidates` pass a supervisor tick runs, with
     the queue's settings, its block-list and ``now``, but read-only: no task
-    is parked or un-parked and no state file is written, so a status command
-    can show what holds each task. ``in_flight_ids`` stands in for the
-    supervisor's slot map (``supervisor.json``'s ``in_flight`` records).
+    is parked or un-parked, no session is cleared, and no file or directory
+    is written, so a status command can show what holds each task. The
+    in-flight tasks and account states are ``snapshot``'s (supervisor.json);
+    without one nothing is in flight and no account takes a task.
     """
+    in_flight = list(snapshot.in_flight) if snapshot is not None else []
+    account_states = dict(snapshot.accounts) if snapshot is not None else {}
     skips: Counter[str] = Counter()
+    held: dict[str, list[Task]] = {}
     eligible = _eligible_candidates(
         queue_dir,
-        in_flight_ids,
+        {record.task_id for record in in_flight},
         _completed_task_ids(queue_dir),
         now=now,
         block_file=getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None),
         effort_levels=settings.effort_levels,
         skips=skips,
+        held=held,
         read_only=True,
     )
     eligible.sort(key=priority_sort_key)
+
+    from claude_task_runner.config.loader import resolve_accounts
+
+    resolution = resolve_accounts(settings)
+    accounts_by_name = {a.name: a for a in resolution.accounts}
+    broken = {b.name: b.error for b in resolution.broken}
     statuses: dict[str, str] = {}
+    routes: dict[str, str | None] = {}
+    affinity_held: list[str] = []
     for task in eligible:
-        sp = state_path_for(queue_dir, task.id)
+        sp = state_file_path(queue_dir, task.id)
         # The selector loaded this state a moment ago, so it parses.
         statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        choice = _route(
+            task,
+            queue_dir=queue_dir,
+            settings=settings,
+            accounts_by_name=accounts_by_name,
+            account_states=account_states,
+            in_flight=in_flight,
+            broken=broken,
+            now=now,
+            read_only=True,
+        )
+        routes[task.id] = choice.account
+        if choice.account is None and _affined_account_for_task(queue_dir, task.id):
+            free = account_dispatch_mod.choose_account(
+                task=task,
+                accounts=accounts_by_name,
+                account_states=account_states,
+                in_flight=in_flight,
+                affined_account=None,
+                broken=broken,
+            )
+            if free.account is not None:
+                affinity_held.append(task.id)
     return SelectionPreview(
         eligible=eligible,
         eligible_statuses=statuses,
+        routes=routes,
+        affinity_held=affinity_held,
         skips=skips,
+        held=held,
         queue_cap=_target_concurrency(queue_dir, settings),
         warming_up=(
             settings.concurrency.initial_concurrency is not None
