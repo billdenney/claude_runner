@@ -91,7 +91,7 @@ def test_preview_counts_a_live_workers_task_and_parks_nothing(
 ) -> None:
     before = _state_bytes(queue)
 
-    preview = orch_mod.preview_selection(queue, load_settings(None), in_flight_ids=set(), now=_NOW)
+    preview = orch_mod.preview_selection(queue, load_settings(None), snapshot=None, now=_NOW)
 
     assert preview.eligible == []
     assert preview.skips["live_worker"] == 1
