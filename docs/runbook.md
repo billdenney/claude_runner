@@ -123,44 +123,62 @@ supervisor not started: the runner-account.toml of 1 account does not load:
 Fix each file, or delete it for the defaults, then start the supervisor again. Once the supervisor runs, a file that breaks only stops new tasks on its account.
 ```
 
-It exits 78 when the content is wrong (a parse or validation error, an
-empty file, `[throttle.*]`, a directory where the file belongs). Under
+It exits 78 when the content or the path is wrong, which only a fix helps:
+a parse or validation error, an empty file, `[throttle.*]`, a directory
+where the file belongs, a symlink loop, a name too long, a path through
+something that is not a directory. Under
 systemd, `systemctl --user status claude-task-runner` then shows the unit
 `failed` with `status=78`, the message is in `journalctl --user -u
 claude-task-runner`, and the unit is not restarted (its
 `RestartPreventExitStatus=` lists 78). It exits 1 instead, with an extra
 line saying the problem may clear up by itself, when every problem is a
-file or directory that could not be read: the account's `config_dir` does
-not exist (a mount not up yet at boot), permission is denied, or the file
-is a symlink to a file that does not exist yet. systemd retries that, up
-to `StartLimitBurst`, so a late mount recovers by itself.
+file or directory that could not be read for now: the account's
+`config_dir` does not exist (a mount not up yet at boot), permission is
+denied, the file is a symlink to a file that does not exist yet, or a
+network mount reports an I/O, stale-handle or not-connected error. systemd
+retries that, up to `StartLimitBurst`, so a late mount recovers by itself.
 
 Under the cron watchdog, `~/.claude_task_runner/watchdog.log` has, in
 place of the verdict line when a restart is due, `watchdog: ERROR
 queue=... the runner-account.toml of N account(s) does not load, so its
-supervisor was not restarted: ...` (or a WARNING saying they cannot be
-read yet, for the kind that may clear up), and no restart is counted.
+supervisor was not restarted: ...`, the tick exits 1, and no restart is
+counted. For the kind that may clear up, the line is a WARNING ending
+`this may clear up by itself, and the next tick tries again`, and the tick
+exits 0, until the problem has lasted
+`[watchdog].transient_config_escalation_s` (10 minutes by default); from
+then on it is an ERROR again, saying how long it has lasted. A queue TOML
+that does not load is logged the same way, as `... config=... does not
+load, so its supervisor was not checked or restarted ...`.
 `claude-task-runner install` refuses to install while a file is broken.
 
 A queue TOML that does not load stops the start the same way, with exit
-78 (exit 1 for a `--config` file that does not exist or cannot be read)
-and the queue TOML's own error (`Settings validation failed: ...`). That
-includes an account's `config_dir`, or `[claude].config_dir`, starting
-with `~user` for a user that does not exist. Every other command that
-reads the queue TOML (`account list`, `supervisor status`, `doctor`,
-`usage`, `install`, `queue add`, ...) then prints `configuration error:
-...` and exits with the same status, without a traceback.
+78 (exit 1 for a file that does not exist or cannot be read for now,
+including a `<queue>/claude_runner.toml` symlink whose target is not there
+yet) and the queue TOML's own error (`Settings validation failed: ...`).
+That includes an account's `config_dir`, or `[claude].config_dir`,
+starting with `~user` for a user that does not exist, or holding a NUL
+byte. Every other command that reads the queue TOML exits with the same
+status and prints the error without a traceback: `account list`, `account
+pause`, `account resume`, `supervisor status`, a waiting `supervisor
+drain` without `--timeout`, `doctor`, `usage`, `install`, `install
+uninstall`, `queue list`, `queue add`, `queue backfill-working-dir`, `queue
+force-dispatch`, `worktree reclaim` and `watchdog register`. Most print
+`configuration error: ...`; with `--json` it is `{"ok": false, "error":
+...}`. The one exception is `watchdog tick`, which logs it as above.
 
 **Symptom while running:** One account gets no new tasks while the others
 dispatch as usual. The supervisor log has, once per error (and again after
 each edit that leaves the file broken):
 
 ```
-account 'work' takes no new tasks until its runner-account.toml loads: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
+account 'work' takes no new tasks until this is fixed: Invalid TOML in /home/bill-work/.claude/runner-account.toml: Expected '=' after a key in a key/value pair (at line 3, column 17)
 ```
 
 `claude-task-runner account list` prints `policy error:` with the same text
-for that account and exits 1; `supervisor status` prints it as
+for that account (with `--json`, in that row's `policy_error`) and exits 1;
+output with `"ok": false` is an error instead of a listing, since exit 1
+also means the queue TOML could not be read for now. `supervisor status`
+prints it as
 `Account error:`; `doctor` fails `account_policies`. When no account's file
 loads, the log also says `no account's runner-account.toml loads (...):
 nothing is dispatched until one is fixed`. If a user named by a `~user`
@@ -186,7 +204,9 @@ usual, and it adds nothing to the queue's concurrency ceiling. Only a
 2. If the supervisor refused to start with exit 78, start it again:
    `systemctl --user start claude-task-runner` (a unit stopped by 78 is not
    restarted on its own), or wait for the next cron watchdog tick. After
-   exit 1, systemd and the watchdog keep trying; if the unit reached its
+   exit 1, systemd and the watchdog keep trying (the watchdog's WARNING
+   turns into an ERROR once the problem has lasted
+   `[watchdog].transient_config_escalation_s`); if the unit reached its
    start limit, `systemctl --user reset-failed claude-task-runner` and
    start it.
 3. If it was running, nothing else is needed: the supervisor re-reads the
@@ -196,7 +216,9 @@ usual, and it adds nothing to the queue's concurrency ceiling. Only a
    clean usage reading first, within one capture cycle.
 4. Deleting the file instead gives the account the defaults
    (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`); the log line
-   then says the file `is gone, so the defaults apply`. An empty file is
+   then says the file `does not exist, so the defaults apply`, as it does
+   when a `config_dir` that did not exist appears without the file. An
+   empty file is
    not the same as no file: it stays broken until it is deleted or filled
    in.
 
