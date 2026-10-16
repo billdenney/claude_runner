@@ -42,7 +42,9 @@ The end-to-end recovery:
 3. Orphan's status is demoted to ``"failed"``,
    ``stop_reason="orphaned_by_supervisor_restart"``.
 4. ``snapshot.in_flight`` / ``in_flight_task_ids`` are cleared (the
-   old supervisor's last-persisted in-flight list is stale).
+   old supervisor's last-persisted in-flight list is stale), except the
+   records of tasks parked with a live worker, which name the account
+   each such worker runs on.
 5. First tick's orchestrator sees a ``"failed"`` task that's a
    ``_DISPATCHABLE_STATUS`` — picks it up.
 6. ``plan_next_spawn`` sees the persisted ``session_id`` and the

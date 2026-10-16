@@ -81,3 +81,20 @@ corruption — it is left for the next pass.
   corruption ever proves to happen while running.)
 - The legacy silent-skip is restorable via
   `[supervisor].quarantine_corrupt_state = false`.
+
+## Amendment (2026-10-17) — a task whose worker still runs is parked, not reverted
+
+Decision 2 and the "Rare false re-dispatch" consequence no longer hold for
+a task whose worker is still running when its state is found corrupt.
+Reverting it to pending would dispatch a second worker into the same
+worktree. The quarantine now reads the worker's `pid`, `log_path`,
+`last_started_at` and `attempts` from the corrupt file's readable head,
+each field kept only if it is valid on its own, and asks
+`runner.dispatcher.live_worker_record` whether a worker of the task still
+runs: the salvaged pid, or a process whose stdout is one of the task's
+stream logs. When one does, it writes a state parked `possibly_hung` with
+that worker on record (stop reason `worker_still_running`) in place of
+the corrupt file, and the result's `preserved_status` is `possibly_hung`.
+The parked worker then holds its account's slot, and its run is recorded
+from its log once it exits (ADR-0025, amendment of 2026-10-16). A task
+whose worker is gone reverts to pending, or keeps `completed`, as before.
