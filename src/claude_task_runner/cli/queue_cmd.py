@@ -8,6 +8,8 @@ Subcommands:
 
 * ``queue list``                  — list pending tasks (``todo/`` YAMLs).
 * ``queue states``                — list TaskState YAMLs, optionally filtered by status.
+* ``queue holds``                 — run the supervisor's task selection once, read-only:
+                                    what can start now and what holds the rest.
 * ``queue show ID``               — show one task's input + state + runs.
 * ``queue add``                   — write a new Task YAML from CLI args.
 * ``queue backfill-working-dir``  — populate ``working_dir`` on existing
@@ -410,7 +412,7 @@ def holds(
     ),
     json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """Show which tasks the supervisor would start now, and what holds the rest.
+    """Show what can start now and what holds the rest.
 
     Runs the supervisor's own candidate selection once, read-only: no task
     is parked or un-parked and no state file is written. The tasks in flight
