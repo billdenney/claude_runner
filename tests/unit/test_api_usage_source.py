@@ -682,6 +682,18 @@ def test_a_login_failure_without_a_marker_gets_one() -> None:
     assert auth_failure_message(UsageApiAuthExpired("HTTP 401")) == "OAuth login failed: HTTP 401"
 
 
+def test_an_unexpandable_config_dir_is_recorded_with_a_marker() -> None:
+    """The one API source login failure that names no marker itself: the
+    account's config_dir names a user who is gone."""
+    src = ApiUsageSource(FakeClock(start=datetime.now(UTC)), config_dir="~nosuchuser-rs/x")
+    exc = _raised(src.read)
+    assert isinstance(exc, CredentialsNotFound)
+    recorded = auth_failure_message(exc)
+    assert recorded == f"OAuth login failed: {exc}"
+    assert str(exc).startswith("config_dir '~nosuchuser-rs/x' cannot be expanded: ")
+    assert usage_error_kind(recorded) == "auth"
+
+
 @pytest.mark.parametrize(
     "recorded",
     [
