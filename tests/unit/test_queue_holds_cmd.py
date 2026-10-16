@@ -384,3 +384,62 @@ def test_parked_workers_and_retry_reasons(
             "next_eligible_at": due.isoformat(),
         }
     ]
+
+
+def test_a_parked_worker_supervisor_json_lists_is_held_by_its_status(
+    queue: Path, tmp_path: Path, worker: Callable[[Path], int]
+) -> None:
+    """A supervisor tick persists each parked live worker's record in
+    supervisor.json. The task is held ``possibly_hung`` and reported among
+    the parked workers, as the tick's selector holds it, not ``in_flight``;
+    its record still takes its account's one slot, so the eligible task
+    cannot start now."""
+    config_dir = tmp_path / "cfg-solo"
+    write_account_cap(config_dir, 1)
+    _config(queue, f'[[accounts]]\nname = "solo"\nconfig_dir = "{config_dir}"\n')
+    started = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    log = tmp_path / "parked.log"
+    pid = worker(log)
+    add_task(queue, "parked")
+    _parked(queue, "parked", pid, log, started)
+    add_task(queue, "fresh")
+    snapshot = SupervisorSnapshot(
+        state=SupervisorState.DISPATCHING,
+        since=SINCE,
+        accounts={"solo": AccountState(state=SupervisorState.DISPATCHING, since=SINCE)},
+        in_flight=[InFlightRecord(task_id="parked", account="solo", started_at=started)],
+        in_flight_task_ids=["parked"],
+    )
+    persist_mod.write_atomic(snapshot, persist_mod.supervisor_state_path(queue))
+
+    holds = _holds(queue)
+
+    assert holds["held"] == {"possibly_hung": 1}
+    assert holds["parked_workers"] == [
+        {
+            "task_id": "parked",
+            "pid": pid,
+            "started_at": started.isoformat(),
+            "running": True,
+            "duration_cap_s": 14400.0,
+            "past_cap": False,
+        }
+    ]
+    assert holds["eligible"] == {
+        "count": 1,
+        "task_ids": ["fresh"],
+        "by_status": {"new": 1},
+        "can_start_now": 0,
+        "waiting_for_their_account": 0,
+    }
+
+
+def test_an_unreadable_in_flight_state_is_held_in_flight(queue: Path) -> None:
+    """A supervisor.json record whose state file does not parse cannot be
+    told apart from a monitored task: it stays held ``in_flight``."""
+    _config(queue)
+    add_task(queue, "a")
+    state_path_for(queue, "a").write_text("{not: [yaml", encoding="utf-8")
+    _in_flight(queue, "a")
+
+    assert _holds(queue)["held"] == {"in_flight": 1}

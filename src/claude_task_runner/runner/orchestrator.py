@@ -1457,6 +1457,12 @@ def preview_selection(
     is written, so a status command can show what holds each task. The
     in-flight tasks and account states are ``snapshot``'s (supervisor.json);
     without one nothing is in flight and no account takes a task.
+
+    supervisor.json also lists the parked live workers a tick holds
+    (:class:`supervisor.adoption.ParkedWorkerTracker`). Their records count
+    against their accounts in routing, as in the tick, but the tick's
+    selector sees only its monitor threads, so it holds a parked task under
+    its status (``possibly_hung``), and so does this preview.
     """
     in_flight = list(snapshot.in_flight) if snapshot is not None else []
     account_states = dict(snapshot.accounts) if snapshot is not None else {}
@@ -1464,7 +1470,7 @@ def preview_selection(
     held: dict[str, list[Task]] = {}
     eligible = _eligible_candidates(
         queue_dir,
-        {record.task_id for record in in_flight},
+        _monitored_task_ids(queue_dir, in_flight),
         _completed_task_ids(queue_dir),
         now=now,
         block_file=getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None),
@@ -1523,6 +1529,24 @@ def preview_selection(
             and not _has_any_completed(queue_dir)
         ),
     )
+
+
+def _monitored_task_ids(queue_dir: Path, in_flight: Sequence[InFlightRecord]) -> set[str]:
+    """The task ids of ``in_flight`` other than parked live workers
+    (:func:`runner.dispatcher.is_parked_live_worker`): those a tick has a
+    monitor thread for. A record whose state cannot be read counts as
+    monitored; the selector then holds its task ``in_flight``."""
+    ids: set[str] = set()
+    for record in in_flight:
+        try:
+            parked = dispatcher_mod.is_parked_live_worker(
+                load_state(state_file_path(queue_dir, record.task_id))
+            )
+        except (OSError, ValueError):
+            parked = False
+        if not parked:
+            ids.add(record.task_id)
+    return ids
 
 
 def _dispatch_one_safely(
