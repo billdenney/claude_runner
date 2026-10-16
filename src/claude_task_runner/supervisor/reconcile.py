@@ -63,7 +63,9 @@ Edge cases:
   Not our problem to detect here.
 * The orphan's worker is still running (``KillMode=process`` keeps
   workers alive across a restart) and was not adopted: adoption is off,
-  or the worker showed no sign of life for ``heartbeat_silence_alert_s``.
+  or the worker showed no sign of life for ``heartbeat_silence_alert_s``,
+  or no state recorded its pid (it is then found by its stream log,
+  :func:`runner.dispatcher.live_worker_record`).
   A ``failed`` task is dispatched again, and a second worker would then
   share the first one's worktree, so the task is parked ``possibly_hung``
   instead (:func:`park_live_worker`) and a WARNING names the pid.
@@ -175,10 +177,11 @@ def reconcile_orphans(
                 state.task_id,
             )
             continue
-        if dispatcher_mod.probe_recorded_worker(state) is dispatcher_mod.WorkerProbe.ALIVE:
-            if _park_unadopted(state, state_path):
-                assert state.pid is not None  # narrowed by the probe
-                parked.append(ParkedWorker(state.task_id, state.pid, state.log_path))
+        live = dispatcher_mod.live_worker_record(state, queue_dir)
+        if live is not None:
+            if _park_unadopted(live, state_path):
+                assert live.pid is not None  # live_worker_record records a pid
+                parked.append(ParkedWorker(live.task_id, live.pid, live.log_path))
             continue
         demoted = state.model_copy(
             update={

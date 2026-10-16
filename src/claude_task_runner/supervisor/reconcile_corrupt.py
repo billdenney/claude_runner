@@ -28,6 +28,15 @@ corrupt file, in which case a minimal valid state preserving
 ``completed`` is salvaged: re-dispatching a ``failed`` /
 ``failed_circuit_breaker`` / parked task is harmless or desirable, but
 re-running a finished extraction wastes a full task.)
+
+The other exception is a task whose worker still runs: reverting it to
+pending would dispatch a second worker into the same worktree. The
+worker's ``pid``, ``log_path``, ``last_started_at`` and spawn identity
+are read from the head too, and when they name a running worker
+(:func:`runner.dispatcher.live_worker_record`, which also finds a worker
+writing the task's stream log), a state parked ``possibly_hung`` with
+that worker on record is written instead
+(:func:`runner.dispatcher.park_live_worker`).
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml
+
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -47,6 +58,7 @@ from claude_task_runner.queue.store import (
     state_dir,
     write_state_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +86,9 @@ class CorruptQuarantineResult:
 
     task_id: str
     quarantined_path: str
-    #: terminal status preserved in a rebuilt state, else ``None`` (the
-    #: task was reverted to pending and will re-dispatch).
+    #: status kept in a rebuilt state: ``completed``, or ``possibly_hung``
+    #: for a task whose worker still runs; else ``None`` (the task was
+    #: reverted to pending and will re-dispatch).
     preserved_status: str | None
 
 
@@ -90,6 +103,46 @@ def _salvage_status(raw: str) -> str | None:
         if m is not None:
             return m.group(1)
     return None
+
+
+_WORKER_FIELDS = frozenset(
+    {"pid", "log_path", "last_started_at", "worker_boot_id", "worker_start_ticks"}
+)
+"""Top-level fields read from a corrupt file's head to find a worker that
+may still run."""
+
+
+def _salvage_worker(raw: str) -> dict[str, object]:
+    """The worker fields (:data:`_WORKER_FIELDS`) readable from the corrupt
+    file's head, each parsed as a one-line YAML mapping; an unreadable
+    line is skipped."""
+    found: dict[str, object] = {}
+    for line in raw.splitlines()[:_HEAD_LINES]:
+        name, sep, _rest = line.partition(":")
+        if not sep or name not in _WORKER_FIELDS:
+            continue
+        try:
+            parsed = yaml.safe_load(line)
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and parsed.get(name) is not None:
+            found[name] = parsed[name]
+    return found
+
+
+def _live_worker_state(queue_dir: Path, task_id: str, raw: str) -> TaskState | None:
+    """A state parked with the task's still-running worker on record, or
+    ``None`` when no worker of the task runs."""
+    try:
+        candidate = TaskState.model_validate(
+            {"task_id": task_id, "status": "running", **_salvage_worker(raw)}
+        )
+    except Exception:
+        candidate = TaskState(task_id=task_id, status="running")
+    live = dispatcher_mod.live_worker_record(candidate, queue_dir)
+    if live is None:
+        return None
+    return dispatcher_mod.park_live_worker(live, why="and its state file was unreadable")
 
 
 def quarantine_corrupt_state_files(
@@ -150,7 +203,20 @@ def quarantine_corrupt_state_files(
             continue
 
         preserved: str | None = None
-        if salvaged in _SALVAGE_STATUSES:
+        parked = _live_worker_state(queue_dir, task_id, raw)
+        if parked is not None:
+            try:
+                write_state_atomic(parked, sp)
+                preserved = parked.status
+            except Exception as exc:
+                logger.error(
+                    "corrupt-state quarantine: %s's worker pid=%s still runs but its "
+                    "parked state could not be written (%s); task reverts to pending",
+                    task_id,
+                    parked.pid,
+                    exc,
+                )
+        elif salvaged in _SALVAGE_STATUSES:
             # Rebuild a minimal valid state so a finished task is not
             # redone. Run history / session_id can't be trusted from a
             # corrupt file, so they are intentionally dropped.
@@ -180,6 +246,7 @@ def quarantine_corrupt_state_files(
             dest,
             (
                 f"rebuilt minimal status={preserved}"
+                + (f" (worker pid={parked.pid} still runs)" if parked is not None else "")
                 if preserved
                 else "task reverts to pending and will re-dispatch"
             ),

@@ -369,6 +369,12 @@ def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
 _STDERR_TAIL_BYTES = 500
 
 
+def task_logs_dir(queue_dir: Path, task_id: str) -> Path:
+    """``<queue>/.claude_task_runner/logs/<task_id>``, where a task's
+    attempts write their stream logs (ADR-0025). Not created here."""
+    return queue_dir / ".claude_task_runner" / "logs" / task_id
+
+
 def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Path, Path]:
     """Return ``(stdout_log, stderr_log)`` for one file-backed attempt.
 
@@ -378,7 +384,7 @@ def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Pat
     directory is created if missing. ``attempt`` is the 1-based attempt
     number already stored on ``TaskState.attempts`` for this run.
     """
-    logs_dir = queue_dir / ".claude_task_runner" / "logs" / task_id
+    logs_dir = task_logs_dir(queue_dir, task_id)
     logs_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = logs_dir / f"attempt-{attempt}.stream.jsonl"
     stderr_log = _stderr_path_for_stdout_log(stdout_log)
@@ -718,6 +724,67 @@ def is_parked_live_worker(state: TaskState) -> bool:
         and state.stop_reason == LIVE_WORKER_STOP_REASON
         and state.pid is not None
     )
+
+
+def live_worker_record(state: TaskState, queue_dir: Path) -> TaskState | None:
+    """``state`` with a still-running worker of its task on record, or
+    ``None`` when no worker of the task runs.
+
+    The recorded worker, when :func:`probe_recorded_worker` says it runs.
+    Otherwise a worker no state records, whose pid was never written (the
+    ``UNTRACKED-PID`` case in :func:`dispatch`) or whose state was lost:
+    a process whose stdout is one of the task's stream logs
+    (:func:`find_live_log_writer`). That one is returned with its pid, log
+    and spawn identity filled in, so it can be parked and probed like any
+    other. Only this user's processes can be found that way.
+    """
+    if probe_recorded_worker(state) is WorkerProbe.ALIVE:
+        return state
+    found = find_live_log_writer(task_logs_dir(queue_dir, state.task_id))
+    if found is None:
+        return None
+    pid, log_path = found
+    boot_id, start_ticks = _process_identity(pid)
+    return state.model_copy(
+        update={
+            "pid": pid,
+            "log_path": log_path,
+            "worker_boot_id": boot_id,
+            "worker_start_ticks": start_ticks,
+        }
+    )
+
+
+def find_live_log_writer(log_dir: Path) -> tuple[int, str] | None:
+    """``(pid, log path)`` of a running process whose stdout is a stream log
+    in ``log_dir``, or ``None``.
+
+    Walks ``/proc/<pid>/fd/1`` for every process; one this user may not
+    read (another user's, under ``sudo``) is skipped. A match is confirmed
+    with :func:`probe_worker`, so a zombie does not count.
+    """
+    if not _PROC_ROOT.is_dir():
+        return None
+    wanted = os.path.realpath(log_dir)
+    try:
+        entries = list(os.scandir(_PROC_ROOT))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            target = os.readlink(os.path.join(entry.path, "fd", "1"))
+        except OSError:
+            continue
+        if not target.endswith(".stream.jsonl"):
+            continue
+        if os.path.realpath(os.path.dirname(target)) != wanted:
+            continue
+        pid = int(entry.name)
+        if probe_worker(pid, log_path=target, started_at=None) is WorkerProbe.ALIVE:
+            return pid, target
+    return None
 
 
 def _process_identity(pid: int) -> tuple[str | None, int | None]:

@@ -162,6 +162,7 @@ _SKIP_DEFERRED_COOLDOWN = "deferred_cooldown"
 _SKIP_INVALID_EFFORT = "invalid_effort"
 _SKIP_DEPENDS_ON = "depends_on"
 _SKIP_READINESS_PREFIX = "readiness_"
+_SKIP_LIVE_WORKER = "live_worker"
 # Finished, not held: left out of the summary's unfinished count.
 _COMPLETED = "completed"
 
@@ -1142,6 +1143,17 @@ def _skip_category(
             # deferred task past its cooldown: fall through to the
             # gates below.
 
+        # A task whose recorded worker still runs is never dispatched
+        # beside it, whatever its status says (a state demoted while its
+        # worker ran). Parked, its worker holds its account's slot and its
+        # run is recorded once it exits (supervisor.adoption.track_parked_workers).
+        if (
+            state.pid is not None
+            and dispatcher_mod.probe_recorded_worker(state) is dispatcher_mod.WorkerProbe.ALIVE
+        ):
+            _park_live_worker(queue_dir, state)
+            return _SKIP_LIVE_WORKER
+
     # Effort gate (ADR-0010): a task whose (model, effort) pair the merged
     # [effort_levels] rejects is never dispatched. It is parked as
     # `deferred` with an `invalid effort: ...` reason and a WARNING, and
@@ -1209,6 +1221,33 @@ def _skip_category(
     return None
 
 
+def _park_live_worker(queue_dir: Path, live: TaskState) -> None:
+    """Refuse to dispatch ``live``'s task: its worker still runs. Park it
+    (:func:`runner.dispatcher.park_live_worker`) and log a WARNING."""
+    parked = dispatcher_mod.park_live_worker(
+        live, why="while its task was about to be dispatched again"
+    )
+    try:
+        write_state_atomic(parked, state_path_for(queue_dir, live.task_id))
+    except Exception as exc:
+        logger.error(
+            "refusing to dispatch task %s: its worker pid=%s is still running, and its "
+            "park could not be written (%s)",
+            live.task_id,
+            live.pid,
+            exc,
+        )
+        return
+    logger.warning(
+        "refusing to dispatch task %s: its worker pid=%s is still running (log=%s); "
+        "parked possibly_hung (stop_reason=%s) so it is not dispatched a second time",
+        live.task_id,
+        live.pid,
+        live.log_path,
+        parked.stop_reason,
+    )
+
+
 def _dispatch_one_safely(
     task: Task,
     queue_dir: Path,
@@ -1219,6 +1258,7 @@ def _dispatch_one_safely(
     linux_user: str | None,
     account: str,
     spawn_gate: SpawnGate | None = None,
+    allow_live_worker: bool = False,
 ) -> None:
     """Thread entrypoint — load state, plan spawn, call dispatch, log errors.
 
@@ -1242,6 +1282,14 @@ def _dispatch_one_safely(
     selector parks a task whose (model, effort) pair ``[effort_levels]``
     rejects, and this makes that hold for every path that spawns this
     function, whatever the caller checked.
+
+    First of all, a task with a worker that still runs is not dispatched:
+    the recorded worker, or one no state records that writes the task's
+    stream log (:func:`runner.dispatcher.live_worker_record`). The task is
+    parked with that worker on record and a WARNING. Two workers in one
+    worktree corrupt its branch, so this holds for every path, whatever
+    produced the state. ``allow_live_worker`` (``queue force-dispatch
+    --allow-live-worker``) is the operator's override.
     """
     sp = state_path_for(queue_dir, task.id)
     if sp.exists():
@@ -1251,6 +1299,12 @@ def _dispatch_one_safely(
             state = TaskState(task_id=task.id)
     else:
         state = TaskState(task_id=task.id)
+
+    if not allow_live_worker:
+        live = dispatcher_mod.live_worker_record(state, queue_dir)
+        if live is not None:
+            _park_live_worker(queue_dir, live)
+            return
 
     effort_reason = _effort_hold_reason(task, settings.effort_levels)
     if effort_reason is not None:
