@@ -671,6 +671,43 @@ def test_finalize_exited_leaves_live_worker(
     assert load_state(state_path_for(queue_dir, "402-live")) == state
 
 
+def test_finalize_exited_records_worker_whose_pid_another_process_has(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The worker finished during the restart and its pid now belongs to a
+    process that writes elsewhere. The worker has exited, so its run is
+    recorded from the log, not left for reconcile_orphans to set failed and
+    dispatch again."""
+    state = _seed_exited(queue_dir, "403-reused")
+    elsewhere = tmp_path / "elsewhere.out"
+    elsewhere.write_text("")
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == _WORKER_PID)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            _WORKER_PID,
+            started=_NOW - timedelta(minutes=5),
+            boot=_NOW - timedelta(days=1),
+            stdout=elsewhere,
+        ),
+    )
+
+    results = finalize_exited_workers(queue_dir, settings=_settings(), clock=FakeClock(_NOW))
+
+    assert results == [
+        ExitedWorkerResult(
+            task_id="403-reused",
+            pid=_WORKER_PID,
+            log_path=str(state.log_path),
+            status="completed",
+            stop_reason="end_turn",
+        )
+    ]
+    assert load_state(state_path_for(queue_dir, "403-reused")).status == "completed"
+
+
 @pytest.mark.parametrize(
     "update",
     [
