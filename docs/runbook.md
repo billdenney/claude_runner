@@ -115,7 +115,7 @@ A broken account file is fatal when the supervisor starts and non-fatal
 while it runs (ADR-0035, amendment of 2026-10-16).
 
 **Symptom at start:** The supervisor does not start. `supervisor start`
-exits 78 and prints every account whose file does not load:
+prints every account whose file does not load:
 
 ```
 supervisor not started: the runner-account.toml of 1 account does not load:
@@ -123,16 +123,33 @@ supervisor not started: the runner-account.toml of 1 account does not load:
 Fix each file, or delete it for the defaults, then start the supervisor again. Once the supervisor runs, a file that breaks only stops new tasks on its account.
 ```
 
-Under systemd, `systemctl --user status claude-task-runner` shows the unit
+It exits 78 when the content is wrong (a parse or validation error, an
+empty file, `[throttle.*]`, a directory where the file belongs). Under
+systemd, `systemctl --user status claude-task-runner` then shows the unit
 `failed` with `status=78`, the message is in `journalctl --user -u
 claude-task-runner`, and the unit is not restarted (its
-`RestartPreventExitStatus=` lists 78). Under the cron watchdog,
-`~/.claude_task_runner/watchdog.log` has `watchdog: ERROR queue=... the
-runner-account.toml of N account(s) does not load, so its supervisor was
-not restarted: ...` on each tick, and no restart is counted. A queue TOML
-that does not load, including an account whose `config_dir` starts with
-`~user` for a user that does not exist, stops the start the same way, with
-exit 78 and the queue TOML's own error (`Settings validation failed: ...`).
+`RestartPreventExitStatus=` lists 78). It exits 1 instead, with an extra
+line saying the problem may clear up by itself, when every problem is a
+file or directory that could not be read: the account's `config_dir` does
+not exist (a mount not up yet at boot), permission is denied, or the file
+is a symlink to a file that does not exist yet. systemd retries that, up
+to `StartLimitBurst`, so a late mount recovers by itself.
+
+Under the cron watchdog, `~/.claude_task_runner/watchdog.log` has, in
+place of the verdict line when a restart is due, `watchdog: ERROR
+queue=... the runner-account.toml of N account(s) does not load, so its
+supervisor was not restarted: ...` (or a WARNING saying they cannot be
+read yet, for the kind that may clear up), and no restart is counted.
+`claude-task-runner install` refuses to install while a file is broken.
+
+A queue TOML that does not load stops the start the same way, with exit
+78 (exit 1 for a `--config` file that does not exist or cannot be read)
+and the queue TOML's own error (`Settings validation failed: ...`). That
+includes an account's `config_dir`, or `[claude].config_dir`, starting
+with `~user` for a user that does not exist. Every other command that
+reads the queue TOML (`account list`, `supervisor status`, `doctor`,
+`usage`, `install`, `queue add`, ...) then prints `configuration error:
+...` and exits with the same status, without a traceback.
 
 **Symptom while running:** One account gets no new tasks while the others
 dispatch as usual. The supervisor log has, once per error (and again after
@@ -146,25 +163,32 @@ account 'work' takes no new tasks until its runner-account.toml loads: Invalid T
 for that account and exits 1; `supervisor status` prints it as
 `Account error:`; `doctor` fails `account_policies`. When no account's file
 loads, the log also says `no account's runner-account.toml loads (...):
-nothing is dispatched until one is fixed`. A user removed from the system
-while the supervisor runs shows the same way for each account whose
-`config_dir` starts with `~` and that user's name.
+nothing is dispatched until one is fixed`. If a user named by a `~user`
+`config_dir` is removed while the supervisor runs, the supervisor reports
+that account the same way, but the commands that reload the queue TOML
+(`account list`, `supervisor status`, `doctor`) refuse it with exit 78, as
+at start.
 
 **Cause:** The account's `<config_dir>/runner-account.toml` is there but
 cannot be read, is empty (zero bytes, often a save that was cut short), is
 a symlink to a file that does not exist, is not TOML, still has a
 `[throttle.*]` table, or sets a value the schema rejects (a
-`max_concurrency` of 0, an unknown key). The supervisor does not guess a
-policy for it (ADR-0035): while it runs, the account takes no new tasks,
-its running tasks finish as usual, and it adds nothing to the queue's
-concurrency ceiling. Only an absent file means the defaults.
+`max_concurrency` of 0, an unknown key); or the `config_dir` itself does
+not exist. The supervisor does not guess a policy for it (ADR-0035): while
+it runs, the account takes no new tasks, its running tasks finish as
+usual, and it adds nothing to the queue's concurrency ceiling. Only a
+`config_dir` that exists without the file means the defaults.
 
 **Steps:**
-1. Fix the file the error names. `claude-task-runner account list` exits
-   0 again once every account's file loads.
-2. If the supervisor refused to start, start it again: `systemctl --user
-   start claude-task-runner` (a unit stopped by exit 78 is not restarted
-   on its own), or wait for the next cron watchdog tick.
+1. Fix the file (or directory, or mount) the error names.
+   `claude-task-runner account list` exits 0 again once every account's
+   file loads.
+2. If the supervisor refused to start with exit 78, start it again:
+   `systemctl --user start claude-task-runner` (a unit stopped by 78 is not
+   restarted on its own), or wait for the next cron watchdog tick. After
+   exit 1, systemd and the watchdog keep trying; if the unit reached its
+   start limit, `systemctl --user reset-failed claude-task-runner` and
+   start it.
 3. If it was running, nothing else is needed: the supervisor re-reads the
    file every tick, logs that the account `takes tasks again: <path>
    loads`, and dispatches to it on that tick. If the file was broken for
@@ -193,8 +217,9 @@ restarts the supervisor itself (`Restart=on-failure`), `RestartSec` after
 each crash, and stops once it has started the unit more than
 `StartLimitBurst` times within `StartLimitIntervalSec`. It does not
 restart a supervisor that exited 0 (a stop or a finished drain) or 78 (it
-refused to start because its configuration does not load; see "An account
-file is broken"). `install` writes
+refused to start because its configuration's content is wrong; see "An
+account file is broken"). A start refused because a file could not be read
+yet exits 1 and is retried. `install` writes
 those three from the queue's `[watchdog].restart_cooldown_s`,
 `[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
 (30 s, 5 and 600 s by default). After changing them, re-run

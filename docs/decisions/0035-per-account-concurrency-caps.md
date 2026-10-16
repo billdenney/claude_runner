@@ -125,7 +125,10 @@ across all accounts without its operator having written the number down.
    so its account stays at 1.
 
 9. **An account whose file does not load takes no new tasks, and nothing
-   stops because of it.** `config.loader.resolve_accounts` never raises
+   stops because of it.** *(Superseded at start by the 2026-10-16
+   amendment: `supervisor start` now refuses to start, and a `config_dir`
+   that does not exist is broken too. Unchanged while it runs.)*
+   `config.loader.resolve_accounts` never raises
    for a per-account file. It returns the accounts whose policy loaded (an
    absent file, or a `config_dir` that does not exist, still means the
    defaults) and, separately, a `BrokenAccount` with the file and the error
@@ -152,7 +155,7 @@ across all accounts without its operator having written the number down.
      dispatched. When the file loads again, the next tick restores the
      account and logs one INFO line. This holds at startup as well: a
      supervisor started with a broken file starts and disables that
-     account. The queue's own `claude_runner.toml` failing to load is
+     account. *(Superseded at start by the 2026-10-16 amendment.)* The queue's own `claude_runner.toml` failing to load is
      still fatal.
    - `supervisor.json` (schema v8) records the error in the account's
      `policy_error`. `supervisor status` prints it and lists it under
@@ -218,7 +221,9 @@ across all accounts without its operator having written the number down.
   waits for a free slot on some account, not for fewer than 2 tasks in
   flight.
 - (+) A broken account file stops only that account, and says so in the
-  log, `supervisor.json`, the CLI and the doctor.
+  log, `supervisor.json`, the CLI and the doctor. *(While the supervisor
+  runs; at start it now stops the supervisor, per the 2026-10-16
+  amendment.)*
 - (-) `account list` exits 1 while any account's file does not load, which
   a script that only checked for success will notice.
 - (neutral) `account list --json` and `supervisor status --json` gain a
@@ -268,9 +273,8 @@ miss; a supervisor that does not start is not. The split is now:
   path as everywhere else, right after the queue TOML loads and before it
   creates the queue's runtime directory, takes the lock, adopts workers,
   writes `supervisor.json` or captures usage. When any account is broken
-  it prints every one, with its file and error, and exits 78
-  (`config.loader.CONFIG_ERROR_EXIT_STATUS`, `EX_CONFIG` in sysexits.h). A
-  queue TOML that does not load now exits 78 the same way, with its error
+  it prints every one, with its file and error, and refuses to start. A
+  queue TOML that does not load is refused the same way, with its error
   printed instead of a traceback.
 - **While running, non-fatal, as decision 9 says.** A file that breaks
   after the supervisor started disables only its account, with the ERROR,
@@ -279,30 +283,70 @@ miss; a supervisor that does not start is not. The split is now:
   trade once work is running. `start_daemon` itself still tolerates a
   broken file from its first tick, for one that breaks between the check
   and that tick.
-- **Unknown `~user`.** `config.schema.AccountSettings` refuses a
+- **Two kinds of configuration error, two exit statuses.** A
+  `config.loader.ConfigError` (and a `BrokenAccount`) carries `transient`.
+  - The content is wrong, and trying again cannot help: a TOML parse
+    error, a file that is not UTF-8, a validation error, a retired key or
+    `[throttle.*]`, an empty account file, a `config_dir` whose `~user`
+    names no user or that is not a directory, a directory where a file
+    belongs. Start exits **78** (`CONFIG_ERROR_EXIT_STATUS`, `EX_CONFIG`
+    in sysexits.h).
+  - A file or directory could not be read and may come back: the
+    `--config` file or a `config_dir` does not exist (a mount not up yet
+    at boot), permission is denied, an account file is a symlink to a file
+    that does not exist yet. Start prints the same error but exits **1**,
+    so systemd's `Restart=on-failure` retries it up to `StartLimitBurst`:
+    a boot-time mount race recovers by itself, and a problem that stays
+    still ends in a `failed` unit. When several accounts are broken, one
+    content error makes it 78.
+  - A `config_dir` that does not exist is now broken (transient). Decision
+    9 read it as the defaults, but such an account cannot work anyway:
+    dispatch refuses a missing `CLAUDE_CONFIG_DIR`, and the doctor fails
+    it. A `config_dir` that exists without the file still means the
+    defaults.
+  - `load_settings` turns every way the queue TOML can fail, an I/O error
+    or a file that is not UTF-8 included, into a `ConfigError`, so no
+    caller gets a traceback for it, and a SIGHUP reload of such a file
+    cannot end the tick loop. `account list`, `account pause`/`resume`,
+    `supervisor status`, `doctor`, `usage`, `install`, `uninstall` and
+    `queue add`/`backfill-working-dir`/`force-dispatch` print
+    `configuration error: ...` and exit by the same rule (78 or 1);
+    `--json` gets `{"ok": false, "error": ...}`.
+- **Unknown `~user`.** `config.schema.AccountSettings`, and
+  `ClaudeSettings` for `[claude].config_dir` whenever it is set (the usage
+  source of a queue with at most one account reads it), refuse a
   `config_dir` whose leading `~user` names no user, so the queue TOML does
-  not load: `supervisor start` exits 78 naming the account, and a SIGHUP
-  reload carrying one is rejected and the old config kept. A rejected
-  reload, for this or any other reason, is now logged as an ERROR rather
-  than a WARNING, since the operator's edit is not in force. Every later
-  expansion of a `config_dir` goes through `config.paths.expand_config_dir`,
-  which raises `ConfigDirError` instead of `RuntimeError`; each caller turns
-  it into its own error (an account broken in `resolve_accounts`, a usage
-  capture spawn error, missing API credentials, a dispatch error, a doctor
-  failure), so a user removed while the supervisor runs fails that account
-  and cannot end the tick loop.
+  not load: start exits 78 naming the account, and a SIGHUP reload carrying
+  one is rejected and the old config kept. A rejected reload, for this or
+  any other reason, is now logged as an ERROR rather than a WARNING, since
+  the operator's edit is not in force. Every later expansion of a
+  `config_dir` goes through `config.paths.expand_config_dir`, which raises
+  `ConfigDirError` instead of `RuntimeError`, and a test fails on any
+  other `.expanduser()` in the package outside an allowlist of paths that
+  are not a `config_dir`. Each caller that can meet a user removed while
+  the supervisor runs turns the error into its own (an account broken in
+  `resolve_accounts`, a usage capture spawn error, missing API
+  credentials, a dispatch error, a warning in the usage source builder),
+  so that fails that account and cannot end the tick loop.
 - **No crash loop.** The systemd unit now has
-  `RestartPreventExitStatus=0 78`: a refused start leaves the unit
-  `failed`, with the reason in the journal, instead of being restarted
-  until `StartLimitBurst` stops it. The cron watchdog reads the account
-  files before a restart, as `supervisor start` would; when one does not
-  load it logs an ERROR naming each, starts nothing, counts no restart and
-  exits 1, as it already did for a queue TOML that does not load. It
-  leaves a running supervisor alone.
+  `RestartPreventExitStatus=0 78`: a start refused for content leaves the
+  unit `failed`, with the reason in the journal, instead of being
+  restarted until `StartLimitBurst` stops it; a transient refusal (exit 1)
+  is retried. The cron watchdog reads the account files when a restart is
+  due, as `supervisor start` would. When one does not load it starts
+  nothing and counts no restart, and logs a line naming each in place of
+  the verdict line: an ERROR (and exit 1) when any is a content error, a
+  WARNING when all may come back, which the next tick reads again. It
+  leaves a running supervisor alone, and a tick in cooldown or backoff
+  reads nothing. `install` reads them too and refuses to install a
+  supervisor that would not start.
 
 **Consequences.** (+) A broken file or an unknown home at start is seen at
 once, in the journal or `supervisor.log`, and the unit or watchdog stops
-retrying. (-) An account file left broken across a restart (a reboot, a
-deploy) now keeps every account from running until it is fixed or
-deleted. (neutral) An existing unit file keeps `RestartPreventExitStatus=0`
-until `claude-task-runner install` rewrites it or the line is edited.
+retrying it; a mount that comes up late is retried instead. (-) An account
+file left broken across a restart (a reboot, a deploy) now keeps every
+account from running until it is fixed or deleted. (-) An account whose
+`config_dir` does not exist now refuses start (exit 1) instead of running
+on the defaults. (neutral) An existing unit file keeps
+`RestartPreventExitStatus=0` until `claude-task-runner install` rewrites
+it or the line is edited.
