@@ -287,8 +287,8 @@ def _pick_account(
         if affined in broken:
             return _AccountPick(
                 None,
-                f"session host account {affined!r} takes no tasks until its "
-                f"runner-account.toml loads: {broken[affined].error}",
+                f"session host account {affined!r} takes no tasks until this is fixed: "
+                f"{broken[affined].error}",
             )
         if affined not in by_name:
             return _AccountPick(
@@ -301,13 +301,13 @@ def _pick_account(
     if task.account is not None and task.account in broken:
         return _AccountPick(
             None,
-            f"pinned account {task.account!r} takes no tasks until its "
-            f"runner-account.toml loads: {broken[task.account].error}",
+            f"pinned account {task.account!r} takes no tasks until this is fixed: "
+            f"{broken[task.account].error}",
         )
     if task.account is not None and task.account in by_name:
         return _AccountPick(by_name[task.account])
     if not by_name:
-        return _AccountPick(None, "no account's runner-account.toml loads")
+        return _AccountPick(None, "no account can take tasks")
     in_flight = list(in_flight)
     for acct in by_name.values():
         if account_in_flight_count(acct.name, in_flight) < acct.policy.concurrency.max_concurrency:
@@ -472,8 +472,9 @@ def tick_consume(
         #      the next dispatch starts a fresh session.
         #   2. Task.account pinning when present and known.
         #   3. First configured account (fallback).
-        #   An account whose runner-account.toml does not load takes no
-        #   tasks, forced or not (ADR-0035): a request bound to one waits.
+        #   An account that cannot take tasks (a runner-account.toml that
+        #   does not load, say) takes none, forced or not (ADR-0035): a
+        #   request bound to one waits.
         affined = state.session_host_account() if state is not None else None
         pick = _pick_account(task, affined, resolution, to_in_flight_records(in_flight_slots))
         if pick.account is None:

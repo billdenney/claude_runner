@@ -316,8 +316,8 @@ def _held_back_line(
     """
     listed = "; ".join(f"{b.name}: {_one_line(b.error)}" for b in resolution.broken)
     return (
-        f"{ts} watchdog: {hold.level} queue={queue_dir} alive={alive} pid={pid} the "
-        f"runner-account.toml of {len(resolution.broken)} account(s) does not load, so its "
+        f"{ts} watchdog: {hold.level} queue={queue_dir} alive={alive} pid={pid} "
+        f"{len(resolution.broken)} account(s) cannot take tasks, so its "
         f"supervisor was not restarted{hold.note}: {listed}\n"
     )
 

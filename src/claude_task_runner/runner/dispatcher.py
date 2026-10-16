@@ -57,7 +57,8 @@ from typing import IO
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
-from claude_task_runner.config.paths import ConfigDirError, TaskPathError, expand_config_dir
+from claude_task_runner.config.linux_user import current_username as _resolve_self_user
+from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
@@ -704,23 +705,6 @@ def _boot_time() -> datetime | None:
             except (ValueError, OverflowError, OSError):
                 return None
     return None
-
-
-def _resolve_self_user() -> str:
-    """Return the supervisor's own Linux username; empty string on lookup failure.
-
-    Mirrored from :mod:`doctor.checks._current_username`. The
-    dispatcher uses it to decide whether ``linux_user`` requires a
-    sudo prefix: if the configured target equals the supervisor's
-    own user, no sudo is needed and we spawn directly.
-    """
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception as exc:
-        logger.debug("self-user lookup failed (%s); treating as unknown", exc)
-        return ""
 
 
 def _build_run_record(
@@ -1551,7 +1535,7 @@ def dispatch(
     * Writes post-run state with appended :class:`RunRecord`, updated
       ``status``, and refreshed ``session_id``.
     * When the worker cannot be started (no ``claude`` binary,
-      :func:`_prepare_spawn`'s checks, or opening the log files or
+      :func:`_account_spawn`'s and :func:`_task_spawn`'s checks, or opening the log files or
       ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
       it was, and returns that outcome (:func:`_defer_unstartable`); no
       attempt is counted.
@@ -1593,6 +1577,12 @@ def dispatch(
     )
     if shutil.which(claude_executable) is None:
         return _defer_unstartable(unstartable, f"claude binary not found: {claude_executable}")
+    # The account's checks run before the pre-dispatch hook, so an account
+    # that cannot start a worker does not run the hook for every task.
+    try:
+        spawn_env, sudo_prefix = _account_spawn(claude_config_dir, linux_user)
+    except Exception as exc:
+        return _defer_unstartable(unstartable, _start_error(exc))
 
     # Pre-dispatch hook. Run with cwd=queue_dir (or None), NOT
     # task.working_dir: the hook's job is often to *create*
@@ -1659,17 +1649,17 @@ def dispatch(
     pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
 
     try:
-        argv, spawn_env, resolved_add_dirs = _prepare_spawn(
+        argv, resolved_add_dirs = _task_spawn(
             task,
             plan,
             queue_dir,
             settings_dispatch=settings_dispatch,
             claude_executable=claude_executable,
             claude_config_dir=claude_config_dir,
-            linux_user=linux_user,
+            sudo_prefix=sudo_prefix,
         )
-    except DispatchError as exc:
-        return _defer_unstartable(unstartable, str(exc))
+    except Exception as exc:
+        return _defer_unstartable(unstartable, _start_error(exc))
 
     started_at = clock.now()
     new_state = state.model_copy(
@@ -1752,10 +1742,7 @@ def dispatch(
         # (ValueError). The deferral replaces the ``running`` write.
         if spawn_gate is not None:
             spawn_gate.leave(task.id)
-        return _defer_unstartable(
-            unstartable,
-            str(exc) if isinstance(exc, OSError) else f"{type(exc).__name__}: {exc}",
-        )
+        return _defer_unstartable(unstartable, _start_error(exc))
     except BaseException:
         # No worker started, so there is no pid to wait for.
         if spawn_gate is not None:
@@ -2647,43 +2634,19 @@ def _finalize_state(
     return new_state, run
 
 
-def _prepare_spawn(
-    task: Task,
-    plan: SpawnPlan,
-    queue_dir: Path,
-    *,
-    settings_dispatch: DispatchSettings | None,
-    claude_executable: str,
-    claude_config_dir: str,
-    linux_user: str | None,
-) -> tuple[list[str], dict[str, str] | None, list[Path]]:
-    """The worker's argv, its environment (``None``: the supervisor's) and
-    its ``--add-dir`` list, with the target ``.claude.json`` prepared.
+def _account_spawn(
+    claude_config_dir: str, linux_user: str | None
+) -> tuple[dict[str, str] | None, list[str]]:
+    """The worker's environment (``None``: the supervisor's) and the
+    ``sudo`` prefix of its command line (empty: none), for its account.
 
-    Raises :class:`DispatchError` when the worker cannot be started: its
-    ``CLAUDE_CONFIG_DIR`` cannot be expanded or does not exist, a
-    ``linux_user`` needs ``sudo`` and it is not on PATH, or the task's
-    ``working_dir`` cannot be expanded. :func:`dispatch` calls it before
-    it writes the ``running`` state.
+    Raises :class:`DispatchError` when the account cannot start a worker:
+    its ``CLAUDE_CONFIG_DIR`` cannot be expanded, does not exist or cannot
+    be checked, or its ``linux_user`` needs ``sudo`` and it is not on
+    PATH. :func:`config.loader.resolve_accounts` already keeps such an
+    account from being chosen; this is the check at the moment of the
+    dispatch. :func:`dispatch` makes it before the pre-dispatch hook runs.
     """
-
-    # Resolve --add-dir scope: queue dir is always added; per-task
-    # additional_dirs are merged in; prompt auto-detect is opt-in.
-    auto_detect = (
-        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
-    )
-    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
-        task,
-        queue_dir,
-        auto_detect=auto_detect,
-    )
-    argv = build_argv(
-        task,
-        plan,
-        claude_executable=claude_executable,
-        add_dirs=resolved_add_dirs,
-    )
-
     # Build the subprocess env. When `claude_config_dir` is set (per-queue
     # config selects a non-default Claude account, e.g. ~/.claude_personal),
     # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
@@ -2704,11 +2667,9 @@ def _prepare_spawn(
     spawn_env: dict[str, str] | None = None
     if claude_config_dir:
         try:
-            config_path = expand_config_dir(claude_config_dir)
+            config_path = existing_config_dir(claude_config_dir)
         except ConfigDirError as exc:
             raise DispatchError(str(exc)) from exc
-        if not config_path.exists():
-            raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
         # Local import — keeps `oauth_token_file` out of the dispatcher's
         # cold-start path for single-account / pre-PR-14 deployments.
@@ -2727,6 +2688,7 @@ def _prepare_spawn(
     # prompt. ENV inheritance across sudo's user transition needs the
     # explicit ``env`` wrapper because sudo defaults strip the
     # supervisor's environment from the target's session.
+    prefix: list[str] = []
     if linux_user and _resolve_self_user() != linux_user:
         sudo_path = shutil.which("sudo")
         if sudo_path is None:
@@ -2743,15 +2705,51 @@ def _prepare_spawn(
                 env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
         # Propagate explicit env via `env` so sudo's default
         # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
-        prefix: list[str] = [sudo_path, "-n", "-u", linux_user]
+        prefix = [sudo_path, "-n", "-u", linux_user]
         if env_pairs:
             prefix.extend(["env", *env_pairs])
-        argv = [*prefix, *argv]
         # Once the subprocess transitions to <linux_user>, the
         # supervisor's own env stops mattering — the env=... arg to
         # Popen below would only apply to the sudo invocation itself.
         # Clear it so we don't fight the sudo prefix.
         spawn_env = None
+    return spawn_env, prefix
+
+
+def _task_spawn(
+    task: Task,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    *,
+    settings_dispatch: DispatchSettings | None,
+    claude_executable: str,
+    claude_config_dir: str,
+    sudo_prefix: list[str],
+) -> tuple[list[str], list[Path]]:
+    """The worker's argv, behind ``sudo_prefix``, and its ``--add-dir``
+    list, with the target ``.claude.json`` prepared for the task.
+
+    Raises :class:`DispatchError` when the task's ``working_dir`` cannot
+    be expanded. :func:`dispatch` calls it after the pre-dispatch hook,
+    which may create the ``working_dir``, and before it writes the
+    ``running`` state.
+    """
+    # Resolve --add-dir scope: queue dir is always added; per-task
+    # additional_dirs are merged in; prompt auto-detect is opt-in.
+    auto_detect = (
+        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
+    )
+    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
+        task,
+        queue_dir,
+        auto_detect=auto_detect,
+    )
+    argv = build_argv(
+        task,
+        plan,
+        claude_executable=claude_executable,
+        add_dirs=resolved_add_dirs,
+    )
 
     # Pre-trust the task's working_dir (and mark onboarding complete) in the
     # target .claude.json. Idempotent — only writes when a flag changes.
@@ -2766,7 +2764,14 @@ def _prepare_spawn(
     except TaskPathError as exc:
         raise DispatchError(str(exc)) from exc
 
-    return argv, spawn_env, resolved_add_dirs
+    return [*sudo_prefix, *argv], resolved_add_dirs
+
+
+def _start_error(exc: Exception) -> str:
+    """How a reason names an exception that kept a worker from starting."""
+    if isinstance(exc, DispatchError | OSError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _record_pre_dispatch_deferral(

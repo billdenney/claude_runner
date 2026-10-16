@@ -43,7 +43,10 @@ For "/runner-format-check" / "did the parser break?" prompts:
 1. Run `claude-task-runner usage healthcheck`. Exit codes signal:
    - `0` clean
    - `1` parse drift (TUI layout changed)
-   - `2` capture timeout (claude didn't respond)
+   - `2` capture timeout (claude didn't respond), or a usage error:
+     with `--config` for a queue of several accounts, `--account` is
+     missing or names no account (the output says `Invalid value for
+     '--account'`)
    - `3` spawn error (claude binary missing)
 
    With `--config`, every `usage` command loads that TOML first. When

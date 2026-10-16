@@ -151,8 +151,8 @@ def choose_account(
                 account=None,
                 reason=(
                     f"session affinity blocks dispatch: host account "
-                    f"{affined_account!r} takes no tasks until its runner-account.toml "
-                    f"loads: {broken[affined_account]}"
+                    f"{affined_account!r} takes no tasks until this is fixed: "
+                    f"{broken[affined_account]}"
                 ),
             )
         if affined_account not in accounts:
@@ -209,8 +209,8 @@ def choose_account(
             return DispatchChoice(
                 account=None,
                 reason=(
-                    f"pinned account {pinned!r} takes no tasks until its "
-                    f"runner-account.toml loads: {broken[pinned]}"
+                    f"pinned account {pinned!r} takes no tasks until this is fixed: "
+                    f"{broken[pinned]}"
                 ),
             )
         if pinned not in accounts:
@@ -246,7 +246,7 @@ def choose_account(
         return DispatchChoice(account=pinned, reason=f"pinned to {pinned!r}")
 
     candidates: list[tuple[tuple[int, int, str], str]] = []
-    blocked_reasons = [f"{name}: its runner-account.toml does not load" for name in broken]
+    blocked_reasons = [f"{name}: takes no tasks until its error is fixed" for name in broken]
     for name, acct in accounts.items():
         maybe_state = account_states.get(name)
         if maybe_state is None:
@@ -445,7 +445,7 @@ class QueueCeiling:
             if self.configured is not None:
                 text += f"; [concurrency].max_concurrency = {self.configured} does not bind"
         if self.broken:
-            text += f"; not counted until its runner-account.toml loads: {', '.join(self.broken)}"
+            text += f"; not counted until fixed: {', '.join(self.broken)}"
         return text
 
     def as_json(self) -> dict[str, object]:

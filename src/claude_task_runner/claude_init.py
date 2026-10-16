@@ -68,7 +68,12 @@ def ensure_initialized(
         # config_dir already and turned a failure into their own error.
         cfg_path = expand_config_dir(str(config_dir))
     config_file = cfg_path / ".claude.json"
-    if not config_file.is_file():
+    try:
+        if not config_file.is_file():
+            return False
+    except OSError as exc:
+        # A parent that denies access: is_file raises rather than say False.
+        logger.debug("ensure_initialized: cannot check %s: %s", config_file, exc)
         return False
 
     # Raises TaskPathError for a working_dir whose ~user names no user; the

@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import pwd
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -58,8 +60,9 @@ GONE = "~no-such-user-ctr-test/.claude"
 """A ``config_dir`` whose ``~user`` names no user."""
 
 REFUSAL_TAIL = (
-    "Fix each file, or delete it for the defaults, then start the supervisor again. "
-    "Once the supervisor runs, a file that breaks only stops new tasks on its account."
+    "Fix each one (a runner-account.toml can also be deleted for the defaults), then start "
+    "the supervisor again. Once the supervisor runs, a problem like this only stops new "
+    "tasks on its account."
 )
 
 
@@ -113,7 +116,7 @@ class TestStartRefuses:
         result = _start(queue)
         assert result.exit_code == CONFIG_ERROR_EXIT_STATUS == 78
         assert result.stdout == (
-            "supervisor not started: the runner-account.toml of 1 account does not load:\n"
+            "supervisor not started: 1 account cannot take tasks:\n"
             f"  personal: Invalid TOML in {path}: {PARSE_ERROR}\n"
             f"{REFUSAL_TAIL}\n"
         )
@@ -130,10 +133,33 @@ class TestStartRefuses:
         result = _start(queue)
         assert result.exit_code == 78
         assert result.stdout == (
-            "supervisor not started: the runner-account.toml of 2 accounts does not load:\n"
+            "supervisor not started: 2 accounts cannot take tasks:\n"
             f"  personal: Invalid TOML in {personal}: {PARSE_ERROR}\n"
             f"  work: {work} is empty; delete it for the defaults, or write the settings "
             "it should hold\n"
+            f"{REFUSAL_TAIL}\n"
+        )
+        assert not (queue / ".claude_task_runner").exists()
+
+    def test_a_linux_user_that_needs_missing_sudo(self, tmp_path: Path) -> None:
+        """No worker could start for the account, so the start is refused as
+        for a broken file; installing sudo, or removing linux_user, fixes it."""
+        accounts = _accounts(tmp_path)
+        queue = _queue(tmp_path, accounts)
+        text = (queue / "claude_runner.toml").read_text(encoding="utf-8")
+        (queue / "claude_runner.toml").write_text(
+            text.replace('name = "work"\n', 'name = "work"\nlinux_user = "bill-work"\n'),
+            encoding="utf-8",
+        )
+        with (
+            patch("claude_task_runner.config.linux_user.current_username", return_value="bill"),
+            patch("claude_task_runner.config.linux_user.shutil.which", return_value=None),
+        ):
+            result = _start(queue)
+        assert result.exit_code == 78
+        assert result.stdout == (
+            "supervisor not started: 1 account cannot take tasks:\n"
+            "  work: linux_user='bill-work' requested but sudo not on PATH\n"
             f"{REFUSAL_TAIL}\n"
         )
         assert not (queue / ".claude_task_runner").exists()
@@ -356,8 +382,8 @@ class TestWatchdog:
         # The held-back line replaces the verdict line, which would say "restart".
         (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
-            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml "
-            "of 1 account(s) does not load, so its supervisor was not restarted: work: "
+            f"watchdog: ERROR queue={queue} alive=False pid=None "
+            "1 account(s) cannot take tasks, so its supervisor was not restarted: work: "
             f"Invalid TOML in {path}: {PARSE_ERROR}"
         )
         # No restart was counted, so the next tick after the fix restarts at once.
@@ -392,7 +418,7 @@ class TestWatchdog:
         assert result.exit_code == 1
         assert "verdict=restart" not in result.stdout
         assert (
-            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml"
+            f"watchdog: ERROR queue={queue} alive=False pid=None 1 account(s) cannot take tasks"
         ) in result.stdout
         assert not backoff_mod.watchdog_state_path().exists()
 
@@ -433,8 +459,8 @@ class TestWatchdog:
         assert result.exit_code == 0, result.output
         (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
-            f"watchdog: WARNING queue={queue} alive=False pid=None the runner-account.toml "
-            "of 1 account(s) does not load, so its supervisor was not restarted; this may "
+            f"watchdog: WARNING queue={queue} alive=False pid=None "
+            "1 account(s) cannot take tasks, so its supervisor was not restarted; this may "
             "clear up by itself, and the next tick tries again: work: config_dir "
             f"{unmounted} does not exist"
         )
@@ -461,8 +487,8 @@ class TestWatchdog:
         assert result.exit_code == 1
         (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
-            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml "
-            "of 2 account(s) does not load, so its supervisor was not restarted: personal: "
+            f"watchdog: ERROR queue={queue} alive=False pid=None "
+            "2 account(s) cannot take tasks, so its supervisor was not restarted: personal: "
             f"Invalid TOML in {personal}: {PARSE_ERROR}; work: config_dir {unmounted} "
             "does not exist"
         )
@@ -517,8 +543,8 @@ class TestWatchdog:
         assert result.exit_code == exit_code, result.output
         (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
-            f"watchdog: {level} queue={queue} alive=False pid=None the runner-account.toml "
-            f"of 1 account(s) does not load, so its supervisor was not restarted; {note}: "
+            f"watchdog: {level} queue={queue} alive=False pid=None "
+            f"1 account(s) cannot take tasks, so its supervisor was not restarted; {note}: "
             f"work: config_dir {unmounted} does not exist"
         )
         state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
@@ -615,6 +641,7 @@ LONG_NAME = "x" * 300
         (errno.ENAMETOOLONG, False),
         (errno.ENOTDIR, False),
         (errno.EISDIR, False),
+        (errno.ENXIO, False),
         (errno.EACCES, True),
         (errno.EPERM, True),
         (errno.ENOENT, True),
@@ -705,16 +732,87 @@ class TestQueueTomlErrno:
         assert error.transient is False
 
 
+def _bounded(call: Callable[[], object], timeout_s: float = 10.0) -> object:
+    """``call()``, failing the test if it has not returned within ``timeout_s``.
+
+    Runs it on a daemon thread, so a call blocked on a FIFO cannot keep the
+    test process alive."""
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # handed back to the test thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    assert not thread.is_alive(), f"still blocked after {timeout_s} s"
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+    return outcome["value"]
+
+
+class TestNotARegularFile:
+    """A FIFO, a device or a socket where a configuration file belongs is a
+    content error, found before the file is read: a FIFO with no writer
+    would otherwise block the reader, the supervisor's tick included."""
+
+    def test_a_fifo_as_the_queue_toml(self, tmp_path: Path) -> None:
+        fifo = tmp_path / "claude_runner.toml"
+        os.mkfifo(fifo)
+        with pytest.raises(ConfigError) as excinfo:
+            _bounded(lambda: load_settings(fifo))
+        assert str(excinfo.value) == f"Settings file is a FIFO, not a regular file: {fifo}"
+        assert excinfo.value.transient is False
+
+    def test_a_queue_toml_linked_to_dev_null(self, tmp_path: Path) -> None:
+        """Not the package defaults, whose account is ``~/.claude``."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+        (queue / "claude_runner.toml").symlink_to("/dev/null")
+        result = _bounded(
+            lambda: CliRunner().invoke(app, ["account", "list", "--queue", str(queue)])
+        )
+        assert result.exit_code == 78
+        assert result.stdout == (
+            "configuration error: Settings file is a character device, not a regular file: "
+            f"{queue / 'claude_runner.toml'}\n"
+        )
+
+    def test_a_fifo_at_the_per_queue_name_is_refused(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        os.mkfifo(queue / "claude_runner.toml")
+        result = _bounded(
+            lambda: CliRunner().invoke(app, ["account", "list", "--queue", str(queue)])
+        )
+        assert result.exit_code == 78
+        assert result.stdout == (
+            "configuration error: Settings file is a FIFO, not a regular file: "
+            f"{queue / 'claude_runner.toml'}\n"
+        )
+
+    def test_a_fifo_as_an_account_file(self, tmp_path: Path) -> None:
+        path = tmp_path / PER_ACCOUNT_TOML_NAME
+        os.mkfifo(path)
+        with pytest.raises(ConfigError) as excinfo:
+            _bounded(lambda: load_account_policy(str(tmp_path)))
+        assert str(excinfo.value) == f"{path} is a FIFO, not a regular file"
+        assert excinfo.value.transient is False
+
+
 def _fail_open(monkeypatch: pytest.MonkeyPatch, path: Path, code: int) -> None:
     """Make opening ``path`` raise ``OSError(code)``, as a failing mount would."""
-    real_open = Path.open
+    real_open = os.open
 
-    def failing_open(self: Path, *args: object, **kwargs: object) -> object:
-        if self == path:
+    def failing_open(file: object, *args: object, **kwargs: object) -> int:
+        if Path(os.fsdecode(file)) == path:  # type: ignore[arg-type]
             raise OSError(code, os.strerror(code))
-        return real_open(self, *args, **kwargs)
+        return real_open(file, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "open", failing_open)
 
 
 DEEP_TOML = "x = " + "[" * 5000 + "]" * 5000 + "\n"
@@ -911,7 +1009,7 @@ class TestStartExitStatus:
         result = _start(queue)
         assert result.exit_code == 1
         assert result.stdout == (
-            "supervisor not started: the runner-account.toml of 1 account does not load:\n"
+            "supervisor not started: 1 account cannot take tasks:\n"
             f"  work: config_dir {unmounted} does not exist\n"
             "Each may clear up by itself (a config_dir on a mount that is not up yet, say), "
             "so this start exits 1 and systemd tries again; fix it if it does not.\n"
@@ -1197,20 +1295,21 @@ def test_install_exits_1_only_when_every_problem_may_clear_up(
         "but the supervisor would not start until it does.\n"
     )
     tail = (
-        "Fix each file, or delete it for the defaults, then run install again. "
-        "Once the supervisor runs, a file that breaks only stops new tasks on its account.\n"
+        "Fix each one (a runner-account.toml can also be deleted for the defaults), then run "
+        "install again. Once the supervisor runs, a problem like this only stops new tasks on "
+        "its account.\n"
     )
     if content_too:
         assert result.exit_code == 78
         assert result.stdout == (
-            "not installed: the runner-account.toml of 2 accounts does not load:\n"
+            "not installed: 2 accounts cannot take tasks:\n"
             f"  personal: Invalid TOML in {personal}: {PARSE_ERROR}\n"
             f"  work: config_dir {unmounted} does not exist\n" + tail
         )
     else:
         assert result.exit_code == 1
         assert result.stdout == (
-            "not installed: the runner-account.toml of 1 account does not load:\n"
+            "not installed: 1 account cannot take tasks:\n"
             f"  work: config_dir {unmounted} does not exist\n" + may_clear_up + tail
         )
 
@@ -1227,8 +1326,9 @@ def test_install_refuses_a_broken_account_file(tmp_path: Path) -> None:
         result = CliRunner().invoke(app, ["install", "--yes", "--queue", str(queue)])
     assert result.exit_code == 78
     assert result.stdout == (
-        "not installed: the runner-account.toml of 1 account does not load:\n"
+        "not installed: 1 account cannot take tasks:\n"
         f"  personal: Invalid TOML in {path}: {PARSE_ERROR}\n"
-        "Fix each file, or delete it for the defaults, then run install again. "
-        "Once the supervisor runs, a file that breaks only stops new tasks on its account.\n"
+        "Fix each one (a runner-account.toml can also be deleted for the defaults), then run "
+        "install again. Once the supervisor runs, a problem like this only stops new tasks on "
+        "its account.\n"
     )

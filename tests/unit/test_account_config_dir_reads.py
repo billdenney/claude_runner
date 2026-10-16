@@ -2,12 +2,12 @@
 
 ``[claude].config_dir`` is a legacy alias: with no ``[[accounts]]`` the
 loader makes a ``default`` account from it, and once ``[[accounts]]`` is
-declared it is ignored. A one-account queue whose account names
-``config_dir = X`` used to build its usage source from
-``[claude].config_dir`` instead, so with that field empty it polled
-``~/.claude``'s usage and throttled on another account's numbers. The
-``usage`` commands read it too. Both now read the account's own
-``config_dir``; ``usage`` takes ``--account`` for a queue of several.
+declared it is ignored. Pinned here: the supervisor's usage source and
+every ``usage`` subcommand read the account's ``config_dir``, whether
+``[claude].config_dir`` is empty or set alongside it, because reading the
+legacy field would poll another account's usage (``~/.claude`` when it is
+empty) and throttle on the wrong numbers. ``usage`` reads the queue's only
+account, or the one ``--account`` names, and refuses to guess among several.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from claude_task_runner.cli import app
 from claude_task_runner.cli.supervisor_cmd import _build_usage_source
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.usage.api_source import ApiUsageSource
+from claude_task_runner.usage.drift import UsageCaptureTimeout
 from claude_task_runner.usage.multi_account_source import MultiAccountUsageSource
 from claude_task_runner.usage.source import ApiThenTtyUsageSource, ClaudeUsageSource
 
@@ -66,8 +67,8 @@ class TestTheSupervisorsUsageSource:
     def test_one_account_reads_its_own_config_dir(
         self, tmp_path: Path, mode: str, claude_config_dir: str
     ) -> None:
-        """With ``[claude].config_dir`` empty this read ``~/.claude``; set,
-        it read that field, which ``[[accounts]]`` makes ignored."""
+        """``[claude].config_dir`` plays no part, empty or set: the account
+        names its own."""
         work = tmp_path / "work"
         work.mkdir()
         path = _toml(tmp_path, _accounts_toml({"work": work}, claude_config_dir))
@@ -172,6 +173,29 @@ class TestTheUsageCommand:
             "Invalid value for '--account': the queue declares 2 accounts (personal, "
             "work); name the one to read with --account"
         ) in " ".join(result.output.replace("│", " ").split())
+
+    @pytest.mark.parametrize("several", [False, True], ids=["one-account", "account-option"])
+    @pytest.mark.parametrize(
+        "subcommand",
+        [["render"], ["json"], ["healthcheck"], ["capture", "-o", "x.cap"], ["whoami"]],
+        ids=lambda argv: argv[0],
+    )
+    def test_every_capture_reads_the_selected_account(
+        self, tmp_path: Path, subcommand: list[str], several: bool
+    ) -> None:
+        """The ``config_dir`` each subcommand hands the capture is the account's."""
+        dirs = {name: tmp_path / name for name in ("personal", "work")}
+        path = _toml(tmp_path, _accounts_toml(dirs if several else {"work": dirs["work"]}))
+        account = ["--account", "work"] if several else []
+        seen: list[object] = []
+
+        def fake_capture(*_args: object, claude_config_dir: str, **_kwargs: object) -> object:
+            seen.append(claude_config_dir)
+            raise UsageCaptureTimeout("stopped here")
+
+        with patch("claude_task_runner.usage.capture.capture", fake_capture):
+            CliRunner().invoke(app, ["usage", "--config", str(path), *account, *subcommand])
+        assert seen == [str(dirs["work"])]
 
     @pytest.mark.parametrize(
         "subcommand", [["whoami", "--quick"], ["refresh"]], ids=lambda argv: argv[0]

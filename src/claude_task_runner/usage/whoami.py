@@ -83,8 +83,8 @@ def credentials_path(claude_config_dir: str = "") -> Path:
 
     Empty ``claude_config_dir`` means use the default ``~/.claude``.
     Raises :class:`config.paths.ConfigDirError` when it cannot be expanded,
-    which ``usage whoami`` cannot reach: it passes ``[claude].config_dir``
-    from settings ``load_settings`` validated.
+    which ``usage whoami`` cannot reach: it passes an account's
+    ``config_dir`` from settings ``load_settings`` validated.
     """
     base = expand_config_dir(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
     return base / CREDENTIALS_FILENAME
@@ -98,12 +98,11 @@ def read_credentials(claude_config_dir: str = "") -> dict[str, str | tuple[str, 
     caller can detect a totally-missing credentials file.
     """
     path = credentials_path(claude_config_dir)
-    if not path.exists():
-        return {}
     try:
         with path.open("rb") as fh:
             payload = json.load(fh)
     except (OSError, json.JSONDecodeError):
+        # Missing, a parent that denies access, or not JSON.
         return {}
     oauth = payload.get("claudeAiOauth")
     if not isinstance(oauth, dict):

@@ -1,21 +1,24 @@
 """A worker that cannot be started parks its task; it never stays ``running``.
 
-:func:`runner.dispatcher.dispatch` checks, before it writes the ``running``
-state, that the ``claude`` binary is on PATH, that the account's
-``CLAUDE_CONFIG_DIR`` can be expanded and exists, that ``sudo`` is there for
-a ``linux_user``, and that the task's ``working_dir`` can be expanded. When
-one fails, or opening the attempt's log files or ``Popen`` raises after that
+:func:`runner.dispatcher.dispatch` checks, before the pre-dispatch hook, that
+the ``claude`` binary is on PATH, that the account's ``CLAUDE_CONFIG_DIR``
+can be expanded, exists and can be checked, and that ``sudo`` is there for a
+``linux_user``; and, before it writes the ``running`` state, that the task's
+``working_dir`` can be expanded. When one fails, or anything raises while
+the attempt's log files are opened or ``Popen`` starts the worker after that
 write, the task is parked ``deferred`` from the state it had before the
-dispatch: no attempt is counted and nothing feeds the circuit breaker, so
-a fix lets it run after ``deferral_recheck_cooldown_s`` with no operator
-step. A ``running`` state with no worker would instead turn
-``possibly_hung`` once the silent reaper's alert passed, and stay there.
+dispatch: no attempt is counted, nothing feeds the circuit breaker, and the
+session is kept, so a fix lets it run (and resume) after
+``deferral_recheck_cooldown_s`` with no operator step. A ``running`` state
+with no worker would instead turn ``possibly_hung`` once the silent reaper's
+alert passed, and stay there.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import os
 import subprocess
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -43,6 +46,7 @@ from claude_task_runner.runner.dispatcher import (
     SpawnPlan,
     dispatch,
 )
+from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
 
 DISPATCHER_LOGGER = "claude_task_runner.runner.dispatcher"
@@ -139,12 +143,15 @@ def _dispatch(
     linux_user: str | None = None,
     adopt_workers: bool = False,
     spawn_gate: SpawnGate | None = None,
+    state: TaskState = PRIOR,
+    plan: SpawnPlan | None = None,
 ) -> dispatcher_mod.DispatchOutcome:
-    write_state_atomic(PRIOR, state_path_for(queue_dir, task.id))
+    write_state_atomic(state, state_path_for(queue_dir, task.id))
     return dispatch(
         task=task,
-        state=PRIOR,
-        plan=SpawnPlan(strategy=ResumeStrategy.FRESH, session_id=None, prompt="x", extra_args=[]),
+        state=state,
+        plan=plan
+        or SpawnPlan(strategy=ResumeStrategy.FRESH, session_id=None, prompt="x", extra_args=[]),
         queue_dir=queue_dir,
         clock=FakeClock(NOW),
         settings_caps=TaskCapsSettings(
@@ -311,6 +318,95 @@ class TestChecksBeforeTheRunningWrite:
         assert written == ["deferred"]
 
 
+@pytest.mark.usefixtures("home", "no_worker")
+def test_an_account_that_cannot_start_a_worker_runs_no_hook(
+    tmp_path: Path, queue_dir: Path, written: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The account's checks come before the pre-dispatch hook, so a broken
+    account does not run the hook (which may create a worktree) for every
+    task routed to it."""
+    marker = tmp_path / "hook-ran"
+    absent = tmp_path / "unmounted"
+    with (
+        _which("claude"),
+        patch.object(
+            dispatcher_mod.hooks_mod,
+            "run_pre_dispatch",
+            side_effect=lambda *a, **k: marker.touch(),
+        ),
+        caplog.at_level(logging.INFO, logger=DISPATCHER_LOGGER),
+    ):
+        outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(absent))
+    _assert_parked(queue_dir, outcome, f"CLAUDE_CONFIG_DIR does not exist: {absent}", caplog)
+    assert written == ["deferred"]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "error", "reason"),
+    [
+        (
+            "claude_task_runner.usage.oauth_token_file.read_long_lived_token",
+            RuntimeError("token store broke"),
+            "RuntimeError: token store broke",
+        ),
+        (
+            "claude_task_runner.runner.dispatcher.add_dirs_mod.resolve_add_dirs",
+            PermissionError(13, "Permission denied", "/q"),
+            "[Errno 13] Permission denied: '/q'",
+        ),
+    ],
+    ids=["account-step", "task-step"],
+)
+@pytest.mark.usefixtures("home", "no_worker")
+def test_any_exception_from_the_checks_parks_the_task(
+    queue_dir: Path,
+    config_dir: Path,
+    written: list[str],
+    caplog: pytest.LogCaptureFixture,
+    target: str,
+    error: Exception,
+    reason: str,
+) -> None:
+    """Not only a DispatchError: whatever a check raises, the task is parked
+    with the cooldown rather than retried every tick with a traceback."""
+    with (
+        _which("claude"),
+        patch(target, side_effect=error),
+        caplog.at_level(logging.INFO, logger=DISPATCHER_LOGGER),
+    ):
+        outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(config_dir))
+    _assert_parked(queue_dir, outcome, reason, caplog)
+    assert written == ["deferred"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a mode-000 directory")
+@pytest.mark.usefixtures("home", "no_worker")
+def test_a_config_dir_behind_a_locked_parent(
+    tmp_path: Path, queue_dir: Path, written: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """``Path.exists`` raises PermissionError there instead of saying False;
+    the task is parked with the cooldown, not retried every tick with a
+    traceback."""
+    locked = tmp_path / "locked"
+    config_dir = locked / "acct"
+    config_dir.mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        with _which("claude"), caplog.at_level(logging.INFO, logger=DISPATCHER_LOGGER):
+            outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(config_dir))
+    finally:
+        locked.chmod(0o755)
+    _assert_parked(
+        queue_dir,
+        outcome,
+        f"cannot check CLAUDE_CONFIG_DIR {config_dir}: [Errno 13] Permission denied: "
+        f"'{config_dir}'",
+        caplog,
+    )
+    assert written == ["deferred"]
+
+
 class TestStartingTheProcess:
     """A process that fails to start replaces the ``running`` write."""
 
@@ -386,6 +482,45 @@ class TestStartingTheProcess:
             outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(config_dir))
         _assert_parked(queue_dir, outcome, "ValueError: embedded null byte", caplog)
         assert written == ["running", "deferred"]
+
+
+def test_the_session_survives_and_the_next_dispatch_resumes(
+    tmp_path: Path, queue_dir: Path, home: Path
+) -> None:
+    """A parked task keeps its session, its host account and its resume
+    count, so the try after the fix resumes the same session."""
+    mount = tmp_path / "mount"
+    projects = tmp_path / "projects"
+    (projects / "some-project").mkdir(parents=True)
+    (projects / "some-project" / "sess-1.jsonl").write_text("{}\n", encoding="utf-8")
+    prior = PRIOR.model_copy(
+        update={"session_id": "sess-1", "session_account": "work", "resume_attempts": 1}
+    )
+    session = load_settings(None).session
+    resume = SpawnPlan(
+        strategy=ResumeStrategy.RESUME, session_id="sess-1", prompt="continue", extra_args=[]
+    )
+    with _which("claude"):
+        parked = _dispatch(
+            queue_dir, _task(), claude_config_dir=str(mount), state=prior, plan=resume
+        ).new_state
+    assert (
+        parked.status,
+        parked.session_id,
+        parked.session_account,
+        parked.resume_attempts,
+        parked.attempts,
+    ) == ("deferred", "sess-1", "work", 1, 2)
+
+    plan = plan_next_spawn(_task(), parked, settings=session, claude_projects_dir=projects)
+    assert (plan.strategy, plan.session_id) == (ResumeStrategy.RESUME, "sess-1")
+    mount.mkdir()
+    _FakePopen.started.clear()
+    with _which("claude"), patch("subprocess.Popen", _FakePopen):
+        _dispatch(queue_dir, _task(), claude_config_dir=str(mount), state=parked, plan=plan)
+    (started,) = _FakePopen.started
+    argv = started["argv"]
+    assert argv[argv.index("--resume") + 1] == "sess-1"
 
 
 # ---------------------------------------------------------------------------

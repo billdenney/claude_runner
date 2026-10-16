@@ -641,8 +641,8 @@ def test_current_username_empty_and_debug_logged_on_failure(
     """A pwd lookup failure → empty string AND a DEBUG log (audit finding:
     the empty-on-failure path was previously silent telemetry gap)."""
     with (
-        patch("claude_task_runner.doctor.checks.os.getuid", side_effect=OSError("boom")),
-        caplog.at_level("DEBUG", logger="claude_task_runner.doctor.checks"),
+        patch("claude_task_runner.config.linux_user.os.getuid", side_effect=OSError("boom")),
+        caplog.at_level("DEBUG", logger="claude_task_runner.config.linux_user"),
     ):
         result = _current_username()
     assert result == ""

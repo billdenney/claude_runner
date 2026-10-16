@@ -226,10 +226,11 @@ def list_accounts(
 
     \b
     Exit codes:
-      0  every account's runner-account.toml loads
-      1  an account's runner-account.toml does not load (the listing
-         names it), or the queue TOML could not be read for now ("ok":
-         false), which may clear up by itself
+      0  every account can take tasks
+      1  an account cannot take tasks: its runner-account.toml does not
+         load, or its linux_user cannot be reached (the listing names
+         it); or the queue TOML could not be read for now ("ok": false),
+         which may clear up by itself
       2  --queue is not an existing directory, or the account pause
          markers cannot be read ("ok": false)
      78  the queue TOML's content is wrong ("ok": false)

@@ -608,7 +608,7 @@ def status(
     snapshot = persist_mod.load(state_path)
     pid = pidfile_mod.read_existing_pid(pid_path)
     alive = pid is not None and pidfile_mod.is_pid_alive(pid)
-    # An account whose runner-account.toml does not load is listed with its
+    # An account that cannot take tasks is listed with its
     # error and counts 0 toward the ceiling; the rest of the status prints.
     resolution = resolve_accounts(settings)
     ceiling = QueueCeiling.of(

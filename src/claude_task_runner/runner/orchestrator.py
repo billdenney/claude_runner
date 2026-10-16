@@ -310,7 +310,8 @@ def tick_dispatch(
         # imports schema; schema is consumed by the rest of the codebase.
         from claude_task_runner.config.loader import resolve_accounts
 
-        # An account whose runner-account.toml does not load is left out,
+        # An account that cannot take tasks (a runner-account.toml that does
+        # not load, a linux_user that cannot be reached) is left out,
         # so it takes no tasks; the daemon logs it (ADR-0035). Its error
         # goes to choose_account so a decline names it.
         resolution = resolve_accounts(settings)

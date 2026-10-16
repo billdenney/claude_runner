@@ -207,8 +207,8 @@ def run_one_tick(
             len(ctx.settings.accounts),
         )
     if account_name is not None and account_name in ctx.broken_accounts:
-        # Its runner-account.toml does not load, so no decision can be made
-        # for it without guessing its policy. Record the capture so the
+        # It cannot take tasks (its runner-account.toml does not load, say),
+        # so no decision is made for it, which could need its policy. Record the capture so the
         # round robin moves on; its reading ages as usual.
         new_snapshot = _record_capture_only(snapshot, account_name, clock)
         return sm_mod.expire_stale_readings(
@@ -336,8 +336,7 @@ class AccountFileWatch:
             if not self.all_broken_logged:
                 self.all_broken_logged = True
                 logger.error(
-                    "no account's runner-account.toml loads (%s): nothing is dispatched "
-                    "until one is fixed",
+                    "no account can take tasks (%s): nothing is dispatched until one is fixed",
                     ", ".join(b.name for b in resolution.broken),
                 )
         else:

@@ -30,7 +30,7 @@ from pathlib import Path
 import pexpect
 
 from claude_task_runner.clock import Clock
-from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
+from claude_task_runner.config.paths import ConfigDirError, existing_config_dir
 from claude_task_runner.config.schema import UsageSettings
 from claude_task_runner.usage.drift import UsageCaptureSpawnError, UsageCaptureTimeout
 
@@ -61,18 +61,17 @@ def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
       reach the TTY capture path.
 
     Raises :class:`UsageCaptureSpawnError` when ``claude_config_dir``
-    points at a path that does not exist on disk, or cannot be expanded
-    (caller pre-condition, surfaced here so the spawn site has one
-    consistent error type, which the supervisor's poll catches).
+    points at a path that does not exist on disk, cannot be checked (a
+    parent that denies access) or cannot be expanded (caller
+    pre-condition, surfaced here so the spawn site has one consistent
+    error type, which the supervisor's poll catches).
     """
     if not claude_config_dir:
         return None
     try:
-        config_path = expand_config_dir(claude_config_dir)
+        config_path = existing_config_dir(claude_config_dir)
     except ConfigDirError as exc:
         raise UsageCaptureSpawnError(str(exc)) from exc
-    if not config_path.exists():
-        raise UsageCaptureSpawnError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
     env: dict[str, str] = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
     # Local import to keep `oauth_token_file` out of the import graph
     # for callers that never construct a capture env (e.g. CLI tools

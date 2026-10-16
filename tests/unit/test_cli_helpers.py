@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,20 @@ def test_a_symlink_to_no_file_is_returned(tmp_path: Path, target: str) -> None:
     per_queue.symlink_to(
         tmp_path / "unmounted" / "claude_runner.toml" if target == "missing" else per_queue
     )
+    assert resolve_per_queue_config(None, queue_dir) == per_queue
+
+
+@pytest.mark.parametrize("kind", ["fifo", "dev-null"])
+def test_anything_else_at_the_per_queue_name_is_returned(tmp_path: Path, kind: str) -> None:
+    """``load_settings`` refuses what is not a regular file; the lookup itself
+    does not open it, so a FIFO cannot block it."""
+    queue_dir = tmp_path / "q"
+    queue_dir.mkdir()
+    per_queue = queue_dir / PER_QUEUE_CONFIG_NAME
+    if kind == "fifo":
+        os.mkfifo(per_queue)
+    else:
+        per_queue.symlink_to("/dev/null")
     assert resolve_per_queue_config(None, queue_dir) == per_queue
 
 

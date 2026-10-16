@@ -22,9 +22,10 @@ Usage
   :class:`UsageReading` that proves the refresh succeeded.
 * As an operator preflight:
   ``claude-task-runner usage --config <queue>/claude_runner.toml refresh``
-  refreshes every configured account and reports each one's status.
-  ``refresh`` itself takes no options. ``--config`` belongs to the
-  ``usage`` group, so it goes before the subcommand.
+  refreshes every configured account and reports each one's status;
+  ``usage --config ... --account <name> refresh`` refreshes that one.
+  ``refresh`` itself takes no options. ``--config`` and ``--account``
+  belong to the ``usage`` group, so they go before the subcommand.
 """
 
 from __future__ import annotations

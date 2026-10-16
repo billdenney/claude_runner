@@ -54,6 +54,24 @@ def expand_config_dir(config_dir: str) -> Path:
     return _expand(config_dir, "config_dir", ConfigDirError)
 
 
+def existing_config_dir(config_dir: str) -> Path:
+    """:func:`expand_config_dir`, checked to exist, for a worker's or a
+    capture's ``CLAUDE_CONFIG_DIR``.
+
+    Raises :class:`ConfigDirError` when it cannot be expanded, does not
+    exist, or cannot be checked: ``Path.exists`` raises, rather than
+    returning ``False``, for a parent that denies access.
+    """
+    path = expand_config_dir(config_dir)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        raise ConfigDirError(f"CLAUDE_CONFIG_DIR does not exist: {path}") from None
+    except OSError as exc:
+        raise ConfigDirError(f"cannot check CLAUDE_CONFIG_DIR {path}: {exc}") from exc
+    return path
+
+
 def expand_task_path(path: str | Path, what: str) -> Path:
     """``path`` with a leading ``~`` or ``~user`` expanded.
 
