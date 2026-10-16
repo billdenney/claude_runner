@@ -50,6 +50,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
+from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.dispatcher import LIVE_WORKER_STOP_REASON, park_live_worker
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import tick_dispatch
@@ -524,6 +525,48 @@ def test_daemon_persists_the_parked_worker_and_account_list_counts_it(
     row = account_cmd._state_fields("default", snap, frozenset(), cap=1)
     assert row["in_flight_count"] == 1
     assert load_state(state_path_for(queue_dir, "t-parked")).stop_reason == LIVE_WORKER_STOP_REASON
+
+
+def test_daemon_gives_force_dispatch_the_parked_workers_and_the_tracker(
+    queue_dir: Path,
+    worker: dict[str, bool],
+    private_global_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force-dispatch runs before the tick's dispatch, so it takes the
+    in-flight list the last tick persisted, which holds the parked worker,
+    and reports a backstop park to the tracker the tick dispatch uses."""
+    _park(queue_dir)
+    settings = load_settings(None)
+    monkeypatch.setattr(daemon_mod, "sleep_for_next_poll", lambda **_kw: None)
+    consumed: list[dict[str, Any]] = []
+    trackers: list[ParkedWorkerTracker] = []
+    real_tick_dispatch = orch_mod.tick_dispatch
+
+    def recording_tick_dispatch(**kwargs: Any) -> SupervisorSnapshot:
+        trackers.append(kwargs["parked_tracker"])
+        return real_tick_dispatch(**kwargs)
+
+    monkeypatch.setattr(orch_mod, "tick_dispatch", recording_tick_dispatch)
+    monkeypatch.setattr(fd_mod, "tick_consume", lambda **kwargs: consumed.append(kwargs) or 0)
+
+    start_daemon(
+        queue_dir=queue_dir,
+        settings=settings,
+        source=FakeUsageSource([_reading(), _reading(), _reading()]),
+        pending_count_fn=lambda: 0,
+        in_flight_count_fn=lambda: 0,
+        clock=FakeClock(_NOW),
+        install_signal_handlers=False,
+        max_ticks=2,
+    )
+
+    assert len(consumed) == 2
+    assert [(r.task_id, r.account) for r in consumed[1]["prior_in_flight"]] == [
+        ("t-parked", "default")
+    ]
+    assert trackers[0] is trackers[1]
+    assert consumed[1]["on_park"] == trackers[0].note_park
 
 
 # ---------------------------------------------------------------------------
