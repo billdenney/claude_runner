@@ -364,6 +364,41 @@ def test_quarantine_finds_a_worker_by_its_salvaged_pid_alone(
     _assert_parked(queue_dir, log)
 
 
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "last_started_at: '2026-13-45T99:00:00Z'",  # parses, but not a time
+        "attempts: -3",  # a number TaskState refuses
+        "log_path: [unterminated",  # not YAML
+    ],
+)
+def test_quarantine_keeps_the_salvaged_pid_past_a_bad_line(
+    queue_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_line: str
+) -> None:
+    """One unreadable worker field costs that field, not the pid: the worker
+    (another user's, found by its pid alone) is still parked."""
+    log = _log(queue_dir)
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == _PID)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            _PID,
+            started=_NOW - timedelta(minutes=30),
+            boot=_NOW - timedelta(days=1),
+        ),
+    )
+    _corrupt(queue_dir, f"task_id: {_TASK}\nstatus: running\n{bad_line}\npid: {_PID}\n")
+
+    results = quarantine_corrupt_state_files(queue_dir, now=_NOW)
+
+    assert [(r.task_id, r.preserved_status) for r in results] == [(_TASK, "possibly_hung")]
+    state = load_state(state_path_for(queue_dir, _TASK))
+    assert (state.status, state.pid) == ("possibly_hung", _PID)
+    assert log.exists()
+
+
 @pytest.mark.parametrize("pid_on_record", [True, False])
 def test_quarantine_parks_a_task_whose_worker_still_runs(
     queue_dir: Path, live_worker: Path, pid_on_record: bool

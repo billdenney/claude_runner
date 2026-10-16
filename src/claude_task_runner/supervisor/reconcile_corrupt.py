@@ -112,8 +112,9 @@ may still run."""
 
 def _salvage_worker(raw: str) -> dict[str, object]:
     """The worker fields (:data:`_WORKER_FIELDS`) readable from the corrupt
-    file's head, each parsed as a one-line YAML mapping; an unreadable
-    line is skipped."""
+    file's head, each parsed as a one-line YAML mapping and kept only if
+    :class:`TaskState` accepts it, so one unreadable line (a bad timestamp,
+    say) costs that field and not the rest."""
     found: dict[str, object] = {}
     for line in raw.splitlines()[:_HEAD_LINES]:
         name, sep, _rest = line.partition(":")
@@ -121,22 +122,24 @@ def _salvage_worker(raw: str) -> dict[str, object]:
             continue
         try:
             parsed = yaml.safe_load(line)
-        except yaml.YAMLError:
+        except (yaml.YAMLError, ValueError):
             continue
-        if isinstance(parsed, dict) and parsed.get(name) is not None:
-            found[name] = parsed[name]
+        if not isinstance(parsed, dict) or parsed.get(name) is None:
+            continue
+        try:
+            TaskState.model_validate({"task_id": "salvage", name: parsed[name]})
+        except ValueError:
+            continue
+        found[name] = parsed[name]
     return found
 
 
 def _live_worker_state(queue_dir: Path, task_id: str, raw: str) -> TaskState | None:
     """A state parked with the task's still-running worker on record, or
     ``None`` when no worker of the task runs."""
-    try:
-        candidate = TaskState.model_validate(
-            {"task_id": task_id, "status": "running", **_salvage_worker(raw)}
-        )
-    except Exception:
-        candidate = TaskState(task_id=task_id, status="running")
+    candidate = TaskState.model_validate(
+        {"task_id": task_id, "status": "running", **_salvage_worker(raw)}
+    )
     live = dispatcher_mod.live_worker_record(candidate, queue_dir)
     if live is None:
         return None
