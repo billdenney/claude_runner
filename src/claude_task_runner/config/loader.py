@@ -18,6 +18,7 @@ config dir.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import tomllib
@@ -71,6 +72,50 @@ limit, so a file on a mount that is not up yet recovers by itself."""
 def config_error_exit_status(*, transient: bool) -> int:
     """:data:`TRANSIENT_CONFIG_ERROR_EXIT_STATUS` or :data:`CONFIG_ERROR_EXIT_STATUS`."""
     return TRANSIENT_CONFIG_ERROR_EXIT_STATUS if transient else CONFIG_ERROR_EXIT_STATUS
+
+
+_CONTENT_ERRNOS = frozenset({errno.ELOOP, errno.ENAMETOOLONG, errno.ENOTDIR, errno.EISDIR})
+"""``OSError`` errnos that retrying cannot fix, because the path itself is
+wrong: a symlink loop, a name too long, a path through something that is
+not a directory, a directory where a file belongs."""
+
+
+def os_error_is_transient(exc: OSError) -> bool:
+    """Whether reading a configuration file failed in a way that may clear up.
+
+    The one classifier both loaders use. ``False`` for the errnos in
+    :data:`_CONTENT_ERRNOS`. ``True`` for every other errno (``EACCES``,
+    ``EPERM``, ``ENOENT``, ``EIO``, ``ESTALE``, ``EHOSTDOWN``, ``ENOTCONN``,
+    ...): permissions get fixed and mounts come up, so a retry may succeed.
+    """
+    return exc.errno not in _CONTENT_ERRNOS
+
+
+def _path_error(path: Path, exc: OSError) -> str | None:
+    """What is wrong with ``path`` itself, worded the same by both loaders.
+
+    A symlink whose target does not exist, named with that target, and a
+    path through something that is not a directory, named as that
+    ancestor. ``None`` for any other error.
+    """
+    if exc.errno == errno.ENOENT and _is_symlink(path):
+        return f"{path} is a symlink to {os.readlink(path)}, which does not exist"
+    if exc.errno == errno.ENOTDIR:
+        return f"{_first_non_directory(path.parent)} is not a directory, so {path} cannot be read"
+    return None
+
+
+def _queue_toml_read_error(path: Path, exc: OSError) -> ConfigError:
+    """The :class:`ConfigError` for the queue TOML failing to open or read."""
+    message = _path_error(path, exc)
+    if message is None:
+        if exc.errno == errno.ENOENT:
+            message = f"Settings file not found: {path}"
+        elif exc.errno == errno.EISDIR:
+            message = f"Settings file is a directory: {path}"
+        else:
+            message = f"Cannot read {path}: {exc}"
+    return ConfigError(message, transient=os_error_is_transient(exc))
 
 
 PER_ACCOUNT_TOML_NAME = "runner-account.toml"
@@ -261,25 +306,33 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
     ------
     ConfigError
         For every way the per-queue TOML can fail, so a caller handles one
-        exception type. ``transient`` when it does not exist or cannot be
-        read; not ``transient`` when it is a directory, is not UTF-8 TOML,
-        sets a retired key (``[throttle.*]`` or one in ``_RETIRED_KEYS``),
-        or the merged settings fail schema validation.
+        exception type. ``transient`` when it cannot be opened or read for
+        a reason that may clear up (:func:`os_error_is_transient`); not
+        ``transient`` when its path or content is wrong: a directory, a
+        symlink loop, a path through a non-directory, not UTF-8 TOML, nested
+        too deeply to parse, a retired key (``[throttle.*]`` or one in
+        ``_RETIRED_KEYS``), or the merged settings fail schema validation.
     """
+    try:
+        return _load_settings(per_queue_toml)
+    except RecursionError as exc:
+        raise ConfigError(f"{per_queue_toml} is nested too deeply to load") from exc
+
+
+def _load_settings(per_queue_toml: Path | None) -> Settings:
     merged = load_defaults()
 
     if per_queue_toml is not None:
         try:
             with per_queue_toml.open("rb") as fh:
                 override = tomllib.load(fh)
-        except FileNotFoundError as exc:
-            raise ConfigError(f"Settings file not found: {per_queue_toml}", transient=True) from exc
-        except IsADirectoryError as exc:
-            raise ConfigError(f"Settings file is a directory: {per_queue_toml}") from exc
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         except OSError as exc:
-            raise ConfigError(f"Cannot read {per_queue_toml}: {exc}", transient=True) from exc
+            raise _queue_toml_read_error(per_queue_toml, exc) from exc
+        except ValueError as exc:
+            # A NUL byte in the path: no file can have that name.
+            raise ConfigError(f"Cannot read {per_queue_toml}: {exc}") from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
         _reject_retired_keys(override, str(per_queue_toml))
         _rename_retired_effort_levels(override, str(per_queue_toml))
@@ -297,10 +350,11 @@ def per_account_toml_path(config_dir: str) -> Path | None:
     Returns ``None`` when ``config_dir`` is empty (the synthesised
     legacy ``"default"`` account before the operator declares a
     non-empty config_dir). When set, returns the absolute path
-    whether or not the file exists. Raises :class:`ConfigError` when a
-    leading ``~user`` names no user, since no path can be built: the queue
-    TOML refuses that at load, so it happens only when the user is removed
-    while the supervisor runs.
+    whether or not the file exists. Raises :class:`ConfigError`, not
+    ``transient``, when a leading ``~user`` names no user or the value
+    holds a NUL byte, since no path can be built: the queue TOML refuses
+    both at load, so it happens only when the user is removed while the
+    supervisor runs, or for settings built without validation.
     """
     if not config_dir:
         return None
@@ -329,17 +383,19 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     config_dir → defaults (used for the synthesised legacy ``"default"``
     account before the operator declares an explicit config_dir).
 
-    Raises :class:`ConfigError` otherwise, naming the file, or the
-    ``config_dir`` when the problem is there. ``transient`` (it may clear
-    up by itself): the ``config_dir`` does not exist (a mount not up yet),
-    the file cannot be read (denied), or it is a symlink to a file that
-    does not exist yet. Not ``transient`` (its content is wrong): the
-    ``config_dir`` names no user's home or is not a directory, the file
-    is a directory, is empty (zero bytes, usually a save cut short, so not
-    read as "use the defaults"), is not UTF-8 TOML, sets the retired
-    ``[throttle.*]`` table or fails validation. :func:`resolve_accounts`
-    turns the error into a :class:`BrokenAccount` instead of letting it
-    propagate.
+    Raises :class:`ConfigError` otherwise, naming the file, or the path
+    that is the problem. ``transient`` (it may clear up by itself): the
+    ``config_dir`` does not exist (a mount not up yet), the file is a
+    symlink to a file that does not exist yet, or it cannot be opened or
+    read for another reason :func:`os_error_is_transient` counts as
+    passing (denied, an I/O or stale-mount error). Not ``transient`` (the
+    path or content is wrong): the ``config_dir`` names no user's home or
+    holds a NUL byte, a path on the way is not a directory, a symlink
+    loop, a name too long, the file is a directory, is empty (zero bytes,
+    usually a save cut short, so not read as "use the defaults"), is not
+    UTF-8 TOML, is nested too deeply, sets the retired ``[throttle.*]``
+    table or fails validation. :func:`resolve_accounts` turns the error
+    into a :class:`BrokenAccount` instead of letting it propagate.
     """
     path = per_account_toml_path(config_dir)
     if path is None:
@@ -347,23 +403,19 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     try:
         with path.open("rb") as fh:
             data = fh.read()
-    except FileNotFoundError:
-        if _is_symlink(path):
-            raise ConfigError(
-                f"{path} is a symlink to {os.readlink(path)}, which does not exist",
-                transient=True,
-            ) from None
-        # exists, not lexists: a config_dir symlinked to a mount that is not
-        # up yet does not exist either.
-        if not os.path.exists(path.parent):
-            raise ConfigError(f"config_dir {path.parent} does not exist", transient=True) from None
-        return AccountPolicy()
-    except NotADirectoryError as exc:
-        raise ConfigError(f"config_dir {path.parent} is not a directory") from exc
-    except IsADirectoryError as exc:
-        raise ConfigError(f"Cannot read {path}: {exc}") from exc
     except OSError as exc:
-        raise ConfigError(f"Cannot read {path}: {exc}", transient=True) from exc
+        message = _path_error(path, exc)
+        if message is None and exc.errno == errno.ENOENT:
+            # exists, not lexists: a config_dir symlinked to a mount that is
+            # not up yet does not exist either.
+            if not os.path.exists(path.parent):
+                raise ConfigError(
+                    f"config_dir {path.parent} does not exist", transient=True
+                ) from None
+            return AccountPolicy()
+        raise ConfigError(
+            message or f"Cannot read {path}: {exc}", transient=os_error_is_transient(exc)
+        ) from exc
     if not data:
         raise ConfigError(
             f"{path} is empty; delete it for the defaults, or write the settings it should hold"
@@ -372,11 +424,25 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
         payload = tomllib.loads(data.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
+    except RecursionError as exc:
+        raise ConfigError(f"{path} is nested too deeply to load") from exc
     _reject_legacy_throttle(payload, str(path))
     try:
         return AccountPolicy.model_validate(payload)
     except ValidationError as exc:
         raise ConfigError(f"Per-account policy validation failed for {path}: {exc}") from exc
+
+
+def _first_non_directory(directory: Path) -> Path:
+    """The path from the root to ``directory`` that exists but is not a directory.
+
+    ``directory`` itself when no single one can be named (it changed
+    meanwhile), so the message still names a path on the way.
+    """
+    for candidate in (*reversed(directory.parents), directory):
+        if os.path.exists(candidate) and not os.path.isdir(candidate):
+            return candidate
+    return directory
 
 
 def _is_symlink(path: Path) -> bool:

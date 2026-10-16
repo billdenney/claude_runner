@@ -72,6 +72,28 @@ def test_per_queue_config_must_be_a_file_not_a_directory(tmp_path: Path) -> None
     assert resolve_per_queue_config(None, queue_dir) is None
 
 
+@pytest.mark.parametrize("target", ["missing", "loop"])
+def test_a_symlink_to_no_file_is_returned(tmp_path: Path, target: str) -> None:
+    """Not the defaults, which name another account: ``load_settings`` then
+    reports the symlink."""
+    queue_dir = tmp_path / "q"
+    queue_dir.mkdir()
+    per_queue = queue_dir / PER_QUEUE_CONFIG_NAME
+    per_queue.symlink_to(
+        tmp_path / "unmounted" / "claude_runner.toml" if target == "missing" else per_queue
+    )
+    assert resolve_per_queue_config(None, queue_dir) == per_queue
+
+
+def test_a_symlink_to_a_file_is_returned(tmp_path: Path) -> None:
+    queue_dir = tmp_path / "q"
+    queue_dir.mkdir()
+    real = tmp_path / "real.toml"
+    real.write_text("")
+    (queue_dir / PER_QUEUE_CONFIG_NAME).symlink_to(real)
+    assert resolve_per_queue_config(None, queue_dir) == queue_dir / PER_QUEUE_CONFIG_NAME
+
+
 @pytest.mark.parametrize("name", [PER_QUEUE_CONFIG_NAME])
 def test_per_queue_name_is_stable(name: str) -> None:
     """The constant name is part of the public CLI contract — operators

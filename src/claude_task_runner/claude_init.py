@@ -27,7 +27,7 @@ import logging
 import os
 from pathlib import Path
 
-from claude_task_runner.config.paths import expand_config_dir
+from claude_task_runner.config.paths import expand_config_dir, expand_task_path
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,9 @@ def ensure_initialized(
     if not config_file.is_file():
         return False
 
-    trust_key = str(Path(trust_dir).expanduser().resolve())
+    # Raises TaskPathError for a working_dir whose ~user names no user; the
+    # dispatcher turns that into a DispatchError for the task.
+    trust_key = str(expand_task_path(trust_dir, "working_dir").resolve())
 
     try:
         data = json.loads(config_file.read_text())

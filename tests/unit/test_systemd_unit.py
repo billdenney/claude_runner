@@ -273,6 +273,13 @@ _UNIT_LINE_OF = {
 }
 """The unit line each ``[watchdog]`` key sets."""
 
+_CRON_ONLY = {
+    "transient_config_escalation_s": (
+        "systemd retries a start that exits 1 up to StartLimitBurst, then fails the unit"
+    ),
+}
+"""``[watchdog]`` keys only the cron watchdog reads, and what systemd does instead."""
+
 
 def _unit(watchdog: WatchdogSettings) -> str:
     return build_unit_text(
@@ -300,14 +307,20 @@ class TestRestartPolicyFromWatchdog:
         """Each ``[watchdog]`` key changes its own unit line and nothing else.
 
         Walks the schema, so a key added to ``[watchdog]`` later fails
-        here until it has a unit line in ``_UNIT_LINE_OF``."""
-        assert set(_UNIT_LINE_OF) == set(WatchdogSettings.model_fields)
+        here until it has a unit line in ``_UNIT_LINE_OF``, or is listed in
+        ``_CRON_ONLY`` with what systemd does instead, and then changes no
+        line."""
+        assert set(_UNIT_LINE_OF) | set(_CRON_ONLY) == set(WatchdogSettings.model_fields)
+        assert not set(_UNIT_LINE_OF) & set(_CRON_ONLY)
         before = _unit(_DEFAULTS).splitlines()
         for key, unit_key in _UNIT_LINE_OF.items():
             default = getattr(_DEFAULTS, key)
             after = _unit(_watchdog(**{key: default * 2})).splitlines()
             changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
             assert changed == [(f"{unit_key}={default:g}", f"{unit_key}={default * 2:g}")], key
+        for key in _CRON_ONLY:
+            default = getattr(_DEFAULTS, key)
+            assert _unit(_watchdog(**{key: default * 2})).splitlines() == before, key
 
     @pytest.mark.parametrize(
         ("seconds", "written"),

@@ -264,15 +264,20 @@ class TestResolveAccounts:
         )
         assert resolution.only_transient is True
 
-    def test_a_config_dir_that_is_a_file_is_broken(self, tmp_path: Path) -> None:
-        config_dir = tmp_path / "acct"
-        config_dir.write_text("", encoding="utf-8")
+    @pytest.mark.parametrize("depth", [0, 2], ids=["config-dir", "ancestor"])
+    def test_a_config_dir_through_a_file_is_broken(self, tmp_path: Path, depth: int) -> None:
+        """The error names the path that is not a directory, the config_dir
+        itself or an ancestor of it."""
+        not_a_dir = tmp_path / "acct"
+        not_a_dir.write_text("", encoding="utf-8")
+        config_dir = not_a_dir.joinpath(*["sub"] * depth)
+        path = config_dir / PER_ACCOUNT_TOML_NAME
         resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
         assert resolution.broken == (
             BrokenAccount(
                 name="solo",
-                path=str(config_dir / PER_ACCOUNT_TOML_NAME),
-                error=f"config_dir {config_dir} is not a directory",
+                path=str(path),
+                error=f"{not_a_dir} is not a directory, so {path} cannot be read",
                 transient=False,
             ),
         )
@@ -292,7 +297,7 @@ def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
 
 def _error_line(name: str, path: Path, error: str | None = None) -> str:
     return (
-        f"account {name!r} takes no new tasks until its runner-account.toml loads: "
+        f"account {name!r} takes no new tasks until this is fixed: "
         f"{error if error is not None else _invalid_toml(path)}"
     )
 
@@ -403,8 +408,31 @@ class TestAccountFileWatch:
             path.unlink()
             watch.observe(self._resolve(tmp_path, two_accounts))
         assert _messages(caplog, logging.INFO) == [
-            f"account 'personal' takes tasks again: {path} is gone, so the defaults apply "
-            "(max_concurrency = 1 and the queue's [dispatch_pct.*])"
+            f"account 'personal' takes tasks again: {path} does not exist, so the defaults "
+            "apply (max_concurrency = 1 and the queue's [dispatch_pct.*])"
+        ]
+
+    def test_a_config_dir_that_appears_without_the_file_says_the_defaults_apply(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A mount that comes up late: the account was broken because its
+        config_dir did not exist, and the file was never there."""
+        config_dir = tmp_path / "acct"
+        accounts = {"solo": config_dir}
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+            watch.observe(self._resolve(tmp_path, accounts))
+            config_dir.mkdir()
+            watch.observe(self._resolve(tmp_path, accounts))
+        assert _messages(caplog, logging.ERROR)[0] == _error_line(
+            "solo",
+            config_dir / PER_ACCOUNT_TOML_NAME,
+            f"config_dir {config_dir} does not exist",
+        )
+        assert _messages(caplog, logging.INFO) == [
+            f"account 'solo' takes tasks again: {config_dir / PER_ACCOUNT_TOML_NAME} does not "
+            "exist, so the defaults apply (max_concurrency = 1 and the queue's "
+            "[dispatch_pct.*])"
         ]
 
 
@@ -877,7 +905,7 @@ class TestDoctor:
         path = _break(two_accounts["personal"])
         result = check_account_policies(queue_toml(tmp_path / "q.toml", two_accounts))
         assert result.status is CheckStatus.FAIL
-        assert result.detail == "1 of 2 per-account policies invalid"
+        assert result.detail == "the runner-account.toml of 1 of 2 accounts does not load"
         assert result.remediation == f"personal: {_invalid_toml(path)}"
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")

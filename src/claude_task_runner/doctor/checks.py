@@ -326,8 +326,10 @@ def check_account_policies(settings: Settings) -> CheckResult:
     """Each account's ``<config_dir>/runner-account.toml`` parses; report resolved policy.
 
     Reads every account through :func:`config.loader.resolve_accounts`. A
-    missing file is informational (defaults apply); a file that exists
-    but does not load is FAIL, with the error. The detail string is a
+    ``config_dir`` that exists without the file means the defaults, and
+    says so. A file that does not load, and a ``config_dir`` that does not
+    exist, are FAIL, with the error: the supervisor gives that account no
+    new tasks, and refuses to start. The detail string is a
     one-line-per-account summary of resolved ``max_concurrency`` and
     band thresholds so the operator can verify what the supervisor
     will use.
@@ -373,7 +375,10 @@ def check_account_policies(settings: Settings) -> CheckResult:
         return CheckResult(
             name="account_policies",
             status=CheckStatus.FAIL,
-            detail=f"{len(fails)} of {len(settings.accounts)} per-account policies invalid",
+            detail=(
+                f"the runner-account.toml of {len(fails)} of {len(settings.accounts)} "
+                "accounts does not load"
+            ),
             remediation="\n".join(fails),
         )
     return CheckResult(

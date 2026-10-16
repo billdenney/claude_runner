@@ -312,7 +312,7 @@ class AccountFileWatch:
                 continue
             self.logged[broken.name] = key
             logger.error(
-                "account %r takes no new tasks until its runner-account.toml loads: %s",
+                "account %r takes no new tasks until this is fixed: %s",
                 broken.name,
                 broken.error,
             )
@@ -324,9 +324,11 @@ class AccountFileWatch:
             if os.path.lexists(path):
                 logger.info("account %r takes tasks again: %s loads", name, path)
             else:
+                # Deleted, or never there: a config_dir that did not exist
+                # (a mount not up yet) and now does without the file.
                 logger.info(
-                    "account %r takes tasks again: %s is gone, so the defaults apply "
-                    "(max_concurrency = 1 and the queue's [dispatch_pct.*])",
+                    "account %r takes tasks again: %s does not exist, so the defaults "
+                    "apply (max_concurrency = 1 and the queue's [dispatch_pct.*])",
                     name,
                     path,
                 )

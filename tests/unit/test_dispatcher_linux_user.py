@@ -399,3 +399,46 @@ def test_a_config_dir_whose_user_is_gone_raises_dispatch_error(
         "Could not determine home directory."
     )
     assert _FakePopen.captured_argv == []
+
+
+def test_a_working_dir_whose_user_is_gone_raises_dispatch_error(
+    tmp_path: Path,
+    queue_dir: Path,
+    task_state: TaskState,
+    settings_kwargs: dict[str, object],
+) -> None:
+    """The trust entry for the working_dir cannot be written, so the dispatch
+    fails with a DispatchError naming the task, not a RuntimeError."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / ".claude.json").write_text("{}", encoding="utf-8")
+    task = Task.model_validate(
+        {
+            "id": "t1",
+            "title": "Test",
+            "prompt": "do thing",
+            "working_dir": "~no-such-user-ctr-test/wt",
+        }
+    )
+    _FakePopen.captured_argv.clear()
+    with (
+        patch("claude_task_runner.runner.dispatcher.shutil.which", return_value="/usr/bin/claude"),
+        pytest.raises(DispatchError) as excinfo,
+    ):
+        dispatch(
+            task=task,
+            state=task_state,
+            plan=_plan(),
+            queue_dir=queue_dir,
+            clock=_FrozenClock(),
+            claude_executable="claude",
+            claude_config_dir=str(config_dir),
+            account="work",
+            persist_state=False,
+            **settings_kwargs,
+        )
+    assert str(excinfo.value) == (
+        "task t1: working_dir '~no-such-user-ctr-test/wt' cannot be expanded: "
+        "Could not determine home directory."
+    )
+    assert _FakePopen.captured_argv == []

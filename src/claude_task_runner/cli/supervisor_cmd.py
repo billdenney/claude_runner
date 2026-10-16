@@ -33,9 +33,7 @@ from claude_task_runner.cli._helpers import (
 )
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import (
-    ConfigError,
     config_error_exit_status,
-    load_settings,
     resolve_accounts,
 )
 from claude_task_runner.config.paths import ConfigDirError
@@ -163,7 +161,7 @@ def _build_per_account_source(
         # The user behind a ~user config_dir was removed after the settings
         # loaded, or the file cannot be checked: build the composite source,
         # whose captures then fail for this account alone, loudly.
-        logger.warning("account config_dir %s: %s", config_dir, exc)
+        logger.warning("cannot check %s for a long-lived token: %s", config_dir, exc)
         long_lived = False
 
     if mode == "tty":
@@ -298,7 +296,7 @@ def start(
 
     resolution = resolve_accounts(settings)
     if resolution.broken:
-        _say(console, broken_accounts_message(resolution.broken), "bold red")
+        _say(console, broken_accounts_message(resolution), "bold red")
         raise typer.Exit(code=config_error_exit_status(transient=resolution.only_transient))
 
     queue_runtime_dir(queue_path)  # ensure subdirs exist
@@ -408,18 +406,17 @@ def _default_drain_wait(config: Path | None, queue_path: Path, console: Console)
 
     Reads the queue's settings as ``supervisor start`` does: ``--config``,
     or ``<queue>/claude_runner.toml`` when it exists. When they do not
-    load, exits 2 before anything is signalled.
+    load, exits as ``supervisor start`` would (78, or 1 for a file that
+    may come back) before anything is signalled.
     """
-    try:
-        settings = load_settings(resolve_per_queue_config(config, queue_path))
-    except (ConfigError, OSError) as exc:
-        _say(
-            console,
-            f"cannot load the settings for the default --timeout: {exc}. "
-            "Pass --timeout <seconds>, or --no-wait, to drain without them.",
-            "bold red",
-        )
-        raise typer.Exit(code=2) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path),
+        console,
+        lead=(
+            "cannot load the settings for the default --timeout (pass --timeout "
+            "<seconds>, or --no-wait, to drain without them)"
+        ),
+    )
     cap = settings.task_caps.max_duration_s_per_task
     if cap == 0:
         return None
@@ -589,19 +586,20 @@ def drain(
     With a cap of 0 it waits without limit. That default is the only
     thing drain reads the queue's settings for, so a
     ``claude_runner.toml`` that does not load stops only a waiting
-    drain without ``--timeout``, with exit 2 before anything is
-    signalled. Pass ``--timeout`` for a task whose override is longer
-    than the cap.
+    drain without ``--timeout``, before anything is signalled, with the
+    exit status ``supervisor start`` gives that config. Pass
+    ``--timeout`` for a task whose override is longer than the cap.
 
     \b
     Exit codes:
       0  supervisor exited (or --no-wait and signal delivered)
       1  no supervisor to signal: no PID file, one that holds no PID,
-         or a PID that is not alive
-      2  --queue is not an existing directory, the settings for the
-         default --timeout did not load, or signal delivery rejected
+         or a PID that is not alive; or the settings for the default
+         --timeout could not be read for now (the message says which)
+      2  --queue is not an existing directory, or signal delivery rejected
          (permission) or refused (a PID of 1 or less, or this command's own)
       4  --wait timed out (the supervisor is still draining)
+     78  the settings for the default --timeout have wrong content
     """
     console = Console()
     queue_path = require_queue_option(queue_dir, console)

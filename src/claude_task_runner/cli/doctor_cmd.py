@@ -67,7 +67,11 @@ def doctor(
 ) -> None:
     """Run a battery of self-diagnostic checks against this queue.
 
-    Exits 0 if everything is PASS / WARN, 1 if any FAIL.
+    Exits 0 if everything is PASS / WARN, 1 if any FAIL. When the queue
+    TOML does not load, no check runs: it prints the error (with --json,
+    as {"ok": false, "error": ...}) and exits as ``supervisor start``
+    would, 78 when the content is wrong and 1 when the file could not be
+    read for now.
     """
     queue_path = queue_dir.resolve()
     settings = load_settings_or_exit(

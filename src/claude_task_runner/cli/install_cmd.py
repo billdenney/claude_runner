@@ -142,7 +142,7 @@ def install(
     if resolution.broken:
         console.print(
             broken_accounts_message(
-                resolution.broken,
+                resolution,
                 refused="not installed",
                 then="run install again",
                 if_transient="but the supervisor would not start until it does",

@@ -1,114 +1,78 @@
-"""Every expansion of a ``config_dir`` goes through ``config.paths.expand_config_dir``.
+"""Only ``config/paths.py`` expands a leading ``~`` in a path.
 
-``Path.expanduser`` raises ``RuntimeError`` for a ``~user`` that names no
-user. A ``RuntimeError`` from the usage capture escaped the supervisor's
-``safe_poll`` and ended its tick loop. ``expand_config_dir`` raises
-``ConfigDirError`` instead, which each caller turns into its own error, so
-this test fails on any ``.expanduser()`` call in ``src/`` outside
-``config/paths.py`` that :data:`ALLOWED` does not list. A new call on a
-``config_dir`` must use the helper; a new call on another kind of path
-needs an entry here, with its reason.
+``Path.expanduser`` and ``os.path.expanduser`` raise ``RuntimeError`` for a
+``~user`` that names no user. Code that must keep running, such as the
+supervisor's tick loop, a dispatch thread or a reclaim pass, would end on
+it. ``config/paths.py`` raises a typed error instead (``ConfigDirError`` for
+an account's ``config_dir``, ``TaskPathError`` for a task path or another
+path from the settings), which each caller turns into an error of its own
+that fails or skips only the account or task concerned. So this test fails
+on any reference to ``expanduser`` elsewhere in ``src/``. :data:`ALLOWED`
+is empty; a site added there must say why its ``RuntimeError`` cannot
+escape.
 """
 
 from __future__ import annotations
 
-import ast
 import textwrap
 from collections import Counter
 from pathlib import Path
+
+from ._reference_gate import references_by_scope
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 PACKAGE = REPO_ROOT / "src" / "claude_task_runner"
 HELPER = Path("config/paths.py")
 
-ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
-    ("runner/add_dirs.py", "_normalize"): (
-        2,
-        "a task's additional_dirs entry, not a config_dir",
-    ),
-    ("claude_init.py", "ensure_initialized"): (
-        1,
-        "trust_dir, the task's working_dir; config_dir goes through the helper",
-    ),
-    ("worktree/reclaim.py", "_task_entries"): (
-        2,
-        "a task's working_dir and deliverable paths, not a config_dir",
-    ),
-    ("worktree/reclaim.py", "_lock_path"): (
-        1,
-        "[worktree_reclaim].lock_file, not a config_dir",
-    ),
-}
-"""``(path under the package, enclosing function)`` → (how many
-``.expanduser()`` calls it may make, why they are not a ``config_dir``)."""
+ALLOWED: dict[tuple[str, str], tuple[int, str]] = {}
+"""``(path under the package, qualified scope)`` → (how many references
+to ``expanduser`` it may make, why a ``RuntimeError`` cannot escape)."""
 
 
-def expanduser_calls(source: str) -> Counter[str]:
-    """How many ``.expanduser()`` calls each function in ``source`` makes.
-
-    The key is the innermost enclosing function's name, ``<module>`` at the
-    top level. ``os.path.expanduser(x)`` counts as well as
-    ``Path(x).expanduser()``.
-    """
-    counts: Counter[str] = Counter()
-
-    def visit(node: ast.AST, scope: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
-                visit(child, child.name)
-                continue
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "expanduser"
-            ):
-                counts[scope] += 1
-            visit(child, scope)
-
-    visit(ast.parse(source), "<module>")
-    return counts
-
-
-def all_calls() -> dict[tuple[str, str], int]:
-    """Every function in the package that calls ``.expanduser()``, outside the helper."""
+def all_references() -> dict[tuple[str, str], int]:
+    """Every scope in the package that refers to ``expanduser``, outside the helper."""
     found: dict[tuple[str, str], int] = {}
     for path in sorted(PACKAGE.rglob("*.py")):
         rel = path.relative_to(PACKAGE)
         if rel == HELPER:
             continue
-        for scope, n in expanduser_calls(path.read_text(encoding="utf-8")).items():
+        source = path.read_text(encoding="utf-8")
+        for scope, n in references_by_scope(source, "expanduser").items():
             found[(rel.as_posix(), scope)] = n
     return found
 
 
-def test_only_the_allowed_sites_call_expanduser() -> None:
-    found = all_calls()
+def test_only_the_helper_expands_a_path() -> None:
+    found = all_references()
     allowed = {key: n for key, (n, _reason) in ALLOWED.items()}
     unexpected = {key: n for key, n in found.items() if allowed.get(key) != n}
     assert not unexpected, (
-        "expanduser() outside config/paths.py, unexpected here: "
-        f"{sorted(unexpected.items())}. Expand a config_dir with "
-        "config.paths.expand_config_dir; for another kind of path, add the "
-        "site to ALLOWED with its reason."
+        "expanduser outside config/paths.py: "
+        f"{sorted(unexpected.items())}. Use config.paths.expand_config_dir "
+        "for a config_dir and config.paths.expand_task_path for any other "
+        "path, and turn its error into the caller's own."
     )
     # A removed site leaves a stale entry; the allowlist must not outlive it.
     assert sorted(found) == sorted(allowed)
 
 
 def test_the_helper_is_where_the_expansion_happens() -> None:
-    assert expanduser_calls((PACKAGE / HELPER).read_text(encoding="utf-8")) == Counter(
-        {"expand_config_dir": 1}
-    )
+    source = (PACKAGE / HELPER).read_text(encoding="utf-8")
+    assert references_by_scope(source, "expanduser") == Counter({"_expand": 1})
 
 
 class TestScanner:
     """The scanner itself: one that finds nothing would pass everything."""
 
-    def test_finds_each_form_in_its_function(self) -> None:
+    def test_finds_each_form_in_its_scope(self) -> None:
         source = textwrap.dedent(
             """
             import os
+            import os.path as osp
+            from os.path import expanduser
+            from os.path import expanduser as eu
             from pathlib import Path
+            from pathlib import Path as P
 
             top = Path("~").expanduser()
 
@@ -118,11 +82,53 @@ class TestScanner:
             def two(a, b):
                 def inner():
                     return os.path.expanduser(b)
-                return Path(a).expanduser(), inner()
+                return Path.expanduser(Path(a)), inner()
+
+            def aliases(a):
+                return expanduser(a), eu(a), osp.expanduser(a), P(a).expanduser()
+
+            def uncalled(a):
+                expand = P.expanduser
+                return list(map(eu, [a])), expand
+
+            class Holder:
+                def method(self, a):
+                    return Path(a).expanduser()
+
+                async def coroutine(self, a):
+                    return os.path.expanduser(a)
+
+                class Inner:
+                    @staticmethod
+                    def nested(a):
+                        return Path(a).expanduser()
+
+            async def coro(a):
+                return Path(a).expanduser()
             """
         )
-        assert expanduser_calls(source) == Counter({"<module>": 1, "one": 1, "two": 1, "inner": 1})
+        assert references_by_scope(source, "expanduser") == Counter(
+            {
+                "<module>": 1,
+                "one": 1,
+                "two": 1,
+                "two.inner": 1,
+                "aliases": 4,
+                "uncalled": 2,
+                "Holder.method": 1,
+                "Holder.coroutine": 1,
+                "Holder.Inner.nested": 1,
+                "coro": 1,
+            }
+        )
 
-    def test_ignores_the_word_in_strings_and_comments(self) -> None:
-        source = 'x = "Path.expanduser()"  # .expanduser() here is a comment\n'
-        assert expanduser_calls(source) == Counter()
+    def test_ignores_the_word_in_strings_comments_and_other_names(self) -> None:
+        source = textwrap.dedent(
+            """
+            x = "Path.expanduser()"  # .expanduser() here is a comment
+            expanduser_count = 0
+            def expanduser_like(a):
+                return a.expanduser_ish()
+            """
+        )
+        assert references_by_scope(source, "expanduser") == Counter()

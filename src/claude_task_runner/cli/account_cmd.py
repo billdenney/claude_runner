@@ -179,8 +179,23 @@ def list_accounts(
     interactively without it for a human-readable summary.
 
     An account whose ``runner-account.toml`` does not load is listed with
-    the error in place of its policy, the others as usual, and the command
-    then exits 1.
+    the error in place of its policy (with --json, in its row's
+    ``policy_error``), the others as usual, and the command then exits 1.
+
+    When the command cannot list at all, it prints only the error; with
+    --json that is ``{"ok": false, "error": ...}``. ``"ok": false`` is how
+    to tell those apart from a listing, which has no ``ok`` key, since
+    exit 1 can mean either.
+
+    \b
+    Exit codes:
+      0  every account's runner-account.toml loads
+      1  an account's runner-account.toml does not load (the listing
+         names it), or the queue TOML could not be read for now ("ok":
+         false), which may clear up by itself
+      2  --queue is not an existing directory, or the account pause
+         markers cannot be read ("ok": false)
+     78  the queue TOML's content is wrong ("ok": false)
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -192,9 +207,11 @@ def list_accounts(
     except OSError as exc:
         msg = f"cannot read the account pause markers in {account_pause.pause_dir(qd)}: {exc}"
         if json:
-            print(_json.dumps({"error": msg}))
+            print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(
+                msg, style="bold red", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         raise typer.Exit(code=2) from exc
 
     loaded = {acct.name: acct for acct in resolution.accounts}

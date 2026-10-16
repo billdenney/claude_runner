@@ -13,6 +13,7 @@ that account at every place that expands its ``config_dir``.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -28,10 +29,15 @@ from claude_task_runner.cli import app, watchdog_cmd
 from claude_task_runner.config.loader import (
     CONFIG_ERROR_EXIT_STATUS,
     PER_ACCOUNT_TOML_NAME,
+    BrokenAccount,
     ConfigError,
+    load_account_policy,
     load_settings,
+    os_error_is_transient,
+    resolve_accounts,
 )
 from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
+from claude_task_runner.config.schema import AccountSettings
 from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.cron.registry import register_queue
 from claude_task_runner.supervisor.daemon import _apply_sighup_reload
@@ -43,6 +49,8 @@ from ._concurrency_fixtures import (
     single_account_queue,
     write_account_cap,
 )
+
+SUPERVISOR_CMD_LOGGER = "claude_task_runner.cli.supervisor_cmd"
 
 BAD_TOML = "max_concurrency 5\n"
 PARSE_ERROR = "Expected '=' after a key in a key/value pair (at line 1, column 17)"
@@ -280,6 +288,42 @@ class TestUserRemovedWhileRunning:
             f"config_dir '{GONE}' cannot be expanded: Could not determine home directory."
         )
 
+    @pytest.mark.parametrize("mode", ["tty", "api", "api_then_tty"])
+    def test_the_supervisor_still_builds_its_usage_sources(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, mode: str
+    ) -> None:
+        """``supervisor start`` builds one usage source per account before the
+        daemon runs; a removed user warns and leaves that account's captures
+        to fail, instead of ending the start with a traceback."""
+        from claude_task_runner.cli.supervisor_cmd import _build_usage_source
+        from claude_task_runner.config.schema import AccountSettings
+        from claude_task_runner.usage.multi_account_source import MultiAccountUsageSource
+
+        loaded = load_settings(None)
+        settings = loaded.model_copy(
+            update={
+                "usage": loaded.usage.model_copy(update={"source": mode}),
+                # model_construct: the validator refuses this config_dir at load.
+                "accounts": [
+                    AccountSettings(name="personal", config_dir=str(tmp_path / "personal")),
+                    AccountSettings.model_construct(name="work", config_dir=GONE),
+                ],
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger=SUPERVISOR_CMD_LOGGER):
+            source = _build_usage_source(settings, tmp_path, lambda: None)
+        assert isinstance(source, MultiAccountUsageSource)
+        assert sorted(source._per_account) == ["personal", "work"]
+        assert [
+            (r.levelno, r.getMessage()) for r in caplog.records if r.name == SUPERVISOR_CMD_LOGGER
+        ] == [
+            (
+                logging.WARNING,
+                f"cannot check {GONE} for a long-lived token: config_dir '{GONE}' cannot "
+                "be expanded: Could not determine home directory.",
+            )
+        ]
+
 
 # ---------------------------------------------------------------------------
 # The cron watchdog holds back a restart that would be refused
@@ -384,16 +428,125 @@ class TestWatchdog:
         (queue / ".claude_task_runner").mkdir()
         register_queue(queue)
         monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        before = datetime.now(UTC)
         result = CliRunner().invoke(app, ["watchdog", "tick"])
         assert result.exit_code == 0, result.output
         (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
             f"watchdog: WARNING queue={queue} alive=False pid=None the runner-account.toml "
-            "of 1 account(s) cannot be read yet, so its supervisor was not restarted; the "
-            f"next tick reads them again: work: config_dir {unmounted} does not exist"
+            "of 1 account(s) does not load, so its supervisor was not restarted; this may "
+            "clear up by itself, and the next tick tries again: work: config_dir "
+            f"{unmounted} does not exist"
         )
         state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
         assert state.recent_restarts == []
+        assert state.transient_config_since is not None
+        assert before <= state.transient_config_since <= datetime.now(UTC)
+
+    def test_one_content_error_among_transient_ones_is_an_error(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a fix helps the account whose file is wrong, so the tick fails
+        at once, however recent the other account's problem is."""
+        accounts = _accounts(isolated_home)
+        personal = Path(accounts["personal"]) / PER_ACCOUNT_TOML_NAME
+        personal.write_text(BAD_TOML, encoding="utf-8")
+        unmounted = isolated_home / "unmounted"
+        accounts["work"] = str(unmounted)
+        queue = _queue(isolated_home, accounts)
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        result = CliRunner().invoke(app, ["watchdog", "tick"])
+        assert result.exit_code == 1
+        (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
+        assert line.split(" ", 1)[1] == (
+            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml "
+            "of 2 account(s) does not load, so its supervisor was not restarted: personal: "
+            f"Invalid TOML in {personal}: {PARSE_ERROR}; work: config_dir {unmounted} "
+            "does not exist"
+        )
+        state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
+        assert state.transient_config_since is None
+
+    @pytest.mark.parametrize(
+        ("escalation_s", "level", "exit_code", "note"),
+        [
+            pytest.param(
+                900,
+                "WARNING",
+                0,
+                "this may clear up by itself, and the next tick tries again",
+                id="within-the-queue-setting",
+            ),
+            pytest.param(
+                600,
+                "ERROR",
+                1,
+                "this may clear up by itself, but has lasted 12 min",
+                id="past-the-queue-setting",
+            ),
+        ],
+    )
+    def test_a_file_that_stays_away_becomes_an_error(
+        self,
+        isolated_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        escalation_s: int,
+        level: str,
+        exit_code: int,
+        note: str,
+    ) -> None:
+        """The queue's ``[watchdog].transient_config_escalation_s`` decides when a
+        problem that may clear up has lasted too long; its start is kept."""
+        accounts = _accounts(isolated_home)
+        unmounted = isolated_home / "unmounted"
+        accounts["work"] = str(unmounted)
+        queue = _queue(isolated_home, accounts)
+        with (queue / "claude_runner.toml").open("a", encoding="utf-8") as fh:
+            fh.write(f"[watchdog]\ntransient_config_escalation_s = {escalation_s}\n")
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        since = datetime.now(UTC) - timedelta(minutes=12, seconds=5)
+        backoff_mod.write_state_atomic(
+            backoff_mod.WatchdogState(queue=queue.resolve(), transient_config_since=since),
+            backoff_mod.watchdog_state_path(),
+        )
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        result = CliRunner().invoke(app, ["watchdog", "tick"])
+        assert result.exit_code == exit_code, result.output
+        (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
+        assert line.split(" ", 1)[1] == (
+            f"watchdog: {level} queue={queue} alive=False pid=None the runner-account.toml "
+            f"of 1 account(s) does not load, so its supervisor was not restarted; {note}: "
+            f"work: config_dir {unmounted} does not exist"
+        )
+        state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
+        assert state.transient_config_since == since
+        assert state.recent_restarts == []
+
+    def test_a_restart_ends_a_transient_spell(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue = _queue(isolated_home, _accounts(isolated_home))
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        backoff_mod.write_state_atomic(
+            backoff_mod.WatchdogState(
+                queue=queue.resolve(),
+                transient_config_since=datetime.now(UTC) - timedelta(minutes=30),
+            ),
+            backoff_mod.watchdog_state_path(),
+        )
+        spawned: list[Path] = []
+        monkeypatch.setattr(
+            watchdog_cmd, "_spawn_supervisor", lambda qd, config=None: spawned.append(qd) or 1
+        )
+        result = CliRunner().invoke(app, ["watchdog", "tick"])
+        assert result.exit_code == 0, result.output
+        assert spawned == [queue.resolve()]
+        state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
+        assert state.transient_config_since is None
 
 
 def _no_spawn(_queue_dir: Path, config: Path | None = None) -> int:
@@ -444,6 +597,238 @@ class TestLoadSettingsErrors:
             path.chmod(0o644)
         assert str(error) == f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
         assert error.transient is True
+
+
+# ---------------------------------------------------------------------------
+# One errno classifier for both loaders
+# ---------------------------------------------------------------------------
+
+LOOP = "[Errno 40] Too many levels of symbolic links"
+TOO_LONG = "[Errno 36] File name too long"
+LONG_NAME = "x" * 300
+
+
+@pytest.mark.parametrize(
+    ("code", "transient"),
+    [
+        (errno.ELOOP, False),
+        (errno.ENAMETOOLONG, False),
+        (errno.ENOTDIR, False),
+        (errno.EISDIR, False),
+        (errno.EACCES, True),
+        (errno.EPERM, True),
+        (errno.ENOENT, True),
+        (errno.EIO, True),
+        (errno.ESTALE, True),
+        (errno.EHOSTDOWN, True),
+        (errno.ENOTCONN, True),
+    ],
+    ids=lambda v: errno.errorcode[v] if isinstance(v, int) and not isinstance(v, bool) else None,
+)
+def test_the_classifier(code: int, transient: bool) -> None:
+    """A path that is wrong (a loop, a name too long, a file where a directory
+    belongs, or the reverse) cannot be fixed by retrying; anything else may
+    clear up: permissions get fixed, mounts come up."""
+    assert os_error_is_transient(OSError(code, os.strerror(code))) is transient
+
+
+def _queue_error(path: Path) -> ConfigError:
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(path)
+    return excinfo.value
+
+
+def _account_error(config_dir: Path | str) -> ConfigError:
+    with pytest.raises(ConfigError) as excinfo:
+        load_account_policy(str(config_dir))
+    return excinfo.value
+
+
+class TestQueueTomlErrno:
+    def test_a_symlink_loop_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.symlink_to(path)
+        error = _queue_error(path)
+        assert str(error) == f"Cannot read {path}: {LOOP}: '{path}'"
+        assert error.transient is False
+
+    def test_a_name_too_long_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / f"{LONG_NAME}.toml"
+        error = _queue_error(path)
+        assert str(error) == f"Cannot read {path}: {TOO_LONG}: '{path}'"
+        assert error.transient is False
+
+    @pytest.mark.parametrize("depth", [0, 2], ids=["parent", "ancestor"])
+    def test_a_path_through_a_file_is_content(self, tmp_path: Path, depth: int) -> None:
+        """``--config /etc/passwd/x.toml``, say."""
+        not_a_dir = tmp_path / "passwd"
+        not_a_dir.write_text("", encoding="utf-8")
+        path = not_a_dir.joinpath(*["sub"] * depth, "x.toml")
+        error = _queue_error(path)
+        assert str(error) == f"{not_a_dir} is not a directory, so {path} cannot be read"
+        assert error.transient is False
+
+    def test_a_symlink_to_nothing_may_come_back(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        target = tmp_path / "unmounted" / "claude_runner.toml"
+        path.symlink_to(target)
+        error = _queue_error(path)
+        assert str(error) == f"{path} is a symlink to {target}, which does not exist"
+        assert error.transient is True
+
+    @pytest.mark.parametrize("code", [errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.EPERM])
+    def test_an_injected_read_error_may_come_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.write_text("", encoding="utf-8")
+        _fail_open(monkeypatch, path, code)
+        error = _queue_error(path)
+        assert str(error) == f"Cannot read {path}: [Errno {code}] {os.strerror(code)}"
+        assert error.transient is True
+
+    def test_nesting_too_deep_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.write_text(DEEP_TOML, encoding="utf-8")
+        error = _queue_error(path)
+        assert str(error) == f"{path} is nested too deeply to load"
+        assert error.transient is False
+
+    def test_a_nul_in_a_config_dir_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.write_text(
+            '[[accounts]]\nname = "personal"\nconfig_dir = "/tmp/x\\u0000y"\n',
+            encoding="utf-8",
+        )
+        error = _queue_error(path)
+        assert "account 'personal': config_dir '/tmp/x\\x00y' contains a NUL byte" in str(error)
+        assert error.transient is False
+
+
+def _fail_open(monkeypatch: pytest.MonkeyPatch, path: Path, code: int) -> None:
+    """Make opening ``path`` raise ``OSError(code)``, as a failing mount would."""
+    real_open = Path.open
+
+    def failing_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self == path:
+            raise OSError(code, os.strerror(code))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+
+DEEP_TOML = "x = " + "[" * 5000 + "]" * 5000 + "\n"
+"""Valid TOML that ``tomllib`` cannot parse without exceeding the recursion limit."""
+
+
+class TestAccountFileErrno:
+    def test_a_symlink_loop_on_the_file_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / PER_ACCOUNT_TOML_NAME
+        path.symlink_to(path)
+        error = _account_error(tmp_path)
+        assert str(error) == f"Cannot read {path}: {LOOP}: '{path}'"
+        assert error.transient is False
+
+    def test_a_symlink_loop_on_the_config_dir_is_content(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / "acct"
+        config_dir.symlink_to(config_dir)
+        path = config_dir / PER_ACCOUNT_TOML_NAME
+        error = _account_error(config_dir)
+        assert str(error) == f"Cannot read {path}: {LOOP}: '{path}'"
+        assert error.transient is False
+
+    def test_a_name_too_long_is_content(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / LONG_NAME
+        path = config_dir / PER_ACCOUNT_TOML_NAME
+        error = _account_error(config_dir)
+        assert str(error) == f"Cannot read {path}: {TOO_LONG}: '{path}'"
+        assert error.transient is False
+
+    @pytest.mark.parametrize("code", [errno.EIO, errno.ESTALE, errno.ENOTCONN, errno.EPERM])
+    def test_an_injected_read_error_may_come_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        path = tmp_path / PER_ACCOUNT_TOML_NAME
+        path.write_text("max_concurrency = 2\n", encoding="utf-8")
+        _fail_open(monkeypatch, path, code)
+        error = _account_error(tmp_path)
+        assert str(error) == f"Cannot read {path}: [Errno {code}] {os.strerror(code)}"
+        assert error.transient is True
+
+    def test_nesting_too_deep_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / PER_ACCOUNT_TOML_NAME
+        path.write_text(DEEP_TOML, encoding="utf-8")
+        error = _account_error(tmp_path)
+        assert str(error) == f"{path} is nested too deeply to load"
+        assert error.transient is False
+
+    def test_a_nul_in_the_config_dir_is_content_and_does_not_raise(self) -> None:
+        """``resolve_accounts`` reports it as a broken account; the validator
+        refuses it at load, so only settings built without validation carry it."""
+        settings = load_settings(None).model_copy(
+            update={
+                "accounts": [
+                    AccountSettings.model_construct(name="personal", config_dir="/tmp/x\x00y")
+                ]
+            }
+        )
+        resolution = resolve_accounts(settings)
+        assert resolution.broken == (
+            BrokenAccount(
+                name="personal",
+                path="/tmp/x\x00y/runner-account.toml",
+                error="config_dir '/tmp/x\\x00y' contains a NUL byte",
+                transient=False,
+            ),
+        )
+
+
+def test_start_refuses_a_config_through_a_file_with_78(tmp_path: Path) -> None:
+    queue = tmp_path / "q"
+    queue.mkdir()
+    config = tmp_path / "passwd" / "x.toml"
+    config.parent.write_text("", encoding="utf-8")
+    result = _start_with(["--queue", str(queue), "--config", str(config)])
+    assert result.exit_code == 78
+    assert result.stdout == (
+        f"supervisor not started: {config.parent} is not a directory, so {config} cannot be read\n"
+    )
+
+
+def test_a_dangling_queue_toml_symlink_is_not_the_defaults(tmp_path: Path) -> None:
+    """``<queue>/claude_runner.toml`` symlinked to a mount not up yet: exit 1,
+    as for ``--config``, instead of the defaults and their ~/.claude account."""
+    queue = tmp_path / "q"
+    queue.mkdir()
+    target = tmp_path / "unmounted" / "claude_runner.toml"
+    (queue / "claude_runner.toml").symlink_to(target)
+    result = CliRunner().invoke(app, ["account", "list", "--queue", str(queue)])
+    assert result.exit_code == 1
+    assert result.stdout == (
+        f"configuration error: {queue / 'claude_runner.toml'} is a symlink to {target}, "
+        "which does not exist\n"
+    )
+
+
+def test_a_sighup_with_nesting_too_deep_keeps_the_old_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    current = load_settings(None)
+    config = tmp_path / "claude_runner.toml"
+    config.write_text(DEEP_TOML, encoding="utf-8")
+    with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+        new_settings, pending = _apply_sighup_reload(
+            current=current, config_path=config, prior_pending=4, pending_count_fn=lambda: 99
+        )
+    assert new_settings is current
+    assert pending == 4
+    assert [(r.levelno, r.getMessage()) for r in caplog.records if r.name == DAEMON_LOGGER] == [
+        (
+            logging.ERROR,
+            f"SIGHUP received: reload failed ({config} is nested too deeply to load); "
+            "keeping old config",
+        )
+    ]
 
 
 def _start_with(argv: list[str]) -> object:
@@ -598,47 +983,205 @@ def test_an_expandable_config_dir_loads(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["account", "list"],
-        ["account", "list", "--json"],
-        ["supervisor", "status"],
-        ["supervisor", "status", "--json"],
-        ["doctor"],
-        ["doctor", "--json"],
-    ],
-    ids=lambda a: "-".join(a),
+DRAIN_LEAD = (
+    "cannot load the settings for the default --timeout (pass --timeout <seconds>, "
+    "or --no-wait, to drain without them)"
 )
-def test_cli_commands_report_a_bad_queue_toml_cleanly(tmp_path: Path, argv: list[str]) -> None:
-    queue = _queue(tmp_path, {"personal": GONE})
-    result = CliRunner().invoke(app, [*argv, "--queue", str(queue)])
-    assert result.exit_code == 78
-    assert isinstance(result.exception, SystemExit)
-    expected_start = f"configuration error: {UNKNOWN_USER_ERROR}"
-    if "--json" in argv:
-        payload = json.loads(result.stdout)
-        assert payload["ok"] is False
-        assert payload["error"].startswith(expected_start)
-    else:
-        assert result.stdout.startswith(expected_start)
-        assert "Traceback" not in result.output
+
+# argv after the command words, the lead its error starts with, and where it
+# prints: every command that loads the queue TOML, so each one is pinned to
+# load_settings_or_exit. test_cli_settings_gate.py keeps a new command from
+# calling load_settings itself.
+SETTINGS_COMMANDS = [
+    (["account", "list", "--queue", "{queue}"], "configuration error", "stdout"),
+    (["account", "list", "--queue", "{queue}", "--json"], "configuration error", "json"),
+    (["account", "pause", "personal", "--queue", "{queue}"], "configuration error", "stdout"),
+    (
+        ["account", "pause", "personal", "--queue", "{queue}", "--json"],
+        "configuration error",
+        "json",
+    ),
+    (["account", "resume", "personal", "--queue", "{queue}"], "configuration error", "stdout"),
+    (
+        ["account", "resume", "personal", "--queue", "{queue}", "--json"],
+        "configuration error",
+        "json",
+    ),
+    (["supervisor", "start", "--queue", "{queue}"], "supervisor not started", "stdout"),
+    (["supervisor", "status", "--queue", "{queue}"], "configuration error", "stdout"),
+    (["supervisor", "status", "--queue", "{queue}", "--json"], "configuration error", "json"),
+    (["supervisor", "drain", "--queue", "{queue}"], DRAIN_LEAD, "stdout"),
+    (["doctor", "--queue", "{queue}"], "configuration error", "stdout"),
+    (["doctor", "--queue", "{queue}", "--json"], "configuration error", "json"),
+    (["usage"], "configuration error", "stdout"),
+    (["install", "--queue", "{queue}", "--yes"], "not installed", "stdout"),
+    (["install", "uninstall", "--yes"], "configuration error", "stdout"),
+    (
+        ["queue", "list", "--queue", "{queue}"],
+        "cannot load the queue's settings to check effort levels",
+        "stdout",
+    ),
+    (
+        ["queue", "list", "--queue", "{queue}", "--json"],
+        "cannot load the queue's settings to check effort levels",
+        "json",
+    ),
+    (
+        ["queue", "add", "--queue", "{queue}", "--id", "t1", "--title", "T", "--prompt", "p"],
+        "configuration error",
+        "stdout",
+    ),
+    (["queue", "backfill-working-dir", "--queue", "{queue}"], "configuration error", "stdout"),
+    (
+        ["queue", "backfill-working-dir", "--queue", "{queue}", "--json"],
+        "configuration error",
+        "json",
+    ),
+    (["queue", "force-dispatch", "t1", "--queue", "{queue}"], "configuration error", "stdout"),
+    (
+        ["queue", "force-dispatch", "t1", "--queue", "{queue}", "--json"],
+        "configuration error",
+        "json",
+    ),
+    (["worktree", "reclaim", "--queue", "{queue}"], "configuration error", "stderr"),
+    (["worktree", "reclaim", "--queue", "{queue}", "--json"], "configuration error", "json"),
+    (["watchdog", "register", "--queue", "{queue}"], "register failed", "stderr"),
+]
 
 
-def test_cli_commands_exit_1_for_a_config_that_may_come_back(tmp_path: Path) -> None:
+_SETTINGS_PARAMS = [
+    pytest.param(argv, lead, stream, id=" ".join(argv).replace(" --queue {queue}", ""))
+    for argv, lead, stream in SETTINGS_COMMANDS
+]
+
+
+def _invoke_settings_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], config: Path, pid: int
+) -> object:
+    """Run ``argv`` with ``--config config`` on a queue under ``tmp_path``.
+
+    The queue has ``todo/`` and a supervisor PID file naming ``pid``, so
+    each command gets as far as loading its settings; nothing may run
+    after that."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     queue = tmp_path / "q"
-    queue.mkdir()
+    (queue / "todo").mkdir(parents=True, exist_ok=True)
+    (queue / ".claude_task_runner").mkdir(exist_ok=True)
+    (queue / ".claude_task_runner" / "supervisor.pid").write_text(f"{pid}\n")
+    args = [a.format(queue=queue) for a in argv] + ["--config", str(config)]
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.start_daemon",
+            side_effect=AssertionError("start_daemon reached"),
+        ),
+        patch(
+            "claude_task_runner.cli.install_cmd._detect_init_system",
+            side_effect=AssertionError("install went on"),
+        ),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd._send_signal",
+            side_effect=AssertionError("a process was signalled"),
+        ),
+    ):
+        return CliRunner().invoke(app, args)
+
+
+def _assert_reported(result: object, lead: str, stream: str, error: str, *, exact: bool) -> None:
+    """``lead: error`` on ``stream`` alone, with no traceback."""
+    assert isinstance(result.exception, SystemExit), result.exception
+    if stream == "json":
+        payload = json.loads(result.stdout)
+        assert set(payload) == {"ok", "error"}
+        assert payload["ok"] is False
+        text = payload["error"]
+    else:
+        text = getattr(result, stream)
+        other = result.stderr if stream == "stdout" else result.stdout
+        assert other == ""
+    message = f"{lead}: {error}"
+    if exact:
+        assert text.rstrip("\n") == message
+    else:
+        assert text.startswith(message)
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(("argv", "lead", "stream"), _SETTINGS_PARAMS)
+def test_every_command_reports_wrong_content_with_78(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_worker_pid: int,
+    argv: list[str],
+    lead: str,
+    stream: str,
+) -> None:
+    config = tmp_path / "claude_runner.toml"
+    config.write_text(f'[[accounts]]\nname = "personal"\nconfig_dir = "{GONE}"\n', encoding="utf-8")
+    result = _invoke_settings_command(tmp_path, monkeypatch, argv, config, live_worker_pid)
+    assert result.exit_code == 78, result.output
+    _assert_reported(result, lead, stream, UNKNOWN_USER_ERROR, exact=False)
+
+
+@pytest.mark.parametrize(("argv", "lead", "stream"), _SETTINGS_PARAMS)
+def test_every_command_reports_a_file_that_may_come_back_with_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_worker_pid: int,
+    argv: list[str],
+    lead: str,
+    stream: str,
+) -> None:
     missing = tmp_path / "not-mounted-yet.toml"
-    result = CliRunner().invoke(
-        app, ["account", "list", "--queue", str(queue), "--config", str(missing)]
-    )
-    assert result.exit_code == 1
-    assert result.stdout == f"configuration error: Settings file not found: {missing}\n"
+    result = _invoke_settings_command(tmp_path, monkeypatch, argv, missing, live_worker_pid)
+    assert result.exit_code == 1, result.output
+    _assert_reported(result, lead, stream, f"Settings file not found: {missing}", exact=True)
 
 
 # ---------------------------------------------------------------------------
 # install refuses to install a supervisor that would not start
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("content_too", [False, True], ids=["transient-only", "mixed"])
+def test_install_exits_1_only_when_every_problem_may_clear_up(
+    tmp_path: Path, content_too: bool
+) -> None:
+    """As ``supervisor start`` would: a config_dir that is not there yet (a
+    mount not up) is exit 1, but one wrong file among them is exit 78."""
+    accounts = _accounts(tmp_path)
+    personal = Path(accounts["personal"]) / PER_ACCOUNT_TOML_NAME
+    if content_too:
+        personal.write_text(BAD_TOML, encoding="utf-8")
+    unmounted = tmp_path / "unmounted"
+    accounts["work"] = str(unmounted)
+    queue = _queue(tmp_path, accounts)
+    with patch(
+        "claude_task_runner.cli.install_cmd._detect_init_system",
+        side_effect=AssertionError("install went on"),
+    ):
+        result = CliRunner().invoke(app, ["install", "--yes", "--queue", str(queue)])
+    may_clear_up = (
+        "Each may clear up by itself (a config_dir on a mount that is not up yet, say), "
+        "but the supervisor would not start until it does.\n"
+    )
+    tail = (
+        "Fix each file, or delete it for the defaults, then run install again. "
+        "Once the supervisor runs, a file that breaks only stops new tasks on its account.\n"
+    )
+    if content_too:
+        assert result.exit_code == 78
+        assert result.stdout == (
+            "not installed: the runner-account.toml of 2 accounts does not load:\n"
+            f"  personal: Invalid TOML in {personal}: {PARSE_ERROR}\n"
+            f"  work: config_dir {unmounted} does not exist\n" + tail
+        )
+    else:
+        assert result.exit_code == 1
+        assert result.stdout == (
+            "not installed: the runner-account.toml of 1 account does not load:\n"
+            f"  work: config_dir {unmounted} does not exist\n" + may_clear_up + tail
+        )
 
 
 def test_install_refuses_a_broken_account_file(tmp_path: Path) -> None:
