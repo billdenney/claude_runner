@@ -10,9 +10,14 @@ to those still-running workers instead of losing the in-flight work.
 
 For each ``status="running"`` state with:
 
-* a live ``pid`` (``os.kill(pid, 0)`` succeeds — ESRCH ⇒ dead),
+* a ``pid`` that is still its worker
+  (:func:`runner.dispatcher.probe_worker`: the pid exists, and it is not
+  a process that was given the pid after the worker exited),
 * a present ``log_path`` whose file exists, and
-* a HEALTHY heartbeat verdict from the existing classifier,
+* a HEALTHY verdict from the silent-orphan reaper's own classifier
+  (:func:`supervisor.reconcile_silent.liveness_verdict`), which counts the
+  agent heartbeat, the previous supervisor's monitor tick and the
+  worker's own writes to its log,
 
 we construct a :class:`runner.in_flight.DispatchSlot` whose thread runs
 :func:`runner.dispatcher.adopt_worker` (tailing the log to completion
@@ -30,7 +35,15 @@ Tasks that do NOT qualify keep today's reaper behaviour:
   :func:`supervisor.reconcile_silent.reconcile_silent_orphans`, which
   runs first; this pass skips any non-HEALTHY survivor as a
   belt-and-braces guard so a reorder of the startup sequence can't make
-  it adopt a hung worker.
+  it adopt a hung worker;
+* a live worker that is not adopted for any other reason ⇒
+  ``reconcile_orphans`` parks it ``possibly_hung``, since a ``failed``
+  task would be dispatched while the worker still runs.
+
+The reaper and this pass use one classifier so they cannot disagree: a
+worker the reaper leaves ``running`` is one this pass adopts. The agent
+heartbeat alone does not do: the dispatcher does not advance it during a
+long tool call (see :mod:`runner.stream`).
 
 A worker can also finish in the restart gap, after one supervisor stops
 and before the next starts. :func:`finalize_exited_workers` runs first of
@@ -46,6 +59,7 @@ import logging
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from claude_task_runner.clock import Clock
@@ -58,8 +72,10 @@ from claude_task_runner.queue.store import (
     task_path_for,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
-from claude_task_runner.runner.heartbeat import HeartbeatVerdict, evaluate
+from claude_task_runner.runner.dispatcher import WorkerProbe
+from claude_task_runner.runner.heartbeat import HeartbeatVerdict
 from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.supervisor import reconcile_silent
 from claude_task_runner.supervisor.states import InFlightRecord
 
 logger = logging.getLogger(__name__)
@@ -208,45 +224,36 @@ def adopt_running_workers(
     return results
 
 
-def _is_adoptable(state: TaskState, *, now: object, settings: Settings) -> bool:
-    """True iff ``state`` is a HEALTHY, file-backed, live-pid running task.
+def _is_adoptable(state: TaskState, *, now: datetime, settings: Settings) -> bool:
+    """True iff ``state`` is a HEALTHY, file-backed running task whose worker runs.
 
-    Mirrors the silent reaper's baseline-correction: a
-    ``last_heartbeat_at`` that predates ``last_started_at`` belongs to a
-    prior finished run and is treated as "no heartbeat this attempt" so
-    the verdict falls back to ``last_started_at``.
+    The verdict is :func:`supervisor.reconcile_silent.liveness_verdict`,
+    the one the startup reaper acted on just before. A state it cannot
+    grade (no ``last_started_at``, a future timestamp) is not adopted.
     """
     if state.status != "running":
         return False
-    if state.pid is None or not dispatcher_mod._pid_alive(state.pid):
-        return False
-    if state.log_path is None:
+    if state.pid is None or state.log_path is None:
         return False
     if not Path(state.log_path).exists():
         return False
-
-    started_at = state.last_started_at
-    if started_at is None:
-        # No recorded start: can't grade a heartbeat window; defer to the
-        # broad demotion sweep rather than adopt blind.
-        return False
-
-    last_hb = state.last_heartbeat_at
-    if last_hb is not None and last_hb < started_at:
-        last_hb = None
-
-    try:
-        status = evaluate(
-            settings=settings.task_caps,
-            last_heartbeat_at=last_hb,
-            started_at=started_at,
-            now=now,  # type: ignore[arg-type]
+    if (
+        dispatcher_mod.probe_worker(
+            state.pid, log_path=state.log_path, started_at=state.last_started_at
         )
-    except ValueError:
-        # Clock skew / future timestamp: defer to reconcile_orphans.
+        is not WorkerProbe.ALIVE
+    ):
         return False
-
-    return status.verdict is HeartbeatVerdict.HEALTHY
+    verdict = reconcile_silent.liveness_verdict(state, settings=settings.task_caps, now=now)
+    if verdict is not HeartbeatVerdict.HEALTHY:
+        logger.info(
+            "adoption: not adopting task %s: its worker pid=%s runs but its liveness verdict is %s",
+            state.task_id,
+            state.pid,
+            verdict,
+        )
+        return False
+    return True
 
 
 def finalize_exited_workers(
@@ -378,8 +385,10 @@ def finalize_exited_workers(
 def _has_exited(state: TaskState) -> bool:
     """True iff ``state`` is a file-backed ``running`` task whose worker is gone.
 
-    Needs a recorded ``pid`` to probe. Without one there is no telling
-    whether the worker still runs, so the task stays with the later passes.
+    Gone means no process has the pid, or another process does
+    (:func:`runner.dispatcher.probe_worker`). Needs a recorded ``pid`` to
+    probe. Without one there is no telling whether the worker still runs,
+    so the task stays with the later passes.
     """
     if state.status != "running":
         return False
@@ -387,7 +396,12 @@ def _has_exited(state: TaskState) -> bool:
         return False
     if not Path(state.log_path).exists():
         return False
-    return not dispatcher_mod._pid_alive(state.pid)
+    return (
+        dispatcher_mod.probe_worker(
+            state.pid, log_path=state.log_path, started_at=state.last_started_at
+        )
+        is not WorkerProbe.ALIVE
+    )
 
 
 def _adopt_one_safely(

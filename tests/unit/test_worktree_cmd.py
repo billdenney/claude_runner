@@ -151,13 +151,14 @@ class TestConfig:
         assert result.exit_code == 1, result.output
         assert "git fetch origin release" in result.stderr
 
-    def test_invalid_config_exits_2(self, runner: CliRunner, world: World) -> None:
+    def test_invalid_config_exits_78(self, runner: CliRunner, world: World) -> None:
+        """As ``supervisor start`` would: only a fix to the file helps."""
         (world.queue / "claude_runner.toml").write_text(
             '[worktree_reclaim]\nbranch_template = "main"\n'
         )
         result = reclaim(runner, world)
-        assert result.exit_code == 2
-        assert result.stderr.startswith("error: Settings validation failed")
+        assert result.exit_code == 78
+        assert result.stderr.startswith("configuration error: Settings validation failed")
 
     def test_not_a_queue_exits_2(self, runner: CliRunner, tmp_path: Path) -> None:
         result = runner.invoke(app, ["worktree", "reclaim", "--queue", str(tmp_path)])

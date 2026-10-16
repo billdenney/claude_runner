@@ -1,11 +1,13 @@
 """An account whose ``runner-account.toml`` does not load (ADR-0035).
 
-Pins: the account takes no new tasks and counts 0 everywhere, with no
-policy standing in for its file; every other account dispatches as usual;
-nothing that reads the file crashes. The supervisor logs one ERROR per
-error or file change and one INFO when the file loads again, records the
-error in ``supervisor.json``, and ``account list``, ``supervisor status``
-and the doctor show it.
+Pins, for a file that breaks while the supervisor runs: the account takes
+no new tasks and counts 0 everywhere, with no policy standing in for its
+file; every other account dispatches as usual; nothing that reads the file
+crashes. The supervisor logs one ERROR per error or file change and one
+INFO when the file loads again, records the error in ``supervisor.json``,
+and ``account list``, ``supervisor status`` and the doctor show it.
+``supervisor start`` refuses to start on one instead
+(``test_fail_fast_account_config.py``).
 
 Most tests use ``personal`` (cap 5) and ``work`` (cap 3) with ``personal``'s
 file broken.
@@ -29,7 +31,7 @@ from claude_task_runner.config.loader import (
     BrokenAccount,
     resolve_accounts,
 )
-from claude_task_runner.config.schema import Settings
+from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.doctor.checks import (
     CheckStatus,
     check_account_policies,
@@ -194,15 +196,20 @@ class TestResolveAccounts:
         assert resolution.broken[0].error == (
             f"{path} is a symlink to {target}, which does not exist"
         )
+        # The target may appear yet (a file saved elsewhere, a mount).
+        assert resolution.broken[0].transient is True
 
-    def test_a_home_that_cannot_be_found_is_broken(
+    def test_a_home_removed_while_running_is_broken(
         self, tmp_path: Path, two_accounts: dict[str, Path]
     ) -> None:
-        accounts = {
-            "personal": Path("~no-such-user-ctr-test/.claude"),
-            "work": two_accounts["work"],
-        }
-        settings = queue_toml(tmp_path / "q.toml", accounts)
+        """The queue TOML refuses a ``~user`` that names no user when it
+        loads, so this is a user removed after the supervisor loaded it,
+        stood in for by settings built without validation."""
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        gone = AccountSettings.model_construct(
+            name="personal", config_dir="~no-such-user-ctr-test/.claude", linux_user=None
+        )
+        settings = settings.model_copy(update={"accounts": [gone, settings.accounts[1]]})
         resolution = resolve_accounts(settings)
         assert [a.name for a in resolution.accounts] == ["work"]
         assert resolution.broken == (
@@ -210,7 +217,7 @@ class TestResolveAccounts:
                 name="personal",
                 path="~no-such-user-ctr-test/.claude/runner-account.toml",
                 error=(
-                    "Cannot find ~no-such-user-ctr-test/.claude/runner-account.toml: "
+                    "config_dir '~no-such-user-ctr-test/.claude' cannot be expanded: "
                     "Could not determine home directory."
                 ),
             ),
@@ -227,17 +234,54 @@ class TestResolveAccounts:
         assert resolution.broken[0].error == (
             f"Cannot read {path}: [Errno 21] Is a directory: '{path}'"
         )
+        # A directory where the file belongs does not go away by itself.
+        assert resolution.broken[0].transient is False
 
-    @pytest.mark.parametrize("layout", ["no-file", "no-dir", "dir-is-a-file"])
-    def test_a_missing_file_is_not_broken(self, tmp_path: Path, layout: str) -> None:
+    def test_a_config_dir_without_the_file_is_the_defaults(self, tmp_path: Path) -> None:
         config_dir = tmp_path / "acct"
-        if layout == "no-file":
-            config_dir.mkdir()
-        elif layout == "dir-is-a-file":
-            config_dir.write_text("", encoding="utf-8")
+        config_dir.mkdir()
         resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
         assert resolution.broken == ()
         assert resolution.accounts[0].policy.concurrency.max_concurrency == 1
+
+    @pytest.mark.parametrize("linked", [False, True], ids=["absent", "symlink-to-nothing"])
+    def test_a_config_dir_that_does_not_exist_is_broken_but_may_come_back(
+        self, tmp_path: Path, linked: bool
+    ) -> None:
+        """A config_dir on a mount that is not up yet: transient, so a start
+        exits 1 and is retried."""
+        config_dir = tmp_path / "acct"
+        if linked:
+            config_dir.symlink_to(tmp_path / "unmounted")
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
+        assert resolution.broken == (
+            BrokenAccount(
+                name="solo",
+                path=str(config_dir / PER_ACCOUNT_TOML_NAME),
+                error=f"config_dir {config_dir} does not exist",
+                transient=True,
+            ),
+        )
+        assert resolution.only_transient is True
+
+    @pytest.mark.parametrize("depth", [0, 2], ids=["config-dir", "ancestor"])
+    def test_a_config_dir_through_a_file_is_broken(self, tmp_path: Path, depth: int) -> None:
+        """The error names the path that is not a directory, the config_dir
+        itself or an ancestor of it."""
+        not_a_dir = tmp_path / "acct"
+        not_a_dir.write_text("", encoding="utf-8")
+        config_dir = not_a_dir.joinpath(*["sub"] * depth)
+        path = config_dir / PER_ACCOUNT_TOML_NAME
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
+        assert resolution.broken == (
+            BrokenAccount(
+                name="solo",
+                path=str(path),
+                error=f"{not_a_dir} is not a directory, so {path} cannot be read",
+                transient=False,
+            ),
+        )
+        assert resolution.only_transient is False
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +297,7 @@ def _messages(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
 
 def _error_line(name: str, path: Path, error: str | None = None) -> str:
     return (
-        f"account {name!r} takes no new tasks until its runner-account.toml loads: "
+        f"account {name!r} takes no new tasks until this is fixed: "
         f"{error if error is not None else _invalid_toml(path)}"
     )
 
@@ -364,8 +408,31 @@ class TestAccountFileWatch:
             path.unlink()
             watch.observe(self._resolve(tmp_path, two_accounts))
         assert _messages(caplog, logging.INFO) == [
-            f"account 'personal' takes tasks again: {path} is gone, so the defaults apply "
-            "(max_concurrency = 1 and the queue's [dispatch_pct.*])"
+            f"account 'personal' takes tasks again: {path} does not exist, so the defaults "
+            "apply (max_concurrency = 1 and the queue's [dispatch_pct.*])"
+        ]
+
+    def test_a_config_dir_that_appears_without_the_file_says_the_defaults_apply(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A mount that comes up late: the account was broken because its
+        config_dir did not exist, and the file was never there."""
+        config_dir = tmp_path / "acct"
+        accounts = {"solo": config_dir}
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+            watch.observe(self._resolve(tmp_path, accounts))
+            config_dir.mkdir()
+            watch.observe(self._resolve(tmp_path, accounts))
+        assert _messages(caplog, logging.ERROR)[0] == _error_line(
+            "solo",
+            config_dir / PER_ACCOUNT_TOML_NAME,
+            f"config_dir {config_dir} does not exist",
+        )
+        assert _messages(caplog, logging.INFO) == [
+            f"account 'solo' takes tasks again: {config_dir / PER_ACCOUNT_TOML_NAME} does not "
+            "exist, so the defaults apply (max_concurrency = 1 and the queue's "
+            "[dispatch_pct.*])"
         ]
 
 
@@ -695,9 +762,11 @@ class TestForceDispatch:
 
 @pytest.mark.usefixtures("private_global_lock")
 class TestSupervisor:
-    def test_a_broken_file_at_startup_disables_the_account_without_a_crash(
+    def test_the_daemon_itself_survives_a_broken_file_from_its_first_tick(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """``supervisor start`` checks the files first, so this is a file that
+        breaks between that check and the first tick: the loop still runs."""
         qd, config = single_account_queue(tmp_path, "")
         path = _break(tmp_path / "acct")
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
@@ -836,7 +905,7 @@ class TestDoctor:
         path = _break(two_accounts["personal"])
         result = check_account_policies(queue_toml(tmp_path / "q.toml", two_accounts))
         assert result.status is CheckStatus.FAIL
-        assert result.detail == "1 of 2 per-account policies invalid"
+        assert result.detail == "the runner-account.toml of 1 of 2 accounts does not load"
         assert result.remediation == f"personal: {_invalid_toml(path)}"
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
@@ -847,9 +916,9 @@ class TestDoctor:
         path.chmod(0)
         try:
             settings = queue_toml(tmp_path / "q.toml", two_accounts)
-            assert resolve_accounts(settings).broken[0].error == (
-                f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
-            )
+            broken = resolve_accounts(settings).broken[0]
+            assert broken.error == f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
+            assert broken.transient is True
             result = check_dispatch_pct_legacy(settings, queue_dir)
         finally:
             path.chmod(0o644)

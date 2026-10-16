@@ -618,11 +618,17 @@ class TestAccountPauseResume:
         args = ["account", "list", "--config", str(config), "--queue", str(queue_dir)]
         human = runner.invoke(app, args)
         assert human.exit_code == 2
-        assert "cannot read the account pause markers" in human.stdout
+        markers = account_pause.pause_dir(queue_dir)
+        message = (
+            f"cannot read the account pause markers in {markers}: "
+            f"[Errno 20] Not a directory: '{markers}'"
+        )
+        assert human.stdout == message + "\n"
         assert "Traceback" not in human.output
         as_json = runner.invoke(app, [*args, "--json"])
         assert as_json.exit_code == 2
-        assert "cannot read the account pause markers" in json.loads(as_json.stdout)["error"]
+        # The shape of every error account list prints with --json.
+        assert json.loads(as_json.stdout) == {"ok": False, "error": message}
 
 
 class TestAccountListHumanReadable:

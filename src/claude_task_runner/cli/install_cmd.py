@@ -18,11 +18,13 @@ from rich.prompt import Confirm
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    broken_accounts_message,
+    load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.loader import config_error_exit_status, resolve_accounts
 from claude_task_runner.cron import install as cron_install
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
@@ -134,7 +136,24 @@ def install(
         # Absolute, naming the file loaded below: the unit runs with
         # WorkingDirectory=<queue>, where a relative path names another.
         resolved_config = resolved_config.absolute()
-    settings = load_settings(resolved_config)
+    settings = load_settings_or_exit(resolved_config, console, lead="not installed")
+    # The supervisor this installs would refuse to start, so say so now.
+    resolution = resolve_accounts(settings)
+    if resolution.broken:
+        console.print(
+            broken_accounts_message(
+                resolution,
+                refused="not installed",
+                then="run install again",
+                if_transient="but the supervisor would not start until it does",
+            ),
+            style="bold red",
+            markup=False,
+            emoji=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+        raise typer.Exit(code=config_error_exit_status(transient=resolution.only_transient))
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
     console.print(
@@ -329,8 +348,8 @@ def uninstall(
     without the cron block, and a later cron ``install`` replaces it
     with its own queue.
     """
-    settings = load_settings(config)
     console = Console()
+    settings = load_settings_or_exit(config, console)
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
 

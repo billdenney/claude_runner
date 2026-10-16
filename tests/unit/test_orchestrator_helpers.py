@@ -10,7 +10,7 @@ long as we mock ``dispatcher_mod.dispatch``.
 from __future__ import annotations
 
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -29,6 +29,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
@@ -36,11 +37,13 @@ from claude_task_runner.runner.orchestrator import (
     _dispatch_one_safely,
     _has_any_completed,
     _reap_finished,
-    _recorded_subprocess_pid,
+    _recorded_subprocess_run,
     _target_concurrency,
     tick_dispatch,
 )
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
+
+from ._worker_probe_stubs import fake_proc
 
 
 def _slot(task_id: str, thread: threading.Thread, account: str = "default") -> DispatchSlot:
@@ -378,6 +381,43 @@ def test_reap_finished_holds_slot_when_pid_is_alive(queue_dir: Path) -> None:
     assert events == [("subprocess_leak_detected", {"task_id": "t1", "pid": 12345})]
 
 
+def test_reap_finished_frees_slot_when_the_pid_belongs_to_another_process(
+    queue_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's pid exists, but its process started two hours after the run
+    did: the worker exited and the pid went to another process. That is no
+    leak, so the slot is freed and no leak is reported; a slot held for an
+    unrelated process would starve the account until that process exits."""
+    t = _exited_thread()
+    slot = _slot("t1", t)
+    d = {"t1": slot}
+    _seed_run_with_pid(queue_dir, "t1", pid=12345, status="running")
+    run_started = datetime(2026, 5, 21, tzinfo=UTC)
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == 12345)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            12345,
+            started=run_started + timedelta(hours=2),
+            boot=run_started - timedelta(days=1),
+        ),
+    )
+    notifs: list[tuple[str, str]] = []
+
+    _reap_finished(
+        d,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        notify_callback=lambda level, msg: notifs.append((level, msg)),
+    )
+
+    assert "t1" not in d
+    assert slot.subprocess_leak_notified_at is None
+    assert notifs == []
+
+
 def test_reap_finished_does_not_renotify_known_leak(queue_dir: Path) -> None:
     """Already-notified leak: subsequent reap_finished calls stay silent.
 
@@ -432,24 +472,27 @@ def test_reap_finished_recovers_slot_when_pid_finally_dies(queue_dir: Path) -> N
     assert "t1" not in d
 
 
-def test_recorded_subprocess_pid_returns_pid_for_running_task(queue_dir: Path) -> None:
+def test_recorded_subprocess_run_returns_pid_for_running_task(queue_dir: Path) -> None:
     """Non-deferred task: the helper returns ``runs[-1].pid`` so the leak
     guard can probe the just-finished dispatch's subprocess."""
     _seed_run_with_pid(queue_dir, "t1", pid=4242, status="running")
-    assert _recorded_subprocess_pid(queue_dir, "t1") == 4242
+    run = _recorded_subprocess_run(queue_dir, "t1")
+    assert run is not None
+    assert run.pid == 4242
+    assert run.started_at == datetime(2026, 5, 21, tzinfo=UTC)
 
 
-def test_recorded_subprocess_pid_returns_none_for_deferred_task(queue_dir: Path) -> None:
+def test_recorded_subprocess_run_returns_none_for_deferred_task(queue_dir: Path) -> None:
     """Deferred task (ADR-0029): the helper returns None despite a pid on
     ``runs[-1]`` — that run belongs to an earlier real dispatch, not the
     deferral (which spawned no subprocess and appended no run)."""
     _seed_run_with_pid(queue_dir, "t1", pid=4242, status="deferred")
-    assert _recorded_subprocess_pid(queue_dir, "t1") is None
+    assert _recorded_subprocess_run(queue_dir, "t1") is None
 
 
-def test_recorded_subprocess_pid_none_when_state_missing(queue_dir: Path) -> None:
+def test_recorded_subprocess_run_none_when_state_missing(queue_dir: Path) -> None:
     """No state file → nothing to probe → None."""
-    assert _recorded_subprocess_pid(queue_dir, "nope") is None
+    assert _recorded_subprocess_run(queue_dir, "nope") is None
 
 
 def test_reap_finished_frees_deferred_slot_despite_alive_pid(queue_dir: Path) -> None:
@@ -462,7 +505,7 @@ def test_reap_finished_frees_deferred_slot_despite_alive_pid(queue_dir: Path) ->
     Its OS pid has long exited and may now be RECYCLED by an unrelated
     process — which ``_pid_alive`` reports alive (it even reports alive
     on ``EPERM`` for a foreign-owned pid). Before the fix,
-    :func:`_recorded_subprocess_pid` handed that recycled pid to the leak
+    :func:`_recorded_subprocess_run` handed that recycled pid to the leak
     guard, which HELD the slot forever: one deferred task pinned a
     low-concurrency account (``work`` at ``max_concurrency=1`` sat at 0%
     dispatch for days). The deferring dispatch had nothing to leak, so

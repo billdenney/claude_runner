@@ -9,17 +9,22 @@ so the orchestrator picks them up and resumes via
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
+    load_state,
     queue_runtime_dir,
     state_path_for,
     todo_dir,
     write_state_atomic,
 )
 from claude_task_runner.supervisor.reconcile import (
+    LIVE_WORKER_STOP_REASON,
     ORPHAN_STOP_REASON,
     reconcile_orphans,
 )
@@ -210,3 +215,62 @@ def test_multiple_orphans_all_demoted(tmp_path: Path) -> None:
 
     _, orphans = reconcile_orphans(qd, _empty_snapshot())
     assert sorted(orphans) == ["t1", "t2", "t3"]
+
+
+# ---------------------------------------------------------------------------
+# A worker that still runs is parked, never demoted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("real_proc")
+def test_live_pipe_backed_worker_is_parked_and_a_reused_pid_is_demoted(
+    tmp_path: Path, live_worker_pid: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With adoption off a worker has no log, so the probe goes by its start
+    time. A worker started when its attempt did is still running: its task
+    is parked ``possibly_hung`` with the pid, logged at WARNING. The same
+    pid recorded for an attempt that started an hour earlier belongs to a
+    process started since, so that task's worker is gone and it is demoted.
+    Neither process is signalled."""
+    qd = _queue(tmp_path)
+    now = datetime.now(UTC)
+    for task_id, started_at in [("t-live", now), ("t-reused", now - timedelta(hours=1))]:
+        write_state_atomic(
+            TaskState(
+                task_id=task_id,
+                status="running",
+                last_started_at=started_at,
+                pid=live_worker_pid,
+                session_id=f"sess-{task_id}",
+            ),
+            state_path_for(qd, task_id),
+        )
+
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.reconcile"):
+        _snap, demoted = reconcile_orphans(qd, _empty_snapshot())
+
+    assert demoted == ["t-reused"]
+    reused = load_state(state_path_for(qd, "t-reused"))
+    assert (reused.status, reused.stop_reason) == ("failed", ORPHAN_STOP_REASON)
+    live = load_state(state_path_for(qd, "t-live"))
+    assert (live.status, live.stop_reason, live.pid, live.session_id) == (
+        "possibly_hung",
+        LIVE_WORKER_STOP_REASON,
+        live_worker_pid,
+        "sess-t-live",
+    )
+    warnings = [(r.name, r.getMessage()) for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings[0] == (
+        "claude_task_runner.supervisor.reconcile",
+        f"reconcile_orphans: task t-live's worker pid={live_worker_pid} is still running "
+        "and was not adopted; parked possibly_hung (stop_reason=worker_still_running), "
+        "not failed, so it is not dispatched a second time (log=None)",
+    )
+    # The probe says why t-reused's pid is not its worker (the offset is the
+    # sleep's start against an attempt an hour older, about +3600s).
+    assert len(warnings) == 2
+    assert warnings[1][0] == "claude_task_runner.runner.dispatcher"
+    assert warnings[1][1].startswith(
+        f"pid {live_worker_pid} is not the worker of the attempt started at "
+        f"{(now - timedelta(hours=1)).isoformat()} (log None): the process started +"
+    )

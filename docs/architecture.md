@@ -52,7 +52,11 @@ introduces a new on-disk file MUST update this document in the same PR.
    `[logging].level` of INFO; no `events.ndjson` file is written today.
    See [Supervisor log and drift evidence](#supervisor-log-and-drift-evidence).
 5. `runner.heartbeat` watches the last event timestamp; marks task `possibly_hung`
-   after `task_caps.heartbeat_silence_alert_s` seconds of silence.
+   after `task_caps.heartbeat_silence_alert_s` seconds of silence. The agent
+   heartbeat does not count `tool_progress`, so it stands still through a
+   long tool call; the silent-orphan reaper and startup adoption also count
+   the monitor's `dispatcher_alive_at` and the worker's writes to its stream
+   log (`supervisor.reconcile_silent.liveness_verdict`).
 6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**
@@ -179,7 +183,19 @@ which `supervisor status` also prints. An account whose
 no new tasks and adds nothing to any of these numbers, with no policy
 standing in for its file; the supervisor logs it once per error, records
 it as `policy_error` in `supervisor.json`, and keeps every other account
-dispatching (ADR-0035). An account is paused while its
+dispatching (ADR-0035). That is while it runs. `supervisor start` reads
+every account's file before it touches the queue and refuses to start
+when one does not load, listing each, as it does for a queue TOML that
+does not load: exit 78 (`config.loader.CONFIG_ERROR_EXIT_STATUS`) when the
+content is wrong, which the systemd unit does not restart on, and exit 1
+when every problem is a file or directory that could not be read and may
+come back (`ConfigError.transient`, `BrokenAccount.transient`), which
+systemd retries. The cron watchdog holds back the restart in both cases
+and reads the files again the next tick (ADR-0035, amendment of
+2026-10-16). A `config_dir` whose `~user` names no user fails the queue
+TOML at load; later expansions go through `config.paths.expand_config_dir`
+(a test fails on any other `.expanduser()` outside an allowlist), so a
+user removed while the supervisor runs fails only that account. An account is paused while its
 `account_paused/<name>` marker exists; the supervisor reads the markers
 every tick, once after the state-machine step and again just before
 dispatch, so `account pause` stops new dispatches on a running supervisor
@@ -296,6 +312,10 @@ These properties are never violated; tests and assertions enforce them.
 2. **In-flight tasks are never killed by supervisor death** — supervisor
    shutdown writes state and exits; tasks continue. Supervisor restart reattaches
    to live PIDs, and records a worker that exited in the meantime from its log.
+   A worker that is still running is never set to a dispatchable status: one
+   the restart cannot adopt is parked `possibly_hung` (ADR-0025, amended
+   2026-10-16), and `runner.dispatcher.probe_worker` decides whether a
+   recorded pid is still its worker.
    Before a stopping supervisor releases its lock, it waits, briefly, for any
    dispatch thread that has started a worker to record its pid
    (`runner.spawn_gate`), so a restart can find every worker.

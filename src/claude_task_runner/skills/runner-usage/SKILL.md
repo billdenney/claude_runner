@@ -46,6 +46,12 @@ For "/runner-format-check" / "did the parser break?" prompts:
    - `2` capture timeout (claude didn't respond)
    - `3` spawn error (claude binary missing)
 
+   With `--config`, every `usage` command loads that TOML first. When
+   it does not load, the command prints `configuration error: ...` and
+   exits `78` (the content is wrong) or `1` (the file could not be read
+   for now). So read exit `1` as parse drift only when the output does
+   not start with `configuration error:`.
+
 2. On non-zero, **don't try to fix the parser yourself**. Surface the
    exit code + stderr, and recommend:
    - Capture the raw output for forensics:

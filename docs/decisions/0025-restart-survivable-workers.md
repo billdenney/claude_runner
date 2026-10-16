@@ -218,3 +218,102 @@ multi-account queue does not have: after a restart its real account could
 be dispatched past its own `max_concurrency` until the worker finished.
 When no source names an account the slot names `(unknown)`, which counts
 against no account's cap, and a WARNING says so (ADR-0035).
+
+## Amendment (2026-10-16) — adopt every worker that shows life; never demote a live one
+
+**What happened.** On 2026-10-16 at 13:24 UTC the live supervisor was
+restarted for a deploy (`systemctl --user restart`, `KillMode=process`).
+The new supervisor adopted one of three running workers. The other two,
+task `oasweep_PMC8247401` (pid 512811) and task `oasweep_PMC8329445` (pid
+395266), were in long Bash calls. Their stream logs were still being
+written (last writes 13:24:35 and 13:24:39), but their `last_heartbeat_at`
+read 13:15:25 and 13:17:52. The startup reaper found both HEALTHY, because
+the old supervisor's monitor had written `dispatcher_alive_at` seconds
+before it stopped. Adoption graded `last_heartbeat_at` alone, found it
+past `heartbeat_silence_alert_s`, and did not adopt them. `reconcile_orphans`
+then set both tasks `failed` (`orphaned_by_supervisor_restart`). It also
+clears the persisted `in_flight` list, so nothing held their accounts'
+slots, and the first tick dispatched both tasks again at 13:24:42 into the
+same worktrees, beside the two workers still running there.
+
+**Why.** Three causes.
+
+1. The agent heartbeat does not advance during a tool call. The dispatch
+   loop updates `last_heartbeat_at` only on the events `parse_lines`
+   yields (`system/init`, `assistant`, `user`, `result`), and writes it at
+   most once per `heartbeat_persist_interval_s` (30 s). `tool_progress` is
+   not yielded, on purpose: it arrives while a tool runs, and counting it
+   would make a worker stuck in a Bash poll loop look alive to the
+   stuck-sleep-loop reaper. In the two logs the Bash calls ran 590 s and
+   570 s with only `tool_progress` and `system` task events, and claude
+   wrote `tool_progress` at 30 s and 360 s into the call, not on a steady
+   beat. A stale heartbeat during a long tool call is therefore expected.
+2. Adoption and the reaper graded the same task differently. The reaper
+   counted `dispatcher_alive_at`; adoption counted only `last_heartbeat_at`.
+3. `reconcile_orphans` demoted every running task it was not told had been
+   adopted, without asking whether its worker still ran. `_pid_alive` could
+   not have said whether a live pid was still the worker anyway: it checks
+   only that some process has the pid.
+
+**Decision.**
+
+1. **One classifier.** `supervisor.reconcile_silent.liveness_verdict`
+   returns the verdict both reaper passes act on, without acting, and
+   adoption adopts only a HEALTHY worker by it. Its signs of life are
+   `dispatcher_alive_at` and the last write to the attempt's stream log,
+   whichever is later; either within `heartbeat_silence_alert_s` means
+   HEALTHY. The log gets every event the worker writes, `tool_progress`
+   included, and it is the only sign of life a worker keeps up while no
+   supervisor runs. It counts as evidence that the worker runs, not as the
+   agent's heartbeat: the stuck-sleep-loop check still keys on
+   `last_heartbeat_at`, so a stuck poll loop writing `tool_progress` is
+   still killed.
+2. **Worker identity.** `runner.dispatcher.probe_worker(pid, log_path,
+   started_at)` returns ALIVE, DEAD or REUSED. A zombie is DEAD. When
+   `/proc/<pid>/fd/1` and the log can both be read, they are the same file
+   (device and inode) for the worker and for nothing else; otherwise the
+   process must have started in the current boot, between 60 s before and
+   300 s after the attempt's `last_started_at`. Without `/proc` only
+   existence is known, as before. Every pass that acts on a recorded worker
+   asks it: the exited-worker finalize and adoption at startup, the
+   adoption monitor's tail and terminate, both reaper passes before any
+   process-tree scan or signal, `reconcile_orphans`, and the orchestrator's
+   leak check after a dispatch thread exits.
+3. **A live worker is never set to a dispatchable status.**
+   `reconcile_orphans` parks a running task whose worker is ALIVE as
+   `possibly_hung` with stop reason `worker_still_running`, keeps `pid` and
+   `log_path`, names the pid in `error`, and logs a WARNING. A reaper KILL
+   verdict now terminates the worker's process group (SIGTERM, then
+   SIGKILL, then a check), as the stuck-loop kill already did, instead of
+   sending one SIGTERM to the pid; the task goes to `failed` only once the
+   worker is gone, and a worker that survives is parked the same way.
+   Neither reaper pass signals or scans a pid that `probe_worker` does not
+   report ALIVE. The SILENT park (`silent_on_restart`, `silent_steady_state`)
+   is unchanged except that its `error` names the pid, and every reap now
+   logs at WARNING.
+4. **Thinking counts.** `system/thinking_tokens`, which claude writes while
+   a model produces extended thinking, now advances the agent heartbeat
+   (`runner.stream.ThinkingEvent`). It never arrives while a tool runs, so
+   it does not hide a stuck poll loop.
+
+**Consequences.**
+
+- A restart adopts every worker that showed a sign of life within
+  `heartbeat_silence_alert_s` (300 s by default) before it, so a deploy
+  restart changes nothing for a worker the old supervisor was monitoring.
+- A worker that is alive but showed no sign of life for longer than that
+  is parked `possibly_hung`, not dispatched again. Nothing monitors it,
+  and when it exits its task stays `possibly_hung` until the operator acts
+  (runbook: "After a restart, a task is failed or possibly_hung while its
+  worker still runs"). A parked worker counts against no account's
+  `max_concurrency`.
+- With `[supervisor].adopt_workers = false` nothing is adopted, and a
+  worker still alive at startup is parked instead of demoted. A dead one
+  is demoted as before.
+- The reaper functions take `terminate_fn` for both kill paths and a
+  `worker_probe_fn`; `sigterm_fn` is gone.
+- On the live queue `heartbeat_silence_kill_s` is 0 (the default), so the
+  KILL verdict never fires there; the per-tick reaper kills only a
+  detected stuck sleep loop, and then only after
+  `stuck_sleep_loop_kill_threshold_s` (600 s) of agent silence with a
+  matching loop in the worker's process tree.

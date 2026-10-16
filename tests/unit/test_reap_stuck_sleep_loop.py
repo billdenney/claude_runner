@@ -65,7 +65,9 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner.dispatcher import WorkerProbe
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 from claude_task_runner.supervisor.reconcile_silent import (
     _BARE_SLEEP_RE,
     _BASH_POLL_ANTIPATTERN_RE,
@@ -77,6 +79,8 @@ from claude_task_runner.supervisor.reconcile_silent import (
     _match_stuck_sleep_loop_argv,
     reap_silent_orphans_tick,
 )
+
+from ._worker_probe_stubs import probes, worker_alive
 
 _LINUX_ONLY = pytest.mark.skipif(
     sys.platform == "win32",
@@ -450,9 +454,17 @@ def _seed(
     last_heartbeat_at: datetime | None = None,
     dispatcher_alive_at: datetime | None = None,
     pid: int | None = None,
+    log_written_at: datetime | None = None,
 ) -> None:
     task = Task(id=task_id, title=task_id, prompt="p")
     write_task_atomic(task, task_path_for(qd, task_id))
+    log_path = None
+    if log_written_at is not None:
+        log = qd / ".claude_task_runner" / "logs" / task_id / "attempt-1.stream.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('{"type":"tool_progress","tool_name":"Bash","heartbeat":true}\n')
+        os.utime(log, (log_written_at.timestamp(), log_written_at.timestamp()))
+        log_path = str(log)
     state = TaskState(
         task_id=task_id,
         status="running",
@@ -460,6 +472,7 @@ def _seed(
         last_heartbeat_at=last_heartbeat_at,
         dispatcher_alive_at=dispatcher_alive_at,
         pid=pid,
+        log_path=log_path,
     )
     write_state_atomic(state, state_path_for(qd, task_id))
 
@@ -510,6 +523,7 @@ def test_fires_when_agent_silent_and_dispatcher_alive(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=terminate_stub,
+        worker_probe_fn=worker_alive,
     )
 
     assert calls == [12345]
@@ -527,6 +541,44 @@ def test_fires_when_agent_silent_and_dispatcher_alive(tmp_path: Path) -> None:
     assert "stuck-sleep-loop" in reloaded.error
     assert "bash_pid=99999" in reloaded.error
     assert reloaded.pid is None
+
+
+def test_fresh_worker_log_does_not_hide_a_stuck_loop(tmp_path: Path) -> None:
+    """A worker stuck in a Bash poll loop keeps writing ``tool_progress``
+    heartbeats to its log. The log is a sign that the worker runs, not the
+    agent's heartbeat, so with no monitor tick at all the stuck-loop check
+    still runs on the agent's 1000 s of silence and kills the loop."""
+    qd = _queue(tmp_path)
+    _seed(
+        qd,
+        "t-stuck-logging",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=1000),
+        dispatcher_alive_at=None,
+        pid=12345,
+        log_written_at=_now() - timedelta(seconds=10),
+    )
+    detector, calls = _record_detector(return_match=(99999, "bash -c while true; do sleep 5; done"))
+    term_calls: list[int] = []
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-stuck-logging"},
+        settings=_settings(),
+        clock=FakeClock(_now()),
+        stuck_loop_detect_fn=detector,
+        terminate_fn=lambda p: term_calls.append(p) or True,
+        worker_probe_fn=worker_alive,
+    )
+
+    assert calls == [12345]
+    assert term_calls == [12345]
+    assert [(r.verdict, r.stuck_loop_bash_pid, r.sigtermed) for r in results] == [
+        (HeartbeatVerdict.KILL, 99999, True)
+    ]
+    reloaded = load_state(state_path_for(qd, "t-stuck-logging"))
+    assert reloaded.status == "failed"
+    assert reloaded.stop_reason == STUCK_SLEEP_LOOP_STOP_REASON
 
 
 def test_skipped_when_heartbeat_fresh(tmp_path: Path) -> None:
@@ -555,6 +607,7 @@ def test_skipped_when_heartbeat_fresh(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert results == []
     assert calls == []  # /proc walk never runs for a fresh task
@@ -586,6 +639,7 @@ def test_skipped_when_silence_below_kill_threshold(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert results == []
     assert calls == []
@@ -614,6 +668,7 @@ def test_skipped_when_silence_exactly_at_kill_threshold(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert results == []
     assert calls == []
@@ -648,6 +703,7 @@ def test_fires_one_second_past_kill_threshold(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=terminate_stub,
+        worker_probe_fn=worker_alive,
     )
     assert calls == [88]
     assert term_calls == [88]
@@ -686,17 +742,19 @@ def test_skipped_when_dispatcher_also_stale(tmp_path: Path) -> None:
 
     detector, calls = _record_detector(return_match=(101, "argv"))
     term_calls: list[int] = []
-    reap_silent_orphans_tick(
+    results = reap_silent_orphans_tick(
         qd,
         {"t-both-stale"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda p: term_calls.append(p) or True,
-        sigterm_fn=lambda _pid: True,
+        worker_probe_fn=worker_alive,
     )
     assert calls == []
-    assert term_calls == []
+    # The plain KILL verdict terminates the worker; no stuck loop is reported.
+    assert term_calls == [42]
+    assert [(r.verdict, r.stuck_loop_bash_pid) for r in results] == [(HeartbeatVerdict.KILL, None)]
 
 
 def test_skipped_when_pid_missing(tmp_path: Path) -> None:
@@ -723,6 +781,7 @@ def test_skipped_when_pid_missing(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert calls == []
 
@@ -752,6 +811,7 @@ def test_skipped_when_knob_disabled(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert calls == []
 
@@ -783,16 +843,17 @@ def test_detector_exception_swallowed(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=boom,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert results == []
     assert load_state(state_path_for(qd, "t-boom")).status == "running"
 
 
-def test_terminate_failure_still_demotes(tmp_path: Path) -> None:
-    """Even when ``terminate_fn`` returns False (could not confirm the
-    kill — EPERM under a Linux-user dispatch, or a D-state), the state
-    YAML is still demoted to failed with the stuck-sleep-loop stop_reason,
-    but ``sigtermed=False`` so the operator can spot the kill that didn't
+def test_terminate_unconfirmed_worker_gone_still_demotes(tmp_path: Path) -> None:
+    """When ``terminate_fn`` returns False (could not confirm the kill) but
+    the worker is gone by the probe after it, the state YAML is still
+    demoted to failed with the stuck-sleep-loop stop_reason, with
+    ``sigtermed=False`` so the operator can spot the kill that didn't
     confirm."""
     qd = _queue(tmp_path)
     started = _now() - timedelta(seconds=3600)
@@ -815,12 +876,83 @@ def test_terminate_failure_still_demotes(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: False,
+        worker_probe_fn=probes(WorkerProbe.ALIVE, WorkerProbe.DEAD),
     )
     assert len(results) == 1
     assert results[0].sigtermed is False
     reloaded = load_state(state_path_for(qd, "t-term-fail"))
     assert reloaded.status == "failed"
     assert reloaded.stop_reason == STUCK_SLEEP_LOOP_STOP_REASON
+
+
+def test_terminate_survivor_is_parked_not_failed(tmp_path: Path) -> None:
+    """A worker still running after the terminate (EPERM under a
+    Linux-user dispatch, or a D-state) is parked possibly_hung with its
+    pid, not set failed: a failed task is dispatched again beside it."""
+    qd = _queue(tmp_path)
+    _seed(
+        qd,
+        "t-survivor",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=1000),
+        dispatcher_alive_at=_now() - timedelta(seconds=10),
+        pid=66,
+    )
+
+    detector, _ = _record_detector(return_match=(67, "argv"))
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-survivor"},
+        settings=_settings(),
+        clock=FakeClock(_now()),
+        stuck_loop_detect_fn=detector,
+        terminate_fn=lambda _p: False,
+        worker_probe_fn=worker_alive,
+    )
+    assert [(r.verdict, r.sigtermed, r.stuck_loop_bash_pid) for r in results] == [
+        (HeartbeatVerdict.KILL, False, 67)
+    ]
+    reloaded = load_state(state_path_for(qd, "t-survivor"))
+    assert reloaded.status == "possibly_hung"
+    assert reloaded.stop_reason == LIVE_WORKER_STOP_REASON
+    assert reloaded.pid == 66
+    assert reloaded.error == (
+        "worker pid=66 is still running after the stuck-sleep-loop reaper terminated "
+        "it (bash_pid=67); parked so the task is not dispatched again while it runs"
+    )
+
+
+@pytest.mark.parametrize("probe", [WorkerProbe.DEAD, WorkerProbe.REUSED])
+def test_not_scanned_or_killed_when_pid_is_not_the_worker(
+    tmp_path: Path, probe: WorkerProbe
+) -> None:
+    """A pid with no process, or one another process was given after the
+    worker exited, is neither scanned nor signalled: its tree is not the
+    worker's. The task stays running for its monitor thread to finalize."""
+    qd = _queue(tmp_path)
+    _seed(
+        qd,
+        "t-gone",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=1000),
+        dispatcher_alive_at=_now() - timedelta(seconds=10),
+        pid=77,
+    )
+    detector, calls = _record_detector(return_match=(78, "argv"))
+    term_calls: list[int] = []
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-gone"},
+        settings=_settings(),
+        clock=FakeClock(_now()),
+        stuck_loop_detect_fn=detector,
+        terminate_fn=lambda p: term_calls.append(p) or True,
+        worker_probe_fn=probes(probe),
+    )
+    assert calls == []
+    assert term_calls == []
+    assert results == []
+    assert load_state(state_path_for(qd, "t-gone")).status == "running"
 
 
 def test_no_match_leaves_task_running(tmp_path: Path) -> None:
@@ -849,6 +981,7 @@ def test_no_match_leaves_task_running(tmp_path: Path) -> None:
         clock=FakeClock(_now()),
         stuck_loop_detect_fn=detector,
         terminate_fn=lambda _p: True,
+        worker_probe_fn=worker_alive,
     )
     assert calls == [44]  # the walk DID run
     assert results == []

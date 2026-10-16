@@ -13,8 +13,11 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.cli._helpers import (
+    CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
+    resolve_per_queue_config,
+)
 from claude_task_runner.doctor.checks import CheckStatus, all_checks
 
 app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
@@ -64,10 +67,16 @@ def doctor(
 ) -> None:
     """Run a battery of self-diagnostic checks against this queue.
 
-    Exits 0 if everything is PASS / WARN, 1 if any FAIL.
+    Exits 0 if everything is PASS / WARN, 1 if any FAIL. When the queue
+    TOML does not load, no check runs: it prints the error (with --json,
+    as {"ok": false, "error": ...}) and exits as ``supervisor start``
+    would, 78 when the content is wrong and 1 when the file could not be
+    read for now.
     """
     queue_path = queue_dir.resolve()
-    settings = load_settings(resolve_per_queue_config(config, queue_path))
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path), Console(), json=json
+    )
 
     results = [
         factory()

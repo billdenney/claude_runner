@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, get_args
 
+import pydantic
 import pytest
 
 from claude_task_runner.config.schema import WorktreeReclaimSettings
@@ -1030,3 +1031,60 @@ def test_unopenable_lock_file_is_a_could_not_run_error(world: World) -> None:
     ):
         run(world, settings=settings)
     assert_untouched(world, "t-lock")
+
+
+GONE_HOME = "~no-such-user-ctr-test"
+"""A ``~user`` that names no user."""
+
+
+def test_a_working_dir_that_cannot_be_expanded_skips_only_that_task(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Its worktree cannot be found, so it is kept, with an ERROR; the pass
+    goes on and reclaims the others."""
+    wt = world.add_task("t-ok")
+    world.add_task("t-gone")
+    world.write_task("t-gone", working_dir=Path(f"{GONE_HOME}/wt"))
+    with caplog.at_level("ERROR", logger=reclaim_mod.__name__):
+        report = run(world)
+    assert only(report, "t-ok").outcome is Outcome.RECLAIMED
+    assert not wt.exists()
+    assert [r.task_id for r in report.results if r.task_id == "t-gone"] == []
+    assert_untouched(world, "t-gone")
+    assert [(r.levelname, r.getMessage()) for r in caplog.records] == [
+        (
+            "ERROR",
+            f"worktree reclaim: skipping task t-gone: working_dir '{GONE_HOME}/wt' cannot be "
+            "expanded: Could not determine home directory.",
+        )
+    ]
+
+
+def test_a_lock_file_that_cannot_be_expanded_is_a_could_not_run_error(world: World) -> None:
+    """The setting refuses it at load (``test_a_lock_file_that_cannot_be_expanded_is_refused``);
+    settings built without validation still end in the pass's own error."""
+    world.add_task("t-lock")
+    settings = WorktreeReclaimSettings.model_construct(
+        **{**WorktreeReclaimSettings().model_dump(), "lock_file": f"{GONE_HOME}/x.lock"}
+    )
+    with pytest.raises(ReclaimError) as excinfo:
+        run(world, settings=settings)
+    assert str(excinfo.value) == (
+        f"[worktree_reclaim].lock_file '{GONE_HOME}/x.lock' cannot be expanded: "
+        "Could not determine home directory."
+    )
+    assert_untouched(world, "t-lock")
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        (f"{GONE_HOME}/x.lock", "cannot be expanded: Could not determine home directory."),
+        ("/run/x\x00y.lock", "contains a NUL byte"),
+    ],
+    ids=["unknown-user", "nul"],
+)
+def test_a_lock_file_that_cannot_be_expanded_is_refused(value: str, reason: str) -> None:
+    with pytest.raises(pydantic.ValidationError) as excinfo:
+        WorktreeReclaimSettings(lock_file=value)
+    assert f"[worktree_reclaim].lock_file {value!r} {reason}" in str(excinfo.value)

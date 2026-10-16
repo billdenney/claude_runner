@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_task_runner.config.loader import load_settings
+from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, load_settings
 from claude_task_runner.config.schema import MAX_DURATION_S, TaskCapsSettings, WatchdogSettings
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
@@ -68,6 +69,14 @@ WantedBy=default.target
 """The unit ``build_unit_text`` wrote for ``_START`` before it read
 ``[watchdog]``, when RestartSec, StartLimitBurst and
 StartLimitIntervalSec were hardcoded. Captured from that code."""
+
+
+def _with_config_error_status(unit: str) -> str:
+    """``unit`` with the one line that changed when a configuration error
+    (exit 78) stopped restarting the unit; every other line is as captured."""
+    assert unit.count("RestartPreventExitStatus=0\n") == 1
+    return unit.replace("RestartPreventExitStatus=0\n", "RestartPreventExitStatus=0 78\n")
+
 
 _DRAIN_UNIT_BEFORE_TASK_CAPS = """\
 [Unit]
@@ -246,6 +255,16 @@ class TestBuildUnitText:
         assert "Restart=on-failure" in text
         assert "RestartPreventExitStatus=0" in text
 
+    def test_a_configuration_error_does_not_restart(self) -> None:
+        """``supervisor start`` exits 78 (EX_CONFIG) when its queue TOML or an
+        account's runner-account.toml does not load. A restart would fail the
+        same way, so the unit stops instead and the journal says why."""
+        text = build_unit_text(
+            supervisor_command="x", queue_dir=Path("/q"), watchdog=_DEFAULTS, task_caps=_CAPS
+        )
+        assert CONFIG_ERROR_EXIT_STATUS == os.EX_CONFIG == 78
+        assert _only_line(text, "RestartPreventExitStatus") == "RestartPreventExitStatus=0 78"
+
 
 _UNIT_LINE_OF = {
     "restart_cooldown_s": "RestartSec",
@@ -253,6 +272,13 @@ _UNIT_LINE_OF = {
     "restart_backoff_max_s": "StartLimitIntervalSec",
 }
 """The unit line each ``[watchdog]`` key sets."""
+
+_CRON_ONLY = {
+    "transient_config_escalation_s": (
+        "systemd retries a start that exits 1 up to StartLimitBurst, then fails the unit"
+    ),
+}
+"""``[watchdog]`` keys only the cron watchdog reads, and what systemd does instead."""
 
 
 def _unit(watchdog: WatchdogSettings) -> str:
@@ -265,8 +291,9 @@ class TestRestartPolicyFromWatchdog:
     """The unit's restart policy comes from the queue's ``[watchdog]``."""
 
     def test_package_defaults_reproduce_the_hardcoded_unit(self) -> None:
-        """A queue that sets no ``[watchdog]`` gets the same unit as before."""
-        assert _unit(_DEFAULTS) == _UNIT_BEFORE_WATCHDOG
+        """A queue that sets no ``[watchdog]`` gets the same unit as before,
+        but for the configuration-error exit status."""
+        assert _unit(_DEFAULTS) == _with_config_error_status(_UNIT_BEFORE_WATCHDOG)
 
     def test_each_key_sets_its_line(self) -> None:
         text = _unit(
@@ -280,14 +307,20 @@ class TestRestartPolicyFromWatchdog:
         """Each ``[watchdog]`` key changes its own unit line and nothing else.
 
         Walks the schema, so a key added to ``[watchdog]`` later fails
-        here until it has a unit line in ``_UNIT_LINE_OF``."""
-        assert set(_UNIT_LINE_OF) == set(WatchdogSettings.model_fields)
+        here until it has a unit line in ``_UNIT_LINE_OF``, or is listed in
+        ``_CRON_ONLY`` with what systemd does instead, and then changes no
+        line."""
+        assert set(_UNIT_LINE_OF) | set(_CRON_ONLY) == set(WatchdogSettings.model_fields)
+        assert not set(_UNIT_LINE_OF) & set(_CRON_ONLY)
         before = _unit(_DEFAULTS).splitlines()
         for key, unit_key in _UNIT_LINE_OF.items():
             default = getattr(_DEFAULTS, key)
             after = _unit(_watchdog(**{key: default * 2})).splitlines()
             changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
             assert changed == [(f"{unit_key}={default:g}", f"{unit_key}={default * 2:g}")], key
+        for key in _CRON_ONLY:
+            default = getattr(_DEFAULTS, key)
+            assert _unit(_watchdog(**{key: default * 2})).splitlines() == before, key
 
     @pytest.mark.parametrize(
         ("seconds", "written"),
@@ -378,8 +411,9 @@ class TestDrainStopTimeout:
     ``[task_caps].max_duration_s_per_task`` lets them run."""
 
     def test_package_defaults_reproduce_the_hardcoded_unit(self) -> None:
-        """A queue that sets no cap gets the same unit as before, byte for byte."""
-        assert _drain_unit(_CAPS) == _DRAIN_UNIT_BEFORE_TASK_CAPS
+        """A queue that sets no cap gets the same unit as before, byte for byte,
+        but for the configuration-error exit status."""
+        assert _drain_unit(_CAPS) == _with_config_error_status(_DRAIN_UNIT_BEFORE_TASK_CAPS)
 
     @pytest.mark.parametrize(
         ("cap", "written"),
@@ -462,7 +496,7 @@ class TestDrainStopTimeout:
             watchdog=_DEFAULTS,
             task_caps=_unvalidated_caps(cap),
         )
-        assert text == _UNIT_BEFORE_WATCHDOG
+        assert text == _with_config_error_status(_UNIT_BEFORE_WATCHDOG)
 
 
 _SYSTEMD_ANALYZE = shutil.which("systemd-analyze")
