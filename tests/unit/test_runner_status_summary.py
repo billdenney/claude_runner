@@ -897,7 +897,8 @@ def test_parked_workers_and_a_worker_that_could_not_start(
     report_now: datetime,
 ) -> None:
     """A task parked while an unwatched worker runs is not stuck: within
-    its time limit it is for your information, past it or after the worker
+    its time limit it is for your information, and past it too, since the
+    running supervisor stops the worker at its next check; after the worker
     exited it is not normal. A worker that could not be started says why
     and when it is tried again."""
     _two_accounts(queue, tmp_path)
@@ -938,8 +939,6 @@ def test_parked_workers_and_a_worker_that_could_not_start(
         "finished.\n"
         + NO_QUESTIONS
         + _attention(
-            "1 task has a worker the supervisor does not watch that has run past the task's time "
-            f"limit (past, pid {pids['past']}). Stop it with {kill}.",
             "1 task was held while a worker the supervisor does not watch ran, and the worker "
             f"has exited (exited, pid {done.pid}), so it waits only for the run to be recorded. "
             "If this lasts past the supervisor's next check, record the run as the runbook "
@@ -956,9 +955,40 @@ def test_parked_workers_and_a_worker_that_could_not_start(
             "before a restart or still alive after it was stopped (within, pid "
             f"{pids['within']}). No second worker starts for it meanwhile. Nothing to do; to "
             f"end one sooner, stop it with {kill}.",
+            "1 task has a worker the supervisor does not watch that has run past the task's time "
+            f"limit (past, pid {pids['past']}). The supervisor stops it within a minute and "
+            "records the run. Nothing to do unless it is still listed after that; the "
+            f"supervisor's log then says why the stop failed, and {kill} ends it.",
             "No task can start right now: every unfinished task is held, as Tasks shows.",
         )
     )
+
+
+def test_a_worker_past_its_limit_while_the_supervisor_is_down(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    worker: Callable[[Path], int],
+    report_now: datetime,
+) -> None:
+    """With no supervisor running to stop it, a parked worker past its
+    task's time limit is not normal, and the operator is told to stop it."""
+    _two_accounts(queue, tmp_path)
+    log = tmp_path / "past.log"
+    pid = worker(log)
+    add_task(queue, "past", max_duration_s_override=300)
+    _parked(queue, "past", pid, log, report_now - timedelta(minutes=10))
+
+    summary = _summary(queue, bin_dir)
+
+    kill = "`kill -TERM -<pid>` (the minus signals its process group)"
+    assert summary.startswith("- **Supervisor:** not running.\n"), summary
+    assert (
+        "- 1 task has a worker the supervisor does not watch that has run past the task's time "
+        f"limit (past, pid {pid}). The supervisor is not running to stop it: stop it with "
+        f"{kill}.\n"
+    ) in summary.partition("**For your information:**")[0]
+    assert "The supervisor stops it" not in summary
 
 
 def test_details_group_the_retry_reasons_and_list_parked_workers(

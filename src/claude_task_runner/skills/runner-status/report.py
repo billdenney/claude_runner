@@ -518,15 +518,9 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
     if error:
         # The runner's error names what is wrong: its runner-account.toml
         # (which it names) or, for instance, its linux_user.
-        poll_s = facts.poll_s
-        within = (
-            f"within {_duration(timedelta(seconds=poll_s))}"
-            if poll_s and poll_s > 60
-            else "within a minute"
-        )
         notes.attention.append(
             f"{name} takes no tasks until this is fixed: {error.rstrip('.')}. Once it is, "
-            f"{name} takes tasks again {within}."
+            f"{name} takes tasks again {_within_a_check(facts)}."
         )
         return
     if row.get("paused"):
@@ -702,11 +696,27 @@ def _listing(items: list[str]) -> str:
     return shown + (f"; and {more} more" if more > 0 else "")
 
 
+def _within_a_check(facts: Facts) -> str:
+    """When the supervisor's next check comes: ``within`` its poll interval,
+    "within a minute" when that is a minute or less or unknown."""
+    poll_s = facts.poll_s
+    if poll_s and poll_s > 60:
+        return f"within {_duration(timedelta(seconds=poll_s))}"
+    return "within a minute"
+
+
 def _parked_notes(
-    watching: list[dict[str, Any]], exited: list[dict[str, Any]], notes: Notes
+    facts: Facts,
+    watching: list[dict[str, Any]],
+    exited: list[dict[str, Any]],
+    live: bool,
+    notes: Notes,
 ) -> None:
     """Tasks parked ``possibly_hung`` while a worker ran that the supervisor
-    does not watch (stop reason ``worker_still_running``)."""
+    does not watch (stop reason ``worker_still_running``). A running
+    supervisor stops such a worker once it is past its task's time limit,
+    at its next check, so the operator is told to stop one only while the
+    supervisor is not running."""
     within = [w for w in watching if not w.get("past_cap")]
     past = [w for w in watching if w.get("past_cap")]
     kill = "`kill -TERM -<pid>` (the minus signals its process group)"
@@ -723,11 +733,22 @@ def _parked_notes(
     if past:
         n = len(past)
         which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in past])
-        notes.attention.append(
+        lead = (
             f"{_plural(n, 'task')} {'has' if n == 1 else 'have'} a worker the supervisor does "
-            f"not watch that has run past the task's time limit ({which}). Stop "
-            f"{'it' if n == 1 else 'each'} with {kill}."
+            f"not watch that has run past the task's time limit ({which})."
         )
+        if live:
+            notes.info.append(
+                f"{lead} The supervisor stops {'it' if n == 1 else 'each'} "
+                f"{_within_a_check(facts)} and records the run. Nothing to do unless "
+                f"{'it is' if n == 1 else 'one is'} still listed after that; the supervisor's "
+                f"log then says why the stop failed, and {kill} ends it."
+            )
+        else:
+            notes.attention.append(
+                f"{lead} The supervisor is not running to stop {'it' if n == 1 else 'them'}: "
+                f"stop {'it' if n == 1 else 'each'} with {kill}."
+            )
     if exited:
         n = len(exited)
         which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in exited])
@@ -832,7 +853,7 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
             f"{n} {'waits' if n == 1 else 'wait'} for an exited worker's run to be recorded"
         )
     parts.append(f"{int(holds.get('completed') or 0)} finished")
-    _parked_notes(watching, exited, notes)
+    _parked_notes(facts, watching, exited, live, notes)
     _retry_notes(facts, holds, notes)
 
     queue = facts.queue

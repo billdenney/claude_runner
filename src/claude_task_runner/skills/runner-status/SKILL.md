@@ -59,7 +59,8 @@ operator, saying what it means and what to do (an account that cannot take
 tasks until a problem is fixed, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
 read, tasks whose worker could not be started, an unwatched worker past
-its time limit or one that exited unrecorded, unreadable sidecar requests,
+its time limit while no supervisor runs to stop it, or one that exited
+unrecorded, unreadable sidecar requests,
 a supervisor that is down or stuck, an unreadable `supervisor.json` or
 queue settings file, nothing running although tasks can start). And **For
 your information**: routine conditions that resolve by themselves, with
@@ -302,6 +303,9 @@ or recent failures), follow the prioritized triage flow below.
       runs and whether it has passed its time limit. While it runs and is
       within its limit there is nothing to do; to end it sooner, stop it
       with `kill -TERM -<pid>` (the minus signals its process group).
+      Past its limit, a running supervisor stops it at its next check and
+      records the run; stop it yourself only while the supervisor is not
+      running, or when it is still listed after that check.
 
    9. **Recent failures** — `--status failed` and
       `--status failed_circuit_breaker`. Report counts; if non-zero,
