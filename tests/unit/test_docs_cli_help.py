@@ -821,7 +821,7 @@ class TestListing:
             (("queue",), "restart-fresh"): "Clear a task's ``session_id`` so it starts fresh.",
             (("queue",), "template"): "Print a complete, annotated example Task YAML.",
             (("usage",), "refresh"): "Refresh the OAuth token of every configured account.",
-            (("usage",), "whoami"): "Show which Claude account `[claude].config_dir` is using.",
+            (("usage",), "whoami"): "Show which Claude account a config_dir is logged in to.",
             (("watchdog",), "tick"): "Run one watchdog tick on the queue the watchdog manages.",
             (("worktree",), "reclaim"): (
                 "Reclaim the git worktrees of completed, merged, clean tasks."

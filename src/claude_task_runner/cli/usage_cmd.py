@@ -5,12 +5,19 @@
 * ``healthcheck`` — capture+parse; exit non-zero on drift / timeout.
 * ``capture`` — capture only; save the raw .cap to a path.
 * ``parse-file`` — parse a previously-saved .cap and print the result.
-* ``whoami`` — show which account the configured ``config_dir`` reads.
+* ``whoami`` — show which Claude account an account's ``config_dir`` reads.
 * ``refresh`` — refresh the OAuth token of every configured account.
 
-``--config`` belongs to the ``usage`` group, not to its subcommands, so
-it goes before the subcommand:
-``claude-task-runner usage --config <queue>/claude_runner.toml refresh``.
+``--config`` and ``--account`` belong to the ``usage`` group, not to its
+subcommands, so they go before the subcommand:
+``claude-task-runner usage --config <queue>/claude_runner.toml --account work whoami``.
+
+Every subcommand but ``refresh`` and ``parse-file`` reads one account: the
+queue's only ``[[accounts]]`` entry (with none, the ``default`` account the
+loader makes from ``[claude].config_dir``), or the one ``--account`` names.
+A queue with several needs ``--account``, as the supervisor reads each
+account from its own ``config_dir`` and ``[claude].config_dir`` is then
+ignored.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from rich.console import Console
 
 from claude_task_runner.cli._helpers import load_settings_or_exit
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.usage import capture as capture_mod
 from claude_task_runner.usage import parser as parser_mod
 from claude_task_runner.usage import whoami as whoami_mod
@@ -47,6 +55,41 @@ def _default_captures_dir() -> Path:
     return Path.home() / ".claude_task_runner" / "usage_captures"
 
 
+def _named_account(settings: Settings, name: str) -> AccountSettings:
+    """The ``[[accounts]]`` entry called ``name``; a usage error (exit 2)
+    listing the configured names when there is none."""
+    for acct in settings.accounts:
+        if acct.name == name:
+            return acct
+    raise typer.BadParameter(
+        f"no account {name!r} in [[accounts]]; configured: "
+        + ", ".join(a.name for a in settings.accounts),
+        param_hint="'--account'",
+    )
+
+
+def _account(ctx: typer.Context) -> AccountSettings:
+    """The one account a subcommand reads: ``--account``'s, or the only one.
+
+    With several accounts and no ``--account`` it is a usage error (exit
+    2) naming them, rather than a guess: ``[claude].config_dir`` is
+    ignored once ``[[accounts]]`` is declared, and the supervisor reads
+    each account from its own ``config_dir``.
+    """
+    settings: Settings = ctx.obj["settings"]
+    name: str | None = ctx.obj["account"]
+    if name is not None:
+        return _named_account(settings, name)
+    if len(settings.accounts) == 1:
+        return settings.accounts[0]
+    raise typer.BadParameter(
+        f"the queue declares {len(settings.accounts)} accounts ("
+        + ", ".join(a.name for a in settings.accounts)
+        + "); name the one to read with --account",
+        param_hint="'--account'",
+    )
+
+
 def _bar(pct: int) -> str:
     filled = pct // 5
     empty = 20 - filled
@@ -62,14 +105,25 @@ def _root(
         "-c",
         help="Per-queue claude_runner.toml. Defaults to package settings.",
     ),
+    account: str | None = typer.Option(
+        None,
+        "--account",
+        help=(
+            "The [[accounts]] entry to read. Needed when the queue declares "
+            "several; refresh then refreshes only that one."
+        ),
+    ),
 ) -> None:
     """Usage capture, parse, and drift check.
 
     With no subcommand, runs ``render``.
     """
     settings = load_settings_or_exit(config, Console())
+    if account is not None:
+        _named_account(settings, account)
     ctx.ensure_object(dict)
     ctx.obj["settings"] = settings
+    ctx.obj["account"] = account
     ctx.obj["captures_dir"] = _default_captures_dir()
     if ctx.invoked_subcommand is None:
         # Click calls a plain function with only the arguments given, so
@@ -81,6 +135,7 @@ def _root(
 def render(ctx: typer.Context) -> None:
     """Print a colored snapshot of the current 5h and 7d windows."""
     settings = ctx.obj["settings"]
+    config_dir = _account(ctx).config_dir
     captures_dir: Path = ctx.obj["captures_dir"]
     console = Console()
     clock = RealClock()
@@ -90,7 +145,7 @@ def render(ctx: typer.Context) -> None:
             clock,
             captures_dir=captures_dir,
             claude_executable=settings.claude.executable,
-            claude_config_dir=settings.claude.config_dir,
+            claude_config_dir=config_dir,
         )
         reading = parser_mod.parse(raw, clock.now(), clock)
     except UsageCaptureSpawnError as exc:
@@ -130,6 +185,7 @@ def render(ctx: typer.Context) -> None:
 def to_json(ctx: typer.Context) -> None:
     """Print machine-readable JSON of the current windows."""
     settings = ctx.obj["settings"]
+    config_dir = _account(ctx).config_dir
     captures_dir: Path = ctx.obj["captures_dir"]
     clock = RealClock()
     try:
@@ -138,7 +194,7 @@ def to_json(ctx: typer.Context) -> None:
             clock,
             captures_dir=captures_dir,
             claude_executable=settings.claude.executable,
-            claude_config_dir=settings.claude.config_dir,
+            claude_config_dir=config_dir,
         )
         reading = parser_mod.parse(raw, clock.now(), clock)
     except (UsageCaptureSpawnError, UsageCaptureTimeout) as exc:
@@ -184,11 +240,13 @@ def healthcheck(ctx: typer.Context) -> None:
     Exit codes:
       0  clean
       1  parse drift
-      2  capture timeout
+      2  capture timeout, or a usage error such as a queue of several
+         accounts without --account (the message says which)
       3  spawn error
       4  unexpected
     """
     settings = ctx.obj["settings"]
+    config_dir = _account(ctx).config_dir
     captures_dir: Path = ctx.obj["captures_dir"]
     console = Console()
     clock = RealClock()
@@ -198,7 +256,7 @@ def healthcheck(ctx: typer.Context) -> None:
             clock,
             captures_dir=captures_dir,
             claude_executable=settings.claude.executable,
-            claude_config_dir=settings.claude.config_dir,
+            claude_config_dir=config_dir,
         )
         reading = parser_mod.parse(raw, clock.now(), clock)
     except UsageCaptureSpawnError as exc:
@@ -241,6 +299,7 @@ def capture_only(
 ) -> None:
     """Capture raw `claude /usage` output to a file (no parsing)."""
     settings = ctx.obj["settings"]
+    config_dir = _account(ctx).config_dir
     captures_dir: Path = ctx.obj["captures_dir"]
     clock = RealClock()
     try:
@@ -249,7 +308,7 @@ def capture_only(
             clock,
             captures_dir=captures_dir,
             claude_executable=settings.claude.executable,
-            claude_config_dir=settings.claude.config_dir,
+            claude_config_dir=config_dir,
         )
     except UsageCaptureSpawnError as exc:
         sys.stderr.write(f"spawn error: {exc}\n")
@@ -272,7 +331,9 @@ def whoami(
         help="Skip the TUI capture; report only credentials.json fields.",
     ),
 ) -> None:
-    """Show which Claude account `[claude].config_dir` is using.
+    """Show which Claude account a config_dir is logged in to.
+
+    The config_dir is the queue's only account's, or ``--account``'s.
 
     Reads ``credentials.json`` for ``subscriptionType`` /
     ``rateLimitTier`` and (unless ``--quick``) does a one-shot
@@ -281,11 +342,12 @@ def whoami(
     confirms which account is being read.
     """
     settings = ctx.obj["settings"]
+    config_dir = _account(ctx).config_dir
     captures_dir: Path = ctx.obj["captures_dir"]
     console = Console()
 
     if quick:
-        snap = whoami_mod.from_credentials_only(settings.claude.config_dir)
+        snap = whoami_mod.from_credentials_only(config_dir)
     else:
         clock = RealClock()
         try:
@@ -294,7 +356,7 @@ def whoami(
                 clock,
                 captures_dir=captures_dir,
                 claude_executable=settings.claude.executable,
-                claude_config_dir=settings.claude.config_dir,
+                claude_config_dir=config_dir,
             )
         except UsageCaptureSpawnError as exc:
             console.print(f"[bold red]spawn error:[/] {exc}")
@@ -304,9 +366,9 @@ def whoami(
                 f"[bold yellow]capture timeout:[/] {exc}\n"
                 "Falling back to credentials-only identity."
             )
-            snap = whoami_mod.from_credentials_only(settings.claude.config_dir)
+            snap = whoami_mod.from_credentials_only(config_dir)
         else:
-            snap = whoami_mod.from_capture(raw, settings.claude.config_dir)
+            snap = whoami_mod.from_capture(raw, config_dir)
 
     config_label = snap.config_dir or "<default ~/.claude>"
     console.print(f"[bold]Config dir:[/]      {config_label}")
@@ -329,6 +391,8 @@ def whoami(
 @app.command("refresh")
 def refresh(ctx: typer.Context) -> None:
     """Refresh the OAuth token of every configured account.
+
+    With ``--account``, only that account's.
 
     Each refresh spawns ``claude /usage`` in a PTY against the account's
     ``config_dir``. The TUI's OAuth-backed call rewrites the credentials
@@ -356,8 +420,10 @@ def refresh(ctx: typer.Context) -> None:
     # refresh helper transitively pulls in pexpect via capture.py.
     from claude_task_runner.usage.oauth_refresh import refresh_all_accounts
 
+    # The callback has refused an --account that names no account.
+    accounts = [a for a in settings.accounts if ctx.obj["account"] in (None, a.name)]
     results = refresh_all_accounts(
-        accounts=settings.accounts,
+        accounts=accounts,
         settings=settings.usage,
         captures_dir=captures_dir,
         clock=clock,

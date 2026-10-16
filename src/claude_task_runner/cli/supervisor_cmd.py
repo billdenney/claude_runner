@@ -86,45 +86,22 @@ def _count_in_flight(queue_dir: Path) -> int:
     return n
 
 
-def _build_tty_source(
-    settings: object,
-    queue_path: Path,
-    *,
-    config_dir: str | None = None,
-) -> ClaudeUsageSource:
-    """Build a TTY usage source against ``config_dir``.
-
-    Defaults to ``settings.claude.config_dir`` (legacy single-account
-    path) when ``config_dir`` is None. Multi-account callers pass each
-    account's ``config_dir`` explicitly.
-    """
-    effective = (
-        config_dir if config_dir is not None else settings.claude.config_dir  # type: ignore[attr-defined]
-    )
+def _build_tty_source(settings: object, queue_path: Path, *, config_dir: str) -> ClaudeUsageSource:
+    """Build a TTY usage source against an account's ``config_dir``."""
     return ClaudeUsageSource(
         settings.usage,  # type: ignore[attr-defined]
         RealClock(),
         captures_dir=_captures_dir(queue_path),
         claude_executable=settings.claude.executable,  # type: ignore[attr-defined]
-        claude_config_dir=effective,
+        claude_config_dir=config_dir,
     )
 
 
-def _build_api_source(
-    settings: object,
-    *,
-    config_dir: str | None = None,
-) -> ApiUsageSource:
-    """Build an API usage source against ``config_dir``.
-
-    Same default rule as :func:`_build_tty_source`.
-    """
-    effective = (
-        config_dir if config_dir is not None else settings.claude.config_dir  # type: ignore[attr-defined]
-    )
+def _build_api_source(settings: object, *, config_dir: str) -> ApiUsageSource:
+    """Build an API usage source against an account's ``config_dir``."""
     return ApiUsageSource(
         RealClock(),
-        config_dir=effective,
+        config_dir=config_dir,
         probe_model=settings.usage.api_probe_model,  # type: ignore[attr-defined]
         timeout_s=settings.usage.api_timeout_s,  # type: ignore[attr-defined]
     )
@@ -135,11 +112,11 @@ def _build_per_account_source(
     queue_path: Path,
     config_dir: str,
 ) -> UsageSource:
-    """Build one inner source for one account, honouring ``[usage].source``.
+    """Build the usage source for one account, honouring ``[usage].source``.
 
-    Same mode dispatch as :func:`_build_usage_source` but pinned to
-    a specific ``config_dir`` so the multi-account wrapper can map
-    one source per configured account.
+    Pinned to that account's ``config_dir``: the only account's source
+    for a one-account queue, one per account inside the multi-account
+    wrapper otherwise.
 
     PR 14 long-lived token override: when ``<config_dir>/oauth-token``
     exists the account is on a ``claude setup-token`` long-lived
@@ -188,8 +165,11 @@ def _build_usage_source(
 ) -> UsageSource:
     """Pick a UsageSource based on ``settings.usage.source`` and account count.
 
-    Single-account (``len(settings.accounts) <= 1``): direct
-    ClaudeUsageSource / ApiUsageSource / composite, same as PR 6.
+    One account: that account's source (:func:`_build_per_account_source`),
+    read from its own ``config_dir``. With no ``[[accounts]]`` the loader
+    makes a ``default`` account from ``[claude].config_dir``, so a legacy
+    TOML reads that as before; with one explicit ``[[accounts]]`` entry,
+    ``[claude].config_dir`` is ignored here as everywhere else.
 
     Multi-account (``len(settings.accounts) > 1``): wrap one
     per-account source per ``[[accounts]]`` block in a
@@ -204,18 +184,8 @@ def _build_usage_source(
     ``last_capture_at`` fields the daemon just persisted.
     """
     accounts = settings.accounts  # type: ignore[attr-defined]
-    if len(accounts) <= 1:
-        mode = settings.usage.source  # type: ignore[attr-defined]
-        if mode == "tty":
-            return _build_tty_source(settings, queue_path)
-        if mode == "api":
-            return _build_api_source(settings)
-        if mode == "api_then_tty":
-            return ApiThenTtyUsageSource(
-                api=_build_api_source(settings),
-                tty=_build_tty_source(settings, queue_path),
-            )
-        raise ValueError(f"unknown [usage].source: {mode!r}")
+    if len(accounts) == 1:
+        return _build_per_account_source(settings, queue_path, accounts[0].config_dir)
 
     # Multi-account: one inner source per account.
     per_account: dict[str, UsageSource] = {
