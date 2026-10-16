@@ -60,8 +60,11 @@ the usage source, so an account added that way is never read.
 1. Set `[logging].level = "DEBUG"` and look for `usage_capture_error`
    events.
 2. Capture as that account by hand: `CLAUDE_CONFIG_DIR=<its config_dir>
-   claude /usage`. On a single-account queue,
-   `claude-task-runner usage healthcheck` does the same.
+   claude /usage`, or `claude-task-runner usage --config
+   <queue>/claude_runner.toml --account <name> healthcheck` (on a
+   one-account queue `--account` can be left out). Both read the
+   account's own `config_dir`, as the supervisor does; `[claude].config_dir`
+   counts only when the queue declares no `[[accounts]]`.
 3. Fix what the capture shows (login, network, the config directory). The
    account leaves `no_reading` at its next clean capture. Meanwhile
    `claude-task-runner queue force-dispatch <task_id>` bypasses this check,
@@ -386,6 +389,18 @@ task that does not run.
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
      `next_eligible_at` printed below the reason has passed, the supervisor
      tries the task again and runs the hook again.
+   - `cannot start the worker:` — the supervisor could not start `claude`
+     for the task: the `claude` binary is not on PATH, the account's
+     `config_dir` does not exist or names an unknown `~user`, `sudo` is
+     missing for the account's `linux_user`, or the task's `working_dir`
+     cannot be expanded or does not exist (the pre-dispatch hook did not
+     create it). The supervisor log has the same text as an ERROR, `task
+     <id>: cannot start the worker: ...; deferred, next try in N s`, and
+     the stop reason is `worker_start_deferred`. No attempt is counted and
+     the circuit breaker is not fed. Fix the cause; the supervisor tries
+     again once `next_eligible_at` has passed
+     (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
+     default), and the task runs.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.

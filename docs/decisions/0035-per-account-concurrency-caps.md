@@ -331,11 +331,13 @@ miss; a supervisor that does not start is not. The split is now:
     `load_settings` call under `cli/` except `watchdog tick`'s, which logs
     instead (below).
   - A `<queue>/claude_runner.toml` symlink whose target does not exist (or
-    that loops) is loaded, and so reported, instead of being passed over
-    for the package defaults, whose default account is `~/.claude`.
+    that loops), and a directory at that name, are loaded, and so reported
+    (exit 1 for the missing target, 78 for a loop or a directory), instead
+    of being passed over for the package defaults, whose default account
+    is `~/.claude`.
 - **Unknown `~user`.** `config.schema.AccountSettings`, and
-  `ClaudeSettings` for `[claude].config_dir` whenever it is set (the usage
-  source of a queue with at most one account reads it), refuse a
+  `ClaudeSettings` for `[claude].config_dir` whenever it is set (with no
+  `[[accounts]]` it is the `default` account's), refuse a
   `config_dir` whose leading `~user` names no user, so the queue TOML does
   not load: start exits 78 naming the account, and a SIGHUP reload carrying
   one is rejected and the old config kept. A rejected reload, for this or
@@ -347,18 +349,46 @@ miss; a supervisor that does not start is not. The split is now:
   are not a `config_dir`. Each caller that can meet a user removed while
   the supervisor runs turns the error into its own (an account broken in
   `resolve_accounts`, a usage capture spawn error, missing API
-  credentials, a dispatch error, a warning in the usage source builder),
+  credentials, a task parked as `cannot start the worker`, a warning in
+  the usage source builder),
   so that fails that account and cannot end the tick loop. A `config_dir`
   holding a NUL byte is refused the same way, at load and later.
 - **Every other path from a task or the settings.** `expand_task_path`
   in the same module raises `TaskPathError` for a task's `working_dir`
   or `additional_dirs` entry and for `[worktree_reclaim].lock_file`. A
-  dispatch whose `working_dir` cannot be expanded fails that task with a
-  `DispatchError`; `--add-dir` skips such an entry with a WARNING, as it
+  dispatch whose `working_dir` cannot be expanded parks that task (next
+  bullet); `--add-dir` skips such an entry with a WARNING, as it
   skips a missing one; a reclaim pass skips such a task with an ERROR and
   keeps its worktree; and the queue TOML refuses such a `lock_file`. The
   gate on `expanduser` (`test_expanduser_gate.py`) now allows no site
   outside `config/paths.py`, counting aliases and uncalled references.
+- **A worker that cannot be started parks its task.** `dispatch` checks
+  everything that can stop `claude` from starting before it writes the
+  `running` state: the binary on PATH, the account's `CLAUDE_CONFIG_DIR`
+  (expandable and present), `sudo` for a `linux_user`, the task's
+  `working_dir` (expandable). A failure, or opening the attempt's log
+  files or `Popen` raising after that write, parks the task `deferred`
+  from the state it had before, with `deferred_reason` `cannot start the
+  worker: ...`, stop reason `worker_start_deferred`, an ERROR in the
+  log, and `next_eligible_at` one `deferral_recheck_cooldown_s` away,
+  the helper the pre-dispatch hook's exit 1 uses (ADR-0026). Not
+  `failed`: the cause is configuration, a fix clears it, and counting it
+  toward the circuit breaker would leave the task
+  `failed_circuit_breaker` for the operator to reset after the fix. No
+  attempt is counted. Before, the task stayed `running` with no pid
+  (the exception ended only the dispatch thread) until the silent
+  reaper made it `possibly_hung`, which nothing dispatches again.
+- **Every account read uses the account's own `config_dir`.** The
+  supervisor's usage source for a one-account queue read
+  `[claude].config_dir`, so a queue whose single `[[accounts]]` entry
+  named a `config_dir` but left that field empty polled `~/.claude`, and
+  throttled on another account's numbers. It is now built like each
+  account's of several, from that account (long-lived token rule
+  included). The `usage` commands read the queue's only account, or the
+  one `--account` names; a queue of several without `--account` is a
+  usage error, never a guess. With no `[[accounts]]` the loader's
+  `default` account carries `[claude].config_dir`, so a legacy TOML reads
+  what it always did.
 - **What is content though it may be passing.** Two errors are classed as
   content (78) although a retry could succeed. A `~user` looked up through
   NSS (LDAP, SSSD) before the directory service answers at boot raises
