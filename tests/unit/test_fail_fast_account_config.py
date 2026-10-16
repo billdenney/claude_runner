@@ -1043,6 +1043,8 @@ SETTINGS_COMMANDS = [
         "configuration error",
         "json",
     ),
+    (["queue", "holds", "--queue", "{queue}"], "configuration error", "stdout"),
+    (["queue", "holds", "--queue", "{queue}", "--json"], "configuration error", "json"),
     (["worktree", "reclaim", "--queue", "{queue}"], "configuration error", "stderr"),
     (["worktree", "reclaim", "--queue", "{queue}", "--json"], "configuration error", "json"),
     (["watchdog", "register", "--queue", "{queue}"], "register failed", "stderr"),
