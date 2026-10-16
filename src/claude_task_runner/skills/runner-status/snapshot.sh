@@ -13,11 +13,12 @@
 # sidecars last itself. Default queue is $PWD. The queue must be an existing
 # directory with a todo/ subdirectory.
 #
-# The runner's facts come from its CLI, called with the supervisor's own
-# --config when it was started with one: `account list --json`, `queue
-# holds --json` (the supervisor's candidate selection, read-only) and
-# `sidecar list --json`. If report.py fails the details it could not print
-# say so, and the exit code still means only what is listed below.
+# The runner's facts come from its CLI: `account list --json` and `queue
+# holds --json` (the supervisor's candidate selection, read-only), both
+# called with the supervisor's own --config when it was started with one,
+# and `sidecar list --json`, which reads no settings. If report.py fails the
+# details it could not print say so, and the exit code still means only what
+# is listed below.
 #
 # Exit codes:
 #   0  report printed
@@ -88,8 +89,10 @@ fi
 # The --config the live supervisor was started with, so the CLI reads the
 # same settings it does (its poll interval and block-list among them). Only
 # the arguments after `supervisor start` count: an interpreter's own -c
-# comes before them.
+# comes before them. /proc keeps each argument whole; the ps fallback splits
+# a path with spaces in it.
 SUP_CONFIG=""
+CONFIG_UNKNOWN=""
 if [[ "$PID_STATE" == "alive" ]]; then
   if [[ -r "/proc/$PID/cmdline" ]]; then
     SUP_ARGS="$(tr '\0' '\n' < "/proc/$PID/cmdline")"
@@ -111,6 +114,22 @@ if [[ "$PID_STATE" == "alive" ]]; then
     fi
     prev="$arg"
   done <<< "$SUP_ARGS"
+fi
+# A relative --config is relative to the supervisor's working directory,
+# not this script's: /proc/<pid>/cwd, or lsof where there is no /proc. When
+# neither can be read, no --config is passed and report.py says the settings
+# the supervisor uses are unknown.
+if [[ -n "$SUP_CONFIG" && "$SUP_CONFIG" != /* ]]; then
+  SUP_CWD="$(readlink "/proc/$PID/cwd" 2>/dev/null || true)"
+  if [[ -z "$SUP_CWD" ]] && command -v lsof > /dev/null 2>&1; then
+    SUP_CWD="$(lsof -a -p "$PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1 || true)"
+  fi
+  if [[ "$SUP_CWD" == /* ]]; then
+    SUP_CONFIG="$SUP_CWD/$SUP_CONFIG"
+  else
+    CONFIG_UNKNOWN="$SUP_CONFIG"
+    SUP_CONFIG=""
+  fi
 fi
 CONFIG_ARGS=()
 if [[ -n "$SUP_CONFIG" ]]; then
@@ -159,6 +178,7 @@ wait
 export RS_QUEUE="$QUEUE" RS_NOW="$NOW" RS_PID_STATE="$PID_STATE" RS_PID="$PID"
 export RS_PID_ETIME="$PID_ETIME" RS_PSLINE="$PSLINE"
 export RS_JOURNAL_STATE="$JOURNAL_STATE" RS_JOURNAL_LINE="$JOURNAL_LINE"
+export RS_CONFIG_UNKNOWN="$CONFIG_UNKNOWN"
 for name in accounts holds sidecars; do
   upper="$(echo "$name" | tr '[:lower:]' '[:upper:]')"
   export "RS_${upper}_RC=$(cat "$TMP/$name.rc")"

@@ -56,10 +56,14 @@ Then **Not normal right now**: one sentence per condition that needs the
 operator, saying what it means and what to do (a broken account settings
 file, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
-read, unreadable sidecar requests, a supervisor that is down or stuck,
-nothing running although tasks can start). And **For your information**:
-routine conditions that resolve by themselves, with when (an account
-throttled until a time, the queue drained because every task is held).
+read, unreadable sidecar requests, a supervisor that is down or stuck, an
+unreadable `supervisor.json` or queue settings file, nothing running
+although tasks can start). And **For your information**: routine
+conditions that resolve by themselves, with when (an account throttled
+until a time, tasks waiting for the account their session runs on, the
+queue drained because every task is held). While the supervisor is not
+running, the tasks and accounts it last recorded as running are given as
+its last record, not as running now.
 "Everything looks normal." when there is neither.
 
 The facts come from the runner, not from re-reading its files:
@@ -68,7 +72,26 @@ pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
 candidate selection run once, read-only, with the poll interval) and
 `claude-task-runner sidecar list --json`. The script passes the live
-supervisor's own `--config` to them.
+supervisor's own `--config` to `account list` and `queue holds`
+(`sidecar list` reads no settings), resolving a relative path against the
+supervisor's working directory. When that directory cannot be read it
+passes none, and the summary says the supervisor's settings are unknown.
+
+`claude-task-runner account list --json` exits 1 both when an account's
+runner-account.toml does not load (the listing shows it, in that row's
+`policy_error`) and when the queue TOML cannot be read for now; output of
+the form `{"ok": false, "error": ...}` is an error with nothing listed, and
+exit 78 means the queue TOML's content is wrong. `queue holds --json` fails
+the same way. The summary then says, once, that the queue settings file
+cannot be read, with the error, and whether it may clear up (exit 1) or
+needs fixing (78).
+
+Of the tasks that can start, `queue holds --json` counts in
+`eligible.can_start_now` those an account can take now, and in
+`eligible.waiting_for_their_account` those held to the account their
+session runs on, which cannot take them; such a task moves to any account
+after `affinity_ttl_s` without running. "Nothing is running although N can
+start" counts only the first.
 
 Under **Details** come the sections the summary is built from, each opening
 with a line saying what it shows and defining its terms:
