@@ -36,9 +36,19 @@ def make_bin(tmp_path: Path) -> Path:
 
 
 def _log_calls(bin_dir: Path) -> tuple[Path, str]:
-    """Return the call log's path and a shell line that appends ``$@`` to it."""
+    """Return the call log's path and a shell line that appends ``$@`` to it.
+
+    The record is appended in one write, so calls a script runs side by side
+    do not interleave."""
     log = bin_dir.parent / "calls.log"
-    return log, f'printf "%s\\n" "$@" -- >> {shlex.quote(str(log))}\n'
+    return log, (
+        f'record="$(printf "%s\\n" "$@" --)"\nprintf "%s\\n" "$record" >> {shlex.quote(str(log))}\n'
+    )
+
+
+def calls_in(log: Path) -> list[str]:
+    """The calls in a call log, one string each, sorted."""
+    return sorted(f"{call}--\n" for call in log.read_text().split("--\n") if call)
 
 
 def real_cli(bin_dir: Path) -> Path:
