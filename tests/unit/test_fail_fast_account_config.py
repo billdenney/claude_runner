@@ -810,6 +810,37 @@ def test_a_dangling_queue_toml_symlink_is_not_the_defaults(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize(
+    ("argv", "lead"),
+    [
+        (["account", "list"], "configuration error"),
+        (["supervisor", "start"], "supervisor not started"),
+    ],
+    ids=["account-list", "supervisor-start"],
+)
+def test_a_directory_at_the_queue_toml_is_not_the_defaults(
+    tmp_path: Path, argv: list[str], lead: str
+) -> None:
+    """``<queue>/claude_runner.toml`` that is a directory: exit 78, as for
+    ``--config``, instead of the defaults and their ~/.claude account."""
+    queue = tmp_path / "q"
+    queue.mkdir()
+    (queue / "claude_runner.toml").mkdir()
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.start_daemon",
+            side_effect=AssertionError("start_daemon reached"),
+        ),
+    ):
+        result = CliRunner().invoke(app, [*argv, "--queue", str(queue)])
+    assert result.exit_code == 78
+    assert result.stdout == (
+        f"{lead}: Settings file is a directory: {queue / 'claude_runner.toml'}\n"
+    )
+    assert not (queue / ".claude_task_runner").exists()
+
+
 def test_a_sighup_with_nesting_too_deep_keeps_the_old_config(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -56,11 +56,12 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
        exists, return it. This is the auto-discovery that fixes the
        common pitfall of running ``claude-task-runner account list
        --queue <dir>`` and silently getting package defaults instead
-       of the accounts declared in the queue's TOML. A symlink there
-       whose target is missing (on a mount not up yet, say) or that
-       loops is returned too, so ``load_settings`` reports it, as a
-       file that may come back or as a symlink loop, rather than the
-       defaults and their default account applying.
+       of the accounts declared in the queue's TOML. A directory there,
+       and a symlink whose target is missing (on a mount not up yet,
+       say) or that loops, are returned too, so ``load_settings``
+       reports them (a directory and a loop as content errors, exit 78;
+       a missing target as one that may come back, exit 1) rather than
+       the defaults and their default account applying.
     3. Otherwise, return ``None`` — caller hands that to
        ``load_settings`` which falls back to package defaults
        (matches the historical no-config behaviour).
@@ -84,7 +85,11 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
     if config is not None:
         return config
     candidate = queue_dir / PER_QUEUE_CONFIG_NAME
-    if candidate.is_file() or (candidate.is_symlink() and not candidate.exists()):
+    if (
+        candidate.is_file()
+        or candidate.is_dir()
+        or (candidate.is_symlink() and not candidate.exists())
+    ):
         return candidate
     return None
 
