@@ -221,42 +221,47 @@ supervisor restart), `claude-task-runner queue states` shows a task as
 `silent_on_restart`, but its `claude` worker is still running and its
 stream log is still growing. A runner older than 2026-10-16 showed such a
 task as `failed` with stop reason `orphaned_by_supervisor_restart`, and
-dispatched it again beside the running worker.
+could dispatch it again beside the running worker.
 
 **Cause:** workers survive a restart (`KillMode=process`) and the new
 supervisor adopts each one that showed a sign of life within
 `[task_caps].heartbeat_silence_alert_s` (300 s by default): an agent event,
-a monitor tick from the previous supervisor, or a write to its stream log.
-A worker that showed none for longer than that, for instance in a long
-Bash call after a long downtime, or every live worker when
-`[supervisor].adopt_workers` is off, is parked instead: a `failed` task
+a monitor tick from the previous supervisor, or a write to its stream log,
+which claude makes every 30 s even during a long Bash call. A worker that
+showed none for longer than that (one hung in an API call, say), every live
+worker when `[supervisor].adopt_workers` is off, and a worker no state
+records (found by its stream log) are parked as `worker_still_running`
+instead: a `failed` task
 would be dispatched again, and two workers in one worktree corrupt its
-branch. Nothing monitors a parked worker, so its task stays `possibly_hung`
-after the worker exits.
+branch. The supervisor reports each park (a `warning` notification and a
+`live_worker_parked` event; `reconcile_orphans: task <id>'s worker
+pid=<pid> is still running and was not adopted` in the log).
+
+A `worker_still_running` park needs nothing from the operator: each tick
+the worker holds a slot of the account it runs on (`account list` counts
+it), and once it exits the supervisor records its run from its log, as
+for a worker that finished during a restart (`recorded exited worker for
+task <id> from its log`), and the task gets that run's status.
 
 **Steps:**
 1. Find the worker. The state's `error` names its pid
    (`claude-task-runner queue show <id>`). Check that the pid is still the
    worker: `readlink /proc/<pid>/fd/1` prints the attempt's log,
    `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl`.
-2. Check for a second worker on the same task. Every worker's working
-   directory is the task's worktree:
+2. Check for a second worker on the same task, which an older runner
+   could start. Every worker's working directory is the task's worktree:
    `for p in $(pgrep -f 'claude --print'); do echo "$p $(readlink /proc/$p/cwd)"; done`.
-   If two share the worktree, first add a `"block_dispatch": true` row for
-   the task to the `[dispatch].dispatch_block_file` (ADR-0029), so the
-   supervisor does not dispatch it a third time, then stop the newer
-   worker (its log has the higher attempt number) with `kill -TERM -<pid>`
-   (the minus signals its process group). Remove the row once the task is
-   recorded (step 4).
-3. Let the worker finish: `tail -f` its log until it writes a `result`
-   event, and wait for the pid to exit.
-4. Record the run. Stop the supervisor, set `status: running` in
-   `<queue>/.claude_task_runner/state/<id>.yaml` (a `worker_still_running`
-   park keeps `pid` and `log_path`, which is what the next step needs), and
-   start the supervisor. Its startup pass records the run from the log's
-   `result` event, as for any worker that exited during a restart. A
-   `silent_on_restart` park has no `pid` left; set it to `failed` instead,
-   and the supervisor resumes the session.
+   If two share the worktree, stop the newer one (its log has the higher
+   attempt number) with `kill -TERM -<pid>` (the minus signals its process
+   group). The current runner does not dispatch a task while one of its
+   workers runs; `queue force-dispatch --allow-live-worker` is the only
+   way past that, and is meant for a worker known to be stuck.
+3. A `silent_on_restart` or `silent_steady_state` park is left only when
+   the worker named in `error` is gone (one that still runs is parked as
+   `worker_still_running`). To run the task again, set its state to
+   `failed` (`status: failed` in
+   `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
+   stopped) and the supervisor resumes its session.
 
 ## Weekly throttled, no dispatch resuming
 
