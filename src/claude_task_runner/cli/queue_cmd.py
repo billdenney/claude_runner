@@ -532,9 +532,9 @@ def holds(
             highlight=False,
             markup=False,
         )
-    for item in unread:
+    for note in unread:
         console.print(
-            f"state of {item['task_id']} not read, so not detailed above: {item['error']}",
+            f"state of {note['task_id']} not read, so not detailed above: {note['error']}",
             style="yellow",
             highlight=False,
             markup=False,
