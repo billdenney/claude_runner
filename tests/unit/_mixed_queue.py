@@ -178,10 +178,11 @@ SELECTOR_WRITERS = (
     "_park_deferred",
     "_unpark",
     "_clear_session_for_fresh_dispatch",
+    "_park_live_worker",
 )
 """Every name through which the selector writes a task's state or creates
-its directory: the gates' park and un-park, the expired-affinity session
-clear, and the store functions they call."""
+its directory: the gates' park and un-park, the live-worker park, the
+expired-affinity session clear, and the store functions they call."""
 
 
 def _refuse(calls: list[str], name: str, *_args: object, **_kwargs: object) -> NoReturn:
