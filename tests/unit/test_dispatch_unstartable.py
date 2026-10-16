@@ -343,20 +343,28 @@ def test_an_account_that_cannot_start_a_worker_runs_no_hook(
 
 
 @pytest.mark.parametrize(
-    ("target", "error", "reason"),
+    ("target", "error", "reason", "traced"),
     [
         (
             "claude_task_runner.usage.oauth_token_file.read_long_lived_token",
             RuntimeError("token store broke"),
             "RuntimeError: token store broke",
+            True,
         ),
         (
             "claude_task_runner.runner.dispatcher.add_dirs_mod.resolve_add_dirs",
             PermissionError(13, "Permission denied", "/q"),
             "[Errno 13] Permission denied: '/q'",
+            False,
+        ),
+        (
+            "claude_task_runner.runner.dispatcher.add_dirs_mod.resolve_add_dirs",
+            TypeError("resolve_add_dirs() got an unexpected keyword argument 'x'"),
+            "TypeError: resolve_add_dirs() got an unexpected keyword argument 'x'",
+            True,
         ),
     ],
-    ids=["account-step", "task-step"],
+    ids=["account-step", "task-step", "task-step-bug"],
 )
 @pytest.mark.usefixtures("home", "no_worker")
 def test_any_exception_from_the_checks_parks_the_task(
@@ -367,9 +375,12 @@ def test_any_exception_from_the_checks_parks_the_task(
     target: str,
     error: Exception,
     reason: str,
+    traced: bool,
 ) -> None:
     """Not only a DispatchError: whatever a check raises, the task is parked
-    with the cooldown rather than retried every tick with a traceback."""
+    with the cooldown rather than retried every tick. An exception that is
+    neither a DispatchError nor an OSError is a bug, so the ERROR carries
+    its traceback; a configuration error's does not."""
     with (
         _which("claude"),
         patch(target, side_effect=error),
@@ -378,6 +389,10 @@ def test_any_exception_from_the_checks_parks_the_task(
         outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(config_dir))
     _assert_parked(queue_dir, outcome, reason, caplog)
     assert written == ["deferred"]
+    [record] = [
+        r for r in caplog.records if r.name == DISPATCHER_LOGGER and r.levelno >= logging.ERROR
+    ]
+    assert (record.exc_info[1] if record.exc_info else None) is (error if traced else None)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches a mode-000 directory")

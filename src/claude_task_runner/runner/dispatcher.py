@@ -1817,7 +1817,7 @@ def dispatch(
     try:
         spawn_env, sudo_prefix = _account_spawn(claude_config_dir, linux_user)
     except Exception as exc:
-        return _defer_unstartable(unstartable, _start_error(exc))
+        return _defer_unstartable(unstartable, exc)
 
     # Pre-dispatch hook. Run with cwd=queue_dir (or None), NOT
     # task.working_dir: the hook's job is often to *create*
@@ -1894,7 +1894,7 @@ def dispatch(
             sudo_prefix=sudo_prefix,
         )
     except Exception as exc:
-        return _defer_unstartable(unstartable, _start_error(exc))
+        return _defer_unstartable(unstartable, exc)
 
     started_at = clock.now()
     new_state = state.model_copy(
@@ -1982,7 +1982,7 @@ def dispatch(
         # (ValueError). The deferral replaces the ``running`` write.
         if spawn_gate is not None:
             spawn_gate.leave(task.id)
-        return _defer_unstartable(unstartable, _start_error(exc))
+        return _defer_unstartable(unstartable, exc)
     except BaseException:
         # No worker started, so there is no pid to wait for.
         if spawn_gate is not None:
@@ -3179,7 +3179,7 @@ UNSTARTABLE_STOP_REASON = "worker_start_deferred"
 """``stop_reason`` of a task parked because its worker could not be started."""
 
 
-def _defer_unstartable(ctx: _UnstartableContext, error: str) -> DispatchOutcome:
+def _defer_unstartable(ctx: _UnstartableContext, error: str | Exception) -> DispatchOutcome:
     """Park a task whose worker cannot be started, and log it as an ERROR.
 
     ``deferred``, not ``failed``: the cause is configuration (no ``claude``
@@ -3189,13 +3189,26 @@ def _defer_unstartable(ctx: _UnstartableContext, error: str) -> DispatchOutcome:
     attempt and never feeds the circuit breaker. The task is tried again
     after ``deferral_recheck_cooldown_s``, and runs once the cause is
     fixed, with no operator step.
+
+    ``error`` is the reason, or the exception that kept the worker from
+    starting (:func:`_start_error` words it). An exception other than a
+    :class:`DispatchError` or an :class:`OSError` is not a configuration
+    problem the checks name but a bug, so the ERROR carries its traceback;
+    the task is deferred all the same.
     """
-    reason = f"cannot start the worker: {error}"
+    traceback: Exception | None = None
+    if isinstance(error, Exception):
+        reason = f"cannot start the worker: {_start_error(error)}"
+        if not isinstance(error, DispatchError | OSError):
+            traceback = error
+    else:
+        reason = f"cannot start the worker: {error}"
     logger.error(
         "task %s: %s; deferred, next try in %.0f s",
         ctx.task.id,
         reason,
         _deferral_cooldown_s(ctx.settings_failure_classifier),
+        exc_info=traceback,
     )
     return _record_deferral(
         task=ctx.task,
