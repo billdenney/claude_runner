@@ -201,6 +201,30 @@ def _write_answers(queue_dir: Path, task_id: str, sequence: int, ids: list[str])
     )
 
 
+class TestOpenSidecarsForOneTask:
+    """``task_id`` reads one task's directory and must yield exactly what the
+    full scan yields for that task."""
+
+    def test_matches_the_full_scan_for_every_task(self, queue_dir: Path) -> None:
+        write_request(queue_dir, _three_question_request("partial"))
+        _write_answers(queue_dir, "partial", 1, ["q1"])
+        write_request(queue_dir, _three_question_request("closed"))
+        _write_answers(queue_dir, "closed", 1, ["q1", "q2", "q3"])
+        write_request(queue_dir, _request("two", 1))
+        write_request(queue_dir, _request("two", 2))
+        (sidecar_dir_for(queue_dir, "broken") / "request-001.json").write_text("{not json")
+
+        everything = list(open_sidecars(queue_dir))
+        assert sorted({item.task_id for item in everything}) == ["broken", "partial", "two"]
+        for task_id in ("partial", "closed", "two", "broken", "absent"):
+            expected = [item for item in everything if item.task_id == task_id]
+            assert list(open_sidecars(queue_dir, task_id=task_id)) == expected
+        assert [item.sequence for item in open_sidecars(queue_dir, task_id="two")] == [1, 2]
+
+    def test_no_sidecar_root(self, queue_dir: Path) -> None:
+        assert list(open_sidecars(queue_dir, task_id="t1")) == []
+
+
 class TestPerQuestionOpenness:
     """Openness is a per-QUESTION property, not per-file.
 

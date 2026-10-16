@@ -23,6 +23,12 @@ close with a deliverable on disk. It is deliberately conservative —
 
 * it fires ONLY on the unambiguous clean-close shape (deliverable present,
   no commit, nothing uncommitted, nothing unpushed);
+* it does not fire while the task has an open sidecar request with a
+  question still outstanding (see :func:`unanswered_asks`). Such a run
+  stopped to ask, not to close: answering makes it eligible again, which is
+  how the answer reaches it, and a row would hold it down after the answer.
+  A zero-question notification gets the row, since acknowledging one would
+  otherwise re-dispatch a task that has nothing left to do;
 * it never overwrites or rewrites an existing row, so an operator ruling
   already in the register wins;
 * it writes ``status: AUTO_GATED`` and records the stop_reason and
@@ -39,6 +45,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
+
+from claude_task_runner.queue.sidecar import OpenSidecar, open_sidecars
 
 logger = structlog.get_logger(__name__)
 
@@ -78,6 +86,35 @@ def already_gated(queue_dir: Path, block_file: str | None, task_id: str) -> bool
     return False
 
 
+def unanswered_asks(queue_dir: Path, task_id: str) -> list[OpenSidecar]:
+    """``task_id``'s open sidecar requests that ask the operator something.
+
+    A request asks when it has at least one question its response has not
+    answered (openness is per question, ADR-0031), or when the request or
+    its response cannot be read well enough to tell (``error`` is set). The
+    second stays open until an operator repairs it, and its answer must then
+    be able to reach the task, so it counts as asking.
+
+    A request with no questions is taken to be a notification and does not
+    count, whatever other keys it carries. The v2 request schema has no
+    notification marker, so this rests on asks being filed as ``questions``,
+    as the agent-stop-and-ask skill specifies; ADR-0033's 2026-10-15
+    amendment records the queue evidence behind that assumption.
+    """
+    return [
+        item
+        for item in open_sidecars(queue_dir, task_id=task_id)
+        if item.outstanding or item.error is not None
+    ]
+
+
+def _describe_ask(item: OpenSidecar) -> str:
+    """One request from :func:`unanswered_asks`, for a log line."""
+    if item.error is not None:
+        return f"request-{item.sequence:03d} unreadable ({item.error})"
+    return f"request-{item.sequence:03d} asks {', '.join(item.outstanding)}"
+
+
 def ensure_terminal_gate(
     *,
     queue_dir: Path,
@@ -88,12 +125,21 @@ def ensure_terminal_gate(
 ) -> bool:
     """Append a ``block_dispatch`` row for a terminal close. Returns True if written.
 
-    No-ops when the feature is off (``block_file`` unset) or a row already
-    exists. The append is a single ``open(..., "a")`` write of one line,
-    which is atomic enough for a JSONL register: concurrent appends
+    No-ops when the feature is off (``block_file`` unset), when the run left
+    questions for the operator (:func:`unanswered_asks`), or when a row
+    already exists. The append is a single ``open(..., "a")`` write of one
+    line, which is atomic enough for a JSONL register: concurrent appends
     interleave by line, never mid-line.
     """
     if not block_file or not task_id:
+        return False
+    asks = unanswered_asks(queue_dir, task_id)
+    if asks:
+        logger.info(
+            "not auto-gating task %s: its open sidecar still asks the operator: %s",
+            task_id,
+            "; ".join(_describe_ask(item) for item in asks),
+        )
         return False
     if already_gated(queue_dir, block_file, task_id):
         return False

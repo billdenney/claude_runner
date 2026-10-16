@@ -26,6 +26,10 @@ The branches that matter, and why each is here:
   convention are unaffected.
 * Unwritable register              => swallowed; a register problem must
   never fail a run that genuinely succeeded.
+* Run that left a sidecar question open => no row. It stopped to ask, not
+  to close: answering makes it eligible again, which is how the answer
+  reaches it. A zero-question notification, or a request whose questions
+  are all answered, gets the row.
 """
 
 from __future__ import annotations
@@ -34,15 +38,27 @@ import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from claude_task_runner.config.loader import load_defaults
 from claude_task_runner.config.schema import DispatchSettings
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState, TokenUsage
+from claude_task_runner.queue.sidecar import list_open_sidecars, sidecar_dir_for, write_response
+from claude_task_runner.queue.store import (
+    state_path_for,
+    task_path_for,
+    write_state_atomic,
+    write_task_atomic,
+)
 from claude_task_runner.runner import terminal_gate as terminal_gate_mod
-from claude_task_runner.runner.dispatcher import _finalize_state
+from claude_task_runner.runner.dispatcher import _apply_open_sidecar, _finalize_state
+from claude_task_runner.runner.orchestrator import _eligible_candidates
 from claude_task_runner.runner.session import ResumeStrategy, SpawnPlan
 from claude_task_runner.runner.stream import StreamSummary
+
+from ._sidecar_files import make_request, make_response, write_request
 
 WHEN = datetime(2026, 9, 4, 12, 0, 0, tzinfo=UTC)
 BLOCK_FILE = "needs_acquisition.jsonl"
@@ -101,6 +117,8 @@ def _finalize(
     pre_sha: str | None,
     settings: DispatchSettings | None = None,
 ) -> tuple[TaskState, RunRecord]:
+    # ``has_open_sidecar`` is computed exactly as the dispatcher's finalize
+    # call sites compute it.
     return _finalize_state(
         prior=_state(),
         plan=_plan(),
@@ -109,6 +127,7 @@ def _finalize(
         cap_violation=None,
         task=task,
         pre_sha=pre_sha,
+        has_open_sidecar=any(tid == task.id for tid, _seq, _path in list_open_sidecars(queue_dir)),
         queue_dir=queue_dir,
         settings_dispatch=(
             settings if settings is not None else DispatchSettings(dispatch_block_file=BLOCK_FILE)
@@ -252,3 +271,208 @@ class TestAlreadyGated:
 
     def test_missing_file_reads_as_not_gated(self, queue_dir: Path) -> None:
         assert not terminal_gate_mod.already_gated(queue_dir, BLOCK_FILE, "t1")
+
+
+def _expected_auto_row() -> dict[str, object]:
+    """Every field of the row the gate writes for ``_skip_task``, except the
+    two timestamps, which :func:`_assert_one_auto_row` checks separately."""
+    return {
+        "task": "t1",
+        "block_dispatch": True,
+        "needed": (
+            "nothing - dispatch blocker only, written automatically when the run "
+            "closed on a terminal disposition (ADR-0033)."
+        ),
+        "reason": (
+            "AUTO-GATED on a terminal close: the run produced a deliverable and no "
+            "commit, and left a clean worktree -- the shape of a skip or defer. "
+            "Without this row, answering the task's sidecar would make it eligible "
+            "again and it would re-derive the same disposition at full effort. "
+            "stop_reason=end_turn. "
+            "Review the deliverable before treating this as a settled ruling; "
+            "replace this row with a curated one to record the real disposition."
+        ),
+        "deliverable": "report.md",
+        "signals": {
+            "blocker_type": "dispatch_blocker",
+            "task": "t1",
+            "severity": "closed",
+            "blocks_dispatch": True,
+            "auto_gated": True,
+        },
+        "status": "AUTO_GATED",
+        "file_kind": "dispatch_blocker",
+    }
+
+
+def _assert_one_auto_row(queue_dir: Path) -> None:
+    (row,) = _rows(queue_dir)
+    added, detected_at = row.pop("added"), row.pop("detected_at")
+    assert row == _expected_auto_row()
+    assert detected_at.startswith(added)
+    datetime.fromisoformat(detected_at)
+
+
+def _sidecar_file(queue_dir: Path, name: str) -> Path:
+    return sidecar_dir_for(queue_dir, "t1") / name
+
+
+class TestOpenSidecarQuestions:
+    """A run with a deliverable and no commit, shaped by what its sidecar asks."""
+
+    def test_no_sidecar_is_gated(self, worktree: Path, queue_dir: Path) -> None:
+        pre = _git(worktree, "rev-parse", "HEAD")
+        state, _ = _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        assert state.status == "completed"
+        _assert_one_auto_row(queue_dir)
+
+    def test_open_question_is_not_gated(self, worktree: Path, queue_dir: Path) -> None:
+        write_request(queue_dir, make_request("t1", question_ids=("q1", "q2")))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        state, _ = _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        assert state.status == "completed"
+        assert not (queue_dir / BLOCK_FILE).exists()
+
+    def test_the_answer_reaches_the_task(self, worktree: Path, queue_dir: Path) -> None:
+        """End to end: finalize as the dispatcher does, answer the sidecar,
+        and the selector admits the task again."""
+        task = _skip_task(worktree)
+        write_task_atomic(task, task_path_for(queue_dir, task.id))
+        write_request(queue_dir, make_request("t1"))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        state, _ = _finalize(worktree, queue_dir, task, pre)
+        state = _apply_open_sidecar(state, task=task, pre_sha=pre, settings_failure_classifier=None)
+        assert state.status == "awaiting_sidecar"
+        write_state_atomic(state, state_path_for(queue_dir, task.id))
+
+        def admitted() -> list[str]:
+            return [
+                t.id
+                for t in _eligible_candidates(
+                    queue_dir,
+                    {},
+                    set(),
+                    block_file=BLOCK_FILE,
+                    effort_levels=load_defaults()["effort_levels"],
+                )
+            ]
+
+        assert admitted() == []
+        write_response(queue_dir, make_response("t1"))
+        assert admitted() == ["t1"]
+
+    def test_partly_answered_request_is_not_gated(self, worktree: Path, queue_dir: Path) -> None:
+        """q2 is still outstanding, so the request is open (ADR-0031)."""
+        write_request(queue_dir, make_request("t1", question_ids=("q1", "q2")))
+        write_response(queue_dir, make_response("t1", answer_ids=("q1",)))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        assert not (queue_dir / BLOCK_FILE).exists()
+
+    @pytest.mark.parametrize(
+        ("request_text", "response_text"),
+        [
+            pytest.param("{not json", None, id="request-not-json"),
+            pytest.param(
+                json.dumps({"task_id": "t1", "questions": [{"prompt": "which?"}]}),
+                None,
+                id="question-without-id",
+            ),
+            pytest.param(
+                make_request("t1").model_dump_json(),
+                json.dumps({"task_id": "t1", "sequence": 1}),
+                id="response-without-answers",
+            ),
+        ],
+    )
+    def test_unreadable_sidecar_is_not_gated(
+        self, worktree: Path, queue_dir: Path, request_text: str, response_text: str | None
+    ) -> None:
+        """A request or response that cannot be read well enough to tell
+        what is answered stays open until repaired, and may be asking, so
+        its eventual answer must be able to reach the task."""
+        _sidecar_file(queue_dir, "request-001.json").write_text(request_text)
+        if response_text is not None:
+            _sidecar_file(queue_dir, "response-001.json").write_text(response_text)
+        (item,) = terminal_gate_mod.unanswered_asks(queue_dir, "t1")
+        assert item.error is not None
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        assert not (queue_dir / BLOCK_FILE).exists()
+
+    def test_open_notification_is_gated(self, worktree: Path, queue_dir: Path) -> None:
+        """Acknowledging a zero-question notification would re-dispatch the
+        task; the row is what stops that."""
+        write_request(queue_dir, make_request("t1", question_ids=()))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        _assert_one_auto_row(queue_dir)
+
+    def test_fully_answered_request_is_gated(self, worktree: Path, queue_dir: Path) -> None:
+        """A rerun after the operator answered (e.g. "skip") that closes
+        terminally without asking again is a real terminal close."""
+        write_request(queue_dir, make_request("t1"))
+        write_response(queue_dir, make_response("t1"))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        _assert_one_auto_row(queue_dir)
+
+    def test_another_tasks_open_question_does_not_matter(
+        self, worktree: Path, queue_dir: Path
+    ) -> None:
+        write_request(queue_dir, make_request("other"))
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        _assert_one_auto_row(queue_dir)
+
+    def test_committed_run_is_not_gated(self, worktree: Path, queue_dir: Path) -> None:
+        """Unchanged by the sidecar rule: a commit means no terminal close,
+        even when the open sidecar is a notification the gate would act on."""
+        write_request(queue_dir, make_request("t1", question_ids=()))
+        task = _skip_task(worktree)
+        pre = _git(worktree, "rev-parse", "HEAD")
+        (worktree / "model.R").write_text("x <- 1\n")
+        _git(worktree, "add", ".")
+        _git(worktree, "commit", "-q", "-m", "add model")
+        state, _ = _finalize(worktree, queue_dir, task, pre)
+        assert state.status == "completed"
+        assert not (queue_dir / BLOCK_FILE).exists()
+
+
+class TestUnansweredAsks:
+    def test_no_sidecar_directory(self, queue_dir: Path) -> None:
+        assert terminal_gate_mod.unanswered_asks(queue_dir, "t1") == []
+
+    def test_open_question_answered_question_and_notification(self, queue_dir: Path) -> None:
+        write_request(queue_dir, make_request("asks", question_ids=("q1", "q2")))
+        write_response(queue_dir, make_response("asks", answer_ids=("q1",)))
+        write_request(queue_dir, make_request("answered"))
+        write_response(queue_dir, make_response("answered"))
+        write_request(queue_dir, make_request("notifies", question_ids=()))
+
+        (item,) = terminal_gate_mod.unanswered_asks(queue_dir, "asks")
+        assert (item.task_id, item.sequence, item.outstanding) == ("asks", 1, ("q2",))
+        assert terminal_gate_mod.unanswered_asks(queue_dir, "answered") == []
+        assert terminal_gate_mod.unanswered_asks(queue_dir, "notifies") == []
+        assert terminal_gate_mod.unanswered_asks(queue_dir, "absent") == []
+
+    def test_skip_is_logged_with_the_request(
+        self, worktree: Path, queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A stub logger: structlog's routing depends on whether an earlier
+        # test configured logging, so capturing its output is order-dependent.
+        lines: list[str] = []
+        monkeypatch.setattr(
+            terminal_gate_mod,
+            "logger",
+            SimpleNamespace(info=lambda msg, *args: lines.append(msg % args)),
+        )
+        write_request(queue_dir, make_request("t1", question_ids=("q1", "q2")))
+        _sidecar_file(queue_dir, "request-002.json").write_text("{not json")
+        pre = _git(worktree, "rev-parse", "HEAD")
+        _finalize(worktree, queue_dir, _skip_task(worktree), pre)
+        (line,) = lines
+        assert line.startswith(
+            "not auto-gating task t1: its open sidecar still asks the operator: "
+            "request-001 asks q1, q2; request-002 unreadable ("
+        )
