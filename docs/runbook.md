@@ -308,32 +308,40 @@ which claude makes every 30 s even during a long Bash call. A worker that
 showed none for longer than that (one hung in an API call, say), every live
 worker when `[supervisor].adopt_workers` is off, and a worker no state
 records (found by its stream log) are parked as `worker_still_running`
-instead: a `failed` task
-would be dispatched again, and two workers in one worktree corrupt its
-branch. The supervisor reports each park (a `warning` notification and a
-`live_worker_parked` event; `reconcile_orphans: task <id>'s worker
-pid=<pid> is still running and was not adopted` in the log).
+instead: a `failed` task would be dispatched again, and two workers in one
+worktree corrupt its branch. The same park happens when a dispatchable
+task turns out to have a worker still running. The supervisor reports each
+park (a `warning` notification and a `live_worker_parked` event).
 
-A `worker_still_running` park needs nothing from the operator: each tick
-the worker holds a slot of the account it runs on (`account list` counts
-it), and once it exits the supervisor records its run from its log, as
-for a worker that finished during a restart (`recorded exited worker for
-task <id> from its log`), and the task gets that run's status.
+While a `worker_still_running` worker runs it holds a slot of the account
+it runs on (`account list` counts it), and nothing dispatches its task. It
+is released when it exits, or when it reaches its task's duration cap
+(`[task_caps].max_duration_s_per_task`, or the task's own
+`max_duration_s_override`), at which the supervisor terminates its process
+group. Either way the supervisor records its run from its log within a
+tick (`recorded exited worker for task <id> from its log`; a capped run is
+recorded as killed by the duration cap), and the task gets that run's
+status.
 
 **Steps:**
 1. Find the worker. The state's `error` names its pid
    (`claude-task-runner queue show <id>`). Check that the pid is still the
    worker: `readlink /proc/<pid>/fd/1` prints the attempt's log,
    `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl`.
-2. Check for a second worker on the same task, which an older runner
-   could start. Every worker's working directory is the task's worktree:
+2. To release a parked worker before it exits or reaches its cap (it is
+   stuck, say), stop it: `kill -TERM -<pid>` (the minus signals its process
+   group). The supervisor records its run within a tick and the task is
+   dispatched again as its status allows. `queue force-dispatch` refuses a
+   parked task, with or without `--allow-live-worker`, and says so; that
+   flag applies only to a pending or failed task whose worker no state
+   records (one found writing the task's stream log).
+3. Check for a second worker on the same task, which a runner older than
+   2026-10-16 could start. Every worker's working directory is the task's
+   worktree:
    `for p in $(pgrep -f 'claude --print'); do echo "$p $(readlink /proc/$p/cwd)"; done`.
    If two share the worktree, stop the newer one (its log has the higher
-   attempt number) with `kill -TERM -<pid>` (the minus signals its process
-   group). The current runner does not dispatch a task while one of its
-   workers runs; `queue force-dispatch --allow-live-worker` is the only
-   way past that, and is meant for a worker known to be stuck.
-3. A `silent_on_restart` or `silent_steady_state` park is left only when
+   attempt number) with `kill -TERM -<pid>`.
+4. A `silent_on_restart` or `silent_steady_state` park is left only when
    the worker named in `error` is gone (one that still runs is parked as
    `worker_still_running`). To run the task again, set its state to
    `failed` (`status: failed` in
