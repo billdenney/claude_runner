@@ -1219,6 +1219,24 @@ def per_account_section(facts: Facts) -> str:
     return "\n".join(out) + "\n"
 
 
+RUNNER_DEFERRALS = {
+    "pre-dispatch hook deferred": "the pre-dispatch hook asked to wait",
+    WORKER_START_LEAD.rstrip(": "): "the worker could not be started",
+}
+"""How each of the runner's own retry-time deferrals starts its
+``deferred_reason``, and what it means."""
+
+
+def _reason_group(reason: str) -> str:
+    """Who deferred a task, from its ``deferred_reason``: the runner says
+    how it starts; any other reason was written by hand or by another tool,
+    and may be long and free-form, so it is not quoted."""
+    for lead, meaning in RUNNER_DEFERRALS.items():
+        if reason.startswith(lead):
+            return meaning
+    return "set by hand or by another tool"
+
+
 def holds_section(facts: Facts) -> str:
     out = [
         "**What holds the tasks** (from `claude-task-runner queue holds --json`)",
@@ -1242,12 +1260,10 @@ def holds_section(facts: Facts) -> str:
     out.append(f"| todo/ tasks (total) | {data.get('todo_tasks', 0)} |")
     retrying = [r for r in data.get("retrying") or [] if isinstance(r, dict)]
     if retrying:
-        # Grouped by the reason's lead, the part before its first colon,
-        # which names who deferred the task.
         counts: Counter[str] = Counter()
         firsts: dict[str, datetime] = {}
         for r in retrying:
-            lead = str(r.get("deferred_reason") or "no reason").split(":", 1)[0]
+            lead = _reason_group(str(r.get("deferred_reason") or ""))
             counts[lead] += 1
             due = _parse_time(r.get("next_eligible_at"))
             if due is not None and (lead not in firsts or due < firsts[lead]):
@@ -1255,8 +1271,7 @@ def holds_section(facts: Facts) -> str:
         out += ["", "_Why the tasks waiting for a retry time were deferred:_", ""]
         for lead, n in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             first = f", the first retried about {_when(firsts[lead])}" if lead in firsts else ""
-            safe = lead.replace("|", "\\|")
-            out.append(f"- {safe}: {n}{first}")
+            out.append(f"- {lead}: {n}{first}")
     parked = [w for w in data.get("parked_workers") or [] if isinstance(w, dict)]
     if parked:
         out += [

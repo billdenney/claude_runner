@@ -930,9 +930,9 @@ def test_details_group_the_retry_reasons_and_list_parked_workers(
 ) -> None:
     holds = {
         "eligible": {"count": 0, "task_ids": [], "by_status": {}},
-        "held": {"deferred_cooldown": 3, "possibly_hung": 1},
+        "held": {"deferred_cooldown": 4, "possibly_hung": 1},
         "completed": 0,
-        "todo_tasks": 4,
+        "todo_tasks": 5,
         "retrying": [
             {
                 "task_id": "a",
@@ -948,6 +948,11 @@ def test_details_group_the_retry_reasons_and_list_parked_workers(
                 "task_id": "c",
                 "deferred_reason": "cannot start the worker: sudo not found",
                 "next_eligible_at": "2026-10-16T12:20:00+00:00",
+            },
+            {
+                "task_id": "e",
+                "deferred_reason": "PARKED by hand. Its `requires: ok | see notes",
+                "next_eligible_at": "2027-01-01T00:00:00+00:00",
             },
         ],
         "parked_workers": [
@@ -966,11 +971,12 @@ def test_details_group_the_retry_reasons_and_list_parked_workers(
     _, _, details = proc.stdout.partition("**What holds the tasks**")
     section = details.split("\n**Queue counts**")[0]
     assert section.endswith(
-        "| todo/ tasks (total) | 4 |\n\n"
+        "| todo/ tasks (total) | 5 |\n\n"
         "_Why the tasks waiting for a retry time were deferred:_\n\n"
-        "- pre-dispatch hook deferred (exit 1): 2, the first retried about 2026-10-16 12:10 "
+        "- the pre-dispatch hook asked to wait: 2, the first retried about 2026-10-16 12:10 "
         "UTC\n"
-        "- cannot start the worker: 1, the first retried about 2026-10-16 12:20 UTC\n\n"
+        "- set by hand or by another tool: 1, the first retried about 2027-01-01 00:00 UTC\n"
+        "- the worker could not be started: 1, the first retried about 2026-10-16 12:20 UTC\n\n"
         "_Counted under possibly_hung, parked while a worker the supervisor does not watch "
         "ran:_\n\n"
         "| task | pid | started | still running | past its time limit |\n"
