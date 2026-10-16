@@ -36,7 +36,8 @@ Two entry points share one classification helper:
 * :func:`reconcile_silent_orphans` — runs ONCE at supervisor start,
   BEFORE :func:`supervisor.reconcile.reconcile_orphans`. Walks every
   state YAML with ``status="running"`` and grades each by heartbeat
-  silence: SILENT → flip to ``possibly_hung`` for operator inspection;
+  silence: SILENT → flip to ``possibly_hung``, with the worker on record
+  when it still runs (see below), for operator inspection otherwise;
   KILL → terminate the worker's process group and flip to ``failed``.
   Without this pass, the broad demotion sweep in ``reconcile_orphans``
   auto-redispatches genuinely-hung tasks, burning slots on a re-hang.
@@ -52,17 +53,24 @@ Both wrap the per-record classification in :func:`_classify_and_act`
 so silence semantics stay identical: SILENT iff silence >
 ``heartbeat_silence_alert_s``; KILL iff silence >
 ``heartbeat_silence_kill_s`` (when set). HEALTHY records produce no
-result and no state change. :func:`liveness_verdict` gives the same
-verdict without acting, for startup adoption
-(:mod:`supervisor.adoption`), so a worker the reaper leaves running is
-one adoption takes.
+result and no state change. :func:`liveness_verdict` gives the verdict
+on the heartbeat and the signs of life without acting, for startup
+adoption (:mod:`supervisor.adoption`). It leaves out the Layer-3
+filesystem check and a task it cannot grade, so a worker the reaper
+keeps running only for those reasons is adopted only if its recorded
+heartbeat is within the alert window; ``reconcile_orphans`` parks the
+rest whose worker runs.
 
 Neither pass signals a pid, or sets a task whose worker is still running
 to ``failed``, before :func:`runner.dispatcher.probe_worker` says the pid
-is still the recorded worker. A kill the worker survives parks the task
-``possibly_hung`` (:func:`runner.dispatcher.park_live_worker`); a
-``failed`` task is dispatched again, and two workers would share its
-worktree.
+is still the recorded worker. A SILENT worker that still runs, and a
+worker that survives a kill, are parked ``possibly_hung`` with the worker
+on record (:func:`runner.dispatcher.park_live_worker`): the worker holds
+its account's slot, and its run is recorded once it exits
+(``supervisor.adoption.track_parked_workers``). A ``failed`` task is
+dispatched again, and two workers would share its worktree. The SILENT
+park of a task whose worker is gone keeps the pass's own stop reason, and
+its ``error`` gives each sign of life's age.
 
 Steady-state TOCTOU guard
 -------------------------
@@ -916,9 +924,27 @@ class _Liveness:
     agent_heartbeat_at: datetime | None
     """``last_heartbeat_at``: the last event the dispatcher counts as the
     agent's own (see :mod:`runner.stream`)."""
-    sign_of_life_at: datetime | None
-    """The later of ``dispatcher_alive_at`` and the last write to the
-    worker's stream log."""
+    monitor_at: datetime | None
+    """``dispatcher_alive_at``: the last monitor-thread tick."""
+    log_written_at: datetime | None
+    """The last write to the worker's stream log."""
+
+    @property
+    def sign_of_life_at(self) -> datetime | None:
+        """The later of the monitor tick and the log write."""
+        signs = [at for at in (self.monitor_at, self.log_written_at) if at is not None]
+        return max(signs, default=None)
+
+    def describe(self, now: datetime) -> str:
+        """Each liveness timestamp's age at ``now``, for an operator."""
+
+        def age(at: datetime | None) -> str:
+            return "none this attempt" if at is None else f"{(now - at).total_seconds():.0f}s ago"
+
+        return (
+            f"agent heartbeat {age(self.agent_heartbeat_at)}, monitor tick "
+            f"{age(self.monitor_at)}, worker log write {age(self.log_written_at)}"
+        )
 
 
 def _read_liveness(state: TaskState) -> _Liveness | None:
@@ -930,15 +956,11 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
     def _this_attempt(at: datetime | None) -> datetime | None:
         return at if at is not None and at >= started_at else None
 
-    signs = [
-        at
-        for at in (_this_attempt(state.dispatcher_alive_at), _this_attempt(_log_written_at(state)))
-        if at is not None
-    ]
     return _Liveness(
         started_at=started_at,
         agent_heartbeat_at=_this_attempt(state.last_heartbeat_at),
-        sign_of_life_at=max(signs, default=None),
+        monitor_at=_this_attempt(state.dispatcher_alive_at),
+        log_written_at=_this_attempt(_log_written_at(state)),
     )
 
 
@@ -968,10 +990,11 @@ def liveness_verdict(
     :func:`runner.heartbeat.evaluate` on ``last_heartbeat_at``. ``None``
     when the state cannot be graded: no ``last_started_at``, or a
     timestamp in the future. Startup adoption adopts only a HEALTHY
-    worker, so a worker this module leaves ``running`` is one adoption
-    takes. Neither the filesystem walk (Layer 3) nor the stuck-sleep-loop
+    worker. Neither the filesystem walk (Layer 3) nor the stuck-sleep-loop
     pierce runs here; the startup reaper, which runs before adoption, has
-    already applied both.
+    already applied both. A worker the reaper kept running for recent
+    filesystem activity has that activity's time as its heartbeat, and is
+    HEALTHY here only if it is within ``heartbeat_silence_alert_s``.
     """
     liveness = _read_liveness(state)
     if liveness is None:
@@ -1171,20 +1194,30 @@ def _classify_and_act(
             )
         survived = not sigtermed and worker_probe_fn(state) is WorkerProbe.ALIVE
 
-    if status.verdict is HeartbeatVerdict.SILENT:
-        worker = (
-            f"worker pid={state.pid} was not signalled and may still be running"
-            if state.pid is not None
-            else "no worker pid on record"
-        )
+    silence = (
+        f"no sign of life within heartbeat_silence_alert_s="
+        f"{settings.heartbeat_silence_alert_s:.0f} ({liveness.describe(now)})"
+    )
+    if (
+        status.verdict is HeartbeatVerdict.SILENT
+        and state.pid is not None
+        and worker_probe_fn(state) is WorkerProbe.ALIVE
+    ):
+        # The worker runs, however quiet: parked with it on record, it
+        # holds its account's slot and its run is recorded once it exits.
+        demoted = park_live_worker(state, why=f"but showed {silence}")
+    elif status.verdict is HeartbeatVerdict.SILENT:
         demoted = state.model_copy(
             update={
                 "status": "possibly_hung",
                 "stop_reason": silent_stop_reason,
                 "error": (
-                    f"{silent_stop_reason}: {status.silence_s:.0f}s without a heartbeat, "
-                    f"worker log write or monitor tick (heartbeat_silence_alert_s="
-                    f"{settings.heartbeat_silence_alert_s:.0f}); {worker}"
+                    f"{silent_stop_reason}: {silence}; "
+                    + (
+                        f"its worker pid={state.pid} is gone"
+                        if state.pid is not None
+                        else "no worker pid on record"
+                    )
                 ),
                 # Clear pid so a subsequent reaper pass (or downstream
                 # tooling that surfaces "live" pids) doesn't think the

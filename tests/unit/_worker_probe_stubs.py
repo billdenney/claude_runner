@@ -22,6 +22,11 @@ def worker_alive(_state: TaskState) -> WorkerProbe:
     return WorkerProbe.ALIVE
 
 
+def worker_gone(_state: TaskState) -> WorkerProbe:
+    """No process has the recorded pid any more."""
+    return WorkerProbe.DEAD
+
+
 def probes(*answers: WorkerProbe) -> Callable[[TaskState], WorkerProbe]:
     """A probe giving ``answers`` in turn, then the last one for every later call."""
     remaining = list(answers)

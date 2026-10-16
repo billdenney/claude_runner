@@ -31,13 +31,14 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 from claude_task_runner.supervisor.reconcile_silent import (
     KILL_STOP_REASON,
     STEADY_SILENT_STOP_REASON,
     reap_silent_orphans_tick,
 )
 
-from ._worker_probe_stubs import worker_alive
+from ._worker_probe_stubs import worker_alive, worker_gone
 
 
 def _queue(tmp_path: Path) -> Path:
@@ -152,7 +153,7 @@ def test_silent_flips_to_possibly_hung_with_steady_stop_reason(tmp_path: Path) -
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
         terminate_fn=recorder,
-        worker_probe_fn=worker_alive,
+        worker_probe_fn=worker_gone,
     )
 
     assert len(results) == 1
@@ -168,9 +169,55 @@ def test_silent_flips_to_possibly_hung_with_steady_stop_reason(tmp_path: Path) -
     assert reloaded.stop_reason == STEADY_SILENT_STOP_REASON
     assert reloaded.pid is None
     assert reloaded.session_id == "sess-1"
+    assert reloaded.error == (
+        "silent_steady_state: no sign of life within heartbeat_silence_alert_s=300 "
+        "(agent heartbeat 500s ago, monitor tick none this attempt, worker log write "
+        "none this attempt); its worker pid=4321 is gone"
+    )
 
     # SILENT must not signal — same policy as the startup pass.
     assert calls == []
+
+
+def test_silent_live_worker_is_parked_with_its_pid(tmp_path: Path) -> None:
+    """A SILENT worker that still runs is parked with it on record
+    (worker_still_running), so it holds its account's slot and its run is
+    recorded once it exits; it is not signalled."""
+    qd = _queue(tmp_path)
+    _seed_running(
+        qd,
+        "t-quiet",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=500),
+        pid=4321,
+    )
+    calls: list[int] = []
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-quiet"},
+        settings=_settings(alert=300, kill=900),
+        clock=FakeClock(_now()),
+        terminate_fn=lambda pid: calls.append(pid) or True,
+        worker_probe_fn=worker_alive,
+    )
+
+    assert [(r.verdict, r.pid, r.sigtermed) for r in results] == [
+        (HeartbeatVerdict.SILENT, 4321, False)
+    ]
+    assert calls == []
+    reloaded = load_state(state_path_for(qd, "t-quiet"))
+    assert (reloaded.status, reloaded.stop_reason, reloaded.pid) == (
+        "possibly_hung",
+        LIVE_WORKER_STOP_REASON,
+        4321,
+    )
+    assert reloaded.error == (
+        "worker pid=4321 is still running but showed no sign of life within "
+        "heartbeat_silence_alert_s=300 (agent heartbeat 500s ago, monitor tick none this "
+        "attempt, worker log write none this attempt); parked so the task is not "
+        "dispatched again while it runs"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +558,7 @@ def test_silent_without_kill_threshold_marks_only(tmp_path: Path) -> None:
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
         terminate_fn=recorder,
-        worker_probe_fn=worker_alive,
+        worker_probe_fn=worker_gone,
     )
 
     assert len(results) == 1
