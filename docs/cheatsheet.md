@@ -130,6 +130,23 @@ At the default INFO level the log has just a `notify[...]` line on entry to
 stale reading puts an account in `NoReading`. There is no separate
 `events.ndjson` sink unless a host wires an event callback.
 
+### See what each account and task is waiting for
+
+```sh
+claude-task-runner account list --json
+claude-task-runner queue holds --json
+```
+
+`account list` gives each account's `dispatch_cap` (what dispatch allows
+it now: 0 while paused, throttled, without a reading, or with a broken
+settings file), `weekly_catch_up_at` for a `THROTTLED_WEEKLY` account (when
+the weekly curve meets its last reading, so when it should take tasks
+again; `scheduled_wakeup_at` is only the next re-check) and `usage_error`
+for an `ERROR_DRIFT` account (`auth`: log it in again; `format`: the usage
+page changed). `queue holds` runs the supervisor's task selection once,
+read-only: which tasks can start as soon as a slot is free and what holds
+each of the rest. `/runner-status` words both for a non-specialist.
+
 ### Make a queue push harder during the day
 
 ```toml
