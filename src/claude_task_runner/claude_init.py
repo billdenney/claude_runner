@@ -72,7 +72,7 @@ def ensure_initialized(
         return False
 
     # Raises TaskPathError for a working_dir whose ~user names no user; the
-    # dispatcher turns that into a DispatchError for the task.
+    # dispatcher parks the task (cannot start the worker).
     trust_key = str(expand_task_path(trust_dir, "working_dir").resolve())
 
     try:

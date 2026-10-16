@@ -13,7 +13,7 @@ instead, which each caller turns into its own error:
   expanded when it loads; later it fails only that account.
 * :func:`expand_task_path` for a task's ``working_dir`` or
   ``additional_dirs`` entry, or ``[worktree_reclaim].lock_file``
-  (:class:`TaskPathError`). A dispatch fails only that task, ``--add-dir``
+  (:class:`TaskPathError`). A dispatch parks only that task, ``--add-dir``
   skips the entry, a reclaim pass skips the task, and the lock file is
   refused when the queue TOML loads.
 """

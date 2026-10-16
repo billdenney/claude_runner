@@ -143,7 +143,8 @@ def test_a_worker_that_fails_to_start_leaves_the_gate(
     queue_dir: Path, task: Task, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Otherwise a stop would wait out the whole bound for a worker that
-    never started, and report it as abandoned."""
+    never started, and report it as abandoned. The task is parked, not left
+    ``running`` (``tests/unit/test_dispatch_unstartable.py``)."""
 
     def failing_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[str]:
         raise OSError("exec failed")
@@ -151,11 +152,15 @@ def test_a_worker_that_fails_to_start_leaves_the_gate(
     monkeypatch.setattr(subprocess, "Popen", failing_popen)
     gate = _RecordingGate(queue_dir, task.id)
 
-    with pytest.raises(OSError, match=r"^exec failed$"):
-        _dispatch(queue_dir, task, adopt=True, gate=gate)
+    outcome = _dispatch(queue_dir, task, adopt=True, gate=gate)
 
     assert gate.calls == [
         ("enter", False, None, None),
         ("leave", True, None, None),
     ]
     assert gate.close(0.0) == []
+    assert (outcome.new_state.status, outcome.new_state.deferred_reason) == (
+        "deferred",
+        "cannot start the worker: exec failed",
+    )
+    assert load_state(state_path_for(queue_dir, task.id)) == outcome.new_state
