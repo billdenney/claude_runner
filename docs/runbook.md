@@ -311,8 +311,10 @@ utilization above the trace target for the current elapsed fraction.
 
 ## Sidecars piling up
 
-**Symptom:** `claude-task-runner queue states --status awaiting_sidecar`
-shows many tasks waiting.
+**Symptom:** `claude-task-runner sidecar list` shows many open requests.
+(`queue states --status awaiting_sidecar` is not the count: a task keeps
+that status after its questions are answered, until it runs again.
+`claude-task-runner queue holds` counts the answered ones as able to start.)
 
 **Steps:**
 1. From Claude Code, `/runner-answer-sidecar` lists all open sidecars.
@@ -355,7 +357,14 @@ not paused or throttled.
    which it rewrites every tick, was modified within the last poll interval
    or two. The log line below cannot show that on its own, since it is
    logged only when something changes.
-2. Find the last line about eligible tasks in the supervisor log
+2. Run `claude-task-runner queue holds --queue <queue>`. It runs the
+   supervisor's own task selection once, without changing anything, and
+   says which tasks can start as soon as an account has a free slot and
+   what holds each of the rest now, in the categories below. Nothing
+   eligible, with every unfinished task held, is a drained queue. Tasks
+   eligible while an account has room but nothing runs is step 5.
+3. The supervisor's log has the same breakdown from when the queue last ran
+   dry. Find the last line about eligible tasks in it
    ([where the log goes](architecture.md#supervisor-log-and-drift-evidence)),
    e.g. `journalctl --user -u claude-task-runner | grep 'eligible tasks' | tail -1`.
    If it reads like
@@ -372,7 +381,7 @@ not paused or throttled.
    queue; step 1 is what shows the supervisor is still at work since. If
    the last line is `eligible tasks available again: N` instead, tasks
    were eligible at that tick.
-3. Each count names what holds those tasks:
+4. Each count names what holds those tasks:
    - `block_dispatch` — a `"block_dispatch": true` row for the task in the
      `[dispatch].dispatch_block_file` (ADR-0029). Remove the row to release it.
    - `readiness_missing_file`, `readiness_awaiting_sidecar_response` — an
@@ -391,7 +400,7 @@ not paused or throttled.
    - `in_flight` — already running under this supervisor.
    - `unparseable_task`, `unparseable_state` — a task or state YAML that
      does not load; the supervisor log names the file.
-4. No `no eligible tasks:` line since the last `dispatched task` line, on a
+5. No `no eligible tasks:` line since the last `dispatched task` line, on a
    supervisor that is ticking, means one of two things:
    - the ticks are not reaching candidate selection: every account is
      paused, throttled or without a reading, or every slot is taken;

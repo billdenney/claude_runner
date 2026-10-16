@@ -112,6 +112,37 @@ def _weekly_catch_up_at(
     return resets_at - timedelta(seconds=(1.0 - t_target) * weekly_window_s)
 
 
+def _eow_window_fraction(policy: ResolvedPolicy, weekly_window_s: float) -> float:
+    """The end-of-week segment's share of the weekly window."""
+    return policy.week.eow_time_switch_s / weekly_window_s if weekly_window_s > 0 else 0.0
+
+
+def weekly_catch_up(
+    policy: ResolvedPolicy,
+    *,
+    observed_pct: float,
+    resets_at: datetime,
+    weekly_window_s: float = _curve.SEVEN_DAYS_S,
+) -> datetime:
+    """When the weekly target curve rises to ``observed_pct`` (ADR-0022).
+
+    For a THROTTLED_WEEKLY account this is when it takes tasks again, as far
+    as the reading it was throttled on goes: the supervisor re-checks
+    earlier (its wakeup is clamped to the next 5h reset), and work still
+    running can raise the observed figure. ``resets_at`` is the end of the
+    current weekly window; observed at or above ``eow_pct`` gives the reset
+    itself.
+    """
+    return _weekly_catch_up_at(
+        observed_pct=observed_pct,
+        resets_at=resets_at,
+        policy_week_early_pct=policy.week.early_pct,
+        policy_week_eow_pct=policy.week.eow_pct,
+        eow_window_fraction=_eow_window_fraction(policy, weekly_window_s),
+        weekly_window_s=weekly_window_s,
+    )
+
+
 def _linear_ramp(
     *,
     observed_pct: int,
@@ -171,14 +202,12 @@ def decide(
     # ---- Weekly check ---------------------------------------------------
     weekly_target: float | None = None
     weekly_throttled = False
-    weekly_catch_up: datetime | None = None
+    catch_up_at: datetime | None = None
     if reading.seven_day.resets_at is not None:
         elapsed = _curve.elapsed_fraction(
             now, reading.seven_day.resets_at, window_s=weekly_window_s
         )
-        eow_window_fraction = (
-            policy.week.eow_time_switch_s / weekly_window_s if weekly_window_s > 0 else 0.0
-        )
+        eow_window_fraction = _eow_window_fraction(policy, weekly_window_s)
         weekly_target = _curve.target_pct(
             elapsed,
             early_pct=float(policy.week.early_pct),
@@ -187,12 +216,10 @@ def decide(
         )
         if float(observed_weekly) > weekly_target:
             weekly_throttled = True
-            weekly_catch_up = _weekly_catch_up_at(
+            catch_up_at = weekly_catch_up(
+                policy,
                 observed_pct=float(observed_weekly),
                 resets_at=reading.seven_day.resets_at,
-                policy_week_early_pct=policy.week.early_pct,
-                policy_week_eow_pct=policy.week.eow_pct,
-                eow_window_fraction=eow_window_fraction,
                 weekly_window_s=weekly_window_s,
             )
 
@@ -215,7 +242,7 @@ def decide(
     # ---- Decision -------------------------------------------------------
     if weekly_throttled:
         # Clamp: never sleep past the next 5h reset, never busy-spin.
-        candidate = weekly_catch_up
+        candidate = catch_up_at
         assert candidate is not None  # weekly_throttled implies resets_at present
         wakeup = max(min_wakeup, min(five_h_reset_wakeup, candidate))
         message = (
@@ -296,4 +323,5 @@ __all__ = [
     "FIVE_HOUR_LENGTH_S",
     "Decision",
     "decide",
+    "weekly_catch_up",
 ]
