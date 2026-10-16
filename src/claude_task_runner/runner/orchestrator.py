@@ -35,7 +35,9 @@ import contextlib
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -140,6 +142,90 @@ def planned_dispatch_order(queue_dir: Path) -> list[Task]:
 #                               will lift this when the window opens.
 _DISPATCHABLE_STATUSES = frozenset({"pending", "failed"})
 
+# Categories the selector counts a skipped task under (see
+# :func:`_skip_category`); they are the names the "no eligible tasks" line
+# prints. Every category is one snake_case word, so the line reads as
+# ``name count`` pairs and greps cleanly: the task-state or register name
+# where one exists (a status that is never dispatched is reported as the
+# status itself, ``running``, ``possibly_hung``, ...; ``block_dispatch``;
+# ``depends_on``), a snake_case phrase otherwise. A task held by readiness
+# is ``readiness_`` plus the categories of its unmet requirements, sorted
+# and joined by ``+`` (``readiness_missing_file``,
+# ``readiness_awaiting_sidecar_response+missing_file``).
+_SKIP_UNPARSEABLE_TASK = "unparseable_task"
+_SKIP_BLOCK_DISPATCH = "block_dispatch"
+_SKIP_IN_FLIGHT = "in_flight"
+_SKIP_UNPARSEABLE_STATE = "unparseable_state"
+_SKIP_UNANSWERED_SIDECAR = "unanswered_sidecar"
+_SKIP_DEFERRED_COOLDOWN = "deferred_cooldown"
+_SKIP_INVALID_EFFORT = "invalid_effort"
+_SKIP_DEPENDS_ON = "depends_on"
+_SKIP_READINESS_PREFIX = "readiness_"
+# Finished, not held: left out of the summary's unfinished count.
+_COMPLETED = "completed"
+
+
+def _unfinished_skips(skips: Mapping[str, int]) -> dict[str, int]:
+    """``skips`` (category -> count, as :func:`_eligible_candidates` fills it)
+    without the ``completed`` count."""
+    return {name: n for name, n in skips.items() if name != _COMPLETED}
+
+
+def _idle_summary(breakdown: Mapping[str, int]) -> str:
+    """The log line for a tick whose selector admitted no task.
+
+    ``breakdown`` is :func:`_unfinished_skips` of the selector's counts.
+    Categories are listed largest first, ties by name, so the same breakdown
+    always prints the same line.
+    """
+    if not breakdown:
+        return "no eligible tasks: no unfinished tasks in todo/"
+    parts = ", ".join(
+        f"{name} {n}" for name, n in sorted(breakdown.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return f"no eligible tasks: {sum(breakdown.values())} unfinished held ({parts})"
+
+
+@dataclass
+class IdleDispatchLog:
+    """Says in the log why a dispatch tick found nothing to dispatch.
+
+    An idle queue and a stalled supervisor otherwise look the same: both
+    leave the log silent. The supervisor keeps one of these for its lifetime
+    and passes it to every :func:`tick_dispatch`. When a tick gets as far as
+    choosing candidates (some account can dispatch, a slot is free) and the
+    selector admits none, one INFO line (:func:`_idle_summary`) breaks the
+    unfinished tasks down by what holds them. Later empty ticks log nothing
+    until that breakdown changes, so a queue that stays drained costs one
+    line, not one per tick. The ``in_flight`` count is printed but is not a
+    change on its own: it moves whenever a running task starts or finishes,
+    which says nothing new about why the rest are held. The first tick that
+    finds candidates after an empty spell logs that it did.
+    """
+
+    last_breakdown: dict[str, int] | None = None
+    """The unfinished-task breakdown last logged; ``None`` when the last
+    tick that chose candidates found some (or none has run yet)."""
+
+    def observe(self, n_eligible: int, skips: Mapping[str, int]) -> None:
+        """Record one selector pass: ``n_eligible`` admitted, the rest in ``skips``."""
+        if n_eligible > 0:
+            if self.last_breakdown is not None:
+                logger.info("eligible tasks available again: %d", n_eligible)
+                self.last_breakdown = None
+            return
+        breakdown = _unfinished_skips(skips)
+        last = self.last_breakdown
+        if last is not None and _without_in_flight(breakdown) == _without_in_flight(last):
+            return
+        self.last_breakdown = breakdown
+        logger.info("%s", _idle_summary(breakdown))
+
+
+def _without_in_flight(breakdown: Mapping[str, int]) -> dict[str, int]:
+    """``breakdown`` without the ``in_flight`` count, for change detection."""
+    return {name: n for name, n in breakdown.items() if name != _SKIP_IN_FLIGHT}
+
 
 def tick_dispatch(
     *,
@@ -154,6 +240,7 @@ def tick_dispatch(
     notify_callback: NotifyCallback | None = None,
     event_callback: EventCallback | None = None,
     spawn_gate: SpawnGate | None = None,
+    idle_log: IdleDispatchLog | None = None,
 ) -> SupervisorSnapshot:
     """Reap finished threads and dispatch new tasks up to the target.
 
@@ -195,6 +282,11 @@ def tick_dispatch(
     captured account — so a strict top-level gate alternated between
     "open" and "closed" each tick when one account was throttled and
     another was fine, halving effective dispatch throughput.
+
+    ``idle_log`` is the supervisor's :class:`IdleDispatchLog`. A tick that
+    reaches candidate selection reports to it how many tasks the selector
+    admitted and what held the rest, and it logs a summary when none were
+    admitted. ``None`` skips that report; dispatch is the same either way.
     """
     _reap_finished(
         in_flight_slots,
@@ -258,6 +350,7 @@ def tick_dispatch(
     # ``getattr`` tolerates the SimpleNamespace settings stubs some
     # tests pass; the real strict ``Settings`` always carries the field.
     block_file = getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None)
+    skips: Counter[str] = Counter()
     candidates = _eligible_candidates(
         queue_dir,
         in_flight_slots,
@@ -265,7 +358,10 @@ def tick_dispatch(
         now=clock.now(),
         block_file=block_file,
         effort_levels=settings.effort_levels,
+        skips=skips,
     )
+    if idle_log is not None:
+        idle_log.observe(len(candidates), skips)
     if not candidates:
         return _refresh_in_flight(snapshot, in_flight_slots)
 
@@ -745,13 +841,12 @@ def _park_deferred(
     Makes a hold VISIBLE. Without this a gate is silent: the selector
     skips the task on every tick with only a debug log, so ``queue states``
     still shows it ``pending`` and an operator investigating "why has this
-    never run?" has nothing to read. That gap is what forced hand-parking
-    five refharvest tasks with a hand-written ``deferred_reason`` on
-    2026-08-06.
+    never run?" has nothing to read, and has to park the task by hand to
+    leave any trace.
 
     Deliberately writes NO ``next_eligible_at``. A cooldown would break the
     ADR-0030 promise that a held task dispatches the first tick after its
-    element appears: the `deferred` branch in :func:`_eligible_candidates`
+    element appears: the `deferred` branch in :func:`_skip_category`
     falls straight through when ``next_eligible_at`` is unset, so the gates
     themselves stay the only thing holding the task and re-admission is
     immediate.
@@ -838,6 +933,7 @@ def _eligible_candidates(
     block_file: str | None = None,
     *,
     effort_levels: dict[str, list[str]],
+    skips: Counter[str] | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -847,6 +943,14 @@ def _eligible_candidates(
     # ``effort_levels`` is the merged ``[effort_levels]`` table the effort
     # gate checks each task's (model, effort) against. Required, with no
     # default: a caller that forgot it must fail, not skip the check.
+    #
+    # ``skips``, when given, is incremented once for every task YAML in
+    # ``todo/`` that is NOT returned, under the category that held it (see
+    # :func:`_skip_category`). A task whose state is ``completed`` is counted
+    # under ``completed`` whichever check skipped it first, so every other
+    # category counts unfinished work only. The returned tasks plus the
+    # counts added here equal the number of task YAMLs read.
+    tally: Counter[str] = skips if skips is not None else Counter()
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots.keys())
 
@@ -868,145 +972,185 @@ def _eligible_candidates(
             task = load_task(path)
         except Exception as exc:
             logger.warning("skipping unparseable task at %s: %s", path, exc)
+            tally[_SKIP_UNPARSEABLE_TASK] += 1
             continue
-        if task.id in blocked_ids:
-            # An operator has flagged this task `block_dispatch: true`
-            # (e.g. a paper awaiting a supplement). Skip it in the
-            # SELECTOR — without spawning a dispatch that the
-            # pre-dispatch hook would only exit-1 defer. That avoids
-            # burning a dispatch+defer cycle (and, on a 1-slot account,
-            # briefly re-occupying the only slot) every cooldown for a
-            # task known to be blocked. The hook remains the enforcing
-            # backstop for any task that slips through. (ADR-0029)
-            continue
-        if task.id in in_flight_ids:
-            continue
-
-        # ``state`` stays in scope past this block: the effort and readiness
-        # gates below need it to record / clear a hold, and they must apply to
-        # a task that has no state file yet (never dispatched) exactly as they
-        # do to one resuming from awaiting_sidecar, deferred, or failed.
-        state: TaskState | None = None
-        sp = state_path_for(queue_dir, task.id)
-        if sp.exists():
-            try:
-                state = load_state(sp)
-            except Exception as exc:
-                # Unparseable state file (disk corruption, a partial
-                # write from a crashed dispatcher). Do NOT treat this as
-                # "not yet dispatched": that silently makes the task
-                # eligible, so a *completed* task could be re-dispatched —
-                # duplicate work and wasted cap. Skip the task and log so
-                # the corruption is visible; an operator (or the doctor
-                # check) must delete or rebuild the state file. Surfacing
-                # this via doctor is tracked separately.
-                logger.error("skipping task %s: unparseable state %s: %s", task.id, sp, exc)
-                continue
-            if state.status not in _DISPATCHABLE_STATUSES:
-                # Special case: awaiting_sidecar tasks become
-                # dispatchable AGAIN once every sidecar request has
-                # a matching response file. Without this, a task
-                # that stopped to ask an operator question stays
-                # stuck forever — the operator's response file is
-                # written but the orchestrator never re-evaluates.
-                # Fixed 2026-05-15 after live observation that 5
-                # answered sidecars on the popPK queue had stayed
-                # in awaiting_sidecar for >90 minutes despite
-                # response-001.json files being in place.
-                if state.status == "awaiting_sidecar" and task.id in open_sidecar_task_ids:
-                    # A request is still unanswered — keep the task
-                    # ineligible until the operator responds.
-                    continue
-                if state.status == "deferred":
-                    # A task parked by a pre-dispatch hook deferral (exit
-                    # 1 — e.g. an input awaiting operator re-acquisition
-                    # or a pending trim) becomes dispatchable again once
-                    # its re-check cooldown elapses. Re-dispatch re-runs
-                    # the hook: if the input is ready it proceeds,
-                    # otherwise the dispatcher re-parks it with a fresh
-                    # cooldown. The cooldown is what keeps a still-blocked
-                    # task from being re-picked every tick — the original
-                    # reason exit-1 deferrals were (wrongly) force-counted
-                    # toward the circuit breaker.
-                    if (
-                        now is not None
-                        and state.next_eligible_at is not None
-                        and now < state.next_eligible_at
-                    ):
-                        continue
-                    # cooldown elapsed (or unset) → fall through, re-attempt.
-                elif state.status != "awaiting_sidecar":
-                    # Any other non-dispatchable status (running,
-                    # completed, failed_circuit_breaker, ...) stays
-                    # skipped.
-                    continue
-                # awaiting_sidecar with every request answered, OR a
-                # deferred task past its cooldown: fall through to the
-                # depends_on check and add to out.
-
-        # Effort gate (ADR-0010): a task whose (model, effort) pair the merged
-        # [effort_levels] rejects is never dispatched. It is parked as
-        # `deferred` with an `invalid effort: ...` reason and a WARNING, and
-        # un-parked the first tick after the task YAML is fixed (or the TOML
-        # is, and the supervisor re-reads it on SIGHUP). The task schema
-        # cannot check this: the accepted sets live in the settings.
-        #
-        # Like the readiness gate below, this sits AFTER the per-status
-        # branching, so a completed, running or circuit-broken task is never
-        # re-parked because [effort_levels] changed under it. It sits BEFORE
-        # depends_on so an authoring error surfaces as soon as the task is
-        # queued, not only once its dependencies finish.
-        effort_reason = _effort_hold_reason(task, effort_levels)
-        if effort_reason is not None:
-            if not _is_parked_with(state, effort_reason):
-                # Once per transition, not once per tick.
-                logger.warning(
-                    "parking task %s as deferred: %s. Fix the task's model or effort, "
-                    "or add the pair to [effort_levels] and send the supervisor SIGHUP",
-                    task.id,
-                    effort_reason,
-                )
-                _park_deferred(queue_dir, task.id, state, effort_reason)
-            continue
-        state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
-
-        unmet = [d for d in task.depends_on if d not in completed_ids]
-        if unmet:
-            continue
-
-        # Mechanical readiness gates (ADR-0030): a task waiting on a file
-        # (or any no-AI precondition) is kept OUT of the candidate set until
-        # every element is satisfied — checked here in-process each tick, so
-        # it never burns a dispatch+hook+cooldown cycle and unblocks the
-        # first tick after the element appears. The open-sidecar set is
-        # already computed above; share it so a `sidecar_response` gate is a
-        # free set lookup. Empty `requires` (the default) → no-op.
-        #
-        # This sits AFTER the per-status branching on purpose, so it is the
-        # last word for EVERY resume path — pending, failed, deferred past
-        # its cooldown, and awaiting_sidecar whose requests have all been
-        # answered. `test_orchestrator_sidecar_resume.py` enumerates those
-        # statuses against an unsatisfied requirement so a future special
-        # case added above cannot quietly route around the gate.
-        unmet_reqs = readiness_mod.unmet_requirements(
-            task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids
+        category = _skip_category(
+            task,
+            queue_dir=queue_dir,
+            in_flight_ids=in_flight_ids,
+            completed_ids=completed_ids,
+            open_sidecar_task_ids=open_sidecar_task_ids,
+            blocked_ids=blocked_ids,
+            now=now,
+            effort_levels=effort_levels,
         )
-        if unmet_reqs:
-            logger.debug(
-                "task %s held by %d unmet readiness requirement(s): %s",
-                task.id,
-                len(unmet_reqs),
-                "; ".join(unmet_reqs),
-            )
-            _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(unmet_reqs))
-            continue
-
-        # Satisfied — if THIS gate is what parked the task, un-park it so the
-        # state stops advertising a block that has cleared.
-        _unpark(queue_dir, task.id, state, readiness_mod.is_hold_reason)
-
-        out.append(task)
+        if category is None:
+            out.append(task)
+        else:
+            tally[_COMPLETED if task.id in completed_ids else category] += 1
     return out
+
+
+def _skip_category(
+    task: Task,
+    *,
+    queue_dir: Path,
+    in_flight_ids: set[str],
+    completed_ids: set[str],
+    open_sidecar_task_ids: set[str],
+    blocked_ids: set[str],
+    now: datetime | None,
+    effort_levels: dict[str, list[str]],
+) -> str | None:
+    """Decide whether the selector admits ``task`` this tick.
+
+    Returns ``None`` when the task is eligible. Otherwise returns the
+    category of what holds it: one of the ``_SKIP_*`` names, the name of a
+    status that is never dispatched (``running``, ``possibly_hung``,
+    ``completed``, ...), or :data:`_SKIP_READINESS_PREFIX` followed by the
+    categories of the unmet requirements. Admission and the reason for a
+    refusal come from this one decision, so the summary
+    :class:`IdleDispatchLog` prints cannot disagree with what the selector
+    did.
+
+    The effort and readiness gates also park a held task as ``deferred`` and
+    un-park it once its hold clears (see :func:`_park_deferred`).
+    """
+    if task.id in blocked_ids:
+        # An operator has flagged this task `block_dispatch: true`
+        # (e.g. a paper awaiting a supplement). Skip it in the
+        # SELECTOR — without spawning a dispatch that the
+        # pre-dispatch hook would only exit-1 defer. That avoids
+        # burning a dispatch+defer cycle (and, on a 1-slot account,
+        # briefly re-occupying the only slot) every cooldown for a
+        # task known to be blocked. The hook remains the enforcing
+        # backstop for any task that slips through. (ADR-0029)
+        return _SKIP_BLOCK_DISPATCH
+    if task.id in in_flight_ids:
+        return _SKIP_IN_FLIGHT
+
+    # ``state`` stays in scope past this block: the effort and readiness
+    # gates below need it to record / clear a hold, and they must apply to
+    # a task that has no state file yet (never dispatched) exactly as they
+    # do to one resuming from awaiting_sidecar, deferred, or failed.
+    state: TaskState | None = None
+    sp = state_path_for(queue_dir, task.id)
+    if sp.exists():
+        try:
+            state = load_state(sp)
+        except Exception as exc:
+            # Unparseable state file (disk corruption, a partial
+            # write from a crashed dispatcher). Do NOT treat this as
+            # "not yet dispatched": that silently makes the task
+            # eligible, so a *completed* task could be re-dispatched —
+            # duplicate work and wasted cap. Skip the task and log so
+            # the corruption is visible; an operator (or the doctor
+            # check) must delete or rebuild the state file. Surfacing
+            # this via doctor is tracked separately.
+            logger.error("skipping task %s: unparseable state %s: %s", task.id, sp, exc)
+            return _SKIP_UNPARSEABLE_STATE
+        if state.status not in _DISPATCHABLE_STATUSES:
+            # Special case: awaiting_sidecar tasks become
+            # dispatchable AGAIN once every sidecar request has
+            # a matching response file. Without this, a task
+            # that stopped to ask an operator question stays
+            # stuck forever — the operator's response file is
+            # written but the orchestrator never re-evaluates.
+            if state.status == "awaiting_sidecar" and task.id in open_sidecar_task_ids:
+                # A request is still unanswered — keep the task
+                # ineligible until the operator responds.
+                return _SKIP_UNANSWERED_SIDECAR
+            if state.status == "deferred":
+                # A deferred task becomes dispatchable again once its
+                # ``next_eligible_at`` passes, whoever wrote it: the
+                # pre-dispatch hook (exit 1 — e.g. an input awaiting
+                # operator re-acquisition or a pending trim) or an
+                # operator by hand. Re-dispatch re-runs the hook: if the
+                # input is ready it proceeds, otherwise the dispatcher
+                # re-parks it with a fresh cooldown. The cooldown is what
+                # keeps a still-blocked task from being re-picked every
+                # tick.
+                if (
+                    now is not None
+                    and state.next_eligible_at is not None
+                    and now < state.next_eligible_at
+                ):
+                    return _SKIP_DEFERRED_COOLDOWN
+                # cooldown elapsed (or unset) → fall through, re-attempt.
+            elif state.status != "awaiting_sidecar":
+                # Any other non-dispatchable status (running,
+                # completed, failed_circuit_breaker, ...) stays
+                # skipped, counted under the status's own name.
+                return state.status
+            # awaiting_sidecar with every request answered, OR a
+            # deferred task past its cooldown: fall through to the
+            # gates below.
+
+    # Effort gate (ADR-0010): a task whose (model, effort) pair the merged
+    # [effort_levels] rejects is never dispatched. It is parked as
+    # `deferred` with an `invalid effort: ...` reason and a WARNING, and
+    # un-parked the first tick after the task YAML is fixed (or the TOML
+    # is, and the supervisor re-reads it on SIGHUP). The task schema
+    # cannot check this: the accepted sets live in the settings.
+    #
+    # Like the readiness gate below, this sits AFTER the per-status
+    # branching, so a completed, running or circuit-broken task is never
+    # re-parked because [effort_levels] changed under it. It sits BEFORE
+    # depends_on so an authoring error surfaces as soon as the task is
+    # queued, not only once its dependencies finish.
+    effort_reason = _effort_hold_reason(task, effort_levels)
+    if effort_reason is not None:
+        if not _is_parked_with(state, effort_reason):
+            # Once per transition, not once per tick.
+            logger.warning(
+                "parking task %s as deferred: %s. Fix the task's model or effort, "
+                "or add the pair to [effort_levels] and send the supervisor SIGHUP",
+                task.id,
+                effort_reason,
+            )
+            _park_deferred(queue_dir, task.id, state, effort_reason)
+        return _SKIP_INVALID_EFFORT
+    state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
+
+    unmet = [d for d in task.depends_on if d not in completed_ids]
+    if unmet:
+        return _SKIP_DEPENDS_ON
+
+    # Mechanical readiness gates (ADR-0030): a task waiting on a file
+    # (or any no-AI precondition) is kept OUT of the candidate set until
+    # every element is satisfied — checked here in-process each tick, so
+    # it never burns a dispatch+hook+cooldown cycle and unblocks the
+    # first tick after the element appears. The open-sidecar set is
+    # already computed above; share it so a `sidecar_response` gate is a
+    # free set lookup. Empty `requires` (the default) → no-op.
+    #
+    # This sits AFTER the per-status branching on purpose, so it is the
+    # last word for EVERY resume path — pending, failed, deferred past
+    # its cooldown, and awaiting_sidecar whose requests have all been
+    # answered. `test_orchestrator_sidecar_resume.py` enumerates those
+    # statuses against an unsatisfied requirement so a future special
+    # case added above cannot quietly route around the gate.
+    unmet_reqs = readiness_mod.unmet_details(
+        task, queue_dir, open_sidecar_task_ids=open_sidecar_task_ids
+    )
+    if unmet_reqs:
+        descriptions = [u.description for u in unmet_reqs]
+        logger.debug(
+            "task %s held by %d unmet readiness requirement(s): %s",
+            task.id,
+            len(descriptions),
+            "; ".join(descriptions),
+        )
+        _park_deferred(queue_dir, task.id, state, readiness_mod.hold_reason(descriptions))
+        # Sorted and de-duplicated, so tasks missing the same kinds of
+        # element share one category whatever order their `requires` lists.
+        return _SKIP_READINESS_PREFIX + "+".join(sorted({u.category for u in unmet_reqs}))
+
+    # Satisfied — if THIS gate is what parked the task, un-park it so the
+    # state stops advertising a block that has cleared.
+    _unpark(queue_dir, task.id, state, readiness_mod.is_hold_reason)
+
+    return None
 
 
 def _dispatch_one_safely(

@@ -156,9 +156,27 @@ or recent failures), follow the prioritized triage flow below.
       parsed. `queue states` lists those whatever `--status` asks for,
       so report them separately, not as deferred.
 
-   9. **Healthy summary** — if none of the above, one terse line:
-      "Supervisor (state) · 5h NN% · weekly NN% · pending K ·
-      in-flight M".
+   9. **Nothing in flight** — if no task is in flight and some account
+      is open for dispatch, read the last line about eligible tasks in
+      the supervisor log (`journalctl --user -u claude-task-runner |
+      grep 'eligible tasks' | tail -1` under systemd; grep
+      `<queue>/.claude_task_runner/supervisor.log` under cron). A
+      `no eligible tasks: N unfinished held (...)` line counts the
+      unfinished tasks by what holds them (`block_dispatch`,
+      `readiness_missing_file`, `depends_on`, a status name, ...). It
+      says the queue was drained as of that line's timestamp, not that
+      the supervisor is ticking now: it is logged only when the counts
+      change, so it may be days old. Confirm liveness separately (the
+      snapshot's PID line, and `supervisor.json` modified within the last
+      poll interval or two, since the supervisor rewrites it every tick)
+      before reporting the counts as a drained queue. If the last line is
+      `eligible tasks available again` instead, the queue had work at
+      that tick. The runbook section "Nothing dispatches, but an account
+      has room" explains each count.
+
+   10. **Healthy summary** — if none of the above, one terse line:
+       "Supervisor (state) · 5h NN% · weekly NN% · pending K ·
+       in-flight M".
 
 3. **Don't auto-fix anything.** This skill is read-only. If the user
    wants action (resume a failed task, answer a sidecar, restart the
