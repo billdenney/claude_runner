@@ -42,8 +42,11 @@ from pathlib import Path
 from types import FrameType
 
 from claude_task_runner.clock import Clock, RealClock
+from claude_task_runner.config.linux_user import needs_sudo
 from claude_task_runner.config.loader import (
     AccountResolution,
+    BrokenAccount,
+    BrokenCause,
     ConfigError,
     load_settings,
     resolve_accounts,
@@ -51,6 +54,7 @@ from claude_task_runner.config.loader import (
 from claude_task_runner.config.schema import (
     AccountConcurrencyPolicy,
     AccountPolicy,
+    ResolvedAccount,
     Settings,
     WorktreeReclaimSettings,
 )
@@ -289,25 +293,31 @@ def _file_stamp(path: str) -> tuple[int, int] | None:
 
 @dataclass
 class AccountFileWatch:
-    """Logs each account whose ``runner-account.toml`` does not load, and its recovery.
+    """Logs each account that cannot take tasks, and its recovery.
 
     The supervisor keeps one for its lifetime and shows it every tick's
     :class:`config.loader.AccountResolution`. For a broken account it logs
-    one ERROR naming the account and the error (which names the file), and
-    again only when the error or the file changes, so an edit that leaves
-    it broken is reported too. When the file loads again it logs one INFO
-    line. While no declared account loads it also logs, once, an ERROR
-    saying nothing can dispatch.
+    one ERROR naming the account and the error, and again only when the
+    error changes or, for a ``runner-account.toml`` that does not load,
+    the file does, so an edit that leaves it broken is reported too. When
+    the account can take tasks again it logs one INFO line saying what
+    cleared, by the :attr:`~config.loader.BrokenAccount.cause` it had: the
+    file loads (or is gone, so the defaults apply), the ``config_dir`` is
+    there, or ``sudo`` is on PATH (or no longer needed). While no declared
+    account loads it also logs, once, an ERROR saying nothing can dispatch.
     """
 
-    logged: dict[str, tuple[str, str, tuple[int, int] | None]] = field(default_factory=dict)
-    """Per broken account: ``(path, error, file stamp)`` of the last ERROR."""
+    logged: dict[str, tuple[BrokenCause, str, str, tuple[int, int] | None]] = field(
+        default_factory=dict
+    )
+    """Per broken account: ``(cause, path, error, file stamp)`` of the last
+    ERROR; the stamp is ``None`` unless the cause is the file."""
 
     all_broken_logged: bool = False
 
     def observe(self, resolution: AccountResolution) -> None:
         for broken in resolution.broken:
-            key = (broken.path, broken.error, _file_stamp(broken.path))
+            key = (broken.cause, broken.path, broken.error, _broken_stamp(broken))
             if self.logged.get(broken.name) == key:
                 continue
             self.logged[broken.name] = key
@@ -316,21 +326,12 @@ class AccountFileWatch:
                 broken.name,
                 broken.error,
             )
-        loaded = {acct.name for acct in resolution.accounts}
+        loaded = {acct.name: acct for acct in resolution.accounts}
         for name in [n for n in self.logged if n not in resolution.broken_names]:
-            path, _error, _stamp = self.logged.pop(name)
-            if name not in loaded:
-                continue
-            if os.path.lexists(path):
-                logger.info("account %r takes tasks again: %s loads", name, path)
-            else:
-                # Deleted, or never there: a config_dir that did not exist
-                # (a mount not up yet) and now does without the file.
+            cause, path, _error, _stamp = self.logged.pop(name)
+            if name in loaded:
                 logger.info(
-                    "account %r takes tasks again: %s does not exist, so the defaults "
-                    "apply (max_concurrency = 1 and the queue's [dispatch_pct.*])",
-                    name,
-                    path,
+                    "account %r takes tasks again: %s", name, _recovery(cause, path, loaded[name])
                 )
         if resolution.broken and not resolution.accounts:
             if not self.all_broken_logged:
@@ -341,6 +342,33 @@ class AccountFileWatch:
                 )
         else:
             self.all_broken_logged = False
+
+
+def _broken_stamp(broken: BrokenAccount) -> tuple[int, int] | None:
+    """The stamp of ``broken``'s file when the file is what does not load;
+    ``None`` for any other cause, whose file (an empty ``path`` included,
+    which would stat the working directory) says nothing about it."""
+    return _file_stamp(broken.path) if broken.cause == "file" else None
+
+
+def _recovery(cause: BrokenCause, path: str, account: ResolvedAccount) -> str:
+    """What cleared for an account that had ``cause`` and loads again."""
+    if cause == "sudo":
+        if needs_sudo(account.linux_user):
+            return "sudo is on PATH"
+        return "its workers no longer run as another Linux user, so it needs no sudo"
+    if os.path.lexists(path):
+        policy = f"{path} loads"
+    else:
+        # Deleted, or never there: a config_dir that did not exist
+        # (a mount not up yet) and now does without the file.
+        policy = (
+            f"{path} does not exist, so the defaults apply "
+            "(max_concurrency = 1 and the queue's [dispatch_pct.*])"
+        )
+    if cause == "config_dir":
+        return f"its config_dir can be read, and {policy}"
+    return policy
 
 
 def _resolve_account_policy(ctx: TickContext, account_name: str | None) -> AccountPolicy:

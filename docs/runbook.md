@@ -222,17 +222,19 @@ usual, and it adds nothing to the queue's concurrency ceiling. Only a
    start limit, `systemctl --user reset-failed claude-task-runner` and
    start it.
 3. If it was running, nothing else is needed: the supervisor re-reads the
-   file every tick, logs that the account `takes tasks again: <path>
-   loads`, and dispatches to it on that tick. If the file was broken for
-   longer than `[usage].max_reading_age_s`, the account waits for its next
-   clean usage reading first, within one capture cycle.
+   file every tick, logs that the account `takes tasks again`, saying
+   what cleared, and dispatches to it on that tick: `<path> loads` for a
+   fixed file, `its config_dir can be read, and <path> loads` for a
+   `config_dir` that is back, and `sudo is on PATH` once `sudo` is
+   found. If the account was broken for longer than
+   `[usage].max_reading_age_s`, it waits for its next clean usage reading
+   first, within one capture cycle.
 4. Deleting the file instead gives the account the defaults
    (`max_concurrency = 1`, the queue's `[dispatch_pct.*]`); the log line
    then says the file `does not exist, so the defaults apply`, as it does
-   when a `config_dir` that did not exist appears without the file. An
-   empty file is
-   not the same as no file: it stays broken until it is deleted or filled
-   in.
+   (after `its config_dir can be read, and`) when a `config_dir` that did
+   not exist appears without the file. An empty file is not the same as no
+   file: it stays broken until it is deleted or filled in.
 
 ## Supervisor crashed repeatedly (watchdog crash-loop)
 

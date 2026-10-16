@@ -132,7 +132,7 @@ class TestResolveAccounts:
         assert [a.name for a in resolution.accounts] == ["work"]
         assert resolution.accounts[0].policy.concurrency.max_concurrency == 3
         assert resolution.broken == (
-            BrokenAccount(name="personal", path=str(path), error=_invalid_toml(path)),
+            BrokenAccount(name="personal", path=str(path), error=_invalid_toml(path), cause="file"),
         )
         assert resolution.policies == {"work": resolution.accounts[0].policy}
         assert resolution.broken_names == frozenset({"personal"})
@@ -184,6 +184,7 @@ class TestResolveAccounts:
                 name="personal",
                 path=str(path),
                 error=error.format(path=path, pydantic=pydantic_minor),
+                cause="file",
             ),
         )
 
@@ -200,6 +201,7 @@ class TestResolveAccounts:
         )
         # The target may appear yet (a file saved elsewhere, a mount).
         assert resolution.broken[0].transient is True
+        assert resolution.broken[0].cause == "file"
 
     def test_a_home_removed_while_running_is_broken(
         self, tmp_path: Path, two_accounts: dict[str, Path]
@@ -222,6 +224,7 @@ class TestResolveAccounts:
                     "config_dir '~no-such-user-ctr-test/.claude' cannot be expanded: "
                     "Could not determine home directory."
                 ),
+                cause="config_dir",
             ),
         )
         assert check_dispatch_pct_legacy(settings, tmp_path).status is CheckStatus.PASS
@@ -238,6 +241,7 @@ class TestResolveAccounts:
         )
         # A directory where the file belongs does not go away by itself.
         assert resolution.broken[0].transient is False
+        assert resolution.broken[0].cause == "file"
 
     def test_a_config_dir_without_the_file_is_the_defaults(self, tmp_path: Path) -> None:
         config_dir = tmp_path / "acct"
@@ -261,6 +265,7 @@ class TestResolveAccounts:
                 name="solo",
                 path=str(config_dir / PER_ACCOUNT_TOML_NAME),
                 error=f"config_dir {config_dir} does not exist",
+                cause="config_dir",
                 transient=True,
             ),
         )
@@ -280,6 +285,7 @@ class TestResolveAccounts:
                 name="solo",
                 path=str(path),
                 error=f"{not_a_dir} is not a directory, so {path} cannot be read",
+                cause="config_dir",
                 transient=False,
             ),
         )
@@ -332,6 +338,7 @@ class TestLinuxUser:
                     name="work",
                     path=str(two_accounts["work"] / PER_ACCOUNT_TOML_NAME),
                     error="linux_user='bill-work' requested but sudo not on PATH",
+                    cause="sudo",
                 ),
             )
             assert [a.name for a in resolution.accounts] == ["personal"]
@@ -484,9 +491,98 @@ class TestAccountFileWatch:
             f"config_dir {config_dir} does not exist",
         )
         assert _messages(caplog, logging.INFO) == [
-            f"account 'solo' takes tasks again: {config_dir / PER_ACCOUNT_TOML_NAME} does not "
-            "exist, so the defaults apply (max_concurrency = 1 and the queue's "
-            "[dispatch_pct.*])"
+            f"account 'solo' takes tasks again: its config_dir can be read, and "
+            f"{config_dir / PER_ACCOUNT_TOML_NAME} does not exist, so the defaults apply "
+            "(max_concurrency = 1 and the queue's [dispatch_pct.*])"
+        ]
+
+    def test_a_config_dir_that_appears_with_the_file_says_it_loads(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config_dir = tmp_path / "acct"
+        accounts = {"solo": config_dir}
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+            watch.observe(self._resolve(tmp_path, accounts))
+            write_account_cap(config_dir, 2)
+            watch.observe(self._resolve(tmp_path, accounts))
+        assert _messages(caplog, logging.INFO) == [
+            f"account 'solo' takes tasks again: its config_dir can be read, and "
+            f"{config_dir / PER_ACCOUNT_TOML_NAME} loads"
+        ]
+
+    @pytest.mark.parametrize(
+        ("linux_user_after", "recovery"),
+        [
+            ("bill-work", "sudo is on PATH"),
+            (None, "its workers no longer run as another Linux user, so it needs no sudo"),
+        ],
+        ids=["sudo-installed", "linux-user-dropped"],
+    )
+    def test_sudo_coming_back_is_not_called_a_file_that_loads(
+        self,
+        tmp_path: Path,
+        two_accounts: dict[str, Path],
+        caplog: pytest.LogCaptureFixture,
+        linux_user_after: str | None,
+        recovery: str,
+    ) -> None:
+        """``work`` runs as another Linux user with no sudo on PATH; its file
+        loads all along. It recovers when sudo appears, or when the queue
+        TOML stops running it as another user."""
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+
+        def resolve(linux_user: str | None, sudo: str | None) -> AccountResolution:
+            accounts = [
+                a.model_copy(update={"linux_user": linux_user}) if a.name == "work" else a
+                for a in settings.accounts
+            ]
+            with (
+                patch("claude_task_runner.config.linux_user.current_username", return_value="bill"),
+                patch("claude_task_runner.config.linux_user.shutil.which", return_value=sudo),
+            ):
+                resolution = resolve_accounts(settings.model_copy(update={"accounts": accounts}))
+                watch.observe(resolution)
+            return resolution
+
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+            resolve("bill-work", None)
+            sudo_after = "/usr/bin/sudo" if linux_user_after else None
+            resolve(linux_user_after, sudo_after)
+        assert _messages(caplog, logging.ERROR) == [
+            "account 'work' takes no new tasks until this is fixed: "
+            "linux_user='bill-work' requested but sudo not on PATH"
+        ]
+        assert _messages(caplog, logging.INFO) == [f"account 'work' takes tasks again: {recovery}"]
+
+    def test_a_sudo_problem_is_not_logged_again_when_the_working_directory_changes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An account with an empty config_dir has no file, so its path is
+        ``""``. Only the error identifies its sudo problem: a change in the
+        supervisor's working directory, which ``""`` would stat, is not a
+        new one."""
+        broken = BrokenAccount(
+            name="default",
+            path="",
+            error="linux_user='bill-work' requested but sudo not on PATH",
+            cause="sudo",
+        )
+        resolution = AccountResolution(accounts=(), broken=(broken,))
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        watch = AccountFileWatch()
+        with caplog.at_level(logging.ERROR, logger=DAEMON_LOGGER):
+            watch.observe(resolution)
+            (cwd / "new-file").write_text("x" * 100, encoding="utf-8")
+            os.utime(cwd, ns=(5_000_000_000, 5_000_000_000))
+            watch.observe(resolution)
+        assert _messages(caplog, logging.ERROR) == [
+            "account 'default' takes no new tasks until this is fixed: "
+            "linux_user='bill-work' requested but sudo not on PATH",
+            "no account can take tasks (default): nothing is dispatched until one is fixed",
         ]
 
 
@@ -978,7 +1074,7 @@ class TestCli:
         as_json = invoke_cli(["supervisor", "status", "--queue", str(queue_dir), "--json"])
         assert as_json.exit_code == 0, as_json.output
         assert json.loads(as_json.stdout)["account_errors"] == [
-            {"name": "personal", "path": str(path), "error": _invalid_toml(path)}
+            {"name": "personal", "cause": "file", "path": str(path), "error": _invalid_toml(path)}
         ]
 
 

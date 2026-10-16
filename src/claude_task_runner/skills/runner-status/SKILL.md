@@ -82,9 +82,11 @@ supervisor's own `--config` to `account list` and `queue holds`
 supervisor's working directory. When that directory cannot be read it
 passes none, and the summary says the supervisor's settings are unknown.
 
-`claude-task-runner account list --json` exits 1 both when an account's
-runner-account.toml does not load (the listing shows it, in that row's
-`policy_error`) and when the queue TOML cannot be read for now; output of
+`claude-task-runner account list --json` exits 1 both when an account
+cannot take tasks (its runner-account.toml does not load, its config_dir
+cannot hold one, or its linux_user needs sudo, which is not on PATH; the
+listing shows it, in that row's `policy_error`) and when the queue TOML
+cannot be read for now; output of
 the form `{"ok": false, "error": ...}` is an error with nothing listed, and
 exit 78 means the queue TOML's content is wrong. `queue holds --json` fails
 the same way. The summary then says, once, that the queue settings file
@@ -224,14 +226,21 @@ or recent failures), follow the prioritized triage flow below.
       the queue's `[claude].config_dir`. Stop here unless the user wants
       more.
 
-   2. **Broken account settings file** — if `account_errors` is
-      non-empty: each entry is an account whose `runner-account.toml`
-      does not load. That account silently takes no tasks and counts 0
-      toward the ceiling, while every other account runs as usual, so
-      nothing else looks wrong. Give the account, the file (`path`) and
-      the `error`, and say: fix the file; the account takes tasks again
-      at the supervisor's next tick. `snapshot.accounts.<name>.policy_error`
-      carries the same error.
+   2. **Account that cannot take tasks** — if `account_errors` is
+      non-empty: each entry is an account that silently takes no tasks
+      and counts 0 toward the ceiling, while every other account runs as
+      usual, so nothing else looks wrong. Its `cause` says why, and what
+      to fix: `file`, its `runner-account.toml` (`path`) does not load:
+      fix the file; `config_dir`, its config_dir cannot hold that file
+      (it does not exist, as on a mount not up yet, names no user's home,
+      or a path on the way is not a directory): fix the config_dir or
+      bring its mount up; `sudo`, its linux_user needs sudo, which is not
+      on the supervisor's PATH: install sudo or put it on that PATH (the
+      file is not the problem, so do not name it). Give the account and
+      the `error` (which names the file or directory at fault), and say
+      the account takes tasks again at the supervisor's next tick after
+      the fix. `snapshot.accounts.<name>.policy_error` carries the same
+      error.
 
    3. **No usage reading** — if `snapshot.state == "no_reading"`, or
       any entry of `snapshot.accounts` has `state == "no_reading"`:

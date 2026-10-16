@@ -876,6 +876,7 @@ class TestAccountFileErrno:
                 name="personal",
                 path="/tmp/x\x00y/runner-account.toml",
                 error="config_dir '/tmp/x\\x00y' contains a NUL byte",
+                cause="config_dir",
                 transient=False,
             ),
         )

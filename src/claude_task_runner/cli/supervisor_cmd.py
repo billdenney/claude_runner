@@ -616,7 +616,10 @@ def status(
         resolution.policies,
         broken=(b.name for b in resolution.broken),
     )
-    account_errors = [{"name": b.name, "path": b.path, "error": b.error} for b in resolution.broken]
+    account_errors = [
+        {"name": b.name, "cause": b.cause, "path": b.path, "error": b.error}
+        for b in resolution.broken
+    ]
 
     payload: dict[str, object] = {
         "queue_dir": str(queue_path),
