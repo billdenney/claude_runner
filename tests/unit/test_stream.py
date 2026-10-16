@@ -13,6 +13,7 @@ from claude_task_runner.runner.stream import (
     ResultEvent,
     StreamSummary,
     SystemInitEvent,
+    ThinkingEvent,
     UserMessageEvent,
     parse_line,
     parse_lines,
@@ -138,6 +139,18 @@ class TestParseLines:
         assert [type(e) for e in events] == [ResultEvent]
         assert summary.skipped_lines == 6
         assert summary.unknown_event_types == {"a": 2, "b": 1, "<NoneType>": 1, "<int>": 1}
+
+    def test_thinking_tokens_yields_a_thinking_event(self) -> None:
+        """Extended-thinking progress is yielded, so the agent heartbeat
+        ticks while the model thinks; it is not drift."""
+        line = (
+            '{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,'
+            '"estimated_tokens_delta":50,"session_id":"s1","uuid":"u1"}'
+        )
+        summary = StreamSummary()
+        assert list(parse_lines([line], summary=summary)) == [ThinkingEvent()]
+        assert summary.skipped_lines == 0
+        assert summary.session_id is None
 
     def test_system_with_unknown_subtype(self) -> None:
         line = '{"type": "system", "subtype": "unknown_thing"}'

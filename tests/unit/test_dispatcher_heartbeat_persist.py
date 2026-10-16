@@ -367,3 +367,32 @@ def test_quietly_skipped_events_never_tick_the_heartbeat() -> None:
     )
 
     assert persists == [started + timedelta(seconds=10), started + timedelta(seconds=60)]
+
+
+def test_thinking_progress_ticks_the_heartbeat() -> None:
+    """``system/thinking_tokens`` arrives while the model writes extended
+    thinking, which is the agent working: each one ticks the heartbeat. Other
+    ``system`` subtypes, such as ``task_started`` for a background tool, and
+    ``tool_progress`` do not."""
+    clock = FakeClock(datetime(2026, 10, 16, 13, 0, tzinfo=UTC))
+    started = clock.now()
+    thinking = (
+        '{"type":"system","subtype":"thinking_tokens","estimated_tokens":204,'
+        '"estimated_tokens_delta":154,"session_id":"s1","uuid":"u1"}'
+    )
+    task_started = '{"type":"system","subtype":"task_started","session_id":"s1"}'
+    progress = '{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":30}'
+    lines = [_system_init_line(), thinking, thinking, task_started, progress, _result_line()]
+    persists: list[datetime] = []
+
+    _dispatch_loop(
+        lines=_arriving_every(clock, 10, lines),
+        terminate=lambda: None,
+        settings_caps=_caps(persist_s=1.0),
+        clock=clock,
+        task=_task(),
+        started_at=started,
+        heartbeat_persist_fn=persists.append,
+    )
+
+    assert persists == [started + timedelta(seconds=s) for s in (10, 20, 30, 60)]
