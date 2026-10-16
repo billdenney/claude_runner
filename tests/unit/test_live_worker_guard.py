@@ -335,6 +335,32 @@ def _corrupt(queue_dir: Path, head: str) -> None:
     state_path_for(queue_dir, _TASK).write_text(head + "runs:\n- [unterminated\n  ]: {\n")
 
 
+def test_quarantine_finds_a_worker_by_its_salvaged_pid_alone(
+    queue_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another Linux user's worker: its stdout cannot be read, so no search
+    of the logs finds it. The pid and start time read from the corrupt
+    file's head do, and the task is parked with that worker."""
+    log = _log(queue_dir)
+    started = _NOW - timedelta(minutes=30)
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == _PID)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(tmp_path / "proc", _PID, started=started, boot=_NOW - timedelta(days=1)),
+    )
+    _corrupt(
+        queue_dir,
+        f"task_id: {_TASK}\nstatus: running\nlast_started_at: '{started.isoformat()}'\n"
+        f"pid: {_PID}\nlog_path: {log}\n",
+    )
+
+    results = quarantine_corrupt_state_files(queue_dir, now=_NOW)
+
+    assert [(r.task_id, r.preserved_status) for r in results] == [(_TASK, "possibly_hung")]
+    _assert_parked(queue_dir, log)
+
+
 @pytest.mark.parametrize("pid_on_record", [True, False])
 def test_quarantine_parks_a_task_whose_worker_still_runs(
     queue_dir: Path, live_worker: Path, pid_on_record: bool

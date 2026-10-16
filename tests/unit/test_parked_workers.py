@@ -141,11 +141,22 @@ def _park(
     return parked
 
 
-def _snapshot(accounts: list[str], in_flight: list[InFlightRecord]) -> SupervisorSnapshot:
+def _snapshot(
+    accounts: list[str], in_flight: list[InFlightRecord], util: dict[str, int] | None = None
+) -> SupervisorSnapshot:
+    """``util`` is each account's 5 h utilization; choose_account prefers the
+    least used account with room."""
     return SupervisorSnapshot(
         state=SupervisorState.DISPATCHING,
         since=_NOW,
-        accounts={n: AccountState(state=SupervisorState.DISPATCHING, since=_NOW) for n in accounts},
+        accounts={
+            n: AccountState(
+                state=SupervisorState.DISPATCHING,
+                since=_NOW,
+                last_5h_util_pct=(util or {}).get(n, 0),
+            )
+            for n in accounts
+        },
         in_flight=in_flight,
         in_flight_task_ids=[r.task_id for r in in_flight],
     )
@@ -182,7 +193,8 @@ def _tick(
 def test_parked_live_worker_holds_its_accounts_slot(
     queue_dir: Path, worker: dict[str, bool]
 ) -> None:
-    """``work`` and ``personal`` take one task each. The worker parked on
+    """``work`` and ``personal`` take one task each, and ``work`` is the
+    less used, so ``choose_account`` would pick it. The worker parked on
     ``work`` (as the previous tick's record says) holds work's slot, so of
     two pending tasks only one starts, on personal; the persisted list shows
     both."""
@@ -195,7 +207,7 @@ def test_parked_live_worker_holds_its_accounts_slot(
     snap, slots = _tick(
         queue_dir,
         _settings(names),
-        _snapshot(names, prior),
+        _snapshot(names, prior, util={"work": 10, "personal": 80}),
         [_resolved("work", 1), _resolved("personal", 1)],
     )
 
