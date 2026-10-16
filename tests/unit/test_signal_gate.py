@@ -179,7 +179,7 @@ def test_blocks_a_scan_of_a_tree_the_test_did_not_start(gate: SignalGate) -> Non
         gate.check_scan_root(1)
     assert str(exc_info.value) == (
         "the stuck-sleep-loop scan walked the real /proc from pid 1, which this test did "
-        "not start; inject stuck_loop_detect_fn, terminate_fn and sigterm_fn, or set "
+        "not start; inject stuck_loop_detect_fn and terminate_fn, or set "
         "bash_poll_antipattern_kill=False"
     )
 

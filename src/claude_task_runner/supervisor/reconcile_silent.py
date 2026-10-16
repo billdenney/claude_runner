@@ -36,7 +36,8 @@ Two entry points share one classification helper:
 * :func:`reconcile_silent_orphans` — runs ONCE at supervisor start,
   BEFORE :func:`supervisor.reconcile.reconcile_orphans`. Walks every
   state YAML with ``status="running"`` and grades each by heartbeat
-  silence: SILENT → flip to ``possibly_hung`` for operator inspection;
+  silence: SILENT → flip to ``possibly_hung``, with the worker on record
+  when it still runs (see below), for operator inspection otherwise;
   KILL → terminate the worker's process group and flip to ``failed``.
   Without this pass, the broad demotion sweep in ``reconcile_orphans``
   auto-redispatches genuinely-hung tasks, burning slots on a re-hang.
@@ -52,17 +53,24 @@ Both wrap the per-record classification in :func:`_classify_and_act`
 so silence semantics stay identical: SILENT iff silence >
 ``heartbeat_silence_alert_s``; KILL iff silence >
 ``heartbeat_silence_kill_s`` (when set). HEALTHY records produce no
-result and no state change. :func:`liveness_verdict` gives the same
-verdict without acting, for startup adoption
-(:mod:`supervisor.adoption`), so a worker the reaper leaves running is
-one adoption takes.
+result and no state change. :func:`liveness_verdict` gives the verdict
+on the heartbeat and the signs of life without acting, for startup
+adoption (:mod:`supervisor.adoption`). It leaves out the Layer-3
+filesystem check and a task it cannot grade, so a worker the reaper
+keeps running only for those reasons is adopted only if its recorded
+heartbeat is within the alert window; ``reconcile_orphans`` parks the
+rest whose worker runs.
 
 Neither pass signals a pid, or sets a task whose worker is still running
 to ``failed``, before :func:`runner.dispatcher.probe_worker` says the pid
-is still the recorded worker. A kill the worker survives parks the task
-``possibly_hung`` (:func:`supervisor.reconcile.park_live_worker`); a
-``failed`` task is dispatched again, and two workers would share its
-worktree.
+is still the recorded worker. A SILENT worker that still runs, and a
+worker that survives a kill, are parked ``possibly_hung`` with the worker
+on record (:func:`runner.dispatcher.park_live_worker`): the worker holds
+its account's slot, and its run is recorded once it exits
+(``supervisor.adoption.ParkedWorkerTracker``). A ``failed`` task is
+dispatched again, and two workers would share its worktree. The SILENT
+park of a task whose worker is gone keeps the pass's own stop reason, and
+its ``error`` gives each sign of life's age.
 
 Steady-state TOCTOU guard
 -------------------------
@@ -174,6 +182,7 @@ healthy.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -196,12 +205,11 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
-from claude_task_runner.runner.dispatcher import WorkerProbe
+from claude_task_runner.runner.dispatcher import WorkerProbe, park_live_worker
 from claude_task_runner.runner.heartbeat import (
     HeartbeatVerdict,
     evaluate,
 )
-from claude_task_runner.supervisor.reconcile import park_live_worker
 
 logger = logging.getLogger(__name__)
 
@@ -766,11 +774,10 @@ def reconcile_silent_orphans(
         Terminates the worker's process group (SIGTERM, then SIGKILL)
         and returns ``True`` iff the worker is confirmed gone; used on a
         KILL verdict and on a stuck sleep loop. Defaults to
-        :func:`_default_terminate_pg`. Tests inject a recorder.
+        :func:`terminate_worker`. Tests inject a recorder.
     worker_probe_fn
         Whether a state's recorded pid is still its worker. Defaults to
-        :func:`runner.dispatcher.probe_worker` on the state's pid, log
-        and start time.
+        :func:`runner.dispatcher.probe_recorded_worker` for ``queue_dir``.
 
     Returns
     -------
@@ -785,9 +792,11 @@ def reconcile_silent_orphans(
     if stuck_loop_detect_fn is None:
         stuck_loop_detect_fn = _detect_stuck_sleep_loop
     if terminate_fn is None:
-        terminate_fn = _default_terminate_pg
+        terminate_fn = terminate_worker
     if worker_probe_fn is None:
-        worker_probe_fn = _probe_recorded_worker
+        worker_probe_fn = functools.partial(
+            dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
+        )
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -873,9 +882,11 @@ def reap_silent_orphans_tick(
     if stuck_loop_detect_fn is None:
         stuck_loop_detect_fn = _detect_stuck_sleep_loop
     if terminate_fn is None:
-        terminate_fn = _default_terminate_pg
+        terminate_fn = terminate_worker
     if worker_probe_fn is None:
-        worker_probe_fn = _probe_recorded_worker
+        worker_probe_fn = functools.partial(
+            dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
+        )
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -918,9 +929,27 @@ class _Liveness:
     agent_heartbeat_at: datetime | None
     """``last_heartbeat_at``: the last event the dispatcher counts as the
     agent's own (see :mod:`runner.stream`)."""
-    sign_of_life_at: datetime | None
-    """The later of ``dispatcher_alive_at`` and the last write to the
-    worker's stream log."""
+    monitor_at: datetime | None
+    """``dispatcher_alive_at``: the last monitor-thread tick."""
+    log_written_at: datetime | None
+    """The last write to the worker's stream log."""
+
+    @property
+    def sign_of_life_at(self) -> datetime | None:
+        """The later of the monitor tick and the log write."""
+        signs = [at for at in (self.monitor_at, self.log_written_at) if at is not None]
+        return max(signs, default=None)
+
+    def describe(self, now: datetime) -> str:
+        """Each liveness timestamp's age at ``now``, for an operator."""
+
+        def age(at: datetime | None) -> str:
+            return "none this attempt" if at is None else f"{(now - at).total_seconds():.0f}s ago"
+
+        return (
+            f"agent heartbeat {age(self.agent_heartbeat_at)}, monitor tick "
+            f"{age(self.monitor_at)}, worker log write {age(self.log_written_at)}"
+        )
 
 
 def _read_liveness(state: TaskState) -> _Liveness | None:
@@ -932,15 +961,11 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
     def _this_attempt(at: datetime | None) -> datetime | None:
         return at if at is not None and at >= started_at else None
 
-    signs = [
-        at
-        for at in (_this_attempt(state.dispatcher_alive_at), _this_attempt(_log_written_at(state)))
-        if at is not None
-    ]
     return _Liveness(
         started_at=started_at,
         agent_heartbeat_at=_this_attempt(state.last_heartbeat_at),
-        sign_of_life_at=max(signs, default=None),
+        monitor_at=_this_attempt(state.dispatcher_alive_at),
+        log_written_at=_this_attempt(_log_written_at(state)),
     )
 
 
@@ -970,10 +995,11 @@ def liveness_verdict(
     :func:`runner.heartbeat.evaluate` on ``last_heartbeat_at``. ``None``
     when the state cannot be graded: no ``last_started_at``, or a
     timestamp in the future. Startup adoption adopts only a HEALTHY
-    worker, so a worker this module leaves ``running`` is one adoption
-    takes. Neither the filesystem walk (Layer 3) nor the stuck-sleep-loop
+    worker. Neither the filesystem walk (Layer 3) nor the stuck-sleep-loop
     pierce runs here; the startup reaper, which runs before adoption, has
-    already applied both.
+    already applied both. A worker the reaper kept running for recent
+    filesystem activity has that activity's time as its heartbeat, and is
+    HEALTHY here only if it is within ``heartbeat_silence_alert_s``.
     """
     liveness = _read_liveness(state)
     if liveness is None:
@@ -989,15 +1015,6 @@ def liveness_verdict(
         ).verdict
     except ValueError:
         return None
-
-
-def _probe_recorded_worker(state: TaskState) -> WorkerProbe:
-    """:func:`runner.dispatcher.probe_worker` on ``state``'s recorded worker."""
-    if state.pid is None:
-        return WorkerProbe.DEAD
-    return dispatcher_mod.probe_worker(
-        state.pid, log_path=state.log_path, started_at=state.last_started_at
-    )
 
 
 def _classify_and_act(
@@ -1182,26 +1199,37 @@ def _classify_and_act(
             )
         survived = not sigtermed and worker_probe_fn(state) is WorkerProbe.ALIVE
 
-    if status.verdict is HeartbeatVerdict.SILENT:
-        worker = (
-            f"worker pid={state.pid} was not signalled and may still be running"
-            if state.pid is not None
-            else "no worker pid on record"
-        )
+    silence = (
+        f"no sign of life within heartbeat_silence_alert_s="
+        f"{settings.heartbeat_silence_alert_s:.0f} ({liveness.describe(now)})"
+    )
+    if (
+        status.verdict is HeartbeatVerdict.SILENT
+        and state.pid is not None
+        and worker_probe_fn(state) is WorkerProbe.ALIVE
+    ):
+        # The worker runs, however quiet: parked with it on record, it
+        # holds its account's slot and its run is recorded once it exits.
+        demoted = park_live_worker(state, why=f"but showed {silence}")
+    elif status.verdict is HeartbeatVerdict.SILENT:
         demoted = state.model_copy(
             update={
                 "status": "possibly_hung",
                 "stop_reason": silent_stop_reason,
                 "error": (
-                    f"{silent_stop_reason}: {status.silence_s:.0f}s without a heartbeat, "
-                    f"worker log write or monitor tick (heartbeat_silence_alert_s="
-                    f"{settings.heartbeat_silence_alert_s:.0f}); {worker}"
+                    f"{silent_stop_reason}: {silence}; "
+                    + (
+                        f"its worker pid={state.pid} is gone"
+                        if state.pid is not None
+                        else "no worker pid on record"
+                    )
                 ),
                 # Clear pid so a subsequent reaper pass (or downstream
                 # tooling that surfaces "live" pids) doesn't think the
                 # process is still tracked; the error names it. session_id
                 # is preserved for operator-driven recovery.
                 "pid": None,
+                "log_path": None,
             }
         )
     elif survived:
@@ -1225,6 +1253,7 @@ def _classify_and_act(
                 # The worker is gone. session_id is preserved so the
                 # re-dispatch can resume.
                 "pid": None,
+                "log_path": None,
             }
         )
 
@@ -1475,7 +1504,7 @@ def _maybe_kill_stuck_sleep_loop(
 
     # Terminate the worker's whole process group: SIGTERM → grace →
     # SIGKILL → post-verify (the same escalation the dispatcher's cap-kill
-    # uses; see :func:`_default_terminate_pg`). ``state.pid`` is the
+    # uses; see :func:`terminate_worker`). ``state.pid`` is the
     # worker (claude --print), spawned ``start_new_session=True`` so it
     # leads its own group; signalling the group reaps the bash + sleep
     # descendants that a bare ``os.kill(state.pid, …)`` would orphan. The
@@ -1508,6 +1537,7 @@ def _maybe_kill_stuck_sleep_loop(
                     f"{agent_silence_s:.0f}s heartbeat staleness; argv={matched_argv!r}"
                 ),
                 "pid": None,
+                "log_path": None,
             }
         )
 
@@ -1542,14 +1572,14 @@ def _maybe_kill_stuck_sleep_loop(
     )
 
 
-def _default_terminate_pg(pid: int) -> bool:
+def terminate_worker(pid: int) -> bool:
     """SIGTERM → grace → SIGKILL → post-verify the process group led by
-    ``pid``; return ``True`` iff the process is confirmed gone afterward.
+    ``pid``; return ``True`` iff the worker is confirmed gone afterward.
 
     The kill path of both reaper passes, for a KILL verdict and for a
     stuck sleep loop. Rather than a bare one-shot SIGTERM (which leaves
-    the worker's shell and tool processes running), it reuses the dispatcher's
-    battle-tested escalation, :func:`runner.dispatcher._terminate_by_pid`:
+    the worker's shell and tool processes running), it reuses the
+    dispatcher's escalation, :func:`runner.dispatcher._terminate_by_pid`:
     SIGTERM the worker's process group, poll for exit, escalate to
     SIGKILL, then verify the process actually died. The bash sleep-loop
     descendants share the worker's process group (the worker is spawned
@@ -1557,20 +1587,28 @@ def _default_terminate_pg(pid: int) -> bool:
     SIGKILL escalation guarantees the slot is freed even if the bash
     ignores SIGTERM (or is wedged in a way that defers signal delivery).
 
-    Returns ``True`` iff ``pid`` is no longer alive after the sequence,
-    recorded as :attr:`ReapResult.sigtermed` so the operator can tell a
-    confirmed kill from a could-not-confirm one (EPERM under a Linux-user
-    dispatch, or a ``TASK_UNINTERRUPTIBLE`` D-state). The escalation runs
-    in the supervisor tick; in practice a ``sleep`` loop dies on the first
+    Liveness during and after the escalation is
+    :func:`runner.dispatcher.probe_worker`, so a worker that died but is
+    not yet reaped (a zombie) counts as gone, as it does for an adoption
+    monitor's terminate. The caller confirmed the pid was the recorded
+    worker just before the signal, and a pid is not given to another
+    process until its own process is reaped, so the probe needs no
+    identity hints here.
+
+    Returns ``True`` iff the worker is gone after the sequence, recorded
+    as :attr:`ReapResult.sigtermed` so the operator can tell a confirmed
+    kill from a could-not-confirm one (EPERM under a Linux-user dispatch,
+    or a ``TASK_UNINTERRUPTIBLE`` D-state). The escalation runs in the
+    supervisor tick; in practice a ``sleep`` loop dies on the first
     SIGTERM within a fraction of the grace period, so the tick stall is
-    sub-second — and stuck-loop kills are rare.
+    sub-second — and kills are rare.
     """
+
+    def _alive() -> bool:
+        return dispatcher_mod.probe_worker(pid, log_path=None, started_at=None) is WorkerProbe.ALIVE
+
     try:
-        dispatcher_mod._terminate_by_pid(
-            pid,
-            alive=lambda: dispatcher_mod._pid_alive(pid),
-            sleep_fn=time.sleep,
-        )
+        dispatcher_mod._terminate_by_pid(pid, alive=_alive, sleep_fn=time.sleep)
     except Exception as exc:
         logger.warning(
             "silent-orphan reaper: _terminate_by_pid(pid=%s) raised %s; reporting unconfirmed kill",
@@ -1578,7 +1616,7 @@ def _default_terminate_pg(pid: int) -> bool:
             exc,
         )
         return False
-    return not dispatcher_mod._pid_alive(pid)
+    return not _alive()
 
 
 __all__ = [
@@ -1591,4 +1629,5 @@ __all__ = [
     "liveness_verdict",
     "reap_silent_orphans_tick",
     "reconcile_silent_orphans",
+    "terminate_worker",
 ]

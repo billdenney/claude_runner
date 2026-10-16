@@ -22,6 +22,11 @@ def worker_alive(_state: TaskState) -> WorkerProbe:
     return WorkerProbe.ALIVE
 
 
+def worker_gone(_state: TaskState) -> WorkerProbe:
+    """No process has the recorded pid any more."""
+    return WorkerProbe.DEAD
+
+
 def probes(*answers: WorkerProbe) -> Callable[[TaskState], WorkerProbe]:
     """A probe giving ``answers`` in turn, then the last one for every later call."""
     remaining = list(answers)
@@ -30,6 +35,12 @@ def probes(*answers: WorkerProbe) -> Callable[[TaskState], WorkerProbe]:
         return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
     return probe
+
+
+def ticks_between(boot: datetime, started: datetime) -> int:
+    """``/proc/<pid>/stat`` starttime of a process started at ``started`` in a
+    boot that began at ``boot``."""
+    return round((started - boot).total_seconds() * os.sysconf("SC_CLK_TCK"))
 
 
 def fake_proc(
@@ -41,22 +52,26 @@ def fake_proc(
     stdout: Path | None = None,
     state: str = "S",
     with_stat: bool = True,
+    boot_id: str | None = "boot-a",
 ) -> Path:
     """Write a ``/proc`` at ``root`` holding one process, ``pid``; return ``root``.
 
     The process started at ``started`` in a boot that began at ``boot``
-    (``None`` leaves out the ``btime`` line). Its command name holds a
-    space and a ``)``, as ``/proc/<pid>/stat`` allows. ``stdout``, when
-    given, is where its fd 1 points; otherwise fd 1 cannot be read, as for
-    another user's process. ``with_stat=False`` leaves out
+    (``None`` leaves out the ``btime`` line) and whose id is ``boot_id``
+    (``None`` leaves out ``sys/kernel/random/boot_id``). Its command name
+    holds a space and a ``)``, as ``/proc/<pid>/stat`` allows. ``stdout``,
+    when given, is where its fd 1 points; otherwise fd 1 cannot be read, as
+    for another user's process. ``with_stat=False`` leaves out
     ``/proc/<pid>/stat``, as ``hidepid`` hides another user's process.
     """
     (root / str(pid) / "fd").mkdir(parents=True)
     btime = f"btime {int(boot.timestamp())}\n" if boot is not None else ""
     (root / "stat").write_text(f"cpu  1 2 3 4\n{btime}processes 99\n")
+    if boot_id is not None:
+        (root / "sys" / "kernel" / "random").mkdir(parents=True)
+        (root / "sys" / "kernel" / "random" / "boot_id").write_text(boot_id + "\n")
     if with_stat:
-        since_boot = started - (boot if boot is not None else started)
-        ticks = round(since_boot.total_seconds() * os.sysconf("SC_CLK_TCK"))
+        ticks = ticks_between(boot if boot is not None else started, started)
         fields = [state, *(["0"] * 18), str(ticks), *(["0"] * 30)]
         (root / str(pid) / "stat").write_text(f"{pid} (claude (x) y) {' '.join(fields)}\n")
     if stdout is not None:

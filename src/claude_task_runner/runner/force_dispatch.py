@@ -74,6 +74,7 @@ from claude_task_runner.supervisor.states import InFlightRecord
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
     from claude_task_runner.config.schema import ResolvedAccount, Settings
+    from claude_task_runner.runner.orchestrator import ParkCallback
 
 logger = logging.getLogger(__name__)
 
@@ -97,13 +98,36 @@ class ForceDispatchRequest:
     task_id: str
     requested_at: datetime
     allow_over_limit: bool = False
+    allow_live_worker: bool = False
+    """Dispatch even though a worker of the task still runs
+    (``queue force-dispatch --allow-live-worker``)."""
 
 
-# A task in any of these states (or with no state file at all) is
-# eligible to be force-dispatched. Anything else means the supervisor
-# (or the dispatcher) is already operating on the task, and we refuse
-# to overlap.
-_FORCE_DISPATCHABLE = frozenset({None, "pending", "failed"})
+FORCE_DISPATCHABLE = frozenset({None, "pending", "failed", "deferred"})
+"""The statuses a task may have (``None``: no state file) to be
+force-dispatched. Anything else means the supervisor (or the dispatcher)
+is already operating on the task, or it is finished, and a force would
+overlap. A ``deferred`` task is accepted, skipping its cooldown: that is
+how an operator retries one at once after fixing what parked it, such as
+a worker that could not be started."""
+
+
+def unstarted_reason(queue_dir: Path, task_id: str, *, since: datetime) -> str | None:
+    """Why a dispatch at or after ``since`` could not start ``task_id``'s
+    worker (its ``deferred_reason``), or ``None`` when none did."""
+    try:
+        state = _load_state_or_none(queue_dir, task_id)
+    except ForceDispatchError:
+        return None
+    if (
+        state is None
+        or state.status != "deferred"
+        or state.stop_reason != dispatcher_mod.UNSTARTABLE_STOP_REASON
+        or state.last_finished_at is None
+        or state.last_finished_at < since
+    ):
+        return None
+    return state.deferred_reason
 
 
 def force_dispatch_dir(queue_dir: Path) -> Path:
@@ -121,6 +145,7 @@ def write_request(
     task_id: str,
     *,
     allow_over_limit: bool = False,
+    allow_live_worker: bool = False,
     clock: Clock | None = None,
 ) -> Path:
     """Atomically write a force-dispatch request file for ``task_id``.
@@ -139,6 +164,7 @@ def write_request(
         "task_id": task_id,
         "requested_at": now.isoformat(),
         "allow_over_limit": bool(allow_over_limit),
+        "allow_live_worker": bool(allow_live_worker),
     }
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -168,6 +194,7 @@ def _parse_request_file(path: Path) -> ForceDispatchRequest | None:
             task_id=str(data["task_id"]),
             requested_at=datetime.fromisoformat(str(data["requested_at"])),
             allow_over_limit=bool(data.get("allow_over_limit", False)),
+            allow_live_worker=bool(data.get("allow_live_worker", False)),
         )
     except (KeyError, ValueError, TypeError) as exc:
         logger.warning("force-dispatch: malformed request %s: %s", path, exc)
@@ -231,9 +258,36 @@ def _load_state_or_none(queue_dir: Path, task_id: str) -> TaskState | None:
         ) from exc
 
 
+def live_worker_of(queue_dir: Path, task_id: str, state: TaskState | None) -> TaskState | None:
+    """``task_id``'s state with its still-running worker on record, or
+    ``None`` (:func:`runner.dispatcher.live_worker_record`)."""
+    return dispatcher_mod.live_worker_record(state or TaskState(task_id=task_id), queue_dir)
+
+
+def parked_worker_message(state: TaskState) -> str:
+    """Why force-dispatch refuses a task parked with its live worker, and how
+    the operator releases it. ``--allow-live-worker`` does not apply."""
+    return (
+        f"task {state.task_id}: its worker pid={state.pid} is still running, parked "
+        f"possibly_hung ({dispatcher_mod.LIVE_WORKER_STOP_REASON}); a second worker would "
+        "share its worktree. It is released, and its run recorded, when it exits or "
+        f"reaches its duration cap; to release it sooner, kill -TERM -{state.pid} (its "
+        "process group) and the supervisor records the run within a tick"
+    )
+
+
+def live_worker_message(live: TaskState) -> str:
+    """Why force-dispatch refuses ``live``'s task."""
+    return (
+        f"task {live.task_id}: its worker pid={live.pid} is still running "
+        f"(log={live.log_path}); a second worker would share its worktree. "
+        "Pass --allow-live-worker to dispatch anyway"
+    )
+
+
 def _no_free_slot(
     accounts: list[ResolvedAccount],
-    in_flight_slots: dict[str, DispatchSlot],
+    in_flight: Sequence[InFlightRecord],
     configured: int | None,
 ) -> bool:
     """Whether a force-dispatch without ``allow_over_limit`` must wait.
@@ -243,10 +297,12 @@ def _no_free_slot(
     account has a free slot under its own ``max_concurrency``
     (:func:`runner.account_dispatch.dispatch_headroom`). Either way it is
     not the warm-up cap. :func:`_pick_account` then chooses the account.
+    ``in_flight`` holds the parked live workers' records too, as the
+    tick's own count does.
     """
     if configured is not None:
-        return len(in_flight_slots) >= configured
-    return dispatch_headroom(accounts, to_in_flight_records(in_flight_slots), None) == 0
+        return len(in_flight) >= configured
+    return dispatch_headroom(accounts, in_flight, None) == 0
 
 
 @dataclass(frozen=True)
@@ -287,8 +343,8 @@ def _pick_account(
         if affined in broken:
             return _AccountPick(
                 None,
-                f"session host account {affined!r} takes no tasks until its "
-                f"runner-account.toml loads: {broken[affined].error}",
+                f"session host account {affined!r} takes no tasks until this is fixed: "
+                f"{broken[affined].error}",
             )
         if affined not in by_name:
             return _AccountPick(
@@ -301,13 +357,13 @@ def _pick_account(
     if task.account is not None and task.account in broken:
         return _AccountPick(
             None,
-            f"pinned account {task.account!r} takes no tasks until its "
-            f"runner-account.toml loads: {broken[task.account].error}",
+            f"pinned account {task.account!r} takes no tasks until this is fixed: "
+            f"{broken[task.account].error}",
         )
     if task.account is not None and task.account in by_name:
         return _AccountPick(by_name[task.account])
     if not by_name:
-        return _AccountPick(None, "no account's runner-account.toml loads")
+        return _AccountPick(None, "no account can take tasks")
     in_flight = list(in_flight)
     for acct in by_name.values():
         if account_in_flight_count(acct.name, in_flight) < acct.policy.concurrency.max_concurrency:
@@ -323,6 +379,8 @@ def tick_consume(
     in_flight_slots: dict[str, DispatchSlot],
     claude_executable: str = "claude",
     spawn_gate: SpawnGate | None = None,
+    prior_in_flight: Sequence[InFlightRecord] = (),
+    on_park: ParkCallback | None = None,
 ) -> int:
     """Drain the force-dispatch request queue; return tasks actually dispatched.
 
@@ -334,12 +392,20 @@ def tick_consume(
 
     Force-dispatched tasks honour ``task.account`` pinning when set;
     otherwise they route to the first configured account that exists.
-    ``spawn_gate`` goes to each dispatch thread, as in
+    ``spawn_gate`` and ``on_park`` go to each dispatch thread, as in
     :func:`runner.orchestrator.tick_dispatch`.
+
+    ``prior_in_flight`` is the in-flight list the last tick persisted
+    (``SupervisorSnapshot.in_flight``). Its records for tasks with no slot
+    in ``in_flight_slots`` are the parked live workers that tick held
+    (:class:`supervisor.adoption.ParkedWorkerTracker`); they count against
+    their accounts in the free-slot check and the account pick, so a
+    force-dispatch cannot take an account past its cap by them.
     """
     requests = list_requests(queue_dir)
     if not requests:
         return 0
+    held = [r for r in prior_in_flight if r.task_id not in in_flight_slots]
 
     resolution = resolve_accounts(settings)
     accounts = list(resolution.accounts)
@@ -390,11 +456,30 @@ def tick_consume(
             )
             continue
         status = state.status if state is not None else None
-        if status not in _FORCE_DISPATCHABLE:
+        if state is not None and dispatcher_mod.is_parked_live_worker(state):
+            logger.warning("force-dispatch: %s; dropping request", parked_worker_message(state))
+            consume_request(queue_dir, task.id)
+            continue
+        if status not in FORCE_DISPATCHABLE:
             logger.warning(
                 "force-dispatch %s: status %s is not dispatchable; dropping request",
                 task.id,
                 status,
+            )
+            consume_request(queue_dir, task.id)
+            continue
+
+        # A worker of the task still runs: a second one in its worktree
+        # would corrupt the branch. Force overrides the throttle, not this,
+        # unless the operator asked (--allow-live-worker).
+        live = live_worker_of(queue_dir, task.id, state)
+        if live is not None and not req.allow_live_worker:
+            logger.warning(
+                "force-dispatch %s: its worker pid=%s is still running (log=%s); dropping "
+                "request — pass --allow-live-worker to dispatch beside it",
+                task.id,
+                live.pid,
+                live.log_path,
             )
             consume_request(queue_dir, task.id)
             continue
@@ -440,15 +525,12 @@ def tick_consume(
 
         # With no account loaded there is no slot to wait for;
         # _pick_account below says so.
-        if (
-            accounts
-            and not req.allow_over_limit
-            and _no_free_slot(accounts, in_flight_slots, configured)
-        ):
+        in_flight = [*to_in_flight_records(in_flight_slots), *held]
+        if accounts and not req.allow_over_limit and _no_free_slot(accounts, in_flight, configured):
             logger.warning(
                 "force-dispatch %s: no free slot (in-flight=%d, %s); leaving request",
                 task.id,
-                len(in_flight_slots),
+                len(in_flight),
                 "every account at its own max_concurrency"
                 if configured is None
                 else f"[concurrency].max_concurrency={configured}",
@@ -472,10 +554,11 @@ def tick_consume(
         #      the next dispatch starts a fresh session.
         #   2. Task.account pinning when present and known.
         #   3. First configured account (fallback).
-        #   An account whose runner-account.toml does not load takes no
-        #   tasks, forced or not (ADR-0035): a request bound to one waits.
+        #   An account that cannot take tasks (a runner-account.toml that
+        #   does not load, say) takes none, forced or not (ADR-0035): a
+        #   request bound to one waits.
         affined = state.session_host_account() if state is not None else None
-        pick = _pick_account(task, affined, resolution, to_in_flight_records(in_flight_slots))
+        pick = _pick_account(task, affined, resolution, in_flight)
         if pick.account is None:
             if pick.drop:
                 logger.warning("force-dispatch %s: %s; dropping request", task.id, pick.reason)
@@ -497,6 +580,8 @@ def tick_consume(
             linux_user=picked.linux_user,
             account=picked.name,
             spawn_gate=spawn_gate,
+            allow_live_worker=req.allow_live_worker,
+            on_park=on_park,
         )
         dispatched += 1
 
@@ -515,6 +600,8 @@ def _spawn_dispatch_thread(
     linux_user: str | None,
     account: str,
     spawn_gate: SpawnGate | None = None,
+    allow_live_worker: bool = False,
+    on_park: ParkCallback | None = None,
 ) -> None:
     """Spawn the same shape of dispatch thread the orchestrator does."""
     # Local import to avoid a circular dependency at module-load time:
@@ -535,7 +622,11 @@ def _spawn_dispatch_thread(
             linux_user,
             account,
         ),
-        kwargs={"spawn_gate": spawn_gate},
+        kwargs={
+            "spawn_gate": spawn_gate,
+            "allow_live_worker": allow_live_worker,
+            "on_park": on_park,
+        },
         name=f"force-dispatch-{task.id}",
         # ADR-0025: match the orchestrator's thread lifetime — daemon when
         # adoption is on so a fast stop need not join the (file-backed,
@@ -565,6 +656,7 @@ def dispatch_synchronously(
     settings: Settings,
     clock: Clock,
     claude_executable: str = "claude",
+    allow_live_worker: bool = False,
 ) -> TaskState:
     """Run one dispatch attempt for ``task_id`` in-process; return final state.
 
@@ -584,8 +676,13 @@ def dispatch_synchronously(
         raise ForceDispatchError(f"cannot parse task {task_id}: {exc}") from exc
 
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
-    if state.status not in _FORCE_DISPATCHABLE:
+    if dispatcher_mod.is_parked_live_worker(state):
+        raise ForceDispatchError(parked_worker_message(state))
+    if state.status not in FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
+    live = live_worker_of(queue_dir, task.id, state)
+    if live is not None and not allow_live_worker:
+        raise ForceDispatchError(live_worker_message(live))
 
     # ADR-0010, same reasoning as tick_consume: force overrides the throttle,
     # not a (model, effort) pair the queue's [effort_levels] rejects.

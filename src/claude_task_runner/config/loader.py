@@ -21,14 +21,16 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import stat
 import tomllib
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from claude_task_runner.config.linux_user import sudo_problem
 from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 from claude_task_runner.config.schema import (
     AccountPolicy,
@@ -56,6 +58,12 @@ class ConfigError(ValueError):
         self.transient = transient
 
 
+class AccountConfigDirError(ConfigError):
+    """An account's ``config_dir`` cannot hold its ``runner-account.toml``:
+    it does not exist, names no user's home, holds a NUL byte, or a path on
+    the way to it is not a directory (:func:`load_account_policy`)."""
+
+
 CONFIG_ERROR_EXIT_STATUS = 78
 """The exit status of a command that refuses to run because its
 configuration's content is wrong (a :class:`ConfigError` that is not
@@ -74,10 +82,13 @@ def config_error_exit_status(*, transient: bool) -> int:
     return TRANSIENT_CONFIG_ERROR_EXIT_STATUS if transient else CONFIG_ERROR_EXIT_STATUS
 
 
-_CONTENT_ERRNOS = frozenset({errno.ELOOP, errno.ENAMETOOLONG, errno.ENOTDIR, errno.EISDIR})
+_CONTENT_ERRNOS = frozenset(
+    {errno.ELOOP, errno.ENAMETOOLONG, errno.ENOTDIR, errno.EISDIR, errno.ENXIO}
+)
 """``OSError`` errnos that retrying cannot fix, because the path itself is
 wrong: a symlink loop, a name too long, a path through something that is
-not a directory, a directory where a file belongs."""
+not a directory, a directory where a file belongs, a socket where a file
+belongs (``open`` of a socket fails with ``ENXIO``)."""
 
 
 def os_error_is_transient(exc: OSError) -> bool:
@@ -116,6 +127,47 @@ def _queue_toml_read_error(path: Path, exc: OSError) -> ConfigError:
         else:
             message = f"Cannot read {path}: {exc}"
     return ConfigError(message, transient=os_error_is_transient(exc))
+
+
+class _NotARegularFile(Exception):
+    """A configuration path that names something other than a file or directory."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+        """``"a FIFO"``, ``"a character device"``, ...: how a message names it."""
+
+
+_SPECIAL_KINDS = (
+    (stat.S_ISFIFO, "a FIFO"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+    (stat.S_ISSOCK, "a socket"),
+)
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """The bytes of the regular file at ``path``, following symlinks.
+
+    Opened without blocking and checked with ``fstat`` before it is read,
+    so a FIFO with no writer cannot hang the caller (the supervisor's tick
+    reads account files). Raises :class:`IsADirectoryError` for a
+    directory, :class:`_NotARegularFile` for any other kind of file, and
+    the ``OSError`` of a path that cannot be opened.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path))
+        if not stat.S_ISREG(mode):
+            raise _NotARegularFile(
+                next((kind for test, kind in _SPECIAL_KINDS if test(mode)), "not a file")
+            )
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read()
+    finally:
+        os.close(fd)
 
 
 PER_ACCOUNT_TOML_NAME = "runner-account.toml"
@@ -308,7 +360,9 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
         For every way the per-queue TOML can fail, so a caller handles one
         exception type. ``transient`` when it cannot be opened or read for
         a reason that may clear up (:func:`os_error_is_transient`); not
-        ``transient`` when its path or content is wrong: a directory, a
+        ``transient`` when its path or content is wrong: a directory or
+        anything else that is not a regular file (a FIFO, a device, a
+        socket; refused before it is read, so a FIFO cannot block), a
         symlink loop, a path through a non-directory, not UTF-8 TOML, nested
         too deeply to parse, a retired key (``[throttle.*]`` or one in
         ``_RETIRED_KEYS``), or the merged settings fail schema validation.
@@ -324,12 +378,15 @@ def _load_settings(per_queue_toml: Path | None) -> Settings:
 
     if per_queue_toml is not None:
         try:
-            with per_queue_toml.open("rb") as fh:
-                override = tomllib.load(fh)
+            override = tomllib.loads(_read_regular_file(per_queue_toml).decode("utf-8"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         except OSError as exc:
             raise _queue_toml_read_error(per_queue_toml, exc) from exc
+        except _NotARegularFile as exc:
+            raise ConfigError(
+                f"Settings file is {exc.kind}, not a regular file: {per_queue_toml}"
+            ) from exc
         except ValueError as exc:
             # A NUL byte in the path: no file can have that name.
             raise ConfigError(f"Cannot read {per_queue_toml}: {exc}") from exc
@@ -361,7 +418,7 @@ def per_account_toml_path(config_dir: str) -> Path | None:
     try:
         return expand_config_dir(config_dir) / PER_ACCOUNT_TOML_NAME
     except ConfigDirError as exc:
-        raise ConfigError(str(exc)) from exc
+        raise AccountConfigDirError(str(exc)) from exc
 
 
 def per_account_toml_shown(config_dir: str) -> str | None:
@@ -384,14 +441,16 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     account before the operator declares an explicit config_dir).
 
     Raises :class:`ConfigError` otherwise, naming the file, or the path
-    that is the problem. ``transient`` (it may clear up by itself): the
+    that is the problem (:class:`AccountConfigDirError` when the problem
+    is the ``config_dir``, not the file). ``transient`` (it may clear up by itself): the
     ``config_dir`` does not exist (a mount not up yet), the file is a
     symlink to a file that does not exist yet, or it cannot be opened or
     read for another reason :func:`os_error_is_transient` counts as
     passing (denied, an I/O or stale-mount error). Not ``transient`` (the
     path or content is wrong): the ``config_dir`` names no user's home or
     holds a NUL byte, a path on the way is not a directory, a symlink
-    loop, a name too long, the file is a directory, is empty (zero bytes,
+    loop, a name too long, the file is a directory or anything else that is
+    not a regular file (a FIFO, a device, a socket), is empty (zero bytes,
     usually a save cut short, so not read as "use the defaults"), is not
     UTF-8 TOML, is nested too deeply, sets the retired ``[throttle.*]``
     table or fails validation. :func:`resolve_accounts` turns the error
@@ -401,19 +460,21 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     if path is None:
         return AccountPolicy()
     try:
-        with path.open("rb") as fh:
-            data = fh.read()
+        data = _read_regular_file(path)
+    except _NotARegularFile as exc:
+        raise ConfigError(f"{path} is {exc.kind}, not a regular file") from exc
     except OSError as exc:
         message = _path_error(path, exc)
         if message is None and exc.errno == errno.ENOENT:
             # exists, not lexists: a config_dir symlinked to a mount that is
             # not up yet does not exist either.
             if not os.path.exists(path.parent):
-                raise ConfigError(
+                raise AccountConfigDirError(
                     f"config_dir {path.parent} does not exist", transient=True
                 ) from None
             return AccountPolicy()
-        raise ConfigError(
+        error = AccountConfigDirError if exc.errno == errno.ENOTDIR else ConfigError
+        raise error(
             message or f"Cannot read {path}: {exc}", transient=os_error_is_transient(exc)
         ) from exc
     if not data:
@@ -452,23 +513,36 @@ def _is_symlink(path: Path) -> bool:
         return False
 
 
+BrokenCause = Literal["file", "config_dir", "sudo"]
+"""What keeps a :class:`BrokenAccount` from taking tasks."""
+
+
 @dataclass(frozen=True)
 class BrokenAccount:
-    """A declared account whose ``runner-account.toml`` does not load.
+    """A declared account that cannot take tasks, for the :attr:`cause` it
+    gives: its ``runner-account.toml`` does not load, its ``config_dir``
+    cannot hold one, or its ``linux_user`` needs ``sudo``, which is not on
+    PATH.
 
-    It takes no new tasks until the file loads again. No policy stands in
-    for the file, neither defaults nor the last one that loaded, so a
-    half-edited file is never read as something its owner did not write
-    (ADR-0035).
+    It takes no new tasks until the cause is fixed. No policy stands in
+    for a file that does not load, neither defaults nor the last one that
+    loaded, so a half-edited file is never read as something its owner did
+    not write (ADR-0035).
     """
 
     name: str
     path: str
-    """The ``runner-account.toml`` that failed, as written when no path
-    could be built from its ``config_dir``."""
+    """The account's ``runner-account.toml``, as written when no path
+    could be built from its ``config_dir``; ``""`` for an empty
+    ``config_dir``. Whatever the cause, so a status line can name it."""
     error: str
-    """The :class:`ConfigError` message: it names the file, or the
-    ``config_dir`` when the problem is there."""
+    """What is wrong: the :class:`ConfigError` message, which names the
+    file or the ``config_dir``, or the ``sudo`` problem."""
+    cause: BrokenCause
+    """``"file"``: the ``runner-account.toml`` does not load.
+    ``"config_dir"``: the ``config_dir`` cannot hold one
+    (:class:`AccountConfigDirError`). ``"sudo"``: the ``linux_user`` needs
+    ``sudo``, which is not on PATH."""
     transient: bool = False
     """:attr:`ConfigError.transient`: whether it may clear up by itself."""
 
@@ -483,7 +557,8 @@ class AccountResolution:
     accounts: tuple[ResolvedAccount, ...]
     """The accounts whose policy loaded (or whose config_dir has no such file)."""
     broken: tuple[BrokenAccount, ...]
-    """The accounts whose file or config_dir does not load."""
+    """The accounts that cannot take tasks: their file or config_dir does
+    not load, or they need ``sudo``, which is not on PATH."""
 
     @property
     def policies(self) -> dict[str, AccountPolicy]:
@@ -507,7 +582,10 @@ def resolve_accounts(settings: Settings) -> AccountResolution:
     reads ``<config_dir>/runner-account.toml`` via
     :func:`load_account_policy`. An account whose file loads, or whose
     ``config_dir`` has no such file (the defaults apply), becomes a
-    :class:`ResolvedAccount`; any other becomes a :class:`BrokenAccount`.
+    :class:`ResolvedAccount`; any other becomes a :class:`BrokenAccount`,
+    and so does one whose ``linux_user`` needs ``sudo`` when ``sudo`` is
+    not on PATH (:func:`config.linux_user.sudo_problem`), a content
+    error: either way the account cannot start a worker.
     Never raises for a per-account file, so one broken file cannot stop
     the supervisor, a dispatch or a CLI listing: each caller decides what a
     broken account means for it.
@@ -523,7 +601,19 @@ def resolve_accounts(settings: Settings) -> AccountResolution:
                     name=acct.name,
                     path=per_account_toml_shown(acct.config_dir) or "",
                     error=str(exc),
+                    cause="config_dir" if isinstance(exc, AccountConfigDirError) else "file",
                     transient=exc.transient,
+                )
+            )
+            continue
+        problem = sudo_problem(acct.linux_user)
+        if problem is not None:
+            broken.append(
+                BrokenAccount(
+                    name=acct.name,
+                    path=per_account_toml_shown(acct.config_dir) or "",
+                    error=problem,
+                    cause="sudo",
                 )
             )
             continue

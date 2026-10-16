@@ -41,11 +41,14 @@ ProcessPoolExecutor) when ``target_concurrency > 1``.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -57,7 +60,8 @@ from typing import IO
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
-from claude_task_runner.config.paths import ConfigDirError, TaskPathError, expand_config_dir
+from claude_task_runner.config.linux_user import current_username as _resolve_self_user
+from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
@@ -370,6 +374,12 @@ def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
 _STDERR_TAIL_BYTES = 500
 
 
+def task_logs_dir(queue_dir: Path, task_id: str) -> Path:
+    """``<queue>/.claude_task_runner/logs/<task_id>``, where a task's
+    attempts write their stream logs (ADR-0025). Not created here."""
+    return queue_dir / ".claude_task_runner" / "logs" / task_id
+
+
 def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Path, Path]:
     """Return ``(stdout_log, stderr_log)`` for one file-backed attempt.
 
@@ -379,7 +389,7 @@ def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Pat
     directory is created if missing. ``attempt`` is the 1-based attempt
     number already stored on ``TaskState.attempts`` for this run.
     """
-    logs_dir = queue_dir / ".claude_task_runner" / "logs" / task_id
+    logs_dir = task_logs_dir(queue_dir, task_id)
     logs_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = logs_dir / f"attempt-{attempt}.stream.jsonl"
     stderr_log = _stderr_path_for_stdout_log(stdout_log)
@@ -580,13 +590,22 @@ start may read and still be its worker. :func:`dispatch` records
 absorbs clock steps."""
 
 
-def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None) -> WorkerProbe:
-    """Whether the worker recorded on a task's state as ``pid`` still runs.
+def probe_worker(
+    pid: int,
+    *,
+    log_path: str | None,
+    started_at: datetime | None,
+    boot_id: str | None = None,
+    start_ticks: int | None = None,
+) -> WorkerProbe:
+    """Whether the worker recorded as ``pid`` still runs.
 
-    Every pass that acts on a recorded worker asks this, so they agree on
-    whether it runs: the startup exited-worker finalize and adoption, an
-    adoption monitor's tail, the silent-orphan reapers, ``reconcile_orphans``
-    and the orchestrator's leak check. :func:`_pid_alive` says only that some
+    Every pass that acts on a recorded worker asks this, through
+    :func:`probe_recorded_worker` where it has the task's state, so they
+    agree on whether it runs: the startup exited-worker finalize and
+    adoption, an adoption monitor's tail, the silent-orphan reapers,
+    ``reconcile_orphans``, the parked-worker pass, the dispatch guards and
+    the orchestrator's leak check. :func:`_pid_alive` says only that some
     process has the pid. After a reboot, or once pids wrap, that can be a
     different process, which a reaper would then signal and adoption would
     watch in place of the worker.
@@ -599,23 +618,27 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
        the same file (device and inode) for the worker and not for anything
        else. This settles it when both can be read, which needs the worker
        to run as this user.
-    3. With ``started_at`` (the state's ``last_started_at``): the process
-       must have started within :data:`WORKER_START_SLACK_BEFORE_S` before
-       and :data:`WORKER_START_SLACK_AFTER_S` after it, in the current boot.
+    3. With ``boot_id`` and ``start_ticks`` (recorded at the spawn): the
+       process must be in that boot and have started at exactly that tick.
        This covers a worker under another Linux user (``sudo``, whose fd
-       table is unreadable) and a pipe-backed one (no log).
+       table is unreadable) and a pipe-backed one (no log), and no clock
+       step moves either value.
+    4. Otherwise, with ``started_at`` (the state's ``last_started_at``),
+       for a state recorded without (3): the process must have started in
+       the current boot, within :data:`WORKER_START_SLACK_BEFORE_S` before
+       and :data:`WORKER_START_SLACK_AFTER_S` after it.
 
     A check that fails proves :attr:`~WorkerProbe.REUSED`, logged at
     WARNING. When ``/proc/<pid>/stat`` cannot be read (no ``/proc``, or
     ``hidepid`` hides another user's process) only existence is known, and
-    the answer is :attr:`~WorkerProbe.ALIVE`, as before this check existed.
+    the answer is :attr:`~WorkerProbe.ALIVE`.
     """
     if not _pid_alive(pid):
         return WorkerProbe.DEAD
     stat = _read_proc_stat(pid)
     if stat is None:
         return WorkerProbe.ALIVE
-    proc_state, start_ticks = stat
+    proc_state, proc_ticks = stat
     if proc_state in ("Z", "X"):
         return WorkerProbe.DEAD
     if log_path is not None:
@@ -630,19 +653,232 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
                 log_path,
             )
             return WorkerProbe.REUSED
-    if started_at is not None:
-        mismatch = _start_mismatch(start_ticks, started_at)
-        if mismatch is not None:
-            logger.warning(
-                "pid %s is not the worker of the attempt started at %s (log %s): %s, "
-                "so the worker exited and its pid now belongs to another process",
-                pid,
-                started_at.isoformat(),
-                log_path,
-                mismatch,
+    mismatch: str | None = None
+    current_boot = _read_boot_id() if boot_id is not None and start_ticks is not None else None
+    if current_boot is not None:
+        if current_boot != boot_id:
+            mismatch = f"the worker started in boot {boot_id}, and this is boot {current_boot}"
+        elif proc_ticks != start_ticks:
+            mismatch = (
+                f"the process started {proc_ticks} ticks after boot, "
+                f"the worker {start_ticks} ticks after it"
             )
-            return WorkerProbe.REUSED
+    elif started_at is not None:
+        mismatch = _start_mismatch(proc_ticks, started_at)
+    if mismatch is not None:
+        logger.warning(
+            "pid %s is not the worker of the attempt started at %s (log %s): %s, "
+            "so the worker exited and its pid now belongs to another process",
+            pid,
+            started_at.isoformat() if started_at is not None else None,
+            log_path,
+            mismatch,
+        )
+        return WorkerProbe.REUSED
     return WorkerProbe.ALIVE
+
+
+def probe_recorded_worker(state: TaskState, queue_dir: Path) -> WorkerProbe:
+    """:func:`probe_worker` on the worker ``state`` records: its pid, log and
+    start time, with the spawn identity from its attempt's identity file
+    (:func:`read_worker_identity`). :attr:`~WorkerProbe.DEAD` with no pid."""
+    if state.pid is None:
+        return WorkerProbe.DEAD
+    identity = read_worker_identity(queue_dir, state)
+    return probe_worker(
+        state.pid,
+        log_path=state.log_path,
+        started_at=state.last_started_at,
+        boot_id=identity[0] if identity is not None else None,
+        start_ticks=identity[1] if identity is not None else None,
+    )
+
+
+def worker_identity_path(queue_dir: Path, task_id: str, attempt: int) -> Path:
+    """``<task logs>/attempt-<attempt>.worker``: the spawn identity of that
+    attempt's worker, beside its stream log."""
+    return task_logs_dir(queue_dir, task_id) / f"attempt-{attempt}.worker"
+
+
+def write_worker_identity(path: Path, pid: int) -> None:
+    """Record running process ``pid``'s boot id and start tick at ``path``.
+
+    A small JSON file, written with tempfile + ``os.replace``. Kept out of
+    the state YAML so a runner without this field still reads every state.
+    Nothing is written when ``/proc`` cannot say (the probe then falls back
+    to the start-time window). ``OSError`` propagates.
+    """
+    boot_id, start_ticks = _process_identity(pid)
+    if boot_id is None or start_ticks is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"pid": pid, "boot_id": boot_id, "start_ticks": start_ticks}
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False, prefix=f".{path.name}."
+    ) as tmp:
+        json.dump(payload, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp.name, path)
+
+
+def read_worker_identity(queue_dir: Path, state: TaskState) -> tuple[str, int] | None:
+    """``(boot_id, start_ticks)`` recorded for ``state``'s worker, or ``None``.
+
+    Read from the identity file of the state's current attempt, and used only
+    when it names the state's pid: a file for another pid is another
+    worker's. ``None`` when the file is missing or unreadable (a worker
+    spawned before identity files existed, or where ``/proc`` could not say).
+    """
+    if state.pid is None:
+        return None
+    path = worker_identity_path(queue_dir, state.task_id, state.attempts)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("pid") != state.pid:
+        return None
+    boot_id, start_ticks = data.get("boot_id"), data.get("start_ticks")
+    if not isinstance(boot_id, str) or not isinstance(start_ticks, int):
+        return None
+    return boot_id, start_ticks
+
+
+LIVE_WORKER_STOP_REASON = "worker_still_running"
+"""Stop reason recorded on a task parked ``possibly_hung`` because its
+worker still runs with no supervisor thread monitoring it: not adopted at
+startup, alive after a reaper's terminate, or found running when its task
+was about to be dispatched again. ``possibly_hung`` is never dispatched,
+so the task gets no second worker. Each tick, the parked worker holds a
+slot of the account it runs on, and once it exits its run is recorded
+from its log (``supervisor.adoption.ParkedWorkerTracker``)."""
+
+
+def park_live_worker(state: TaskState, *, why: str) -> TaskState:
+    """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
+    still runs. ``why`` completes "worker pid=N is still running ...".
+
+    Keeps ``pid``, ``log_path`` and ``attempts``: they are how the parked
+    worker is probed each tick and its run recorded once it exits.
+    """
+    return state.model_copy(
+        update={
+            "status": "possibly_hung",
+            "stop_reason": LIVE_WORKER_STOP_REASON,
+            "error": (
+                f"worker pid={state.pid} is still running {why}; parked so the task "
+                f"is not dispatched again while it runs"
+            ),
+        }
+    )
+
+
+def is_parked_live_worker(state: TaskState) -> bool:
+    """Whether ``state`` was parked by :func:`park_live_worker` and still
+    records the worker's pid."""
+    return (
+        state.status == "possibly_hung"
+        and state.stop_reason == LIVE_WORKER_STOP_REASON
+        and state.pid is not None
+    )
+
+
+def live_worker_record(state: TaskState, queue_dir: Path) -> TaskState | None:
+    """``state`` with a still-running worker of its task on record, or
+    ``None`` when no worker of the task runs.
+
+    The recorded worker, when :func:`probe_recorded_worker` says it runs.
+    Otherwise a worker no state records, whose pid was never written (the
+    ``UNTRACKED-PID`` case in :func:`dispatch`) or whose state was lost:
+    a process whose stdout is one of the task's stream logs
+    (:func:`find_live_log_writer`). That one is returned with its pid and
+    log, its attempt number from the log's name
+    (``attempt-<N>.stream.jsonl``, kept when the state already counts more
+    attempts, so a later attempt never reuses an existing log), and its own
+    process start time as ``last_started_at``, so it can be parked, probed
+    and recorded like any other. Only this user's processes can be found
+    that way.
+    """
+    if probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE:
+        return state
+    found = find_live_log_writer(task_logs_dir(queue_dir, state.task_id))
+    if found is None:
+        return None
+    pid, log_path = found
+    update: dict[str, object] = {"pid": pid, "log_path": log_path}
+    match = _ATTEMPT_LOG_RE.fullmatch(os.path.basename(log_path))
+    if match is not None:
+        update["attempts"] = max(state.attempts, int(match.group(1)))
+    started = _process_started_at(pid)
+    if started is not None:
+        update["last_started_at"] = started
+    return state.model_copy(update=update)
+
+
+_ATTEMPT_LOG_RE = re.compile(r"attempt-(\d+)\.stream\.jsonl")
+"""A stream log's name: :func:`_attempt_log_paths`."""
+
+
+def _process_started_at(pid: int) -> datetime | None:
+    """When the running process ``pid`` started, from ``/proc``; ``None``
+    when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot = _boot_time()
+    if stat is None or boot is None:
+        return None
+    return boot + timedelta(seconds=stat[1] / os.sysconf("SC_CLK_TCK"))
+
+
+def find_live_log_writer(log_dir: Path) -> tuple[int, str] | None:
+    """``(pid, log path)`` of a running process whose stdout is a stream log
+    in ``log_dir``, or ``None``.
+
+    Walks ``/proc/<pid>/fd/1`` for every process; one this user may not
+    read (another user's, under ``sudo``) is skipped. A match is confirmed
+    with :func:`probe_worker`, so a zombie does not count.
+    """
+    if not _PROC_ROOT.is_dir():
+        return None
+    wanted = os.path.realpath(log_dir)
+    try:
+        entries = list(os.scandir(_PROC_ROOT))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            target = os.readlink(os.path.join(entry.path, "fd", "1"))
+        except OSError:
+            continue
+        if not target.endswith(".stream.jsonl"):
+            continue
+        if os.path.realpath(os.path.dirname(target)) != wanted:
+            continue
+        pid = int(entry.name)
+        if probe_worker(pid, log_path=target, started_at=None) is WorkerProbe.ALIVE:
+            return pid, target
+    return None
+
+
+def _process_identity(pid: int) -> tuple[str | None, int | None]:
+    """``(boot_id, start_ticks)`` of the running process ``pid``, for
+    :func:`probe_worker`; ``(None, None)`` when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot_id = _read_boot_id()
+    if stat is None or boot_id is None:
+        return None, None
+    return boot_id, stat[1]
+
+
+def _read_boot_id() -> str | None:
+    """This boot's id from ``/proc/sys/kernel/random/boot_id``, or ``None``."""
+    try:
+        text = (_PROC_ROOT / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
 
 
 def _read_proc_stat(pid: int) -> tuple[str, int] | None:
@@ -704,23 +940,6 @@ def _boot_time() -> datetime | None:
             except (ValueError, OverflowError, OSError):
                 return None
     return None
-
-
-def _resolve_self_user() -> str:
-    """Return the supervisor's own Linux username; empty string on lookup failure.
-
-    Mirrored from :mod:`doctor.checks._current_username`. The
-    dispatcher uses it to decide whether ``linux_user`` requires a
-    sudo prefix: if the configured target equals the supervisor's
-    own user, no sudo is needed and we spawn directly.
-    """
-    try:
-        import pwd
-
-        return pwd.getpwuid(os.getuid()).pw_name
-    except Exception as exc:
-        logger.debug("self-user lookup failed (%s); treating as unknown", exc)
-        return ""
 
 
 def _build_run_record(
@@ -1550,6 +1769,11 @@ def dispatch(
     * Writes pre-run state with ``status="running"``.
     * Writes post-run state with appended :class:`RunRecord`, updated
       ``status``, and refreshed ``session_id``.
+    * When the worker cannot be started (no ``claude`` binary,
+      :func:`_account_spawn`'s and :func:`_task_spawn`'s checks, or opening the log files or
+      ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
+      it was, and returns that outcome (:func:`_defer_unstartable`); no
+      attempt is counted.
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
@@ -1572,8 +1796,28 @@ def dispatch(
     that, and after the supervisor has closed it a daemon thread starts
     no worker. ``None`` (callers outside the supervisor) skips it.
     """
+    # A worker that cannot be started parks the task (_defer_unstartable):
+    # the checks run before the ``running`` write below, and a process that
+    # fails to start after it replaces that write, so no task is left
+    # ``running`` with no worker.
+    unstartable = _UnstartableContext(
+        task=task,
+        state=state,
+        plan=plan,
+        queue_dir=queue_dir,
+        clock=clock,
+        persist_state=persist_state,
+        settings_failure_classifier=settings_failure_classifier,
+        account=account,
+    )
     if shutil.which(claude_executable) is None:
-        raise DispatchError(f"claude binary not found: {claude_executable}")
+        return _defer_unstartable(unstartable, f"claude binary not found: {claude_executable}")
+    # The account's checks run before the pre-dispatch hook, so an account
+    # that cannot start a worker does not run the hook for every task.
+    try:
+        spawn_env, sudo_prefix = _account_spawn(claude_config_dir, linux_user)
+    except Exception as exc:
+        return _defer_unstartable(unstartable, exc)
 
     # Pre-dispatch hook. Run with cwd=queue_dir (or None), NOT
     # task.working_dir: the hook's job is often to *create*
@@ -1639,6 +1883,19 @@ def dispatch(
     # restart (ADR-0025) can apply the same gates.
     pre_sha = _snapshot_pre_dispatch_sha(task.working_dir)
 
+    try:
+        argv, resolved_add_dirs = _task_spawn(
+            task,
+            plan,
+            queue_dir,
+            settings_dispatch=settings_dispatch,
+            claude_executable=claude_executable,
+            claude_config_dir=claude_config_dir,
+            sudo_prefix=sudo_prefix,
+        )
+    except Exception as exc:
+        return _defer_unstartable(unstartable, exc)
+
     started_at = clock.now()
     new_state = state.model_copy(
         update={
@@ -1646,27 +1903,16 @@ def dispatch(
             "attempts": state.attempts + 1,
             "last_started_at": started_at,
             "pre_dispatch_sha": pre_sha,
+            # A state demoted at a restart keeps its old worker's pid and
+            # log. Until this attempt's own are recorded below, the state
+            # must not point at that worker.
+            "pid": None,
+            "log_path": None,
         }
     )
     if persist_state:
         write_state_atomic(new_state, state_path_for(queue_dir, task.id))
 
-    # Resolve --add-dir scope: queue dir is always added; per-task
-    # additional_dirs are merged in; prompt auto-detect is opt-in.
-    auto_detect = (
-        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
-    )
-    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
-        task,
-        queue_dir,
-        auto_detect=auto_detect,
-    )
-    argv = build_argv(
-        task,
-        plan,
-        claude_executable=claude_executable,
-        add_dirs=resolved_add_dirs,
-    )
     logger.info(
         "[dispatch] task_id=%s model=%s effort=%s attempt=%d add_dirs=%s",
         task.id,
@@ -1675,88 +1921,6 @@ def dispatch(
         new_state.attempts,
         _truncate_paths_for_log(resolved_add_dirs),
     )
-
-    # Build the subprocess env. When `claude_config_dir` is set (per-queue
-    # config selects a non-default Claude account, e.g. ~/.claude_personal),
-    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
-    # subprocess reads the same credentials the supervisor's /usage capture
-    # uses. Without this, the supervisor sees personal-account utilization
-    # while every dispatched task hits the default ~/.claude account --
-    # which may be at a different / depleted quota.
-    #
-    # PR 14: when the account is on a long-lived OAuth token (file at
-    # `<config_dir>/oauth-token`, produced by `claude setup-token`),
-    # also export `CLAUDE_CODE_OAUTH_TOKEN` so the CLI bypasses
-    # `.credentials.json` and uses the long-lived bearer instead. This
-    # is the same env-var contract documented for GitHub Actions; the
-    # CLI honours it as the auth source when present. The file lookup
-    # is shared with `ApiUsageSource` (PR 14) so the supervisor's
-    # usage capture and the dispatched subprocess always agree on which
-    # token is in use for an account.
-    spawn_env: dict[str, str] | None = None
-    if claude_config_dir:
-        try:
-            config_path = expand_config_dir(claude_config_dir)
-        except ConfigDirError as exc:
-            raise DispatchError(str(exc)) from exc
-        if not config_path.exists():
-            raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
-        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
-        # Local import — keeps `oauth_token_file` out of the dispatcher's
-        # cold-start path for single-account / pre-PR-14 deployments.
-        from claude_task_runner.usage.oauth_token_file import read_long_lived_token
-
-        long_lived = read_long_lived_token(claude_config_dir)
-        if long_lived is not None:
-            spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
-
-    # Multi-Linux-user dispatch: when the resolved account has a
-    # `linux_user` set and it differs from the supervisor's own user,
-    # wrap argv with `sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=...`.
-    # The doctor's check_account_sudo runs `sudo -n -u <linux_user>
-    # /bin/true` as a precondition at startup, so we don't re-check
-    # here; -n keeps a misconfigured run from hanging on a password
-    # prompt. ENV inheritance across sudo's user transition needs the
-    # explicit ``env`` wrapper because sudo defaults strip the
-    # supervisor's environment from the target's session.
-    if linux_user and _resolve_self_user() != linux_user:
-        sudo_path = shutil.which("sudo")
-        if sudo_path is None:
-            raise DispatchError(f"linux_user={linux_user!r} requested but sudo not on PATH")
-        env_pairs: list[str] = []
-        if spawn_env is not None:
-            env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
-            # PR 14: propagate the long-lived OAuth token across the
-            # sudo boundary too — sudo's default env_reset would strip
-            # CLAUDE_CODE_OAUTH_TOKEN. Without this the per-account
-            # token would only affect the supervisor's own dispatches,
-            # not the multi-Linux-user spawn (PR 3) target shells.
-            if "CLAUDE_CODE_OAUTH_TOKEN" in spawn_env:
-                env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
-        # Propagate explicit env via `env` so sudo's default
-        # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
-        prefix: list[str] = [sudo_path, "-n", "-u", linux_user]
-        if env_pairs:
-            prefix.extend(["env", *env_pairs])
-        argv = [*prefix, *argv]
-        # Once the subprocess transitions to <linux_user>, the
-        # supervisor's own env stops mattering — the env=... arg to
-        # Popen below would only apply to the sudo invocation itself.
-        # Clear it so we don't fight the sudo prefix.
-        spawn_env = None
-
-    # Pre-trust the task's working_dir (and mark onboarding complete) in the
-    # target .claude.json. Idempotent — only writes when a flag changes.
-    # ``--print`` mode doesn't paint the TUI trust prompt, but the trust
-    # state is still consulted; without this entry a fresh config_dir can
-    # bounce the dispatch on first use.
-    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
-
-    _trust_dir = task.working_dir if task.working_dir else Path.cwd()
-    try:
-        _ensure_claude_init(claude_config_dir or None, _trust_dir)
-    except TaskPathError as exc:
-        raise DispatchError(f"task {task.id}: {exc}") from exc
 
     # ADR-0025: file-backed output. When adoption is on (and we have a
     # state YAML to record the log path on), redirect the worker's
@@ -1812,6 +1976,13 @@ def dispatch(
             # git/Rscript). Without this the children survive as orphans.
             start_new_session=True,
         )
+    except Exception as exc:
+        # No worker started: a working_dir that is not there, a log file
+        # that cannot be opened (OSError), an argument Popen refuses
+        # (ValueError). The deferral replaces the ``running`` write.
+        if spawn_gate is not None:
+            spawn_gate.leave(task.id)
+        return _defer_unstartable(unstartable, exc)
     except BaseException:
         # No worker started, so there is no pid to wait for.
         if spawn_gate is not None:
@@ -1842,10 +2013,28 @@ def dispatch(
     # so an operator grepping the journal sees that this attempt won't be
     # reapable by pid.
     if persist_state:
+        # The spawn identity goes beside the stream log, written before the
+        # pid so that a worker whose pid write fails is still identified.
         try:
-            pid_update: dict[str, object] = {"pid": process.pid}
-            if stdout_log_path is not None:
-                pid_update["log_path"] = str(stdout_log_path)
+            write_worker_identity(
+                worker_identity_path(queue_dir, task.id, new_state.attempts), process.pid
+            )
+        except OSError as exc:
+            logger.warning(
+                "task %s: could not record worker pid=%s's spawn identity (%s); its "
+                "probe falls back to its start time",
+                task.id,
+                process.pid,
+                exc,
+            )
+        try:
+            # log_path is always written, None for a pipe-backed worker:
+            # the worker probe compares a recorded log with the pid's
+            # stdout, so an earlier attempt's log must not stay on record.
+            pid_update: dict[str, object] = {
+                "pid": process.pid,
+                "log_path": str(stdout_log_path) if stdout_log_path is not None else None,
+            }
             new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
         except Exception as exc:
@@ -2167,10 +2356,7 @@ def adopt_worker(
     alive_monitor.start()
 
     def _alive() -> bool:
-        return (
-            probe_worker(pid, log_path=state.log_path, started_at=state.last_started_at)
-            is WorkerProbe.ALIVE
-        )
+        return probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE
 
     def _terminate_adopted() -> None:
         # The pid may have passed to another process since the last poll.
@@ -2223,6 +2409,8 @@ def finalize_exited_worker(
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
+    require_result: bool = True,
+    cap_violation: caps_mod.CapViolation | None = None,
 ) -> DispatchOutcome | None:
     """Record the run of a file-backed worker that exited with no supervisor watching.
 
@@ -2239,16 +2427,20 @@ def finalize_exited_worker(
     Returns ``None`` and writes nothing when the log holds no terminal
     ``result`` event. That worker crashed or was killed mid-run, and the
     startup reaper and ``reconcile_orphans`` handle it as they always have.
+    With ``require_result=False``, for a worker parked by
+    :func:`park_live_worker` (no later pass handles a parked task), such a
+    run is recorded as a crash instead, as :func:`adopt_worker` records a
+    worker whose pid vanished; a worker with no log (pipe-backed) is
+    recorded the same way. ``cap_violation`` records a worker the caller
+    stopped at its cap as killed by that cap.
 
     The caller has established that ``state.pid`` is dead, so nothing here
-    signals or waits on a process. No cap is applied: caps stop a live
-    worker, and this one ended on its own.
+    signals or waits on a process. It applies no cap itself: a caller that
+    stopped the worker at its cap passes ``cap_violation``.
     """
-    if state.log_path is None:
-        return None
-    log_path = Path(state.log_path)
-    summary = _reparse_stdout_file(log_path)
-    if summary.final_result is None:
+    log_path = Path(state.log_path) if state.log_path is not None else None
+    summary = _reparse_stdout_file(log_path) if log_path is not None else StreamSummary()
+    if require_result and summary.final_result is None:
         return None
 
     now = clock.now()
@@ -2257,10 +2449,16 @@ def finalize_exited_worker(
         task=task,
         prior=state,
         summary=summary,
-        cap_violation=None,
+        cap_violation=cap_violation,
         started_at=started_at,
-        finished_at=_log_finished_at(log_path, started_at=started_at, now=now),
-        stderr_tail=_read_stderr_tail(_stderr_path_for_stdout_log(log_path)),
+        finished_at=(
+            _log_finished_at(log_path, started_at=started_at, now=now)
+            if log_path is not None
+            else now
+        ),
+        stderr_tail=(
+            _read_stderr_tail(_stderr_path_for_stdout_log(log_path)) if log_path is not None else ""
+        ),
         account=account,
         queue_dir=queue_dir,
         settings_failure_classifier=settings_failure_classifier,
@@ -2320,7 +2518,9 @@ def _finalize_adopted(
     The terminal write uses the same recheck guard as the silent-orphan
     reaper: if the on-disk status is no longer ``"running"`` a concurrent
     reaper finalized first, so we stand down rather than clobber its
-    record (ADR-0025 concurrency note).
+    record (ADR-0025 concurrency note). A task parked by
+    :func:`park_live_worker` for this same worker is the exception: the
+    park only waited for the worker to exit, so its run is recorded.
     """
     # No terminal result ⇒ infer a crash via a non-zero synthetic exit
     # code so _build_run_record records ``process_exit_nonzero``. A present result
@@ -2406,7 +2606,9 @@ def _finalize_adopted(
         )
         write_state_atomic(final_state, state_path)
     else:
-        if current.status == "running":
+        if current.status == "running" or (
+            is_parked_live_worker(current) and current.pid == prior.pid
+        ):
             write_state_atomic(final_state, state_path)
         else:
             logger.info(
@@ -2703,6 +2905,146 @@ def _finalize_state(
     return new_state, run
 
 
+def _account_spawn(
+    claude_config_dir: str, linux_user: str | None
+) -> tuple[dict[str, str] | None, list[str]]:
+    """The worker's environment (``None``: the supervisor's) and the
+    ``sudo`` prefix of its command line (empty: none), for its account.
+
+    Raises :class:`DispatchError` when the account cannot start a worker:
+    its ``CLAUDE_CONFIG_DIR`` cannot be expanded, does not exist or cannot
+    be checked, or its ``linux_user`` needs ``sudo`` and it is not on
+    PATH. :func:`config.loader.resolve_accounts` already keeps such an
+    account from being chosen; this is the check at the moment of the
+    dispatch. :func:`dispatch` makes it before the pre-dispatch hook runs.
+    """
+    # Build the subprocess env. When `claude_config_dir` is set (per-queue
+    # config selects a non-default Claude account, e.g. ~/.claude_personal),
+    # propagate it via CLAUDE_CONFIG_DIR so the dispatched `claude --print`
+    # subprocess reads the same credentials the supervisor's /usage capture
+    # uses. Without this, the supervisor sees personal-account utilization
+    # while every dispatched task hits the default ~/.claude account --
+    # which may be at a different / depleted quota.
+    #
+    # PR 14: when the account is on a long-lived OAuth token (file at
+    # `<config_dir>/oauth-token`, produced by `claude setup-token`),
+    # also export `CLAUDE_CODE_OAUTH_TOKEN` so the CLI bypasses
+    # `.credentials.json` and uses the long-lived bearer instead. This
+    # is the same env-var contract documented for GitHub Actions; the
+    # CLI honours it as the auth source when present. The file lookup
+    # is shared with `ApiUsageSource` (PR 14) so the supervisor's
+    # usage capture and the dispatched subprocess always agree on which
+    # token is in use for an account.
+    spawn_env: dict[str, str] | None = None
+    if claude_config_dir:
+        try:
+            config_path = existing_config_dir(claude_config_dir)
+        except ConfigDirError as exc:
+            raise DispatchError(str(exc)) from exc
+        spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
+        # Local import — keeps `oauth_token_file` out of the dispatcher's
+        # cold-start path for single-account / pre-PR-14 deployments.
+        from claude_task_runner.usage.oauth_token_file import read_long_lived_token
+
+        long_lived = read_long_lived_token(claude_config_dir)
+        if long_lived is not None:
+            spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
+
+    # Multi-Linux-user dispatch: when the resolved account has a
+    # `linux_user` set and it differs from the supervisor's own user,
+    # wrap argv with `sudo -n -u <linux_user> env CLAUDE_CONFIG_DIR=...`.
+    # The doctor's check_account_sudo runs `sudo -n -u <linux_user>
+    # /bin/true` as a precondition at startup, so we don't re-check
+    # here; -n keeps a misconfigured run from hanging on a password
+    # prompt. ENV inheritance across sudo's user transition needs the
+    # explicit ``env`` wrapper because sudo defaults strip the
+    # supervisor's environment from the target's session.
+    prefix: list[str] = []
+    if linux_user and _resolve_self_user() != linux_user:
+        sudo_path = shutil.which("sudo")
+        if sudo_path is None:
+            raise DispatchError(f"linux_user={linux_user!r} requested but sudo not on PATH")
+        env_pairs: list[str] = []
+        if spawn_env is not None:
+            env_pairs.append(f"CLAUDE_CONFIG_DIR={spawn_env['CLAUDE_CONFIG_DIR']}")
+            # PR 14: propagate the long-lived OAuth token across the
+            # sudo boundary too — sudo's default env_reset would strip
+            # CLAUDE_CODE_OAUTH_TOKEN. Without this the per-account
+            # token would only affect the supervisor's own dispatches,
+            # not the multi-Linux-user spawn (PR 3) target shells.
+            if "CLAUDE_CODE_OAUTH_TOKEN" in spawn_env:
+                env_pairs.append(f"CLAUDE_CODE_OAUTH_TOKEN={spawn_env['CLAUDE_CODE_OAUTH_TOKEN']}")
+        # Propagate explicit env via `env` so sudo's default
+        # env_reset behaviour doesn't drop CLAUDE_CONFIG_DIR.
+        prefix = [sudo_path, "-n", "-u", linux_user]
+        if env_pairs:
+            prefix.extend(["env", *env_pairs])
+        # Once the subprocess transitions to <linux_user>, the
+        # supervisor's own env stops mattering — the env=... arg to
+        # Popen below would only apply to the sudo invocation itself.
+        # Clear it so we don't fight the sudo prefix.
+        spawn_env = None
+    return spawn_env, prefix
+
+
+def _task_spawn(
+    task: Task,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    *,
+    settings_dispatch: DispatchSettings | None,
+    claude_executable: str,
+    claude_config_dir: str,
+    sudo_prefix: list[str],
+) -> tuple[list[str], list[Path]]:
+    """The worker's argv, behind ``sudo_prefix``, and its ``--add-dir``
+    list, with the target ``.claude.json`` prepared for the task.
+
+    Raises :class:`DispatchError` when the task's ``working_dir`` cannot
+    be expanded. :func:`dispatch` calls it after the pre-dispatch hook,
+    which may create the ``working_dir``, and before it writes the
+    ``running`` state.
+    """
+    # Resolve --add-dir scope: queue dir is always added; per-task
+    # additional_dirs are merged in; prompt auto-detect is opt-in.
+    auto_detect = (
+        settings_dispatch.auto_detect_paths_in_prompt if settings_dispatch is not None else False
+    )
+    resolved_add_dirs = add_dirs_mod.resolve_add_dirs(
+        task,
+        queue_dir,
+        auto_detect=auto_detect,
+    )
+    argv = build_argv(
+        task,
+        plan,
+        claude_executable=claude_executable,
+        add_dirs=resolved_add_dirs,
+    )
+
+    # Pre-trust the task's working_dir (and mark onboarding complete) in the
+    # target .claude.json. Idempotent — only writes when a flag changes.
+    # ``--print`` mode doesn't paint the TUI trust prompt, but the trust
+    # state is still consulted; without this entry a fresh config_dir can
+    # bounce the dispatch on first use.
+    from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
+
+    _trust_dir = task.working_dir if task.working_dir else Path.cwd()
+    try:
+        _ensure_claude_init(claude_config_dir or None, _trust_dir)
+    except TaskPathError as exc:
+        raise DispatchError(str(exc)) from exc
+
+    return [*sudo_prefix, *argv], resolved_add_dirs
+
+
+def _start_error(exc: Exception) -> str:
+    """How a reason names an exception that kept a worker from starting."""
+    if isinstance(exc, DispatchError | OSError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _record_pre_dispatch_deferral(
     *,
     task: Task,
@@ -2736,16 +3078,51 @@ def _record_pre_dispatch_deferral(
     the cooldown elapses — a still-blocked hook re-checks on a cadence
     instead of being re-picked at every tick and starving ready work.
     """
-    now = clock.now()
     reason = "pre-dispatch hook deferred (exit 1)" + (
         f": {hook_result.stderr.strip()}" if hook_result.stderr.strip() else ""
     )
-    # For the attempt log only — NOT appended to state.runs (see docstring).
+    return _record_deferral(
+        task=task,
+        state=state,
+        plan=plan,
+        queue_dir=queue_dir,
+        reason=reason,
+        stop_reason="pre_dispatch_deferred",
+        clock=clock,
+        persist_state=persist_state,
+        settings_failure_classifier=settings_failure_classifier,
+        account=account,
+    )
+
+
+def _record_deferral(
+    *,
+    task: Task,
+    state: TaskState,
+    plan: SpawnPlan,
+    queue_dir: Path,
+    reason: str,
+    stop_reason: str,
+    clock: Clock,
+    persist_state: bool,
+    settings_failure_classifier: FailureClassifierSettings | None,
+    account: str | None,
+) -> DispatchOutcome:
+    """Park ``task`` in ``deferred`` with ``reason``, re-checked after the
+    cooldown, without counting an attempt.
+
+    Built on ``state`` as it was before the dispatch, so it also replaces
+    a ``running`` state written for a worker that never started. See
+    :func:`_record_pre_dispatch_deferral` for why nothing is appended to
+    ``runs``.
+    """
+    now = clock.now()
+    # For the attempt log only — NOT appended to state.runs.
     run = RunRecord(
         attempt=state.attempts + 1,
         started_at=now,
         finished_at=now,
-        stop_reason="pre_dispatch_deferred",
+        stop_reason=stop_reason,
         error=reason,
         usage=TokenUsage(),
         cost_usd=0.0,
@@ -2753,11 +3130,7 @@ def _record_pre_dispatch_deferral(
         resumed_from_session=plan.session_id if plan.strategy is ResumeStrategy.RESUME else None,
         account=account,
     )
-    cooldown_s = (
-        settings_failure_classifier.deferral_recheck_cooldown_s
-        if settings_failure_classifier is not None
-        else 900.0
-    )
+    cooldown_s = _deferral_cooldown_s(settings_failure_classifier)
     new_state = state.model_copy(
         update={
             "status": "deferred",
@@ -2766,7 +3139,7 @@ def _record_pre_dispatch_deferral(
             "next_eligible_at": now + timedelta(seconds=cooldown_s),
             "last_started_at": now,
             "last_finished_at": now,
-            "stop_reason": "pre_dispatch_deferred",
+            "stop_reason": stop_reason,
             "error": None,
         }
     )
@@ -2777,6 +3150,77 @@ def _record_pre_dispatch_deferral(
         run_record=run,
         new_state=new_state,
         summary=StreamSummary(),
+    )
+
+
+def _deferral_cooldown_s(settings_failure_classifier: FailureClassifierSettings | None) -> float:
+    """``[failure_classifier].deferral_recheck_cooldown_s``, 900 s without settings."""
+    if settings_failure_classifier is None:
+        return 900.0
+    return settings_failure_classifier.deferral_recheck_cooldown_s
+
+
+@dataclass(frozen=True)
+class _UnstartableContext:
+    """What :func:`_defer_unstartable` needs from one :func:`dispatch` call."""
+
+    task: Task
+    state: TaskState
+    """The state before the dispatch, never the ``running`` one."""
+    plan: SpawnPlan
+    queue_dir: Path
+    clock: Clock
+    persist_state: bool
+    settings_failure_classifier: FailureClassifierSettings | None
+    account: str | None
+
+
+UNSTARTABLE_STOP_REASON = "worker_start_deferred"
+"""``stop_reason`` of a task parked because its worker could not be started."""
+
+
+def _defer_unstartable(ctx: _UnstartableContext, error: str | Exception) -> DispatchOutcome:
+    """Park a task whose worker cannot be started, and log it as an ERROR.
+
+    ``deferred``, not ``failed``: the cause is configuration (no ``claude``
+    binary, a ``CLAUDE_CONFIG_DIR`` that is missing or cannot be expanded,
+    ``sudo`` missing for a ``linux_user``, a ``working_dir`` that cannot
+    be expanded or does not exist), which a fix clears, so it counts no
+    attempt and never feeds the circuit breaker. The task is tried again
+    after ``deferral_recheck_cooldown_s``, and runs once the cause is
+    fixed, with no operator step.
+
+    ``error`` is the reason, or the exception that kept the worker from
+    starting (:func:`_start_error` words it). An exception other than a
+    :class:`DispatchError` or an :class:`OSError` is not a configuration
+    problem the checks name but a bug, so the ERROR carries its traceback;
+    the task is deferred all the same.
+    """
+    traceback: Exception | None = None
+    if isinstance(error, Exception):
+        reason = f"cannot start the worker: {_start_error(error)}"
+        if not isinstance(error, DispatchError | OSError):
+            traceback = error
+    else:
+        reason = f"cannot start the worker: {error}"
+    logger.error(
+        "task %s: %s; deferred, next try in %.0f s",
+        ctx.task.id,
+        reason,
+        _deferral_cooldown_s(ctx.settings_failure_classifier),
+        exc_info=traceback,
+    )
+    return _record_deferral(
+        task=ctx.task,
+        state=ctx.state,
+        plan=ctx.plan,
+        queue_dir=ctx.queue_dir,
+        reason=reason,
+        stop_reason=UNSTARTABLE_STOP_REASON,
+        clock=ctx.clock,
+        persist_state=ctx.persist_state,
+        settings_failure_classifier=ctx.settings_failure_classifier,
+        account=ctx.account,
     )
 
 

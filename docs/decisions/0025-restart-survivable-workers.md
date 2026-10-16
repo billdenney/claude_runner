@@ -245,9 +245,11 @@ same worktrees, beside the two workers still running there.
    not yielded, on purpose: it arrives while a tool runs, and counting it
    would make a worker stuck in a Bash poll loop look alive to the
    stuck-sleep-loop reaper. In the two logs the Bash calls ran 590 s and
-   570 s with only `tool_progress` and `system` task events, and claude
-   wrote `tool_progress` at 30 s and 360 s into the call, not on a steady
-   beat. A stale heartbeat during a long tool call is therefore expected.
+   570 s, and claude wrote a `heartbeat: true` `tool_progress` event every
+   30 s through each of them (elapsed 30, 60, ... 570), so the logs' mtimes
+   advanced every 30 s while `last_heartbeat_at` stood still. A stale
+   heartbeat during a long tool call is therefore expected, and the log is
+   a sign of life on a steady beat.
 2. Adoption and the reaper graded the same task differently. The reaper
    counted `dispatcher_alive_at`; adoption counted only `last_heartbeat_at`.
 3. `reconcile_orphans` demoted every running task it was not told had been
@@ -262,36 +264,96 @@ same worktrees, beside the two workers still running there.
    adoption adopts only a HEALTHY worker by it. Its signs of life are
    `dispatcher_alive_at` and the last write to the attempt's stream log,
    whichever is later; either within `heartbeat_silence_alert_s` means
-   HEALTHY. The log gets every event the worker writes, `tool_progress`
-   included, and it is the only sign of life a worker keeps up while no
-   supervisor runs. It counts as evidence that the worker runs, not as the
-   agent's heartbeat: the stuck-sleep-loop check still keys on
-   `last_heartbeat_at`, so a stuck poll loop writing `tool_progress` is
-   still killed.
-2. **Worker identity.** `runner.dispatcher.probe_worker(pid, log_path,
-   started_at)` returns ALIVE, DEAD or REUSED. A zombie is DEAD. When
-   `/proc/<pid>/fd/1` and the log can both be read, they are the same file
-   (device and inode) for the worker and for nothing else; otherwise the
-   process must have started in the current boot, between 60 s before and
-   300 s after the attempt's `last_started_at`. Without `/proc` only
-   existence is known, as before. Every pass that acts on a recorded worker
-   asks it: the exited-worker finalize and adoption at startup, the
-   adoption monitor's tail and terminate, both reaper passes before any
-   process-tree scan or signal, `reconcile_orphans`, and the orchestrator's
-   leak check after a dispatch thread exits.
+   HEALTHY, as does an agent heartbeat within it. The log gets every event
+   the worker writes, `tool_progress` included, and it is the only sign of
+   life a worker keeps up while no supervisor runs. It counts as evidence
+   that the worker runs, not as the agent's heartbeat: the stuck-sleep-loop
+   check still keys on `last_heartbeat_at`, so a stuck poll loop writing
+   `tool_progress` is still killed. The two passes differ in what the
+   verdict leaves out: the startup reaper also keeps running a worker whose
+   worktree had a file written within `zombie_verify_fs_activity_window_s`
+   (Layer 3, recorded as `last_heartbeat_at`) and one it cannot grade (no
+   `last_started_at`, a timestamp in the future). Adoption takes such a
+   worker only if that recorded heartbeat is within the alert window;
+   otherwise `reconcile_orphans` parks it (3).
+2. **Worker identity.** `runner.dispatcher.probe_worker` returns ALIVE,
+   DEAD or REUSED (another process now has the pid), and
+   `probe_recorded_worker(state, queue_dir)` hands it a state's whole
+   record; every pass that acts on a recorded worker asks it. A zombie is
+   DEAD. When `/proc/<pid>/fd/1` and the log can both be read, they are the
+   same file (device and inode) for the worker and for nothing else.
+   Otherwise (a worker under another Linux user, or pipe-backed) the probe
+   compares the boot id and start tick that `dispatch()` records at the
+   spawn (from `/proc/sys/kernel/random/boot_id` and field 22 of
+   `/proc/<pid>/stat`); neither moves with a clock step. They are written,
+   before the pid, to a per-attempt file beside the stream log,
+   `logs/<task>/attempt-<N>.worker`, not to the state YAML, and used only
+   when that file names the state's pid. A worker without one falls back
+   to the process starting in the current boot between 60 s before and
+   300 s after `last_started_at`. Without `/proc` only existence is
+   known. The callers: the exited-worker finalize and adoption at startup,
+   the adoption monitor's tail and terminate, both reaper passes before any
+   process-tree scan or signal (their terminate, too, so a zombie counts as
+   gone), `reconcile_orphans`, the parked-worker pass, the dispatch guards
+   and the orchestrator's leak check (the last by start time alone, as a
+   RunRecord carries no log or spawn identity).
 3. **A live worker is never set to a dispatchable status.**
-   `reconcile_orphans` parks a running task whose worker is ALIVE as
-   `possibly_hung` with stop reason `worker_still_running`, keeps `pid` and
-   `log_path`, names the pid in `error`, and logs a WARNING. A reaper KILL
-   verdict now terminates the worker's process group (SIGTERM, then
-   SIGKILL, then a check), as the stuck-loop kill already did, instead of
-   sending one SIGTERM to the pid; the task goes to `failed` only once the
-   worker is gone, and a worker that survives is parked the same way.
-   Neither reaper pass signals or scans a pid that `probe_worker` does not
-   report ALIVE. The SILENT park (`silent_on_restart`, `silent_steady_state`)
-   is unchanged except that its `error` names the pid, and every reap now
-   logs at WARNING.
-4. **Thinking counts.** `system/thinking_tokens`, which claude writes while
+   `reconcile_orphans` parks a running task whose worker still runs as
+   `possibly_hung` with stop reason `worker_still_running`
+   (`runner.dispatcher.park_live_worker`), keeping `pid`, `log_path` and
+   `attempts`, naming the pid in `error`, logging a WARNING and notifying
+   the operator (`live_worker_parked` event). "Still runs" means the
+   recorded worker, or, when no state records one (its pid was never
+   written, `UNTRACKED-PID`), a process whose stdout is one of the task's
+   stream logs (`runner.dispatcher.live_worker_record`), recorded with the
+   attempt number from that log's name and its own process start time.
+   Every pass that demotes a task because its worker is gone clears both
+   `pid` and `log_path`. A reaper KILL
+   verdict terminates the worker's process group (SIGTERM, then SIGKILL,
+   then a check), as the stuck-loop kill already did, instead of sending
+   one SIGTERM to the pid; the task goes to `failed` only once the worker
+   is gone, and a worker that survives is parked the same way. Neither
+   reaper pass signals or scans a pid that the probe does not report
+   ALIVE. A SILENT verdict on a worker that still runs parks it the same
+   way. The SILENT park of a task whose worker is gone (`silent_on_restart`,
+   `silent_steady_state`) is unchanged except that its `error` names the
+   pid and the age of each sign of life. Every reap logs at WARNING.
+4. **A parked worker is accounted for.** Each tick,
+   `supervisor.adoption.ParkedWorkerTracker` counts every parked worker
+   that still runs against the account it runs on, from the sources
+   adoption uses (the previous tick's or the previous supervisor's
+   `in_flight` record, which `reconcile_orphans` keeps for a parked task;
+   the session host account; the only account), so `dispatch_headroom`,
+   `choose_account`, `supervisor.json` and `account list` see it. One no
+   record attributes counts against an explicit `[concurrency].max_concurrency`
+   only. A task the selector parks counts from the same tick. A parked
+   worker is held to its task's duration cap as a monitored one is: past
+   it, the pass terminates its process group through the reapers'
+   terminate and records the run as killed by the cap. Once the worker
+   exits or is stopped, its run is recorded from its log (a crash, without
+   a `result` event, or with no log) on a thread that holds the task's
+   slot, as a dispatch thread holds it through its post-dispatch hook, and
+   the record goes. A run that cannot be recorded is logged once per
+   distinct error and retried after a delay that doubles from 60 s to an
+   hour. The startup exited-worker finalize records a parked worker that
+   exited while no supervisor ran.
+5. **Consumers refuse a live worker's task.** Whatever produced the state,
+   the selector skips (`live_worker`) and parks a dispatchable task whose
+   recorded worker still runs, and the pre-spawn backstop in
+   `_dispatch_one_safely`, which every dispatch path goes through, does the
+   same for a worker found by `live_worker_record`; both report the park as
+   the startup does, once. `queue force-dispatch` refuses a task parked
+   with its worker whatever its flags, naming the worker and how to
+   release it; `--allow-live-worker` lets it dispatch a pending, failed or
+   deferred task (or one with no state yet) whose worker no state records. The corrupt-state quarantine
+   (ADR-0028), which would revert a running task to pending, reads the
+   worker's fields from the readable head of the file and parks the task
+   instead when its worker still runs.
+6. **The spawn writes a fresh record.** `dispatch()` clears `pid` and
+   `log_path` in its running write before the spawn and always writes both
+   after it, `log_path` `None` for a pipe-backed worker, so a new attempt
+   never carries the worker of the one before it.
+7. **Thinking counts.** `system/thinking_tokens`, which claude writes while
    a model produces extended thinking, now advances the agent heartbeat
    (`runner.stream.ThinkingEvent`). It never arrives while a tool runs, so
    it does not hide a stuck poll loop.
@@ -300,18 +362,26 @@ same worktrees, beside the two workers still running there.
 
 - A restart adopts every worker that showed a sign of life within
   `heartbeat_silence_alert_s` (300 s by default) before it, so a deploy
-  restart changes nothing for a worker the old supervisor was monitoring.
+  restart changes nothing for a worker the old supervisor was monitoring,
+  and a worker in a long Bash call, whose log is written every 30 s, is
+  adopted after a downtime of any length.
 - A worker that is alive but showed no sign of life for longer than that
-  is parked `possibly_hung`, not dispatched again. Nothing monitors it,
-  and when it exits its task stays `possibly_hung` until the operator acts
-  (runbook: "After a restart, a task is failed or possibly_hung while its
-  worker still runs"). A parked worker counts against no account's
-  `max_concurrency`.
+  is parked `possibly_hung`, not dispatched again. It holds its account's
+  slot until it exits or reaches its duration cap, and its run is then
+  recorded within a tick. An operator who wants it released sooner stops
+  its process group (runbook: "After a restart, a task is failed or
+  possibly_hung while its worker still runs").
 - With `[supervisor].adopt_workers = false` nothing is adopted, and a
   worker still alive at startup is parked instead of demoted. A dead one
   is demoted as before.
 - The reaper functions take `terminate_fn` for both kill paths and a
   `worker_probe_fn`; `sigterm_fn` is gone.
+- `TaskState` has no new fields, so rolling back to an earlier runner
+  leaves every state readable. The spawn identity lives in the
+  `attempt-<N>.worker` files, which an earlier runner ignores. A state
+  that carries `worker_boot_id` or `worker_start_ticks` inline (written by
+  a build of this change that kept them there, never deployed) loads with
+  the two keys dropped.
 - On the live queue `heartbeat_silence_kill_s` is 0 (the default), so the
   KILL verdict never fires there; the per-tick reaper kills only a
   detected stuck sleep loop, and then only after

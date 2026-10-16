@@ -30,7 +30,6 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import (
-    DispatchError,
     DispatchOutcome,
     build_argv,
     dispatch,
@@ -461,17 +460,22 @@ class TestDispatchError:
         task: Task,
         fresh_plan: SpawnPlan,
     ) -> None:
-        with pytest.raises(DispatchError, match="not found"):
-            dispatch(
-                task=task,
-                state=TaskState(task_id=task.id),
-                plan=fresh_plan,
-                queue_dir=queue_dir,
-                clock=RealClock(),
-                settings_caps=_caps(),
-                settings_hooks=_hooks(),
-                claude_executable="this-binary-does-not-exist-1234",
-            )
+        """Parked, not raised: see ``tests/unit/test_dispatch_unstartable.py``."""
+        outcome = dispatch(
+            task=task,
+            state=TaskState(task_id=task.id),
+            plan=fresh_plan,
+            queue_dir=queue_dir,
+            clock=RealClock(),
+            settings_caps=_caps(),
+            settings_hooks=_hooks(),
+            claude_executable="this-binary-does-not-exist-1234",
+        )
+        assert outcome.new_state.status == "deferred"
+        assert outcome.new_state.deferred_reason == (
+            "cannot start the worker: claude binary not found: this-binary-does-not-exist-1234"
+        )
+        assert outcome.new_state.attempts == 0
 
     def test_shim_reports_error_marks_failed(
         self,

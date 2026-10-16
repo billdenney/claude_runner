@@ -27,6 +27,9 @@ variable reads as empty):
 ``RS_JOURNAL_STATE``  ``read`` (the journal has entries for the live
                       supervisor's PID), ``empty`` or ``unavailable``
 ``RS_JOURNAL_LINE``   the newest line about eligible tasks among them
+``RS_CONFIG_UNKNOWN`` the supervisor's relative ``--config``, set when its
+                      working directory could not be read, so the CLI calls
+                      went without one
 """
 
 from __future__ import annotations
@@ -74,6 +77,10 @@ every TaskStatus and fails until each has its row."""
 
 _STATUS_RE = re.compile(r"^status:\s*(\S+)\s*$", re.M)
 
+CONFIG_ERROR_LEAD = "configuration error: "
+"""How the CLI's ``"error"`` starts when the queue settings file does not
+load."""
+
 # Account states in which an account takes tasks (account_dispatch's
 # _DISPATCHABLE_STATES).
 _TAKING_STATES = frozenset({"dispatching", "slowing_down", "idle"})
@@ -116,6 +123,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
         "are marked running but not tracked by the supervisor",
     ),
     "possibly_hung": ("looks stuck", "look stuck"),
+    "live_worker": (
+        "still has a worker running from an earlier attempt",
+        "still have a worker running from an earlier attempt",
+    ),
     "failed_circuit_breaker": (
         "stopped after repeated failures",
         "stopped after repeated failures",
@@ -138,6 +149,7 @@ _HELD_ORDER = (
     "weekly_paused",
     "invalid_effort",
     "possibly_hung",
+    "live_worker",
     "failed_circuit_breaker",
     "running",
     "unparseable_task",
@@ -156,6 +168,11 @@ class CommandResult:
 
     data: dict[str, Any] | None
     error: str | None
+    rc: str = ""
+    config_error: str | None = None
+    """Why the queue settings file did not load, when the CLI said so as
+    ``{"ok": false, "error": "configuration error: ..."}``: exit 78 when its
+    content is wrong, 1 when it could not be read and may come back."""
 
 
 @dataclass
@@ -176,6 +193,9 @@ class Facts:
     saved_at: datetime | None
     snapshot: dict[str, Any] | None
     snapshot_error: str | None
+    config_unknown: str
+    """The supervisor's relative ``--config`` when its working directory
+    could not be read, so the CLI was run without it; empty otherwise."""
     accounts: CommandResult
     holds: CommandResult
     sidecars: CommandResult
@@ -233,20 +253,28 @@ def _command(command: str, key: str, prefix: str) -> CommandResult:
     """Parse one CLI call from ``<prefix>_RC``, ``_OUT`` and ``_ERR``; ``key``
     is the field a listing must carry. A non-zero exit with a listing still
     counts: ``account list`` exits 1 when an account's file is broken, and
-    lists it."""
+    lists it. ``{"ok": false, "error": ...}`` is an error with nothing
+    listed."""
     rc = _env(f"{prefix}_RC")
     if rc == "missing":
-        return CommandResult(None, "claude-task-runner is not on PATH")
+        return CommandResult(None, "claude-task-runner is not on PATH", rc)
     stdout = _read(_env(f"{prefix}_OUT"))
     try:
         data = json.loads(stdout)
     except ValueError:
         data = None
     if isinstance(data, dict) and key in data:
-        return CommandResult(data, None)
+        return CommandResult(data, None, rc)
+    where = f"`claude-task-runner {command}` exited {rc or '?'}"
+    if isinstance(data, dict) and data.get("ok") is False and isinstance(data.get("error"), str):
+        error: str = data["error"]
+        config_error = (
+            error.removeprefix(CONFIG_ERROR_LEAD) if error.startswith(CONFIG_ERROR_LEAD) else None
+        )
+        return CommandResult(None, f"{where}: {error}", rc, config_error)
     printed = (stdout + "\n" + _read(_env(f"{prefix}_ERR"))).strip().splitlines()
     tail = printed[-1].strip() if printed else "no output"
-    return CommandResult(None, f"`claude-task-runner {command}` exited {rc or '?'}: {tail}")
+    return CommandResult(None, f"{where}: {tail}", rc)
 
 
 def _status_of(path: str) -> str | None:
@@ -326,9 +354,13 @@ def gather() -> Facts:
             saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
             with open(sup_json, encoding="utf-8") as fh:
                 loaded = json.load(fh)
-            snapshot = loaded if isinstance(loaded, dict) else None
         except (OSError, ValueError) as exc:
             snapshot_error = str(exc)
+        else:
+            if isinstance(loaded, dict):
+                snapshot = loaded
+            else:
+                snapshot_error = f"it holds a JSON {type(loaded).__name__}, not an object"
 
     log_path = runtime / "supervisor.log"
     candidates = [
@@ -354,6 +386,7 @@ def gather() -> Facts:
         saved_at=saved_at,
         snapshot=snapshot,
         snapshot_error=snapshot_error,
+        config_unknown=_env("RS_CONFIG_UNKNOWN"),
         accounts=_command("account list --json", "accounts", "RS_ACCOUNTS"),
         holds=_command("queue holds --json", "held", "RS_HOLDS"),
         sidecars=_command("sidecar list --json", "sidecars", "RS_SIDECARS"),
@@ -428,7 +461,7 @@ def _account_line(row: dict[str, Any]) -> tuple[str, bool]:
     state = row.get("state")
     still = f"; {in_flight} still running" if in_flight else ""
     if row.get("policy_error"):
-        return f"takes no tasks, because its settings file has an error{still}", False
+        return f"takes no tasks until a problem with it is fixed{still}", False
     if row.get("paused"):
         return f"paused{still}", False
     if state == "throttled_5h":
@@ -469,25 +502,25 @@ def _account_line(row: dict[str, Any]) -> tuple[str, bool]:
 def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) -> None:
     name = row["name"]
     in_flight = int(row.get("in_flight_count") or 0)
-    still = (
-        f" {_plural(in_flight, 'task')} it started {'is' if in_flight == 1 else 'are'} "
-        f"still running."
-        if in_flight
-        else ""
-    )
+    if not in_flight:
+        still = ""
+    elif live:
+        still = (
+            f" {_plural(in_flight, 'task')} it started {'is' if in_flight == 1 else 'are'} "
+            f"still running."
+        )
+    else:
+        still = (
+            f" {_plural(in_flight, 'task')} it started {'was' if in_flight == 1 else 'were'} "
+            f"running at the supervisor's last record."
+        )
     error = row.get("policy_error")
     if error:
-        path = row.get("policy_file")
-        where = "" if not path or path in error else f"{path}: "
-        poll_s = facts.poll_s
-        within = (
-            f"within {_duration(timedelta(seconds=poll_s))}"
-            if poll_s and poll_s > 60
-            else "within a minute"
-        )
+        # The runner's error names what is wrong: its runner-account.toml
+        # (which it names) or, for instance, its linux_user.
         notes.attention.append(
-            f"{name} takes no tasks because its settings file has an error: {where}{error}. "
-            f"Fix the file; {name} takes tasks again {within}."
+            f"{name} takes no tasks until this is fixed: {error.rstrip('.')}. Once it is, "
+            f"{name} takes tasks again {_within_a_check(facts)}."
         )
         return
     if row.get("paused"):
@@ -513,13 +546,21 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
         )
     elif state == "throttled_weekly":
         catch_up = _parse_time(row.get("weekly_catch_up_at"))
-        if catch_up is not None:
+        recheck = _parse_time(times.get("scheduled_wakeup_at"))
+        if catch_up is not None and catch_up > facts.now:
             notes.info.append(
                 f"{name} starts again about {_when(catch_up)}, when its weekly use falls back "
                 f"under plan. Nothing to do."
             )
+        elif catch_up is not None:
+            # The usage at the last reading is back under plan by now, but
+            # the account stays throttled until the supervisor reads again.
+            about = f" (about {_when(recheck)})" if recheck and recheck > facts.now else ""
+            notes.info.append(
+                f"{name}'s weekly use should be back under plan by now, so it should start again "
+                f"at its next check{about}. Nothing to do."
+            )
         else:
-            recheck = _parse_time(times.get("scheduled_wakeup_at"))
             then = f"; the supervisor re-checks at {_when(recheck)}" if recheck else ""
             notes.info.append(
                 f"{name} starts again once its weekly use falls back under plan{then}. "
@@ -621,7 +662,7 @@ def _capacity(
         text = f"up to {value} at once ({breakdown}; the queue-wide cap of {configured} is higher)."
     broken = ceiling.get("broken_accounts") or []
     if broken:
-        text += f" Not counted: {', '.join(broken)} (settings file error)."
+        text += f" Not counted: {', '.join(broken)} (cannot take tasks)."
     holds = facts.holds.data or {}
     queue_cap = holds.get("queue_cap")
     if holds.get("warming_up") and isinstance(queue_cap, int) and queue_cap < value:
@@ -640,9 +681,120 @@ def _capacity(
     return text + f" Right now {running} running, with {now}.", room
 
 
+WORKER_START_LEAD = "cannot start the worker: "
+"""How the runner's ``deferred_reason`` starts when a task's worker failed
+its checks before it was spawned (a config_dir, sudo, working_dir or log
+file problem); the supervisor tries again after a cooldown."""
+
+LISTED = 3
+"""How many tasks an item names before it says how many more there are."""
+
+
+def _listing(items: list[str]) -> str:
+    shown = "; ".join(items[:LISTED])
+    more = len(items) - LISTED
+    return shown + (f"; and {more} more" if more > 0 else "")
+
+
+def _within_a_check(facts: Facts) -> str:
+    """When the supervisor's next check comes: ``within`` its poll interval,
+    "within a minute" when that is a minute or less or unknown."""
+    poll_s = facts.poll_s
+    if poll_s and poll_s > 60:
+        return f"within {_duration(timedelta(seconds=poll_s))}"
+    return "within a minute"
+
+
+def _parked_notes(
+    facts: Facts,
+    watching: list[dict[str, Any]],
+    exited: list[dict[str, Any]],
+    live: bool,
+    notes: Notes,
+) -> None:
+    """Tasks parked ``possibly_hung`` while a worker ran that the supervisor
+    does not watch (stop reason ``worker_still_running``). A running
+    supervisor stops such a worker once it is past its task's time limit,
+    at its next check, so the operator is told to stop one only while the
+    supervisor is not running."""
+    within = [w for w in watching if not w.get("past_cap")]
+    past = [w for w in watching if w.get("past_cap")]
+    kill = "`kill -TERM -<pid>` (the minus signals its process group)"
+    if within:
+        n = len(within)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in within])
+        notes.info.append(
+            f"{_plural(n, 'task')} {'has' if n == 1 else 'have'} a worker still running that "
+            f"the supervisor does not watch, left from before a restart or still alive after "
+            f"it was stopped ({which}). No second worker starts for "
+            f"{'it' if n == 1 else 'them'} meanwhile. Nothing to do; to end one sooner, stop "
+            f"it with {kill}."
+        )
+    if past:
+        n = len(past)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in past])
+        lead = (
+            f"{_plural(n, 'task')} {'has' if n == 1 else 'have'} a worker the supervisor does "
+            f"not watch that has run past the task's time limit ({which})."
+        )
+        if live:
+            notes.info.append(
+                f"{lead} The supervisor stops {'it' if n == 1 else 'each'} "
+                f"{_within_a_check(facts)} and records the run. Nothing to do unless "
+                f"{'it is' if n == 1 else 'one is'} still listed after that; the supervisor's "
+                f"log then says why the stop failed, and {kill} ends it."
+            )
+        else:
+            notes.attention.append(
+                f"{lead} The supervisor is not running to stop {'it' if n == 1 else 'them'}: "
+                f"stop {'it' if n == 1 else 'each'} with {kill}."
+            )
+    if exited:
+        n = len(exited)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in exited])
+        notes.attention.append(
+            f"{_plural(n, 'task')} {'was' if n == 1 else 'were'} held while a worker the "
+            f"supervisor does not watch ran, and the worker has exited ({which}), so "
+            f"{'it waits' if n == 1 else 'they wait'} only for the run to be recorded. If this "
+            f"lasts past the supervisor's next check, record the run as the runbook describes "
+            f"for a worker that ran on after a restart."
+        )
+
+
+def _retry_notes(facts: Facts, holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks whose worker could not be started, and when each is tried again."""
+    failed = [
+        r
+        for r in holds.get("retrying") or []
+        if isinstance(r, dict) and str(r.get("deferred_reason") or "").startswith(WORKER_START_LEAD)
+    ]
+    if not failed:
+        return
+    items = []
+    for r in failed:
+        why = str(r["deferred_reason"]).removeprefix(WORKER_START_LEAD).rstrip(".")
+        due = _parse_time(r.get("next_eligible_at"))
+        when = (
+            f"retries about {_when(due)}"
+            if due and due > facts.now
+            else "retries at the next check"
+        )
+        items.append(f"{r.get('task_id')}: {why}; {when}")
+    n = len(failed)
+    notes.attention.append(
+        f"{_plural(n, 'task')} could not start {'its' if n == 1 else 'their'} worker "
+        f"({_listing(items)}). Fix what each names; the supervisor tries again at the time "
+        f"given, or `claude-task-runner queue force-dispatch <id> --queue {facts.queue}` starts "
+        f"one at once after the fix."
+    )
+
+
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:
     holds = facts.holds.data
     if holds is None:
+        if facts.holds.config_error is not None:
+            # plain_summary words the settings file's error once.
+            return f"unknown ({_SETTINGS_UNREADABLE})."
         notes.attention.append(
             f"What holds the tasks could not be read ({facts.holds.error}). Run "
             f"`claude-task-runner queue holds --queue {facts.queue}` to see the error."
@@ -651,27 +803,58 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
     held = {k: int(v) for k, v in (holds.get("held") or {}).items() if int(v)}
     eligible = holds.get("eligible") or {}
     n_eligible = int(eligible.get("count") or 0)
+    can_start = int(eligible.get("can_start_now", n_eligible) or 0)
+    affined = int(eligible.get("waiting_for_their_account") or 0)
     answered = int((eligible.get("by_status") or {}).get("awaiting_sidecar") or 0)
     running = held.pop("in_flight", 0)
     parts: list[str] = []
-    if running:
+    if running and live:
         parts.append(f"{running} running")
-    if n_eligible == answered and answered:
+    elif running:
         parts.append(
-            f"{n_eligible} answered {'task' if n_eligible == 1 else 'tasks'} can start as soon "
-            f"as a slot is free"
+            f"{running} {'was' if running == 1 else 'were'} running at the supervisor's last record"
         )
-    elif answered:
-        parts.append(
-            f"{n_eligible} can start as soon as a slot is free ({answered} of them answered "
-            f"after asking you)"
+    if n_eligible:
+        session = f"only on the account {'its' if n_eligible == 1 else 'their'} session runs on"
+        who = (
+            f"{n_eligible} answered {'task' if n_eligible == 1 else 'tasks'}"
+            if answered == n_eligible
+            else str(n_eligible)
         )
-    elif n_eligible:
-        parts.append(f"{n_eligible} can start as soon as a slot is free")
+        where = session if affined == n_eligible else "as soon as a slot is free"
+        of_them = []
+        if answered and answered < n_eligible:
+            of_them.append(f"{answered} of them answered after asking you")
+        if affined and affined < n_eligible:
+            of_them.append(
+                f"{affined} of them only on the account {'its' if affined == 1 else 'their'} "
+                f"session runs on"
+            )
+        qualified = f" ({'; '.join(of_them)})" if of_them else ""
+        parts.append(f"{who} can start {where}{qualified}")
+    # Parked workers are counted under possibly_hung, but are not stuck.
+    parked = [w for w in holds.get("parked_workers") or [] if isinstance(w, dict)]
+    watching = [w for w in parked if w.get("running")]
+    exited = [w for w in parked if not w.get("running")]
+    held["possibly_hung"] = held.get("possibly_hung", 0) - len(parked)
+    if held["possibly_hung"] <= 0:
+        del held["possibly_hung"]
     order = {name: i for i, name in enumerate(_HELD_ORDER)}
     for name in sorted(held, key=lambda k: (order.get(k, len(order)), k)):
         parts.append(held_words(name, held[name]))
+    if watching:
+        n = len(watching)
+        parts.append(
+            f"{n} {'has' if n == 1 else 'have'} a worker running that the supervisor does not watch"
+        )
+    if exited:
+        n = len(exited)
+        parts.append(
+            f"{n} {'waits' if n == 1 else 'wait'} for an exited worker's run to be recorded"
+        )
     parts.append(f"{int(holds.get('completed') or 0)} finished")
+    _parked_notes(facts, watching, exited, live, notes)
+    _retry_notes(facts, holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."
@@ -697,11 +880,24 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
         if held.get(name):
             notes.attention.append(what.replace("{n}", str(held[name])))
 
+    if live and affined:
+        ttl = holds.get("affinity_ttl_s")
+        after = (
+            f"after {_plural(round(ttl / 60), 'minute')} without running"
+            if isinstance(ttl, int | float) and ttl > 0
+            else "once its session has been idle long enough"
+        )
+        notes.info.append(
+            f"{_plural(affined, 'task')} can start only on the account "
+            f"{'its' if affined == 1 else 'their'} session runs on, which cannot take "
+            f"{_them(affined)} now; {'it moves' if affined == 1 else 'they move'} to any account "
+            f"{after}. Nothing to do."
+        )
     if live and running == 0:
-        if n_eligible and room:
+        if can_start and room:
             notes.attention.append(
-                f"Nothing is running although {n_eligible} "
-                f"{'task' if n_eligible == 1 else 'tasks'} can start and there is room for "
+                f"Nothing is running although {can_start} "
+                f"{'task' if can_start == 1 else 'tasks'} can start and there is room for "
                 f"{room}. If this lasts beyond the supervisor's next check, look in its log for "
                 f"`dispatch skipped task` lines."
             )
@@ -749,15 +945,80 @@ def _questions_line(facts: Facts, notes: Notes) -> str:
     return text
 
 
+_SETTINGS_UNREADABLE = "the queue settings file cannot be read"
+
+
+def _settings_notes(facts: Facts, notes: Notes) -> None:
+    """What the summary says about the settings the CLI read the facts
+    with: the queue settings file's load error, said once whichever call
+    met it, and a supervisor ``--config`` that could not be followed."""
+    if facts.config_unknown:
+        notes.attention.append(
+            f"The supervisor was started with the relative settings path "
+            f"`--config {facts.config_unknown}`, and its working directory cannot be read, so "
+            f"which settings file it uses is unknown; the facts below come from the queue's own "
+            f"settings file instead. Run /runner-status as the user the supervisor runs as, or "
+            f"start the supervisor with an absolute --config path."
+        )
+    failed = next(
+        (r for r in (facts.accounts, facts.holds) if r.data is None and r.config_error), None
+    )
+    if failed is None or failed.config_error is None:
+        return
+    detail = "; ".join(line.strip() for line in failed.config_error.splitlines() if line.strip())
+    detail = detail.rstrip(".")
+    if failed.rc == "78":
+        fix = (
+            "Its content is wrong and needs fixing: a supervisor started with it refuses to "
+            "start, and a running one keeps the settings it loaded before. Fix the file, then "
+            "send the supervisor SIGHUP to load it."
+        )
+    elif failed.rc == "1":
+        fix = (
+            "It could not be read just now, which may clear up by itself (a mount or permission "
+            "that comes back). If it lasts, check that the file is there and readable."
+        )
+    else:
+        fix = "Check the file."
+    unknown = " and ".join(
+        what
+        for result, what in (
+            (facts.accounts, "what each account is doing"),
+            (facts.holds, "what holds the tasks"),
+        )
+        if result.data is None and result.config_error
+    )
+    notes.attention.append(
+        f"The queue settings file cannot be read: {detail}. {fix} Until it can, {unknown} "
+        f"{'is' if ' and ' not in unknown else 'are'} unknown."
+    )
+
+
+def _record_note(facts: Facts, notes: Notes) -> None:
+    """An unreadable supervisor.json: the in-flight tasks and the accounts'
+    usage states come from it."""
+    if facts.snapshot_error is None:
+        return
+    notes.attention.append(
+        f"The supervisor's record ({facts.runtime / 'supervisor.json'}) cannot be read "
+        f"({facts.snapshot_error}), so which tasks are running and what each account's last "
+        f"usage reading said are unknown. A running supervisor rewrites it at every check; if "
+        f"this lasts, look at the file and the supervisor's log."
+    )
+
+
 def plain_summary(facts: Facts) -> str:
     notes = Notes(attention=[], info=[])
     supervisor, live = _supervisor_line(facts, notes)
     lines = [f"- **Supervisor:** {supervisor}"]
-
+    _record_note(facts, notes)
+    _settings_notes(facts, notes)
     data = facts.accounts.data
     rows: list[dict[str, Any]] = list(data.get("accounts") or []) if data else []
     taking: list[str] = []
-    if data is None:
+    if data is None and facts.accounts.config_error is not None:
+        lines.append(f"- **Accounts:** unknown ({_SETTINGS_UNREADABLE}).")
+    elif data is None:
         lines.append("- **Accounts:** unknown.")
         notes.attention.append(
             f"The account list could not be read ({facts.accounts.error}), so what each account "
@@ -824,7 +1085,7 @@ def supervisor_json_section(facts: Facts) -> str:
         ("state", d.get("state")),
         ("5h util", f"{d.get('last_5h_util_pct', '?')}%"),
         ("weekly util", f"{d.get('last_weekly_util_pct', '?')}%"),
-        ("in_flight", len(d.get("in_flight_task_ids") or [])),
+        ("in_flight", len(d.get("in_flight") or [])),
         ("since", d.get("since", "?")),
         ("scheduled_wakeup", d.get("scheduled_wakeup_at", "-")),
         ("5h reset_at", d.get("last_5h_reset_at", "?")),
@@ -855,7 +1116,8 @@ def accounts_section(facts: Facts) -> str:
         "_Each account runs at most its own limit (`max_concurrency` in its "
         'runner-account.toml). "Allowed now" is what it may run at the moment: lower while it '
         "slows down to save its 5-hour allowance, 0 while it is throttled, paused, without a "
-        'usage reading, or its settings file is broken. "In flight" means running now. '
+        "usage reading, or when it cannot take tasks at all (its runner-account.toml does not "
+        'load, for one: "problem" says what). "In flight" means running now. '
         '"Resumes about" is when a weekly-throttled account\'s use falls back under plan. The '
         "queue ceiling is the most tasks the whole queue may run at once._",
         "",
@@ -866,7 +1128,7 @@ def accounts_section(facts: Facts) -> str:
         return "\n".join(out) + "\n"
     out.append(
         "| account | limit | allowed now | in flight | paused | resumes about | settings file "
-        "| error |"
+        "| problem |"
     )
     out.append("|---|---:|---:|---:|:-:|---|---|---|")
     for row in data.get("accounts") or []:
@@ -893,7 +1155,7 @@ def accounts_section(facts: Facts) -> str:
             f"{'not set' if configured is None else configured}"
             f"{', which binds' if ceiling.get('binds') else ''}; "
             f"warm-up cap [concurrency].initial_concurrency: "
-            f"{'not set' if initial is None else initial}; broken account files: {broken})"
+            f"{'not set' if initial is None else initial}; accounts that cannot take tasks: {broken})"
         )
     return "\n".join(out) + "\n"
 
@@ -979,6 +1241,24 @@ def per_account_section(facts: Facts) -> str:
     return "\n".join(out) + "\n"
 
 
+RUNNER_DEFERRALS = {
+    "pre-dispatch hook deferred": "the pre-dispatch hook asked to wait",
+    WORKER_START_LEAD.rstrip(": "): "the worker could not be started",
+}
+"""How each of the runner's own retry-time deferrals starts its
+``deferred_reason``, and what it means."""
+
+
+def _reason_group(reason: str) -> str:
+    """Who deferred a task, from its ``deferred_reason``: the runner says
+    how it starts; any other reason was written by hand or by another tool,
+    and may be long and free-form, so it is not quoted."""
+    for lead, meaning in RUNNER_DEFERRALS.items():
+        if reason.startswith(lead):
+            return meaning
+    return "set by hand or by another tool"
+
+
 def holds_section(facts: Facts) -> str:
     out = [
         "**What holds the tasks** (from `claude-task-runner queue holds --json`)",
@@ -1000,6 +1280,35 @@ def holds_section(facts: Facts) -> str:
     out += [f"| {name} | {n} |" for name, n in sorted((data.get("held") or {}).items())]
     out.append(f"| completed | {data.get('completed', 0)} |")
     out.append(f"| todo/ tasks (total) | {data.get('todo_tasks', 0)} |")
+    retrying = [r for r in data.get("retrying") or [] if isinstance(r, dict)]
+    if retrying:
+        counts: Counter[str] = Counter()
+        firsts: dict[str, datetime] = {}
+        for r in retrying:
+            lead = _reason_group(str(r.get("deferred_reason") or ""))
+            counts[lead] += 1
+            due = _parse_time(r.get("next_eligible_at"))
+            if due is not None and (lead not in firsts or due < firsts[lead]):
+                firsts[lead] = due
+        out += ["", "_Why the tasks waiting for a retry time were deferred:_", ""]
+        for lead, n in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            first = f", the first retried about {_when(firsts[lead])}" if lead in firsts else ""
+            out.append(f"- {lead}: {n}{first}")
+    parked = [w for w in data.get("parked_workers") or [] if isinstance(w, dict)]
+    if parked:
+        out += [
+            "",
+            "_Counted under possibly_hung, parked while a worker the supervisor does not watch "
+            "ran:_",
+            "",
+            "| task | pid | started | still running | past its time limit |",
+            "|---|---:|---|:-:|:-:|",
+        ]
+        out += [
+            f"| {w.get('task_id')} | {w.get('pid')} | {w.get('started_at') or '—'} "
+            f"| {'yes' if w.get('running') else 'no'} | {'yes' if w.get('past_cap') else 'no'} |"
+            for w in parked
+        ]
     if data.get("supervisor_json_error"):
         out += ["", f"_in-flight tasks unknown: {data['supervisor_json_error']}_"]
     return "\n".join(out) + "\n"

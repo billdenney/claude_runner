@@ -30,7 +30,6 @@ from claude_task_runner.config.schema import (
 )
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.runner.dispatcher import (
-    DispatchError,
     ResumeStrategy,
     SpawnPlan,
     dispatch,
@@ -248,13 +247,13 @@ def test_linux_user_different_wraps_with_sudo(
     assert "claude" in argv[6]
 
 
-def test_linux_user_without_sudo_binary_raises(
+def test_linux_user_without_sudo_binary_is_parked(
     queue_dir: Path,
     task: Task,
     task_state: TaskState,
     settings_kwargs: dict[str, object],
 ) -> None:
-    """sudo missing but linux_user requested → DispatchError before spawning."""
+    """sudo missing but linux_user requested → parked before spawning."""
 
     def _which(name: str) -> str | None:
         return "/usr/bin/claude" if name == "claude" else None
@@ -264,9 +263,8 @@ def test_linux_user_without_sudo_binary_raises(
         patch("claude_task_runner.runner.dispatcher.shutil.which", side_effect=_which),
         patch("claude_task_runner.runner.dispatcher._resolve_self_user", return_value="bill"),
         patch("claude_task_runner.claude_init.ensure_initialized"),
-        pytest.raises(DispatchError, match="sudo"),
     ):
-        dispatch(
+        outcome = dispatch(
             task=task,
             state=task_state,
             plan=_plan(),
@@ -279,6 +277,9 @@ def test_linux_user_without_sudo_binary_raises(
             persist_state=False,
             **settings_kwargs,
         )
+    assert outcome.new_state.deferred_reason == (
+        "cannot start the worker: linux_user='bill-work' requested but sudo not on PATH"
+    )
     assert _FakePopen.captured_argv == []
 
 
@@ -368,21 +369,20 @@ def test_run_record_carries_subprocess_pid(
     assert outcome.run_record.pid == 4242
 
 
-def test_a_config_dir_whose_user_is_gone_raises_dispatch_error(
+def test_a_config_dir_whose_user_is_gone_parks_the_task(
     queue_dir: Path,
     task: Task,
     task_state: TaskState,
     settings_kwargs: dict[str, object],
 ) -> None:
-    """A ``~user`` removed while the supervisor runs fails this dispatch with
-    a DispatchError, the dispatch thread's own error, not a RuntimeError."""
+    """A ``~user`` removed while the supervisor runs parks this task with
+    the reason, instead of a RuntimeError ending the dispatch thread."""
     _FakePopen.captured_argv.clear()
     with (
         patch("claude_task_runner.runner.dispatcher.shutil.which", return_value="/usr/bin/claude"),
         patch("claude_task_runner.claude_init.ensure_initialized"),
-        pytest.raises(DispatchError) as excinfo,
     ):
-        dispatch(
+        outcome = dispatch(
             task=task,
             state=task_state,
             plan=_plan(),
@@ -394,21 +394,21 @@ def test_a_config_dir_whose_user_is_gone_raises_dispatch_error(
             persist_state=False,
             **settings_kwargs,
         )
-    assert str(excinfo.value) == (
-        "config_dir '~no-such-user-ctr-test/.claude' cannot be expanded: "
-        "Could not determine home directory."
+    assert outcome.new_state.deferred_reason == (
+        "cannot start the worker: config_dir '~no-such-user-ctr-test/.claude' cannot be "
+        "expanded: Could not determine home directory."
     )
     assert _FakePopen.captured_argv == []
 
 
-def test_a_working_dir_whose_user_is_gone_raises_dispatch_error(
+def test_a_working_dir_whose_user_is_gone_parks_the_task(
     tmp_path: Path,
     queue_dir: Path,
     task_state: TaskState,
     settings_kwargs: dict[str, object],
 ) -> None:
-    """The trust entry for the working_dir cannot be written, so the dispatch
-    fails with a DispatchError naming the task, not a RuntimeError."""
+    """The trust entry for the working_dir cannot be written, so the task is
+    parked with the reason, instead of a RuntimeError ending the thread."""
     config_dir = tmp_path / "cfg"
     config_dir.mkdir()
     (config_dir / ".claude.json").write_text("{}", encoding="utf-8")
@@ -423,9 +423,8 @@ def test_a_working_dir_whose_user_is_gone_raises_dispatch_error(
     _FakePopen.captured_argv.clear()
     with (
         patch("claude_task_runner.runner.dispatcher.shutil.which", return_value="/usr/bin/claude"),
-        pytest.raises(DispatchError) as excinfo,
     ):
-        dispatch(
+        outcome = dispatch(
             task=task,
             state=task_state,
             plan=_plan(),
@@ -437,8 +436,8 @@ def test_a_working_dir_whose_user_is_gone_raises_dispatch_error(
             persist_state=False,
             **settings_kwargs,
         )
-    assert str(excinfo.value) == (
-        "task t1: working_dir '~no-such-user-ctr-test/wt' cannot be expanded: "
-        "Could not determine home directory."
+    assert outcome.new_state.deferred_reason == (
+        "cannot start the worker: working_dir '~no-such-user-ctr-test/wt' cannot be "
+        "expanded: Could not determine home directory."
     )
     assert _FakePopen.captured_argv == []

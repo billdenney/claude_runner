@@ -259,6 +259,38 @@ class TestWeeklyCatchUp:
         assert d.wakeup_at == weekly_catch_up(policy, observed_pct=45.0, resets_at=weekly_resets_at)
         assert d.wakeup_at is not None and now < d.wakeup_at < weekly_resets_at
 
+    def test_known_answer_on_a_fourteen_day_window(self) -> None:
+        # The 40h elbow is 40/336 of a 336h window, so t_elbow = 296/336 and
+        # 30% is met at t = 30/60 * 296/336 = 148/336: 188h before the reset.
+        resets = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+        got = weekly_catch_up(
+            _policy(), observed_pct=30.0, resets_at=resets, weekly_window_s=2 * SEVEN_DAYS_S
+        )
+        assert got == resets - timedelta(hours=188)
+
+    def test_decide_uses_its_own_window(self) -> None:
+        """On a 14-day window, 45% half-way through is over the curve, which
+        meets it 114h before the reset (t = 45/60 * 296/336 = 222/336); the
+        seven-day curve would say 72h. The 5-hour reset is later than both,
+        so it does not clamp the wakeup."""
+        now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+        weekly_resets_at = now + timedelta(days=7)
+        reading = _reading(
+            five_h_pct=5,
+            weekly_pct=45,
+            five_h_resets_at=now + timedelta(days=9),
+            weekly_resets_at=weekly_resets_at,
+        )
+        d = decide(
+            _policy(timezone="UTC"),
+            reading,
+            FakeClock(now),
+            poll_interval_s=POLL,
+            weekly_window_s=2 * SEVEN_DAYS_S,
+        )
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == weekly_resets_at - timedelta(hours=114)
+
 
 class TestWeeklyResetUnparseable:
     def test_missing_weekly_resets_at_allows_dispatch(self) -> None:

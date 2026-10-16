@@ -369,7 +369,7 @@ def test_adopts_live_worker_the_reaper_left_running(
     results = adopt_running_workers(
         queue_dir, settings=settings, clock=FakeClock(_NOW), in_flight_slots=slots
     )
-    _snap, demoted = reconcile_orphans(
+    _snap, demoted, _parked = reconcile_orphans(
         queue_dir, _snapshot(), adopted_ids={r.task_id for r in results}
     )
 
@@ -400,7 +400,7 @@ def test_live_worker_with_no_sign_of_life_is_parked_not_failed(
         queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
     )
     with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.reconcile"):
-        _snap, demoted = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
+        _snap, demoted, _parked = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
 
     assert results == []
     assert demoted == []
@@ -454,7 +454,7 @@ def test_worker_whose_pid_another_process_has_is_treated_as_gone(
     results = adopt_running_workers(
         queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
     )
-    _snap, demoted = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
+    _snap, demoted, _parked = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
 
     # The log holds no result event, so the exited-worker finalize leaves it.
     assert exited == []
@@ -514,7 +514,7 @@ def test_reconcile_orphans_shields_adopted_ids(
         last_heartbeat_at=_NOW,
     )
 
-    _snap, demoted = reconcile_orphans(queue_dir, _snapshot(), adopted_ids={"200-adopted"})
+    _snap, demoted, _parked = reconcile_orphans(queue_dir, _snapshot(), adopted_ids={"200-adopted"})
 
     # Only the non-adopted orphan was demoted.
     assert demoted == ["201-plain"]
@@ -537,7 +537,7 @@ def test_reconcile_orphans_demotes_all_when_no_adopted(
         last_heartbeat_at=_NOW,
     )
     _seed_running(queue_dir, "300-b", pid=None, log_path=None, started_at=_NOW)
-    _snap, demoted = reconcile_orphans(queue_dir, _snapshot())
+    _snap, demoted, _parked = reconcile_orphans(queue_dir, _snapshot())
     assert demoted == ["300-a", "300-b"]
     assert load_state(state_path_for(queue_dir, "300-a")).status == "failed"
     assert load_state(state_path_for(queue_dir, "300-b")).status == "failed"

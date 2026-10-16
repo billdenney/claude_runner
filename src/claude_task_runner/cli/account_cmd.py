@@ -66,8 +66,9 @@ app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
 
 def _snapshot(settings: Settings, queue_dir: Path) -> SupervisorSnapshot | None:
-    """Load supervisor.json or return None when it doesn't exist."""
-    path = persist_mod.supervisor_state_path(queue_dir, settings.supervisor.state_file)
+    """Load supervisor.json or return None when it doesn't exist. Read-only:
+    no runtime directory is created to look for it."""
+    path = persist_mod.supervisor_state_file(queue_dir, settings.supervisor.state_file)
     return persist_mod.load(path)
 
 
@@ -183,7 +184,10 @@ def _broken_row(
     snapshot: SupervisorSnapshot | None,
     paused: frozenset[str],
 ) -> dict[str, object]:
-    """One row in ``account list`` for an account whose file does not load.
+    """One row in ``account list`` for an account that cannot take tasks
+    (:class:`config.loader.BrokenAccount`: its file does not load, its
+    ``config_dir`` cannot hold one, or its ``linux_user`` needs ``sudo``,
+    which is not on PATH).
 
     It has no policy to show, and dispatch allows it no tasks.
     """
@@ -215,9 +219,11 @@ def list_accounts(
     Skills use ``--json`` for machine-parseable output; operators run
     interactively without it for a human-readable summary.
 
-    An account whose ``runner-account.toml`` does not load is listed with
-    the error in place of its policy (with --json, in its row's
-    ``policy_error``), the others as usual, and the command then exits 1.
+    An account that cannot take tasks (its ``runner-account.toml`` does not
+    load, its ``config_dir`` cannot hold one, or its ``linux_user`` needs
+    ``sudo``, which is not on PATH) is listed with the error in place of
+    its policy (with --json, in its row's ``policy_error``), the others as
+    usual, and the command then exits 1.
 
     When the command cannot list at all, it prints only the error; with
     --json that is ``{"ok": false, "error": ...}``. ``"ok": false`` is how
@@ -226,10 +232,11 @@ def list_accounts(
 
     \b
     Exit codes:
-      0  every account's runner-account.toml loads
-      1  an account's runner-account.toml does not load (the listing
-         names it), or the queue TOML could not be read for now ("ok":
-         false), which may clear up by itself
+      0  every account can take tasks
+      1  an account cannot take tasks: its runner-account.toml or its
+         config_dir does not load, or its linux_user cannot be reached
+         (the listing names it); or the queue TOML could not be read for
+         now ("ok": false), which may clear up by itself
       2  --queue is not an existing directory, or the account pause
          markers cannot be read ("ok": false)
      78  the queue TOML's content is wrong ("ok": false)
@@ -327,6 +334,20 @@ def _print_account(
         f"5h={util_5h_s}   weekly={util_w_s}   "
         f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
     )
+    if row["weekly_catch_up_at"] is not None:
+        console.print(
+            f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "
+            "under plan; scheduled_wakeup_at is only the next re-check)",
+            highlight=False,
+        )
+    usage_error = row["usage_error"]
+    if isinstance(usage_error, dict):
+        fix = "log it in again" if usage_error["kind"] == "auth" else "the usage page changed"
+        console.print(
+            f"  [bold red]usage error:[/]     {escape(usage_error['message'])} ({fix})",
+            highlight=False,
+            soft_wrap=True,
+        )
 
 
 def _update_paused(

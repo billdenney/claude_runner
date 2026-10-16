@@ -13,7 +13,7 @@ instead, which each caller turns into its own error:
   expanded when it loads; later it fails only that account.
 * :func:`expand_task_path` for a task's ``working_dir`` or
   ``additional_dirs`` entry, or ``[worktree_reclaim].lock_file``
-  (:class:`TaskPathError`). A dispatch fails only that task, ``--add-dir``
+  (:class:`TaskPathError`). A dispatch parks only that task, ``--add-dir``
   skips the entry, a reclaim pass skips the task, and the lock file is
   refused when the queue TOML loads.
 """
@@ -52,6 +52,24 @@ def expand_config_dir(config_dir: str) -> Path:
     be expanded or holds a NUL byte.
     """
     return _expand(config_dir, "config_dir", ConfigDirError)
+
+
+def existing_config_dir(config_dir: str) -> Path:
+    """:func:`expand_config_dir`, checked to exist, for a worker's or a
+    capture's ``CLAUDE_CONFIG_DIR``.
+
+    Raises :class:`ConfigDirError` when it cannot be expanded, does not
+    exist, or cannot be checked: ``Path.exists`` raises, rather than
+    returning ``False``, for a parent that denies access.
+    """
+    path = expand_config_dir(config_dir)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        raise ConfigDirError(f"CLAUDE_CONFIG_DIR does not exist: {path}") from None
+    except OSError as exc:
+        raise ConfigDirError(f"cannot check CLAUDE_CONFIG_DIR {path}: {exc}") from exc
+    return path
 
 
 def expand_task_path(path: str | Path, what: str) -> Path:

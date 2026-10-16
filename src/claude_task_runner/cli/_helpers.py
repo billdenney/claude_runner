@@ -11,6 +11,7 @@ module that is otherwise a pure settings + per-account loader.
 from __future__ import annotations
 
 import json as _json
+import os
 from pathlib import Path
 
 import typer
@@ -56,11 +57,13 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
        exists, return it. This is the auto-discovery that fixes the
        common pitfall of running ``claude-task-runner account list
        --queue <dir>`` and silently getting package defaults instead
-       of the accounts declared in the queue's TOML. A symlink there
-       whose target is missing (on a mount not up yet, say) or that
-       loops is returned too, so ``load_settings`` reports it, as a
-       file that may come back or as a symlink loop, rather than the
-       defaults and their default account applying.
+       of the accounts declared in the queue's TOML. Anything at that
+       name is returned, not only a file: a directory, a FIFO, a device,
+       a symlink whose target is missing (on a mount not up yet, say) or
+       that loops. ``load_settings`` then reports it (a missing target as
+       one that may come back, exit 1; the others as content errors,
+       exit 78) rather than the defaults and their default account
+       applying.
     3. Otherwise, return ``None`` — caller hands that to
        ``load_settings`` which falls back to package defaults
        (matches the historical no-config behaviour).
@@ -84,7 +87,7 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
     if config is not None:
         return config
     candidate = queue_dir / PER_QUEUE_CONFIG_NAME
-    if candidate.is_file() or (candidate.is_symlink() and not candidate.exists()):
+    if os.path.lexists(candidate):
         return candidate
     return None
 
@@ -136,7 +139,7 @@ def broken_accounts_message(
     then: str = "start the supervisor again",
     if_transient: str = "so this start exits 1 and systemd tries again; fix it if it does not",
 ) -> str:
-    """Why a command refuses to go on: every account file that does not load.
+    """Why a command refuses to go on: every account that cannot take tasks.
 
     ``supervisor start`` uses the defaults; ``install`` passes its own
     ``refused``, ``then`` and ``if_transient``. The line saying each may
@@ -145,7 +148,7 @@ def broken_accounts_message(
     """
     broken = resolution.broken
     noun = "account" if len(broken) == 1 else "accounts"
-    lines = [f"{refused}: the runner-account.toml of {len(broken)} {noun} does not load:"]
+    lines = [f"{refused}: {len(broken)} {noun} cannot take tasks:"]
     lines += [f"  {b.name}: {b.error}" for b in broken]
     if resolution.only_transient:
         lines.append(
@@ -153,8 +156,9 @@ def broken_accounts_message(
             f"say), {if_transient}."
         )
     lines.append(
-        f"Fix each file, or delete it for the defaults, then {then}. "
-        "Once the supervisor runs, a file that breaks only stops new tasks on its account."
+        f"Fix each one (a runner-account.toml can also be deleted for the defaults), then "
+        f"{then}. Once the supervisor runs, a problem like this only stops new tasks on its "
+        "account."
     )
     return "\n".join(lines)
 

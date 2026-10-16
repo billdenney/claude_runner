@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -35,12 +35,16 @@ from claude_task_runner.queue.store import (
     QueueSchemaError,
     _load_yaml,
     _yaml_loader,
+    iter_pending_tasks,
+    iter_state_files,
     list_pending_tasks,
     list_state_files,
     load_state,
     load_task,
     queue_runtime_dir,
     require_queue_dir,
+    runtime_path,
+    state_file_path,
     state_path_for,
     task_path_for,
     todo_dir,
@@ -366,11 +370,15 @@ class TestErrorHandling:
 
 
 class TestListing:
-    def test_list_pending_returns_sorted(self, queue_dir: Path) -> None:
+    @pytest.mark.parametrize("lister", [list_pending_tasks, iter_pending_tasks])
+    def test_list_pending_returns_sorted(
+        self, queue_dir: Path, lister: Callable[[Path], Iterator[Path]]
+    ) -> None:
         td = todo_dir(queue_dir)
         for tid in ("003-c", "001-a", "002-b"):
             (td / f"{tid}.yaml").write_text(f"id: {tid}\ntitle: T\nprompt: P\n")
-        names = [p.stem for p in list_pending_tasks(queue_dir)]
+        (td / "notes.txt").write_text("not a task\n")
+        names = [p.stem for p in lister(queue_dir)]
         assert names == ["001-a", "002-b", "003-c"]
 
     def test_list_states(self, queue_dir: Path) -> None:
@@ -717,6 +725,7 @@ class TestRequireQueueDir:
 
 
 _QUEUE_DIR_EXTRA_ARGS: dict[str, tuple[str, ...]] = {
+    "state_file_path": ("t1",),
     "state_path_for": ("t1",),
     "task_path_for": ("t1",),
 }
@@ -747,11 +756,15 @@ class TestNeverCreatesTheQueue:
         # Equality, so that a new function is looked at: it may need
         # arguments in _QUEUE_DIR_EXTRA_ARGS.
         assert set(_queue_dir_functions()) == {
+            "iter_pending_tasks",
+            "iter_state_files",
             "list_pending_tasks",
             "list_state_files",
             "queue_runtime_dir",
             "require_queue_dir",
+            "runtime_path",
             "state_dir",
+            "state_file_path",
             "state_path_for",
             "task_path_for",
             "todo_dir",
@@ -779,6 +792,17 @@ class TestNeverCreatesTheQueue:
             if inspect.isgenerator(result):
                 list(result)
         assert sorted(p.name for p in base.iterdir()) == before
+
+    def test_the_readers_create_nothing_in_a_queue(self, tmp_path: Path) -> None:
+        """A queue with no runtime directory or ``todo/`` yet has no state
+        files and no tasks, and reading it that way leaves it so."""
+        queue = tmp_path / "q"
+        queue.mkdir()
+        assert runtime_path(queue) == queue / ".claude_task_runner"
+        assert state_file_path(queue, "t1") == queue / ".claude_task_runner" / "state" / "t1.yaml"
+        assert list(iter_state_files(queue)) == []
+        assert list(iter_pending_tasks(queue)) == []
+        assert list(queue.iterdir()) == []
 
     def test_existing_queue_gets_its_subdirectories(self, queue_dir: Path) -> None:
         todo_dir(queue_dir)
@@ -891,3 +915,20 @@ class TestRetiredEffortSpellings:
             {"id": "t1", "title": "T", "prompt": "p", "effort": "extra_high"}
         )
         assert task.effort == "extra_high"
+
+
+def test_state_drops_the_retired_spawn_identity_keys(tmp_path: Path) -> None:
+    """A state written with the spawn identity inline (it now lives beside
+    the stream log) still loads, without those keys, and is written back
+    without them."""
+    path = tmp_path / "t.yaml"
+    path.write_text(
+        "schema_version: 2\ntask_id: t\nstatus: running\npid: 4242\n"
+        "worker_boot_id: 5b0d3a5e-2f1c-4c55-9a3e-8d6f2b7c1e44\nworker_start_ticks: 91641447\n"
+    )
+    state = load_state(path)
+    assert (state.task_id, state.status, state.pid) == ("t", "running", 4242)
+    write_state_atomic(state, path)
+    text = path.read_text()
+    assert "worker_boot_id" not in text
+    assert "worker_start_ticks" not in text

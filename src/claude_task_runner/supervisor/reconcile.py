@@ -42,7 +42,9 @@ The end-to-end recovery:
 3. Orphan's status is demoted to ``"failed"``,
    ``stop_reason="orphaned_by_supervisor_restart"``.
 4. ``snapshot.in_flight`` / ``in_flight_task_ids`` are cleared (the
-   old supervisor's last-persisted in-flight list is stale).
+   old supervisor's last-persisted in-flight list is stale), except the
+   records of tasks parked with a live worker, which name the account
+   each such worker runs on.
 5. First tick's orchestrator sees a ``"failed"`` task that's a
    ``_DISPATCHABLE_STATUS`` — picks it up.
 6. ``plan_next_spawn`` sees the persisted ``session_id`` and the
@@ -63,7 +65,9 @@ Edge cases:
   Not our problem to detect here.
 * The orphan's worker is still running (``KillMode=process`` keeps
   workers alive across a restart) and was not adopted: adoption is off,
-  or the worker showed no sign of life for ``heartbeat_silence_alert_s``.
+  or the worker showed no sign of life for ``heartbeat_silence_alert_s``,
+  or no state recorded its pid (it is then found by its stream log,
+  :func:`runner.dispatcher.live_worker_record`).
   A ``failed`` task is dispatched again, and a second worker would then
   share the first one's worktree, so the task is parked ``possibly_hung``
   instead (:func:`park_live_worker`) and a WARNING names the pid.
@@ -75,15 +79,20 @@ Edge cases:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
     load_state,
+    state_path_for,
     write_state_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner.dispatcher import LIVE_WORKER_STOP_REASON, park_live_worker
 from claude_task_runner.supervisor.states import SupervisorSnapshot
 
 logger = logging.getLogger(__name__)
@@ -94,31 +103,40 @@ ORPHAN_STOP_REASON = "orphaned_by_supervisor_restart"
 task's previous run is marked failed (and can grep journals for
 this specific phrase to find restarts that orphaned work)."""
 
-LIVE_WORKER_STOP_REASON = "worker_still_running"
-"""Stop reason recorded on a task parked ``possibly_hung`` because its
-worker is still running and no supervisor monitors it: not adopted at
-startup, or alive after a reaper's terminate. ``possibly_hung`` is never
-dispatched, so the task gets no second worker; the operator resumes it
-once the pid named in ``error`` has exited."""
+
+@dataclass(frozen=True)
+class ParkedWorker:
+    """A task parked because its worker still runs, to report
+    (:func:`report_park`)."""
+
+    task_id: str
+    pid: int
+    log_path: str | None
+    why: str
+    """Completes "worker pid=N is still running ..."."""
 
 
-def park_live_worker(state: TaskState, *, why: str) -> TaskState:
-    """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
-    still runs. ``why`` completes "worker pid=N is still running ...".
+_UNADOPTED = "and was not adopted"
 
-    Keeps ``pid`` and ``log_path``, so the operator, and the error, can
-    find the worker.
-    """
-    return state.model_copy(
-        update={
-            "status": "possibly_hung",
-            "stop_reason": LIVE_WORKER_STOP_REASON,
-            "error": (
-                f"worker pid={state.pid} is still running {why}; parked so the task "
-                f"is not dispatched again while it runs"
-            ),
-        }
-    )
+
+def report_park(
+    parked: ParkedWorker,
+    notify_callback: Callable[[str, str], None] | None,
+    event_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """Tell the operator about a live-worker park: a ``warning`` notify and a
+    ``live_worker_parked`` event."""
+    if notify_callback is not None:
+        notify_callback(
+            "warning",
+            f"task {parked.task_id}: worker pid={parked.pid} is still running "
+            f"{parked.why}; parked possibly_hung, not dispatched again",
+        )
+    if event_callback is not None:
+        event_callback(
+            "live_worker_parked",
+            {"task_id": parked.task_id, "pid": parked.pid, "log_path": parked.log_path},
+        )
 
 
 def reconcile_orphans(
@@ -126,7 +144,7 @@ def reconcile_orphans(
     snapshot: SupervisorSnapshot,
     *,
     adopted_ids: set[str] | None = None,
-) -> tuple[SupervisorSnapshot, list[str]]:
+) -> tuple[SupervisorSnapshot, list[str], list[ParkedWorker]]:
     """Demote orphan ``"running"`` TaskStates to ``"failed"``.
 
     Called by ``start_daemon`` once at startup, after the snapshot is
@@ -135,12 +153,14 @@ def reconcile_orphans(
     1. The supervisor snapshot with ``in_flight`` /
        ``in_flight_task_ids`` cleared (those records were the
        previous supervisor's view; this supervisor has its own
-       empty slot map).
+       empty slot map), except the records of tasks parked with a live
+       worker: they name the account each one runs on, which
+       ``supervisor.adoption.ParkedWorkerTracker`` keeps counting.
     2. The list of task IDs whose state was demoted.
-
-    A running orphan whose recorded worker still runs is never demoted:
-    it is parked ``possibly_hung`` with :data:`LIVE_WORKER_STOP_REASON`
-    and logged at WARNING, and is not in the returned list.
+    3. A :class:`ParkedWorker` for each running orphan whose recorded
+       worker still runs. Such a task is never demoted: it is parked
+       ``possibly_hung`` with :data:`LIVE_WORKER_STOP_REASON` and logged at
+       WARNING, and the daemon notifies the operator.
 
     Writes are atomic per TaskState via
     :func:`queue.store.write_state_atomic`. The snapshot is returned
@@ -165,6 +185,7 @@ def reconcile_orphans(
     """
     shielded = adopted_ids or set()
     orphan_ids: list[str] = []
+    parked: list[ParkedWorker] = []
     for state_path in list_state_files(queue_dir):
         try:
             state = load_state(state_path)
@@ -185,14 +206,11 @@ def reconcile_orphans(
                 state.task_id,
             )
             continue
-        if (
-            state.pid is not None
-            and dispatcher_mod.probe_worker(
-                state.pid, log_path=state.log_path, started_at=state.last_started_at
-            )
-            is dispatcher_mod.WorkerProbe.ALIVE
-        ):
-            _park_unadopted(state, state_path)
+        live = dispatcher_mod.live_worker_record(state, queue_dir)
+        if live is not None:
+            if _park_unadopted(live, state_path):
+                assert live.pid is not None  # live_worker_record records a pid
+                parked.append(ParkedWorker(live.task_id, live.pid, live.log_path, _UNADOPTED))
             continue
         demoted = state.model_copy(
             update={
@@ -202,6 +220,10 @@ def reconcile_orphans(
                 # task was working fine when the supervisor died. The
                 # next dispatch via session-resume continues from where
                 # the conversation left off.
+                # The worker is gone: drop its pid and log so the state
+                # does not point at it.
+                "pid": None,
+                "log_path": None,
             }
         )
         try:
@@ -226,19 +248,30 @@ def reconcile_orphans(
     # of who-was-running-where doesn't apply to this process; our
     # own in_flight_slots will be authoritative going forward, and
     # the orchestrator refreshes the snapshot's in_flight list every
-    # tick.
+    # tick. A parked live worker's record stays: it is the only record
+    # of the account the worker runs on.
+    kept = [r for r in snapshot.in_flight if _is_parked(queue_dir, r.task_id)]
     new_snapshot = snapshot.model_copy(
         update={
-            "in_flight": [],
-            "in_flight_task_ids": [],
+            "in_flight": kept,
+            "in_flight_task_ids": [r.task_id for r in kept],
         }
     )
-    return new_snapshot, orphan_ids
+    return new_snapshot, orphan_ids, parked
 
 
-def _park_unadopted(state: TaskState, state_path: Path) -> None:
-    """Park a running orphan whose worker still runs, with a WARNING."""
-    parked = park_live_worker(state, why="and was not adopted by this supervisor")
+def _is_parked(queue_dir: Path, task_id: str) -> bool:
+    """Whether ``task_id``'s state is parked with a live worker on record."""
+    try:
+        return dispatcher_mod.is_parked_live_worker(load_state(state_path_for(queue_dir, task_id)))
+    except Exception:
+        return False
+
+
+def _park_unadopted(state: TaskState, state_path: Path) -> bool:
+    """Park a running orphan whose worker still runs, with a WARNING.
+    ``False`` when the state could not be written."""
+    parked = park_live_worker(state, why=f"{_UNADOPTED} by this supervisor")
     try:
         write_state_atomic(parked, state_path)
     except Exception as exc:
@@ -250,7 +283,7 @@ def _park_unadopted(state: TaskState, state_path: Path) -> None:
             state_path,
             exc,
         )
-        return
+        return False
     logger.warning(
         "reconcile_orphans: task %s's worker pid=%s is still running and was not "
         "adopted; parked possibly_hung (stop_reason=%s), not failed, so it is not "
@@ -260,11 +293,14 @@ def _park_unadopted(state: TaskState, state_path: Path) -> None:
         LIVE_WORKER_STOP_REASON,
         state.log_path,
     )
+    return True
 
 
 __all__ = [
     "LIVE_WORKER_STOP_REASON",
     "ORPHAN_STOP_REASON",
+    "ParkedWorker",
     "park_live_worker",
     "reconcile_orphans",
+    "report_park",
 ]

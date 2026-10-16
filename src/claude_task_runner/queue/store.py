@@ -120,6 +120,45 @@ def queue_runtime_dir(queue_dir: Path) -> Path:
     return runtime
 
 
+def runtime_path(queue_dir: Path) -> Path:
+    """``<queue>/.claude_task_runner/``, without creating it.
+
+    For callers that only read: a status command reports a queue as it is,
+    and must not create the runtime tree to look at it. Writers use
+    :func:`queue_runtime_dir`, which creates it. A queue directory that is
+    not there raises as :func:`queue_runtime_dir` does, so a missing
+    runtime directory never stands for a missing queue.
+
+    Raises
+    ------
+    FileNotFoundError
+        ``queue_dir`` is missing, or a symlink to nothing.
+    NotADirectoryError
+        ``queue_dir`` is not a directory.
+    """
+    _require_existing_queue(queue_dir)
+    return queue_dir / ".claude_task_runner"
+
+
+def _require_existing_queue(queue_dir: Path) -> None:
+    """Raise as :func:`runtime_path` documents unless ``queue_dir`` is a directory."""
+    if not queue_dir.is_dir():
+        if queue_dir.exists():
+            raise NotADirectoryError(f"not a directory: {queue_dir}")
+        raise FileNotFoundError(f"no such directory: {queue_dir}")
+
+
+def state_file_path(queue_dir: Path, task_id: str) -> Path:
+    """Like :func:`state_path_for`, without creating any directory."""
+    return runtime_path(queue_dir) / "state" / f"{task_id}.yaml"
+
+
+def iter_state_files(queue_dir: Path) -> Iterator[Path]:
+    """Like :func:`list_state_files`, without creating the state directory:
+    a queue that has none has no state files."""
+    yield from sorted((runtime_path(queue_dir) / "state").glob("*.yaml"))
+
+
 def todo_dir(queue_dir: Path) -> Path:
     """Resolve ``<queue>/todo/`` and ensure it exists.
 
@@ -308,10 +347,20 @@ def load_task(path: Path) -> Task:
     return _validate(Task, payload, path)
 
 
+_RETIRED_STATE_KEYS = frozenset({"worker_boot_id", "worker_start_ticks"})
+"""Keys a state YAML may hold that :class:`TaskState` does not define: a
+worker's spawn identity, which the runner keeps in the attempt's identity
+file beside its stream log (``runner.dispatcher.worker_identity_path``).
+``TaskState`` forbids unknown keys, so :func:`load_state` drops these; the
+next write of the state leaves them out."""
+
+
 def load_state(path: Path) -> TaskState:
     """Read and validate a single TaskState YAML."""
     payload = _load_yaml(path)
     _check_schema_version(payload, path)
+    for key in _RETIRED_STATE_KEYS:
+        payload.pop(key, None)
     return _validate(TaskState, payload, path)
 
 
@@ -377,6 +426,14 @@ def list_pending_tasks(queue_dir: Path) -> Iterator[Path]:
     """
     todo = todo_dir(queue_dir)
     yield from sorted(todo.glob("*.yaml"))
+
+
+def iter_pending_tasks(queue_dir: Path) -> Iterator[Path]:
+    """Like :func:`list_pending_tasks`, without creating ``todo/``: a queue
+    that has none has no tasks. A queue directory that is not there raises
+    as :func:`runtime_path` does."""
+    _require_existing_queue(queue_dir)
+    yield from sorted((queue_dir / "todo").glob("*.yaml"))
 
 
 def list_state_files(queue_dir: Path) -> Iterator[Path]:

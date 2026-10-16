@@ -38,7 +38,9 @@ non-specialist can read in ten seconds, as five short lines:
 - **Accounts**: one line each: taking tasks (slots in use out of the slots
   it is allowed now), or not, and why (paused, its 5-hour allowance used
   up, using its weekly allowance faster than planned, no recent usage
-  reading, its usage could not be read, a broken settings file).
+  reading, its usage could not be read, or a problem that stops it taking
+  tasks at all until fixed, such as a runner-account.toml that does not
+  load).
 - **How many can run**: the concurrency ceiling (the most tasks the queue
   may run at once), where it comes from (the sum of the accounts' own
   `max_concurrency`, or a queue-wide `[concurrency].max_concurrency` that
@@ -53,22 +55,51 @@ non-specialist can read in ten seconds, as five short lines:
   acknowledge.
 
 Then **Not normal right now**: one sentence per condition that needs the
-operator, saying what it means and what to do (a broken account settings
-file, a paused account, an expired login or an unreadable usage page, a
+operator, saying what it means and what to do (an account that cannot take
+tasks until a problem is fixed, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
-read, unreadable sidecar requests, a supervisor that is down or stuck,
-nothing running although tasks can start). And **For your information**:
-routine conditions that resolve by themselves, with when (an account
-throttled until a time, the queue drained because every task is held).
+read, tasks whose worker could not be started, an unwatched worker past
+its time limit while no supervisor runs to stop it, or one that exited
+unrecorded, unreadable sidecar requests,
+a supervisor that is down or stuck, an unreadable `supervisor.json` or
+queue settings file, nothing running although tasks can start). And **For
+your information**: routine conditions that resolve by themselves, with
+when (an account throttled until a time, tasks waiting for the account
+their session runs on, a worker still running that the supervisor does
+not watch, the queue drained because every task is held). While the supervisor is not
+running, the tasks and accounts it last recorded as running are given as
+its last record, not as running now.
 "Everything looks normal." when there is neither.
 
 The facts come from the runner, not from re-reading its files:
 `claude-task-runner account list --json` (each account's state, caps,
 pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
-candidate selection run once, read-only, with the poll interval) and
+candidate selection run once, read-only, with the poll interval, the
+parked workers and why each task waiting for a retry time was deferred) and
 `claude-task-runner sidecar list --json`. The script passes the live
-supervisor's own `--config` to them.
+supervisor's own `--config` to `account list` and `queue holds`
+(`sidecar list` reads no settings), resolving a relative path against the
+supervisor's working directory. When that directory cannot be read it
+passes none, and the summary says the supervisor's settings are unknown.
+
+`claude-task-runner account list --json` exits 1 both when an account
+cannot take tasks (its runner-account.toml does not load, its config_dir
+cannot hold one, or its linux_user needs sudo, which is not on PATH; the
+listing shows it, in that row's `policy_error`) and when the queue TOML
+cannot be read for now; output of
+the form `{"ok": false, "error": ...}` is an error with nothing listed, and
+exit 78 means the queue TOML's content is wrong. `queue holds --json` fails
+the same way. The summary then says, once, that the queue settings file
+cannot be read, with the error, and whether it may clear up (exit 1) or
+needs fixing (78).
+
+Of the tasks that can start, `queue holds --json` counts in
+`eligible.can_start_now` those an account can take now, and in
+`eligible.waiting_for_their_account` those held to the account their
+session runs on, which cannot take them; such a task moves to any account
+after `affinity_ttl_s` without running. "Nothing is running although N can
+start" counts only the first.
 
 Under **Details** come the sections the summary is built from, each opening
 with a line saying what it shows and defining its terms:
@@ -79,9 +110,10 @@ with a line saying what it shows and defining its terms:
   time). `scheduled_wakeup` is the supervisor's next re-check, not when a
   throttled account resumes.
 - **Accounts and concurrency**: each account's own limit, how many it is
-  allowed now (0 while paused, throttled, without a reading, or broken),
-  in flight, paused, when a weekly-throttled account resumes, its settings
-  file and any error in it; then the queue ceiling with its parts.
+  allowed now (0 while paused, throttled, without a reading, or unable to
+  take tasks), in flight, paused, when a weekly-throttled account resumes,
+  its settings file and any problem that stops it taking tasks; then the
+  queue ceiling with its parts.
 - **Per-account state**, from supervisor.json's `accounts` map: state,
   5h/weekly util, paused (read from the `account_paused/` markers, which
   `supervisor.json` trails by a tick), in-flight count, throttle target,
@@ -126,9 +158,10 @@ with a line saying what it shows and defining its terms:
    **For your information** items.
 2. **Then the details**, section by section, each with one sentence on
    what it means, including the concurrency ceiling (its value, where it
-   comes from, whether the queue-wide cap binds) and any broken account
-   settings file (which file, the error, and that the account takes tasks
-   again within a tick of the fix).
+   comes from, whether the queue-wide cap binds) and any account that
+   cannot take tasks (the runner's error, which names the file when its
+   runner-account.toml is at fault, and that the account takes tasks again
+   within a tick of the fix).
 3. If a section could not be gathered it says "unknown", "could not list"
    or "unavailable"; say its facts are unknown, never empty or healthy.
 
@@ -185,17 +218,30 @@ or recent failures), follow the prioritized triage flow below.
       token): log the account in again, `CLAUDE_CONFIG_DIR=<its
       config_dir> claude /login`, or renew its long-lived token with
       `claude setup-token`; `format` (the usage page changed): run
-      `claude-task-runner usage healthcheck` or invoke `/runner-usage`.
-      Stop here unless the user wants more.
+      `claude-task-runner usage --config <the queue's claude_runner.toml>
+      healthcheck` (the supervisor's own `--config` when it was started
+      with one; without `--config` it reads the package's default account,
+      not the queue's), or invoke `/runner-usage`. On a multi-account
+      queue also name the account, `usage --config <toml> --account <name>
+      healthcheck`, once `usage` has `--account`; until then it checks
+      the queue's `[claude].config_dir`. Stop here unless the user wants
+      more.
 
-   2. **Broken account settings file** — if `account_errors` is
-      non-empty: each entry is an account whose `runner-account.toml`
-      does not load. That account silently takes no tasks and counts 0
-      toward the ceiling, while every other account runs as usual, so
-      nothing else looks wrong. Give the account, the file (`path`) and
-      the `error`, and say: fix the file; the account takes tasks again
-      at the supervisor's next tick. `snapshot.accounts.<name>.policy_error`
-      carries the same error.
+   2. **Account that cannot take tasks** — if `account_errors` is
+      non-empty: each entry is an account that silently takes no tasks
+      and counts 0 toward the ceiling, while every other account runs as
+      usual, so nothing else looks wrong. Its `cause` says why, and what
+      to fix: `file`, its `runner-account.toml` (`path`) does not load:
+      fix the file; `config_dir`, its config_dir cannot hold that file
+      (it does not exist, as on a mount not up yet, names no user's home,
+      or a path on the way is not a directory): fix the config_dir or
+      bring its mount up; `sudo`, its linux_user needs sudo, which is not
+      on the supervisor's PATH: install sudo or put it on that PATH (the
+      file is not the problem, so do not name it). Give the account and
+      the `error` (which names the file or directory at fault), and say
+      the account takes tasks again at the supervisor's next tick after
+      the fix. `snapshot.accounts.<name>.policy_error` carries the same
+      error.
 
    3. **No usage reading** — if `snapshot.state == "no_reading"`, or
       any entry of `snapshot.accounts` has `state == "no_reading"`:
@@ -249,6 +295,17 @@ or recent failures), follow the prioritized triage flow below.
       as `unanswered_sidecar`.
 
    8. **Hung tasks** — run with `--status possibly_hung`. Report each.
+      One whose `stop_reason` is `worker_still_running` is not stuck: the
+      supervisor parked it because a worker it does not watch was still
+      running (left from before a restart, or alive after it was
+      stopped), so it starts no second worker beside it. `queue holds
+      --json` lists these as `parked_workers`, with whether each still
+      runs and whether it has passed its time limit. While it runs and is
+      within its limit there is nothing to do; to end it sooner, stop it
+      with `kill -TERM -<pid>` (the minus signals its process group).
+      Past its limit, a running supervisor stops it at its next check and
+      records the run; stop it yourself only while the supervisor is not
+      running, or when it is still listed after that check.
 
    9. **Recent failures** — `--status failed` and
       `--status failed_circuit_breaker`. Report counts; if non-zero,
@@ -271,9 +328,22 @@ or recent failures), follow the prioritized triage flow below.
          hook asked to wait. The hook runs again once the task's
          `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
          in `[failure_classifier]` (900 s by default) after the deferral.
-         Of the runner's own deferrals, only these set
-         `next_eligible_at`. Give the count and the earliest
-         `next_eligible_at`.
+         Give the count and the earliest `next_eligible_at`.
+       - `cannot start the worker:` (stop reason `worker_start_deferred`)
+         — the worker failed its checks before it was spawned: the
+         account's `config_dir` is missing or cannot be expanded, `sudo`
+         is missing for its `linux_user`, the task's `working_dir` is not
+         trusted or cannot be expanded, or its log files or the spawn
+         itself failed. The rest of the reason names which. Like a hook
+         deferral it sets `next_eligible_at` (`deferral_recheck_cooldown_s`
+         after it) and is tried again once that passes. This needs the
+         operator: give each task with its reason and `next_eligible_at`,
+         and say to fix the named cause; `queue force-dispatch <id>`
+         starts it at once after the fix. The summary words these as
+         "could not start its worker".
+
+         Of the runner's own deferrals, these two set
+         `next_eligible_at`; the readiness and effort holds do not.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,

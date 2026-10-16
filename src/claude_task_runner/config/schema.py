@@ -31,7 +31,10 @@ UsageSourceMode = Literal["tty", "api", "api_then_tty"]
   headers are reverse-engineered and the OAuth token can expire.
 * ``"api_then_tty"`` — API path with TTY fall-through on documented
   API failures (auth-expired / missing-header / network). The TTY
-  fall-through also refreshes the OAuth token as a side effect.
+  fall-through also refreshes the OAuth token as a side effect. An
+  account with a long-lived token (``<config_dir>/oauth-token``,
+  ADR-0021) uses the API path alone, whether it is the queue's only
+  account or one of several: TTY cannot recover a revoked token.
 """
 
 
@@ -144,13 +147,17 @@ class SessionSettings(_StrictModel):
 class FailureClassifierSettings(_StrictModel):
     failure_circuit_breaker_threshold: int = Field(ge=1)
     deferral_recheck_cooldown_s: float = Field(default=900.0, ge=0, le=MAX_DURATION_S)
-    """Seconds a task parked in ``deferred`` (pre-dispatch hook exit
-    code 1 — its documented transient-defer contract) waits before the
-    orchestrator re-attempts dispatch. Deferrals are NOT failures and do
-    not trip the circuit breaker; this cooldown only bounds how often a
-    still-blocked task re-runs the hook, so a long wait (e.g. a paper
-    awaiting operator re-acquisition) re-checks periodically instead of
-    being re-picked every tick and starving ready work. Default 15 min."""
+    """Seconds a task the dispatcher parks in ``deferred`` waits before the
+    orchestrator re-attempts dispatch: one whose pre-dispatch hook exited 1
+    (its documented transient-defer contract), and one whose worker could
+    not be started (``worker_start_deferred``: no ``claude`` binary, an
+    account's ``CLAUDE_CONFIG_DIR`` that cannot be used, a ``working_dir``
+    that cannot be expanded or does not exist). Deferrals are NOT failures
+    and do not trip the circuit breaker; this cooldown only bounds how
+    often a still-blocked task is tried again, so a long wait (e.g. a paper
+    awaiting operator re-acquisition, a mount not up yet) re-checks
+    periodically instead of being re-picked every tick and starving ready
+    work. Default 15 min."""
     sidecar_refile_loop_threshold: int = Field(default=4, ge=1)
     """Consecutive no-progress sidecar re-files (a dispatch that ends
     ``awaiting_sidecar`` without committing anything) after which the
@@ -584,10 +591,10 @@ class ClaudeSettings(_StrictModel):
     instead. When ``[[accounts]]`` is absent, the loader synthesises a
     single account named ``"default"`` from this field for backwards
     compatibility. When both are present, ``[[accounts]]`` wins and this
-    field is ignored. Empty string means "use claude's default"
-    (``~/.claude``). A ``config_dir`` whose leading ``~user`` names no
-    user fails validation whenever it is set, since the usage source of a
-    queue with at most one account reads it.
+    field is ignored, by dispatch and by every usage read alike. Empty
+    string means "use claude's default" (``~/.claude``). A ``config_dir``
+    whose leading ``~user`` names no user fails validation whenever it is
+    set, as an account's does.
     """
 
     executable: str = "claude"

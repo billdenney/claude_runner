@@ -242,14 +242,14 @@ def _read_oauth_token(config_dir: str) -> str:
         return long_lived
 
     creds_path = base / ".credentials.json"
-    if not creds_path.exists():
-        raise CredentialsNotFound(
-            f"OAuth credentials file not found: {creds_path}. "
-            f"Run `CLAUDE_CONFIG_DIR={creds_path.parent} claude /login` first."
-        )
     try:
         with creds_path.open("rb") as fh:
             data = json.load(fh)
+    except FileNotFoundError:
+        raise CredentialsNotFound(
+            f"OAuth credentials file not found: {creds_path}. "
+            f"Run `CLAUDE_CONFIG_DIR={creds_path.parent} claude /login` first."
+        ) from None
     except (OSError, json.JSONDecodeError) as exc:
         raise CredentialsNotFound(f"could not read {creds_path}: {exc}") from exc
 
