@@ -31,7 +31,7 @@ re-running a finished extraction wastes a full task.)
 
 The other exception is a task whose worker still runs: reverting it to
 pending would dispatch a second worker into the same worktree. The
-worker's ``pid``, ``log_path``, ``last_started_at`` and spawn identity
+worker's ``pid``, ``log_path``, ``last_started_at`` and attempt number
 are read from the head too, and when they name a running worker
 (:func:`runner.dispatcher.live_worker_record`, which also finds a worker
 writing the task's stream log), a state parked ``possibly_hung`` with
@@ -105,9 +105,7 @@ def _salvage_status(raw: str) -> str | None:
     return None
 
 
-_WORKER_FIELDS = frozenset(
-    {"pid", "log_path", "last_started_at", "worker_boot_id", "worker_start_ticks"}
-)
+_WORKER_FIELDS = frozenset({"pid", "log_path", "last_started_at", "attempts"})
 """Top-level fields read from a corrupt file's head to find a worker that
 may still run."""
 

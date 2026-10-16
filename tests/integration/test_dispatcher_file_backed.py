@@ -18,6 +18,7 @@ reach the owned run's verdict.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -361,25 +362,28 @@ def test_spawn_records_the_workers_boot_and_start_tick(
     monkeypatch: pytest.MonkeyPatch,
     reset_shim_env: None,
 ) -> None:
-    """The running state written with the pid names this boot and the
-    worker's start tick, and finalizing clears both."""
+    """The spawn writes the worker's boot id and start tick to its attempt's
+    identity file beside the stream log, and no state YAML carries them, so
+    a runner that does not know them still reads every state."""
     import claude_task_runner.runner.dispatcher as dmod
 
-    identities: list[tuple[int | None, str | None, int | None]] = []
+    written: list[dict[str, object]] = []
     real_write = dmod.write_state_atomic
 
     def _spy(state: TaskState, path: Path) -> None:
-        if state.status == "running" and state.pid is not None:
-            identities.append((state.pid, state.worker_boot_id, state.worker_start_ticks))
+        written.append(state.model_dump(mode="json"))
         real_write(state, path)
 
     monkeypatch.setattr(dmod, "write_state_atomic", _spy)
 
     outcome = _dispatch(queue_dir, task, fresh_plan, adopt=True)
 
-    pid, boot_id, ticks = identities[0]
-    assert pid == outcome.run_record.pid  # type: ignore[attr-defined]
-    assert boot_id == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    assert isinstance(ticks, int) and ticks > 0
-    final = load_state(state_path_for(queue_dir, task.id))
-    assert (final.worker_boot_id, final.worker_start_ticks) == (None, None)
+    identity = json.loads(
+        (queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.worker").read_text()
+    )
+    assert identity["pid"] == outcome.run_record.pid  # type: ignore[attr-defined]
+    assert identity["boot_id"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    assert isinstance(identity["start_ticks"], int) and identity["start_ticks"] > 0
+    assert written and all(
+        "worker_boot_id" not in w and "worker_start_ticks" not in w for w in written
+    )

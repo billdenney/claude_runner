@@ -253,7 +253,10 @@ def test_backstop_refuses_a_task_whose_unrecorded_worker_writes_its_log(
 
     assert called == []
     parked = _assert_parked(queue_dir, live_worker)
-    assert parked.worker_start_ticks is not None
+    # The found worker's own attempt and start: its log is attempt-1, and
+    # the fake process started 30 minutes before now.
+    assert parked.attempts == 1
+    assert parked.last_started_at == _NOW - timedelta(minutes=30)
 
 
 def test_backstop_dispatches_with_the_operators_override(

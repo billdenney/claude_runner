@@ -166,7 +166,7 @@ def adopt_running_workers(
             logger.warning("adoption: skipping unparseable state file %s: %s", state_path, exc)
             continue
 
-        if not _is_adoptable(state, now=now, settings=settings):
+        if not _is_adoptable(state, queue_dir, now=now, settings=settings):
             continue
 
         assert state.pid is not None  # narrowed by _is_adoptable
@@ -229,7 +229,7 @@ def adopt_running_workers(
     return results
 
 
-def _is_adoptable(state: TaskState, *, now: datetime, settings: Settings) -> bool:
+def _is_adoptable(state: TaskState, queue_dir: Path, *, now: datetime, settings: Settings) -> bool:
     """True iff ``state`` is a HEALTHY, file-backed running task whose worker runs.
 
     The verdict is :func:`supervisor.reconcile_silent.liveness_verdict`,
@@ -242,7 +242,7 @@ def _is_adoptable(state: TaskState, *, now: datetime, settings: Settings) -> boo
         return False
     if not Path(state.log_path).exists():
         return False
-    if dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE:
+    if dispatcher_mod.probe_recorded_worker(state, queue_dir) is not WorkerProbe.ALIVE:
         return False
     verdict = reconcile_silent.liveness_verdict(state, settings=settings.task_caps, now=now)
     if verdict is not HeartbeatVerdict.HEALTHY:
@@ -313,7 +313,7 @@ def finalize_exited_workers(
             )
             continue
 
-        if not _has_exited(state):
+        if not _has_exited(state, queue_dir):
             continue
         result = _record_exited(
             queue_dir,
@@ -409,7 +409,7 @@ def _record_exited(
     )
 
 
-def _has_exited(state: TaskState) -> bool:
+def _has_exited(state: TaskState, queue_dir: Path) -> bool:
     """True iff ``state``'s recorded worker is gone and its run is unrecorded.
 
     That is a file-backed ``running`` task, or a task parked by
@@ -427,7 +427,7 @@ def _has_exited(state: TaskState) -> bool:
             return False
     elif not dispatcher_mod.is_parked_live_worker(state):
         return False
-    return dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE
+    return dispatcher_mod.probe_recorded_worker(state, queue_dir) is not WorkerProbe.ALIVE
 
 
 @dataclass(frozen=True)
@@ -495,7 +495,7 @@ def track_parked_workers(
         if not dispatcher_mod.is_parked_live_worker(state):
             continue
         account = prior_accounts.get(state.task_id) or state.session_host_account()
-        if dispatcher_mod.probe_recorded_worker(state) is WorkerProbe.ALIVE:
+        if dispatcher_mod.probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE:
             records.append(
                 InFlightRecord(
                     task_id=state.task_id,

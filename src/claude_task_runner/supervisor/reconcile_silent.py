@@ -182,6 +182,7 @@ healthy.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -776,7 +777,7 @@ def reconcile_silent_orphans(
         :func:`_default_terminate_pg`. Tests inject a recorder.
     worker_probe_fn
         Whether a state's recorded pid is still its worker. Defaults to
-        :func:`runner.dispatcher.probe_recorded_worker`.
+        :func:`runner.dispatcher.probe_recorded_worker` for ``queue_dir``.
 
     Returns
     -------
@@ -793,7 +794,9 @@ def reconcile_silent_orphans(
     if terminate_fn is None:
         terminate_fn = _default_terminate_pg
     if worker_probe_fn is None:
-        worker_probe_fn = dispatcher_mod.probe_recorded_worker
+        worker_probe_fn = functools.partial(
+            dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
+        )
 
     results: list[ReapResult] = []
     now = clock.now()
@@ -881,7 +884,9 @@ def reap_silent_orphans_tick(
     if terminate_fn is None:
         terminate_fn = _default_terminate_pg
     if worker_probe_fn is None:
-        worker_probe_fn = dispatcher_mod.probe_recorded_worker
+        worker_probe_fn = functools.partial(
+            dispatcher_mod.probe_recorded_worker, queue_dir=queue_dir
+        )
 
     results: list[ReapResult] = []
     now = clock.now()

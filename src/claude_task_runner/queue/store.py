@@ -308,10 +308,20 @@ def load_task(path: Path) -> Task:
     return _validate(Task, payload, path)
 
 
+_RETIRED_STATE_KEYS = frozenset({"worker_boot_id", "worker_start_ticks"})
+"""Keys a state YAML may carry that :class:`TaskState` no longer has: a
+worker's spawn identity, now kept beside its stream log
+(``runner.dispatcher.worker_identity_path``). ``TaskState`` forbids unknown
+keys, so they are dropped on load; the runner's next write of the state
+leaves them out."""
+
+
 def load_state(path: Path) -> TaskState:
     """Read and validate a single TaskState YAML."""
     payload = _load_yaml(path)
     _check_schema_version(payload, path)
+    for key in _RETIRED_STATE_KEYS:
+        payload.pop(key, None)
     return _validate(TaskState, payload, path)
 
 

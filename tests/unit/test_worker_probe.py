@@ -12,6 +12,7 @@ exact values; the second runs real processes against the host's ``/proc``.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -308,25 +309,37 @@ def test_unreadable_boot_id_falls_back_to_the_window(
 
 @pytest.mark.usefixtures("alive")
 @pytest.mark.parametrize(
-    ("ticks", "expected"),
-    [(_SPAWN_TICKS, WorkerProbe.ALIVE), (_SPAWN_TICKS + 5, WorkerProbe.REUSED)],
+    ("file_pid", "ticks", "expected"),
+    [
+        pytest.param(_PID, _SPAWN_TICKS, WorkerProbe.ALIVE, id="identity-matches"),
+        pytest.param(_PID, _SPAWN_TICKS + 5, WorkerProbe.REUSED, id="identity-differs"),
+        # A file naming another pid is another worker's: ignored, and the
+        # start-time window (which this process fits) decides.
+        pytest.param(_PID + 1, _SPAWN_TICKS + 5, WorkerProbe.ALIVE, id="other-pids-file"),
+        pytest.param(None, None, WorkerProbe.ALIVE, id="no-file"),
+    ],
 )
-def test_probe_recorded_worker_passes_the_whole_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ticks: int, expected: WorkerProbe
+def test_probe_recorded_worker_reads_the_attempts_identity_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    file_pid: int | None,
+    ticks: int | None,
+    expected: WorkerProbe,
 ) -> None:
-    """The state-level probe hands the recorded spawn identity on: a start
-    tick that differs from the process's is a different process."""
+    """The state-level probe takes the spawn identity from the identity file
+    of the state's attempt, beside its stream log, when it names the state's
+    pid: a start tick that differs from the process's is a different process."""
     _use(monkeypatch, _fake_proc(tmp_path))
-    state = TaskState(
-        task_id="t",
-        status="running",
-        last_started_at=_STARTED,
-        pid=_PID,
-        worker_boot_id="boot-a",
-        worker_start_ticks=ticks,
+    queue_dir = tmp_path / "q"
+    if file_pid is not None:
+        path = dispatcher_mod.worker_identity_path(queue_dir, "t", 3)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"pid": file_pid, "boot_id": "boot-a", "start_ticks": ticks}))
+    state = TaskState(task_id="t", status="running", attempts=3, last_started_at=_STARTED, pid=_PID)
+    assert probe_recorded_worker(state, queue_dir) is expected
+    assert (
+        probe_recorded_worker(state.model_copy(update={"pid": None}), queue_dir) is WorkerProbe.DEAD
     )
-    assert probe_recorded_worker(state) is expected
-    assert probe_recorded_worker(state.model_copy(update={"pid": None})) is WorkerProbe.DEAD
 
 
 def test_pid_one_is_refused_and_dead() -> None:

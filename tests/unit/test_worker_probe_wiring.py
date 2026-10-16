@@ -269,7 +269,7 @@ def test_adoption_monitor_does_not_signal_a_pid_that_changed_hands(
     state = _seed(queue_dir, "t-cap", lines=[_INIT, _INIT])
     answers = [WorkerProbe.ALIVE]
 
-    def probe(_state: TaskState) -> WorkerProbe:
+    def probe(_state: TaskState, _queue_dir: Path) -> WorkerProbe:
         return answers.pop(0) if answers else WorkerProbe.REUSED
 
     monkeypatch.setattr(dispatcher_mod, "probe_recorded_worker", probe)

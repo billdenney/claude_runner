@@ -41,11 +41,14 @@ ProcessPoolExecutor) when ``target_concurrency > 1``.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -674,18 +677,71 @@ def probe_worker(
     return WorkerProbe.ALIVE
 
 
-def probe_recorded_worker(state: TaskState) -> WorkerProbe:
-    """:func:`probe_worker` on the worker ``state`` records: its pid, log,
-    start time and spawn identity. :attr:`~WorkerProbe.DEAD` with no pid."""
+def probe_recorded_worker(state: TaskState, queue_dir: Path) -> WorkerProbe:
+    """:func:`probe_worker` on the worker ``state`` records: its pid, log and
+    start time, with the spawn identity from its attempt's identity file
+    (:func:`read_worker_identity`). :attr:`~WorkerProbe.DEAD` with no pid."""
     if state.pid is None:
         return WorkerProbe.DEAD
+    identity = read_worker_identity(queue_dir, state)
     return probe_worker(
         state.pid,
         log_path=state.log_path,
         started_at=state.last_started_at,
-        boot_id=state.worker_boot_id,
-        start_ticks=state.worker_start_ticks,
+        boot_id=identity[0] if identity is not None else None,
+        start_ticks=identity[1] if identity is not None else None,
     )
+
+
+def worker_identity_path(queue_dir: Path, task_id: str, attempt: int) -> Path:
+    """``<task logs>/attempt-<attempt>.worker``: the spawn identity of that
+    attempt's worker, beside its stream log."""
+    return task_logs_dir(queue_dir, task_id) / f"attempt-{attempt}.worker"
+
+
+def write_worker_identity(path: Path, pid: int) -> None:
+    """Record running process ``pid``'s boot id and start tick at ``path``.
+
+    A small JSON file, written with tempfile + ``os.replace``. Kept out of
+    the state YAML so a runner without this field still reads every state.
+    Nothing is written when ``/proc`` cannot say (the probe then falls back
+    to the start-time window). ``OSError`` propagates.
+    """
+    boot_id, start_ticks = _process_identity(pid)
+    if boot_id is None or start_ticks is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"pid": pid, "boot_id": boot_id, "start_ticks": start_ticks}
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False, prefix=f".{path.name}."
+    ) as tmp:
+        json.dump(payload, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp.name, path)
+
+
+def read_worker_identity(queue_dir: Path, state: TaskState) -> tuple[str, int] | None:
+    """``(boot_id, start_ticks)`` recorded for ``state``'s worker, or ``None``.
+
+    Read from the identity file of the state's current attempt, and used only
+    when it names the state's pid: a file for another pid is another
+    worker's. ``None`` when the file is missing or unreadable (a worker
+    spawned before identity files existed, or where ``/proc`` could not say).
+    """
+    if state.pid is None:
+        return None
+    path = worker_identity_path(queue_dir, state.task_id, state.attempts)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("pid") != state.pid:
+        return None
+    boot_id, start_ticks = data.get("boot_id"), data.get("start_ticks")
+    if not isinstance(boot_id, str) or not isinstance(start_ticks, int):
+        return None
+    return boot_id, start_ticks
 
 
 LIVE_WORKER_STOP_REASON = "worker_still_running"
@@ -702,8 +758,8 @@ def park_live_worker(state: TaskState, *, why: str) -> TaskState:
     """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
     still runs. ``why`` completes "worker pid=N is still running ...".
 
-    Keeps ``pid``, ``log_path`` and the spawn identity: they are how the
-    parked worker is probed each tick and its run recorded once it exits.
+    Keeps ``pid``, ``log_path`` and ``attempts``: they are how the parked
+    worker is probed each tick and its run recorded once it exits.
     """
     return state.model_copy(
         update={
@@ -735,25 +791,42 @@ def live_worker_record(state: TaskState, queue_dir: Path) -> TaskState | None:
     Otherwise a worker no state records, whose pid was never written (the
     ``UNTRACKED-PID`` case in :func:`dispatch`) or whose state was lost:
     a process whose stdout is one of the task's stream logs
-    (:func:`find_live_log_writer`). That one is returned with its pid, log
-    and spawn identity filled in, so it can be parked and probed like any
-    other. Only this user's processes can be found that way.
+    (:func:`find_live_log_writer`). That one is returned with its pid and
+    log, its attempt number from the log's name
+    (``attempt-<N>.stream.jsonl``, kept when the state already counts more
+    attempts, so a later attempt never reuses an existing log), and its own
+    process start time as ``last_started_at``, so it can be parked, probed
+    and recorded like any other. Only this user's processes can be found
+    that way.
     """
-    if probe_recorded_worker(state) is WorkerProbe.ALIVE:
+    if probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE:
         return state
     found = find_live_log_writer(task_logs_dir(queue_dir, state.task_id))
     if found is None:
         return None
     pid, log_path = found
-    boot_id, start_ticks = _process_identity(pid)
-    return state.model_copy(
-        update={
-            "pid": pid,
-            "log_path": log_path,
-            "worker_boot_id": boot_id,
-            "worker_start_ticks": start_ticks,
-        }
-    )
+    update: dict[str, object] = {"pid": pid, "log_path": log_path}
+    match = _ATTEMPT_LOG_RE.fullmatch(os.path.basename(log_path))
+    if match is not None:
+        update["attempts"] = max(state.attempts, int(match.group(1)))
+    started = _process_started_at(pid)
+    if started is not None:
+        update["last_started_at"] = started
+    return state.model_copy(update=update)
+
+
+_ATTEMPT_LOG_RE = re.compile(r"attempt-(\d+)\.stream\.jsonl")
+"""A stream log's name: :func:`_attempt_log_paths`."""
+
+
+def _process_started_at(pid: int) -> datetime | None:
+    """When the running process ``pid`` started, from ``/proc``; ``None``
+    when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot = _boot_time()
+    if stat is None or boot is None:
+        return None
+    return boot + timedelta(seconds=stat[1] / os.sysconf("SC_CLK_TCK"))
 
 
 def find_live_log_writer(log_dir: Path) -> tuple[int, str] | None:
@@ -1813,8 +1886,6 @@ def dispatch(
             # must not point at that worker.
             "pid": None,
             "log_path": None,
-            "worker_boot_id": None,
-            "worker_start_ticks": None,
         }
     )
     if persist_state:
@@ -2011,16 +2082,27 @@ def dispatch(
     # so an operator grepping the journal sees that this attempt won't be
     # reapable by pid.
     if persist_state:
+        # The spawn identity goes beside the stream log, written before the
+        # pid so that a worker whose pid write fails is still identified.
+        try:
+            write_worker_identity(
+                worker_identity_path(queue_dir, task.id, new_state.attempts), process.pid
+            )
+        except OSError as exc:
+            logger.warning(
+                "task %s: could not record worker pid=%s's spawn identity (%s); its "
+                "probe falls back to its start time",
+                task.id,
+                process.pid,
+                exc,
+            )
         try:
             # log_path is always written, None for a pipe-backed worker:
             # the worker probe compares a recorded log with the pid's
             # stdout, so an earlier attempt's log must not stay on record.
-            boot_id, start_ticks = _process_identity(process.pid)
             pid_update: dict[str, object] = {
                 "pid": process.pid,
                 "log_path": str(stdout_log_path) if stdout_log_path is not None else None,
-                "worker_boot_id": boot_id,
-                "worker_start_ticks": start_ticks,
             }
             new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
@@ -2343,7 +2425,7 @@ def adopt_worker(
     alive_monitor.start()
 
     def _alive() -> bool:
-        return probe_recorded_worker(state) is WorkerProbe.ALIVE
+        return probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE
 
     def _terminate_adopted() -> None:
         # The pid may have passed to another process since the last poll.
@@ -2882,8 +2964,6 @@ def _finalize_state(
             # The next dispatch records a new log_path. No-op for the
             # pipe path, where log_path was never set.
             "log_path": None,
-            "worker_boot_id": None,
-            "worker_start_ticks": None,
             # The attempt's pre-dispatch HEAD has served the output gate;
             # the next dispatch snapshots its own.
             "pre_dispatch_sha": None,

@@ -11,8 +11,6 @@ last_heartbeat_at: '2026-09-24T22:08:01.543428Z'
 dispatcher_alive_at: '2026-09-24T22:08:01.543428Z'
 pid: 4243
 log_path: .claude_task_runner/logs/042-smith_2021_examplumab.jsonl
-worker_boot_id: 5b0d3a5e-2f1c-4c55-9a3e-8d6f2b7c1e44
-worker_start_ticks: 91641447
 pre_dispatch_sha: 3b18e512dba79e4c8300dd08aeb37f8e728b8dad
 stop_reason: end_turn
 error: 'sidecar filed: covariate encoding is ambiguous'

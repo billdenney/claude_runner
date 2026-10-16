@@ -1160,7 +1160,8 @@ def _skip_category(
         # run is recorded once it exits (supervisor.adoption.track_parked_workers).
         if (
             state.pid is not None
-            and dispatcher_mod.probe_recorded_worker(state) is dispatcher_mod.WorkerProbe.ALIVE
+            and dispatcher_mod.probe_recorded_worker(state, queue_dir)
+            is dispatcher_mod.WorkerProbe.ALIVE
         ):
             if not read_only:
                 _park_live_worker(queue_dir, state)
