@@ -139,7 +139,10 @@ claude-task-runner queue holds --json
 
 `account list` gives each account's `dispatch_cap` (what dispatch allows
 it now: 0 while paused, throttled, without a reading, or with a broken
-settings file), `weekly_catch_up_at` for a `THROTTLED_WEEKLY` account (when
+settings file). That is the dispatcher's view only: `queue force-dispatch`
+bypasses throttling and pauses, so it can still start a task on a paused
+or throttled account, though not on one whose settings file is broken.
+It also gives `weekly_catch_up_at` for a `THROTTLED_WEEKLY` account (when
 the weekly curve meets its last reading, so when it should take tasks
 again; `scheduled_wakeup_at` is only the next re-check) and `usage_error`
 for an `ERROR_DRIFT` account (`auth`: log it in again; `format`: the usage
