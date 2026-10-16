@@ -1270,6 +1270,199 @@ class TestUnionIsIdempotent:
         assert (wt / REGISTER).read_bytes() == once
 
 
+class TestUnionHonoursWhatABranchRemovedOrCorrected:
+    """A branch's own diff can remove an entry (a rename, a re-filing) or
+    correct an annotation, not only add. The union read only additions: the
+    base's old entry came back beside the renamed one, and a same-length or
+    shorter correction lost to the base's annotation under "longest wins, the
+    base's on a tie". The NEWS union had the same blind spot for reworded
+    bullets (seven duplicates on the 2026-10-10 nlmixr2lib merge)."""
+
+    LINE = "- **Example models:** `A_2020_a.R` (a: 12 mg), `Old_2019_x.R` (old)."
+    BASE = f"# Covariates\n\n## Body size\n\n### WT (**canonical for weight**)\n\n{LINE}\n"
+
+    def _world(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixed_line: str
+    ) -> tuple[Path, Path]:
+        """claude/fix rewrites the line; claude/add appends to the same line, so
+        -X theirs keeps add's copy and fix's change is lost from the merge."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        push_task_branch(
+            repo,
+            "claude/fix",
+            {REGISTER: self.BASE.replace(self.LINE, fixed_line)},
+            "Fix the entry",
+        )
+        added = self.BASE.replace(
+            "`Old_2019_x.R` (old).", "`Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        assert fixed_line not in (wt / REGISTER).read_text(), "the fixture lost nothing"
+        return repo, wt
+
+    def test_a_renamed_entry_does_not_come_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        renamed = self.LINE.replace("`Old_2019_x.R`", "`New_2019_x.R`")
+        repo, wt = self._world(tmp_path, monkeypatch, renamed)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        line = next(x for x in (wt / REGISTER).read_text().splitlines() if "Example models" in x)
+        assert line == (
+            "- **Example models:** `A_2020_a.R` (a: 12 mg), `New_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        assert (
+            "# dropped 1 entry a merged branch removed:"
+            " Body size / WT (**canonical for weight**) / Old_2019_x.R"
+        ) in proc.stderr
+
+    def test_a_same_length_correction_wins_over_the_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        corrected = self.LINE.replace("(a: 12 mg)", "(a: 21 mg)")
+        repo, wt = self._world(tmp_path, monkeypatch, corrected)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        line = next(x for x in (wt / REGISTER).read_text().splitlines() if "Example models" in x)
+        assert line == (
+            "- **Example models:** `A_2020_a.R` (a: 21 mg), `Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+
+    def test_a_correction_to_an_annotation_main_also_changed_does_not_override_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The branch saw "12 mg"; main has since written "15 mg". The branch's
+        "21 mg" corrects text the base no longer has, so the base's stands."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        push_task_branch(
+            repo,
+            "claude/fix",
+            {REGISTER: self.BASE.replace("(a: 12 mg)", "(a: 21 mg)")},
+            "Fix the entry",
+        )
+        update_main(repo, {REGISTER: self.BASE.replace("(a: 12 mg)", "(a: 15 mg)")}, "main fix")
+        added = self.BASE.replace("(a: 12 mg)", "(a: 15 mg)").replace(
+            "`Old_2019_x.R` (old).", "`Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        assert self._line(wt) == (
+            "- **Example models:** `A_2020_a.R` (a: 15 mg), `Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+
+    @staticmethod
+    def _line(wt: Path) -> str:
+        return next(x for x in (wt / REGISTER).read_text().splitlines() if "Example models" in x)
+
+    def _run(self, repo: Path) -> subprocess.CompletedProcess[str]:
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        return proc
+
+    def test_a_rename_run_twice_is_run_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        renamed = self.LINE.replace("`Old_2019_x.R`", "`New_2019_x.R`")
+        repo, wt = self._world(tmp_path, monkeypatch, renamed)
+        self._run(repo)
+        once = (wt / REGISTER).read_bytes()
+        second = self._run(repo)
+        assert second.stderr.endswith(f"# nothing to add; left unchanged: {wt / REGISTER}\n")
+        assert (wt / REGISTER).read_bytes() == once
+
+    def test_an_empty_correction_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A correction that removes the annotation is still a correction."""
+        repo, wt = self._world(tmp_path, monkeypatch, self.LINE.replace(" (a: 12 mg)", ""))
+        self._run(repo)
+        assert self._line(wt) == (
+            "- **Example models:** `A_2020_a.R`, `Old_2019_x.R` (old), `C_2021_c.R` (c)."
+        )
+
+    def test_a_removal_of_an_entry_main_also_changed_is_not_honoured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The branch removed Old as it saw it; main has re-annotated Old since."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        push_task_branch(
+            repo, "claude/fix", {REGISTER: self.BASE.replace(", `Old_2019_x.R` (old)", "")}, "Drop"
+        )
+        main = self.BASE.replace("(old)", "(old, re-annotated)")
+        update_main(repo, {REGISTER: main}, "main re-annotates Old")
+        added = main.replace("(old, re-annotated).", "(old, re-annotated), `C_2021_c.R` (c).")
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        proc = self._run(repo)
+        assert "Old_2019_x.R` (old, re-annotated)" in self._line(wt)
+        assert "dropped" not in proc.stderr
+
+    def test_an_entry_one_branch_removed_and_another_added_stays(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """claude/early, cut before main had Old, adds it; claude/fix removes it."""
+        start = self.BASE.replace(", `Old_2019_x.R` (old)", "")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: start})
+        push_task_branch(
+            repo,
+            "claude/early",
+            {REGISTER: start.replace("(a: 12 mg).", "(a: 12 mg), `Old_2019_x.R` (old).")},
+            "Add Old",
+        )
+        update_main(repo, {REGISTER: self.BASE}, "main gains Old")
+        push_task_branch(repo, "claude/fix", {REGISTER: start}, "Drop Old")
+        wt = consolidate(repo, ["origin/claude/early", "origin/claude/fix"], CONSOLIDATION)
+        self._run(repo)
+        assert "`Old_2019_x.R` (old)" in self._line(wt)
+
+    def test_two_branches_correcting_one_annotation_differently_keep_the_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: self.BASE})
+        for name, dose in (("a", "21 mg"), ("b", "31 mg")):
+            text = self.BASE.replace("(a: 12 mg)", f"(a: {dose})")
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Fix {name}")
+        wt = consolidate(repo, ["origin/claude/a", "origin/claude/b"], CONSOLIDATION)
+        proc = self._run(repo)
+        assert "(a: 21 mg)" in self._line(wt)
+        assert "# two merged branches correct" in proc.stderr
+
+    def test_a_renamed_heading_does_not_empty_its_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """claude/fix renames the heading right above the line, so its copy has
+        no entries in the old bucket; that is not a removal of them."""
+        base = self.BASE.replace("**)\n\n- **Example", "**)\n- **Example")
+        renamed = base.replace("### WT (**canonical for weight**)", "### WT (**weight**)")
+        added = base.replace("`Old_2019_x.R` (old).", "`Old_2019_x.R` (old), `C_2021_c.R` (c).")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: base})
+        push_task_branch(repo, "claude/fix", {REGISTER: renamed}, "Rename the heading")
+        push_task_branch(repo, "claude/add", {REGISTER: added}, "Add C 2021")
+        wt = consolidate(repo, ["origin/claude/fix", "origin/claude/add"], CONSOLIDATION)
+        assert "canonical for weight" in (wt / REGISTER).read_text(), "the fixture lost nothing"
+        proc = self._run(repo)
+        line = self._line(wt)
+        assert "`A_2020_a.R`" in line and "`Old_2019_x.R`" in line
+        assert "dropped" not in proc.stderr
+
+    def test_a_line_whose_entries_all_went_is_left_alone(self) -> None:
+        """Every entry removed would leave "- **Example models:** ."; the line is
+        kept as it is and reported instead."""
+        u = load_helper("union_merge_lines")
+        bucket = ("Body size", "WT (**canonical for weight**)")
+        union = u.Union()
+        union.annotations[bucket] = {"A_2020_a.R": "(a)"}
+        union.base_order[bucket] = ["A_2020_a.R"]
+        union.removed[bucket] = {"A_2020_a.R"}
+        text = "## Body size\n\n### WT (**canonical for weight**)\n\n- **Example models:** `A_2020_a.R` (a).\n"
+        out, report = u.emit_merged(text, union)
+        assert out == text
+        assert any("every entry" in note for note in report)
+
+
 class TestDedupCanonicalHeaders:
     DUPLICATED = """\
 # Compartments

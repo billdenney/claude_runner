@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -199,3 +200,195 @@ def test_an_inherited_bullet_main_reworded_is_not_brought_back(
         "# dropping 1 bullet(s) that are neither on origin/main nor added by a merged branch:\n"
         "#   - Add Base 2000 x model.\n"
     ) in proc.stdout
+
+
+REWORD_BASE = (
+    "# development version\n\n"
+    "- Add Base 2000 x model.\n\n"
+    "- Add Old 1999 y model (doi:10.1000/wrong).\n\n"
+    "- Add Gone 1998 z model.\n"
+)
+
+
+def _reword_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, main_too: bool = False
+) -> tuple[Path, Path]:
+    """A branch that corrects one inherited bullet and deletes another, and a
+    branch that adds a model; optionally main rewords the corrected bullet too."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": REWORD_BASE})
+    fixed = (
+        REWORD_BASE.replace("doi:10.1000/wrong", "doi:10.1000/right")
+        .replace("- Add Gone 1998 z model.\n", "")
+        .rstrip("\n")
+        + "\n"
+    )
+    push_task_branch(repo, "claude/fix", {"NEWS.md": fixed}, "Correct the Old 1999 DOI")
+    # Inserted right above the bullet claude/fix corrects, so the two hunks
+    # conflict and -X theirs brings the old wording back, as on 2026-10-10.
+    added = REWORD_BASE.replace("- Add Old", "- Add New 2024 w model.\n\n- Add Old")
+    push_task_branch(repo, "claude/new", {"NEWS.md": added}, "Add New 2024")
+    if main_too:
+        update_main(
+            repo,
+            {"NEWS.md": REWORD_BASE.replace("doi:10.1000/wrong", "doi:10.1000/mains")},
+            "main rewords Old 1999",
+        )
+    wt = consolidate(repo, ["origin/claude/fix", "origin/claude/new"], "news")
+    return repo, wt
+
+
+def test_a_bullet_a_branch_reworded_is_rewritten_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading only additions kept both wordings: the base's old one in place
+    and the branch's new one at the top (seven such duplicates on 2026-10-10).
+    The branch's rewording now replaces the old bullet where it stands, and a
+    bullet it deleted is gone."""
+    repo, wt = _reword_world(tmp_path, monkeypatch)
+    assert "doi:10.1000/wrong" in (wt / "NEWS.md").read_text(), "the fixture did not reproduce it"
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news")
+    assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+    assert (wt / "NEWS.md").read_text() == (
+        "# development version\n\n"
+        "- Add New 2024 w model.\n\n"
+        "- Add Base 2000 x model.\n\n"
+        "- Add Old 1999 y model (doi:10.1000/right).\n"
+    )
+    assert (
+        "#   reworded by a merged branch: - Add Old 1999 y model (doi:10.1000/wrong)."
+        in proc.stdout
+    )
+    assert "#   deleted by a merged branch: - Add Gone 1998 z model." in proc.stdout
+    # Idempotent: a second run changes nothing.
+    again = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news", "--check")
+    assert again.returncode == 0, again.stdout
+
+
+def test_a_rewording_of_a_bullet_main_also_changed_is_added_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main rewrote the same bullet after the branch forked, so the base has
+    neither wording the branch saw. The base's wording stays, the branch's is
+    added at the top, and the run names it for review."""
+    repo, wt = _reword_world(tmp_path, monkeypatch, main_too=True)
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news")
+    assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+    news = (wt / "NEWS.md").read_text()
+    assert "- Add Old 1999 y model (doi:10.1000/mains)." in news
+    assert news.index("- Add Old 1999 y model (doi:10.1000/right).") < news.index(
+        "- Add Base 2000 x model."
+    )
+    assert (
+        "# NOTE: origin/claude/fix rewords a bullet origin/main no longer has; its new wording"
+        " is added at the top, check it against the base's own:"
+        " - Add Old 1999 y model (doi:10.1000/right)."
+    ) in proc.stdout
+
+
+def _news(*items: str) -> str:
+    return "# development version\n\n" + "\n\n".join(f"- {i}" for i in items) + "\n"
+
+
+def _run_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base: str,
+    first: tuple[str, str],
+    second: tuple[str, str],
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Consolidate claude/<first> then claude/<second> and run the NEWS union."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": base})
+    for name, text in (first, second):
+        push_task_branch(repo, f"claude/{name}", {"NEWS.md": text}, f"Change {name}")
+    wt = consolidate(repo, [f"origin/claude/{first[0]}", f"origin/claude/{second[0]}"], "news")
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "news")
+    return proc, wt
+
+
+class TestWhatABranchDidToInheritedBullets:
+    """The rewording pass must tell a moved, reworded or deleted bullet apart."""
+
+    def test_a_bullet_a_branch_only_moved_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reorder is not a deletion: the bullet is still in the branch's copy."""
+        base = _news("A 2000 x.", "B 2001 y.", "C 2002 z.")
+        proc, wt = _run_two(
+            tmp_path,
+            monkeypatch,
+            base,
+            ("mv", _news("C 2002 z.", "A 2000 x.", "B 2001 y.")),
+            ("add", _news("N 2024 n.", "A 2000 x.", "B 2001 y.", "C 2002 z.")),
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "- C 2002 z." in (wt / "NEWS.md").read_text()
+        assert "deleted by a merged branch" not in proc.stdout
+
+    def test_a_new_bullet_above_a_fix_does_not_take_the_fixed_bullets_place(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Insert N above X and fix X to X': X' replaces X, N goes to the top."""
+        base = _news("X 2000 doi:wrong.", "Y 2001 y.", "Z 2002 z.")
+        proc, wt = _run_two(
+            tmp_path,
+            monkeypatch,
+            base,
+            ("fix", _news("N 2024 n.", "X 2000 doi:right.", "Y 2001 y.", "Z 2002 z.")),
+            ("add", _news("M 2023 m.", "X 2000 doi:wrong.", "Y 2001 y.", "Z 2002 z.")),
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        # New bullets go on top in ref-name order (claude/add, then claude/fix).
+        assert (wt / "NEWS.md").read_text() == _news(
+            "M 2023 m.", "N 2024 n.", "X 2000 doi:right.", "Y 2001 y.", "Z 2002 z."
+        )
+        assert "#   reworded by a merged branch: - X 2000 doi:wrong." in proc.stdout
+
+    def test_two_middle_bullets_a_branch_deleted_go_with_their_blank_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = _news("A 2000 a.", "B 2001 b.", "C 2002 c.", "D 2003 d.")
+        proc, wt = _run_two(
+            tmp_path,
+            monkeypatch,
+            base,
+            ("del", _news("A 2000 a.", "D 2003 d.")),
+            ("add", _news("A 2000 a.", "N 2024 n.", "B 2001 b.", "C 2002 c.", "D 2003 d.")),
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (wt / "NEWS.md").read_text() == _news("N 2024 n.", "A 2000 a.", "D 2003 d.")
+
+    def test_two_branches_rewording_one_bullet_differently_keep_the_first_and_say_so(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = _news("X 2000 doi:wrong.", "Y 2001 y.")
+        proc, wt = _run_two(
+            tmp_path,
+            monkeypatch,
+            base,
+            ("a", _news("X 2000 doi:right-a.", "Y 2001 y.")),
+            ("b", _news("X 2000 doi:right-b.", "Y 2001 y.")),
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        news = (wt / "NEWS.md").read_text()
+        assert "doi:right-a" in news and "doi:wrong" not in news
+        assert (
+            "# NOTE: origin/claude/b also changes a bullet another merged branch changed"
+            in proc.stdout
+        )
+
+    def test_a_branch_that_deletes_most_of_the_history_stops_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truncated NEWS.md on a branch is a mistake, not a dozen deletions."""
+        many = [f"Old{k:02d} 19{k:02d} m." for k in range(15)]
+        base = _news(*many)
+        proc, _wt = _run_two(
+            tmp_path,
+            monkeypatch,
+            base,
+            ("trunc", _news(*many[:2])),
+            ("add", _news("N 2024 n.", *many)),
+        )
+        assert proc.returncode == 2, proc.stdout
+        assert "origin/claude/trunc deletes 13 of its 15 inherited bullets" in proc.stderr
+        assert "# rebuilt" not in proc.stdout, "it must stop before rewriting NEWS.md"
