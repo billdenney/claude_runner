@@ -230,12 +230,15 @@ def test_live_pipe_backed_worker_is_parked_and_a_reused_pid_is_demoted(
     """With adoption off a worker has no log, so the probe goes by its start
     time. A worker started when its attempt did is still running: its task
     is parked ``possibly_hung`` with the pid, logged at WARNING. The same
-    pid recorded for an attempt that started an hour earlier belongs to a
-    process started since, so that task's worker is gone and it is demoted.
+    pid recorded for an attempt that started ten minutes after that process
+    is not that attempt's worker, so its task is demoted. The attempt is
+    dated after the process, not before it, so it is always within this boot
+    and the probe judges it by the start window whatever the host's uptime.
     Neither process is signalled."""
     qd = _queue(tmp_path)
     now = datetime.now(UTC)
-    for task_id, started_at in [("t-live", now), ("t-reused", now - timedelta(hours=1))]:
+    reused_at = now + timedelta(minutes=10)
+    for task_id, started_at in [("t-live", now), ("t-reused", reused_at)]:
         write_state_atomic(
             TaskState(
                 task_id=task_id,
@@ -267,13 +270,13 @@ def test_live_pipe_backed_worker_is_parked_and_a_reused_pid_is_demoted(
         "and was not adopted; parked possibly_hung (stop_reason=worker_still_running), "
         "not failed, so it is not dispatched a second time (log=None)",
     )
-    # The probe says why t-reused's pid is not its worker (the offset is the
-    # sleep's start against an attempt an hour older, about +3600s).
+    # The probe says why t-reused's pid is not its worker: the sleep started
+    # about 600 s before that attempt, past the 60 s allowed before it.
     assert len(warnings) == 2
     assert warnings[1][0] == "claude_task_runner.runner.dispatcher"
     assert warnings[1][1].startswith(
         f"pid {live_worker_pid} is not the worker of the attempt started at "
-        f"{(now - timedelta(hours=1)).isoformat()} (log None): the process started +"
+        f"{reused_at.isoformat()} (log None): the process started -"
     )
 
 
