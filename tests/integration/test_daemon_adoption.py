@@ -9,12 +9,18 @@ Covers the wiring (not ``adopt_worker``'s own logic — that's in
   emits a ``worker_adopted`` event/notify, and a slot is left in flight;
 * a running task that is NOT adoptable (here: a dead pid) is still
   demoted by ``reconcile_orphans`` to ``failed`` — the legacy recovery;
-* with ``[supervisor].adopt_workers`` off, even a perfectly-adoptable
-  worker is demoted (kill-switch restores legacy behaviour);
+* with ``[supervisor].adopt_workers`` off, nothing is adopted: a dead
+  worker's task is demoted (the legacy behaviour), and a live one's is
+  parked ``possibly_hung``, so no second worker is dispatched beside it;
 * a worker that exited while no supervisor ran, leaving a terminal
   ``result`` event in its log, is recorded from the log (the 2026-09-26
   restart incident) whatever its heartbeat age; one that left no result
-  event is still demoted, as before.
+  event is still demoted, as before;
+* against real worker processes and the host's ``/proc`` (the 2026-10-16
+  restart incident): a worker in a long tool call, whose agent heartbeat
+  is minutes old, is adopted and finalized from its log; one with no sign
+  of life at all is parked, not failed, and left running; and a task whose
+  pid now belongs to another process is demoted without signalling it.
 
 ``adopt_worker`` is stubbed to a no-op so the daemon's adoption monitor
 thread doesn't run a real tail loop; ``_pid_alive`` is stubbed per test.
@@ -23,11 +29,17 @@ thread doesn't run a real tail loop; ``_pid_alive`` is stubbed per test.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import signal
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from signal_gate import SignalGate
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
@@ -44,10 +56,12 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.daemon import start_daemon
-from claude_task_runner.supervisor.reconcile import ORPHAN_STOP_REASON
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON, ORPHAN_STOP_REASON
 from claude_task_runner.supervisor.states import InFlightRecord
 from claude_task_runner.usage.models import UsageReading, WindowReading
 from claude_task_runner.usage.source import FakeUsageSource
+
+from ._file_worker import spawn_file_worker
 
 _NOW = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
 
@@ -103,6 +117,7 @@ def _run_daemon(
     qd: Path,
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
+    clock: FakeClock | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, dict[str, object]]]]:
     test_lock = qd.parent / "test_global.lock"
     monkeypatch.setattr("claude_task_runner.supervisor.pidfile.global_lock_path", lambda: test_lock)
@@ -114,7 +129,7 @@ def _run_daemon(
         source=FakeUsageSource([_reading()]),
         pending_count_fn=lambda: 0,
         in_flight_count_fn=lambda: 0,
-        clock=FakeClock(_NOW),
+        clock=clock if clock is not None else FakeClock(_NOW),
         notify_callback=lambda level, msg: notifications.append((level, msg)),
         event_callback=lambda kind, payload: events.append((kind, payload)),
         install_signal_handlers=False,
@@ -161,14 +176,26 @@ def test_daemon_demotes_dead_pid_worker(tmp_path: Path, monkeypatch: pytest.Monk
     assert reloaded.stop_reason == ORPHAN_STOP_REASON
 
 
-def test_daemon_kill_switch_demotes_even_adoptable_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("alive", "status", "stop_reason"),
+    [
+        (False, "failed", ORPHAN_STOP_REASON),
+        (True, "possibly_hung", LIVE_WORKER_STOP_REASON),
+    ],
+)
+def test_daemon_kill_switch_adopts_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alive: bool,
+    status: str,
+    stop_reason: str,
 ) -> None:
-    """With adoption OFF, a perfectly-adoptable worker is still demoted —
-    the kill-switch restores the legacy demote-on-restart behaviour."""
+    """With adoption OFF nothing is adopted. A gone worker's task is demoted
+    for re-dispatch, as before adoption existed; a live worker's is parked,
+    since a failed task would be dispatched beside the worker."""
     qd = _queue(tmp_path)
     _seed_running_filebacked(qd, "t-off")
-    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: alive)
     # adopt_worker must never be called when the flag is off.
     monkeypatch.setattr(
         dispatcher_mod,
@@ -179,8 +206,8 @@ def test_daemon_kill_switch_demotes_even_adoptable_worker(
     _run_daemon(qd, _settings(adopt=False), monkeypatch)
 
     reloaded = load_state(state_path_for(qd, "t-off"))
-    assert reloaded.status == "failed"
-    assert reloaded.stop_reason == ORPHAN_STOP_REASON
+    assert reloaded.status == status
+    assert reloaded.stop_reason == stop_reason
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +423,149 @@ def test_daemon_gives_both_finalize_paths_the_dispatch_and_hook_settings(
     for path in ("exited", "adopted"):
         assert calls[path]["settings_dispatch"] is settings.dispatch, path
         assert calls[path]["settings_hooks"] is settings.hooks, path
+
+
+# ---------------------------------------------------------------------------
+# Real workers, real /proc (2026-10-16 restart incident)
+# ---------------------------------------------------------------------------
+
+
+def _seed_real_worker(qd: Path, task_id: str, *, pid: int, log: Path, now: datetime) -> None:
+    """A running first attempt started 20 minutes ago whose agent heartbeat
+    is 9 minutes old: the worker has been in one tool call since."""
+    write_task_atomic(
+        Task(id=task_id, title="t", prompt="p", working_dir=None),
+        qd / "todo" / f"{task_id}.yaml",
+    )
+    state = TaskState(
+        task_id=task_id,
+        status="running",
+        attempts=1,
+        last_started_at=now - timedelta(minutes=20),
+        last_heartbeat_at=now - timedelta(minutes=9),
+        pid=pid,
+        log_path=str(log),
+        session_id="sess-real",
+    )
+    write_state_atomic(state, state_path_for(qd, task_id))
+
+
+def _wait_for_lines(log: Path, count: int) -> None:
+    deadline = time.monotonic() + 10
+    while len(log.read_text().splitlines()) < count:
+        assert time.monotonic() < deadline, f"{log} never reached {count} lines"
+        time.sleep(0.05)
+
+
+def _adoption_thread(task_id: str) -> threading.Thread:
+    (thread,) = [t for t in threading.enumerate() if t.name == f"adopt-{task_id}"]
+    return thread
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("real_proc")
+def test_daemon_adopts_real_worker_in_a_long_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signal_gate: SignalGate
+) -> None:
+    """The incident: the old supervisor's monitor ticked seconds before the
+    restart, the agent heartbeat is 9 minutes old, and the worker is busy
+    in a tool call. The new supervisor adopts it, and the adoption monitor
+    records its run once it finishes. It is never set failed, so it is
+    never dispatched a second time."""
+    qd = _queue(tmp_path)
+    now = datetime.now(UTC)
+    log = qd / ".claude_task_runner" / "logs" / "t-tool" / "attempt-1.stream.jsonl"
+    pid = spawn_file_worker(log, {"WORKER_SESSION_ID": "sess-real", "WORKER_HOLD_S": "2"})
+    signal_gate.allow(pid)
+    _wait_for_lines(log, 2)
+    _seed_real_worker(qd, "t-tool", pid=pid, log=log, now=now)
+    state = load_state(state_path_for(qd, "t-tool"))
+    write_state_atomic(
+        state.model_copy(update={"dispatcher_alive_at": now - timedelta(seconds=20)}),
+        state_path_for(qd, "t-tool"),
+    )
+
+    _notifications, events = _run_daemon(qd, _settings(), monkeypatch, clock=FakeClock(now))
+
+    assert ("worker_adopted", {"task_id": "t-tool", "pid": pid, "log_path": str(log)}) in events
+    assert load_state(state_path_for(qd, "t-tool")).status == "running"
+    thread = _adoption_thread("t-tool")
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    final = load_state(state_path_for(qd, "t-tool"))
+    assert final.status == "completed"
+    assert [r.stop_reason for r in final.runs] == ["end_turn"]
+    assert final.pid is None
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("real_proc")
+def test_daemon_parks_real_worker_with_no_sign_of_life(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_gate: SignalGate,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Heartbeat, monitor tick and log write all 9 minutes old, but the
+    worker runs. The startup reaper parks the task possibly_hung, naming
+    the pid; it is not set failed, and the worker is not signalled."""
+    qd = _queue(tmp_path)
+    now = datetime.now(UTC)
+    log = qd / ".claude_task_runner" / "logs" / "t-quiet" / "attempt-1.stream.jsonl"
+    pid = spawn_file_worker(log, {"WORKER_SESSION_ID": "sess-real", "WORKER_HOLD_S": "60"})
+    signal_gate.allow(pid)
+    try:
+        _wait_for_lines(log, 2)
+        quiet_since = (now - timedelta(minutes=9)).timestamp()
+        os.utime(log, (quiet_since, quiet_since))
+        _seed_real_worker(qd, "t-quiet", pid=pid, log=log, now=now)
+        state = load_state(state_path_for(qd, "t-quiet"))
+        write_state_atomic(
+            state.model_copy(update={"dispatcher_alive_at": now - timedelta(minutes=9)}),
+            state_path_for(qd, "t-quiet"),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _notifications, events = _run_daemon(qd, _settings(), monkeypatch, clock=FakeClock(now))
+
+        parked = load_state(state_path_for(qd, "t-quiet"))
+        assert parked.status == "possibly_hung"
+        assert parked.stop_reason == "silent_on_restart"
+        assert parked.error == (
+            "silent_on_restart: 540s without a heartbeat, worker log write or monitor "
+            f"tick (heartbeat_silence_alert_s=300); worker pid={pid} was not signalled "
+            "and may still be running"
+        )
+        assert not any(kind == "worker_adopted" for kind, _payload in events)
+        assert (
+            "claude_task_runner.supervisor.reconcile_silent",
+            f"reaped silent orphan task t-quiet: verdict=silent silence=540s pid={pid} "
+            "sigtermed=False new_status=possibly_hung stop_reason=silent_on_restart",
+        ) in [(r.name, r.getMessage()) for r in caplog.records if r.levelno == logging.WARNING]
+        assert dispatcher_mod.probe_worker(pid, log_path=str(log), started_at=None) is (
+            dispatcher_mod.WorkerProbe.ALIVE
+        )
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+
+
+@pytest.mark.usefixtures("real_proc")
+def test_daemon_demotes_task_whose_pid_another_process_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_worker_pid: int
+) -> None:
+    """The recorded pid is alive, but it is a process this attempt did not
+    start: its stdout is not the attempt's log. The worker is gone, so the
+    task is demoted for re-dispatch, and the other process is left alone."""
+    qd = _queue(tmp_path)
+    now = datetime.now(UTC)
+    log = qd / ".claude_task_runner" / "logs" / "t-reused" / "attempt-1.stream.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text('{"type":"system","subtype":"init","session_id":"sess-real"}\n')
+    _seed_real_worker(qd, "t-reused", pid=live_worker_pid, log=log, now=now)
+
+    _run_daemon(qd, _settings(), monkeypatch, clock=FakeClock(now))
+
+    demoted = load_state(state_path_for(qd, "t-reused"))
+    assert (demoted.status, demoted.stop_reason) == ("failed", ORPHAN_STOP_REASON)
+    assert dispatcher_mod._pid_alive(live_worker_pid)

@@ -51,6 +51,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import IO
 
@@ -543,6 +544,166 @@ def _pid_alive(pid: int) -> bool:
         # ESRCH ⇒ genuinely gone; anything else ⇒ conservatively alive.
         return exc.errno != errno.ESRCH
     return True
+
+
+class WorkerProbe(StrEnum):
+    """What :func:`probe_worker` found at a recorded worker's pid."""
+
+    ALIVE = "alive"
+    """The recorded worker is running, or the host gives no way to tell it
+    from another process with its pid (no ``/proc``, or the process is
+    hidden from this user), in which case the pid's existence decides."""
+
+    DEAD = "dead"
+    """No process has the pid, or only the worker's zombie has it."""
+
+    REUSED = "reused"
+    """A live process has the pid but is not the recorded worker: the worker
+    exited and the kernel gave its pid to another process. The worker is
+    gone, and the pid must not be signalled."""
+
+
+_PROC_ROOT = Path("/proc")
+"""Linux ``/proc``, read by :func:`probe_worker`. Tests point it elsewhere."""
+
+WORKER_START_SLACK_BEFORE_S = 60.0
+"""How long before the attempt's ``last_started_at`` its worker's process
+start may read and still be its worker. A process cannot start before the
+dispatch that spawned it, so this only absorbs the start time's error: the
+boot time it is computed from is truncated to the second and moves with
+clock steps."""
+
+WORKER_START_SLACK_AFTER_S = 300.0
+"""How long after the attempt's ``last_started_at`` its worker's process
+start may read and still be its worker. :func:`dispatch` records
+``last_started_at`` and starts the worker within a second or two; the rest
+absorbs clock steps."""
+
+
+def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None) -> WorkerProbe:
+    """Whether the worker recorded on a task's state as ``pid`` still runs.
+
+    Every pass that acts on a recorded worker asks this, so they agree on
+    whether it runs: the startup exited-worker finalize and adoption, an
+    adoption monitor's tail, the silent-orphan reapers, ``reconcile_orphans``
+    and the orchestrator's leak check. :func:`_pid_alive` says only that some
+    process has the pid. After a reboot, or once pids wrap, that can be a
+    different process, which a reaper would then signal and adoption would
+    watch in place of the worker.
+
+    The checks, in order, after :func:`_pid_alive`:
+
+    1. A zombie (``/proc/<pid>/stat`` state ``Z`` or ``X``) is :attr:`~WorkerProbe.DEAD`.
+    2. With ``log_path``: the dispatcher hands the worker its attempt's log
+       as stdout (ADR-0025), so ``/proc/<pid>/fd/1`` and ``log_path`` are
+       the same file (device and inode) for the worker and not for anything
+       else. This settles it when both can be read, which needs the worker
+       to run as this user.
+    3. With ``started_at`` (the state's ``last_started_at``): the process
+       must have started within :data:`WORKER_START_SLACK_BEFORE_S` before
+       and :data:`WORKER_START_SLACK_AFTER_S` after it, in the current boot.
+       This covers a worker under another Linux user (``sudo``, whose fd
+       table is unreadable) and a pipe-backed one (no log).
+
+    A check that fails proves :attr:`~WorkerProbe.REUSED`, logged at
+    WARNING. When ``/proc/<pid>/stat`` cannot be read (no ``/proc``, or
+    ``hidepid`` hides another user's process) only existence is known, and
+    the answer is :attr:`~WorkerProbe.ALIVE`, as before this check existed.
+    """
+    if not _pid_alive(pid):
+        return WorkerProbe.DEAD
+    stat = _read_proc_stat(pid)
+    if stat is None:
+        return WorkerProbe.ALIVE
+    proc_state, start_ticks = stat
+    if proc_state in ("Z", "X"):
+        return WorkerProbe.DEAD
+    if log_path is not None:
+        same_file = _stdout_is(pid, log_path)
+        if same_file is not None:
+            if same_file:
+                return WorkerProbe.ALIVE
+            logger.warning(
+                "pid %s is not the worker that wrote %s: its stdout is another file, "
+                "so the worker exited and its pid now belongs to another process",
+                pid,
+                log_path,
+            )
+            return WorkerProbe.REUSED
+    if started_at is not None:
+        mismatch = _start_mismatch(start_ticks, started_at)
+        if mismatch is not None:
+            logger.warning(
+                "pid %s is not the worker of the attempt started at %s (log %s): %s, "
+                "so the worker exited and its pid now belongs to another process",
+                pid,
+                started_at.isoformat(),
+                log_path,
+                mismatch,
+            )
+            return WorkerProbe.REUSED
+    return WorkerProbe.ALIVE
+
+
+def _read_proc_stat(pid: int) -> tuple[str, int] | None:
+    """``(state, starttime)`` from ``/proc/<pid>/stat``, or ``None`` if unreadable.
+
+    ``starttime`` is clock ticks after boot. The command name (field 2) is
+    in parentheses and may itself contain spaces and ``)``, so the fields
+    are counted from the last ``)``: state is field 3, starttime field 22.
+    """
+    try:
+        text = (_PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    fields = text[text.rfind(")") + 1 :].split()
+    try:
+        return fields[0], int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _stdout_is(pid: int, log_path: str) -> bool | None:
+    """Whether ``pid``'s fd 1 is the file at ``log_path``; ``None`` when either
+    cannot be stat'ed (another user's process, fd 1 closed, the log deleted)."""
+    try:
+        stdout = os.stat(_PROC_ROOT / str(pid) / "fd" / "1")
+        log = os.stat(log_path)
+    except OSError:
+        return None
+    return (stdout.st_dev, stdout.st_ino) == (log.st_dev, log.st_ino)
+
+
+def _start_mismatch(start_ticks: int, started_at: datetime) -> str | None:
+    """Why a process started ``start_ticks`` after boot cannot be the worker of
+    an attempt started at ``started_at``, or ``None`` when it can be, or when
+    the boot time is unreadable."""
+    boot = _boot_time()
+    if boot is None:
+        return None
+    if boot > started_at:
+        return f"this boot began at {boot.isoformat()}, after the attempt started"
+    started = boot + timedelta(seconds=start_ticks / os.sysconf("SC_CLK_TCK"))
+    offset_s = (started - started_at).total_seconds()
+    if -WORKER_START_SLACK_BEFORE_S <= offset_s <= WORKER_START_SLACK_AFTER_S:
+        return None
+    return f"the process started {offset_s:+.0f}s from the attempt's start"
+
+
+def _boot_time() -> datetime | None:
+    """The boot time from ``/proc/stat``'s ``btime`` line, or ``None``."""
+    try:
+        text = (_PROC_ROOT / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        name, _, value = line.partition(" ")
+        if name == "btime":
+            try:
+                return datetime.fromtimestamp(int(value), tz=UTC)
+            except (ValueError, OverflowError, OSError):
+                return None
+    return None
 
 
 def _resolve_self_user() -> str:
@@ -1912,8 +2073,9 @@ def adopt_worker(
     with a live ``pid`` and a present ``log_path``, this re-attaches to
     the orphaned ``claude --print`` worker without a ``Popen``:
 
-    * liveness is ``os.kill(pid, 0)`` (``_pid_alive`` — ESRCH ⇒ dead,
-      EPERM ⇒ alive);
+    * liveness is :func:`probe_worker`: the pid exists and is still this
+      attempt's worker, not a process that was given the pid after the
+      worker exited;
     * the recorded stdout log is tailed via :func:`tail_lines` and fed
       through the SAME :func:`_dispatch_loop` as an owned worker, so the
       per-event cap / heartbeat / silence enforcement is identical;
@@ -2005,10 +2167,15 @@ def adopt_worker(
     alive_monitor.start()
 
     def _alive() -> bool:
-        return _pid_alive(pid)
+        return (
+            probe_worker(pid, log_path=state.log_path, started_at=state.last_started_at)
+            is WorkerProbe.ALIVE
+        )
 
     def _terminate_adopted() -> None:
-        _terminate_by_pid(pid, alive=_alive, sleep_fn=sleep_fn)
+        # The pid may have passed to another process since the last poll.
+        if _alive():
+            _terminate_by_pid(pid, alive=_alive, sleep_fn=sleep_fn)
 
     try:
         summary, cap_violation = _dispatch_loop(

@@ -13,6 +13,7 @@ import yaml
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import Settings
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 
 # Blocks and fails any signal a test sends to a process it did not start.
 # pytester runs that gate in a subprocess for tests/unit/test_signal_gate.py.
@@ -46,6 +47,33 @@ def _no_leaked_signal_handlers() -> Iterator[None]:
             signal.signal(signum, handler)
     if leaked:
         pytest.fail(f"test left a signal handler installed for {', '.join(leaked)}")
+
+
+_NO_PROC = Path(__file__).parent / "no-such-proc"
+"""A ``/proc`` root that does not exist."""
+
+
+@pytest.fixture(autouse=True)
+def _worker_probe_off_host_proc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep :func:`dispatcher.probe_worker` off the host's ``/proc``.
+
+    Tests record made-up worker pids and stub ``dispatcher._pid_alive`` for
+    them. Read from the real ``/proc``, such a pid would be judged by
+    whatever process has it on the machine running the tests. With no
+    ``/proc`` the probe answers from ``_pid_alive`` alone. Tests of the
+    identity checks set ``dispatcher._PROC_ROOT`` themselves: to a fake
+    tree, or back to ``/proc`` for processes they start.
+    """
+    monkeypatch.setattr(dispatcher_mod, "_PROC_ROOT", _NO_PROC)
+
+
+@pytest.fixture
+def real_proc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let :func:`dispatcher.probe_worker` read the host's ``/proc``, for a
+    test whose recorded workers are processes it started itself."""
+    if not Path("/proc/self/stat").exists():
+        pytest.skip("needs a Linux /proc")
+    monkeypatch.setattr(dispatcher_mod, "_PROC_ROOT", Path("/proc"))
 
 
 def _ignore_signal(_signum: int, _frame: object) -> None:

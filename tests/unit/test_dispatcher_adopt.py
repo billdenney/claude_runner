@@ -62,6 +62,7 @@ from claude_task_runner.runner.dispatcher import (
 
 from ._git_world import git, isolate_git
 from ._sidecar_files import make_request, write_request
+from ._worker_probe_stubs import fake_proc
 
 _PID = 999_001
 
@@ -141,6 +142,54 @@ def _seed_running(
 def _write_log(log_path: Path, lines: list[str]) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("".join(line + "\n" for line in lines))
+
+
+def test_adopt_stops_tailing_when_the_pid_passes_to_another_process(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pid still exists, but its stdout is another file: the worker has
+    exited and another process has the pid. The monitor stops tailing at
+    once and finalizes from the log, instead of watching the other process
+    and holding the task ``running`` until it exits. Nothing is signalled."""
+    task = Task(id="009-adopt-reused", title="t", prompt="p", working_dir=None)
+    log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
+    _write_log(log, [_init_line(), _assistant_line()])
+    started = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+    state = _seed_running(queue_dir, task, log_path=log, started_at=started)
+    elsewhere = tmp_path / "elsewhere.out"
+    elsewhere.write_text("")
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == _PID)
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            _PID,
+            started=started,
+            boot=started - timedelta(days=1),
+            stdout=elsewhere,
+        ),
+    )
+    sleeps: list[float] = []
+
+    def no_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        assert len(sleeps) < 100, "still tailing a pid that is not the worker"
+
+    outcome = adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        clock=RealClock(),
+        settings_caps=_caps(),
+        sleep_fn=no_sleep,
+    )
+
+    assert sleeps == []
+    assert outcome.new_state.status == "failed"
+    assert outcome.run_record.stop_reason == "process_exit_nonzero"
 
 
 def test_adopt_alive_finalizes_from_terminal_result(

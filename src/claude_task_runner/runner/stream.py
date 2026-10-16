@@ -53,7 +53,20 @@ its heartbeat on every yielded event, and the stuck-sleep-loop reaper acts
 only while that heartbeat is stale, so yielding these would make a worker
 stuck in a Bash poll loop look alive. ``rate_limit_event`` carries the
 account's rate-limit status. Both shapes were checked against claude 2.1.281.
+
+So the agent heartbeat (``TaskState.last_heartbeat_at``) stands still for
+the whole of a long tool call. The worker's stream log does not: these
+events are written to it, which is what the silent-orphan reaper and
+startup adoption read as the worker's own sign of life.
 """
+
+_THINKING_SUBTYPE = "thinking_tokens"
+"""The ``system`` subtype claude sends repeatedly while a model writes
+extended thinking: a running estimate of the thinking tokens so far, with
+no text. Yielded as :class:`ThinkingEvent` so the agent heartbeat ticks
+while the model thinks. It is sent while a model generates, not while a
+tool runs, so it does not make a worker stuck in a Bash poll loop look
+alive. Checked against claude 2.1.281."""
 
 _TOKEN_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("input_tokens", ("input_tokens",)),
@@ -74,6 +87,12 @@ class SystemInitEvent:
     """The first line — carries the new session id."""
 
     session_id: str
+
+
+@dataclass(frozen=True)
+class ThinkingEvent:
+    """A ``system/thinking_tokens`` progress line: the model is thinking.
+    Carries nothing the runner records."""
 
 
 @dataclass(frozen=True)
@@ -267,7 +286,9 @@ def parse_lines(
     lines: Iterable[str | bytes],
     *,
     summary: StreamSummary | None = None,
-) -> Iterator[SystemInitEvent | AssistantMessageEvent | UserMessageEvent | ResultEvent]:
+) -> Iterator[
+    SystemInitEvent | ThinkingEvent | AssistantMessageEvent | UserMessageEvent | ResultEvent
+]:
     """Yield typed events from an iterable of NDJSON lines.
 
     The optional ``summary`` is mutated in-place before each event is
@@ -297,7 +318,11 @@ def parse_lines(
         evt_type = obj.get("type")
 
         if evt_type == "system":
-            if obj.get("subtype") != "init":
+            subtype = obj.get("subtype")
+            if subtype == _THINKING_SUBTYPE:
+                yield ThinkingEvent()
+                continue
+            if subtype != "init":
                 # Another system subtype: a known type, so not drift; nothing to yield.
                 continue
             session_id = obj.get("session_id")
