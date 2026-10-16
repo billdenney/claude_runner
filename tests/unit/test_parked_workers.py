@@ -45,6 +45,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner.dispatcher import LIVE_WORKER_STOP_REASON, park_live_worker
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import tick_dispatch
@@ -808,3 +809,53 @@ def test_backstop_park_is_reported_at_the_next_tick(
     assert events == [
         ("live_worker_parked", {"task_id": "t-untracked", "pid": _PID, "log_path": str(log)})
     ]
+
+
+def test_a_forced_tasks_backstop_park_goes_to_the_tracker(
+    queue_dir: Path, worker: dict[str, bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker starts writing the forced task's log after the request's own
+    check found none (that check is stubbed to find none), so the dispatch
+    thread's backstop parks the task. The park goes to the tracker, which
+    the next tick reports, as for a park in a tick's own dispatch."""
+    _task(queue_dir, "t-forced")
+    log = queue_dir / ".claude_task_runner" / "logs" / "t-forced" / "attempt-1.stream.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            _PID,
+            started=_STARTED,
+            boot=_NOW - timedelta(days=1),
+            stdout=log,
+        ),
+    )
+    monkeypatch.setattr(fd_mod, "live_worker_of", lambda *_args: None)
+    config_dir = tmp_path / "cfg-work"
+    config_dir.mkdir()
+    settings = load_settings(None).model_copy(
+        update={"accounts": [AccountSettings(name="work", config_dir=str(config_dir))]}
+    )
+    fd_mod.write_request(queue_dir, "t-forced")
+    tracker = ParkedWorkerTracker()
+    slots: dict[str, DispatchSlot] = {}
+
+    with patch("claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch") as dispatch:
+        n = fd_mod.tick_consume(
+            queue_dir=queue_dir,
+            settings=settings,
+            clock=FakeClock(_NOW),
+            in_flight_slots=slots,
+            on_park=tracker.note_park,
+        )
+        for slot in slots.values():
+            slot.thread.join(timeout=10)
+
+    assert n == 1
+    dispatch.assert_not_called()
+    assert [
+        (state.task_id, state.status, state.pid, why) for state, why in tracker.drain_parks()
+    ] == [("t-forced", "possibly_hung", _PID, "when its task was about to be dispatched again")]

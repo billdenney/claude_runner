@@ -1352,6 +1352,8 @@ def start_daemon(
                             in_flight_slots=in_flight_slots,
                             claude_executable=settings.claude.executable,
                             spawn_gate=spawn_gate,
+                            prior_in_flight=snapshot.in_flight,
+                            on_park=parked_tracker.note_park,
                         )
                     except Exception:
                         # Keep the loop alive, but tally the failure so a

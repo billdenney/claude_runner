@@ -35,7 +35,7 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner.account_dispatch import QueueCeiling, dispatch_headroom
-from claude_task_runner.runner.in_flight import DispatchSlot
+from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.supervisor.daemon import QueueCeilingWatch
 from claude_task_runner.supervisor.states import (
     AccountState,
@@ -806,6 +806,64 @@ class TestForceDispatch:
         finally:
             stop.set()
 
+    @pytest.mark.parametrize(
+        ("concurrency", "busy", "parked", "dispatched"),
+        [
+            ("", {"personal": 5, "work": 2}, {}, 1),
+            ("", {"personal": 5, "work": 2}, {"work": 1}, 0),
+            ("max_concurrency = 5", {"personal": 4}, {}, 1),
+            ("max_concurrency = 5", {"personal": 4}, {"work": 1}, 0),
+        ],
+        ids=["omitted-free", "omitted-parked-fills", "explicit-free", "explicit-parked-fills"],
+    )
+    def test_parked_workers_take_their_slots(
+        self,
+        tmp_path: Path,
+        queue_dir: Path,
+        two_accounts: dict[str, Path],
+        concurrency: str,
+        busy: dict[str, int],
+        parked: dict[str, int],
+        dispatched: int,
+    ) -> None:
+        """The last tick's in-flight list holds every slot's record and
+        each parked live worker's. The parked workers count against their
+        accounts as the tick counts them; the slots count once."""
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts, concurrency)
+        make_tasks(queue_dir, 1)
+        fd_mod.write_request(queue_dir, "t00")
+        stop = threading.Event()
+        slots = busy_slots(stop, **busy)
+        prior = [*to_in_flight_records(slots), *_parked_records(**parked)]
+        try:
+            with HeldDispatches() as held:
+                n = fd_mod.tick_consume(
+                    queue_dir=queue_dir,
+                    settings=settings,
+                    clock=RealClock(),
+                    in_flight_slots=slots,
+                    prior_in_flight=prior,
+                )
+                assert n == dispatched
+                assert fd_mod.request_path(queue_dir, "t00").exists() is (dispatched == 0)
+                held.release({k: v for k, v in slots.items() if k == "t00"})
+        finally:
+            stop.set()
+
+
+def _parked_records(**by_account: int) -> list[InFlightRecord]:
+    """In-flight records of parked live workers, ``n`` per account: no slot
+    in this supervisor, as a tick's tracker holds them."""
+    return [
+        InFlightRecord(
+            task_id=f"parked-{account}-{i}",
+            account=account,
+            started_at=datetime(2026, 10, 15, tzinfo=UTC),
+        )
+        for account, n in by_account.items()
+        for i in range(n)
+    ]
+
 
 class TestForceDispatchAccount:
     @pytest.mark.parametrize(
@@ -837,6 +895,33 @@ class TestForceDispatchAccount:
                 )
                 assert n == 1
                 assert slots["t00"].account == picked
+                stop.set()
+                held.release(slots)
+        finally:
+            stop.set()
+
+    def test_a_parked_worker_fills_the_first_account(
+        self, tmp_path: Path, queue_dir: Path, two_accounts: dict[str, Path]
+    ) -> None:
+        """personal has 4 of its 5 slots busy and a parked worker in the
+        fifth: the request goes to work."""
+        settings = queue_toml(tmp_path / "claude_runner.toml", two_accounts)
+        make_tasks(queue_dir, 1)
+        fd_mod.write_request(queue_dir, "t00")
+        stop = threading.Event()
+        slots = busy_slots(stop, personal=4)
+        prior = [*to_in_flight_records(slots), *_parked_records(personal=1)]
+        try:
+            with HeldDispatches() as held:
+                n = fd_mod.tick_consume(
+                    queue_dir=queue_dir,
+                    settings=settings,
+                    clock=RealClock(),
+                    in_flight_slots=slots,
+                    prior_in_flight=prior,
+                )
+                assert n == 1
+                assert slots["t00"].account == "work"
                 stop.set()
                 held.release(slots)
         finally:
