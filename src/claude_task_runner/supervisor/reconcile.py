@@ -191,6 +191,10 @@ def reconcile_orphans(
                 # task was working fine when the supervisor died. The
                 # next dispatch via session-resume continues from where
                 # the conversation left off.
+                # The worker is gone: drop its pid and log so the state
+                # does not point at it.
+                "pid": None,
+                "log_path": None,
             }
         )
         try:

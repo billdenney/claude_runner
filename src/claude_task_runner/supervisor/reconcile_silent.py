@@ -1224,6 +1224,7 @@ def _classify_and_act(
                 # process is still tracked; the error names it. session_id
                 # is preserved for operator-driven recovery.
                 "pid": None,
+                "log_path": None,
             }
         )
     elif survived:
@@ -1247,6 +1248,7 @@ def _classify_and_act(
                 # The worker is gone. session_id is preserved so the
                 # re-dispatch can resume.
                 "pid": None,
+                "log_path": None,
             }
         )
 
@@ -1530,6 +1532,7 @@ def _maybe_kill_stuck_sleep_loop(
                     f"{agent_silence_s:.0f}s heartbeat staleness; argv={matched_argv!r}"
                 ),
                 "pid": None,
+                "log_path": None,
             }
         )
 
