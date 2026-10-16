@@ -36,7 +36,7 @@ import json
 import logging
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,7 +59,8 @@ from claude_task_runner.runner import readiness as readiness_mod
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
-from claude_task_runner.supervisor.states import SupervisorState
+from claude_task_runner.supervisor import adoption as adoption_mod
+from claude_task_runner.supervisor.states import InFlightRecord, SupervisorState
 
 if TYPE_CHECKING:
     from claude_task_runner.clock import Clock
@@ -296,13 +297,26 @@ def tick_dispatch(
         event_callback=event_callback,
     )
 
+    # A worker parked with no monitor thread (runner.dispatcher
+    # .park_live_worker) still runs on an account: count it against that
+    # account like a slot, and record its run once it exits.
+    parked = adoption_mod.track_parked_workers(
+        queue_dir,
+        settings=settings,
+        clock=clock,
+        prior_in_flight=snapshot.in_flight,
+        owned_ids=in_flight_slots.keys(),
+    )
+    _report_finished_parked(parked.finished, notify_callback, event_callback)
+    held = parked.in_flight
+
     if draining:
         # Drain mode: skip both the candidate enumeration and
         # choose_account routing. The reap above handled any threads
         # that finished since the last tick; the refresh below
         # surfaces the still-running set into the snapshot so the
         # daemon's persist step records accurate in_flight attribution.
-        return _refresh_in_flight(snapshot, in_flight_slots)
+        return _refresh_in_flight(snapshot, in_flight_slots, held)
 
     broken: dict[str, str] = {}
     if accounts is None:
@@ -329,13 +343,15 @@ def tick_dispatch(
     # and it's not operator-paused), let choose_account do the actual
     # per-task routing.
     if not _any_account_dispatchable(snapshot, accounts_by_name):
-        return _refresh_in_flight(snapshot, in_flight_slots)
+        return _refresh_in_flight(snapshot, in_flight_slots, held)
 
     available = account_dispatch_mod.dispatch_headroom(
-        accounts, to_in_flight_records(in_flight_slots), _target_concurrency(queue_dir, settings)
+        accounts,
+        [*to_in_flight_records(in_flight_slots), *held],
+        _target_concurrency(queue_dir, settings),
     )
     if available == 0:
-        return _refresh_in_flight(snapshot, in_flight_slots)
+        return _refresh_in_flight(snapshot, in_flight_slots, held)
 
     # ADR-0025 thread lifetime: daemon when adoption is on (fast stop need
     # not join), non-daemon otherwise (drain joins). ``getattr`` tolerates
@@ -363,7 +379,7 @@ def tick_dispatch(
     if idle_log is not None:
         idle_log.observe(len(candidates), skips)
     if not candidates:
-        return _refresh_in_flight(snapshot, in_flight_slots)
+        return _refresh_in_flight(snapshot, in_flight_slots, held)
 
     candidates.sort(key=priority_sort_key)
 
@@ -382,7 +398,7 @@ def tick_dispatch(
         affined = _affined_account_for_task(queue_dir, task.id)
         # Build the per-tick view of attributed in-flight tasks so
         # choose_account sees each newly-dispatched slot as it lands.
-        live_in_flight = to_in_flight_records(in_flight_slots)
+        live_in_flight = [*to_in_flight_records(in_flight_slots), *held]
         choice = account_dispatch_mod.choose_account(
             task=task,
             accounts=accounts_by_name,
@@ -462,26 +478,56 @@ def tick_dispatch(
             choice.reason,
         )
 
-    return _refresh_in_flight(snapshot, in_flight_slots)
+    return _refresh_in_flight(snapshot, in_flight_slots, held)
 
 
 def _refresh_in_flight(
     snapshot: SupervisorSnapshot,
     in_flight_slots: dict[str, DispatchSlot],
+    held: Sequence[InFlightRecord] = (),
 ) -> SupervisorSnapshot:
-    """Return ``snapshot`` with ``in_flight`` rebuilt from ``in_flight_slots``.
+    """Return ``snapshot`` with ``in_flight`` rebuilt from ``in_flight_slots``
+    and ``held``, the parked live workers' records
+    (:func:`supervisor.adoption.track_parked_workers`), sorted by task id.
 
     Also keeps the legacy ``in_flight_task_ids`` field in sync so v2
     consumers still see the task-id list. The two fields are
     redundant by design (see :class:`SupervisorSnapshot` docstring).
     """
-    records = to_in_flight_records(in_flight_slots)
+    records = sorted([*to_in_flight_records(in_flight_slots), *held], key=lambda r: r.task_id)
     return snapshot.model_copy(
         update={
             "in_flight": records,
             "in_flight_task_ids": [r.task_id for r in records],
         }
     )
+
+
+def _report_finished_parked(
+    finished: Sequence[adoption_mod.ExitedWorkerResult],
+    notify_callback: NotifyCallback | None,
+    event_callback: EventCallback | None,
+) -> None:
+    """Report each parked worker whose run was recorded this tick, as the
+    daemon reports a worker that exited during a restart."""
+    for ex in finished:
+        if notify_callback is not None:
+            notify_callback(
+                "info",
+                f"recorded exited worker for task {ex.task_id} from its log "
+                f"(pid={ex.pid}): status={ex.status} stop_reason={ex.stop_reason}",
+            )
+        if event_callback is not None:
+            event_callback(
+                "exited_worker_finalized",
+                {
+                    "task_id": ex.task_id,
+                    "pid": ex.pid,
+                    "log_path": ex.log_path,
+                    "status": ex.status,
+                    "stop_reason": ex.stop_reason,
+                },
+            )
 
 
 def _any_account_dispatchable(

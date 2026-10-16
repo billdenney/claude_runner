@@ -82,6 +82,7 @@ from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
     load_state,
+    state_path_for,
     write_state_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
@@ -121,7 +122,9 @@ def reconcile_orphans(
     1. The supervisor snapshot with ``in_flight`` /
        ``in_flight_task_ids`` cleared (those records were the
        previous supervisor's view; this supervisor has its own
-       empty slot map).
+       empty slot map), except the records of tasks parked with a live
+       worker: they name the account each one runs on, which
+       ``supervisor.adoption.track_parked_workers`` keeps counting.
     2. The list of task IDs whose state was demoted.
     3. A :class:`ParkedWorker` for each running orphan whose recorded
        worker still runs. Such a task is never demoted: it is parked
@@ -209,14 +212,24 @@ def reconcile_orphans(
     # of who-was-running-where doesn't apply to this process; our
     # own in_flight_slots will be authoritative going forward, and
     # the orchestrator refreshes the snapshot's in_flight list every
-    # tick.
+    # tick. A parked live worker's record stays: it is the only record
+    # of the account the worker runs on.
+    kept = [r for r in snapshot.in_flight if _is_parked(queue_dir, r.task_id)]
     new_snapshot = snapshot.model_copy(
         update={
-            "in_flight": [],
-            "in_flight_task_ids": [],
+            "in_flight": kept,
+            "in_flight_task_ids": [r.task_id for r in kept],
         }
     )
     return new_snapshot, orphan_ids, parked
+
+
+def _is_parked(queue_dir: Path, task_id: str) -> bool:
+    """Whether ``task_id``'s state is parked with a live worker on record."""
+    try:
+        return dispatcher_mod.is_parked_live_worker(load_state(state_path_for(queue_dir, task_id)))
+    except Exception:
+        return False
 
 
 def _park_unadopted(state: TaskState, state_path: Path) -> bool:

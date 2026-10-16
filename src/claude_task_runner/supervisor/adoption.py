@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -273,7 +273,7 @@ def finalize_exited_workers(
     A task parked by :func:`runner.dispatcher.park_live_worker` whose
     worker has exited since is recorded too, whatever its log holds (a
     crash without a ``result`` event), since no later pass handles a
-    parked task.
+    parked task; :func:`track_parked_workers` does the same every tick.
 
     Must run before :func:`supervisor.reconcile_silent.reconcile_silent_orphans`.
     A finished worker's heartbeat is as stale as a hung one's, so the
@@ -426,6 +426,97 @@ def _has_exited(state: TaskState) -> bool:
     return dispatcher_mod.probe_recorded_worker(state) is not WorkerProbe.ALIVE
 
 
+@dataclass(frozen=True)
+class ParkedWorkers:
+    """What :func:`track_parked_workers` found this tick."""
+
+    in_flight: list[InFlightRecord]
+    """One record per parked worker still running, naming the account it
+    runs on (:data:`UNATTRIBUTED_ACCOUNT` when no record says), sorted by
+    task id."""
+    finished: list[ExitedWorkerResult]
+    """The parked workers that had exited, whose runs were recorded."""
+
+
+_PARKED_MARKER = dispatcher_mod.LIVE_WORKER_STOP_REASON.encode()
+
+
+def track_parked_workers(
+    queue_dir: Path,
+    *,
+    settings: Settings,
+    clock: Clock,
+    prior_in_flight: Sequence[InFlightRecord],
+    owned_ids: Collection[str],
+) -> ParkedWorkers:
+    """Per tick: count each parked live worker against its account; record
+    the run of each that has exited.
+
+    A worker parked by :func:`runner.dispatcher.park_live_worker` has no
+    monitor thread, so no slot in ``in_flight_slots``. It still runs on an
+    account, so while :func:`runner.dispatcher.probe_recorded_worker` says
+    it runs, this returns an :class:`InFlightRecord` for it, which the
+    orchestrator adds to the slots' records for ``dispatch_headroom``,
+    ``choose_account`` and the persisted ``in_flight`` list. The account
+    comes from the sources adoption uses: the previous tick's
+    ``prior_in_flight`` record for the task (the previous supervisor's,
+    after a restart; ``reconcile_orphans`` keeps it), then the state's
+    session host account, then the only account of a single-account queue.
+    With none of those, the record names :data:`UNATTRIBUTED_ACCOUNT` and
+    counts against an explicit ``[concurrency].max_concurrency`` only.
+
+    Once the probe says the worker is gone, its run is recorded from its
+    log as at startup (:func:`finalize_exited_workers`), and its record
+    goes with it. Tasks in ``owned_ids`` (with a thread in this supervisor,
+    such as a task a reaper parked while its dispatch thread still waits on
+    the worker) are left to that thread.
+
+    Only state files whose text names the park's stop reason are parsed, so
+    a tick on a queue of thousands of tasks reads each file but parses few.
+    """
+    paths = [p for p in list_state_files(queue_dir) if p.stem not in owned_ids and _names_park(p)]
+    if not paths:
+        return ParkedWorkers(in_flight=[], finished=[])
+
+    prior_accounts = _prior_accounts(settings, prior_in_flight)
+    sole_account = settings.accounts[0].name if len(settings.accounts) == 1 else None
+    records: list[InFlightRecord] = []
+    finished: list[ExitedWorkerResult] = []
+    for state_path in paths:
+        try:
+            state = load_state(state_path)
+        except Exception as exc:
+            logger.debug("parked-worker pass: skipping %s: %s", state_path, exc)
+            continue
+        if not dispatcher_mod.is_parked_live_worker(state):
+            continue
+        account = prior_accounts.get(state.task_id) or state.session_host_account()
+        if dispatcher_mod.probe_recorded_worker(state) is WorkerProbe.ALIVE:
+            records.append(
+                InFlightRecord(
+                    task_id=state.task_id,
+                    account=account or sole_account or UNATTRIBUTED_ACCOUNT,
+                    started_at=(
+                        state.last_started_at if state.last_started_at is not None else clock.now()
+                    ),
+                )
+            )
+            continue
+        result = _record_exited(queue_dir, state, settings=settings, clock=clock, account=account)
+        if result is not None:
+            finished.append(result)
+    records.sort(key=lambda r: r.task_id)
+    return ParkedWorkers(in_flight=records, finished=finished)
+
+
+def _names_park(state_path: Path) -> bool:
+    """Whether the state file's bytes contain the park's stop reason."""
+    try:
+        return _PARKED_MARKER in state_path.read_bytes()
+    except OSError:
+        return False
+
+
 def _adopt_one_safely(
     task: Task,
     state: TaskState,
@@ -458,6 +549,8 @@ def _adopt_one_safely(
 __all__ = [
     "AdoptionResult",
     "ExitedWorkerResult",
+    "ParkedWorkers",
     "adopt_running_workers",
     "finalize_exited_workers",
+    "track_parked_workers",
 ]
