@@ -20,6 +20,8 @@ the run is recorded under, and that it never clobbers a concurrent writer.
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,12 +48,19 @@ from claude_task_runner.supervisor.adoption import (
     adopt_running_workers,
     finalize_exited_workers,
 )
-from claude_task_runner.supervisor.reconcile import reconcile_orphans
+from claude_task_runner.supervisor.reconcile import (
+    LIVE_WORKER_STOP_REASON,
+    ORPHAN_STOP_REASON,
+    reconcile_orphans,
+)
+from claude_task_runner.supervisor.reconcile_silent import reconcile_silent_orphans
 from claude_task_runner.supervisor.states import (
     InFlightRecord,
     SupervisorSnapshot,
     SupervisorState,
 )
+
+from ._worker_probe_stubs import fake_proc
 
 
 @pytest.fixture
@@ -81,6 +90,7 @@ def _seed_running(
     log_path: Path | None,
     started_at: datetime,
     last_heartbeat_at: datetime | None = None,
+    dispatcher_alive_at: datetime | None = None,
 ) -> None:
     # A Task YAML is needed so adoption can load it for adopt_worker.
     write_task_atomic(
@@ -92,16 +102,27 @@ def _seed_running(
         status="running",
         last_started_at=started_at,
         last_heartbeat_at=last_heartbeat_at,
+        dispatcher_alive_at=dispatcher_alive_at,
         pid=pid,
         log_path=str(log_path) if log_path is not None else None,
     )
     write_state_atomic(state, state_path_for(queue_dir, task_id))
 
 
-def _make_log(queue_dir: Path, task_id: str) -> Path:
+_LONG_AGO = _NOW - timedelta(days=30)
+"""Before every attempt's start, so a log last written then is no sign of life."""
+
+
+def _make_log(queue_dir: Path, task_id: str, *, written_at: datetime = _LONG_AGO) -> Path:
+    """Write a worker log whose last write (mtime) is ``written_at``.
+
+    The mtime is set because it is a sign of life the adoption verdict
+    reads, and the tests' clock is not the wall clock.
+    """
     log = queue_dir / ".claude_task_runner" / "logs" / task_id / "attempt-1.stream.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text('{"type":"system","subtype":"init","session_id":"s"}\n')
+    os.utime(log, (written_at.timestamp(), written_at.timestamp()))
     return log
 
 
@@ -289,6 +310,161 @@ def test_silent_worker_not_adopted(queue_dir: Path, monkeypatch: pytest.MonkeyPa
     assert results == []
 
 
+# ---------------------------------------------------------------------------
+# A live worker in a long tool call (2026-10-16 restart incident)
+# ---------------------------------------------------------------------------
+
+_HEARTBEAT_9_MIN_AGO = _NOW - timedelta(minutes=9)
+"""Past the 300 s alert: no event the dispatcher counts for 9 minutes."""
+
+
+def test_adopts_live_worker_whose_log_is_fresh_though_its_heartbeat_is_stale(
+    queue_dir: Path, stub_worker: list[str]
+) -> None:
+    """A long Bash call writes only ``tool_progress`` and other events the
+    agent heartbeat does not count, and no monitor ticked while no
+    supervisor ran. The worker's own writes to its log show it is alive."""
+    log = _make_log(queue_dir, "110-tool-call", written_at=_NOW - timedelta(seconds=30))
+    _seed_running(
+        queue_dir,
+        "110-tool-call",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(minutes=20),
+        last_heartbeat_at=_HEARTBEAT_9_MIN_AGO,
+        dispatcher_alive_at=_HEARTBEAT_9_MIN_AGO,
+    )
+    slots: dict[str, DispatchSlot] = {}
+    results = adopt_running_workers(
+        queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
+    )
+    assert [(r.task_id, r.pid) for r in results] == [("110-tool-call", 4321)]
+    assert list(slots) == ["110-tool-call"]
+
+
+def test_adopts_live_worker_the_reaper_left_running(
+    queue_dir: Path, stub_worker: list[str]
+) -> None:
+    """The incident: the heartbeat was 9 minutes old, and the previous
+    supervisor's monitor had ticked 20 s before the restart. The startup
+    reaper found the task HEALTHY and left it running; adoption must agree
+    and take it, or ``reconcile_orphans`` sets it failed while it runs."""
+    log = _make_log(queue_dir, "111-incident")
+    _seed_running(
+        queue_dir,
+        "111-incident",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(minutes=20),
+        last_heartbeat_at=_HEARTBEAT_9_MIN_AGO,
+        dispatcher_alive_at=_NOW - timedelta(seconds=20),
+    )
+    settings = _settings()
+
+    assert (
+        reconcile_silent_orphans(queue_dir, settings=settings.task_caps, clock=FakeClock(_NOW))
+        == []
+    )
+    slots: dict[str, DispatchSlot] = {}
+    results = adopt_running_workers(
+        queue_dir, settings=settings, clock=FakeClock(_NOW), in_flight_slots=slots
+    )
+    _snap, demoted = reconcile_orphans(
+        queue_dir, _snapshot(), adopted_ids={r.task_id for r in results}
+    )
+
+    assert [r.task_id for r in results] == ["111-incident"]
+    assert demoted == []
+    assert load_state(state_path_for(queue_dir, "111-incident")).status == "running"
+
+
+def test_live_worker_with_no_sign_of_life_is_parked_not_failed(
+    queue_dir: Path, stub_worker: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Heartbeat, monitor tick and log all older than the alert window: the
+    worker is not adopted, and ``reconcile_orphans`` parks its task
+    ``possibly_hung``, keeping the pid, instead of setting it failed beside
+    a worker that still runs."""
+    log = _make_log(queue_dir, "112-quiet", written_at=_HEARTBEAT_9_MIN_AGO)
+    _seed_running(
+        queue_dir,
+        "112-quiet",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(minutes=20),
+        last_heartbeat_at=_HEARTBEAT_9_MIN_AGO,
+        dispatcher_alive_at=_HEARTBEAT_9_MIN_AGO,
+    )
+    slots: dict[str, DispatchSlot] = {}
+    results = adopt_running_workers(
+        queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
+    )
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.supervisor.reconcile"):
+        _snap, demoted = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
+
+    assert results == []
+    assert demoted == []
+    parked = load_state(state_path_for(queue_dir, "112-quiet"))
+    assert parked.status == "possibly_hung"
+    assert parked.stop_reason == LIVE_WORKER_STOP_REASON
+    assert parked.pid == 4321
+    assert parked.log_path == str(log)
+    assert parked.error == (
+        "worker pid=4321 is still running and was not adopted by this supervisor; "
+        "parked so the task is not dispatched again while it runs"
+    )
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "reconcile_orphans: task 112-quiet's worker pid=4321 is still running and was "
+        "not adopted; parked possibly_hung (stop_reason=worker_still_running), not "
+        f"failed, so it is not dispatched a second time (log={log})"
+    ]
+
+
+def test_worker_whose_pid_another_process_has_is_treated_as_gone(
+    queue_dir: Path, stub_worker: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pid exists, but its process writes elsewhere: the worker exited
+    and the pid went to another process. Nothing is adopted or parked; the
+    task is demoted for re-dispatch, as for a dead pid."""
+    log = _make_log(queue_dir, "113-reused", written_at=_NOW - timedelta(seconds=30))
+    _seed_running(
+        queue_dir,
+        "113-reused",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(minutes=20),
+        last_heartbeat_at=_NOW - timedelta(seconds=10),
+    )
+    elsewhere = tmp_path / "elsewhere.out"
+    elsewhere.write_text("")
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "_PROC_ROOT",
+        fake_proc(
+            tmp_path / "proc",
+            4321,
+            started=_NOW - timedelta(minutes=20),
+            boot=_NOW - timedelta(days=1),
+            stdout=elsewhere,
+        ),
+    )
+
+    exited = finalize_exited_workers(queue_dir, settings=_settings(), clock=FakeClock(_NOW))
+    slots: dict[str, DispatchSlot] = {}
+    results = adopt_running_workers(
+        queue_dir, settings=_settings(), clock=FakeClock(_NOW), in_flight_slots=slots
+    )
+    _snap, demoted = reconcile_orphans(queue_dir, _snapshot(), adopted_ids=set())
+
+    # The log holds no result event, so the exited-worker finalize leaves it.
+    assert exited == []
+    assert results == []
+    assert demoted == ["113-reused"]
+    state = load_state(state_path_for(queue_dir, "113-reused"))
+    assert state.status == "failed"
+    assert state.stop_reason == ORPHAN_STOP_REASON
+
+
 def test_adoption_off_is_noop(queue_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``[supervisor].adopt_workers`` false, adoption never runs even
     for a perfectly-adoptable worker."""
@@ -314,10 +490,13 @@ def _snapshot() -> SupervisorSnapshot:
     return SupervisorSnapshot(state=SupervisorState.IDLE, since=_NOW)
 
 
-def test_reconcile_orphans_shields_adopted_ids(queue_dir: Path, live_worker_pid: int) -> None:
+def test_reconcile_orphans_shields_adopted_ids(
+    queue_dir: Path, live_worker_pid: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``reconcile_orphans`` must NOT demote a task whose id is in
     ``adopted_ids`` — that task has a live worker + monitor thread."""
-    # Two running orphans; one is "adopted", one is not.
+    # Two running orphans; one is "adopted", one is not and its worker is gone.
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda pid: pid == live_worker_pid)
     _seed_running(
         queue_dir,
         "200-adopted",
@@ -344,21 +523,24 @@ def test_reconcile_orphans_shields_adopted_ids(queue_dir: Path, live_worker_pid:
 
 
 def test_reconcile_orphans_demotes_all_when_no_adopted(
-    queue_dir: Path, live_worker_pid: int
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Default (no adopted_ids): every running orphan is demoted — the
-    historical behaviour is preserved bit-for-bit."""
+    """Default (no adopted_ids): every running orphan whose worker is gone
+    is demoted, as before adoption existed."""
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
     _seed_running(
         queue_dir,
         "300-a",
-        pid=live_worker_pid,
+        pid=4321,
         log_path=_make_log(queue_dir, "300-a"),
         started_at=_NOW,
         last_heartbeat_at=_NOW,
     )
+    _seed_running(queue_dir, "300-b", pid=None, log_path=None, started_at=_NOW)
     _snap, demoted = reconcile_orphans(queue_dir, _snapshot())
-    assert demoted == ["300-a"]
+    assert demoted == ["300-a", "300-b"]
     assert load_state(state_path_for(queue_dir, "300-a")).status == "failed"
+    assert load_state(state_path_for(queue_dir, "300-b")).status == "failed"
 
 
 # ---------------------------------------------------------------------------

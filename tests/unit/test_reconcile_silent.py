@@ -8,14 +8,17 @@ chooses between three outcomes:
   ``reconcile_orphans``'s broad demotion sweep.
 * SILENT (alert window crossed, kill threshold not exceeded):
   flip to ``possibly_hung``.
-* KILL (kill threshold exceeded): SIGTERM the recorded pid (best-
-  effort) and flip to ``failed``.
+* KILL (kill threshold exceeded): terminate the recorded worker's
+  process group and flip to ``failed``, or to ``possibly_hung`` when the
+  worker survives; a pid that is no longer the worker is not signalled.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
@@ -27,12 +30,16 @@ from claude_task_runner.queue.store import (
     todo_dir,
     write_state_atomic,
 )
+from claude_task_runner.runner.dispatcher import WorkerProbe
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 from claude_task_runner.supervisor.reconcile_silent import (
     KILL_STOP_REASON,
     SILENT_STOP_REASON,
     reconcile_silent_orphans,
 )
+
+from ._worker_probe_stubs import probes
 
 
 def _queue(tmp_path: Path) -> Path:
@@ -101,8 +108,12 @@ def test_silent_running_flipped_to_possibly_hung(tmp_path: Path) -> None:
     reloaded = load_state(state_path_for(qd, "t-silent"))
     assert reloaded.status == "possibly_hung"
     assert reloaded.stop_reason == SILENT_STOP_REASON
-    assert reloaded.error is None
-    # pid cleared on demotion.
+    assert reloaded.error == (
+        "silent_on_restart: 600s without a heartbeat, worker log write or monitor "
+        "tick (heartbeat_silence_alert_s=300); worker pid=4321 was not signalled "
+        "and may still be running"
+    )
+    # pid cleared on demotion; the error names it.
     assert reloaded.pid is None
     # session_id preserved for potential operator-driven recovery.
     assert reloaded.session_id == "sess-1"
@@ -125,7 +136,8 @@ def test_silent_does_not_call_sigterm(tmp_path: Path) -> None:
         qd,
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
     )
 
     assert calls == []
@@ -152,7 +164,8 @@ def test_kill_threshold_exceeded_sigterms_and_fails(tmp_path: Path) -> None:
         qd,
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
     )
 
     assert calls == [9999]
@@ -194,7 +207,8 @@ def test_kill_with_no_pid_still_fails_but_no_sigterm(tmp_path: Path) -> None:
         qd,
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
     )
 
     assert calls == []
@@ -206,26 +220,91 @@ def test_kill_with_no_pid_still_fails_but_no_sigterm(tmp_path: Path) -> None:
     assert reloaded.stop_reason == KILL_STOP_REASON
 
 
-def test_kill_sigterm_lookup_failure_reports_not_sigtermed(tmp_path: Path) -> None:
-    """sigterm_fn returns False (e.g. ProcessLookupError swallowed)
-    — the state still flips to failed but sigtermed is False."""
+def test_kill_unconfirmed_but_worker_gone_still_fails(tmp_path: Path) -> None:
+    """terminate_fn cannot confirm the kill, but the probe after it finds
+    the worker gone: the state flips to failed, with sigtermed False."""
     qd = _queue(tmp_path)
     started = _now() - timedelta(seconds=1000)
     _seed_running(qd, "t-gone", started_at=started, pid=9999)
 
-    def gone(_pid: int) -> bool:
+    def unconfirmed(_pid: int) -> bool:
         return False
 
     results = reconcile_silent_orphans(
         qd,
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=gone,
+        terminate_fn=unconfirmed,
+        worker_probe_fn=probes(WorkerProbe.ALIVE, WorkerProbe.DEAD),
     )
 
     assert len(results) == 1
     assert results[0].sigtermed is False
     assert load_state(state_path_for(qd, "t-gone")).status == "failed"
+
+
+def test_kill_worker_that_survives_is_parked_not_failed(tmp_path: Path) -> None:
+    """A worker still running after the terminate is parked possibly_hung,
+    keeping its pid: a failed task would be dispatched again beside it."""
+    qd = _queue(tmp_path)
+    _seed_running(qd, "t-survivor", started_at=_now() - timedelta(seconds=1000), pid=9999)
+    calls: list[int] = []
+
+    def unconfirmed(pid: int) -> bool:
+        calls.append(pid)
+        return False
+
+    results = reconcile_silent_orphans(
+        qd,
+        settings=_settings(alert=300, kill=900),
+        clock=FakeClock(_now()),
+        terminate_fn=unconfirmed,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
+    )
+
+    assert calls == [9999]
+    assert [(r.task_id, r.verdict, r.pid, r.sigtermed) for r in results] == [
+        ("t-survivor", HeartbeatVerdict.KILL, 9999, False)
+    ]
+    reloaded = load_state(state_path_for(qd, "t-survivor"))
+    assert reloaded.status == "possibly_hung"
+    assert reloaded.stop_reason == LIVE_WORKER_STOP_REASON
+    assert reloaded.pid == 9999
+    assert reloaded.error == (
+        "worker pid=9999 is still running after orphaned-restart-reap terminated it "
+        "for 1000s silence (heartbeat_silence_kill_s=900); parked so the task is not "
+        "dispatched again while it runs"
+    )
+
+
+@pytest.mark.parametrize("probe", [WorkerProbe.DEAD, WorkerProbe.REUSED])
+def test_kill_does_not_signal_a_pid_that_is_not_the_worker(
+    tmp_path: Path, probe: WorkerProbe
+) -> None:
+    """A pid with no process, or one another process was given after the
+    worker exited, is never signalled; the worker is gone, so the task fails."""
+    qd = _queue(tmp_path)
+    _seed_running(qd, "t-reused", started_at=_now() - timedelta(seconds=1000), pid=9999)
+    calls: list[int] = []
+
+    def recorder(pid: int) -> bool:
+        calls.append(pid)
+        return True
+
+    results = reconcile_silent_orphans(
+        qd,
+        settings=_settings(alert=300, kill=900),
+        clock=FakeClock(_now()),
+        terminate_fn=recorder,
+        worker_probe_fn=probes(probe),
+    )
+
+    assert calls == []
+    assert [(r.verdict, r.sigtermed) for r in results] == [(HeartbeatVerdict.KILL, False)]
+    reloaded = load_state(state_path_for(qd, "t-reused"))
+    assert reloaded.status == "failed"
+    assert reloaded.stop_reason == KILL_STOP_REASON
+    assert reloaded.pid is None
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +331,8 @@ def test_healthy_running_left_alone(tmp_path: Path) -> None:
         qd,
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
     )
 
     assert results == []
@@ -390,7 +470,8 @@ def test_mixed_verdicts_in_one_pass(tmp_path: Path, live_worker_pid: int) -> Non
         qd,
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=probes(WorkerProbe.ALIVE),
     )
 
     # HEALTHY produces no result; SILENT and KILL each produce one.

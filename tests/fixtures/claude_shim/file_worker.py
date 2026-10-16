@@ -2,8 +2,9 @@
 """Fake file-backed `claude` worker for ADR-0025 adoption e2e tests.
 
 Unlike the stdout-streaming ``claude`` shim, this one writes its
-stream-json directly to a FILE — modelling a worker whose stdout the
-dispatcher redirected to ``attempt-N.stream.jsonl``.
+stream-json to a FILE that is its stdout — modelling a worker whose stdout
+the dispatcher redirected to ``attempt-N.stream.jsonl``. The runner's
+worker-identity probe checks that a recorded pid's fd 1 is the log.
 
 It **forks** so the process that actually writes the log is re-parented
 to init (PID 1) once this launcher exits, exactly like a real ``claude``
@@ -30,6 +31,9 @@ Env vars:
 * ``WORKER_PRESLEEP_S``  (default ``0``) — grandchild sleeps this long
   BEFORE writing anything (lets the adopter attach while it is still
   "live" and quiet)
+* ``WORKER_HOLD_S``      (default ``0``) — after the assistant event, the
+  grandchild sleeps this long before the result, writing nothing (models
+  a long tool call)
 * ``WORKER_NO_RESULT``   (default ``""``) — if set, the grandchild writes
   init + assistant but NO terminal result event, then exits (models a
   crash mid-run)
@@ -43,17 +47,19 @@ import sys
 import time
 
 
-def _write_stream(log_path: str) -> int:
+def _write_stream() -> int:
     session_id = os.environ.get("WORKER_SESSION_ID", "adopt-e2e")
     stop_reason = os.environ.get("WORKER_STOP_REASON", "end_turn")
     is_error = os.environ.get("WORKER_IS_ERROR", "false").lower() == "true"
     presleep = float(os.environ.get("WORKER_PRESLEEP_S", "0"))
+    hold = float(os.environ.get("WORKER_HOLD_S", "0"))
     no_result = bool(os.environ.get("WORKER_NO_RESULT", ""))
 
     if presleep:
         time.sleep(presleep)
 
-    with open(log_path, "a", encoding="utf-8") as fh:
+    # fd 1 is the log (see main); write through it, as claude does.
+    with open(1, "w", encoding="utf-8", closefd=False) as fh:
 
         def emit(obj: dict) -> None:
             fh.write(json.dumps(obj) + "\n")
@@ -71,6 +77,8 @@ def _write_stream(log_path: str) -> int:
         )
         if no_result:
             return 1
+        if hold:
+            time.sleep(hold)
         emit(
             {
                 "type": "result",
@@ -103,19 +111,22 @@ def main() -> int:
         return 0
 
     # Worker (child): detach into its own session (mirrors the
-    # dispatcher's start_new_session). Crucially, redirect stdin/stdout/
-    # stderr to /dev/null so the worker does NOT keep the launcher's
-    # captured stdout pipe open — otherwise ``subprocess.run(
+    # dispatcher's start_new_session). Crucially, point stdout at the log
+    # and stdin/stderr at /dev/null so the worker does NOT keep the
+    # launcher's captured stdout pipe open — otherwise ``subprocess.run(
     # capture_output=True)`` in the test would block reading that pipe
     # until the worker (which inherited the fd) exits, defeating the
-    # "launch and return while the worker keeps running" contract. Use
-    # os._exit so the forked child doesn't run pytest/atexit machinery.
+    # "launch and return while the worker keeps running" contract. The log
+    # is created here, before the launcher returns, as the dispatcher
+    # creates it before ``Popen``. Use os._exit so the forked child doesn't
+    # run pytest/atexit machinery.
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(devnull, 0)
-    os.dup2(devnull, 1)
+    os.dup2(log_fd, 1)
     os.dup2(devnull, 2)
-    os._exit(_write_stream(log_path))
+    os._exit(_write_stream())
 
 
 if __name__ == "__main__":

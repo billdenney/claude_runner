@@ -39,6 +39,8 @@ from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
 from claude_task_runner.supervisor import reconcile_silent as rs
 
+from ._worker_probe_stubs import worker_alive
+
 INIT = "pid 1 is init, and process group 1 is every process the user owns"
 OWN_GROUP_PID = "pid 0 means this process's own process group"
 NEGATIVE_PID = "a negative pid is a process group, and -1 is every process the user owns"
@@ -324,11 +326,6 @@ def test_the_stuck_loop_scan_refuses_init_before_walking(
     assert sent.calls == []
 
 
-def test_default_sigterm_refuses_init(sent: Recorder) -> None:
-    assert rs._default_sigterm(1) is False
-    assert sent.calls == []
-
-
 def _queue_with_a_pid_one_worker(tmp_path: Path) -> Path:
     qd = tmp_path / "q"
     qd.mkdir()
@@ -367,7 +364,8 @@ def test_incident_replay_scan_sends_nothing(
 ) -> None:
     """The 2026-09-26 state: a pid-1 worker, heartbeat 2000 s stale, the
     dispatcher alive, and a marker-wait loop under init. Unguarded, the scan
-    matched and the kill went to process group 1."""
+    matched and the kill went to process group 1. The worker probe refuses
+    pid 1 and reports no worker, so nothing is scanned or sent."""
     qd = _queue_with_a_pid_one_worker(tmp_path)
     monkeypatch.setattr(rs, "_PROC_ROOT", _fake_proc_with_a_loop_under_init(tmp_path))
 
@@ -378,14 +376,15 @@ def test_incident_replay_scan_sends_nothing(
     assert results == []
     assert load_state(state_path_for(qd, "t-incident")).status == "running"
     assert sent.calls == []
-    assert _errors(caplog) == [f"refusing to scan the process tree of pid 1: {INIT}"]
+    assert _errors(caplog) == [f"refusing to probe pid 1: {INIT}"]
 
 
 def test_incident_replay_kill_sends_nothing(
     sent: Recorder, caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
-    """Had the scan matched anyway, the default terminate refuses pid 1 and
-    the task is still demoted, with ``sigtermed`` false."""
+    """Had the probe been fooled and the scan matched anyway, the default
+    terminate refuses pid 1, with ``sigtermed`` false. The fooled probe still
+    reports the worker running, so the task is parked, not set failed."""
     qd = _queue_with_a_pid_one_worker(tmp_path)
 
     results = rs.reap_silent_orphans_tick(
@@ -394,12 +393,13 @@ def test_incident_replay_kill_sends_nothing(
         settings=_caps(),
         clock=FakeClock(NOW),
         stuck_loop_detect_fn=lambda _pid: (4242, LOOP_ARGV),
+        worker_probe_fn=worker_alive,
     )
 
     assert [(r.verdict, r.pid, r.sigtermed, r.stuck_loop_bash_pid) for r in results] == [
         (HeartbeatVerdict.KILL, 1, False, 4242)
     ]
-    assert load_state(state_path_for(qd, "t-incident")).status == "failed"
+    assert load_state(state_path_for(qd, "t-incident")).status == "possibly_hung"
     assert sent.calls == []
     assert _errors(caplog) == [f"refusing to send SIGTERM to pid 1: {INIT}"]
 

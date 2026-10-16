@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
     list_pending_tasks,
@@ -539,7 +539,9 @@ def _reap_finished(
     Defence-in-depth post-kill sanity check (Bug 5 of the 2026-06
     zombie-consolidated PR): for every slot whose dispatch thread has
     exited, we look up the subprocess pid in the just-written run record
-    and probe ``os.kill(pid, 0)``. If the pid is still alive — the
+    and ask :func:`dispatcher.probe_worker` whether it is still that run's
+    worker (a pid another process was given since does not hold the slot).
+    If the pid is still alive — the
     dispatcher's SIGTERM→SIGKILL escalation failed (typically a kernel
     D-state) — we log loudly, fire a one-shot operator notification,
     and DO NOT delete the slot. Holding the slot prevents the queue
@@ -561,8 +563,16 @@ def _reap_finished(
         with contextlib.suppress(Exception):
             slot.thread.join(timeout=0.1)
 
-        leak_pid = _recorded_subprocess_pid(queue_dir, tid) if queue_dir is not None else None
-        if leak_pid is not None and dispatcher_mod._pid_alive(leak_pid):
+        run = _recorded_subprocess_run(queue_dir, tid) if queue_dir is not None else None
+        leak_pid = run.pid if run is not None else None
+        if (
+            leak_pid is not None
+            and run is not None
+            # No log_path: the run's worker may have been pipe-backed, and a
+            # leak is held on the start-time check alone, erring toward held.
+            and dispatcher_mod.probe_worker(leak_pid, log_path=None, started_at=run.started_at)
+            is dispatcher_mod.WorkerProbe.ALIVE
+        ):
             if slot.subprocess_leak_notified_at is None:
                 logger.error(
                     "SUBPROCESS_LEAK_DETECTED: task %s dispatch thread exited but "
@@ -593,13 +603,13 @@ def _reap_finished(
         logger.info("reaped finished dispatch thread for task %s", tid)
 
 
-def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
-    """Return the most recent run record's pid for ``task_id``, or ``None``.
+def _recorded_subprocess_run(queue_dir: Path, task_id: str) -> RunRecord | None:
+    """Return the most recent run record for ``task_id`` when it has a pid, or ``None``.
 
-    Reads the task's state YAML and returns ``runs[-1].pid`` — the OS
-    pid of the subprocess most recently spawned for this task. Used by
-    the post-tick reap's subprocess-leak detection. Returns ``None``
-    when:
+    Reads the task's state YAML and returns ``runs[-1]``, whose ``pid`` is
+    the OS pid of the subprocess most recently spawned for this task and
+    whose ``started_at`` dates it. Used by the post-tick reap's
+    subprocess-leak detection. Returns ``None`` when:
 
     * the state file is missing or unparseable (defensive — a missing
       state YAML means we have nothing to check)
@@ -641,9 +651,9 @@ def _recorded_subprocess_pid(queue_dir: Path, task_id: str) -> int | None:
     # (possibly recycled) pid would wrongly hold the slot (ADR-0029).
     if state.status == "deferred":
         return None
-    if not state.runs:
+    if not state.runs or state.runs[-1].pid is None:
         return None
-    return state.runs[-1].pid
+    return state.runs[-1]
 
 
 def _target_concurrency(queue_dir: Path, settings: Settings) -> int | None:

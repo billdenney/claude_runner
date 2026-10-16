@@ -21,8 +21,11 @@ zero filesystem overhead when everything is healthy.
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
@@ -42,8 +45,12 @@ from claude_task_runner.supervisor.reconcile_silent import (
     STEADY_SILENT_STOP_REASON,
     ReapResult,
     _latest_mtime_in_tree,
+    liveness_verdict,
     reap_silent_orphans_tick,
+    reconcile_silent_orphans,
 )
+
+from ._worker_probe_stubs import worker_alive
 
 
 def _queue(tmp_path: Path) -> Path:
@@ -86,9 +93,11 @@ def _seed_task_and_state(
     dispatcher_alive_at: datetime | None = None,
     pid: int | None = None,
     working_dir: Path | None = None,
+    log_written_at: datetime | None = None,
 ) -> None:
     """Seed both the Task YAML (with working_dir) AND the state YAML
-    so the FS verification step can find the worktree."""
+    so the FS verification step can find the worktree. ``log_written_at``
+    gives the task a worker log last written then."""
     task = Task(
         id=task_id,
         title=task_id,
@@ -103,8 +112,18 @@ def _seed_task_and_state(
         last_heartbeat_at=last_heartbeat_at,
         dispatcher_alive_at=dispatcher_alive_at,
         pid=pid,
+        log_path=str(_worker_log(qd, task_id, log_written_at)) if log_written_at else None,
     )
     write_state_atomic(state, state_path_for(qd, task_id))
+
+
+def _worker_log(qd: Path, task_id: str, written_at: datetime) -> Path:
+    """A worker stream log whose last write (mtime) is ``written_at``."""
+    log = qd / ".claude_task_runner" / "logs" / task_id / "attempt-1.stream.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text('{"type":"tool_progress","tool_name":"Bash","elapsed_time_seconds":360}\n')
+    os.utime(log, (written_at.timestamp(), written_at.timestamp()))
+    return log
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +187,8 @@ def test_dispatcher_alive_stale_falls_through_to_hb(tmp_path: Path) -> None:
         {"t-both-stale"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=lambda _pid: True,
+        terminate_fn=lambda _pid: True,
+        worker_probe_fn=worker_alive,
     )
 
     # Both stale + no working_dir = no FS check = act on KILL verdict.
@@ -238,7 +258,16 @@ def test_dispatcher_alive_one_second_past_alert_falls_through(tmp_path: Path) ->
         )
     ]
     assert load_state(state_path_for(qd, "t-alive-past-alert")) == before.model_copy(
-        update={"status": "possibly_hung", "stop_reason": STEADY_SILENT_STOP_REASON, "pid": None}
+        update={
+            "status": "possibly_hung",
+            "stop_reason": STEADY_SILENT_STOP_REASON,
+            "pid": None,
+            "error": (
+                "silent_steady_state: 500s without a heartbeat, worker log write or "
+                "monitor tick (heartbeat_silence_alert_s=300); worker pid=7 was not "
+                "signalled and may still be running"
+            ),
+        }
     )
 
 
@@ -267,7 +296,8 @@ def test_dispatcher_alive_predates_started_treated_as_none(tmp_path: Path) -> No
         {"t-stale-alive"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=lambda _pid: True,
+        terminate_fn=lambda _pid: True,
+        worker_probe_fn=worker_alive,
     )
 
     # Silence = now - started_at = 1000s > kill=900 → KILL.
@@ -394,7 +424,8 @@ def test_fs_stale_mtime_still_kills(tmp_path: Path) -> None:
         {"t-zombie"},
         settings=_settings(alert=300, kill=900, fs_window=600),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
         fs_mtime_fn=stub_mtime,
     )
 
@@ -476,7 +507,16 @@ def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None
         )
     ]
     assert load_state(state_path_for(qd, "t-fs-past-window")) == before.model_copy(
-        update={"status": "possibly_hung", "stop_reason": STEADY_SILENT_STOP_REASON, "pid": None}
+        update={
+            "status": "possibly_hung",
+            "stop_reason": STEADY_SILENT_STOP_REASON,
+            "pid": None,
+            "error": (
+                "silent_steady_state: 2000s without a heartbeat, worker log write or "
+                "monitor tick (heartbeat_silence_alert_s=300); worker pid=42 was not "
+                "signalled and may still be running"
+            ),
+        }
     )
 
 
@@ -832,7 +872,8 @@ def test_fs_refresh_recheck_failure_treated_as_healthy_not_demoted(tmp_path: Pat
         {"t-fs-recheck-fail"},
         settings=_settings(alert=300, kill=900, fs_window=600),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
         fs_mtime_fn=stub_mtime_then_corrupt,
     )
 
@@ -842,3 +883,111 @@ def test_fs_refresh_recheck_failure_treated_as_healthy_not_demoted(tmp_path: Pat
     # The corrupt file was NOT overwritten with a demotion; the reaper
     # stood down and left it for a later pass / operator inspection.
     assert sp.read_text(encoding="utf-8") == "not: valid: yaml: ]["
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: the worker's own log writes are a sign of life
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pass_name", ["startup", "tick"])
+def test_fresh_worker_log_keeps_a_kill_level_silence_alive(tmp_path: Path, pass_name: str) -> None:
+    """A long Bash call: 1000 s without an event the agent heartbeat counts,
+    no monitor tick (none ran, or it died), past ``heartbeat_silence_kill_s``.
+    The worker wrote its log 30 s ago, so neither pass kills or parks it."""
+    qd = _queue(tmp_path)
+    _seed_task_and_state(
+        qd,
+        "t-tool-call",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=1000),
+        pid=1234,
+        log_written_at=_now() - timedelta(seconds=30),
+    )
+    before = load_state(state_path_for(qd, "t-tool-call"))
+    terminated: list[int] = []
+
+    settings = _settings(alert=300, kill=900)
+    clock = FakeClock(_now())
+
+    def terminate(pid: int) -> bool:
+        terminated.append(pid)
+        return True
+
+    if pass_name == "startup":
+        results = reconcile_silent_orphans(
+            qd, settings=settings, clock=clock, terminate_fn=terminate, worker_probe_fn=worker_alive
+        )
+    else:
+        results = reap_silent_orphans_tick(
+            qd,
+            {"t-tool-call"},
+            settings=settings,
+            clock=clock,
+            terminate_fn=terminate,
+            worker_probe_fn=worker_alive,
+        )
+
+    assert results == []
+    assert terminated == []
+    assert load_state(state_path_for(qd, "t-tool-call")) == before
+
+
+def test_worker_log_one_second_past_alert_is_no_sign_of_life(tmp_path: Path) -> None:
+    qd = _queue(tmp_path)
+    _seed_task_and_state(
+        qd,
+        "t-log",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=None,
+        pid=1234,
+        log_written_at=_now() - timedelta(seconds=301),
+    )
+    state = load_state(state_path_for(qd, "t-log"))
+    assert liveness_verdict(state, settings=_settings(alert=300, kill=900), now=_now()) is (
+        HeartbeatVerdict.KILL
+    )
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_age_s", "alive_age_s", "log_age_s", "verdict"),
+    [
+        (10, None, None, HeartbeatVerdict.HEALTHY),
+        (400, None, None, HeartbeatVerdict.SILENT),
+        (1000, None, None, HeartbeatVerdict.KILL),
+        (1000, 20, None, HeartbeatVerdict.HEALTHY),
+        (1000, 301, None, HeartbeatVerdict.KILL),
+        (1000, None, 20, HeartbeatVerdict.HEALTHY),
+        (1000, 400, 300, HeartbeatVerdict.HEALTHY),
+        (400, 400, 400, HeartbeatVerdict.SILENT),
+    ],
+)
+def test_liveness_verdict_known_answers(
+    tmp_path: Path,
+    heartbeat_age_s: int,
+    alive_age_s: int | None,
+    log_age_s: int | None,
+    verdict: HeartbeatVerdict,
+) -> None:
+    """The verdict adoption reads: HEALTHY when the monitor tick or the
+    worker log is within the 300 s alert window, else the heartbeat's
+    verdict (SILENT past 300 s, KILL past 900 s)."""
+    qd = _queue(tmp_path)
+    _seed_task_and_state(
+        qd,
+        "t-v",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=heartbeat_age_s),
+        dispatcher_alive_at=(
+            _now() - timedelta(seconds=alive_age_s) if alive_age_s is not None else None
+        ),
+        pid=1234,
+        log_written_at=_now() - timedelta(seconds=log_age_s) if log_age_s is not None else None,
+    )
+    state = load_state(state_path_for(qd, "t-v"))
+    assert liveness_verdict(state, settings=_settings(alert=300, kill=900), now=_now()) is verdict
+
+
+def test_liveness_verdict_cannot_grade_without_a_start(tmp_path: Path) -> None:
+    state = TaskState(task_id="t-x", status="running", last_started_at=None, pid=1234)
+    assert liveness_verdict(state, settings=_settings(), now=_now()) is None

@@ -8,14 +8,13 @@ startup adoption does. The worker runs to completion (writing a terminal
 result event), the adopter tails the live file to the end, infers the
 outcome, and finalizes the task as completed with a RunRecord persisted.
 
-This exercises the real tailer, the real ``_pid_alive`` probe, the real
+This exercises the real tailer, the real worker probe on the host's
+``/proc`` (the worker's stdout is its log), the real
 ``_DispatcherAliveMonitor`` thread, and the real finalize — no stubbing.
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,10 +33,12 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner.dispatcher import adopt_worker
 
+from ._file_worker import spawn_file_worker
+
+pytestmark = pytest.mark.usefixtures("real_proc")
+
 _SETTINGS = load_settings(None)
 """Package defaults; the adopted finalize requires the dispatch and hook settings."""
-
-WORKER = Path(__file__).parent.parent / "fixtures" / "claude_shim" / "file_worker.py"
 
 
 @pytest.fixture
@@ -56,29 +57,6 @@ def _caps() -> TaskCapsSettings:
         heartbeat_silence_kill_s=0,
         dispatcher_alive_write_interval_s=600.0,
     )
-
-
-def _spawn_worker(log_path: Path, env_extra: dict[str, str]) -> int:
-    """Launch the file-backed worker; return the (init-owned) worker pid.
-
-    The launcher forks the real worker, prints its pid, and exits, so the
-    worker is re-parented to init (no zombie for this test process) and
-    its pid genuinely disappears on exit — which is what the adopter's
-    ``os.kill(pid, 0)`` liveness probe needs.
-    """
-    import os
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, **env_extra}
-    out = subprocess.run(
-        [sys.executable, str(WORKER), str(log_path)],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    return int(out.stdout.strip())
 
 
 def _seed_running(queue_dir: Path, task: Task, log: Path, pid: int) -> TaskState:
@@ -102,7 +80,7 @@ def test_adopt_real_worker_to_completion(queue_dir: Path) -> None:
     # Worker sleeps briefly before writing, so adoption attaches while it
     # is still live and quiet (the tailer polls), then drains its output
     # once it writes and exits.
-    pid = _spawn_worker(
+    pid = spawn_file_worker(
         log,
         {
             "WORKER_SESSION_ID": "adopt-live",
@@ -147,7 +125,7 @@ def test_adopt_real_worker_crash_no_result_failed(queue_dir: Path) -> None:
     task = Task(id="901-adopt-crash-e2e", title="t", prompt="p", working_dir=None)
     log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
 
-    pid = _spawn_worker(
+    pid = spawn_file_worker(
         log,
         {"WORKER_SESSION_ID": "adopt-crash", "WORKER_NO_RESULT": "1", "WORKER_PRESLEEP_S": "0.2"},
     )
@@ -181,7 +159,7 @@ def test_adopt_waits_for_live_worker_then_finalizes(queue_dir: Path) -> None:
     task = Task(id="902-adopt-wait", title="t", prompt="p", working_dir=None)
     log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
 
-    pid = _spawn_worker(log, {"WORKER_SESSION_ID": "adopt-wait", "WORKER_PRESLEEP_S": "0.6"})
+    pid = spawn_file_worker(log, {"WORKER_SESSION_ID": "adopt-wait", "WORKER_PRESLEEP_S": "0.6"})
     state = _seed_running(queue_dir, task, log, pid)
 
     start = time.monotonic()

@@ -37,6 +37,8 @@ from claude_task_runner.supervisor.reconcile_silent import (
     reap_silent_orphans_tick,
 )
 
+from ._worker_probe_stubs import worker_alive
+
 
 def _queue(tmp_path: Path) -> Path:
     qd = tmp_path / "q"
@@ -105,7 +107,8 @@ def test_fresh_heartbeat_no_change(tmp_path: Path) -> None:
         {"t-healthy"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
     )
 
     assert results == []
@@ -148,7 +151,8 @@ def test_silent_flips_to_possibly_hung_with_steady_stop_reason(tmp_path: Path) -
         {"t-silent"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
     )
 
     assert len(results) == 1
@@ -199,7 +203,8 @@ def test_kill_threshold_exceeded_sigterms_and_fails(tmp_path: Path) -> None:
         {"t-kill"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
     )
 
     assert calls == [9999]
@@ -274,7 +279,8 @@ def test_only_in_flight_tasks_evaluated(tmp_path: Path, live_worker_pid: int) ->
         {"t-tracked"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
     )
 
     assert {r.task_id for r in results} == {"t-tracked"}
@@ -293,7 +299,7 @@ def test_recheck_skips_demote_if_dispatcher_finalized(tmp_path: Path) -> None:
     verdict computation and its write, the reaper must NOT overwrite
     the dispatcher's authoritative state.
 
-    Simulated by injecting a sigterm_fn that, when called, writes a
+    Simulated by injecting a terminate_fn that, when called, writes a
     "completed" state to the YAML — emulating a dispatcher thread that
     happened to finalize right after the reaper SIGTERM-ed. The
     reaper's pre-write recheck must see status != "running" and skip
@@ -320,7 +326,8 @@ def test_recheck_skips_demote_if_dispatcher_finalized(tmp_path: Path) -> None:
         {"t-race"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=racy_sigterm,
+        terminate_fn=racy_sigterm,
+        worker_probe_fn=worker_alive,
     )
 
     # The sigterm fired (returns True is recorded internally) but the
@@ -345,7 +352,7 @@ def test_recheck_skips_demote_under_real_thread_race(tmp_path: Path) -> None:
     must observe the change and stand down.
 
     Determinism: the cross-thread finalize is released inside the
-    injected ``sigterm_fn`` — which the reaper calls AFTER computing its
+    injected ``terminate_fn`` — which the reaper calls AFTER computing its
     verdict but BEFORE ``_demote_if_still_running`` re-reads the state.
     The hook signals the dispatcher thread, then blocks until that
     thread has actually committed its ``write_state_atomic``. So the
@@ -396,7 +403,8 @@ def test_recheck_skips_demote_under_real_thread_race(tmp_path: Path) -> None:
             {"t-thread-race"},
             settings=_settings(alert=300, kill=900),
             clock=FakeClock(_now()),
-            sigterm_fn=sigterm_handoff,
+            terminate_fn=sigterm_handoff,
+            worker_probe_fn=worker_alive,
         )
     finally:
         dispatcher.join(timeout=5)
@@ -445,7 +453,8 @@ def test_baseline_correction_uses_started_at(tmp_path: Path) -> None:
         {"t-base"},
         settings=_settings(alert=300, kill=900),
         clock=FakeClock(_now()),
-        sigterm_fn=lambda _pid: True,
+        terminate_fn=lambda _pid: True,
+        worker_probe_fn=worker_alive,
     )
 
     # Silence is now-started_at = 1000s. With kill=900, this is KILL,
@@ -501,7 +510,8 @@ def test_silent_without_kill_threshold_marks_only(tmp_path: Path) -> None:
         {"t-no-kill"},
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
-        sigterm_fn=recorder,
+        terminate_fn=recorder,
+        worker_probe_fn=worker_alive,
     )
 
     assert len(results) == 1

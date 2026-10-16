@@ -1117,7 +1117,7 @@ def start_daemon(
             # Silent-orphan reaper (must precede reconcile_orphans):
             # walks in-flight state YAMLs and grades each by heartbeat
             # silence — SILENT → possibly_hung (parked for operator),
-            # KILL → failed + best-effort SIGTERM of the recorded pid.
+            # KILL → terminate the worker's process group, then failed.
             # Skipping this pass would let reconcile_orphans's broad
             # demotion sweep auto-redispatch tasks that are genuinely
             # hung, burning slots on a re-hang.
@@ -1201,7 +1201,8 @@ def start_daemon(
             # this sweep then handles the remaining HEALTHY-but-orphaned
             # set (recent dispatches that the dead supervisor didn't
             # have time to mark possibly_hung). Adopted tasks (ADR-0025)
-            # are shielded — they have a live worker + monitor thread.
+            # are shielded — they have a live worker + monitor thread — and
+            # one whose worker still runs unadopted is parked possibly_hung.
             snapshot, orphan_ids = reconcile_mod.reconcile_orphans(
                 queue_dir, snapshot, adopted_ids=adopted_ids
             )
