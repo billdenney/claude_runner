@@ -1534,12 +1534,12 @@ def _maybe_kill_stuck_sleep_loop(
 
 def _default_terminate_pg(pid: int) -> bool:
     """SIGTERM → grace → SIGKILL → post-verify the process group led by
-    ``pid``; return ``True`` iff the process is confirmed gone afterward.
+    ``pid``; return ``True`` iff the worker is confirmed gone afterward.
 
     The kill path of both reaper passes, for a KILL verdict and for a
     stuck sleep loop. Rather than a bare one-shot SIGTERM (which leaves
-    the worker's shell and tool processes running), it reuses the dispatcher's
-    battle-tested escalation, :func:`runner.dispatcher._terminate_by_pid`:
+    the worker's shell and tool processes running), it reuses the
+    dispatcher's escalation, :func:`runner.dispatcher._terminate_by_pid`:
     SIGTERM the worker's process group, poll for exit, escalate to
     SIGKILL, then verify the process actually died. The bash sleep-loop
     descendants share the worker's process group (the worker is spawned
@@ -1547,20 +1547,28 @@ def _default_terminate_pg(pid: int) -> bool:
     SIGKILL escalation guarantees the slot is freed even if the bash
     ignores SIGTERM (or is wedged in a way that defers signal delivery).
 
-    Returns ``True`` iff ``pid`` is no longer alive after the sequence,
-    recorded as :attr:`ReapResult.sigtermed` so the operator can tell a
-    confirmed kill from a could-not-confirm one (EPERM under a Linux-user
-    dispatch, or a ``TASK_UNINTERRUPTIBLE`` D-state). The escalation runs
-    in the supervisor tick; in practice a ``sleep`` loop dies on the first
+    Liveness during and after the escalation is
+    :func:`runner.dispatcher.probe_worker`, so a worker that died but is
+    not yet reaped (a zombie) counts as gone, as it does for an adoption
+    monitor's terminate. The caller confirmed the pid was the recorded
+    worker just before the signal, and a pid is not given to another
+    process until its own process is reaped, so the probe needs no
+    identity hints here.
+
+    Returns ``True`` iff the worker is gone after the sequence, recorded
+    as :attr:`ReapResult.sigtermed` so the operator can tell a confirmed
+    kill from a could-not-confirm one (EPERM under a Linux-user dispatch,
+    or a ``TASK_UNINTERRUPTIBLE`` D-state). The escalation runs in the
+    supervisor tick; in practice a ``sleep`` loop dies on the first
     SIGTERM within a fraction of the grace period, so the tick stall is
-    sub-second — and stuck-loop kills are rare.
+    sub-second — and kills are rare.
     """
+
+    def _alive() -> bool:
+        return dispatcher_mod.probe_worker(pid, log_path=None, started_at=None) is WorkerProbe.ALIVE
+
     try:
-        dispatcher_mod._terminate_by_pid(
-            pid,
-            alive=lambda: dispatcher_mod._pid_alive(pid),
-            sleep_fn=time.sleep,
-        )
+        dispatcher_mod._terminate_by_pid(pid, alive=_alive, sleep_fn=time.sleep)
     except Exception as exc:
         logger.warning(
             "silent-orphan reaper: _terminate_by_pid(pid=%s) raised %s; reporting unconfirmed kill",
@@ -1568,7 +1576,7 @@ def _default_terminate_pg(pid: int) -> bool:
             exc,
         )
         return False
-    return not dispatcher_mod._pid_alive(pid)
+    return not _alive()
 
 
 __all__ = [
