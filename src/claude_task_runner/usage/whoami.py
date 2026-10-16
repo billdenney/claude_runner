@@ -82,7 +82,9 @@ def credentials_path(claude_config_dir: str = "") -> Path:
     """Resolve the active ``credentials.json`` path.
 
     Empty ``claude_config_dir`` means use the default ``~/.claude``.
-    Raises :class:`config.paths.ConfigDirError` when it cannot be expanded.
+    Raises :class:`config.paths.ConfigDirError` when it cannot be expanded,
+    which ``usage whoami`` cannot reach: it passes ``[claude].config_dir``
+    from settings ``load_settings`` validated.
     """
     base = expand_config_dir(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
     return base / CREDENTIALS_FILENAME

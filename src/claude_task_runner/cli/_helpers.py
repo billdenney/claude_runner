@@ -17,7 +17,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.config.loader import BrokenAccount
+from claude_task_runner.config.loader import (
+    BrokenAccount,
+    ConfigError,
+    config_error_exit_status,
+    load_settings,
+)
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.store import require_queue_dir
 from claude_task_runner.runner.account_dispatch import QueueCeiling
@@ -121,15 +126,61 @@ def queue_ceiling_json(ceiling: QueueCeiling, settings: Settings) -> dict[str, o
     return {**ceiling.as_json(), "initial_concurrency": settings.concurrency.initial_concurrency}
 
 
-def broken_accounts_message(broken: Sequence[BrokenAccount]) -> str:
-    """Why ``supervisor start`` refuses to start: every account file that does not load."""
+def broken_accounts_message(
+    broken: Sequence[BrokenAccount],
+    *,
+    refused: str = "supervisor not started",
+    then: str = "start the supervisor again",
+    if_transient: str = "so this start exits 1 and systemd tries again; fix it if it does not",
+) -> str:
+    """Why a command refuses to go on: every account file that does not load.
+
+    ``supervisor start`` uses the defaults; ``install`` passes its own
+    ``refused``, ``then`` and ``if_transient``.
+    """
     noun = "account" if len(broken) == 1 else "accounts"
-    lines = [
-        f"supervisor not started: the runner-account.toml of {len(broken)} {noun} does not load:"
-    ]
+    lines = [f"{refused}: the runner-account.toml of {len(broken)} {noun} does not load:"]
     lines += [f"  {b.name}: {b.error}" for b in broken]
+    if all(b.transient for b in broken):
+        lines.append(
+            "Each may clear up by itself (a config_dir on a mount that is not up yet, "
+            f"say), {if_transient}."
+        )
     lines.append(
-        "Fix each file, or delete it for the defaults, then start the supervisor again. "
+        f"Fix each file, or delete it for the defaults, then {then}. "
         "Once the supervisor runs, a file that breaks only stops new tasks on its account."
     )
     return "\n".join(lines)
+
+
+def load_settings_or_exit(
+    config: Path | None,
+    console: Console,
+    *,
+    json: bool = False,
+    lead: str = "configuration error",
+) -> Settings:
+    """``load_settings(config)``, or print why it failed and exit.
+
+    Exits 78 when the configuration's content is wrong and 1 when a file
+    could not be read and may come back (:attr:`ConfigError.transient`),
+    the rule ``supervisor start`` follows. The error is printed whole
+    without a traceback, after ``lead``; with ``json`` it goes to stdout
+    as ``{"ok": false, "error": ...}``.
+    """
+    try:
+        return load_settings(config)
+    except ConfigError as exc:
+        message = f"{lead}: {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": message}))
+        else:
+            console.print(
+                message,
+                style="bold red",
+                markup=False,
+                emoji=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+        raise typer.Exit(code=config_error_exit_status(transient=exc.transient)) from exc

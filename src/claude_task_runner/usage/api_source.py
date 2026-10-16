@@ -234,10 +234,10 @@ def _read_oauth_token(config_dir: str) -> str:
     (recommended) or ``claude /login`` to populate one of the two.
     """
     try:
-        long_lived = read_long_lived_token(config_dir)
         base = expand_config_dir(config_dir) if config_dir else Path.home() / ".claude"
     except ConfigDirError as exc:
         raise CredentialsNotFound(str(exc)) from exc
+    long_lived = read_long_lived_token(str(base))
     if long_lived is not None:
         return long_lived
 

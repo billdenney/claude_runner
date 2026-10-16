@@ -414,8 +414,11 @@ class TestDispatchSynchronously:
 # ---------------------------------------------------------------------------
 
 
-def _make_multi_account_settings(*, max_c: int = 2) -> Any:
-    """Two-account settings shape for affinity tests."""
+def _make_multi_account_settings(queue_dir: Path, *, max_c: int = 2) -> Any:
+    """Two-account settings shape for affinity tests, with each account's
+    config_dir created beside ``queue_dir``: one that does not exist is broken."""
+    for name in (".claude_personal", ".claude_work"):
+        (queue_dir.parent / name).mkdir(exist_ok=True)
     from claude_task_runner.config.schema import AccountSettings
 
     return SimpleNamespace(
@@ -428,8 +431,8 @@ def _make_multi_account_settings(*, max_c: int = 2) -> Any:
         claude=SimpleNamespace(executable="claude", config_dir=""),
         dispatch=SimpleNamespace(auto_detect_paths_in_prompt=False),
         accounts=[
-            AccountSettings(name="personal", config_dir="/tmp/.claude_personal"),
-            AccountSettings(name="work", config_dir="/tmp/.claude_work"),
+            AccountSettings(name="personal", config_dir=str(queue_dir.parent / ".claude_personal")),
+            AccountSettings(name="work", config_dir=str(queue_dir.parent / ".claude_work")),
         ],
     )
 
@@ -465,7 +468,7 @@ class TestForceDispatchAffinity:
         _make_task(queue_dir, "t1", account="personal")
         _seed_sessioned_state(queue_dir, "t1", session_id="sess1", session_account="work")
         fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
-        settings = _make_multi_account_settings()
+        settings = _make_multi_account_settings(queue_dir)
         in_flight: dict[str, DispatchSlot] = {}
 
         captured: dict[str, str | None] = {}
@@ -484,13 +487,13 @@ class TestForceDispatchAffinity:
         assert n == 1
         # Affinity wins over both task.account=personal AND first-configured.
         assert captured["account"] == "work"
-        assert captured["config_dir"] == "/tmp/.claude_work"
+        assert captured["config_dir"] == str(queue_dir.parent / ".claude_work")
 
     def test_tick_consume_drops_request_for_orphaned_affined_account(self, queue_dir: Path) -> None:
         _make_task(queue_dir, "t1")
         _seed_sessioned_state(queue_dir, "t1", session_id="sess1", session_account="ghost")
         fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
-        settings = _make_multi_account_settings()
+        settings = _make_multi_account_settings(queue_dir)
         in_flight: dict[str, DispatchSlot] = {}
 
         with patch.object(fd_mod, "_spawn_dispatch_thread") as spawn:
@@ -515,7 +518,7 @@ class TestForceDispatchAffinity:
             session_account="ghost",
             status="failed",
         )
-        settings = _make_multi_account_settings()
+        settings = _make_multi_account_settings(queue_dir)
         with pytest.raises(fd_mod.ForceDispatchError, match="restart-fresh"):
             fd_mod.dispatch_synchronously(
                 task_id="t1",
@@ -533,7 +536,7 @@ class TestForceDispatchAffinity:
             state_path_for(queue_dir, "t1"),
         )
         fd_mod.write_request(queue_dir, "t1", allow_over_limit=True)
-        settings = _make_multi_account_settings()
+        settings = _make_multi_account_settings(queue_dir)
         in_flight: dict[str, DispatchSlot] = {}
 
         captured: dict[str, str | None] = {}

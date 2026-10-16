@@ -34,6 +34,7 @@ from rich.console import Console
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
 )
@@ -545,7 +546,7 @@ def add_task(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console)
 
     if not _ID_RE.match(task_id):
         console.print(f"[bold red]invalid task id:[/] {task_id!r} (allowed: {_ID_RE.pattern})")
@@ -680,7 +681,7 @@ def backfill_working_dir(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
 
     template = settings.queue.working_dir_template
     if not template.strip():
@@ -950,7 +951,7 @@ def force_dispatch(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     queue_runtime_dir(qd)
 
     task_path = task_path_for(qd, task_id)

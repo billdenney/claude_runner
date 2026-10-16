@@ -25,8 +25,11 @@ One tick:
    whether to act.
 6. On RESTART verdict: read every account's ``runner-account.toml`` as
    ``supervisor start`` does. If one does not load, the supervisor would
-   refuse to start, so log an ERROR line naming each file, start nothing,
-   count no restart, and exit 1 after step 7. Otherwise spawn
+   refuse to start, so log a line naming each file in place of the
+   verdict line, start nothing and count no restart. That line is an
+   ERROR, and the tick exits 1 after step 7, unless every problem may
+   clear up by itself (a mount not up yet): then it is a WARNING, and the
+   next tick reads the files again. Otherwise spawn
    ``claude-task-runner supervisor start`` detached, with ``--config``
    naming the same file.
 7. Save the state, unless ``--dry-run``.
@@ -53,13 +56,19 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
 
 from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, resolve_per_queue_config
 from claude_task_runner.clock import Clock, RealClock
-from claude_task_runner.config.loader import ConfigError, load_settings, resolve_accounts
+from claude_task_runner.config.loader import (
+    BrokenAccount,
+    ConfigError,
+    load_settings,
+    resolve_accounts,
+)
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import backoff as backoff_mod
 from claude_task_runner.cron import registry as registry_mod
@@ -135,7 +144,9 @@ def tick(
     ERROR line; the supervisor is then neither checked nor restarted.
     Exits 1 too when a restart is due but an account's
     ``runner-account.toml`` does not load, after logging an ERROR line
-    naming each one; nothing is started and no restart is counted.
+    naming each one; nothing is started and no restart is counted. When
+    every such problem may clear up by itself (a file or directory that
+    cannot be read yet), the line is a WARNING and the tick exits 0.
     """
     clock = RealClock()
     state_path = backoff_mod.watchdog_state_path()
@@ -193,7 +204,7 @@ def tick(
             config_failed = True
             sys.stdout.write(
                 f"{ts} watchdog: ERROR queue={queue_dir} config={queue_config} does not "
-                f"load, so its supervisor was not checked or restarted: {_one_line(exc)}\n"
+                f"load, so its supervisor was not checked or restarted: {_one_line(str(exc))}\n"
             )
         else:
             new_state, config_failed = _decide_and_act(
@@ -214,12 +225,35 @@ def tick(
         raise typer.Exit(code=1)
 
 
-def _one_line(exc: object) -> str:
-    """``exc``'s message on one line, so each watchdog.log entry stays one line.
+def _one_line(text: str) -> str:
+    """``text`` on one line, so each watchdog.log entry stays one line.
 
     A pydantic validation error spans several lines; they are joined
     with ``"; "``, and spaces within a line are kept."""
-    return "; ".join(line.strip() for line in str(exc).splitlines() if line.strip())
+    return "; ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _held_back_line(
+    ts: str, queue_dir: Path, alive: bool, pid: int | None, broken: Sequence[BrokenAccount]
+) -> str:
+    """The log line for a restart held back because account files do not load.
+
+    ERROR when any account's content is wrong: the supervisor would exit 78
+    and only a fix helps. WARNING when every problem may clear up by itself
+    (a mount not up yet): the next tick reads the files again.
+    """
+    listed = "; ".join(f"{b.name}: {_one_line(b.error)}" for b in broken)
+    if all(b.transient for b in broken):
+        return (
+            f"{ts} watchdog: WARNING queue={queue_dir} alive={alive} pid={pid} the "
+            f"runner-account.toml of {len(broken)} account(s) cannot be read yet, so its "
+            f"supervisor was not restarted; the next tick reads them again: {listed}\n"
+        )
+    return (
+        f"{ts} watchdog: ERROR queue={queue_dir} alive={alive} pid={pid} the "
+        f"runner-account.toml of {len(broken)} account(s) does not load, so its "
+        f"supervisor was not restarted: {listed}\n"
+    )
 
 
 def _queue_config(
@@ -257,10 +291,13 @@ def _decide_and_act(
 
     Before a restart, every account's ``runner-account.toml`` is read as
     ``supervisor start`` reads it. When one does not load, the supervisor
-    would refuse to start (exit 78), so nothing is spawned, an ERROR names
-    each file, and the restart is not counted, as for a queue config that
-    does not load. A running supervisor is left alone: once it runs, a
-    broken account file only disables its account."""
+    would refuse to start, so nothing is spawned and the restart is not
+    counted; a line naming each file is logged in place of the verdict
+    line (:func:`_held_back_line`). That is reported as a configuration
+    error (exit 1) unless every problem may clear up by itself, in which
+    case the next tick simply reads the files again. A running supervisor,
+    and a restart held back for cooldown or backoff, are left alone: the
+    files are read only when a restart is due."""
     watchdog = settings.watchdog
     alive, pid = _supervisor_is_alive(queue_dir)
     lock_held, lock_pid = False, None
@@ -277,21 +314,18 @@ def _decide_and_act(
         clock=clock,
     )
 
+    if decision.verdict is backoff_mod.WatchdogVerdict.RESTART:
+        resolution = resolve_accounts(settings)
+        if resolution.broken:
+            # Logged in place of the verdict line, which would say "restart".
+            sys.stdout.write(_held_back_line(ts, queue_dir, alive, pid, resolution.broken))
+            return state, not resolution.only_transient
+
     sys.stdout.write(
         f"{ts} watchdog queue={queue_dir} alive={alive} pid={pid} "
         f"verdict={decision.verdict.value} detail={decision.detail!r}\n"
     )
 
-    if decision.verdict is backoff_mod.WatchdogVerdict.RESTART:
-        broken = resolve_accounts(settings).broken
-        if broken:
-            listed = "; ".join(f"{b.name}: {_one_line(b.error)}" for b in broken)
-            sys.stdout.write(
-                f"{ts} watchdog: ERROR queue={queue_dir} the runner-account.toml of "
-                f"{len(broken)} account(s) does not load, so its supervisor was not "
-                f"restarted: {listed}\n"
-            )
-            return state, True
     if decision.verdict is backoff_mod.WatchdogVerdict.RESTART and not dry_run:
         try:
             new_pid = _spawn_supervisor(queue_dir, queue_config)

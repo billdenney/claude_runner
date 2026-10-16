@@ -27,7 +27,7 @@ import logging
 import os
 from pathlib import Path
 
-from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
+from claude_task_runner.config.paths import expand_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +64,9 @@ def ensure_initialized(
     if config_dir is None or str(config_dir) == "":
         cfg_path = Path.home() / ".claude"
     else:
-        try:
-            cfg_path = expand_config_dir(str(config_dir))
-        except ConfigDirError as exc:
-            # The spawn that follows fails on the same config_dir with its
-            # own error; there is nothing here to initialize.
-            logger.warning("ensure_initialized: %s", exc)
-            return False
+        # Both callers, the dispatcher and the usage capture, have expanded
+        # config_dir already and turned a failure into their own error.
+        cfg_path = expand_config_dir(str(config_dir))
     config_file = cfg_path / ".claude.json"
     if not config_file.is_file():
         return False

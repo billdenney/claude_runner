@@ -40,15 +40,37 @@ logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
-    """Raised when settings cannot be loaded or validated."""
+    """Raised when settings cannot be loaded or validated.
+
+    ``transient`` tells the two kinds apart. ``False``: the configuration's
+    content is wrong (a parse or validation error, a retired key, an empty
+    account file, a ``~user`` that names no user), and trying again cannot
+    help. ``True``: a file or directory could not be read (missing, denied,
+    a symlink to nothing yet), which may clear up by itself, as when a
+    mount comes up after boot.
+    """
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 CONFIG_ERROR_EXIT_STATUS = 78
-"""The exit status of ``supervisor start`` when it refuses to start because
-its configuration does not load: the queue TOML, or any account's
-``runner-account.toml``. 78 is ``EX_CONFIG`` in sysexits.h. The systemd unit
-lists it in ``RestartPreventExitStatus=``, so a configuration error stops
-the unit instead of restarting it until the start limit trips."""
+"""The exit status of a command that refuses to run because its
+configuration's content is wrong (a :class:`ConfigError` that is not
+``transient``): 78 is ``EX_CONFIG`` in sysexits.h. The systemd unit lists it
+in ``RestartPreventExitStatus=``, so ``supervisor start`` refusing for this
+reason stops the unit instead of restarting it until the start limit trips."""
+
+TRANSIENT_CONFIG_ERROR_EXIT_STATUS = 1
+"""The exit status for a ``transient`` :class:`ConfigError`: an ordinary
+failure, which systemd's ``Restart=on-failure`` retries up to its start
+limit, so a file on a mount that is not up yet recovers by itself."""
+
+
+def config_error_exit_status(*, transient: bool) -> int:
+    """:data:`TRANSIENT_CONFIG_ERROR_EXIT_STATUS` or :data:`CONFIG_ERROR_EXIT_STATUS`."""
+    return TRANSIENT_CONFIG_ERROR_EXIT_STATUS if transient else CONFIG_ERROR_EXIT_STATUS
 
 
 PER_ACCOUNT_TOML_NAME = "runner-account.toml"
@@ -238,20 +260,26 @@ def load_settings(per_queue_toml: Path | None = None) -> Settings:
     Raises
     ------
     ConfigError
-        If the per-queue TOML doesn't exist, fails to parse, sets a retired
-        key (``[throttle.*]`` or one in ``_RETIRED_KEYS``), or the merged
-        settings fail schema validation.
+        For every way the per-queue TOML can fail, so a caller handles one
+        exception type. ``transient`` when it does not exist or cannot be
+        read; not ``transient`` when it is a directory, is not UTF-8 TOML,
+        sets a retired key (``[throttle.*]`` or one in ``_RETIRED_KEYS``),
+        or the merged settings fail schema validation.
     """
     merged = load_defaults()
 
     if per_queue_toml is not None:
-        if not per_queue_toml.exists():
-            raise ConfigError(f"Settings file not found: {per_queue_toml}")
         try:
             with per_queue_toml.open("rb") as fh:
                 override = tomllib.load(fh)
-        except tomllib.TOMLDecodeError as exc:
+        except FileNotFoundError as exc:
+            raise ConfigError(f"Settings file not found: {per_queue_toml}", transient=True) from exc
+        except IsADirectoryError as exc:
+            raise ConfigError(f"Settings file is a directory: {per_queue_toml}") from exc
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
+        except OSError as exc:
+            raise ConfigError(f"Cannot read {per_queue_toml}: {exc}", transient=True) from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
         _reject_retired_keys(override, str(per_queue_toml))
         _rename_retired_effort_levels(override, str(per_queue_toml))
@@ -295,20 +323,23 @@ def per_account_toml_shown(config_dir: str) -> str | None:
 def load_account_policy(config_dir: str) -> AccountPolicy:
     """Read ``<config_dir>/runner-account.toml`` and return the policy.
 
-    An absent file → all defaults: ``max_concurrency=1`` and no
-    ``[dispatch_pct.*]`` overrides, so :func:`throttle.policy.resolve`
-    uses the queue's values. A missing ``config_dir``, or one that is not
-    a directory, counts as an absent file. Empty config_dir → defaults
-    (used for the synthesised legacy ``"default"`` account before the
-    operator declares an explicit config_dir).
+    A ``config_dir`` that exists with no such file → all defaults:
+    ``max_concurrency=1`` and no ``[dispatch_pct.*]`` overrides, so
+    :func:`throttle.policy.resolve` uses the queue's values. Empty
+    config_dir → defaults (used for the synthesised legacy ``"default"``
+    account before the operator declares an explicit config_dir).
 
-    Raises :class:`ConfigError` naming the file when it is there but does
-    not load: it cannot be read, is a symlink to nothing, is empty (zero
-    bytes), is not UTF-8 TOML, sets the retired ``[throttle.*]`` table or
-    fails validation. An empty file or a dangling symlink is usually a
-    file caught mid-save, so it is not read as "use the defaults".
-    :func:`resolve_accounts` turns the error into a :class:`BrokenAccount`
-    instead of letting it propagate.
+    Raises :class:`ConfigError` otherwise, naming the file, or the
+    ``config_dir`` when the problem is there. ``transient`` (it may clear
+    up by itself): the ``config_dir`` does not exist (a mount not up yet),
+    the file cannot be read (denied), or it is a symlink to a file that
+    does not exist yet. Not ``transient`` (its content is wrong): the
+    ``config_dir`` names no user's home or is not a directory, the file
+    is a directory, is empty (zero bytes, usually a save cut short, so not
+    read as "use the defaults"), is not UTF-8 TOML, sets the retired
+    ``[throttle.*]`` table or fails validation. :func:`resolve_accounts`
+    turns the error into a :class:`BrokenAccount` instead of letting it
+    propagate.
     """
     path = per_account_toml_path(config_dir)
     if path is None:
@@ -316,14 +347,23 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
     try:
         with path.open("rb") as fh:
             data = fh.read()
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         if _is_symlink(path):
             raise ConfigError(
-                f"{path} is a symlink to {os.readlink(path)}, which does not exist"
+                f"{path} is a symlink to {os.readlink(path)}, which does not exist",
+                transient=True,
             ) from None
+        # exists, not lexists: a config_dir symlinked to a mount that is not
+        # up yet does not exist either.
+        if not os.path.exists(path.parent):
+            raise ConfigError(f"config_dir {path.parent} does not exist", transient=True) from None
         return AccountPolicy()
-    except OSError as exc:
+    except NotADirectoryError as exc:
+        raise ConfigError(f"config_dir {path.parent} is not a directory") from exc
+    except IsADirectoryError as exc:
         raise ConfigError(f"Cannot read {path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {path}: {exc}", transient=True) from exc
     if not data:
         raise ConfigError(
             f"{path} is empty; delete it for the defaults, or write the settings it should hold"
@@ -358,9 +398,13 @@ class BrokenAccount:
 
     name: str
     path: str
-    """The ``runner-account.toml`` that failed."""
+    """The ``runner-account.toml`` that failed, as written when no path
+    could be built from its ``config_dir``."""
     error: str
-    """The :class:`ConfigError` message, which names the file."""
+    """The :class:`ConfigError` message: it names the file, or the
+    ``config_dir`` when the problem is there."""
+    transient: bool = False
+    """:attr:`ConfigError.transient`: whether it may clear up by itself."""
 
 
 @dataclass(frozen=True)
@@ -371,9 +415,9 @@ class AccountResolution:
     """
 
     accounts: tuple[ResolvedAccount, ...]
-    """The accounts whose policy loaded (or whose file is missing)."""
+    """The accounts whose policy loaded (or whose config_dir has no such file)."""
     broken: tuple[BrokenAccount, ...]
-    """The accounts whose file exists but does not load."""
+    """The accounts whose file or config_dir does not load."""
 
     @property
     def policies(self) -> dict[str, AccountPolicy]:
@@ -384,15 +428,20 @@ class AccountResolution:
     def broken_names(self) -> frozenset[str]:
         return frozenset(b.name for b in self.broken)
 
+    @property
+    def only_transient(self) -> bool:
+        """Whether every broken account may clear up by itself (and there is one)."""
+        return bool(self.broken) and all(b.transient for b in self.broken)
+
 
 def resolve_accounts(settings: Settings) -> AccountResolution:
     """Compose each account's queue-side declaration with its per-account policy.
 
     Walks ``settings.accounts`` in declaration order; for each entry,
     reads ``<config_dir>/runner-account.toml`` via
-    :func:`load_account_policy`. An account whose file loads, or is
-    missing (the defaults apply), becomes a :class:`ResolvedAccount`; one
-    whose file exists but does not load becomes a :class:`BrokenAccount`.
+    :func:`load_account_policy`. An account whose file loads, or whose
+    ``config_dir`` has no such file (the defaults apply), becomes a
+    :class:`ResolvedAccount`; any other becomes a :class:`BrokenAccount`.
     Never raises for a per-account file, so one broken file cannot stop
     the supervisor, a dispatch or a CLI listing: each caller decides what a
     broken account means for it.
@@ -408,6 +457,7 @@ def resolve_accounts(settings: Settings) -> AccountResolution:
                     name=acct.name,
                     path=per_account_toml_shown(acct.config_dir) or "",
                     error=str(exc),
+                    transient=exc.transient,
                 )
             )
             continue

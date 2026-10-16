@@ -1568,7 +1568,8 @@ def _apply_sighup_reload(
 ) -> tuple[Settings, int]:
     """Apply a SIGHUP-triggered reload; return ``(new_settings, new_pending)``.
 
-    On any failure (TOML parse error, schema violation, OS error) we log
+    On any failure (TOML parse error, a file that is not UTF-8 or cannot
+    be read, schema violation; all a :class:`ConfigError`) we log
     an ERROR and return ``(current, prior_pending)`` — the old config
     stays active and the operator sees the failure in the journal. The
     edit the operator made is not in force, so it is an error, not a
@@ -1581,14 +1582,9 @@ def _apply_sighup_reload(
     try:
         new_settings = load_settings(config_path)
     except ConfigError as exc:
+        # load_settings raises ConfigError for an unreadable or non-UTF-8
+        # file too, so nothing here can end the tick loop.
         logger.error("SIGHUP received: reload failed (%s); keeping old config", exc)
-        return current, prior_pending
-    except OSError as exc:
-        logger.error(
-            "SIGHUP received: cannot read %s (%s); keeping old config",
-            config_path,
-            exc,
-        )
         return current, prior_pending
 
     changes = _diff_settings(current, new_settings)

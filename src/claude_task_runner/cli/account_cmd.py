@@ -33,6 +33,7 @@ from rich.markup import escape
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    load_settings_or_exit,
     queue_ceiling_json,
     queue_ceiling_text,
     require_queue_option,
@@ -40,7 +41,6 @@ from claude_task_runner.cli._helpers import (
 )
 from claude_task_runner.config.loader import (
     BrokenAccount,
-    load_settings,
     per_account_toml_shown,
     resolve_accounts,
 )
@@ -184,7 +184,7 @@ def list_accounts(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     resolution = resolve_accounts(settings)
     snapshot = _snapshot(settings, qd)
     try:
@@ -325,7 +325,7 @@ def pause_account(
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     changed, message = _update_paused(qd, settings, name, paused=True)
     if json:
         print(_json.dumps({"changed": changed, "message": message}))
@@ -348,7 +348,7 @@ def resume_account(
     """Reverse ``account pause <name>``; dispatch includes it again."""
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
+    settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console, json=json)
     changed, message = _update_paused(qd, settings, name, paused=False)
     if json:
         print(_json.dumps({"changed": changed, "message": message}))

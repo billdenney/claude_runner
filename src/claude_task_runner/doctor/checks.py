@@ -26,7 +26,7 @@ from claude_task_runner.config.loader import (
     per_account_toml_path,
     resolve_accounts,
 )
-from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
+from claude_task_runner.config.paths import expand_config_dir
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.cron import registry as registry_mod
 from claude_task_runner.cron import systemd_unit as systemd_mod
@@ -213,11 +213,8 @@ def check_accounts(settings: Settings) -> CheckResult:
         if not acct.config_dir:
             oks.append(f"{acct.name} (default ~/.claude)")
             continue
-        try:
-            path = expand_config_dir(acct.config_dir)
-        except ConfigDirError as exc:
-            fails.append(f"{acct.name}: {exc}")
-            continue
+        # load_settings refused a config_dir that cannot be expanded.
+        path = expand_config_dir(acct.config_dir)
         if not path.exists():
             fails.append(
                 f"{acct.name}: CLAUDE_CONFIG_DIR does not exist: {path}\n"

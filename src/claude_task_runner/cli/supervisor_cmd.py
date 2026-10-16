@@ -25,6 +25,7 @@ from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
     broken_accounts_message,
+    load_settings_or_exit,
     queue_ceiling_json,
     queue_ceiling_text,
     require_queue_option,
@@ -32,11 +33,12 @@ from claude_task_runner.cli._helpers import (
 )
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import (
-    CONFIG_ERROR_EXIT_STATUS,
     ConfigError,
+    config_error_exit_status,
     load_settings,
     resolve_accounts,
 )
+from claude_task_runner.config.paths import ConfigDirError
 from claude_task_runner.observability import configure_logging
 from claude_task_runner.queue.store import (
     list_pending_tasks,
@@ -155,7 +157,14 @@ def _build_per_account_source(
     # don't need it (keeps the CLI startup graph slim).
     from claude_task_runner.usage.oauth_token_file import oauth_token_path
 
-    long_lived = oauth_token_path(config_dir).exists()
+    try:
+        long_lived = oauth_token_path(config_dir).exists()
+    except (ConfigDirError, OSError) as exc:
+        # The user behind a ~user config_dir was removed after the settings
+        # loaded, or the file cannot be checked: build the composite source,
+        # whose captures then fail for this account alone, loudly.
+        logger.warning("account config_dir %s: %s", config_dir, exc)
+        long_lived = False
 
     if mode == "tty":
         # Long-lived bearer + tty-only source: still build the TTY
@@ -268,17 +277,17 @@ def start(
     Refuses to start, before it touches the queue, when its
     configuration does not load: ``claude_runner.toml``, or any
     account's ``runner-account.toml``. It prints every such error and
-    exits 78 (``EX_CONFIG``), which the systemd unit does not restart
-    on. Once it runs, an account file that breaks disables only that
-    account (ADR-0035).
+    exits 78 (``EX_CONFIG``) when the content is wrong, which the systemd
+    unit does not restart on, or 1 when every problem is a file or
+    directory that could not be read and may come back (a mount not up
+    yet), which systemd retries. Once it runs, an account file that
+    breaks disables only that account (ADR-0035).
     """
     console = Console()
     queue_path = require_queue_option(queue_dir, console)
-    try:
-        settings = load_settings(resolve_per_queue_config(config, queue_path))
-    except ConfigError as exc:
-        _say(console, f"supervisor not started: {exc}", "bold red")
-        raise typer.Exit(code=CONFIG_ERROR_EXIT_STATUS) from exc
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path), console, lead="supervisor not started"
+    )
     # Re-apply logging settings now that the queue's [logging] block has
     # been read. The CLI entry point's early configure runs before Typer
     # parses arguments (so it can use env-var overrides) with safe
@@ -287,10 +296,10 @@ def start(
     # defaults.
     configure_logging(level=settings.logging.level, fmt=settings.logging.format)
 
-    broken = resolve_accounts(settings).broken
-    if broken:
-        _say(console, broken_accounts_message(broken), "bold red")
-        raise typer.Exit(code=CONFIG_ERROR_EXIT_STATUS)
+    resolution = resolve_accounts(settings)
+    if resolution.broken:
+        _say(console, broken_accounts_message(resolution.broken), "bold red")
+        raise typer.Exit(code=config_error_exit_status(transient=resolution.only_transient))
 
     queue_runtime_dir(queue_path)  # ensure subdirs exist
 
@@ -559,7 +568,8 @@ def drain(
     A drained supervisor exits 0, and under systemd it stays down. The
     unit is ``Restart=on-failure`` with ``RestartPreventExitStatus=0 78``,
     so systemd restarts the supervisor only when it fails, never after
-    a clean exit (or a start refused for a configuration error, 78). To restart under systemd without losing work, run
+    a clean exit (or a start refused for a configuration error, 78). To
+    restart under systemd without losing work, run
     ``systemctl --user restart claude-task-runner`` instead of
     ``drain``. It runs the unit's ``ExecStop`` and then starts a new
     supervisor. ``ExecStop`` is ``supervisor drain --no-wait`` only
@@ -621,7 +631,9 @@ def status(
     """Show the supervisor's current state and recent activity."""
     console = Console()
     queue_path = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, queue_path))
+    settings = load_settings_or_exit(
+        resolve_per_queue_config(config, queue_path), console, json=json
+    )
     state_path = persist_mod.supervisor_state_path(queue_path, settings.supervisor.state_file)
     pid_path = queue_path / ".claude_task_runner" / "supervisor.pid"
 

@@ -562,11 +562,23 @@ class ClaudeSettings(_StrictModel):
     single account named ``"default"`` from this field for backwards
     compatibility. When both are present, ``[[accounts]]`` wins and this
     field is ignored. Empty string means "use claude's default"
-    (``~/.claude``).
+    (``~/.claude``). A ``config_dir`` whose leading ``~user`` names no
+    user fails validation whenever it is set, since the usage source of a
+    queue with at most one account reads it.
     """
 
     executable: str = "claude"
     config_dir: str = ""
+
+    @field_validator("config_dir")
+    @classmethod
+    def _check_config_dir(cls, value: str) -> str:
+        if value:
+            try:
+                expand_config_dir(value)
+            except ConfigDirError as exc:
+                raise ValueError(f"[claude].{exc}") from exc
+        return value
 
 
 class AccountSettings(_StrictModel):

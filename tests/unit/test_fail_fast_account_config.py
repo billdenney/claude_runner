@@ -13,7 +13,11 @@ that account at every place that expands its ``config_dir``.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import pwd
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -234,8 +238,11 @@ class TestUnknownHome:
         ]
         assert len(errors) == 1
         assert errors[0].startswith(
-            f"SIGHUP received: reload failed ({_unknown_user_error('default')}"
+            "SIGHUP received: reload failed (Settings validation failed: 2 validation errors "
+            "for Settings\nclaude.config_dir\n  Value error, [claude].config_dir "
+            f"'{GONE}' cannot be expanded: Could not determine home directory. "
         )
+        assert f"account 'default': config_dir '{GONE}' cannot be expanded" in errors[0]
         # The old config stays, so the ceiling is not announced again.
         assert [
             r.getMessage()
@@ -273,28 +280,6 @@ class TestUserRemovedWhileRunning:
             f"config_dir '{GONE}' cannot be expanded: Could not determine home directory."
         )
 
-    def test_claude_init_skips_it(self, caplog: pytest.LogCaptureFixture) -> None:
-        from claude_task_runner.claude_init import ensure_initialized
-
-        with caplog.at_level(logging.WARNING, logger="claude_task_runner.claude_init"):
-            assert ensure_initialized(GONE, "/tmp") is False
-        assert [r.getMessage() for r in caplog.records] == [
-            f"ensure_initialized: config_dir '{GONE}' cannot be expanded: "
-            "Could not determine home directory."
-        ]
-
-    def test_the_doctor_fails_the_account(self, tmp_path: Path) -> None:
-        from claude_task_runner.config.schema import AccountSettings
-        from claude_task_runner.doctor.checks import CheckStatus, check_accounts
-
-        gone = AccountSettings.model_construct(name="personal", config_dir=GONE, linux_user=None)
-        settings = load_settings(None).model_copy(update={"accounts": [gone]})
-        result = check_accounts(settings)
-        assert result.status is CheckStatus.FAIL
-        assert (
-            f"personal: config_dir '{GONE}' cannot be expanded: Could not determine home directory."
-        ) in (result.remediation or "")
-
 
 # ---------------------------------------------------------------------------
 # The cron watchdog holds back a restart that would be refused
@@ -324,11 +309,12 @@ class TestWatchdog:
         result = CliRunner().invoke(app, ["watchdog", "tick"])
         assert result.exit_code == 1
         assert spawned == []
-        line = result.stdout.splitlines()[-1]
+        # The held-back line replaces the verdict line, which would say "restart".
+        (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
         assert line.split(" ", 1)[1] == (
-            f"watchdog: ERROR queue={queue} the runner-account.toml of 1 account(s) does "
-            f"not load, so its supervisor was not restarted: work: Invalid TOML in {path}: "
-            f"{PARSE_ERROR}"
+            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml "
+            "of 1 account(s) does not load, so its supervisor was not restarted: work: "
+            f"Invalid TOML in {path}: {PARSE_ERROR}"
         )
         # No restart was counted, so the next tick after the fix restarts at once.
         state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
@@ -347,3 +333,328 @@ class TestWatchdog:
         assert result.exit_code == 0, result.output
         assert "verdict=skip" in result.stdout
         assert "ERROR" not in result.stdout
+
+    def test_a_dry_run_reports_it_too(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        accounts = _accounts(isolated_home)
+        path = Path(accounts["work"]) / PER_ACCOUNT_TOML_NAME
+        path.write_text(BAD_TOML, encoding="utf-8")
+        queue = _queue(isolated_home, accounts)
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        result = CliRunner().invoke(app, ["watchdog", "tick", "--dry-run"])
+        assert result.exit_code == 1
+        assert "verdict=restart" not in result.stdout
+        assert (
+            f"watchdog: ERROR queue={queue} alive=False pid=None the runner-account.toml"
+        ) in result.stdout
+        assert not backoff_mod.watchdog_state_path().exists()
+
+    def test_a_cooldown_is_left_alone(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The files are read only when a restart is due; a tick in cooldown
+        logs its verdict as before."""
+        accounts = _accounts(isolated_home)
+        (Path(accounts["work"]) / PER_ACCOUNT_TOML_NAME).write_text(BAD_TOML, encoding="utf-8")
+        queue = _queue(isolated_home, accounts)
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        backoff_mod.write_state_atomic(
+            backoff_mod.WatchdogState(
+                queue=queue.resolve(), recent_restarts=[datetime.now(UTC) - timedelta(seconds=5)]
+            ),
+            backoff_mod.watchdog_state_path(),
+        )
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        result = CliRunner().invoke(app, ["watchdog", "tick"])
+        assert result.exit_code == 0, result.output
+        assert "verdict=cooldown" in result.stdout
+        assert "runner-account.toml" not in result.stdout
+
+    def test_a_file_that_may_come_back_is_a_warning(
+        self, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        accounts = _accounts(isolated_home)
+        unmounted = isolated_home / "unmounted"
+        accounts["work"] = str(unmounted)
+        queue = _queue(isolated_home, accounts)
+        (queue / ".claude_task_runner").mkdir()
+        register_queue(queue)
+        monkeypatch.setattr(watchdog_cmd, "_spawn_supervisor", _no_spawn)
+        result = CliRunner().invoke(app, ["watchdog", "tick"])
+        assert result.exit_code == 0, result.output
+        (line,) = [ln for ln in result.stdout.splitlines() if str(queue) in ln]
+        assert line.split(" ", 1)[1] == (
+            f"watchdog: WARNING queue={queue} alive=False pid=None the runner-account.toml "
+            "of 1 account(s) cannot be read yet, so its supervisor was not restarted; the "
+            f"next tick reads them again: work: config_dir {unmounted} does not exist"
+        )
+        state = backoff_mod.load_state(backoff_mod.watchdog_state_path())
+        assert state.recent_restarts == []
+
+
+def _no_spawn(_queue_dir: Path, config: Path | None = None) -> int:
+    raise AssertionError("a supervisor was spawned")
+
+
+# ---------------------------------------------------------------------------
+# Exit 78 when the content is wrong, 1 when a file may come back
+# ---------------------------------------------------------------------------
+
+NON_UTF8 = b"\xff\xfe"
+UTF8_ERROR = "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+
+
+class TestLoadSettingsErrors:
+    """``load_settings`` raises ConfigError for every way the file can fail."""
+
+    def _error(self, path: Path) -> ConfigError:
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(path)
+        return excinfo.value
+
+    def test_not_utf8_is_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.write_bytes(NON_UTF8)
+        error = self._error(path)
+        assert str(error) == f"Invalid TOML in {path}: {UTF8_ERROR}"
+        assert error.transient is False
+
+    def test_a_directory_is_content(self, tmp_path: Path) -> None:
+        error = self._error(tmp_path)
+        assert str(error) == f"Settings file is a directory: {tmp_path}"
+        assert error.transient is False
+
+    def test_a_missing_file_may_come_back(self, tmp_path: Path) -> None:
+        error = self._error(tmp_path / "absent.toml")
+        assert str(error) == f"Settings file not found: {tmp_path / 'absent.toml'}"
+        assert error.transient is True
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_a_denied_file_may_come_back(self, tmp_path: Path) -> None:
+        path = tmp_path / "claude_runner.toml"
+        path.write_text("", encoding="utf-8")
+        path.chmod(0)
+        try:
+            error = self._error(path)
+        finally:
+            path.chmod(0o644)
+        assert str(error) == f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
+        assert error.transient is True
+
+
+def _start_with(argv: list[str]) -> object:
+    with (
+        patch("claude_task_runner.cli.supervisor_cmd.configure_logging"),
+        patch(
+            "claude_task_runner.cli.supervisor_cmd.start_daemon",
+            side_effect=AssertionError("start_daemon reached"),
+        ),
+    ):
+        return CliRunner().invoke(app, ["supervisor", "start", *argv])
+
+
+class TestStartExitStatus:
+    def test_start_config_not_utf8_exits_78(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        config = tmp_path / "broken.toml"
+        config.write_bytes(NON_UTF8)
+        result = _start_with(["--queue", str(queue), "--config", str(config)])
+        assert result.exit_code == 78
+        assert result.stdout == (
+            f"supervisor not started: Invalid TOML in {config}: {UTF8_ERROR}\n"
+        )
+
+    def test_start_config_that_is_a_directory_exits_78(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        result = _start_with(["--queue", str(queue), "--config", str(tmp_path)])
+        assert result.exit_code == 78
+        assert result.stdout == (
+            f"supervisor not started: Settings file is a directory: {tmp_path}\n"
+        )
+
+    def test_start_config_missing_exits_1(self, tmp_path: Path) -> None:
+        queue = tmp_path / "q"
+        queue.mkdir()
+        missing = tmp_path / "not-mounted-yet.toml"
+        result = _start_with(["--queue", str(queue), "--config", str(missing)])
+        assert result.exit_code == 1
+        assert result.stdout == f"supervisor not started: Settings file not found: {missing}\n"
+        assert not (queue / ".claude_task_runner").exists()
+
+    def test_an_account_dir_that_may_come_back_exits_1(self, tmp_path: Path) -> None:
+        accounts = _accounts(tmp_path)
+        unmounted = tmp_path / "unmounted"
+        accounts["work"] = str(unmounted)
+        queue = _queue(tmp_path, accounts)
+        result = _start(queue)
+        assert result.exit_code == 1
+        assert result.stdout == (
+            "supervisor not started: the runner-account.toml of 1 account does not load:\n"
+            f"  work: config_dir {unmounted} does not exist\n"
+            "Each may clear up by itself (a config_dir on a mount that is not up yet, say), "
+            "so this start exits 1 and systemd tries again; fix it if it does not.\n"
+            f"{REFUSAL_TAIL}\n"
+        )
+        assert not (queue / ".claude_task_runner").exists()
+
+    def test_any_content_error_among_them_exits_78(self, tmp_path: Path) -> None:
+        accounts = _accounts(tmp_path)
+        (Path(accounts["personal"]) / PER_ACCOUNT_TOML_NAME).write_text(BAD_TOML, encoding="utf-8")
+        accounts["work"] = str(tmp_path / "unmounted")
+        result = _start(_queue(tmp_path, accounts))
+        assert result.exit_code == 78
+        assert "Each may clear up by itself" not in result.stdout
+
+    def test_a_claude_config_dir_with_an_unknown_user_refuses_start(self, tmp_path: Path) -> None:
+        """``[claude].config_dir`` is validated even beside explicit
+        ``[[accounts]]``: the usage source of a one-account queue reads it."""
+        queue = _queue(tmp_path, _accounts(tmp_path))
+        toml = queue / "claude_runner.toml"
+        toml.write_text(
+            f'[claude]\nconfig_dir = "{GONE}"\n\n' + toml.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        result = _start(queue)
+        assert result.exit_code == 78
+        assert result.stdout.startswith(
+            "supervisor not started: Settings validation failed: 1 validation error for "
+            "Settings\nclaude.config_dir\n  Value error, [claude].config_dir "
+            f"'{GONE}' cannot be expanded: Could not determine home directory. "
+        )
+
+
+@pytest.mark.allow_self_signal
+@pytest.mark.usefixtures("private_global_lock")
+def test_a_sighup_with_a_non_utf8_file_keeps_the_supervisor_running(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    qd, config = single_account_queue(tmp_path, "")
+
+    def corrupt() -> None:
+        config.write_bytes(NON_UTF8)
+
+    with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):
+        # Returns only after all its ticks: the reload did not end the loop.
+        run_daemon(
+            qd,
+            config,
+            pending_count_fn=sighup_in_second_tick(corrupt),
+            install_signal_handlers=True,
+            max_ticks=5,
+        )
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == DAEMON_LOGGER and r.levelno == logging.ERROR
+    ]
+    assert errors == [
+        f"SIGHUP received: reload failed (Invalid TOML in {config}: {UTF8_ERROR}); "
+        "keeping old config"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The validator accepts every config_dir that can be expanded
+# ---------------------------------------------------------------------------
+
+
+def _current_user() -> str:
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+@pytest.mark.parametrize(
+    "config_dir",
+    ["", "~", "~/.claude", "~{user}/.claude", "rel/dir", "$HOME/.claude", "/srv/claude"],
+)
+def test_an_expandable_config_dir_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_dir: str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    value = config_dir.format(user=_current_user())
+    queue = _queue(tmp_path, {"personal": value})
+    settings = load_settings(queue / "claude_runner.toml")
+    assert settings.accounts[0].config_dir == value
+    if value:
+        expected = {
+            "~": tmp_path,
+            "~/.claude": tmp_path / ".claude",
+            f"~{_current_user()}/.claude": Path(pwd.getpwnam(_current_user()).pw_dir) / ".claude",
+            "rel/dir": Path("rel/dir"),
+            # A variable is not expanded: config_dir is a path, not a shell word.
+            "$HOME/.claude": Path("$HOME/.claude"),
+            "/srv/claude": Path("/srv/claude"),
+        }[value]
+        assert expand_config_dir(value) == expected
+
+
+# ---------------------------------------------------------------------------
+# The other commands print a configuration error without a traceback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["account", "list"],
+        ["account", "list", "--json"],
+        ["supervisor", "status"],
+        ["supervisor", "status", "--json"],
+        ["doctor"],
+        ["doctor", "--json"],
+    ],
+    ids=lambda a: "-".join(a),
+)
+def test_cli_commands_report_a_bad_queue_toml_cleanly(tmp_path: Path, argv: list[str]) -> None:
+    queue = _queue(tmp_path, {"personal": GONE})
+    result = CliRunner().invoke(app, [*argv, "--queue", str(queue)])
+    assert result.exit_code == 78
+    assert isinstance(result.exception, SystemExit)
+    expected_start = f"configuration error: {UNKNOWN_USER_ERROR}"
+    if "--json" in argv:
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error"].startswith(expected_start)
+    else:
+        assert result.stdout.startswith(expected_start)
+        assert "Traceback" not in result.output
+
+
+def test_cli_commands_exit_1_for_a_config_that_may_come_back(tmp_path: Path) -> None:
+    queue = tmp_path / "q"
+    queue.mkdir()
+    missing = tmp_path / "not-mounted-yet.toml"
+    result = CliRunner().invoke(
+        app, ["account", "list", "--queue", str(queue), "--config", str(missing)]
+    )
+    assert result.exit_code == 1
+    assert result.stdout == f"configuration error: Settings file not found: {missing}\n"
+
+
+# ---------------------------------------------------------------------------
+# install refuses to install a supervisor that would not start
+# ---------------------------------------------------------------------------
+
+
+def test_install_refuses_a_broken_account_file(tmp_path: Path) -> None:
+    accounts = _accounts(tmp_path)
+    path = Path(accounts["personal"]) / PER_ACCOUNT_TOML_NAME
+    path.write_text(BAD_TOML, encoding="utf-8")
+    queue = _queue(tmp_path, accounts)
+    with patch(
+        "claude_task_runner.cli.install_cmd._detect_init_system",
+        side_effect=AssertionError("install went on"),
+    ):
+        result = CliRunner().invoke(app, ["install", "--yes", "--queue", str(queue)])
+    assert result.exit_code == 78
+    assert result.stdout == (
+        "not installed: the runner-account.toml of 1 account does not load:\n"
+        f"  personal: Invalid TOML in {path}: {PARSE_ERROR}\n"
+        "Fix each file, or delete it for the defaults, then run install again. "
+        "Once the supervisor runs, a file that breaks only stops new tasks on its account.\n"
+    )

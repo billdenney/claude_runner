@@ -297,9 +297,10 @@ def build_unit_text(
     * ``RestartPreventExitStatus`` is ``0`` and
       :data:`config.loader.CONFIG_ERROR_EXIT_STATUS` (78): a clean exit,
       and a ``supervisor start`` that refused to start because its
-      configuration does not load, are not restarted. The unit stays
+      configuration's content is wrong, are not restarted. The unit stays
       ``failed``, with the reason in the journal, until it is started
-      again by hand.
+      again by hand. A start refused because a file could not be read yet
+      exits 1 and is retried like a crash.
 
     With the package defaults (30 s, 5 and 600 s) the unit is the one
     this function wrote before it read ``[watchdog]``. Seconds are

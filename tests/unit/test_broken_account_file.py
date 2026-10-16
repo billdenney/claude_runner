@@ -196,6 +196,8 @@ class TestResolveAccounts:
         assert resolution.broken[0].error == (
             f"{path} is a symlink to {target}, which does not exist"
         )
+        # The target may appear yet (a file saved elsewhere, a mount).
+        assert resolution.broken[0].transient is True
 
     def test_a_home_removed_while_running_is_broken(
         self, tmp_path: Path, two_accounts: dict[str, Path]
@@ -232,17 +234,49 @@ class TestResolveAccounts:
         assert resolution.broken[0].error == (
             f"Cannot read {path}: [Errno 21] Is a directory: '{path}'"
         )
+        # A directory where the file belongs does not go away by itself.
+        assert resolution.broken[0].transient is False
 
-    @pytest.mark.parametrize("layout", ["no-file", "no-dir", "dir-is-a-file"])
-    def test_a_missing_file_is_not_broken(self, tmp_path: Path, layout: str) -> None:
+    def test_a_config_dir_without_the_file_is_the_defaults(self, tmp_path: Path) -> None:
         config_dir = tmp_path / "acct"
-        if layout == "no-file":
-            config_dir.mkdir()
-        elif layout == "dir-is-a-file":
-            config_dir.write_text("", encoding="utf-8")
+        config_dir.mkdir()
         resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
         assert resolution.broken == ()
         assert resolution.accounts[0].policy.concurrency.max_concurrency == 1
+
+    @pytest.mark.parametrize("linked", [False, True], ids=["absent", "symlink-to-nothing"])
+    def test_a_config_dir_that_does_not_exist_is_broken_but_may_come_back(
+        self, tmp_path: Path, linked: bool
+    ) -> None:
+        """A config_dir on a mount that is not up yet: transient, so a start
+        exits 1 and is retried."""
+        config_dir = tmp_path / "acct"
+        if linked:
+            config_dir.symlink_to(tmp_path / "unmounted")
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
+        assert resolution.broken == (
+            BrokenAccount(
+                name="solo",
+                path=str(config_dir / PER_ACCOUNT_TOML_NAME),
+                error=f"config_dir {config_dir} does not exist",
+                transient=True,
+            ),
+        )
+        assert resolution.only_transient is True
+
+    def test_a_config_dir_that_is_a_file_is_broken(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / "acct"
+        config_dir.write_text("", encoding="utf-8")
+        resolution = resolve_accounts(queue_toml(tmp_path / "q.toml", {"solo": config_dir}))
+        assert resolution.broken == (
+            BrokenAccount(
+                name="solo",
+                path=str(config_dir / PER_ACCOUNT_TOML_NAME),
+                error=f"config_dir {config_dir} is not a directory",
+                transient=False,
+            ),
+        )
+        assert resolution.only_transient is False
 
 
 # ---------------------------------------------------------------------------
@@ -854,9 +888,9 @@ class TestDoctor:
         path.chmod(0)
         try:
             settings = queue_toml(tmp_path / "q.toml", two_accounts)
-            assert resolve_accounts(settings).broken[0].error == (
-                f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
-            )
+            broken = resolve_accounts(settings).broken[0]
+            assert broken.error == f"Cannot read {path}: [Errno 13] Permission denied: '{path}'"
+            assert broken.transient is True
             result = check_dispatch_pct_legacy(settings, queue_dir)
         finally:
             path.chmod(0o644)
