@@ -136,11 +136,16 @@ def runtime_path(queue_dir: Path) -> Path:
     NotADirectoryError
         ``queue_dir`` is not a directory.
     """
+    _require_existing_queue(queue_dir)
+    return queue_dir / ".claude_task_runner"
+
+
+def _require_existing_queue(queue_dir: Path) -> None:
+    """Raise as :func:`runtime_path` documents unless ``queue_dir`` is a directory."""
     if not queue_dir.is_dir():
         if queue_dir.exists():
             raise NotADirectoryError(f"not a directory: {queue_dir}")
         raise FileNotFoundError(f"no such directory: {queue_dir}")
-    return queue_dir / ".claude_task_runner"
 
 
 def state_file_path(queue_dir: Path, task_id: str) -> Path:
@@ -421,6 +426,14 @@ def list_pending_tasks(queue_dir: Path) -> Iterator[Path]:
     """
     todo = todo_dir(queue_dir)
     yield from sorted(todo.glob("*.yaml"))
+
+
+def iter_pending_tasks(queue_dir: Path) -> Iterator[Path]:
+    """Like :func:`list_pending_tasks`, without creating ``todo/``: a queue
+    that has none has no tasks. A queue directory that is not there raises
+    as :func:`runtime_path` does."""
+    _require_existing_queue(queue_dir)
+    yield from sorted((queue_dir / "todo").glob("*.yaml"))
 
 
 def list_state_files(queue_dir: Path) -> Iterator[Path]:

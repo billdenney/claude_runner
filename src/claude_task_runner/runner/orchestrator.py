@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
     load_state,
@@ -1144,7 +1145,7 @@ def _eligible_candidates(
     # ``in_flight_slots`` is read for its task ids only (a slot map's keys).
     # ``read_only`` turns off the gates' bookkeeping (see
     # :func:`_skip_category`): the same tasks are returned and counted, and
-    # no state file is written.
+    # no state file is written, nor ``todo/`` created.
     tally: Counter[str] = skips if skips is not None else Counter()
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots)
@@ -1162,7 +1163,8 @@ def _eligible_candidates(
     if blocked_ids:
         logger.debug("dispatch block-list active: %d task(s) parked", len(blocked_ids))
 
-    for path in list_pending_tasks(queue_dir):
+    pending = iter_pending_tasks if read_only else list_pending_tasks
+    for path in pending(queue_dir):
         try:
             task = load_task(path)
         except Exception as exc:

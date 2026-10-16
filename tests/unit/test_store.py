@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ from claude_task_runner.queue.store import (
     QueueSchemaError,
     _load_yaml,
     _yaml_loader,
+    iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
     list_state_files,
@@ -369,11 +370,15 @@ class TestErrorHandling:
 
 
 class TestListing:
-    def test_list_pending_returns_sorted(self, queue_dir: Path) -> None:
+    @pytest.mark.parametrize("lister", [list_pending_tasks, iter_pending_tasks])
+    def test_list_pending_returns_sorted(
+        self, queue_dir: Path, lister: Callable[[Path], Iterator[Path]]
+    ) -> None:
         td = todo_dir(queue_dir)
         for tid in ("003-c", "001-a", "002-b"):
             (td / f"{tid}.yaml").write_text(f"id: {tid}\ntitle: T\nprompt: P\n")
-        names = [p.stem for p in list_pending_tasks(queue_dir)]
+        (td / "notes.txt").write_text("not a task\n")
+        names = [p.stem for p in lister(queue_dir)]
         assert names == ["001-a", "002-b", "003-c"]
 
     def test_list_states(self, queue_dir: Path) -> None:
@@ -751,6 +756,7 @@ class TestNeverCreatesTheQueue:
         # Equality, so that a new function is looked at: it may need
         # arguments in _QUEUE_DIR_EXTRA_ARGS.
         assert set(_queue_dir_functions()) == {
+            "iter_pending_tasks",
             "iter_state_files",
             "list_pending_tasks",
             "list_state_files",
@@ -788,13 +794,14 @@ class TestNeverCreatesTheQueue:
         assert sorted(p.name for p in base.iterdir()) == before
 
     def test_the_readers_create_nothing_in_a_queue(self, tmp_path: Path) -> None:
-        """A queue with no runtime directory yet has no state files, and
-        reading it that way leaves it so."""
+        """A queue with no runtime directory or ``todo/`` yet has no state
+        files and no tasks, and reading it that way leaves it so."""
         queue = tmp_path / "q"
         queue.mkdir()
         assert runtime_path(queue) == queue / ".claude_task_runner"
         assert state_file_path(queue, "t1") == queue / ".claude_task_runner" / "state" / "t1.yaml"
         assert list(iter_state_files(queue)) == []
+        assert list(iter_pending_tasks(queue)) == []
         assert list(queue.iterdir()) == []
 
     def test_existing_queue_gets_its_subdirectories(self, queue_dir: Path) -> None:

@@ -443,3 +443,15 @@ def test_an_unreadable_in_flight_state_is_held_in_flight(queue: Path) -> None:
     _in_flight(queue, "a")
 
     assert _holds(queue)["held"] == {"in_flight": 1}
+
+
+def test_creates_nothing_in_a_queue_without_todo(tmp_path: Path) -> None:
+    """A queue with no ``todo/`` (nor runtime directory) holds no task, and
+    the command leaves it as it found it."""
+    bare = tmp_path / "bare"
+    bare.mkdir()
+
+    holds = _holds(bare)
+
+    assert (holds["todo_tasks"], holds["eligible"]["count"]) == (0, 0)
+    assert sorted(p.relative_to(bare) for p in bare.rglob("*")) == []
