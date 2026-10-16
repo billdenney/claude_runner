@@ -98,6 +98,17 @@ def sidecar_list_call(queue: Path) -> str:
     return f"sidecar\nlist\n--queue\n{queue}\n--json\n--\n"
 
 
+def account_list_call(queue: Path) -> str:
+    """The call log after one ``account list --queue <queue> --json``."""
+    return f"account\nlist\n--queue\n{queue}\n--json\n--\n"
+
+
+def stub_journalctl(bin_dir: Path, output: str = "") -> None:
+    """Install a ``journalctl`` that prints ``output`` whatever it is asked,
+    so a script's journal search sees no machine's real journal."""
+    _write_exe(bin_dir / "journalctl", f"printf %s {shlex.quote(output)}\n")
+
+
 _LIST = "`claude-task-runner sidecar list --json`"
 _JSON_ERROR = '{"ok": false, "error": "--queue is not an existing directory: /gone"}'
 _TRACEBACK = "Traceback (most recent call last):\nRuntimeError: boom"

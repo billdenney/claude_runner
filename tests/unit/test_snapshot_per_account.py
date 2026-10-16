@@ -13,12 +13,13 @@ or the supervisor.json fields table.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
 
 from claude_task_runner.cli.install_skills_cmd import _packaged_skill_dir
+
+from ._cli_on_path import EMPTY_LISTING, make_bin, run_script, stub_cli, stub_journalctl
 
 
 @pytest.fixture
@@ -46,18 +47,16 @@ def _run_snapshot(script: Path, queue: Path) -> str:
     """Run snapshot.sh against ``queue`` and return its stdout.
 
     stderr is folded in so a failed step shows up in test-failure output
-    rather than being silently swallowed. We don't ``check=True``: the
-    script exits 1 after the report when it cannot list the open sidecars,
-    which depends on the ``claude-task-runner`` on PATH, and this file pins
-    only the per-account table. ``test_snapshot_script.py`` pins the exit
-    codes.
+    rather than being silently swallowed. The ``claude-task-runner`` on PATH
+    is a stub that lists nothing and ``journalctl`` prints nothing, so no
+    installed CLI or journal changes the report; this file pins only the
+    per-account table. ``test_snapshot_script.py`` pins the exit codes and
+    ``test_runner_status_summary.py`` the summary.
     """
-    proc = subprocess.run(
-        ["bash", str(script), "--queue", str(queue)],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    bin_dir = make_bin(queue.parent)
+    stub_cli(bin_dir, stdout=EMPTY_LISTING)
+    stub_journalctl(bin_dir)
+    proc = run_script(script, bin_dir, "--queue", str(queue), cwd=queue.parent)
     return proc.stdout + ("\n[stderr]\n" + proc.stderr if proc.stderr else "")
 
 

@@ -4,12 +4,17 @@
 # Usage:
 #   ./snapshot.sh [--queue <queue_dir>]
 #
-# Output: a markdown block with supervisor liveness, supervisor.json
-# state, state-file count, open-sidecar list, queue counts, and a
-# per-account state table sourced from supervisor.json's v3 `accounts`
-# map (state, 5h/weekly util, paused, in-flight count, reset + wakeup
-# times, last capture). Default queue is $PWD. The queue must be an
-# existing directory with a todo/ subdirectory.
+# Output: a markdown block. It opens with a plain-language summary
+# (report.py summary) of everything below: whether the supervisor is
+# running, what each account is doing, how many tasks may run at once and
+# why, broken account files, task counts, questions waiting, and one plain
+# sentence for each condition that is not normal. The details follow, each
+# with a line saying what it shows: supervisor liveness, the supervisor.json
+# fields, accounts and concurrency (`account list --json`), the per-account
+# usage table from supervisor.json's `accounts` map, queue counts, the
+# supervisor's last "no eligible tasks" log line, and the open sidecars.
+# Default queue is $PWD. The queue must be an existing directory with a
+# todo/ subdirectory.
 #
 # Exit codes:
 #   0  report printed
@@ -53,34 +58,99 @@ if [[ ! -d "$QUEUE/todo" ]]; then
 fi
 
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "## Queue status — $NOW"
-echo ""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
-# ----- Supervisor process liveness -----
+# ----- Gather -----
+#
+# Everything the summary needs is gathered before anything is printed, so the
+# summary can come first. The CLI's JSON is used wherever a command exposes a
+# fact: `account list --json` for each account's state, cap, pause marker and
+# settings-file error, and for the queue's concurrency ceiling;
+# `sidecar list --json` for the open questions.
 PIDFILE="$QUEUE/.claude_task_runner/supervisor.pid"
+PID=""
+PID_STATE="missing"
+PID_ETIME=""
 if [[ -f "$PIDFILE" ]]; then
   PID="$(cat "$PIDFILE")"
   if [[ -n "$PID" ]] && ps -p "$PID" > /dev/null 2>&1; then
-    PSLINE="$(ps -p "$PID" -o pid,etime,time,cmd= --no-headers 2>/dev/null || true)"
-    echo "**Supervisor**: alive PID $PID"
-    echo '```'
-    echo "$PSLINE"
-    echo '```'
+    PID_STATE="alive"
+    PID_ETIME="$(ps -p "$PID" -o etime= 2>/dev/null | tr -d ' ' || true)"
   else
-    echo "**Supervisor**: NOT RUNNING (stale pidfile $PIDFILE → $PID)"
+    PID_STATE="stale"
   fi
+fi
+
+# Run `claude-task-runner <args>` into $TMP/<name>.{out,err,rc}; rc is
+# "missing" when the CLI is not on PATH.
+run_cli() {
+  local name="$1"
+  shift
+  if ! command -v claude-task-runner > /dev/null 2>&1; then
+    echo "missing" > "$TMP/$name.rc"
+    : > "$TMP/$name.out"
+    : > "$TMP/$name.err"
+    return
+  fi
+  local rc=0
+  claude-task-runner "$@" > "$TMP/$name.out" 2> "$TMP/$name.err" || rc=$?
+  echo "$rc" > "$TMP/$name.rc"
+}
+run_cli accounts account list --queue "$QUEUE" --json
+run_cli sidecars sidecar list --queue "$QUEUE" --json
+
+# The live supervisor's newest line about eligible tasks in the journal
+# (systemd); report.py also reads <queue>/.claude_task_runner/supervisor.log
+# (cron watchdog). Filtering on the PID keeps another queue's supervisor, or
+# an earlier run, out of it.
+JOURNAL_LINE=""
+if [[ "$PID_STATE" == "alive" ]] && command -v journalctl > /dev/null 2>&1; then
+  JOURNAL_LINE="$(journalctl --user "_PID=$PID" -r -o cat --no-pager 2> /dev/null \
+    | grep -m1 -E 'no eligible tasks:|eligible tasks available again:' || true)"
+fi
+
+export RS_QUEUE="$QUEUE" RS_NOW="$NOW" RS_PID_STATE="$PID_STATE" RS_PID_ETIME="$PID_ETIME"
+export RS_JOURNAL_LINE="$JOURNAL_LINE"
+export RS_ACCOUNTS_RC="$(cat "$TMP/accounts.rc")" RS_ACCOUNTS_OUT="$TMP/accounts.out"
+export RS_ACCOUNTS_ERR="$TMP/accounts.err"
+export RS_SIDECARS_RC="$(cat "$TMP/sidecars.rc")" RS_SIDECARS_OUT="$TMP/sidecars.out"
+export RS_SIDECARS_ERR="$TMP/sidecars.err"
+
+# ----- Report -----
+echo "## Queue status — $NOW"
+echo ""
+python3 "$SCRIPT_DIR/report.py" summary
+echo ""
+echo "### Details"
+echo ""
+
+# ----- Supervisor process liveness -----
+if [[ "$PID_STATE" == "alive" ]]; then
+  PSLINE="$(ps -p "$PID" -o pid,etime,time,cmd= --no-headers 2>/dev/null || true)"
+  echo "**Supervisor**: alive PID $PID"
+  echo '```'
+  echo "$PSLINE"
+  echo '```'
+elif [[ "$PID_STATE" == "stale" ]]; then
+  echo "**Supervisor**: NOT RUNNING (stale pidfile $PIDFILE → $PID)"
 else
   echo "**Supervisor**: NOT RUNNING (no pidfile at $PIDFILE)"
 fi
+echo ""
+echo "_The supervisor is the background process that starts tasks, watches each account's usage and records progress. Nothing new starts while it is not running._"
 echo ""
 
 # ----- supervisor.json state -----
 SUP_JSON="$QUEUE/.claude_task_runner/supervisor.json"
 if [[ -f "$SUP_JSON" ]]; then
   python3 - "$SUP_JSON" <<'PY'
-import json, sys
+import json, os, sys
+from datetime import datetime, timezone
 with open(sys.argv[1]) as f:
     d = json.load(f)
+saved = datetime.fromtimestamp(os.stat(sys.argv[1]).st_mtime, timezone.utc)
 fields = [
     ("state", d.get("state")),
     ("5h util", f'{d.get("last_5h_util_pct","?")}%'),
@@ -91,8 +161,16 @@ fields = [
     ("5h reset_at", d.get("last_5h_reset_at","?")),
     ("weekly reset_at", d.get("last_weekly_reset_at","?")),
     ("drift", d.get("last_drift_message","") or "-"),
+    ("last saved", saved.strftime("%Y-%m-%dT%H:%M:%SZ")),
 ]
 print("**supervisor.json**")
+print()
+print(
+    "_The supervisor's own record, rewritten every time it checks the queue (each poll "
+    "interval), so `last saved` shows whether it is still working. `state` is its overall "
+    "mode; `5h util` and `weekly util` are how much of the 5-hour and weekly usage allowance "
+    "is used; `in_flight` counts tasks running now; times are UTC._"
+)
 print()
 print("| field | value |")
 print("|---|---|")
@@ -102,6 +180,8 @@ PY
 else
   echo "**supervisor.json**: missing at $SUP_JSON"
 fi
+echo ""
+python3 "$SCRIPT_DIR/report.py" accounts
 echo ""
 
 # ----- Per-account state -----
@@ -170,6 +250,15 @@ in_flight_by_account = Counter(
 print("**Per-account state** (from supervisor.json `accounts`)")
 print()
 print(
+    "_What each account's last usage reading says. `state`: dispatching or idle take tasks, "
+    "slowing_down takes fewer, throttled_5h and throttled_weekly take none until their limit "
+    "resets, no_reading takes none until a reading arrives. `in-flight` is how many tasks the "
+    "account is running now; `target` (the throttle target) is how many the throttle lets it "
+    "run, \"—\" when no reading has set one; `wakeup` is when the supervisor looks again; times "
+    "are UTC._"
+)
+print()
+print(
     "| account | state | 5h | weekly | paused | in-flight | target | "
     "5h reset | weekly reset | wakeup | last capture |"
 )
@@ -214,67 +303,13 @@ if drift_rows:
         safe = msg.replace("|", r"\|")
         print(f"- `{name}`: {safe}")
 PY
-fi
 echo ""
+fi
 
-# ----- State-file & queue counts -----
-STATE_DIR="$QUEUE/.claude_task_runner/state"
-TODO_COUNT="$(find "$QUEUE/todo" -maxdepth 1 -name '*.yaml' -type f | wc -l)"
-
-# Status breakdown across state YAMLs: a row for every task status, a row for
-# each status the runner does not know, and one for files that could not be
-# read or name no status, so the rows add up to the total. Pending, deferred
-# and weekly_paused tasks, and unreadable files, used to be counted in the
-# total and in no row.
-#
-# Runs without a state directory too, counting 0 of each: a queue whose
-# supervisor has never started has none yet, and the table header must still
-# come before the todo/*.yaml row, which used to be printed on its own.
-python3 - "$STATE_DIR" <<'PY'
-import glob
-import os
-import re
-import sys
-from collections import Counter
-
-# TaskStatus in queue/schema.py, in its order. The heredoc runs under plain
-# python3 and cannot import the package, so tests/unit/test_snapshot_script.py
-# seeds a state file for every TaskStatus and fails until each has its row.
-STATUSES = (
-    "pending",
-    "running",
-    "awaiting_sidecar",
-    "deferred",
-    "possibly_hung",
-    "completed",
-    "failed",
-    "failed_circuit_breaker",
-    "weekly_paused",
-)
-state_dir = sys.argv[1]
-counts = Counter()
-status_re = re.compile(r"^status:\s*(\S+)\s*$", re.M)
-for p in glob.glob(os.path.join(state_dir, "*.yaml")):
-    try:
-        with open(p) as f:
-            text = f.read(2000)
-    except (OSError, ValueError):
-        text = ""
-    m = status_re.search(text)
-    # None counts the files that could not be read or name no status.
-    counts[m.group(1) if m else None] += 1
-print("**Queue counts**")
-print()
-print("| field | value |")
-print("|---|---|")
-for k in STATUSES:
-    print(f"| state.{k} | {counts[k]} |")
-for k in sorted(k for k in counts if k is not None and k not in STATUSES):
-    print(f"| state.{k} (unknown status) | {counts[k]} |")
-print(f"| state files unreadable or without a status | {counts[None]} |")
-print(f"| state files (total) | {sum(counts.values())} |")
-PY
-echo "| todo/*.yaml | $TODO_COUNT |"
+# ----- Queue counts and the last idle report -----
+python3 "$SCRIPT_DIR/report.py" counts
+echo ""
+python3 "$SCRIPT_DIR/report.py" idle
 echo ""
 
 # ----- Open sidecars -----
@@ -285,13 +320,8 @@ echo ""
 # exit, or output that is not a listing prints "could not list" and why, and
 # the script exits 1 once the report is out.
 SIDECARS_RC=0
-if command -v claude-task-runner > /dev/null 2>&1; then
-  SC_OUT="$(mktemp)"
-  SC_ERR="$(mktemp)"
-  trap 'rm -f "$SC_OUT" "$SC_ERR"' EXIT
-  SC_RC=0
-  claude-task-runner sidecar list --queue "$QUEUE" --json > "$SC_OUT" 2> "$SC_ERR" || SC_RC=$?
-  SC_RC="$SC_RC" SC_OUT="$SC_OUT" SC_ERR="$SC_ERR" python3 - <<'PY' || SIDECARS_RC=$?
+if [[ "$RS_SIDECARS_RC" != "missing" ]]; then
+  SC_RC="$RS_SIDECARS_RC" SC_OUT="$RS_SIDECARS_OUT" SC_ERR="$RS_SIDECARS_ERR" python3 - <<'PY' || SIDECARS_RC=$?
 import json
 import os
 import sys
@@ -329,6 +359,12 @@ nq = d.get("n_outstanding_questions")
 if nq is None:
     nq = sum(len(s.get("outstanding") or []) for s in rows)
 print(f"**Open sidecars**: {n} request(s), {nq} unanswered question(s)")
+print()
+print(
+    "_Questions tasks have stopped to ask you (a task waiting on one is awaiting_sidecar). "
+    "One request can hold several questions; a request with no questions is a notice to "
+    "acknowledge. Answer them with /runner-answer-sidecar._"
+)
 print()
 if n == 0:
     print("(none)")
