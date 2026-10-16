@@ -577,7 +577,7 @@ def _refresh_in_flight(
 ) -> SupervisorSnapshot:
     """Return ``snapshot`` with ``in_flight`` rebuilt from ``in_flight_slots``
     and ``held``, the parked live workers' records
-    (:func:`supervisor.adoption.track_parked_workers`), sorted by task id.
+    (:class:`supervisor.adoption.ParkedWorkerTracker`), sorted by task id.
 
     Also keeps the legacy ``in_flight_task_ids`` field in sync so v2
     consumers still see the task-id list. The two fields are
@@ -1298,7 +1298,7 @@ def _skip_category(
         # A task whose recorded worker still runs is never dispatched
         # beside it, whatever its status says (a state demoted while its
         # worker ran). Parked, its worker holds its account's slot and its
-        # run is recorded once it exits (supervisor.adoption.track_parked_workers).
+        # run is recorded once it exits (supervisor.adoption.ParkedWorkerTracker).
         if (
             state.pid is not None
             and dispatcher_mod.probe_recorded_worker(state, queue_dir)

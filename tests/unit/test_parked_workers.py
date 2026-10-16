@@ -2,12 +2,16 @@
 
 ``runner.dispatcher.park_live_worker`` parks a task whose worker runs with
 no monitor thread in this supervisor. Each tick,
-``supervisor.adoption.track_parked_workers``:
+``supervisor.adoption.ParkedWorkerTracker``:
 
 * counts each parked worker that still runs against the account it runs
   on, so ``dispatch_headroom`` and ``choose_account`` see it, and so do the
   persisted ``in_flight`` list and ``account list``;
-* records the run of each parked worker that has exited, from its log.
+* stops a parked worker past its task's duration cap;
+* records the run of each parked worker that has exited, from its log, on
+  a thread holding the task's slot, backing off a run that cannot be
+  recorded;
+* reports each park, whichever pass made it.
 
 The startup exited-worker finalize records them too.
 """
@@ -219,7 +223,7 @@ def _track(
 
 
 # ---------------------------------------------------------------------------
-# S1: a parked live worker holds its account's slot
+# A parked live worker holds its account's slot
 # ---------------------------------------------------------------------------
 
 
@@ -427,7 +431,7 @@ def test_other_possibly_hung_tasks_are_not_counted(
 
 
 # ---------------------------------------------------------------------------
-# S2: the startup pass records a parked worker that exited
+# The startup pass records a parked worker that exited
 # ---------------------------------------------------------------------------
 
 
@@ -523,7 +527,7 @@ def test_daemon_persists_the_parked_worker_and_account_list_counts_it(
 
 
 # ---------------------------------------------------------------------------
-# S-1: a parked worker is held to its task's duration cap
+# A parked worker is held to its task's duration cap
 # ---------------------------------------------------------------------------
 
 
@@ -616,7 +620,7 @@ def test_a_capped_worker_that_survives_keeps_its_slot_and_backs_off(
 
 
 # ---------------------------------------------------------------------------
-# N-5: a run that cannot be recorded is logged once and retried later
+# A run that cannot be recorded is logged once and retried later
 # ---------------------------------------------------------------------------
 
 
@@ -656,7 +660,7 @@ def test_unrecordable_parked_run_is_logged_once_and_backs_off(
 
 
 # ---------------------------------------------------------------------------
-# N-6: recording a parked run runs off the tick thread, holding the slot
+# Recording a parked run runs off the tick thread, holding the slot
 # ---------------------------------------------------------------------------
 
 
@@ -695,7 +699,7 @@ def test_a_slow_post_dispatch_hook_does_not_stall_the_tick(
 
 
 # ---------------------------------------------------------------------------
-# N-4, N-10: a park made by the selector or a dispatch thread is reported
+# A park made by the selector or a dispatch thread is reported
 # once and counted from the tick it happens in
 # ---------------------------------------------------------------------------
 

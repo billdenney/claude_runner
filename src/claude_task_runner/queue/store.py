@@ -348,11 +348,11 @@ def load_task(path: Path) -> Task:
 
 
 _RETIRED_STATE_KEYS = frozenset({"worker_boot_id", "worker_start_ticks"})
-"""Keys a state YAML may carry that :class:`TaskState` no longer has: a
-worker's spawn identity, now kept beside its stream log
-(``runner.dispatcher.worker_identity_path``). ``TaskState`` forbids unknown
-keys, so they are dropped on load; the runner's next write of the state
-leaves them out."""
+"""Keys a state YAML may hold that :class:`TaskState` does not define: a
+worker's spawn identity, which the runner keeps in the attempt's identity
+file beside its stream log (``runner.dispatcher.worker_identity_path``).
+``TaskState`` forbids unknown keys, so :func:`load_state` drops these; the
+next write of the state leaves them out."""
 
 
 def load_state(path: Path) -> TaskState:
