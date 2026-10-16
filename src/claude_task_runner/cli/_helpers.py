@@ -11,11 +11,13 @@ module that is otherwise a pure settings + per-account loader.
 from __future__ import annotations
 
 import json as _json
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
 from rich.console import Console
 
+from claude_task_runner.config.loader import BrokenAccount
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.store import require_queue_dir
 from claude_task_runner.runner.account_dispatch import QueueCeiling
@@ -117,3 +119,17 @@ def queue_ceiling_text(ceiling: QueueCeiling, settings: Settings) -> str:
 def queue_ceiling_json(ceiling: QueueCeiling, settings: Settings) -> dict[str, object]:
     """The ``queue_ceiling`` object of ``--json`` output, with the warm-up cap."""
     return {**ceiling.as_json(), "initial_concurrency": settings.concurrency.initial_concurrency}
+
+
+def broken_accounts_message(broken: Sequence[BrokenAccount]) -> str:
+    """Why ``supervisor start`` refuses to start: every account file that does not load."""
+    noun = "account" if len(broken) == 1 else "accounts"
+    lines = [
+        f"supervisor not started: the runner-account.toml of {len(broken)} {noun} does not load:"
+    ]
+    lines += [f"  {b.name}: {b.error}" for b in broken]
+    lines.append(
+        "Fix each file, or delete it for the defaults, then start the supervisor again. "
+        "Once the supervisor runs, a file that breaks only stops new tasks on its account."
+    )
+    return "\n".join(lines)

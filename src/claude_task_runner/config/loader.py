@@ -28,6 +28,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 from claude_task_runner.config.schema import (
     AccountPolicy,
     ResolvedAccount,
@@ -40,6 +41,14 @@ logger = logging.getLogger(__name__)
 
 class ConfigError(ValueError):
     """Raised when settings cannot be loaded or validated."""
+
+
+CONFIG_ERROR_EXIT_STATUS = 78
+"""The exit status of ``supervisor start`` when it refuses to start because
+its configuration does not load: the queue TOML, or any account's
+``runner-account.toml``. 78 is ``EX_CONFIG`` in sysexits.h. The systemd unit
+lists it in ``RestartPreventExitStatus=``, so a configuration error stops
+the unit instead of restarting it until the start limit trips."""
 
 
 PER_ACCOUNT_TOML_NAME = "runner-account.toml"
@@ -261,14 +270,16 @@ def per_account_toml_path(config_dir: str) -> Path | None:
     legacy ``"default"`` account before the operator declares a
     non-empty config_dir). When set, returns the absolute path
     whether or not the file exists. Raises :class:`ConfigError` when a
-    leading ``~user`` names no user, since no path can be built.
+    leading ``~user`` names no user, since no path can be built: the queue
+    TOML refuses that at load, so it happens only when the user is removed
+    while the supervisor runs.
     """
     if not config_dir:
         return None
     try:
-        return Path(config_dir).expanduser() / PER_ACCOUNT_TOML_NAME
-    except RuntimeError as exc:
-        raise ConfigError(f"Cannot find {config_dir}/{PER_ACCOUNT_TOML_NAME}: {exc}") from exc
+        return expand_config_dir(config_dir) / PER_ACCOUNT_TOML_NAME
+    except ConfigDirError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def per_account_toml_shown(config_dir: str) -> str | None:

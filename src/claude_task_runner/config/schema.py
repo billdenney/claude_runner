@@ -14,6 +14,7 @@ from typing import Final, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from claude_task_runner.config.duration import DurationParseError, parse_duration
+from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 
 UsageSourceMode = Literal["tty", "api", "api_then_tty"]
 """Which production :class:`UsageSource` the daemon should use.
@@ -609,7 +610,9 @@ class AccountSettings(_StrictModel):
     config_dir: str
     """``CLAUDE_CONFIG_DIR`` for this account. Empty string targets
     claude's default ``~/.claude``. The loader also reads per-account
-    dispatch policy from ``<config_dir>/runner-account.toml``."""
+    dispatch policy from ``<config_dir>/runner-account.toml``. A leading
+    ``~user`` that names no user fails validation, so the queue TOML does
+    not load."""
 
     linux_user: str | None = None
     """Optional Linux uid name to spawn claude as. When set, the
@@ -627,6 +630,11 @@ class AccountSettings(_StrictModel):
             )
         if self.linux_user is not None and not self.linux_user.strip():
             raise ValueError("linux_user must be a non-empty Linux username when set")
+        if self.config_dir:
+            try:
+                expand_config_dir(self.config_dir)
+            except ConfigDirError as exc:
+                raise ValueError(f"account {self.name!r}: {exc}") from exc
         return self
 
 

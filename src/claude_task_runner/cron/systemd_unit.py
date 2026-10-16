@@ -29,6 +29,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS
 from claude_task_runner.config.schema import TaskCapsSettings, WatchdogSettings
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,12 @@ def build_unit_text(
       seconds, systemd stops restarting it. It can be started by hand
       once the interval has passed, or at once after ``systemctl --user
       reset-failed``. The cron watchdog backs off and retries instead.
+    * ``RestartPreventExitStatus`` is ``0`` and
+      :data:`config.loader.CONFIG_ERROR_EXIT_STATUS` (78): a clean exit,
+      and a ``supervisor start`` that refused to start because its
+      configuration does not load, are not restarted. The unit stays
+      ``failed``, with the reason in the journal, until it is started
+      again by hand.
 
     With the package defaults (30 s, 5 and 600 s) the unit is the one
     this function wrote before it read ``[watchdog]``. Seconds are
@@ -394,9 +401,11 @@ def build_unit_text(
         f"TimeoutStopSec={timeout_stop}\n"
         "Restart=on-failure\n"
         f"RestartSec={restart_sec}\n"
-        # Don't restart when supervisor exits cleanly (a successful drain
-        # or fast-stop).
-        "RestartPreventExitStatus=0\n"
+        # Don't restart when the supervisor exits cleanly (a successful
+        # drain or fast-stop), or refuses to start because its
+        # configuration does not load: a restart would fail the same way
+        # until the start limit stopped the unit anyway.
+        f"RestartPreventExitStatus=0 {CONFIG_ERROR_EXIT_STATUS}\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"
         "\n"

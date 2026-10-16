@@ -56,6 +56,7 @@ from typing import IO
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock
+from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 from claude_task_runner.config.schema import (
     DispatchSettings,
     FailureClassifierSettings,
@@ -1533,7 +1534,10 @@ def dispatch(
     # token is in use for an account.
     spawn_env: dict[str, str] | None = None
     if claude_config_dir:
-        config_path = Path(claude_config_dir).expanduser()
+        try:
+            config_path = expand_config_dir(claude_config_dir)
+        except ConfigDirError as exc:
+            raise DispatchError(str(exc)) from exc
         if not config_path.exists():
             raise DispatchError(f"CLAUDE_CONFIG_DIR does not exist: {config_path}")
         spawn_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}

@@ -29,7 +29,7 @@ from claude_task_runner.cli.supervisor_cmd import (
     _count_pending,
     app,
 )
-from claude_task_runner.config.loader import ConfigError, load_settings
+from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, ConfigError, load_settings
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
@@ -906,12 +906,12 @@ def test_start_refuses_a_queue_with_an_unknown_timezone(runner: CliRunner, tmp_p
         patch("claude_task_runner.cli.supervisor_cmd.start_daemon") as mock_start,
     ):
         result = runner.invoke(app, ["start", "--queue", str(queue)])
-    assert result.exit_code == 1
-    assert isinstance(result.exception, ConfigError)
-    assert "dispatch_pct.timezone" in str(result.exception)
-    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in str(
-        result.exception
+    assert result.exit_code == CONFIG_ERROR_EXIT_STATUS
+    assert result.stdout.startswith(
+        "supervisor not started: Settings validation failed: 1 validation error for "
+        "Settings\ndispatch_pct.timezone\n"
     )
+    assert "[dispatch_pct].timezone = 'Not/AZone' is not an IANA time zone name" in result.stdout
     mock_start.assert_not_called()
 
 

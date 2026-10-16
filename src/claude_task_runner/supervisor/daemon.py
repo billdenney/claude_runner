@@ -1569,8 +1569,11 @@ def _apply_sighup_reload(
     """Apply a SIGHUP-triggered reload; return ``(new_settings, new_pending)``.
 
     On any failure (TOML parse error, schema violation, OS error) we log
-    a warning and return ``(current, prior_pending)`` — the old config
-    stays active and the operator sees the failure in the journal.
+    an ERROR and return ``(current, prior_pending)`` — the old config
+    stays active and the operator sees the failure in the journal. The
+    edit the operator made is not in force, so it is an error, not a
+    warning. Account files are not checked here: they are re-read every
+    tick, and one that does not load disables only its account.
     The orchestrator rescans ``todo/`` on every tick already, so the
     only "rescan" work this function does is recount ``prior_pending``
     so the summary line can report how many new tasks appeared.
@@ -1578,10 +1581,10 @@ def _apply_sighup_reload(
     try:
         new_settings = load_settings(config_path)
     except ConfigError as exc:
-        logger.warning("SIGHUP received: reload failed (%s); keeping old config", exc)
+        logger.error("SIGHUP received: reload failed (%s); keeping old config", exc)
         return current, prior_pending
     except OSError as exc:
-        logger.warning(
+        logger.error(
             "SIGHUP received: cannot read %s (%s); keeping old config",
             config_path,
             exc,

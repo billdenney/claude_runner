@@ -366,3 +366,36 @@ def test_run_record_carries_subprocess_pid(
         )
     # _FakePopen hard-codes pid=4242.
     assert outcome.run_record.pid == 4242
+
+
+def test_a_config_dir_whose_user_is_gone_raises_dispatch_error(
+    queue_dir: Path,
+    task: Task,
+    task_state: TaskState,
+    settings_kwargs: dict[str, object],
+) -> None:
+    """A ``~user`` removed while the supervisor runs fails this dispatch with
+    a DispatchError, the dispatch thread's own error, not a RuntimeError."""
+    _FakePopen.captured_argv.clear()
+    with (
+        patch("claude_task_runner.runner.dispatcher.shutil.which", return_value="/usr/bin/claude"),
+        patch("claude_task_runner.claude_init.ensure_initialized"),
+        pytest.raises(DispatchError) as excinfo,
+    ):
+        dispatch(
+            task=task,
+            state=task_state,
+            plan=_plan(),
+            queue_dir=queue_dir,
+            clock=_FrozenClock(),
+            claude_executable="claude",
+            claude_config_dir="~no-such-user-ctr-test/.claude",
+            account="work",
+            persist_state=False,
+            **settings_kwargs,
+        )
+    assert str(excinfo.value) == (
+        "config_dir '~no-such-user-ctr-test/.claude' cannot be expanded: "
+        "Could not determine home directory."
+    )
+    assert _FakePopen.captured_argv == []

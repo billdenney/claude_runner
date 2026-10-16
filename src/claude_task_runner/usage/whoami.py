@@ -27,6 +27,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_task_runner.config.paths import expand_config_dir
 from claude_task_runner.usage import render as render_mod
 
 CREDENTIALS_FILENAME = ".credentials.json"
@@ -81,8 +82,9 @@ def credentials_path(claude_config_dir: str = "") -> Path:
     """Resolve the active ``credentials.json`` path.
 
     Empty ``claude_config_dir`` means use the default ``~/.claude``.
+    Raises :class:`config.paths.ConfigDirError` when it cannot be expanded.
     """
-    base = Path(claude_config_dir).expanduser() if claude_config_dir else Path.home() / ".claude"
+    base = expand_config_dir(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
     return base / CREDENTIALS_FILENAME
 
 

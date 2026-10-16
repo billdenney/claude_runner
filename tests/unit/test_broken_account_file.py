@@ -1,11 +1,13 @@
 """An account whose ``runner-account.toml`` does not load (ADR-0035).
 
-Pins: the account takes no new tasks and counts 0 everywhere, with no
-policy standing in for its file; every other account dispatches as usual;
-nothing that reads the file crashes. The supervisor logs one ERROR per
-error or file change and one INFO when the file loads again, records the
-error in ``supervisor.json``, and ``account list``, ``supervisor status``
-and the doctor show it.
+Pins, for a file that breaks while the supervisor runs: the account takes
+no new tasks and counts 0 everywhere, with no policy standing in for its
+file; every other account dispatches as usual; nothing that reads the file
+crashes. The supervisor logs one ERROR per error or file change and one
+INFO when the file loads again, records the error in ``supervisor.json``,
+and ``account list``, ``supervisor status`` and the doctor show it.
+``supervisor start`` refuses to start on one instead
+(``test_fail_fast_account_config.py``).
 
 Most tests use ``personal`` (cap 5) and ``work`` (cap 3) with ``personal``'s
 file broken.
@@ -29,7 +31,7 @@ from claude_task_runner.config.loader import (
     BrokenAccount,
     resolve_accounts,
 )
-from claude_task_runner.config.schema import Settings
+from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.doctor.checks import (
     CheckStatus,
     check_account_policies,
@@ -195,14 +197,17 @@ class TestResolveAccounts:
             f"{path} is a symlink to {target}, which does not exist"
         )
 
-    def test_a_home_that_cannot_be_found_is_broken(
+    def test_a_home_removed_while_running_is_broken(
         self, tmp_path: Path, two_accounts: dict[str, Path]
     ) -> None:
-        accounts = {
-            "personal": Path("~no-such-user-ctr-test/.claude"),
-            "work": two_accounts["work"],
-        }
-        settings = queue_toml(tmp_path / "q.toml", accounts)
+        """The queue TOML refuses a ``~user`` that names no user when it
+        loads, so this is a user removed after the supervisor loaded it,
+        stood in for by settings built without validation."""
+        settings = queue_toml(tmp_path / "q.toml", two_accounts)
+        gone = AccountSettings.model_construct(
+            name="personal", config_dir="~no-such-user-ctr-test/.claude", linux_user=None
+        )
+        settings = settings.model_copy(update={"accounts": [gone, settings.accounts[1]]})
         resolution = resolve_accounts(settings)
         assert [a.name for a in resolution.accounts] == ["work"]
         assert resolution.broken == (
@@ -210,7 +215,7 @@ class TestResolveAccounts:
                 name="personal",
                 path="~no-such-user-ctr-test/.claude/runner-account.toml",
                 error=(
-                    "Cannot find ~no-such-user-ctr-test/.claude/runner-account.toml: "
+                    "config_dir '~no-such-user-ctr-test/.claude' cannot be expanded: "
                     "Could not determine home directory."
                 ),
             ),
@@ -695,9 +700,11 @@ class TestForceDispatch:
 
 @pytest.mark.usefixtures("private_global_lock")
 class TestSupervisor:
-    def test_a_broken_file_at_startup_disables_the_account_without_a_crash(
+    def test_the_daemon_itself_survives_a_broken_file_from_its_first_tick(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """``supervisor start`` checks the files first, so this is a file that
+        breaks between that check and the first tick: the loop still runs."""
         qd, config = single_account_queue(tmp_path, "")
         path = _break(tmp_path / "acct")
         with caplog.at_level(logging.INFO, logger=DAEMON_LOGGER):

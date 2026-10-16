@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_task_runner.clock import Clock
+from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 from claude_task_runner.usage.drift import (
     UsageApiAuthExpired,
     UsageApiHeaderMissing,
@@ -232,13 +233,15 @@ def _read_oauth_token(config_dir: str) -> str:
     nothing — the operator can then either run ``claude setup-token``
     (recommended) or ``claude /login`` to populate one of the two.
     """
-    long_lived = read_long_lived_token(config_dir)
+    try:
+        long_lived = read_long_lived_token(config_dir)
+        base = expand_config_dir(config_dir) if config_dir else Path.home() / ".claude"
+    except ConfigDirError as exc:
+        raise CredentialsNotFound(str(exc)) from exc
     if long_lived is not None:
         return long_lived
 
-    creds_path = (
-        Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
-    ) / ".credentials.json"
+    creds_path = base / ".credentials.json"
     if not creds_path.exists():
         raise CredentialsNotFound(
             f"OAuth credentials file not found: {creds_path}. "

@@ -59,6 +59,8 @@ import logging
 import stat
 from pathlib import Path
 
+from claude_task_runner.config.paths import expand_config_dir
+
 logger = logging.getLogger(__name__)
 
 OAUTH_TOKEN_FILENAME = "oauth-token"
@@ -70,8 +72,11 @@ def oauth_token_path(config_dir: str) -> Path:
 
     Empty ``config_dir`` targets ``~/.claude`` to match the
     convention used by :mod:`claude_task_runner.usage.api_source`.
+    Raises :class:`config.paths.ConfigDirError` when it cannot be
+    expanded; its callers expand ``config_dir`` themselves first and turn
+    that into their own error.
     """
-    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    base = expand_config_dir(config_dir) if config_dir else Path.home() / ".claude"
     return base / OAUTH_TOKEN_FILENAME
 
 
