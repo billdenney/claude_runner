@@ -988,6 +988,7 @@ def _eligible_candidates(
     *,
     effort_levels: dict[str, list[str]],
     skips: Counter[str] | None = None,
+    held: dict[str, list[Task]] | None = None,
     read_only: bool = False,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
@@ -1004,7 +1005,8 @@ def _eligible_candidates(
     # :func:`_skip_category`). A task whose state is ``completed`` is counted
     # under ``completed`` whichever check skipped it first, so every other
     # category counts unfinished work only. The returned tasks plus the
-    # counts added here equal the number of task YAMLs read.
+    # counts added here equal the number of task YAMLs read. ``held``, when
+    # given, gets each unfinished task not returned under its category.
     #
     # ``in_flight_slots`` is read for its task ids only (a slot map's keys).
     # ``read_only`` turns off the gates' bookkeeping (see
@@ -1047,8 +1049,12 @@ def _eligible_candidates(
         )
         if category is None:
             out.append(task)
+        elif task.id in completed_ids:
+            tally[_COMPLETED] += 1
         else:
-            tally[_COMPLETED if task.id in completed_ids else category] += 1
+            tally[category] += 1
+            if held is not None:
+                held.setdefault(category, []).append(task)
     return out
 
 
@@ -1241,6 +1247,9 @@ class SelectionPreview:
     skips: Counter[str]
     """Every other task YAML in ``todo/``, counted under the category that
     holds it, ``completed`` included (see :func:`_eligible_candidates`)."""
+    held: dict[str, list[Task]]
+    """The unfinished tasks ``skips`` counts, by category; a task file that
+    cannot be read has no :class:`Task` and is only counted."""
     queue_cap: int | None
     """The queue-wide cap on tasks in flight now (:func:`_target_concurrency`):
     ``[concurrency].initial_concurrency`` while warming up, else
@@ -1269,6 +1278,7 @@ def preview_selection(
     in_flight = list(snapshot.in_flight) if snapshot is not None else []
     account_states = dict(snapshot.accounts) if snapshot is not None else {}
     skips: Counter[str] = Counter()
+    held: dict[str, list[Task]] = {}
     eligible = _eligible_candidates(
         queue_dir,
         {record.task_id for record in in_flight},
@@ -1277,6 +1287,7 @@ def preview_selection(
         block_file=getattr(getattr(settings, "dispatch", None), "dispatch_block_file", None),
         effort_levels=settings.effort_levels,
         skips=skips,
+        held=held,
         read_only=True,
     )
     eligible.sort(key=priority_sort_key)
@@ -1322,6 +1333,7 @@ def preview_selection(
         routes=routes,
         affinity_held=affinity_held,
         skips=skips,
+        held=held,
         queue_cap=_target_concurrency(queue_dir, settings),
         warming_up=(
             settings.concurrency.initial_concurrency is not None

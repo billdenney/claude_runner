@@ -822,6 +822,163 @@ def test_supervisor_json_details_count_the_in_flight_records(
     assert "\n| in_flight | `2` |\n" in _run(queue, bin_dir).stdout
 
 
+@pytest.fixture
+def worker() -> Iterator[Callable[[Path], int]]:
+    """Start a stand-in worker writing to ``log``, as the dispatcher's
+    workers write to their attempt's log. Killed at teardown."""
+    children: list[subprocess.Popen[bytes]] = []
+
+    def start(log: Path) -> int:
+        with log.open("wb") as out:
+            child = subprocess.Popen(["sleep", "600"], stdout=out, start_new_session=True)
+        children.append(child)
+        return child.pid
+
+    yield start
+    for child in children:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def _parked(queue: Path, task_id: str, pid: int, log: Path | None, started: datetime) -> None:
+    add_state(
+        queue,
+        task_id,
+        "possibly_hung",
+        stop_reason="worker_still_running",
+        pid=pid,
+        log_path=None if log is None else str(log),
+        last_started_at=started,
+    )
+
+
+def test_parked_workers_and_a_worker_that_could_not_start(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    worker: Callable[[Path], int],
+    report_now: datetime,
+) -> None:
+    """A task parked while an unwatched worker runs is not stuck: within
+    its time limit it is for your information, past it or after the worker
+    exited it is not normal. A worker that could not be started says why
+    and when it is tried again."""
+    _two_accounts(queue, tmp_path)
+    started = report_now - timedelta(minutes=10)
+    logs = {name: tmp_path / f"{name}.log" for name in ("within", "past")}
+    pids = {name: worker(log) for name, log in logs.items()}
+    add_task(queue, "within")
+    _parked(queue, "within", pids["within"], logs["within"], started)
+    add_task(queue, "past", max_duration_s_override=300)
+    _parked(queue, "past", pids["past"], logs["past"], started)
+    done = subprocess.Popen(["true"])
+    done.wait(timeout=10)
+    add_task(queue, "exited")
+    _parked(queue, "exited", done.pid, None, started)
+    add_task(queue, "silent")
+    add_state(queue, "silent", "possibly_hung", stop_reason="silent_on_restart")
+    due = report_now + timedelta(minutes=15)
+    add_task(queue, "no-config-dir")
+    add_state(
+        queue,
+        "no-config-dir",
+        "deferred",
+        stop_reason="worker_start_deferred",
+        deferred_reason="cannot start the worker: config_dir /gone does not exist",
+        next_eligible_at=due,
+    )
+    supervisor()
+
+    kill = "`kill -TERM -<pid>` (the minus signals its process group)"
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 1 waits for a retry time; 1 looks stuck; 2 have a worker running that the "
+        "supervisor does not watch; 1 waits for an exited worker's run to be recorded; 0 "
+        "finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "1 task has a worker the supervisor does not watch that has run past the task's time "
+            f"limit (past, pid {pids['past']}). Stop it with {kill}.",
+            "1 task was held while a worker the supervisor does not watch ran, and the worker "
+            f"has exited (exited, pid {done.pid}), so it waits only for the run to be recorded. "
+            "If this lasts past the supervisor's next check, record the run as the runbook "
+            "describes for a worker that ran on after a restart.",
+            "1 task could not start its worker (no-config-dir: config_dir /gone does not exist; "
+            f"retries about {_when(due)}). Fix what each names; the supervisor tries again at the "
+            f"time given, or `claude-task-runner queue force-dispatch <id> --queue {queue}` "
+            "starts one at once after the fix.",
+            "Tasks that have gone quiet while running and may be stuck: 1. See the runbook "
+            'section "Task `possibly_hung` for hours".',
+        )
+        + _info(
+            "1 task has a worker still running that the supervisor does not watch, left from "
+            "before a restart or still alive after it was stopped (within, pid "
+            f"{pids['within']}). No second worker starts for it meanwhile. Nothing to do; to "
+            f"end one sooner, stop it with {kill}.",
+            "No task can start right now: every unfinished task is held, as Tasks shows.",
+        )
+    )
+
+
+def test_details_group_the_retry_reasons_and_list_parked_workers(
+    queue: Path, bin_dir: Path
+) -> None:
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"deferred_cooldown": 3, "possibly_hung": 1},
+        "completed": 0,
+        "todo_tasks": 4,
+        "retrying": [
+            {
+                "task_id": "a",
+                "deferred_reason": "pre-dispatch hook deferred (exit 1): paper missing",
+                "next_eligible_at": "2026-10-16T12:30:00+00:00",
+            },
+            {
+                "task_id": "b",
+                "deferred_reason": "pre-dispatch hook deferred (exit 1): other",
+                "next_eligible_at": "2026-10-16T12:10:00+00:00",
+            },
+            {
+                "task_id": "c",
+                "deferred_reason": "cannot start the worker: sudo not found",
+                "next_eligible_at": "2026-10-16T12:20:00+00:00",
+            },
+        ],
+        "parked_workers": [
+            {
+                "task_id": "d",
+                "pid": 4242,
+                "started_at": "2026-10-16T10:00:00+00:00",
+                "running": True,
+                "duration_cap_s": 14400.0,
+                "past_cap": False,
+            }
+        ],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    _, _, details = proc.stdout.partition("**What holds the tasks**")
+    section = details.split("\n**Queue counts**")[0]
+    assert section.endswith(
+        "| todo/ tasks (total) | 4 |\n\n"
+        "_Why the tasks waiting for a retry time were deferred:_\n\n"
+        "- pre-dispatch hook deferred (exit 1): 2, the first retried about 2026-10-16 12:10 "
+        "UTC\n"
+        "- cannot start the worker: 1, the first retried about 2026-10-16 12:20 UTC\n\n"
+        "_Counted under possibly_hung, parked while a worker the supervisor does not watch "
+        "ran:_\n\n"
+        "| task | pid | started | still running | past its time limit |\n"
+        "|---|---:|---|:-:|:-:|\n"
+        "| d | 4242 | 2026-10-16T10:00:00+00:00 | yes | no |\n"
+    ), section
+
+
 def test_notice_and_unreadable_sidecar_request(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:

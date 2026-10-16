@@ -29,6 +29,7 @@ import json as _json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -41,6 +42,7 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config.schema import Settings
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     QueueIOError,
@@ -50,20 +52,24 @@ from claude_task_runner.queue.store import (
     load_state,
     load_task,
     queue_runtime_dir,
+    state_file_path,
     state_path_for,
     task_path_for,
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner import readiness as readiness_mod
+from claude_task_runner.runner.caps import effective_duration_cap_s
 from claude_task_runner.runner.effort_levels import (
     UnknownEffortLevel,
     validate_effort,
 )
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor import pidfile as pidfile_mod
+from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
@@ -430,6 +436,14 @@ def holds(
     selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
     (the warm-up cap while ``warming_up``), ``null`` when there is none.
 
+    Two holds carry their tasks' details. ``parked_workers``: the
+    ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
+    ``worker_still_running``), each with its ``pid``, ``started_at``,
+    whether it is still ``running``, its ``duration_cap_s`` (0: none) and
+    whether it has run ``past_cap``.
+    ``retrying``: the ``deferred_cooldown`` tasks, each with its
+    ``deferred_reason`` and ``next_eligible_at``.
+
     \b
     Exit codes:
       0  listed
@@ -452,6 +466,9 @@ def holds(
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
     can_start_now = sum(1 for account in preview.routes.values() if account is not None)
+    now = RealClock().now()
+    parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now)
+    retrying = _retrying(qd, preview.held.get("deferred_cooldown", []))
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -467,6 +484,8 @@ def holds(
         "affinity_ttl_s": settings.dispatch.affinity_ttl_seconds,
         "queue_cap": preview.queue_cap,
         "warming_up": preview.warming_up,
+        "parked_workers": parked,
+        "retrying": retrying,
         "supervisor_json_error": snapshot_error,
     }
     if json:
@@ -492,11 +511,76 @@ def holds(
     console.print(
         f"[bold]selection runs every:[/] {settings.usage.poll_interval_s:g} s", highlight=False
     )
+    for worker in parked:
+        cap = "past its time limit" if worker["past_cap"] else "within its time limit"
+        state = "still running" if worker["running"] else "exited"
+        console.print(
+            f"[bold]parked worker:[/] {worker['task_id']} pid {worker['pid']} since "
+            f"{worker['started_at']}, {state} ({cap})",
+            highlight=False,
+        )
+    for item in retrying:
+        console.print(
+            f"[bold]retries at {item['next_eligible_at']}:[/] {item['task_id']}: "
+            f"{item['deferred_reason']}",
+            highlight=False,
+            markup=False,
+        )
     if snapshot_error:
         console.print(
             f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
             highlight=False,
         )
+
+
+def _parked_workers(
+    qd: Path, settings: Settings, tasks: list[Task], now: datetime
+) -> list[dict[str, object]]:
+    """Of ``tasks`` (held ``possibly_hung``), those parked because a worker
+    the supervisor does not watch was running: when it started, whether it
+    still runs (:func:`runner.dispatcher.probe_worker`) and whether it has
+    run past the task's duration cap."""
+    out: list[dict[str, object]] = []
+    for task in tasks:
+        state = load_state(state_file_path(qd, task.id))
+        if state.stop_reason != LIVE_WORKER_STOP_REASON:
+            continue
+        started = state.last_started_at or (state.runs[-1].started_at if state.runs else None)
+        cap = effective_duration_cap_s(settings.task_caps, task)
+        out.append(
+            {
+                "task_id": task.id,
+                "pid": state.pid,
+                "started_at": started.isoformat() if started else None,
+                "running": state.pid is not None
+                and dispatcher_mod.probe_worker(
+                    state.pid, log_path=state.log_path, started_at=state.last_started_at
+                )
+                is dispatcher_mod.WorkerProbe.ALIVE,
+                "duration_cap_s": cap,
+                "past_cap": bool(
+                    cap > 0 and started is not None and (now - started).total_seconds() > cap
+                ),
+            }
+        )
+    return out
+
+
+def _retrying(qd: Path, tasks: list[Task]) -> list[dict[str, object]]:
+    """``tasks`` (held ``deferred_cooldown``) with why each was deferred
+    and when the supervisor tries it again."""
+    out: list[dict[str, object]] = []
+    for task in tasks:
+        state = load_state(state_file_path(qd, task.id))
+        due = state.next_eligible_at
+        out.append(
+            {
+                "task_id": task.id,
+                "deferred_reason": state.deferred_reason,
+                "next_eligible_at": due.isoformat() if due else None,
+            }
+        )
+    return out
 
 
 @app.command("show")

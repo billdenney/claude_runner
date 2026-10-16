@@ -123,6 +123,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
         "are marked running but not tracked by the supervisor",
     ),
     "possibly_hung": ("looks stuck", "look stuck"),
+    "live_worker": (
+        "still has a worker running from an earlier attempt",
+        "still have a worker running from an earlier attempt",
+    ),
     "failed_circuit_breaker": (
         "stopped after repeated failures",
         "stopped after repeated failures",
@@ -145,6 +149,7 @@ _HELD_ORDER = (
     "weekly_paused",
     "invalid_effort",
     "possibly_hung",
+    "live_worker",
     "failed_circuit_breaker",
     "running",
     "unparseable_task",
@@ -682,6 +687,87 @@ def _capacity(
     return text + f" Right now {running} running, with {now}.", room
 
 
+WORKER_START_LEAD = "cannot start the worker: "
+"""How the runner's ``deferred_reason`` starts when a task's worker failed
+its checks before it was spawned (a config_dir, sudo, working_dir or log
+file problem); the supervisor tries again after a cooldown."""
+
+LISTED = 3
+"""How many tasks an item names before it says how many more there are."""
+
+
+def _listing(items: list[str]) -> str:
+    shown = "; ".join(items[:LISTED])
+    more = len(items) - LISTED
+    return shown + (f"; and {more} more" if more > 0 else "")
+
+
+def _parked_notes(
+    watching: list[dict[str, Any]], exited: list[dict[str, Any]], notes: Notes
+) -> None:
+    """Tasks parked ``possibly_hung`` while a worker ran that the supervisor
+    does not watch (stop reason ``worker_still_running``)."""
+    within = [w for w in watching if not w.get("past_cap")]
+    past = [w for w in watching if w.get("past_cap")]
+    kill = "`kill -TERM -<pid>` (the minus signals its process group)"
+    if within:
+        n = len(within)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in within])
+        notes.info.append(
+            f"{_plural(n, 'task')} {'has' if n == 1 else 'have'} a worker still running that "
+            f"the supervisor does not watch, left from before a restart or still alive after "
+            f"it was stopped ({which}). No second worker starts for "
+            f"{'it' if n == 1 else 'them'} meanwhile. Nothing to do; to end one sooner, stop "
+            f"it with {kill}."
+        )
+    if past:
+        n = len(past)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in past])
+        notes.attention.append(
+            f"{_plural(n, 'task')} {'has' if n == 1 else 'have'} a worker the supervisor does "
+            f"not watch that has run past the task's time limit ({which}). Stop "
+            f"{'it' if n == 1 else 'each'} with {kill}."
+        )
+    if exited:
+        n = len(exited)
+        which = _listing([f"{w.get('task_id')}, pid {w.get('pid')}" for w in exited])
+        notes.attention.append(
+            f"{_plural(n, 'task')} {'was' if n == 1 else 'were'} held while a worker the "
+            f"supervisor does not watch ran, and the worker has exited ({which}), so "
+            f"{'it waits' if n == 1 else 'they wait'} only for the run to be recorded. If this "
+            f"lasts past the supervisor's next check, record the run as the runbook describes "
+            f"for a worker that ran on after a restart."
+        )
+
+
+def _retry_notes(facts: Facts, holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks whose worker could not be started, and when each is tried again."""
+    failed = [
+        r
+        for r in holds.get("retrying") or []
+        if isinstance(r, dict) and str(r.get("deferred_reason") or "").startswith(WORKER_START_LEAD)
+    ]
+    if not failed:
+        return
+    items = []
+    for r in failed:
+        why = str(r["deferred_reason"]).removeprefix(WORKER_START_LEAD).rstrip(".")
+        due = _parse_time(r.get("next_eligible_at"))
+        when = (
+            f"retries about {_when(due)}"
+            if due and due > facts.now
+            else "retries at the next check"
+        )
+        items.append(f"{r.get('task_id')}: {why}; {when}")
+    n = len(failed)
+    notes.attention.append(
+        f"{_plural(n, 'task')} could not start {'its' if n == 1 else 'their'} worker "
+        f"({_listing(items)}). Fix what each names; the supervisor tries again at the time "
+        f"given, or `claude-task-runner queue force-dispatch <id> --queue {facts.queue}` starts "
+        f"one at once after the fix."
+    )
+
+
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:
     holds = facts.holds.data
     if holds is None:
@@ -725,10 +811,29 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
             )
         qualified = f" ({'; '.join(of_them)})" if of_them else ""
         parts.append(f"{who} can start {where}{qualified}")
+    # Parked workers are counted under possibly_hung, but are not stuck.
+    parked = [w for w in holds.get("parked_workers") or [] if isinstance(w, dict)]
+    watching = [w for w in parked if w.get("running")]
+    exited = [w for w in parked if not w.get("running")]
+    held["possibly_hung"] = held.get("possibly_hung", 0) - len(parked)
+    if held["possibly_hung"] <= 0:
+        del held["possibly_hung"]
     order = {name: i for i, name in enumerate(_HELD_ORDER)}
     for name in sorted(held, key=lambda k: (order.get(k, len(order)), k)):
         parts.append(held_words(name, held[name]))
+    if watching:
+        n = len(watching)
+        parts.append(
+            f"{n} {'has' if n == 1 else 'have'} a worker running that the supervisor does not watch"
+        )
+    if exited:
+        n = len(exited)
+        parts.append(
+            f"{n} {'waits' if n == 1 else 'wait'} for an exited worker's run to be recorded"
+        )
     parts.append(f"{int(holds.get('completed') or 0)} finished")
+    _parked_notes(watching, exited, notes)
+    _retry_notes(facts, holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."
@@ -1135,6 +1240,38 @@ def holds_section(facts: Facts) -> str:
     out += [f"| {name} | {n} |" for name, n in sorted((data.get("held") or {}).items())]
     out.append(f"| completed | {data.get('completed', 0)} |")
     out.append(f"| todo/ tasks (total) | {data.get('todo_tasks', 0)} |")
+    retrying = [r for r in data.get("retrying") or [] if isinstance(r, dict)]
+    if retrying:
+        # Grouped by the reason's lead, the part before its first colon,
+        # which names who deferred the task.
+        counts: Counter[str] = Counter()
+        firsts: dict[str, datetime] = {}
+        for r in retrying:
+            lead = str(r.get("deferred_reason") or "no reason").split(":", 1)[0]
+            counts[lead] += 1
+            due = _parse_time(r.get("next_eligible_at"))
+            if due is not None and (lead not in firsts or due < firsts[lead]):
+                firsts[lead] = due
+        out += ["", "_Why the tasks waiting for a retry time were deferred:_", ""]
+        for lead, n in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            first = f", the first retried about {_when(firsts[lead])}" if lead in firsts else ""
+            safe = lead.replace("|", "\\|")
+            out.append(f"- {safe}: {n}{first}")
+    parked = [w for w in data.get("parked_workers") or [] if isinstance(w, dict)]
+    if parked:
+        out += [
+            "",
+            "_Counted under possibly_hung, parked while a worker the supervisor does not watch "
+            "ran:_",
+            "",
+            "| task | pid | started | still running | past its time limit |",
+            "|---|---:|---|:-:|:-:|",
+        ]
+        out += [
+            f"| {w.get('task_id')} | {w.get('pid')} | {w.get('started_at') or '—'} "
+            f"| {'yes' if w.get('running') else 'no'} | {'yes' if w.get('past_cap') else 'no'} |"
+            for w in parked
+        ]
     if data.get("supervisor_json_error"):
         out += ["", f"_in-flight tasks unknown: {data['supervisor_json_error']}_"]
     return "\n".join(out) + "\n"

@@ -56,12 +56,14 @@ Then **Not normal right now**: one sentence per condition that needs the
 operator, saying what it means and what to do (a broken account settings
 file, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
-read, unreadable sidecar requests, a supervisor that is down or stuck, an
-unreadable `supervisor.json` or queue settings file, nothing running
-although tasks can start). And **For your information**: routine
-conditions that resolve by themselves, with when (an account throttled
-until a time, tasks waiting for the account their session runs on, the
-queue drained because every task is held). While the supervisor is not
+read, tasks whose worker could not be started, an unwatched worker past
+its time limit or one that exited unrecorded, unreadable sidecar requests,
+a supervisor that is down or stuck, an unreadable `supervisor.json` or
+queue settings file, nothing running although tasks can start). And **For
+your information**: routine conditions that resolve by themselves, with
+when (an account throttled until a time, tasks waiting for the account
+their session runs on, a worker still running that the supervisor does
+not watch, the queue drained because every task is held). While the supervisor is not
 running, the tasks and accounts it last recorded as running are given as
 its last record, not as running now.
 "Everything looks normal." when there is neither.
@@ -70,7 +72,8 @@ The facts come from the runner, not from re-reading its files:
 `claude-task-runner account list --json` (each account's state, caps,
 pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
-candidate selection run once, read-only, with the poll interval) and
+candidate selection run once, read-only, with the poll interval, the
+parked workers and why each task waiting for a retry time was deferred) and
 `claude-task-runner sidecar list --json`. The script passes the live
 supervisor's own `--config` to `account list` and `queue holds`
 (`sidecar list` reads no settings), resolving a relative path against the
@@ -208,8 +211,14 @@ or recent failures), follow the prioritized triage flow below.
       token): log the account in again, `CLAUDE_CONFIG_DIR=<its
       config_dir> claude /login`, or renew its long-lived token with
       `claude setup-token`; `format` (the usage page changed): run
-      `claude-task-runner usage healthcheck` or invoke `/runner-usage`.
-      Stop here unless the user wants more.
+      `claude-task-runner usage --config <the queue's claude_runner.toml>
+      healthcheck` (the supervisor's own `--config` when it was started
+      with one; without `--config` it reads the package's default account,
+      not the queue's), or invoke `/runner-usage`. On a multi-account
+      queue also name the account, `usage --config <toml> --account <name>
+      healthcheck`, once `usage` has `--account`; until then it checks
+      the queue's `[claude].config_dir`. Stop here unless the user wants
+      more.
 
    2. **Broken account settings file** — if `account_errors` is
       non-empty: each entry is an account whose `runner-account.toml`
@@ -272,6 +281,14 @@ or recent failures), follow the prioritized triage flow below.
       as `unanswered_sidecar`.
 
    8. **Hung tasks** — run with `--status possibly_hung`. Report each.
+      One whose `stop_reason` is `worker_still_running` is not stuck: the
+      supervisor parked it because a worker it does not watch was still
+      running (left from before a restart, or alive after it was
+      stopped), so it starts no second worker beside it. `queue holds
+      --json` lists these as `parked_workers`, with whether each still
+      runs and whether it has passed its time limit. While it runs and is
+      within its limit there is nothing to do; to end it sooner, stop it
+      with `kill -TERM -<pid>` (the minus signals its process group).
 
    9. **Recent failures** — `--status failed` and
       `--status failed_circuit_breaker`. Report counts; if non-zero,
@@ -294,9 +311,22 @@ or recent failures), follow the prioritized triage flow below.
          hook asked to wait. The hook runs again once the task's
          `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
          in `[failure_classifier]` (900 s by default) after the deferral.
-         Of the runner's own deferrals, only these set
-         `next_eligible_at`. Give the count and the earliest
-         `next_eligible_at`.
+         Give the count and the earliest `next_eligible_at`.
+       - `cannot start the worker:` (stop reason `worker_start_deferred`)
+         — the worker failed its checks before it was spawned: the
+         account's `config_dir` is missing or cannot be expanded, `sudo`
+         is missing for its `linux_user`, the task's `working_dir` is not
+         trusted or cannot be expanded, or its log files or the spawn
+         itself failed. The rest of the reason names which. Like a hook
+         deferral it sets `next_eligible_at` (`deferral_recheck_cooldown_s`
+         after it) and is tried again once that passes. This needs the
+         operator: give each task with its reason and `next_eligible_at`,
+         and say to fix the named cause; `queue force-dispatch <id>`
+         starts it at once after the fix. The summary words these as
+         "could not start its worker".
+
+         Of the runner's own deferrals, these two set
+         `next_eligible_at`; the readiness and effort holds do not.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,

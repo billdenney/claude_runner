@@ -12,6 +12,8 @@ state writer and leaves every state file as it was.
 from __future__ import annotations
 
 import json
+import subprocess
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -121,6 +123,14 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
         "affinity_ttl_s": 5400.0,
         "queue_cap": None,
         "warming_up": False,
+        "parked_workers": [],
+        "retrying": [
+            {
+                "task_id": "cooldown",
+                "deferred_reason": "pre-dispatch hook deferred (exit 1): waiting",
+                "next_eligible_at": "2027-10-14T12:00:00+00:00",
+            }
+        ],
         "supervisor_json_error": None,
     }
 
@@ -268,3 +278,109 @@ def test_warm_up_cap_until_a_task_completes(queue: Path) -> None:
 def test_poll_interval_comes_from_the_settings(queue: Path) -> None:
     _config(queue, "[usage]\npoll_interval_s = 300\n")
     assert _holds(queue)["poll_interval_s"] == 300.0
+
+
+@pytest.fixture
+def worker(tmp_path: Path) -> Iterator[Callable[[Path], int]]:
+    """Start a stand-in worker writing to ``log``, as the dispatcher's
+    workers write to their attempt's log. Killed at teardown."""
+    children: list[subprocess.Popen[bytes]] = []
+
+    def start(log: Path) -> int:
+        with log.open("wb") as out:
+            child = subprocess.Popen(["sleep", "600"], stdout=out, start_new_session=True)
+        children.append(child)
+        return child.pid
+
+    yield start
+    for child in children:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def _exited_pid() -> int:
+    child = subprocess.Popen(["true"])
+    child.wait(timeout=10)
+    return child.pid
+
+
+def _parked(queue: Path, task_id: str, pid: int, log: Path | None, started: datetime) -> None:
+    add_state(
+        queue,
+        task_id,
+        "possibly_hung",
+        stop_reason="worker_still_running",
+        pid=pid,
+        log_path=None if log is None else str(log),
+        last_started_at=started,
+        error=f"worker pid={pid} is still running at startup; parked",
+    )
+
+
+def test_parked_workers_and_retry_reasons(
+    queue: Path, tmp_path: Path, worker: Callable[[Path], int]
+) -> None:
+    """Of the possibly_hung tasks, those parked while an unwatched worker
+    ran carry the worker: still running or not, and past the task's time
+    limit or not (here a 5-minute override, and the 4-hour default). The
+    deferred_cooldown tasks carry their reasons."""
+    _config(queue)
+    started = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    logs = {name: tmp_path / f"{name}.log" for name in ("within", "past")}
+    pids = {name: worker(log) for name, log in logs.items()}
+    add_task(queue, "within")
+    _parked(queue, "within", pids["within"], logs["within"], started)
+    add_task(queue, "past", max_duration_s_override=300)
+    _parked(queue, "past", pids["past"], logs["past"], started)
+    add_task(queue, "exited")
+    gone = _exited_pid()
+    _parked(queue, "exited", gone, None, started)
+    add_task(queue, "silent")
+    add_state(queue, "silent", "possibly_hung", stop_reason="silent_on_restart")
+    due = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=15)
+    add_task(queue, "no-config-dir")
+    add_state(
+        queue,
+        "no-config-dir",
+        "deferred",
+        stop_reason="worker_start_deferred",
+        deferred_reason="cannot start the worker: config_dir /gone does not exist",
+        next_eligible_at=due,
+    )
+
+    holds = _holds(queue)
+    assert holds["held"] == {"deferred_cooldown": 1, "possibly_hung": 4}
+    at = started.isoformat()
+    assert holds["parked_workers"] == [
+        {
+            "task_id": "exited",
+            "pid": gone,
+            "started_at": at,
+            "running": False,
+            "duration_cap_s": 14400.0,
+            "past_cap": False,
+        },
+        {
+            "task_id": "past",
+            "pid": pids["past"],
+            "started_at": at,
+            "running": True,
+            "duration_cap_s": 300.0,
+            "past_cap": True,
+        },
+        {
+            "task_id": "within",
+            "pid": pids["within"],
+            "started_at": at,
+            "running": True,
+            "duration_cap_s": 14400.0,
+            "past_cap": False,
+        },
+    ]
+    assert holds["retrying"] == [
+        {
+            "task_id": "no-config-dir",
+            "deferred_reason": "cannot start the worker: config_dir /gone does not exist",
+            "next_eligible_at": due.isoformat(),
+        }
+    ]
