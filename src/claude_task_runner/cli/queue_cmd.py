@@ -40,13 +40,14 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
+from claude_task_runner.config import loader as config_loader
 from claude_task_runner.config.loader import ConfigError, load_settings
 from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     QueueIOError,
     QueueSchemaError,
+    iter_state_files,
     list_pending_tasks,
-    list_state_files,
     load_state,
     load_task,
     queue_runtime_dir,
@@ -351,7 +352,9 @@ def list_states(
     qd = require_queue_option(queue_dir, console, json=json)
     filter_set = set(status_filter)
     out: list[dict[str, object]] = []
-    for path in list_state_files(qd):
+    # Read-only: a queue whose supervisor never ran has no state directory,
+    # and listing its states must not create one.
+    for path in iter_state_files(qd):
         payload = _safe_load_state(path)
         if payload is None:
             out.append({"id": path.stem, "path": str(path), "error": "unparseable"})
@@ -415,45 +418,67 @@ def holds(
     """Show what can start now and what holds the rest.
 
     Runs the supervisor's own candidate selection once, read-only: no task
-    is parked or un-parked and no state file is written. The tasks in flight
+    is parked or un-parked, no session is cleared, and nothing is written
+    or created under the queue. The tasks in flight and the account states
     are the ones ``supervisor.json`` records.
 
     Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
     (it starts as soon as an account has a free slot), ``held`` under the
     category that holds it (``block_dispatch``, ``depends_on``,
     ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
-    status such as ``possibly_hung``, ...), or ``completed``.
-    ``poll_interval_s`` is how often the supervisor runs this selection, and
-    ``queue_cap`` the queue-wide cap on tasks in flight now (the warm-up
-    cap while ``warming_up``), ``null`` when there is none.
+    status such as ``possibly_hung``, ...), or ``completed``. Of the
+    eligible, ``can_start_now`` have an account that takes them now, and
+    ``waiting_for_their_account`` are held to the account their session
+    runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
+    lets another. ``poll_interval_s`` is how often the supervisor runs this
+    selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
+    (the warm-up cap while ``warming_up``), ``null`` when there is none.
+
+    \b
+    Exit codes:
+      0  listed
+      1  the queue TOML could not be read ("ok": false), which may clear up
+      2  --queue is not an existing directory
+     78  the queue TOML's content is wrong ("ok": false)
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
-    settings = load_settings(resolve_per_queue_config(config, qd))
-    state_path = persist_mod.supervisor_state_path(qd, settings.supervisor.state_file)
+    try:
+        settings = config_loader.load_settings(resolve_per_queue_config(config, qd))
+    except config_loader.ConfigError as exc:
+        message = f"configuration error: {exc}"
+        if json:
+            print(_json.dumps({"ok": False, "error": message}))
+        else:
+            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        # 78 (EX_CONFIG) for content that is wrong; 1 for a file that could
+        # not be read and may come back, where the loader can tell.
+        raise typer.Exit(code=1 if getattr(exc, "transient", True) else 78) from exc
+    state_path = persist_mod.supervisor_state_file(qd, settings.supervisor.state_file)
     snapshot_error: str | None = None
     try:
         snapshot = persist_mod.load(state_path)
     except persist_mod.SupervisorPersistenceError as exc:
         snapshot, snapshot_error = None, str(exc)
-    in_flight_ids = {r.task_id for r in snapshot.in_flight} if snapshot is not None else set()
-    preview = orch_mod.preview_selection(
-        qd, settings, in_flight_ids=in_flight_ids, now=RealClock().now()
-    )
+    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=RealClock().now())
     held = {k: n for k, n in sorted(preview.skips.items()) if k != "completed"}
     by_status: dict[str, int] = {}
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
+    can_start_now = sum(1 for account in preview.routes.values() if account is not None)
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
             "task_ids": [t.id for t in preview.eligible],
             "by_status": dict(sorted(by_status.items())),
+            "can_start_now": can_start_now,
+            "waiting_for_their_account": len(preview.affinity_held),
         },
         "held": held,
         "completed": preview.skips.get("completed", 0),
         "todo_tasks": len(preview.eligible) + sum(preview.skips.values()),
         "poll_interval_s": settings.usage.poll_interval_s,
+        "affinity_ttl_s": settings.dispatch.affinity_ttl_seconds,
         "queue_cap": preview.queue_cap,
         "warming_up": preview.warming_up,
         "supervisor_json_error": snapshot_error,
@@ -461,12 +486,26 @@ def holds(
     if json:
         print(_json.dumps(payload, indent=2))
         return
-    console.print(f"[bold]eligible now:[/] {len(preview.eligible)}", highlight=False)
+    console.print(
+        f"[bold]eligible:[/] {len(preview.eligible)} ({can_start_now} can start now, "
+        f"{len(preview.affinity_held)} waiting for the account their session runs on)",
+        highlight=False,
+    )
     for task in preview.eligible:
-        console.print(f"  {task.id} ({preview.eligible_statuses[task.id]})", highlight=False)
+        route = preview.routes[task.id] or "no account now"
+        console.print(
+            f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})", highlight=False
+        )
     for category, n in held.items():
         console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
     console.print(f"[bold]completed:[/] {payload['completed']}", highlight=False)
+    cap = "none" if preview.queue_cap is None else str(preview.queue_cap)
+    if preview.warming_up:
+        cap += " (warm-up, until a first task completes)"
+    console.print(f"[bold]queue-wide cap:[/] {cap}", highlight=False)
+    console.print(
+        f"[bold]selection runs every:[/] {settings.usage.poll_interval_s:g} s", highlight=False
+    )
     if snapshot_error:
         console.print(
             f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",

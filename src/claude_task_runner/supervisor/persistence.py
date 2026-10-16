@@ -46,7 +46,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from claude_task_runner.queue.store import queue_runtime_dir
+from claude_task_runner.queue.store import queue_runtime_dir, runtime_path
 from claude_task_runner.supervisor.states import (
     SUPERVISOR_SCHEMA_VERSION,
     AccountState,
@@ -57,6 +57,12 @@ from claude_task_runner.supervisor.states import (
 
 class SupervisorPersistenceError(ValueError):
     """Reading or writing ``supervisor.json`` failed."""
+
+
+def supervisor_state_file(queue_dir: Path, state_file: str = "supervisor.json") -> Path:
+    """Like :func:`supervisor_state_path`, without creating the runtime
+    directory, for a caller that only reads the snapshot."""
+    return runtime_path(queue_dir) / state_file
 
 
 def supervisor_state_path(queue_dir: Path, state_file: str = "supervisor.json") -> Path:

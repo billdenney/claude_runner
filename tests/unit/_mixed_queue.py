@@ -6,11 +6,15 @@ fixture must classify the same way through both.
 
 from __future__ import annotations
 
+import functools
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
+import pytest
+
+from claude_task_runner.queue import store as store_mod
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.sidecar import write_response
 from claude_task_runner.queue.store import (
@@ -20,6 +24,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import orchestrator as orchestrator_mod
 
 from ._sidecar_files import make_request, make_response, write_request
 
@@ -42,7 +47,8 @@ def add_state(qd: Path, task_id: str, status: str, **fields: Any) -> None:
 
 def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     """One task per way the selector can hold a task, plus completed and
-    eligible ones. ``missing_file`` is an absolute path that does not exist,
+    eligible ones, two of them (:data:`STALE_HOLDS`) still parked by a hold
+    that has cleared. ``missing_file`` is an absolute path that does not exist,
     so two copies of this queue write identical readiness reasons. The task
     ``inflight`` is in flight only for a caller that says so. The cooldowns
     are a year either side of :data:`NOW`, so a real clock sees the same."""
@@ -115,6 +121,25 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     write_request(qd, make_request("sidecar-answered"))
     write_response(qd, make_response("sidecar-answered"))
 
+    # Eligible, and parked by a hold that has since cleared: the live
+    # selector un-parks each (a state write); a read-only one must not.
+    # Their reasons are the gates' own, without a cooldown.
+    add_task(qd, "effort-fixed")
+    add_state(
+        qd,
+        "effort-fixed",
+        "deferred",
+        deferred_reason="invalid effort: claude-sonnet-4-6 does not accept effort 'max'",
+    )
+    (qd / "arrived.md").write_text("here now\n", encoding="utf-8")
+    add_task(qd, "file-arrived", requires=[{"kind": "file", "path": "arrived.md"}])
+    add_state(
+        qd,
+        "file-arrived",
+        "deferred",
+        deferred_reason="readiness hold: file arrived.md does not exist",
+    )
+
 
 MIXED_EXPECTED_SKIPS = Counter(
     {
@@ -136,4 +161,45 @@ MIXED_EXPECTED_SKIPS = Counter(
         "completed": 2,
     }
 )
-MIXED_EXPECTED_ELIGIBLE = ["cooldown-over", "ready", "sidecar-answered"]
+MIXED_EXPECTED_ELIGIBLE = [
+    "cooldown-over",
+    "effort-fixed",
+    "file-arrived",
+    "ready",
+    "sidecar-answered",
+]
+STALE_HOLDS = ("effort-fixed", "file-arrived")
+"""The eligible tasks whose state still carries a gate's cleared hold."""
+
+
+SELECTOR_WRITERS = (
+    "write_state_atomic",
+    "state_path_for",
+    "_park_deferred",
+    "_unpark",
+    "_clear_session_for_fresh_dispatch",
+)
+"""Every name through which the selector writes a task's state or creates
+its directory: the gates' park and un-park, the expired-affinity session
+clear, and the store functions they call."""
+
+
+def _refuse(calls: list[str], name: str, *_args: object, **_kwargs: object) -> NoReturn:
+    calls.append(name)
+    raise AssertionError(f"a read-only selection called {name}")
+
+
+def forbid_selector_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make each of :data:`SELECTOR_WRITERS`, and the store's state writer,
+    record its name and raise. The selector swallows a failed write, so the
+    returned list, not an exception, is what a read-only caller asserts
+    stays empty."""
+    calls: list[str] = []
+    for name in SELECTOR_WRITERS:
+        monkeypatch.setattr(orchestrator_mod, name, functools.partial(_refuse, calls, name))
+    monkeypatch.setattr(
+        store_mod,
+        "write_state_atomic",
+        functools.partial(_refuse, calls, "store.write_state_atomic"),
+    )
+    return calls

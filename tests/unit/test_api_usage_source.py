@@ -20,10 +20,13 @@ Coverage:
 
 from __future__ import annotations
 
+import ast
+import functools
 import json
 import logging
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -42,10 +45,13 @@ from claude_task_runner.usage.api_source import (
     _read_oauth_token,
 )
 from claude_task_runner.usage.drift import (
+    AUTH_FAILURE_MARKERS,
     UsageApiAuthExpired,
     UsageApiHeaderMissing,
     UsageApiNetworkError,
     UsageFormatDrift,
+    auth_failure_message,
+    usage_error_kind,
 )
 from claude_task_runner.usage.models import UsageReading
 from claude_task_runner.usage.source import (
@@ -610,3 +616,153 @@ def test_safe_poll_returns_drift_for_unrepresentable_header_value(
         result = safe_poll(api)
     assert isinstance(result, UsageApiHeaderMissing)
     assert header in str(result)
+
+
+# ---------------------------------------------------------------------------
+# How a recorded failure reads: a login to renew (auth) or a changed usage
+# page (format). ``account list`` and /runner-status tell the operator which
+# to fix from the recorded message alone.
+# ---------------------------------------------------------------------------
+
+
+def _raised(call: Callable[[], object]) -> Exception:
+    try:
+        call()
+    except Exception as exc:
+        return exc
+    raise AssertionError("expected an exception")
+
+
+def _rejected(tmp_path: Path, code: int) -> Exception:
+    src = ApiUsageSource(FakeClock(start=datetime.now(UTC)), config_dir=_make_creds(tmp_path))
+    err = urllib.error.HTTPError(
+        ANTHROPIC_API_URL,
+        code,
+        "Unauthorized",
+        hdrs=None,
+        fp=None,  # type: ignore[arg-type]
+    )
+    with patch("urllib.request.urlopen", side_effect=err):
+        return _raised(src.read)
+
+
+def _no_credentials(tmp_path: Path) -> Exception:
+    src = ApiUsageSource(FakeClock(start=datetime.now(UTC)), config_dir=str(tmp_path / "none"))
+    return _raised(src.read)
+
+
+def _credentials(tmp_path: Path, text: str) -> Exception:
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / ".credentials.json").write_text(text, encoding="utf-8")
+    return _raised(functools.partial(_read_oauth_token, str(config_dir)))
+
+
+LOGIN_FAILURES: dict[str, Callable[[Path], Exception]] = {
+    "rejected-401": functools.partial(_rejected, code=401),
+    "rejected-403": functools.partial(_rejected, code=403),
+    "no-credentials-file": _no_credentials,
+    "credentials-not-json": functools.partial(_credentials, text="not json {"),
+    "no-token-in-credentials": functools.partial(_credentials, text='{"other": {}}'),
+}
+"""Each way the API source reports a login failure, as it raises it."""
+
+
+@pytest.mark.parametrize("make", LOGIN_FAILURES.values(), ids=list(LOGIN_FAILURES))
+def test_each_login_failure_is_recorded_whole_as_auth(
+    make: Callable[[Path], Exception], tmp_path: Path
+) -> None:
+    exc = make(tmp_path)
+    assert isinstance(exc, UsageApiAuthExpired)
+    assert auth_failure_message(exc) == str(exc)
+    assert usage_error_kind(str(exc)) == "auth"
+
+
+def test_a_login_failure_without_a_marker_gets_one() -> None:
+    assert auth_failure_message(UsageApiAuthExpired("HTTP 401")) == "OAuth login failed: HTTP 401"
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        "OAuth bearer rejected by https://api.anthropic.com/v1/messages (HTTP 401)",
+        "OAuth bearer rejected: OAuth bearer rejected by https://api.anthropic.com/v1/messages "
+        "(HTTP 401)",
+        "could not read /home/u/.claude/.credentials.json: [Errno 13] Permission denied",
+    ],
+    ids=["unprefixed", "earlier-prefix", "credentials-file"],
+)
+def test_messages_an_earlier_supervisor_recorded_read_as_auth(recorded: str) -> None:
+    assert usage_error_kind(recorded) == "auth"
+
+
+def _header_drift(headers: dict[str, str]) -> Exception:
+    return _raised(
+        functools.partial(_headers_to_reading, headers, datetime(2026, 5, 21, tzinfo=UTC))
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"anthropic-ratelimit-unified-5h-utilization": None},
+        {"anthropic-ratelimit-unified-7d-reset": None},
+        {"anthropic-ratelimit-unified-5h-utilization": "high"},
+        {"anthropic-ratelimit-unified-7d-utilization": "nan"},
+        {"anthropic-ratelimit-unified-5h-utilization": "42.5"},
+        {"anthropic-ratelimit-unified-5h-reset": "soon"},
+        {"anthropic-ratelimit-unified-7d-reset": "1e400"},
+    ],
+    ids=[
+        "missing",
+        "missing-reset",
+        "unparseable",
+        "non-finite",
+        "out-of-range",
+        "bad-reset",
+        "unrepresentable-reset",
+    ],
+)
+def test_each_header_drift_reads_as_format(change: dict[str, str | None]) -> None:
+    headers = {k: v for k, v in {**_VALID_HEADERS, **change}.items() if v is not None}
+    exc = _header_drift(headers)
+    assert isinstance(exc, UsageFormatDrift)
+    assert usage_error_kind(str(exc)) == "format"
+
+
+USAGE_SOURCES = Path(__file__).parents[2] / "src" / "claude_task_runner" / "usage"
+NOT_LOGIN_FAILURES = {
+    "UsageFormatDrift",
+    "UsageApiHeaderMissing",
+    "UsageCaptureTimeout",
+    "UsageApiNetworkError",
+    "UsageCaptureSpawnError",
+}
+"""The usage errors that are not a login failure."""
+
+
+def _literal_text(node: ast.expr) -> str:
+    """The literal parts of a message argument: constants and f-string text."""
+    return "".join(
+        part.value
+        for part in ast.walk(node)
+        if isinstance(part, ast.Constant) and isinstance(part.value, str)
+    )
+
+
+def test_no_other_usage_error_names_a_marker() -> None:
+    """A drift or network message that named a marker would read as a login
+    to renew. Scans every ``raise`` of those errors under usage/."""
+    raised: dict[str, str] = {}
+    for path in sorted(USAGE_SOURCES.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not (isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)):
+                continue
+            func = node.exc.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name in NOT_LOGIN_FAILURES:
+                text = " ".join(_literal_text(arg) for arg in node.exc.args)
+                raised[f"{path.name}:{node.lineno}"] = text
+    assert len(raised) >= 10, raised
+    named = {where: text for where, text in raised.items() if usage_error_kind(text) == "auth"}
+    assert named == {}, f"markers {AUTH_FAILURE_MARKERS} in {named}"

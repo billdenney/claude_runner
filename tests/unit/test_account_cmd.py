@@ -30,7 +30,9 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
-from claude_task_runner.usage.drift import AUTH_FAILURE_PREFIX
+
+LOGIN_REJECTED = "OAuth bearer rejected by https://api.anthropic.com/v1/messages (HTTP 401)"
+"""The API source's message for a rejected login, as a supervisor records it."""
 
 
 @pytest.fixture
@@ -311,7 +313,7 @@ class TestAccountList:
                 "login": AccountState(
                     state=SupervisorState.ERROR_DRIFT,
                     since=since,
-                    last_drift_message=f"{AUTH_FAILURE_PREFIX}HTTP 401",
+                    last_drift_message=LOGIN_REJECTED,
                 ),
                 "page": AccountState(
                     state=SupervisorState.ERROR_DRIFT,
@@ -334,9 +336,23 @@ class TestAccountList:
         assert {n: by_name[n]["usage_error"] for n in names} == {
             "weekly": None,
             "fivehr": None,
-            "login": {"kind": "auth", "message": "OAuth bearer rejected: HTTP 401"},
+            "login": {"kind": "auth", "message": LOGIN_REJECTED},
             "page": {"kind": "format", "message": "5-hour usage block not found"},
         }
+
+        text = runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
+            env={"COLUMNS": "1000"},
+        )
+        assert text.exit_code == 0, text.output
+        lines = [line.strip() for line in text.stdout.splitlines()]
+        assert [line for line in lines if line.startswith(("resumes about:", "usage error:"))] == [
+            f"resumes about:   {resets - timedelta(hours=104)} (when its weekly use is back "
+            "under plan; scheduled_wakeup_at is only the next re-check)",
+            f"usage error:     {LOGIN_REJECTED} (log it in again)",
+            "usage error:     5-hour usage block not found (the usage page changed)",
+        ]
 
     def test_dispatch_cap_is_max_lowered_to_the_throttle_target(
         self, runner: CliRunner, tmp_path: Path

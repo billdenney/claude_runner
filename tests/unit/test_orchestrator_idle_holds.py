@@ -44,6 +44,7 @@ from claude_task_runner.supervisor import daemon as daemon_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.states import (
     AccountState,
+    InFlightRecord,
     SupervisorSnapshot,
     SupervisorState,
 )
@@ -55,9 +56,11 @@ from ._mixed_queue import (
     MIXED_EXPECTED_ELIGIBLE,
     MIXED_EXPECTED_SKIPS,
     NOW,
+    STALE_HOLDS,
     add_state,
     add_task,
     build_mixed_queue,
+    forbid_selector_writes,
 )
 from ._sidecar_files import make_request, write_request
 
@@ -121,7 +124,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
     eligible = _select(queue_dir, skips)
 
     n_yamls = len(list(todo_dir(queue_dir).glob("*.yaml")))
-    assert n_yamls == 20
+    assert n_yamls == 22
     assert len(eligible) + sum(skips.values()) == n_yamls
 
 
@@ -172,21 +175,34 @@ def _state_bytes(qd: Path) -> dict[str, bytes]:
     return {p.name: p.read_bytes() for p in state_path_for(qd, "x").parent.glob("*.yaml")}
 
 
-def test_preview_is_the_selector_without_its_side_effects(tmp_path: Path) -> None:
+def _in_flight_snapshot(task_id: str) -> SupervisorSnapshot:
+    return SupervisorSnapshot(
+        state=SupervisorState.DISPATCHING,
+        since=NOW,
+        in_flight=[InFlightRecord(task_id=task_id, account="default", started_at=NOW)],
+    )
+
+
+def test_preview_is_the_selector_without_its_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``preview_selection`` admits and counts exactly what a supervisor
-    tick's selection does, and writes nothing. The tick's pass, on a second
-    copy of the queue, does park tasks, so the comparison can tell."""
+    tick's selection does, and writes nothing: it calls no state writer, and
+    the two stale holds stay parked. The tick's pass, on a second copy of
+    the queue, parks the held tasks and un-parks the stale ones, so the
+    byte comparison can tell."""
     missing = tmp_path / "absent" / "paper.md"
     previewed = _queue_copy(tmp_path / "previewed", missing)
     ticked = _queue_copy(tmp_path / "ticked", missing)
     before = _state_bytes(previewed)
+    settings = load_settings(previewed / "claude_runner.toml")
 
-    preview = orchestrator_mod.preview_selection(
-        previewed,
-        load_settings(previewed / "claude_runner.toml"),
-        in_flight_ids={"inflight"},
-        now=NOW,
-    )
+    with monkeypatch.context() as patched:
+        writes = forbid_selector_writes(patched)
+        preview = orchestrator_mod.preview_selection(
+            previewed, settings, snapshot=_in_flight_snapshot("inflight"), now=NOW
+        )
+    assert writes == []
     skips: Counter[str] = Counter()
     ticked_ids = sorted(
         t.id
@@ -204,12 +220,18 @@ def test_preview_is_the_selector_without_its_side_effects(tmp_path: Path) -> Non
     assert preview.skips == skips == MIXED_EXPECTED_SKIPS
     assert preview.eligible_statuses == {
         "cooldown-over": "deferred",
+        "effort-fixed": "deferred",
+        "file-arrived": "deferred",
         "ready": "new",
         "sidecar-answered": "awaiting_sidecar",
     }
     assert (preview.queue_cap, preview.warming_up) == (None, False)
     assert _state_bytes(previewed) == before
-    assert _state_bytes(ticked) != before
+    after_tick = _state_bytes(ticked)
+    for task_id in STALE_HOLDS:
+        assert b"status: pending" in after_tick[f"{task_id}.yaml"]
+        assert b"status: deferred" in before[f"{task_id}.yaml"]
+    assert after_tick != before
 
 
 def test_completed_whichever_check_skips_it(queue_dir: Path) -> None:

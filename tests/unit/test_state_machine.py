@@ -681,9 +681,13 @@ class TestAuthExpired:
             clock,
         )
         assert new.state is SupervisorState.ERROR_DRIFT
-        # The prefix is what lets a status reader say "log in again".
-        assert new.last_drift_message == "OAuth bearer rejected: HTTP 401"
+        # A message without an auth marker gets one, so a status reader can
+        # say "log in again"; one that has a marker is recorded as raised.
+        assert new.last_drift_message == "OAuth login failed: HTTP 401"
         assert usage_error_kind(new.last_drift_message) == "auth"
+        assert [a.message for a in actions if isinstance(a, Notify)] == [
+            "usage login failed: HTTP 401"
+        ]
         action_types = {type(a) for a in actions}
         assert Notify in action_types
         assert StopDispatch in action_types
@@ -720,9 +724,37 @@ class TestAuthExpired:
             clock,
         )
         assert new.state is SupervisorState.ERROR_DRIFT
-        assert "HTTP 401 again" in new.last_drift_message
+        assert new.last_drift_message == "OAuth login failed: HTTP 401 again"
+        assert usage_error_kind(new.last_drift_message) == "auth"
         assert new.consecutive_clean_polls == 0
         assert not any(isinstance(a, Notify) for a in actions)
+
+    @pytest.mark.parametrize("already_drifting", [False, True], ids=["entry", "during-drift"])
+    def test_a_marked_message_is_recorded_as_raised(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+        already_drifting: bool,
+    ) -> None:
+        """The API source's own message names the OAuth bearer, so it is
+        recorded whole, not after a second "OAuth ..." lead."""
+        message = "OAuth bearer rejected by https://api.anthropic.com/v1/messages (HTTP 401)"
+        state = SupervisorState.ERROR_DRIFT if already_drifting else SupervisorState.DISPATCHING
+        new, _ = step(
+            _input(
+                _initial(state),
+                UsageApiAuthExpired(message),
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=2,
+            ),
+            clock,
+        )
+        assert new.last_drift_message == message
+        assert usage_error_kind(new.last_drift_message) == "auth"
 
 
 # ----------------------------------------------------------------------------
