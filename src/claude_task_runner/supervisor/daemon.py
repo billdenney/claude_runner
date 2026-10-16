@@ -1009,6 +1009,9 @@ def start_daemon(
     # Remembers the last "no eligible tasks" summary across ticks so a
     # drained queue logs it once per change, not once per tick.
     idle_log = orch_mod.IdleDispatchLog()
+    # Workers parked with no monitor thread: retry delays, and the parks and
+    # recorded runs queued between ticks (supervisor.adoption).
+    parked_tracker = adoption_mod.ParkedWorkerTracker()
 
     # The handlers go in before the lock is taken, so a stop during startup
     # still reaches the loop's first check, and come out after it is
@@ -1204,9 +1207,11 @@ def start_daemon(
             # have time to mark possibly_hung). Adopted tasks (ADR-0025)
             # are shielded — they have a live worker + monitor thread — and
             # one whose worker still runs unadopted is parked possibly_hung.
-            snapshot, orphan_ids = reconcile_mod.reconcile_orphans(
+            snapshot, orphan_ids, parked = reconcile_mod.reconcile_orphans(
                 queue_dir, snapshot, adopted_ids=adopted_ids
             )
+            for p in parked:
+                reconcile_mod.report_park(p, notify_callback, event_callback)
             if orphan_ids:
                 logger.info(
                     "reconciled %d orphan task(s) for session resume: %s",
@@ -1430,6 +1435,7 @@ def start_daemon(
                         event_callback=event_callback,
                         spawn_gate=spawn_gate,
                         idle_log=idle_log,
+                        parked_tracker=parked_tracker,
                     )
                     persist_mod.write_atomic(snapshot, state_path)
                 except Exception:

@@ -1312,6 +1312,7 @@ class TestForceDispatchReadinessGate:
             settings=ANY,
             clock=ANY,
             claude_executable="claude",
+            allow_live_worker=False,
         )
         assert fd_mod.list_requests(queue_dir) == []
 

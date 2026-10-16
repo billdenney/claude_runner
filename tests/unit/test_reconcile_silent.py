@@ -95,7 +95,9 @@ def test_silent_running_flipped_to_possibly_hung(tmp_path: Path) -> None:
     _seed_running(qd, "t-silent", started_at=started, pid=4321, session_id="sess-1")
 
     clock = FakeClock(_now())
-    results = reconcile_silent_orphans(qd, settings=_settings(alert=300), clock=clock)
+    results = reconcile_silent_orphans(
+        qd, settings=_settings(alert=300), clock=clock, worker_probe_fn=probes(WorkerProbe.DEAD)
+    )
 
     assert len(results) == 1
     r = results[0]
@@ -109,9 +111,9 @@ def test_silent_running_flipped_to_possibly_hung(tmp_path: Path) -> None:
     assert reloaded.status == "possibly_hung"
     assert reloaded.stop_reason == SILENT_STOP_REASON
     assert reloaded.error == (
-        "silent_on_restart: 600s without a heartbeat, worker log write or monitor "
-        "tick (heartbeat_silence_alert_s=300); worker pid=4321 was not signalled "
-        "and may still be running"
+        "silent_on_restart: no sign of life within heartbeat_silence_alert_s=300 "
+        "(agent heartbeat none this attempt, monitor tick none this attempt, worker "
+        "log write none this attempt); its worker pid=4321 is gone"
     )
     # pid cleared on demotion; the error names it.
     assert reloaded.pid is None

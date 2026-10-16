@@ -116,6 +116,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
         "are marked running but not tracked by the supervisor",
     ),
     "possibly_hung": ("looks stuck", "look stuck"),
+    "live_worker": (
+        "still has a worker running from an earlier attempt",
+        "still have a worker running from an earlier attempt",
+    ),
     "failed_circuit_breaker": (
         "stopped after repeated failures",
         "stopped after repeated failures",
@@ -138,6 +142,7 @@ _HELD_ORDER = (
     "weekly_paused",
     "invalid_effort",
     "possibly_hung",
+    "live_worker",
     "failed_circuit_breaker",
     "running",
     "unparseable_task",

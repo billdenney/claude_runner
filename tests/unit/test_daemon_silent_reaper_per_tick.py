@@ -97,7 +97,7 @@ def test_per_tick_reap_runs_every_tick_by_default(
 
     call_count = {"n": 0}
 
-    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock, sigterm_fn=None):
+    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock):
         call_count["n"] += 1
         return []
 
@@ -145,7 +145,7 @@ def test_per_tick_reap_results_surface_to_callbacks(
         sigtermed=True,
     )
 
-    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock, sigterm_fn=None):
+    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock):
         return [fake_result]
 
     monkeypatch.setattr(rs_mod, "reap_silent_orphans_tick", fake_reap)
@@ -204,7 +204,7 @@ def test_per_tick_reap_interval_throttles_calls(
 
     call_count = {"n": 0}
 
-    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock, sigterm_fn=None):
+    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock):
         call_count["n"] += 1
         return []
 
@@ -250,7 +250,7 @@ def test_per_tick_reap_skipped_during_drain(
 
     call_count = {"n": 0}
 
-    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock, sigterm_fn=None):
+    def fake_reap(queue_dir, in_flight_task_ids, *, settings, clock):
         call_count["n"] += 1
         return []
 

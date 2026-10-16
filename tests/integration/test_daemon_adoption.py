@@ -203,11 +203,33 @@ def test_daemon_kill_switch_adopts_nothing(
         lambda **_kw: (_ for _ in ()).throw(AssertionError("adoption disabled")),
     )
 
-    _run_daemon(qd, _settings(adopt=False), monkeypatch)
+    notifications, events = _run_daemon(qd, _settings(adopt=False), monkeypatch)
 
     reloaded = load_state(state_path_for(qd, "t-off"))
     assert reloaded.status == status
     assert reloaded.stop_reason == stop_reason
+    # A park is reported to the operator; a demotion is not.
+    parked_notes = [
+        (lvl, msg) for lvl, msg in notifications if "still running and was not adopted" in msg
+    ]
+    parked_events = [(k, p) for k, p in events if k == "live_worker_parked"]
+    if alive:
+        assert parked_notes == [
+            (
+                "warning",
+                "task t-off: worker pid=4321 is still running and was not adopted; "
+                "parked possibly_hung, not dispatched again",
+            )
+        ]
+        assert parked_events == [
+            (
+                "live_worker_parked",
+                {"task_id": "t-off", "pid": 4321, "log_path": reloaded.log_path},
+            )
+        ]
+    else:
+        assert parked_notes == []
+        assert parked_events == []
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +497,9 @@ def test_daemon_adopts_real_worker_in_a_long_tool_call(
     qd = _queue(tmp_path)
     now = datetime.now(UTC)
     log = qd / ".claude_task_runner" / "logs" / "t-tool" / "attempt-1.stream.jsonl"
-    pid = spawn_file_worker(log, {"WORKER_SESSION_ID": "sess-real", "WORKER_HOLD_S": "2"})
+    # Long enough that a slow start-up still finds the worker running, so it
+    # is adopted rather than recorded as exited.
+    pid = spawn_file_worker(log, {"WORKER_SESSION_ID": "sess-real", "WORKER_HOLD_S": "10"})
     signal_gate.allow(pid)
     _wait_for_lines(log, 2)
     _seed_real_worker(qd, "t-tool", pid=pid, log=log, now=now)
@@ -490,7 +514,7 @@ def test_daemon_adopts_real_worker_in_a_long_tool_call(
     assert ("worker_adopted", {"task_id": "t-tool", "pid": pid, "log_path": str(log)}) in events
     assert load_state(state_path_for(qd, "t-tool")).status == "running"
     thread = _adoption_thread("t-tool")
-    thread.join(timeout=20)
+    thread.join(timeout=40)
     assert not thread.is_alive()
     final = load_state(state_path_for(qd, "t-tool"))
     assert final.status == "completed"
@@ -507,8 +531,10 @@ def test_daemon_parks_real_worker_with_no_sign_of_life(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Heartbeat, monitor tick and log write all 9 minutes old, but the
-    worker runs. The startup reaper parks the task possibly_hung, naming
-    the pid; it is not set failed, and the worker is not signalled."""
+    worker runs. The startup reaper parks the task possibly_hung with the
+    worker on record (worker_still_running), so it holds its slot and its
+    run is recorded once it exits; it is not set failed, and the worker is
+    not signalled."""
     qd = _queue(tmp_path)
     now = datetime.now(UTC)
     log = qd / ".claude_task_runner" / "logs" / "t-quiet" / "attempt-1.stream.jsonl"
@@ -529,18 +555,22 @@ def test_daemon_parks_real_worker_with_no_sign_of_life(
             _notifications, events = _run_daemon(qd, _settings(), monkeypatch, clock=FakeClock(now))
 
         parked = load_state(state_path_for(qd, "t-quiet"))
-        assert parked.status == "possibly_hung"
-        assert parked.stop_reason == "silent_on_restart"
+        assert (parked.status, parked.stop_reason, parked.pid) == (
+            "possibly_hung",
+            LIVE_WORKER_STOP_REASON,
+            pid,
+        )
         assert parked.error == (
-            "silent_on_restart: 540s without a heartbeat, worker log write or monitor "
-            f"tick (heartbeat_silence_alert_s=300); worker pid={pid} was not signalled "
-            "and may still be running"
+            f"worker pid={pid} is still running but showed no sign of life within "
+            "heartbeat_silence_alert_s=300 (agent heartbeat 540s ago, monitor tick 540s "
+            "ago, worker log write 540s ago); parked so the task is not dispatched again "
+            "while it runs"
         )
         assert not any(kind == "worker_adopted" for kind, _payload in events)
         assert (
             "claude_task_runner.supervisor.reconcile_silent",
             f"reaped silent orphan task t-quiet: verdict=silent silence=540s pid={pid} "
-            "sigtermed=False new_status=possibly_hung stop_reason=silent_on_restart",
+            "sigtermed=False new_status=possibly_hung stop_reason=worker_still_running",
         ) in [(r.name, r.getMessage()) for r in caplog.records if r.levelno == logging.WARNING]
         assert dispatcher_mod.probe_worker(pid, log_path=str(log), started_at=None) is (
             dispatcher_mod.WorkerProbe.ALIVE

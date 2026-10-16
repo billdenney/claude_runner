@@ -50,7 +50,7 @@ from claude_task_runner.supervisor.reconcile_silent import (
     reconcile_silent_orphans,
 )
 
-from ._worker_probe_stubs import worker_alive
+from ._worker_probe_stubs import worker_alive, worker_gone
 
 
 def _queue(tmp_path: Path) -> Path:
@@ -246,6 +246,7 @@ def test_dispatcher_alive_one_second_past_alert_falls_through(tmp_path: Path) ->
         {"t-alive-past-alert"},
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
+        worker_probe_fn=worker_gone,
     )
 
     assert results == [
@@ -263,9 +264,9 @@ def test_dispatcher_alive_one_second_past_alert_falls_through(tmp_path: Path) ->
             "stop_reason": STEADY_SILENT_STOP_REASON,
             "pid": None,
             "error": (
-                "silent_steady_state: 500s without a heartbeat, worker log write or "
-                "monitor tick (heartbeat_silence_alert_s=300); worker pid=7 was not "
-                "signalled and may still be running"
+                "silent_steady_state: no sign of life within heartbeat_silence_alert_s=300 "
+                "(agent heartbeat 500s ago, monitor tick 301s ago, worker log write none "
+                "this attempt); its worker pid=7 is gone"
             ),
         }
     )
@@ -495,6 +496,7 @@ def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None
         settings=_settings(alert=300, kill=0, fs_window=600),
         clock=FakeClock(_now()),
         fs_mtime_fn=lambda _path: mtime.timestamp(),
+        worker_probe_fn=worker_gone,
     )
 
     assert results == [
@@ -512,9 +514,9 @@ def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None
             "stop_reason": STEADY_SILENT_STOP_REASON,
             "pid": None,
             "error": (
-                "silent_steady_state: 2000s without a heartbeat, worker log write or "
-                "monitor tick (heartbeat_silence_alert_s=300); worker pid=42 was not "
-                "signalled and may still be running"
+                "silent_steady_state: no sign of life within heartbeat_silence_alert_s=300 "
+                "(agent heartbeat 2000s ago, monitor tick none this attempt, worker log "
+                "write none this attempt); its worker pid=42 is gone"
             ),
         }
     )
@@ -814,6 +816,7 @@ def test_steady_silent_stop_reason_used_when_no_fs_evidence(tmp_path: Path) -> N
         settings=_settings(alert=300, kill=0),
         clock=FakeClock(_now()),
         fs_mtime_fn=no_activity,
+        worker_probe_fn=worker_gone,
     )
 
     assert len(results) == 1

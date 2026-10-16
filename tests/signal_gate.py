@@ -25,7 +25,7 @@ Signal-0 probes pass through.
 The gate also fails a test whose code runs the reaper's stuck-sleep-loop
 scan over the real ``/proc`` from a pid the test did not start, since a
 match there leads straight to a kill. A test that seeds a borrowed pid must
-inject ``stuck_loop_detect_fn``, ``terminate_fn`` and ``sigterm_fn``, or set
+inject ``stuck_loop_detect_fn`` and ``terminate_fn``, or set
 ``bash_poll_antipattern_kill`` to false. A test that needs a live worker
 uses :func:`live_worker_pid`.
 """
@@ -143,8 +143,8 @@ class SignalGate:
         if not self._started_by_test(pid):
             self._block(
                 f"the stuck-sleep-loop scan walked the real /proc from pid {pid}, which this "
-                "test did not start; inject stuck_loop_detect_fn, terminate_fn and "
-                "sigterm_fn, or set bash_poll_antipattern_kill=False"
+                "test did not start; inject stuck_loop_detect_fn and terminate_fn, or set "
+                "bash_poll_antipattern_kill=False"
             )
 
     def _started_by_test(self, pid: int) -> bool:

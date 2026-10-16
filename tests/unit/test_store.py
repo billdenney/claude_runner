@@ -891,3 +891,20 @@ class TestRetiredEffortSpellings:
             {"id": "t1", "title": "T", "prompt": "p", "effort": "extra_high"}
         )
         assert task.effort == "extra_high"
+
+
+def test_state_drops_the_retired_spawn_identity_keys(tmp_path: Path) -> None:
+    """A state written with the spawn identity inline (it now lives beside
+    the stream log) still loads, without those keys, and is written back
+    without them."""
+    path = tmp_path / "t.yaml"
+    path.write_text(
+        "schema_version: 2\ntask_id: t\nstatus: running\npid: 4242\n"
+        "worker_boot_id: 5b0d3a5e-2f1c-4c55-9a3e-8d6f2b7c1e44\nworker_start_ticks: 91641447\n"
+    )
+    state = load_state(path)
+    assert (state.task_id, state.status, state.pid) == ("t", "running", 4242)
+    write_state_atomic(state, path)
+    text = path.read_text()
+    assert "worker_boot_id" not in text
+    assert "worker_start_ticks" not in text

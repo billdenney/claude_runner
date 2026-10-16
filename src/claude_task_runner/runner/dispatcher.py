@@ -41,11 +41,14 @@ ProcessPoolExecutor) when ``target_concurrency > 1``.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
@@ -371,6 +374,12 @@ def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
 _STDERR_TAIL_BYTES = 500
 
 
+def task_logs_dir(queue_dir: Path, task_id: str) -> Path:
+    """``<queue>/.claude_task_runner/logs/<task_id>``, where a task's
+    attempts write their stream logs (ADR-0025). Not created here."""
+    return queue_dir / ".claude_task_runner" / "logs" / task_id
+
+
 def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Path, Path]:
     """Return ``(stdout_log, stderr_log)`` for one file-backed attempt.
 
@@ -380,7 +389,7 @@ def _attempt_log_paths(queue_dir: Path, task_id: str, attempt: int) -> tuple[Pat
     directory is created if missing. ``attempt`` is the 1-based attempt
     number already stored on ``TaskState.attempts`` for this run.
     """
-    logs_dir = queue_dir / ".claude_task_runner" / "logs" / task_id
+    logs_dir = task_logs_dir(queue_dir, task_id)
     logs_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = logs_dir / f"attempt-{attempt}.stream.jsonl"
     stderr_log = _stderr_path_for_stdout_log(stdout_log)
@@ -581,13 +590,22 @@ start may read and still be its worker. :func:`dispatch` records
 absorbs clock steps."""
 
 
-def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None) -> WorkerProbe:
-    """Whether the worker recorded on a task's state as ``pid`` still runs.
+def probe_worker(
+    pid: int,
+    *,
+    log_path: str | None,
+    started_at: datetime | None,
+    boot_id: str | None = None,
+    start_ticks: int | None = None,
+) -> WorkerProbe:
+    """Whether the worker recorded as ``pid`` still runs.
 
-    Every pass that acts on a recorded worker asks this, so they agree on
-    whether it runs: the startup exited-worker finalize and adoption, an
-    adoption monitor's tail, the silent-orphan reapers, ``reconcile_orphans``
-    and the orchestrator's leak check. :func:`_pid_alive` says only that some
+    Every pass that acts on a recorded worker asks this, through
+    :func:`probe_recorded_worker` where it has the task's state, so they
+    agree on whether it runs: the startup exited-worker finalize and
+    adoption, an adoption monitor's tail, the silent-orphan reapers,
+    ``reconcile_orphans``, the parked-worker pass, the dispatch guards and
+    the orchestrator's leak check. :func:`_pid_alive` says only that some
     process has the pid. After a reboot, or once pids wrap, that can be a
     different process, which a reaper would then signal and adoption would
     watch in place of the worker.
@@ -600,23 +618,27 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
        the same file (device and inode) for the worker and not for anything
        else. This settles it when both can be read, which needs the worker
        to run as this user.
-    3. With ``started_at`` (the state's ``last_started_at``): the process
-       must have started within :data:`WORKER_START_SLACK_BEFORE_S` before
-       and :data:`WORKER_START_SLACK_AFTER_S` after it, in the current boot.
+    3. With ``boot_id`` and ``start_ticks`` (recorded at the spawn): the
+       process must be in that boot and have started at exactly that tick.
        This covers a worker under another Linux user (``sudo``, whose fd
-       table is unreadable) and a pipe-backed one (no log).
+       table is unreadable) and a pipe-backed one (no log), and no clock
+       step moves either value.
+    4. Otherwise, with ``started_at`` (the state's ``last_started_at``),
+       for a state recorded without (3): the process must have started in
+       the current boot, within :data:`WORKER_START_SLACK_BEFORE_S` before
+       and :data:`WORKER_START_SLACK_AFTER_S` after it.
 
     A check that fails proves :attr:`~WorkerProbe.REUSED`, logged at
     WARNING. When ``/proc/<pid>/stat`` cannot be read (no ``/proc``, or
     ``hidepid`` hides another user's process) only existence is known, and
-    the answer is :attr:`~WorkerProbe.ALIVE`, as before this check existed.
+    the answer is :attr:`~WorkerProbe.ALIVE`.
     """
     if not _pid_alive(pid):
         return WorkerProbe.DEAD
     stat = _read_proc_stat(pid)
     if stat is None:
         return WorkerProbe.ALIVE
-    proc_state, start_ticks = stat
+    proc_state, proc_ticks = stat
     if proc_state in ("Z", "X"):
         return WorkerProbe.DEAD
     if log_path is not None:
@@ -631,19 +653,232 @@ def probe_worker(pid: int, *, log_path: str | None, started_at: datetime | None)
                 log_path,
             )
             return WorkerProbe.REUSED
-    if started_at is not None:
-        mismatch = _start_mismatch(start_ticks, started_at)
-        if mismatch is not None:
-            logger.warning(
-                "pid %s is not the worker of the attempt started at %s (log %s): %s, "
-                "so the worker exited and its pid now belongs to another process",
-                pid,
-                started_at.isoformat(),
-                log_path,
-                mismatch,
+    mismatch: str | None = None
+    current_boot = _read_boot_id() if boot_id is not None and start_ticks is not None else None
+    if current_boot is not None:
+        if current_boot != boot_id:
+            mismatch = f"the worker started in boot {boot_id}, and this is boot {current_boot}"
+        elif proc_ticks != start_ticks:
+            mismatch = (
+                f"the process started {proc_ticks} ticks after boot, "
+                f"the worker {start_ticks} ticks after it"
             )
-            return WorkerProbe.REUSED
+    elif started_at is not None:
+        mismatch = _start_mismatch(proc_ticks, started_at)
+    if mismatch is not None:
+        logger.warning(
+            "pid %s is not the worker of the attempt started at %s (log %s): %s, "
+            "so the worker exited and its pid now belongs to another process",
+            pid,
+            started_at.isoformat() if started_at is not None else None,
+            log_path,
+            mismatch,
+        )
+        return WorkerProbe.REUSED
     return WorkerProbe.ALIVE
+
+
+def probe_recorded_worker(state: TaskState, queue_dir: Path) -> WorkerProbe:
+    """:func:`probe_worker` on the worker ``state`` records: its pid, log and
+    start time, with the spawn identity from its attempt's identity file
+    (:func:`read_worker_identity`). :attr:`~WorkerProbe.DEAD` with no pid."""
+    if state.pid is None:
+        return WorkerProbe.DEAD
+    identity = read_worker_identity(queue_dir, state)
+    return probe_worker(
+        state.pid,
+        log_path=state.log_path,
+        started_at=state.last_started_at,
+        boot_id=identity[0] if identity is not None else None,
+        start_ticks=identity[1] if identity is not None else None,
+    )
+
+
+def worker_identity_path(queue_dir: Path, task_id: str, attempt: int) -> Path:
+    """``<task logs>/attempt-<attempt>.worker``: the spawn identity of that
+    attempt's worker, beside its stream log."""
+    return task_logs_dir(queue_dir, task_id) / f"attempt-{attempt}.worker"
+
+
+def write_worker_identity(path: Path, pid: int) -> None:
+    """Record running process ``pid``'s boot id and start tick at ``path``.
+
+    A small JSON file, written with tempfile + ``os.replace``. Kept out of
+    the state YAML so a runner without this field still reads every state.
+    Nothing is written when ``/proc`` cannot say (the probe then falls back
+    to the start-time window). ``OSError`` propagates.
+    """
+    boot_id, start_ticks = _process_identity(pid)
+    if boot_id is None or start_ticks is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"pid": pid, "boot_id": boot_id, "start_ticks": start_ticks}
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False, prefix=f".{path.name}."
+    ) as tmp:
+        json.dump(payload, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp.name, path)
+
+
+def read_worker_identity(queue_dir: Path, state: TaskState) -> tuple[str, int] | None:
+    """``(boot_id, start_ticks)`` recorded for ``state``'s worker, or ``None``.
+
+    Read from the identity file of the state's current attempt, and used only
+    when it names the state's pid: a file for another pid is another
+    worker's. ``None`` when the file is missing or unreadable (a worker
+    spawned before identity files existed, or where ``/proc`` could not say).
+    """
+    if state.pid is None:
+        return None
+    path = worker_identity_path(queue_dir, state.task_id, state.attempts)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("pid") != state.pid:
+        return None
+    boot_id, start_ticks = data.get("boot_id"), data.get("start_ticks")
+    if not isinstance(boot_id, str) or not isinstance(start_ticks, int):
+        return None
+    return boot_id, start_ticks
+
+
+LIVE_WORKER_STOP_REASON = "worker_still_running"
+"""Stop reason recorded on a task parked ``possibly_hung`` because its
+worker still runs with no supervisor thread monitoring it: not adopted at
+startup, alive after a reaper's terminate, or found running when its task
+was about to be dispatched again. ``possibly_hung`` is never dispatched,
+so the task gets no second worker. Each tick, the parked worker holds a
+slot of the account it runs on, and once it exits its run is recorded
+from its log (``supervisor.adoption.ParkedWorkerTracker``)."""
+
+
+def park_live_worker(state: TaskState, *, why: str) -> TaskState:
+    """``state`` parked ``possibly_hung`` because its worker, ``state.pid``,
+    still runs. ``why`` completes "worker pid=N is still running ...".
+
+    Keeps ``pid``, ``log_path`` and ``attempts``: they are how the parked
+    worker is probed each tick and its run recorded once it exits.
+    """
+    return state.model_copy(
+        update={
+            "status": "possibly_hung",
+            "stop_reason": LIVE_WORKER_STOP_REASON,
+            "error": (
+                f"worker pid={state.pid} is still running {why}; parked so the task "
+                f"is not dispatched again while it runs"
+            ),
+        }
+    )
+
+
+def is_parked_live_worker(state: TaskState) -> bool:
+    """Whether ``state`` was parked by :func:`park_live_worker` and still
+    records the worker's pid."""
+    return (
+        state.status == "possibly_hung"
+        and state.stop_reason == LIVE_WORKER_STOP_REASON
+        and state.pid is not None
+    )
+
+
+def live_worker_record(state: TaskState, queue_dir: Path) -> TaskState | None:
+    """``state`` with a still-running worker of its task on record, or
+    ``None`` when no worker of the task runs.
+
+    The recorded worker, when :func:`probe_recorded_worker` says it runs.
+    Otherwise a worker no state records, whose pid was never written (the
+    ``UNTRACKED-PID`` case in :func:`dispatch`) or whose state was lost:
+    a process whose stdout is one of the task's stream logs
+    (:func:`find_live_log_writer`). That one is returned with its pid and
+    log, its attempt number from the log's name
+    (``attempt-<N>.stream.jsonl``, kept when the state already counts more
+    attempts, so a later attempt never reuses an existing log), and its own
+    process start time as ``last_started_at``, so it can be parked, probed
+    and recorded like any other. Only this user's processes can be found
+    that way.
+    """
+    if probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE:
+        return state
+    found = find_live_log_writer(task_logs_dir(queue_dir, state.task_id))
+    if found is None:
+        return None
+    pid, log_path = found
+    update: dict[str, object] = {"pid": pid, "log_path": log_path}
+    match = _ATTEMPT_LOG_RE.fullmatch(os.path.basename(log_path))
+    if match is not None:
+        update["attempts"] = max(state.attempts, int(match.group(1)))
+    started = _process_started_at(pid)
+    if started is not None:
+        update["last_started_at"] = started
+    return state.model_copy(update=update)
+
+
+_ATTEMPT_LOG_RE = re.compile(r"attempt-(\d+)\.stream\.jsonl")
+"""A stream log's name: :func:`_attempt_log_paths`."""
+
+
+def _process_started_at(pid: int) -> datetime | None:
+    """When the running process ``pid`` started, from ``/proc``; ``None``
+    when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot = _boot_time()
+    if stat is None or boot is None:
+        return None
+    return boot + timedelta(seconds=stat[1] / os.sysconf("SC_CLK_TCK"))
+
+
+def find_live_log_writer(log_dir: Path) -> tuple[int, str] | None:
+    """``(pid, log path)`` of a running process whose stdout is a stream log
+    in ``log_dir``, or ``None``.
+
+    Walks ``/proc/<pid>/fd/1`` for every process; one this user may not
+    read (another user's, under ``sudo``) is skipped. A match is confirmed
+    with :func:`probe_worker`, so a zombie does not count.
+    """
+    if not _PROC_ROOT.is_dir():
+        return None
+    wanted = os.path.realpath(log_dir)
+    try:
+        entries = list(os.scandir(_PROC_ROOT))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            target = os.readlink(os.path.join(entry.path, "fd", "1"))
+        except OSError:
+            continue
+        if not target.endswith(".stream.jsonl"):
+            continue
+        if os.path.realpath(os.path.dirname(target)) != wanted:
+            continue
+        pid = int(entry.name)
+        if probe_worker(pid, log_path=target, started_at=None) is WorkerProbe.ALIVE:
+            return pid, target
+    return None
+
+
+def _process_identity(pid: int) -> tuple[str | None, int | None]:
+    """``(boot_id, start_ticks)`` of the running process ``pid``, for
+    :func:`probe_worker`; ``(None, None)`` when ``/proc`` cannot say."""
+    stat = _read_proc_stat(pid)
+    boot_id = _read_boot_id()
+    if stat is None or boot_id is None:
+        return None, None
+    return boot_id, stat[1]
+
+
+def _read_boot_id() -> str | None:
+    """This boot's id from ``/proc/sys/kernel/random/boot_id``, or ``None``."""
+    try:
+        text = (_PROC_ROOT / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
 
 
 def _read_proc_stat(pid: int) -> tuple[str, int] | None:
@@ -1668,6 +1903,11 @@ def dispatch(
             "attempts": state.attempts + 1,
             "last_started_at": started_at,
             "pre_dispatch_sha": pre_sha,
+            # A state demoted at a restart keeps its old worker's pid and
+            # log. Until this attempt's own are recorded below, the state
+            # must not point at that worker.
+            "pid": None,
+            "log_path": None,
         }
     )
     if persist_state:
@@ -1773,10 +2013,28 @@ def dispatch(
     # so an operator grepping the journal sees that this attempt won't be
     # reapable by pid.
     if persist_state:
+        # The spawn identity goes beside the stream log, written before the
+        # pid so that a worker whose pid write fails is still identified.
         try:
-            pid_update: dict[str, object] = {"pid": process.pid}
-            if stdout_log_path is not None:
-                pid_update["log_path"] = str(stdout_log_path)
+            write_worker_identity(
+                worker_identity_path(queue_dir, task.id, new_state.attempts), process.pid
+            )
+        except OSError as exc:
+            logger.warning(
+                "task %s: could not record worker pid=%s's spawn identity (%s); its "
+                "probe falls back to its start time",
+                task.id,
+                process.pid,
+                exc,
+            )
+        try:
+            # log_path is always written, None for a pipe-backed worker:
+            # the worker probe compares a recorded log with the pid's
+            # stdout, so an earlier attempt's log must not stay on record.
+            pid_update: dict[str, object] = {
+                "pid": process.pid,
+                "log_path": str(stdout_log_path) if stdout_log_path is not None else None,
+            }
             new_state = new_state.model_copy(update=pid_update)
             write_state_atomic(new_state, state_path_for(queue_dir, task.id))
         except Exception as exc:
@@ -2098,10 +2356,7 @@ def adopt_worker(
     alive_monitor.start()
 
     def _alive() -> bool:
-        return (
-            probe_worker(pid, log_path=state.log_path, started_at=state.last_started_at)
-            is WorkerProbe.ALIVE
-        )
+        return probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE
 
     def _terminate_adopted() -> None:
         # The pid may have passed to another process since the last poll.
@@ -2154,6 +2409,8 @@ def finalize_exited_worker(
     settings_hooks: HookSettings,
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
+    require_result: bool = True,
+    cap_violation: caps_mod.CapViolation | None = None,
 ) -> DispatchOutcome | None:
     """Record the run of a file-backed worker that exited with no supervisor watching.
 
@@ -2170,16 +2427,20 @@ def finalize_exited_worker(
     Returns ``None`` and writes nothing when the log holds no terminal
     ``result`` event. That worker crashed or was killed mid-run, and the
     startup reaper and ``reconcile_orphans`` handle it as they always have.
+    With ``require_result=False``, for a worker parked by
+    :func:`park_live_worker` (no later pass handles a parked task), such a
+    run is recorded as a crash instead, as :func:`adopt_worker` records a
+    worker whose pid vanished; a worker with no log (pipe-backed) is
+    recorded the same way. ``cap_violation`` records a worker the caller
+    stopped at its cap as killed by that cap.
 
     The caller has established that ``state.pid`` is dead, so nothing here
-    signals or waits on a process. No cap is applied: caps stop a live
-    worker, and this one ended on its own.
+    signals or waits on a process. It applies no cap itself: a caller that
+    stopped the worker at its cap passes ``cap_violation``.
     """
-    if state.log_path is None:
-        return None
-    log_path = Path(state.log_path)
-    summary = _reparse_stdout_file(log_path)
-    if summary.final_result is None:
+    log_path = Path(state.log_path) if state.log_path is not None else None
+    summary = _reparse_stdout_file(log_path) if log_path is not None else StreamSummary()
+    if require_result and summary.final_result is None:
         return None
 
     now = clock.now()
@@ -2188,10 +2449,16 @@ def finalize_exited_worker(
         task=task,
         prior=state,
         summary=summary,
-        cap_violation=None,
+        cap_violation=cap_violation,
         started_at=started_at,
-        finished_at=_log_finished_at(log_path, started_at=started_at, now=now),
-        stderr_tail=_read_stderr_tail(_stderr_path_for_stdout_log(log_path)),
+        finished_at=(
+            _log_finished_at(log_path, started_at=started_at, now=now)
+            if log_path is not None
+            else now
+        ),
+        stderr_tail=(
+            _read_stderr_tail(_stderr_path_for_stdout_log(log_path)) if log_path is not None else ""
+        ),
         account=account,
         queue_dir=queue_dir,
         settings_failure_classifier=settings_failure_classifier,
@@ -2251,7 +2518,9 @@ def _finalize_adopted(
     The terminal write uses the same recheck guard as the silent-orphan
     reaper: if the on-disk status is no longer ``"running"`` a concurrent
     reaper finalized first, so we stand down rather than clobber its
-    record (ADR-0025 concurrency note).
+    record (ADR-0025 concurrency note). A task parked by
+    :func:`park_live_worker` for this same worker is the exception: the
+    park only waited for the worker to exit, so its run is recorded.
     """
     # No terminal result ⇒ infer a crash via a non-zero synthetic exit
     # code so _build_run_record records ``process_exit_nonzero``. A present result
@@ -2337,7 +2606,9 @@ def _finalize_adopted(
         )
         write_state_atomic(final_state, state_path)
     else:
-        if current.status == "running":
+        if current.status == "running" or (
+            is_parked_live_worker(current) and current.pid == prior.pid
+        ):
             write_state_atomic(final_state, state_path)
         else:
             logger.info(

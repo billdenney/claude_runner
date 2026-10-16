@@ -41,7 +41,7 @@ from claude_task_runner.cli._helpers import (
     resolve_per_queue_config,
 )
 from claude_task_runner.clock import RealClock
-from claude_task_runner.queue.schema import Task
+from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     QueueIOError,
     QueueSchemaError,
@@ -55,6 +55,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner import orchestrator as orch_mod
 from claude_task_runner.runner import readiness as readiness_mod
@@ -984,6 +985,17 @@ def force_dispatch(
             "before honouring the request."
         ),
     ),
+    allow_live_worker: bool = typer.Option(
+        False,
+        "--allow-live-worker",
+        help=(
+            "Dispatch a pending or failed task even though a worker of it is still "
+            "running, one no state records (found writing the task's stream log). "
+            "Without this flag the command refuses: a second worker in the task's "
+            "worktree corrupts its branch. A task parked with its worker "
+            "(possibly_hung, worker_still_running) is refused either way."
+        ),
+    ),
     wait_seconds: float = typer.Option(
         60.0,
         "--wait-seconds",
@@ -1021,7 +1033,9 @@ def force_dispatch(
     Exits non-zero if the task YAML is missing from ``todo/``, if its
     current status is not dispatchable (``running``,
     ``awaiting_sidecar``, ``completed``, ``failed_circuit_breaker``,
-    ``weekly_paused``), if the queue's ``[effort_levels]`` rejects its
+    ``weekly_paused``), if a worker of the task is still running (its
+    recorded pid, or a process writing its stream log) and
+    ``--allow-live-worker`` is not given, if the queue's ``[effort_levels]`` rejects its
     (model, effort) pair, if one of its ``requires`` elements is unmet
     (ADR-0030), or if the pre-dispatch hook fails during the synchronous
     path.
@@ -1050,18 +1064,35 @@ def force_dispatch(
         raise typer.Exit(code=2) from exc
 
     state_path = state_path_for(qd, task_id)
-    current_status: str | None = None
+    current_state: TaskState | None = None
     if state_path.exists():
         try:
-            current_status = load_state(state_path).status
+            current_state = load_state(state_path)
         except (QueueIOError, QueueSchemaError):
-            current_status = None
+            current_state = None
+    current_status = current_state.status if current_state is not None else None
+    if current_state is not None and dispatcher_mod.is_parked_live_worker(current_state):
+        msg = fd_mod.parked_worker_message(current_state)
+        if json:
+            print(_json.dumps({"ok": False, "error": msg, "pid": current_state.pid}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(code=2)
     if current_status not in fd_mod.FORCE_DISPATCHABLE:
         msg = f"task {task_id} status={current_status!r} is not dispatchable"
         if json:
             print(_json.dumps({"ok": False, "error": msg, "status": current_status}))
         else:
             console.print(f"[bold red]{msg}[/]")
+        raise typer.Exit(code=2)
+
+    live = fd_mod.live_worker_of(qd, task_id, current_state)
+    if live is not None and not allow_live_worker:
+        msg = fd_mod.live_worker_message(live)
+        if json:
+            print(_json.dumps({"ok": False, "error": msg, "pid": live.pid}))
+        else:
+            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
         raise typer.Exit(code=2)
 
     # ADR-0010. Checked here as well as by both force paths so that, with a
@@ -1089,7 +1120,9 @@ def force_dispatch(
 
     if _supervisor_is_alive(qd):
         requested_at = RealClock().now()
-        path = fd_mod.write_request(qd, task_id, allow_over_limit=over_limit)
+        path = fd_mod.write_request(
+            qd, task_id, allow_over_limit=over_limit, allow_live_worker=allow_live_worker
+        )
         if not json:
             console.print(
                 f"[green]request written:[/] {path}\n"
@@ -1148,6 +1181,7 @@ def force_dispatch(
             settings=settings,
             clock=RealClock(),
             claude_executable=settings.claude.executable,
+            allow_live_worker=allow_live_worker,
         )
     except fd_mod.ForceDispatchError as exc:
         msg = str(exc)

@@ -97,6 +97,9 @@ class ForceDispatchRequest:
     task_id: str
     requested_at: datetime
     allow_over_limit: bool = False
+    allow_live_worker: bool = False
+    """Dispatch even though a worker of the task still runs
+    (``queue force-dispatch --allow-live-worker``)."""
 
 
 FORCE_DISPATCHABLE = frozenset({None, "pending", "failed", "deferred"})
@@ -141,6 +144,7 @@ def write_request(
     task_id: str,
     *,
     allow_over_limit: bool = False,
+    allow_live_worker: bool = False,
     clock: Clock | None = None,
 ) -> Path:
     """Atomically write a force-dispatch request file for ``task_id``.
@@ -159,6 +163,7 @@ def write_request(
         "task_id": task_id,
         "requested_at": now.isoformat(),
         "allow_over_limit": bool(allow_over_limit),
+        "allow_live_worker": bool(allow_live_worker),
     }
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -188,6 +193,7 @@ def _parse_request_file(path: Path) -> ForceDispatchRequest | None:
             task_id=str(data["task_id"]),
             requested_at=datetime.fromisoformat(str(data["requested_at"])),
             allow_over_limit=bool(data.get("allow_over_limit", False)),
+            allow_live_worker=bool(data.get("allow_live_worker", False)),
         )
     except (KeyError, ValueError, TypeError) as exc:
         logger.warning("force-dispatch: malformed request %s: %s", path, exc)
@@ -249,6 +255,33 @@ def _load_state_or_none(queue_dir: Path, task_id: str) -> TaskState | None:
         raise ForceDispatchError(
             f"task {task_id} state YAML is unreadable/corrupt: {state_path} ({exc})"
         ) from exc
+
+
+def live_worker_of(queue_dir: Path, task_id: str, state: TaskState | None) -> TaskState | None:
+    """``task_id``'s state with its still-running worker on record, or
+    ``None`` (:func:`runner.dispatcher.live_worker_record`)."""
+    return dispatcher_mod.live_worker_record(state or TaskState(task_id=task_id), queue_dir)
+
+
+def parked_worker_message(state: TaskState) -> str:
+    """Why force-dispatch refuses a task parked with its live worker, and how
+    the operator releases it. ``--allow-live-worker`` does not apply."""
+    return (
+        f"task {state.task_id}: its worker pid={state.pid} is still running, parked "
+        f"possibly_hung ({dispatcher_mod.LIVE_WORKER_STOP_REASON}); a second worker would "
+        "share its worktree. It is released, and its run recorded, when it exits or "
+        f"reaches its duration cap; to release it sooner, kill -TERM -{state.pid} (its "
+        "process group) and the supervisor records the run within a tick"
+    )
+
+
+def live_worker_message(live: TaskState) -> str:
+    """Why force-dispatch refuses ``live``'s task."""
+    return (
+        f"task {live.task_id}: its worker pid={live.pid} is still running "
+        f"(log={live.log_path}); a second worker would share its worktree. "
+        "Pass --allow-live-worker to dispatch anyway"
+    )
 
 
 def _no_free_slot(
@@ -410,11 +443,30 @@ def tick_consume(
             )
             continue
         status = state.status if state is not None else None
+        if state is not None and dispatcher_mod.is_parked_live_worker(state):
+            logger.warning("force-dispatch: %s; dropping request", parked_worker_message(state))
+            consume_request(queue_dir, task.id)
+            continue
         if status not in FORCE_DISPATCHABLE:
             logger.warning(
                 "force-dispatch %s: status %s is not dispatchable; dropping request",
                 task.id,
                 status,
+            )
+            consume_request(queue_dir, task.id)
+            continue
+
+        # A worker of the task still runs: a second one in its worktree
+        # would corrupt the branch. Force overrides the throttle, not this,
+        # unless the operator asked (--allow-live-worker).
+        live = live_worker_of(queue_dir, task.id, state)
+        if live is not None and not req.allow_live_worker:
+            logger.warning(
+                "force-dispatch %s: its worker pid=%s is still running (log=%s); dropping "
+                "request — pass --allow-live-worker to dispatch beside it",
+                task.id,
+                live.pid,
+                live.log_path,
             )
             consume_request(queue_dir, task.id)
             continue
@@ -518,6 +570,7 @@ def tick_consume(
             linux_user=picked.linux_user,
             account=picked.name,
             spawn_gate=spawn_gate,
+            allow_live_worker=req.allow_live_worker,
         )
         dispatched += 1
 
@@ -536,6 +589,7 @@ def _spawn_dispatch_thread(
     linux_user: str | None,
     account: str,
     spawn_gate: SpawnGate | None = None,
+    allow_live_worker: bool = False,
 ) -> None:
     """Spawn the same shape of dispatch thread the orchestrator does."""
     # Local import to avoid a circular dependency at module-load time:
@@ -556,7 +610,7 @@ def _spawn_dispatch_thread(
             linux_user,
             account,
         ),
-        kwargs={"spawn_gate": spawn_gate},
+        kwargs={"spawn_gate": spawn_gate, "allow_live_worker": allow_live_worker},
         name=f"force-dispatch-{task.id}",
         # ADR-0025: match the orchestrator's thread lifetime — daemon when
         # adoption is on so a fast stop need not join the (file-backed,
@@ -586,6 +640,7 @@ def dispatch_synchronously(
     settings: Settings,
     clock: Clock,
     claude_executable: str = "claude",
+    allow_live_worker: bool = False,
 ) -> TaskState:
     """Run one dispatch attempt for ``task_id`` in-process; return final state.
 
@@ -605,8 +660,13 @@ def dispatch_synchronously(
         raise ForceDispatchError(f"cannot parse task {task_id}: {exc}") from exc
 
     state = _load_state_or_none(queue_dir, task.id) or TaskState(task_id=task.id)
+    if dispatcher_mod.is_parked_live_worker(state):
+        raise ForceDispatchError(parked_worker_message(state))
     if state.status not in FORCE_DISPATCHABLE:
         raise ForceDispatchError(f"task {task.id} status={state.status!r} is not dispatchable")
+    live = live_worker_of(queue_dir, task.id, state)
+    if live is not None and not allow_live_worker:
+        raise ForceDispatchError(live_worker_message(live))
 
     # ADR-0010, same reasoning as tick_consume: force overrides the throttle,
     # not a (model, effort) pair the queue's [effort_levels] rejects.
