@@ -15,7 +15,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,7 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
+from claude_task_runner.usage.drift import AUTH_FAILURE_PREFIX
 
 
 @pytest.fixture
@@ -276,6 +277,66 @@ class TestAccountList:
         assert by_name["personal"]["last_5h_util_pct"] == 42
         assert by_name["personal"]["in_flight_count"] == 2
         assert by_name["work"]["paused"] is True
+        # Paused: dispatch allows it nothing, whatever its state would.
+        assert by_name["work"]["dispatch_cap"] == 0
+        assert by_name["personal"]["dispatch_cap"] == 1
+
+    def test_weekly_catch_up_and_usage_errors(self, runner: CliRunner, tmp_path: Path) -> None:
+        """A weekly-throttled account carries when the weekly curve meets
+        its reading (default curve: 60% at the 40h elbow, so 30% observed
+        is met 104h before the reset); an ERROR_DRIFT account says whether
+        its login or the usage page failed."""
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        names = ["weekly", "fivehr", "login", "page"]
+        config = _write_queue_config(tmp_path, accounts=[(n, "", None) for n in names])
+        since = datetime(2026, 10, 16, tzinfo=UTC)
+        resets = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                "weekly": AccountState(
+                    state=SupervisorState.THROTTLED_WEEKLY,
+                    since=since,
+                    last_weekly_util_pct=30,
+                    last_weekly_reset_at=resets,
+                    scheduled_wakeup_at=since,
+                ),
+                "fivehr": AccountState(
+                    state=SupervisorState.THROTTLED_5H,
+                    since=since,
+                    last_weekly_util_pct=30,
+                    last_weekly_reset_at=resets,
+                ),
+                "login": AccountState(
+                    state=SupervisorState.ERROR_DRIFT,
+                    since=since,
+                    last_drift_message=f"{AUTH_FAILURE_PREFIX}HTTP 401",
+                ),
+                "page": AccountState(
+                    state=SupervisorState.ERROR_DRIFT,
+                    since=since,
+                    last_drift_message="5-hour usage block not found",
+                ),
+            },
+        )
+        result = runner.invoke(
+            app, ["account", "list", "--config", str(config), "--queue", str(queue_dir), "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        by_name = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
+        assert {n: by_name[n]["weekly_catch_up_at"] for n in names} == {
+            "weekly": str(resets - timedelta(hours=104)),
+            "fivehr": None,
+            "login": None,
+            "page": None,
+        }
+        assert {n: by_name[n]["usage_error"] for n in names} == {
+            "weekly": None,
+            "fivehr": None,
+            "login": {"kind": "auth", "message": "OAuth bearer rejected: HTTP 401"},
+            "page": {"kind": "format", "message": "5-hour usage block not found"},
+        }
 
     def test_dispatch_cap_is_max_lowered_to_the_throttle_target(
         self, runner: CliRunner, tmp_path: Path

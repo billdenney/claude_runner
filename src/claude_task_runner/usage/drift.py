@@ -37,6 +37,22 @@ class UsageCaptureSpawnError(RuntimeError):
     """`claude` could not be spawned (binary missing, permission denied, etc.)."""
 
 
+AUTH_FAILURE_PREFIX = "OAuth bearer rejected: "
+"""Starts the ``last_drift_message`` the state machine records when a
+:class:`UsageApiAuthExpired` puts an account in ERROR_DRIFT, so a reader of
+``supervisor.json`` can tell a login that needs renewing from parser drift
+(:func:`usage_error_kind`)."""
+
+
+def usage_error_kind(message: str) -> str:
+    """``auth`` for a recorded login failure, ``format`` for anything else.
+
+    ``message`` is an account's ``last_drift_message``. Only messages the
+    state machine wrote with :data:`AUTH_FAILURE_PREFIX` read as ``auth``.
+    """
+    return "auth" if message.startswith(AUTH_FAILURE_PREFIX) else "format"
+
+
 class UsageApiAuthExpired(UsageCaptureSpawnError):
     """The OAuth bearer token in ``<config_dir>/.credentials.json`` returned 401/403.
 

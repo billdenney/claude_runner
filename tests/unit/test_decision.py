@@ -14,7 +14,7 @@ from datetime import UTC, datetime, time, timedelta
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.supervisor.states import SupervisorState
 from claude_task_runner.throttle.curve import SEVEN_DAYS_S
-from claude_task_runner.throttle.decision import decide
+from claude_task_runner.throttle.decision import decide, weekly_catch_up
 from claude_task_runner.throttle.policy import (
     ResolvedBand,
     ResolvedNight,
@@ -226,6 +226,38 @@ class TestThrottledWeekly:
         d = decide(_policy(timezone="UTC"), reading, clock, poll_interval_s=POLL)
         assert d.state is SupervisorState.THROTTLED_WEEKLY
         assert d.wakeup_at == now + timedelta(seconds=POLL)
+
+
+class TestWeeklyCatchUp:
+    """``weekly_catch_up``: when the curve meets a weekly-throttled reading.
+    Status commands report it, so it must be the time decide() aims at."""
+
+    def test_known_answer_on_the_default_curve(self) -> None:
+        # 30% on the early segment (60% at the 40h elbow of a 168h week):
+        # t = 30/60 * 128/168 = 64/168, so the curve meets it 104h before
+        # the reset.
+        resets = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+        got = weekly_catch_up(_policy(), observed_pct=30.0, resets_at=resets)
+        assert got == resets - timedelta(hours=104)
+
+    def test_at_or_above_eow_pct_is_the_reset(self) -> None:
+        resets = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+        assert weekly_catch_up(_policy(), observed_pct=95.0, resets_at=resets) == resets
+
+    def test_decide_wakes_at_the_catch_up_when_it_comes_first(self) -> None:
+        now = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+        weekly_resets_at = now + timedelta(seconds=SEVEN_DAYS_S / 2)
+        reading = _reading(
+            five_h_pct=5,
+            weekly_pct=45,
+            five_h_resets_at=now + timedelta(days=3),
+            weekly_resets_at=weekly_resets_at,
+        )
+        policy = _policy(timezone="UTC")
+        d = decide(policy, reading, FakeClock(now), poll_interval_s=POLL)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == weekly_catch_up(policy, observed_pct=45.0, resets_at=weekly_resets_at)
+        assert d.wakeup_at is not None and now < d.wakeup_at < weekly_resets_at
 
 
 class TestWeeklyResetUnparseable:

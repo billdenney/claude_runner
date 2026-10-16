@@ -67,6 +67,7 @@ from claude_task_runner.usage.drift import (
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
     UsageFormatDrift,
+    usage_error_kind,
 )
 from claude_task_runner.usage.models import UsageReading, WindowReading
 
@@ -506,7 +507,8 @@ class TestErrorDrift:
         )
         assert new.state is SupervisorState.ERROR_DRIFT
         assert new.consecutive_clean_polls == 0
-        assert "only 1 block" in new.last_drift_message
+        assert new.last_drift_message == "only 1 block found"
+        assert usage_error_kind(new.last_drift_message) == "format"
         assert any(isinstance(a, Notify) and a.level == "error" for a in actions)
         assert any(isinstance(a, EmitEvent) and a.event_type == "drift_detected" for a in actions)
         assert StopDispatch in _action_types(actions)
@@ -679,7 +681,9 @@ class TestAuthExpired:
             clock,
         )
         assert new.state is SupervisorState.ERROR_DRIFT
-        assert "HTTP 401" in new.last_drift_message
+        # The prefix is what lets a status reader say "log in again".
+        assert new.last_drift_message == "OAuth bearer rejected: HTTP 401"
+        assert usage_error_kind(new.last_drift_message) == "auth"
         action_types = {type(a) for a in actions}
         assert Notify in action_types
         assert StopDispatch in action_types
