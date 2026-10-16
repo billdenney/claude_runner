@@ -347,8 +347,9 @@ status.
    group). The supervisor records its run within a tick and the task is
    dispatched again as its status allows. `queue force-dispatch` refuses a
    parked task, with or without `--allow-live-worker`, and says so; that
-   flag applies only to a pending or failed task whose worker no state
-   records (one found writing the task's stream log).
+   flag applies only to a pending, failed or deferred task (or one with no
+   state yet) whose worker no state records (one found writing the task's
+   stream log).
 3. Check for a second worker on the same task, which a runner older than
    2026-10-16 could start. Every worker's working directory is the task's
    worktree:

@@ -1122,8 +1122,9 @@ def force_dispatch(
         False,
         "--allow-live-worker",
         help=(
-            "Dispatch a pending or failed task even though a worker of it is still "
-            "running, one no state records (found writing the task's stream log). "
+            "Dispatch a pending, failed or deferred task (or one with no state yet) "
+            "even though a worker of it is still running, one no state records (found "
+            "writing the task's stream log). "
             "Without this flag the command refuses: a second worker in the task's "
             "worktree corrupts its branch. A task parked with its worker "
             "(possibly_hung, worker_still_running) is refused either way."

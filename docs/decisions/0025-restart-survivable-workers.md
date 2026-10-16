@@ -344,8 +344,8 @@ same worktrees, beside the two workers still running there.
    same for a worker found by `live_worker_record`; both report the park as
    the startup does, once. `queue force-dispatch` refuses a task parked
    with its worker whatever its flags, naming the worker and how to
-   release it; `--allow-live-worker` lets it dispatch a pending or failed
-   task whose worker no state records. The corrupt-state quarantine
+   release it; `--allow-live-worker` lets it dispatch a pending, failed or
+   deferred task (or one with no state yet) whose worker no state records. The corrupt-state quarantine
    (ADR-0028), which would revert a running task to pending, reads the
    worker's fields from the readable head of the file and parks the task
    instead when its worker still runs.
