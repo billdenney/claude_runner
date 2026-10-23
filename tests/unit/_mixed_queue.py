@@ -51,7 +51,9 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     that has cleared. ``missing_file`` is an absolute path that does not exist,
     so two copies of this queue write identical readiness reasons. The task
     ``inflight`` is in flight only for a caller that says so. The cooldowns
-    are a year either side of :data:`NOW`, so a real clock sees the same."""
+    are a year either side of :data:`NOW`, the time every caller must select
+    at: a caller selecting at the wall clock would see ``cooldown`` become
+    eligible once ``NOW`` is a year past."""
     (todo_dir(qd) / "broken.yaml").write_text("not: valid: yaml: [\n", encoding="utf-8")
 
     # block_dispatch row; the second id's task is completed, so it counts

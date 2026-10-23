@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from claude_task_runner.cli import queue_cmd as queue_cmd_mod
+from claude_task_runner.clock import FakeClock
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
@@ -39,6 +41,7 @@ from ._concurrency_fixtures import invoke_cli, write_account_cap
 from ._mixed_queue import (
     BLOCK_FILE,
     MIXED_EXPECTED_MISSING,
+    NOW,
     STALE_HOLDS,
     add_state,
     add_task,
@@ -105,10 +108,20 @@ def _states(queue: Path) -> dict[str, bytes]:
     return {p.name: p.read_bytes() for p in state_path_for(queue, "x").parent.glob("*.yaml")}
 
 
-def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
+@pytest.fixture
+def mixed(queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``queue`` holding the mixed queue, with the command's clock at the
+    queue's :data:`NOW`: its cooldowns are set from ``NOW``, so the command
+    must select at that time, whatever day the test runs."""
+    build_mixed_queue(queue, tmp_path / "absent.md")
+    monkeypatch.setattr(queue_cmd_mod, "RealClock", lambda: FakeClock(NOW))
+    return queue
+
+
+def test_every_task_lands_in_one_place(mixed: Path) -> None:
     """supervisor.json records no account state, so no account can take a
     task yet (a cold start): every eligible task waits for a slot."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
     _in_flight(queue, "inflight")
 
@@ -149,10 +162,10 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
     }
 
 
-def test_missing_dependencies_match_the_selector(queue: Path, tmp_path: Path) -> None:
+def test_missing_dependencies_match_the_selector(mixed: Path) -> None:
     """``missing_dependencies`` is the selector's own record, one row per
     task held ``depends_on_missing``, so it cannot disagree with ``held``."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
 
     holds = _holds(queue)
@@ -180,11 +193,11 @@ def test_missing_dependencies_list_every_missing_id_in_depends_on_order(queue: P
     ]
 
 
-def test_writes_no_state_file(queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_writes_no_state_file(mixed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A supervisor tick would park needs-file and bad-effort as deferred
     and un-park the two stale holds; the command calls no state writer and
     leaves every state file as it was."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
     _in_flight(queue, "inflight")
     before = _states(queue)

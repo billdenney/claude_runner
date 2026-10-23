@@ -473,13 +473,13 @@ def holds(
         snapshot = persist_mod.load(state_path)
     except persist_mod.SupervisorPersistenceError as exc:
         snapshot, snapshot_error = None, str(exc)
-    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=RealClock().now())
+    now = RealClock().now()
+    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=now)
     held = {k: n for k, n in sorted(preview.skips.items()) if k != "completed"}
     by_status: dict[str, int] = {}
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
     can_start_now = sum(1 for account in preview.routes.values() if account is not None)
-    now = RealClock().now()
     unread: list[dict[str, str]] = []
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
