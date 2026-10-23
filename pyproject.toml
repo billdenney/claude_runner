@@ -43,7 +43,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "vulture>=2.16",
-    "types-PyYAML",
+    # The first stubs that annotate yaml.resolver.BaseResolver's
+    # descend_resolver and ascend_resolver, which queue/store.py overrides.
+    "types-PyYAML>=6.0.12.20260815",
     "types-pexpect",
     # Run lint / format hooks locally before each commit.
     # Mirrors the GitHub Actions CI lint steps; see .pre-commit-config.yaml.

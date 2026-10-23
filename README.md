@@ -86,6 +86,15 @@ Run the hooks against every file (handy after a refactor or rebase):
 pre-commit run --all-files
 ```
 
+CI installs the dev extras with `-c .github/ci-constraints.txt`, which pins
+mypy and types-PyYAML to exact versions, so a new release of either cannot
+fail CI without a change in this repository. To move to newer ones, set the
+new versions there, install them locally with
+`pip install -c .github/ci-constraints.txt mypy types-PyYAML`, and run
+`mypy src`; fix what it reports in the same pull request. Bump them when a
+release is wanted, or when the floors in `pyproject.toml`'s dev extras rise
+above the pins.
+
 The full lint / format / type / test pipeline that CI runs is:
 
 ```sh
