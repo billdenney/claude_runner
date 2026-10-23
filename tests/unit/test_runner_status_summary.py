@@ -215,7 +215,8 @@ def _tasks(
     """Todo tasks in the usual places: ``new`` never started; ``answered``
     asked and were answered; ``asking`` wait for ``questions`` answers each;
     ``blocked`` are in the block list; ``depends`` wait for a task that never
-    finishes; ``files`` for a file that is absent; ``done`` finished."""
+    finishes (it has a state file and no todo/ YAML); ``files`` for a file
+    that is absent; ``done`` finished."""
     for i in range(new):
         add_task(queue, f"new-{i}")
     for i in range(answered):
@@ -234,6 +235,8 @@ def _tasks(
         add_state(queue, f"blocked-{i}", "pending")
         rows.append(json.dumps({"task": f"blocked-{i}", "block_dispatch": True}) + "\n")
     (queue / BLOCK_FILE).write_text("".join(rows), encoding="utf-8")
+    if depends:
+        add_state(queue, "never-finishes", "pending")
     for i in range(depends):
         add_task(queue, f"depends-{i}", depends_on=["never-finishes"])
     for i in range(files):

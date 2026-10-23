@@ -39,11 +39,13 @@ from typer.testing import CliRunner
 
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import load_defaults
-from claude_task_runner.queue.schema import Task
+from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     queue_runtime_dir,
+    state_path_for,
     task_path_for,
     todo_dir,
+    write_state_atomic,
     write_task_atomic,
 )
 from claude_task_runner.runner.in_flight import DispatchSlot
@@ -383,7 +385,10 @@ class TestTickDispatchPriorityScenarios:
         blocked on an incomplete dependency stays pending while lower-
         priority tasks dispatch ahead of it. Without this guarantee
         operators could starve a queue by marking everything ``high``."""
-        _make_task(queue_dir, "z-high", priority="high", depends_on=["missing-dep"])
+        write_state_atomic(
+            TaskState(task_id="unfinished-dep"), state_path_for(queue_dir, "unfinished-dep")
+        )
+        _make_task(queue_dir, "z-high", priority="high", depends_on=["unfinished-dep"])
         _make_task(queue_dir, "a-normal", priority="normal")
         settings = _make_settings(initial=1, max_c=1)
         order = _capture_dispatch_order(queue_dir=queue_dir, settings=settings)

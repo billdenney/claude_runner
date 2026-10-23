@@ -92,7 +92,10 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
 
     add_task(qd, "bad-effort", model="claude-sonnet-4-6", effort="max")
 
-    add_task(qd, "waits-on-upstream", depends_on=["never-finishes"])
+    # depends_on: a task that exists and has not completed. A dependency
+    # that names no task at all is held apart, even beside an unfinished one.
+    add_task(qd, "waits-on-upstream", depends_on=["status-running"])
+    add_task(qd, "names-a-missing-task", depends_on=["status-running", "no-such-task"])
 
     add_task(qd, "needs-file", requires=[{"kind": "file", "path": str(missing_file)}])
 
@@ -155,6 +158,7 @@ MIXED_EXPECTED_SKIPS = Counter(
         "weekly_paused": 1,
         "invalid_effort": 1,
         "depends_on": 1,
+        "depends_on_missing": 1,
         "readiness_missing_file": 1,
         "readiness_awaiting_sidecar_response": 1,
         "readiness_awaiting_sidecar_response+missing_file": 1,
@@ -168,6 +172,8 @@ MIXED_EXPECTED_ELIGIBLE = [
     "ready",
     "sidecar-answered",
 ]
+MIXED_EXPECTED_MISSING = {"names-a-missing-task": ["no-such-task"]}
+"""The ``depends_on_missing`` task and the dependency it names that no task has."""
 STALE_HOLDS = ("effort-fixed", "file-arrived")
 """The eligible tasks whose state still carries a gate's cleared hold."""
 

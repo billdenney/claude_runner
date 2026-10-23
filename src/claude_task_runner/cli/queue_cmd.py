@@ -306,8 +306,9 @@ def _print_deferral(console: Console, state: dict[str, object]) -> None:
     prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
     the earliest time the supervisor tries the task again. Of the runner's
     own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
-    readiness hold (ADR-0030) and an effort hold (ADR-0010) do not,
-    because their gate re-checks the task on every tick.
+    readiness hold (ADR-0030), an effort hold (ADR-0010) and a
+    missing-dependency hold (ADR-0036) do not, because their gate
+    re-checks the task on every tick.
 
     Printed as written: Rich markup would drop the ``[effort_levels]`` in
     an unknown model's effort hold and raise on a ``[/]`` in a hook's
@@ -428,25 +429,32 @@ def holds(
     Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
     (it starts as soon as an account has a free slot), ``held`` under the
     category that holds it (``block_dispatch``, ``depends_on``,
-    ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
-    status such as ``possibly_hung``, ...), or ``completed``. Of the
-    eligible, ``can_start_now`` have an account that takes them now, and
+    ``depends_on_missing``, ``unanswered_sidecar``,
+    ``readiness_missing_file``, ``in_flight``, a status such as
+    ``possibly_hung``, ...), or ``completed``. ``depends_on`` waits for a
+    dependency that has not completed; ``depends_on_missing`` names one
+    that no task file in ``todo/`` and no state file has, so the task can
+    never start until its ``depends_on`` is fixed or that task is created.
+    Of the eligible, ``can_start_now`` have an account that takes them now, and
     ``waiting_for_their_account`` are held to the account their session
     runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
     lets another. ``poll_interval_s`` is how often the supervisor runs this
     selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
     (the warm-up cap while ``warming_up``), ``null`` when there is none.
 
-    Two holds carry their tasks' details. ``parked_workers``: the
+    Three holds carry their tasks' details. ``parked_workers``: the
     ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
     ``worker_still_running``), each with its ``pid``, ``started_at``,
     whether it is still ``running``, its ``duration_cap_s`` (0: none) and
     whether it has run ``past_cap``.
     ``retrying``: the ``deferred_cooldown`` tasks, each with its
     ``deferred_reason`` and ``next_eligible_at``. A task whose state no
-    longer loads when these details are read (removed or rewritten since
-    the selection read it) is left out of them and listed under
+    longer loads when these two are read (removed or rewritten since the
+    selection read it) is left out of them and listed under
     ``unread_states`` with the error.
+    ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
+    the ``missing`` ids in its ``depends_on`` that no task has, in the
+    order it lists them.
 
     \b
     Exit codes:
@@ -474,6 +482,7 @@ def holds(
     unread: list[dict[str, str]] = []
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
+    missing = sorted(preview.missing_dependencies.items())
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -491,6 +500,7 @@ def holds(
         "warming_up": preview.warming_up,
         "parked_workers": parked,
         "retrying": retrying,
+        "missing_dependencies": [{"task_id": t, "missing": ids} for t, ids in missing],
         "unread_states": unread,
         "supervisor_json_error": snapshot_error,
     }
@@ -529,6 +539,14 @@ def holds(
         console.print(
             f"[bold]retries at {item['next_eligible_at']}:[/] {item['task_id']}: "
             f"{item['deferred_reason']}",
+            highlight=False,
+            markup=False,
+        )
+    for task_id, ids in missing:
+        console.print(
+            f"missing dependency: {task_id} depends on {', '.join(ids)}, "
+            "which no task in todo/ or state/ has",
+            style="yellow",
             highlight=False,
             markup=False,
         )

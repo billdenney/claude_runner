@@ -1,7 +1,7 @@
 """Tests for runner/orchestrator.py helper functions and `tick_dispatch`.
 
 The helpers (``_target_concurrency``, ``_has_any_completed``,
-``_completed_task_ids``, ``_reap_finished``, ``tick_dispatch``,
+``_state_task_ids``, ``_reap_finished``, ``tick_dispatch``,
 ``_dispatch_one_safely``) all operate against the filesystem and an
 in-memory thread dict — fully testable without external services as
 long as we mock ``dispatcher_mod.dispatch``.
@@ -33,11 +33,11 @@ from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
 from claude_task_runner.runner.orchestrator import (
-    _completed_task_ids,
     _dispatch_one_safely,
     _has_any_completed,
     _reap_finished,
     _recorded_subprocess_run,
+    _state_task_ids,
     _target_concurrency,
     tick_dispatch,
 )
@@ -188,28 +188,36 @@ def test_has_any_completed_skips_unparseable(queue_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _completed_task_ids
+# _state_task_ids
 # ---------------------------------------------------------------------------
 
 
-def test_completed_task_ids_empty(queue_dir: Path) -> None:
-    assert _completed_task_ids(queue_dir) == set()
+def test_state_task_ids_empty(queue_dir: Path) -> None:
+    assert _state_task_ids(queue_dir) == (set(), set())
 
 
-def test_completed_task_ids_collects_only_completed(queue_dir: Path) -> None:
+def test_state_task_ids_collects_completed_and_every_recorded_id(queue_dir: Path) -> None:
     _seed_state(queue_dir, "t1", "completed")
     _seed_state(queue_dir, "t2", "completed")
     _seed_state(queue_dir, "t3", "pending")
     _seed_state(queue_dir, "t4", "failed")
-    assert _completed_task_ids(queue_dir) == {"t1", "t2"}
+    ids = _state_task_ids(queue_dir)
+    assert ids.completed == {"t1", "t2"}
+    assert ids.recorded == {"t1", "t2", "t3", "t4"}
 
 
-def test_completed_task_ids_skips_unparseable(queue_dir: Path) -> None:
+def test_state_task_ids_records_an_unparseable_state_but_not_as_completed(
+    queue_dir: Path,
+) -> None:
+    """An unparseable state file still says its task exists, so a
+    depends_on naming it waits rather than being held as missing."""
     bad = queue_dir / ".claude_task_runner" / "state" / "bad.yaml"
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text("not yaml: ][", encoding="utf-8")
     _seed_state(queue_dir, "good", "completed")
-    assert _completed_task_ids(queue_dir) == {"good"}
+    ids = _state_task_ids(queue_dir)
+    assert ids.completed == {"good"}
+    assert ids.recorded == {"bad", "good"}
 
 
 # ---------------------------------------------------------------------------

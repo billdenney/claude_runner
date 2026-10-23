@@ -105,6 +105,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
     "block_dispatch": (_BLOCK_LIST, _BLOCK_LIST),
     "unanswered_sidecar": ("waits for your answer", "wait for your answer"),
     "depends_on": ("waits for another task to finish", "wait for another task to finish"),
+    "depends_on_missing": (
+        "waits for a task that does not exist",
+        "wait for a task that does not exist",
+    ),
     "deferred_cooldown": ("waits for a retry time", "wait for a retry time"),
     "invalid_effort": (
         "is set to a model or effort the queue does not allow",
@@ -144,6 +148,7 @@ _HELD_ORDER = (
     "readiness_awaiting_sidecar_response+missing_file",
     "readiness_missing_file",
     "depends_on",
+    "depends_on_missing",
     "deferred_cooldown",
     "block_dispatch",
     "weekly_paused",
