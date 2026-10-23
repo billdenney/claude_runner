@@ -105,6 +105,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
     "block_dispatch": (_BLOCK_LIST, _BLOCK_LIST),
     "unanswered_sidecar": ("waits for your answer", "wait for your answer"),
     "depends_on": ("waits for another task to finish", "wait for another task to finish"),
+    "depends_on_missing": (
+        "waits for a task that does not exist",
+        "wait for a task that does not exist",
+    ),
     "deferred_cooldown": ("waits for a retry time", "wait for a retry time"),
     "invalid_effort": (
         "is set to a model or effort the queue does not allow",
@@ -144,6 +148,7 @@ _HELD_ORDER = (
     "readiness_awaiting_sidecar_response+missing_file",
     "readiness_missing_file",
     "depends_on",
+    "depends_on_missing",
     "deferred_cooldown",
     "block_dispatch",
     "weekly_paused",
@@ -789,6 +794,42 @@ def _retry_notes(facts: Facts, holds: dict[str, Any], notes: Notes) -> None:
     )
 
 
+def _missing_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """``queue holds``' ``missing_dependencies``: each task held
+    ``depends_on_missing``, with the ids in its depends_on that have no task
+    file in todo/ and are not completed or running."""
+    return [
+        (str(r.get("task_id")), [str(m) for m in r.get("missing") or []])
+        for r in holds.get("missing_dependencies") or []
+        if isinstance(r, dict)
+    ]
+
+
+def _missing_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks whose depends_on names a task that does not exist: they do not
+    start until someone fixes the depends_on or adds the missing task."""
+    rows = _missing_dependency_rows(holds)
+    if not rows:
+        return
+    items = [f"{task_id} needs {', '.join(missing)}" for task_id, missing in rows]
+    n = len(rows)
+    lead = (
+        "1 task waits for a task that does not exist"
+        if n == 1
+        else f"{n} tasks wait for tasks that do not exist"
+    )
+    then = (
+        "It will not start until its depends_on is fixed or the missing task is added to todo/."
+        if n == 1
+        else "They will not start until each depends_on is fixed or the missing tasks are added "
+        "to todo/."
+    )
+    notes.attention.append(
+        f"{lead} ({_listing(items)}). No id named there has a task file in todo/, and none "
+        f"of them has completed or is running. {then}"
+    )
+
+
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:
     holds = facts.holds.data
     if holds is None:
@@ -855,6 +896,7 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
     parts.append(f"{int(holds.get('completed') or 0)} finished")
     _parked_notes(facts, watching, exited, live, notes)
     _retry_notes(facts, holds, notes)
+    _missing_dependency_notes(holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."
@@ -1309,6 +1351,17 @@ def holds_section(facts: Facts) -> str:
             f"| {'yes' if w.get('running') else 'no'} | {'yes' if w.get('past_cap') else 'no'} |"
             for w in parked
         ]
+    missing = _missing_dependency_rows(data)
+    if missing:
+        out += [
+            "",
+            "_Counted under depends_on_missing: no id listed has a task file in todo/, and none "
+            "of them has completed or is running:_",
+            "",
+            "| task | missing dependencies |",
+            "|---|---|",
+        ]
+        out += [f"| {task_id} | {', '.join(ids)} |" for task_id, ids in missing]
     if data.get("supervisor_json_error"):
         out += ["", f"_in-flight tasks unknown: {data['supervisor_json_error']}_"]
     return "\n".join(out) + "\n"
@@ -1329,11 +1382,11 @@ def counts_section(facts: Facts) -> str:
         "_How many tasks the runner has a record of in each state, finished ones too. pending: "
         "not started yet; running: being worked on now; awaiting_sidecar: stopped to ask a "
         "question, and stays so until it runs again, so it may already be answered and waiting "
-        "for a slot; deferred: on hold until a file appears, a retry time passes or a setting "
-        "is fixed; possibly_hung: running but silent for a long time; completed: done; failed: "
-        "failed once and will be retried; failed_circuit_breaker: failed repeatedly and will "
-        "not be retried; weekly_paused: held by the weekly limit. todo/*.yaml counts the task "
-        "files in todo/._",
+        "for a slot; deferred: on hold until a file appears, a retry time passes, or a setting "
+        "or a task's depends_on is fixed; possibly_hung: running but silent for a long time; "
+        "completed: done; failed: failed once and will be retried; failed_circuit_breaker: "
+        "failed repeatedly and will not be retried; weekly_paused: held by the weekly limit. "
+        "todo/*.yaml counts the task files in todo/._",
         "",
         "| field | value |",
         "|---|---|",

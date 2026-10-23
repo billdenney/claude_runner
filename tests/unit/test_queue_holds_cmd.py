@@ -38,6 +38,7 @@ from claude_task_runner.supervisor.states import (
 from ._concurrency_fixtures import invoke_cli, write_account_cap
 from ._mixed_queue import (
     BLOCK_FILE,
+    MIXED_EXPECTED_MISSING,
     STALE_HOLDS,
     add_state,
     add_task,
@@ -52,6 +53,7 @@ HELD = {
     "block_dispatch": 1,
     "deferred_cooldown": 1,
     "depends_on": 1,
+    "depends_on_missing": 1,
     "failed_circuit_breaker": 1,
     "in_flight": 1,
     "invalid_effort": 1,
@@ -126,7 +128,7 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
         },
         "held": HELD,
         "completed": 2,
-        "todo_tasks": 22,
+        "todo_tasks": 23,
         "poll_interval_s": 60.0,
         "affinity_ttl_s": 5400.0,
         "queue_cap": None,
@@ -139,9 +141,43 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
                 "next_eligible_at": "2027-10-14T12:00:00+00:00",
             }
         ],
+        "missing_dependencies": [
+            {"task_id": "names-a-missing-task", "missing": ["no-such-task"]},
+        ],
         "unread_states": [],
         "supervisor_json_error": None,
     }
+
+
+def test_missing_dependencies_match_the_selector(queue: Path, tmp_path: Path) -> None:
+    """``missing_dependencies`` is the selector's own record, one row per
+    task held ``depends_on_missing``, so it cannot disagree with ``held``."""
+    build_mixed_queue(queue, tmp_path / "absent.md")
+    _config(queue)
+
+    holds = _holds(queue)
+
+    assert holds["missing_dependencies"] == [
+        {"task_id": task_id, "missing": ids} for task_id, ids in MIXED_EXPECTED_MISSING.items()
+    ]
+    assert holds["held"]["depends_on_missing"] == len(MIXED_EXPECTED_MISSING)
+
+
+def test_missing_dependencies_list_every_missing_id_in_depends_on_order(queue: Path) -> None:
+    """Each held task lists only the ids no task has, once each, in the
+    order its depends_on gives them; rows are sorted by task id."""
+    _config(queue)
+    add_task(queue, "upstream")
+    add_task(queue, "b-waits", depends_on=["zeta", "upstream", "alpha", "zeta"])
+    add_task(queue, "a-waits", depends_on=["ghost"])
+
+    holds = _holds(queue)
+
+    assert holds["held"] == {"depends_on_missing": 2}
+    assert holds["missing_dependencies"] == [
+        {"task_id": "a-waits", "missing": ["ghost"]},
+        {"task_id": "b-waits", "missing": ["zeta", "alpha"]},
+    ]
 
 
 def test_writes_no_state_file(queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,6 +267,24 @@ def test_text_output(queue: Path, tmp_path: Path) -> None:
         "completed: 0\n"
         "queue-wide cap: none\n"
         "selection runs every: 60 s\n"
+    )
+
+
+def test_text_output_names_each_missing_dependency(queue: Path) -> None:
+    add_task(queue, "fresh")
+    add_task(queue, "orphan", depends_on=["fresh", "115-gone", "[122]-gone"])
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == (
+        "eligible: 1 (0 can start now, 0 waiting for the account their session runs on)\n"
+        "  fresh (new; no account now)\n"
+        "held, depends_on_missing: 1\n"
+        "completed: 0\n"
+        "queue-wide cap: none\n"
+        "selection runs every: 60 s\n"
+        "missing dependency: orphan needs 115-gone, [122]-gone (no task file in todo/, not "
+        "completed or running)\n"
     )
 
 

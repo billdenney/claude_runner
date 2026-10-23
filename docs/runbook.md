@@ -410,6 +410,17 @@ task that does not run.
      task's (model, effort) pair (ADR-0010). Fix the task's model or effort,
      or add the pair to `[effort_levels]` and send the supervisor SIGHUP.
      The task goes back to `pending` on the next tick.
+   - `missing dependency:` — the task's `depends_on` names a task id that
+     has no task file in `todo/` and whose state is not `completed`,
+     `running` or `possibly_hung`, so it can never complete (ADR-0036).
+     Either no task has the id, or only a state file is left from a task
+     whose YAML was renamed or deleted: the supervisor dispatches only
+     tasks in `todo/`. The reason lists the ids, and the supervisor log
+     has a WARNING, `parking task <id> as deferred: missing dependency:
+     ...`, from when the task was parked. Fix the id in the task's
+     `depends_on` (to the renamed task's new id, or remove it), or create
+     the missing task in `todo/`. The task goes back to `pending` on the
+     next tick, then waits for the dependency to complete if it now exists.
    - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
      `next_eligible_at` printed below the reason has passed, the supervisor
@@ -474,7 +485,19 @@ not paused or throttled.
      task missing elements of both kinds is counted once, under
      `readiness_awaiting_sidecar_response+missing_file`.
    - `unanswered_sidecar` — see "Sidecars piling up".
-   - `depends_on` — a task named in `depends_on` has not completed.
+   - `depends_on` — a task named in `depends_on` has not completed. It
+     exists: it has a task file in `todo/`, or its state is `running` or
+     `possibly_hung` (a worker may still finish it), or its state file
+     cannot be read. If its task file is in `todo/` but it is
+     `failed_circuit_breaker` or will otherwise never run again, this holds
+     until you fix or remove it.
+   - `depends_on_missing` — a task named in `depends_on` cannot complete:
+     it has no task file in `todo/` and its state is not `completed`,
+     `running` or `possibly_hung` (no state at all, or one left by a
+     renamed or deleted task), so waiting will never release the task.
+     `queue holds` names each such task and the ids it is missing; see "A
+     task stays `deferred`". A task with both a missing and an unfinished
+     dependency is counted here.
    - `deferred_cooldown` — a `deferred` state whose `next_eligible_at` has
      not passed, whoever wrote it: a pre-dispatch hook deferral or a
      deferral written by hand. See "A task stays `deferred`".

@@ -72,7 +72,6 @@ SNAPSHOT = SKILL_DIR / "snapshot.sh"
 REPORT = SKILL_DIR / "report.py"
 
 SINCE = datetime(2026, 10, 16, 8, 0, tzinfo=UTC)
-WEEKLY_RESET = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
 BLOCK_FILE = "needs_acquisition.jsonl"
 BAD_TOML = "max_concurrency 5\n"
 NORMAL = "\nEverything looks normal.\n"
@@ -215,7 +214,9 @@ def _tasks(
     """Todo tasks in the usual places: ``new`` never started; ``answered``
     asked and were answered; ``asking`` wait for ``questions`` answers each;
     ``blocked`` are in the block list; ``depends`` wait for a task that never
-    finishes; ``files`` for a file that is absent; ``done`` finished."""
+    finishes (its state is possibly_hung and it has no todo/ YAML, so it is
+    not counted itself); ``files`` for a file that is absent; ``done``
+    finished."""
     for i in range(new):
         add_task(queue, f"new-{i}")
     for i in range(answered):
@@ -234,6 +235,8 @@ def _tasks(
         add_state(queue, f"blocked-{i}", "pending")
         rows.append(json.dumps({"task": f"blocked-{i}", "block_dispatch": True}) + "\n")
     (queue / BLOCK_FILE).write_text("".join(rows), encoding="utf-8")
+    if depends:
+        add_state(queue, "never-finishes", "possibly_hung")
     for i in range(depends):
         add_task(queue, f"depends-{i}", depends_on=["never-finishes"])
     for i in range(files):
@@ -480,20 +483,28 @@ def test_paused_account_with_a_task_still_running(
 
 
 def test_weekly_throttle_resumes_when_use_falls_back_under_plan(
-    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
 ) -> None:
     """The resume time is the weekly curve's catch-up from `account list`,
     not the supervisor's next re-check (scheduled_wakeup_at, much sooner).
-    On the default curve 30% used is met 104 hours before the reset."""
+    On the default curve 30% used is met 104 hours before the reset, so a
+    reset 110 hours after the report's time puts the resume 6 hours ahead
+    of it. Both instants follow the report's time: the report words a
+    resume time that has passed differently."""
+    weekly_reset = report_now.replace(second=0) + timedelta(hours=110)
     _two_accounts(
         queue,
         tmp_path,
         personal=_state(
             SupervisorState.THROTTLED_WEEKLY,
             last_weekly_util_pct=30,
-            last_weekly_reset_at=WEEKLY_RESET,
+            last_weekly_reset_at=weekly_reset,
             target_concurrency=0,
-            scheduled_wakeup_at=SINCE + timedelta(hours=5),
+            scheduled_wakeup_at=report_now + timedelta(hours=1),
         ),
         running={"work": 3},
     )
@@ -511,7 +522,7 @@ def test_weekly_throttle_resumes_when_use_falls_back_under_plan(
         "- **Tasks:** 3 running; 2 can start as soon as a slot is free; 0 finished.\n"
         + NO_QUESTIONS
         + _info(
-            f"personal starts again about {_when(WEEKLY_RESET - timedelta(hours=104))}, when its "
+            f"personal starts again about {_when(weekly_reset - timedelta(hours=104))}, when its "
             "weekly use falls back under plan. Nothing to do."
         )
     )
@@ -688,6 +699,91 @@ def test_tasks_that_need_the_operator(
         )
         + _info("No task can start right now: every unfinished task is held, as Tasks shows.")
     )
+
+
+def test_tasks_whose_dependency_does_not_exist(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """A task whose depends_on names a task that does not exist can never
+    start, unlike one waiting for a task that does: it needs the operator,
+    and the summary names each such task with the ids it is missing."""
+    _two_accounts(queue, tmp_path)
+    _tasks(queue, depends=1)
+    add_task(queue, "orphan-a", depends_on=["115-pouzin_2022_tusamitamab"])
+    add_task(
+        queue,
+        "orphan-b",
+        depends_on=["never-finishes", "122-yao_2018_guselkumab", "129-ng_2009_clozapine"],
+    )
+    supervisor()
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 1 waits for another task to finish; 2 wait for a task that does not "
+        "exist; 0 finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "2 tasks wait for tasks that do not exist (orphan-a needs "
+            "115-pouzin_2022_tusamitamab; orphan-b needs 122-yao_2018_guselkumab, "
+            "129-ng_2009_clozapine). No id named there has a task file in todo/, and none of "
+            "them has completed or is running. They will not start until each depends_on is "
+            "fixed or the missing tasks are added to todo/."
+        )
+        + _info("No task can start right now: every unfinished task is held, as Tasks shows.")
+    )
+
+
+def test_one_task_whose_dependency_does_not_exist_and_the_details(
+    queue: Path, bin_dir: Path
+) -> None:
+    """One such task is worded in the singular; the details list every
+    task held for a missing dependency, not only the first few."""
+    rows = [{"task_id": f"orphan-{i}", "missing": [f"gone-{i}"]} for i in range(5)]
+    rows[0]["missing"].append("gone-x")
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"depends_on_missing": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "missing_dependencies": rows[:1],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    assert (
+        "- 1 task waits for a task that does not exist (orphan-0 needs gone-0, gone-x). No id "
+        "named there has a task file in todo/, and none of them has completed or is running. "
+        "It will not start until its depends_on is fixed or the missing task is added to "
+        "todo/.\n"
+    ) in _summary(queue, bin_dir)
+
+    holds["held"] = {"depends_on_missing": 5}
+    holds["todo_tasks"] = 5
+    holds["missing_dependencies"] = rows
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    summary = proc.stdout.partition("### Details\n")[0]
+    assert (
+        "(orphan-0 needs gone-0, gone-x; orphan-1 needs gone-1; orphan-2 needs gone-2; and 2 more)"
+    ) in summary
+    _, _, details = proc.stdout.partition("**What holds the tasks**")
+    section = details.split("\n**Queue counts**")[0]
+    assert section.endswith(
+        "| depends_on_missing | 5 |\n"
+        "| completed | 0 |\n"
+        "| todo/ tasks (total) | 5 |\n\n"
+        "_Counted under depends_on_missing: no id listed has a task file in todo/, and none of "
+        "them has completed or is running:_\n\n"
+        "| task | missing dependencies |\n"
+        "|---|---|\n"
+        "| orphan-0 | gone-0, gone-x |\n"
+        "| orphan-1 | gone-1 |\n"
+        "| orphan-2 | gone-2 |\n"
+        "| orphan-3 | gone-3 |\n"
+        "| orphan-4 | gone-4 |\n"
+    ), section
 
 
 def test_nothing_running_although_tasks_can_start(

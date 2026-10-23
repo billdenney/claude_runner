@@ -49,8 +49,9 @@ non-specialist can read in ten seconds, as five short lines:
 - **Tasks**: what the supervisor's own selection says about every task in
   `todo/`: how many run, how many can start as soon as a slot is free
   (and how many of those were answered after asking), how many wait for
-  your answer, a file, another task or a retry time, how many the block
-  list holds, how many look stuck or failed for good, how many finished.
+  your answer, a file, another task or a retry time, how many wait for a
+  task that does not exist, how many the block list holds, how many look
+  stuck or failed for good, how many finished.
 - **Questions for you**: the open sidecar questions, and notices to
   acknowledge.
 
@@ -58,9 +59,10 @@ Then **Not normal right now**: one sentence per condition that needs the
 operator, saying what it means and what to do (an account that cannot take
 tasks until a problem is fixed, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
-read, tasks whose worker could not be started, an unwatched worker past
-its time limit while no supervisor runs to stop it, or one that exited
-unrecorded, unreadable sidecar requests,
+read, tasks whose `depends_on` names a task that does not exist (each with
+the ids it is missing), tasks whose worker could not be started, an
+unwatched worker past its time limit while no supervisor runs to stop it,
+or one that exited unrecorded, unreadable sidecar requests,
 a supervisor that is down or stuck, an unreadable `supervisor.json` or
 queue settings file, nothing running although tasks can start). And **For
 your information**: routine conditions that resolve by themselves, with
@@ -76,7 +78,8 @@ The facts come from the runner, not from re-reading its files:
 pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
 candidate selection run once, read-only, with the poll interval, the
-parked workers and why each task waiting for a retry time was deferred) and
+parked workers, why each task waiting for a retry time was deferred, and
+the missing dependency ids of each task held `depends_on_missing`) and
 `claude-task-runner sidecar list --json`. The script passes the live
 supervisor's own `--config` to `account list` and `queue holds`
 (`sidecar list` reads no settings), resolving a relative path against the
@@ -121,7 +124,9 @@ with a line saying what it shows and defining its terms:
   tasks dispatch lets the account run (below its `max_concurrency`): the
   ADR-0022 ramp while `slowing_down`, 0 while throttled, "—" when no
   decision has set one.
-- **What holds the tasks**: `queue holds`' counts per category.
+- **What holds the tasks**: `queue holds`' counts per category, why the
+  tasks waiting for a retry time were deferred, the parked workers, and
+  every task held `depends_on_missing` with its missing dependency ids.
 - **Queue counts**: a row for every task status across every state file,
   finished tasks included, one for any status the runner does not know,
   and one for files it could not read or that name no status (the rows
@@ -324,6 +329,14 @@ or recent failures), follow the prioritized triage flow below.
          YAML is fixed, or the pair is added to the TOML and the
          supervisor gets SIGHUP. This needs the operator: list each task
          with its reason.
+       - `missing dependency:` — the task's `depends_on` names a task id
+         that has no task file in `todo/` and is not completed or running
+         (no task has it, or only a state left by a renamed or deleted
+         task), so it can never complete (ADR-0036). It stays parked
+         until the task's `depends_on` is fixed or the missing task is
+         created in `todo/`; the supervisor un-parks it at its next check.
+         This needs the operator: list each task with the ids its reason
+         names.
        - `pre-dispatch hook deferred (exit 1)` — the queue's pre-dispatch
          hook asked to wait. The hook runs again once the task's
          `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
@@ -343,7 +356,8 @@ or recent failures), follow the prioritized triage flow below.
          "could not start its worker".
 
          Of the runner's own deferrals, these two set
-         `next_eligible_at`; the readiness and effort holds do not.
+         `next_eligible_at`; the readiness, effort and missing-dependency
+         holds do not.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,
@@ -359,7 +373,12 @@ or recent failures), follow the prioritized triage flow below.
        is open for dispatch, `queue holds --json` says why now: no task
        can start when `eligible.count` is 0 and `held` counts what holds
        the rest (`block_dispatch`, `readiness_missing_file`, `depends_on`,
-       `unanswered_sidecar`, a status name, ...). If tasks can start and
+       `depends_on_missing`, `unanswered_sidecar`, a status name, ...).
+       `depends_on` waits for a task that exists and has not finished;
+       `depends_on_missing` names one with no task file in `todo/` that
+       is not completed or running, never clears by waiting, and needs
+       the operator: `missing_dependencies` lists each such task with its
+       `missing` ids. If tasks can start and
        an account has room but nothing runs, look in the supervisor's log
        for `dispatch skipped task` lines. The snapshot's **Last idle
        report** is the supervisor's own `no eligible tasks:` line, which is

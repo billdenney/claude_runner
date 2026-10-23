@@ -54,6 +54,7 @@ from claude_task_runner.usage.source import FakeUsageSource
 from ._mixed_queue import (
     BLOCK_FILE,
     MIXED_EXPECTED_ELIGIBLE,
+    MIXED_EXPECTED_MISSING,
     MIXED_EXPECTED_SKIPS,
     NOW,
     STALE_HOLDS,
@@ -124,7 +125,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
     eligible = _select(queue_dir, skips)
 
     n_yamls = len(list(todo_dir(queue_dir).glob("*.yaml")))
-    assert n_yamls == 22
+    assert n_yamls == 23
     assert len(eligible) + sum(skips.values()) == n_yamls
 
 
@@ -218,6 +219,7 @@ def test_preview_is_the_selector_without_its_side_effects(
 
     assert [t.id for t in preview.eligible] == ticked_ids == MIXED_EXPECTED_ELIGIBLE
     assert preview.skips == skips == MIXED_EXPECTED_SKIPS
+    assert preview.missing_dependencies == MIXED_EXPECTED_MISSING
     assert preview.eligible_statuses == {
         "cooldown-over": "deferred",
         "effort-fixed": "deferred",
@@ -390,6 +392,7 @@ def test_logs_on_entry_change_and_recovery_only(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [
@@ -430,6 +433,39 @@ def test_logs_on_entry_change_and_recovery_only(
         (
             logging.INFO,
             "no eligible tasks: 2 unfinished held (deferred_cooldown 1, depends_on 1)",
+        )
+    ]
+
+
+def test_a_missing_dependency_has_its_own_count_and_one_warning(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, no_spawn: None
+) -> None:
+    """Through real ticks: the line counts a task whose dependency does not
+    exist apart from one waiting for a task that does, and the WARNING that
+    names the missing id is logged once, not once per tick."""
+    caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
+    idle_log = IdleDispatchLog()
+    add_task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_state(queue_dir, "never-finishes", "possibly_hung")
+    add_task(queue_dir, "orphan", depends_on=["115-pouzin_2022_tusamitamab"])
+
+    for _ in range(3):
+        _tick(queue_dir, idle_log)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == ORCHESTRATOR_LOGGER and r.levelno == logging.WARNING
+    ]
+    assert warnings == [
+        "parking task orphan as deferred: missing dependency: depends_on names "
+        "115-pouzin_2022_tusamitamab, which has no task file in todo/ and is not completed or "
+        "running. Fix the task's depends_on, or create the missing task in todo/"
+    ]
+    assert _idle_lines(caplog) == [
+        (
+            logging.INFO,
+            "no eligible tasks: 2 unfinished held (depends_on 1, depends_on_missing 1)",
         )
     ]
 
@@ -483,6 +519,7 @@ def test_silent_when_no_account_can_dispatch(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     _tick(queue_dir, idle_log, snapshot=_snapshot(SupervisorState.THROTTLED_WEEKLY))
 
@@ -496,6 +533,7 @@ def test_silent_when_every_slot_is_taken(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_state(queue_dir, "never-finishes", "possibly_hung")
     release = threading.Event()
     busy = threading.Thread(target=release.wait)
     busy.start()
@@ -547,6 +585,7 @@ def test_supervisor_logs_a_drained_queue_once(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     monkeypatch.setattr(daemon_mod, "sleep_for_next_poll", lambda **kw: None)
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     start_daemon(
         queue_dir=queue_dir,
