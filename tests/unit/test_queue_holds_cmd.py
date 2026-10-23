@@ -449,6 +449,45 @@ def test_parked_workers_and_retry_reasons(
     ]
 
 
+def test_text_output_of_the_detail_lines(queue: Path) -> None:
+    """Each detail line's label renders as markup rather than as a literal
+    "[bold]...[/]", and what a hook, an operator or the queue wrote (task
+    ids, a deferral reason with brackets and an emoji code, a broken
+    supervisor.json's error) prints as written."""
+    _config(queue)
+    now = datetime.now(UTC).replace(microsecond=0)
+    started, due = now - timedelta(minutes=10), now + timedelta(minutes=15)
+    add_task(queue, "exited")
+    gone = _exited_pid()
+    _parked(queue, "exited", gone, None, started)
+    add_task(queue, "hooked")
+    reason = "pre-dispatch hook deferred (exit 1): see [effort_levels], [/] and /data/:b:/x"
+    add_state(queue, "hooked", "deferred", deferred_reason=reason, next_eligible_at=due)
+    add_task(queue, "orphan", depends_on=["[gone]"])
+    persist_mod.supervisor_state_path(queue).write_text("[bold]", encoding="utf-8")
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue)])
+
+    assert result.exit_code == 0, result.output
+    path = persist_mod.supervisor_state_path(queue)
+    assert result.stdout == (
+        "eligible: 0 (0 can start now, 0 waiting for the account their session runs on)\n"
+        "held, deferred_cooldown: 1\n"
+        "held, depends_on_missing: 1\n"
+        "held, possibly_hung: 1\n"
+        "completed: 0\n"
+        "queue-wide cap: none\n"
+        "selection runs every: 60 s\n"
+        f"parked worker: exited pid {gone} since {started.isoformat()}, exited (within its "
+        "time limit)\n"
+        f"retries at {due.isoformat()}: hooked: {reason}\n"
+        "missing dependency: orphan needs [gone] (no task file in todo/, not completed or "
+        "running)\n"
+        f"supervisor.json not read, in-flight tasks unknown: {path}: invalid JSON: Expecting "
+        "value: line 1 column 2 (char 1)\n"
+    )
+
+
 def test_a_parked_worker_supervisor_json_lists_is_held_by_its_status(
     queue: Path, tmp_path: Path, worker: Callable[[Path], int]
 ) -> None:

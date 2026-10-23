@@ -508,6 +508,9 @@ def holds(
     if json:
         print(_json.dumps(payload, indent=2))
         return
+    # Labels are Rich markup; every task id, reason and error is escaped and
+    # printed without emoji codes, so a "[/]" in a hook's stderr or a ":b:"
+    # in a path prints as written.
     console.print(
         f"[bold]eligible:[/] {len(preview.eligible)} ({can_start_now} can start now, "
         f"{len(preview.affinity_held)} waiting for the account their session runs on)",
@@ -516,7 +519,9 @@ def holds(
     for task in preview.eligible:
         route = preview.routes[task.id] or "no account now"
         console.print(
-            f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})", highlight=False
+            f"  {escape(task.id)} ({preview.eligible_statuses[task.id]}; {escape(route)})",
+            highlight=False,
+            emoji=False,
         )
     for category, n in held.items():
         console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
@@ -532,22 +537,24 @@ def holds(
         cap = "past its time limit" if worker["past_cap"] else "within its time limit"
         state = "still running" if worker["running"] else "exited"
         console.print(
-            f"[bold]parked worker:[/] {worker['task_id']} pid {worker['pid']} since "
-            f"{worker['started_at']}, {state} ({cap})",
+            f"[bold]parked worker:[/] {escape(str(worker['task_id']))} pid {worker['pid']} "
+            f"since {worker['started_at']}, {state} ({cap})",
             highlight=False,
+            emoji=False,
         )
     for item in retrying:
         console.print(
-            f"[bold]retries at {item['next_eligible_at']}:[/] {item['task_id']}: "
-            f"{item['deferred_reason']}",
+            f"[bold]retries at {item['next_eligible_at']}:[/] {escape(str(item['task_id']))}: "
+            f"{escape(str(item['deferred_reason']))}",
             highlight=False,
-            markup=False,
+            emoji=False,
         )
     for task_id, ids in missing:
         console.print(
             f"[bold]missing dependency:[/] {escape(task_id)} needs {escape(', '.join(ids))} "
             "(no task file in todo/, not completed or running)",
             highlight=False,
+            emoji=False,
         )
     for note in unread:
         console.print(
@@ -558,8 +565,9 @@ def holds(
         )
     if snapshot_error:
         console.print(
-            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
+            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {escape(snapshot_error)}",
             highlight=False,
+            emoji=False,
         )
 
 
