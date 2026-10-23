@@ -72,7 +72,6 @@ SNAPSHOT = SKILL_DIR / "snapshot.sh"
 REPORT = SKILL_DIR / "report.py"
 
 SINCE = datetime(2026, 10, 16, 8, 0, tzinfo=UTC)
-WEEKLY_RESET = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
 BLOCK_FILE = "needs_acquisition.jsonl"
 BAD_TOML = "max_concurrency 5\n"
 NORMAL = "\nEverything looks normal.\n"
@@ -483,20 +482,28 @@ def test_paused_account_with_a_task_still_running(
 
 
 def test_weekly_throttle_resumes_when_use_falls_back_under_plan(
-    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
 ) -> None:
     """The resume time is the weekly curve's catch-up from `account list`,
     not the supervisor's next re-check (scheduled_wakeup_at, much sooner).
-    On the default curve 30% used is met 104 hours before the reset."""
+    On the default curve 30% used is met 104 hours before the reset, so a
+    reset 110 hours after the report's time puts the resume 6 hours ahead
+    of it. Both instants follow the report's time: the report words a
+    resume time that has passed differently."""
+    weekly_reset = report_now.replace(second=0) + timedelta(hours=110)
     _two_accounts(
         queue,
         tmp_path,
         personal=_state(
             SupervisorState.THROTTLED_WEEKLY,
             last_weekly_util_pct=30,
-            last_weekly_reset_at=WEEKLY_RESET,
+            last_weekly_reset_at=weekly_reset,
             target_concurrency=0,
-            scheduled_wakeup_at=SINCE + timedelta(hours=5),
+            scheduled_wakeup_at=report_now + timedelta(hours=1),
         ),
         running={"work": 3},
     )
@@ -514,7 +521,7 @@ def test_weekly_throttle_resumes_when_use_falls_back_under_plan(
         "- **Tasks:** 3 running; 2 can start as soon as a slot is free; 0 finished.\n"
         + NO_QUESTIONS
         + _info(
-            f"personal starts again about {_when(WEEKLY_RESET - timedelta(hours=104))}, when its "
+            f"personal starts again about {_when(weekly_reset - timedelta(hours=104))}, when its "
             "weekly use falls back under plan. Nothing to do."
         )
     )
