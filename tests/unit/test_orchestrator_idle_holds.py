@@ -392,7 +392,7 @@ def test_logs_on_entry_change_and_recovery_only(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
-    add_state(queue_dir, "never-finishes", "pending")
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     _tick(queue_dir, idle_log)
     assert _idle_lines(caplog) == [
@@ -446,7 +446,7 @@ def test_a_missing_dependency_has_its_own_count_and_one_warning(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
-    add_state(queue_dir, "never-finishes", "pending")
+    add_state(queue_dir, "never-finishes", "possibly_hung")
     add_task(queue_dir, "orphan", depends_on=["115-pouzin_2022_tusamitamab"])
 
     for _ in range(3):
@@ -459,8 +459,8 @@ def test_a_missing_dependency_has_its_own_count_and_one_warning(
     ]
     assert warnings == [
         "parking task orphan as deferred: missing dependency: depends_on names "
-        "115-pouzin_2022_tusamitamab, but no task in todo/ or state/ has that id. Fix the "
-        "task's depends_on, or create the missing task in todo/"
+        "115-pouzin_2022_tusamitamab, which has no task file in todo/ and is not completed or "
+        "running. Fix the task's depends_on, or create the missing task in todo/"
     ]
     assert _idle_lines(caplog) == [
         (
@@ -519,7 +519,7 @@ def test_silent_when_no_account_can_dispatch(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
-    add_state(queue_dir, "never-finishes", "pending")
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     _tick(queue_dir, idle_log, snapshot=_snapshot(SupervisorState.THROTTLED_WEEKLY))
 
@@ -533,7 +533,7 @@ def test_silent_when_every_slot_is_taken(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     idle_log = IdleDispatchLog()
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
-    add_state(queue_dir, "never-finishes", "pending")
+    add_state(queue_dir, "never-finishes", "possibly_hung")
     release = threading.Event()
     busy = threading.Thread(target=release.wait)
     busy.start()
@@ -585,7 +585,7 @@ def test_supervisor_logs_a_drained_queue_once(
     caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
     monkeypatch.setattr(daemon_mod, "sleep_for_next_poll", lambda **kw: None)
     add_task(queue_dir, "waits", depends_on=["never-finishes"])
-    add_state(queue_dir, "never-finishes", "pending")
+    add_state(queue_dir, "never-finishes", "possibly_hung")
 
     start_daemon(
         queue_dir=queue_dir,

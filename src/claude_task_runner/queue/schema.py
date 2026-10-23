@@ -229,9 +229,9 @@ class Task(_StrictBase):
     """Dispatch ordering within the eligible set: ``low`` | ``normal`` | ``high``."""
     depends_on: list[str] = Field(default_factory=list)
     """Task ids that must be ``completed`` before this task dispatches. An id
-    with no ``todo/<id>.yaml`` and no state file can never complete: the
-    supervisor parks the task ``deferred`` with a WARNING until the id is
-    fixed or that task is created (ADR-0036)."""
+    with no ``todo/<id>.yaml`` whose state is not completed or running can
+    never complete: the supervisor parks the task ``deferred`` with a
+    WARNING until the id is fixed or that task is created (ADR-0036)."""
     requires: list[ReadinessRequirement] = Field(default_factory=list)
     """Mechanical (no-AI, no-dispatch) preconditions the supervisor checks
     each tick before selecting this task — e.g. an input file that must

@@ -12,8 +12,8 @@ the daemon calls :func:`tick_dispatch`, which:
    sets it.
 3. Picks eligible pending tasks (no ``running`` state file, all
    ``depends_on`` IDs are ``completed``), up to that number. A
-   ``depends_on`` ID that names no task, with neither a ``todo/`` YAML nor
-   a state file, can never complete: the task is held as
+   ``depends_on`` ID with no ``todo/`` YAML whose state is not completed
+   or running can never complete: the task is held as
    ``depends_on_missing`` and parked ``deferred`` with a WARNING until its
    ``depends_on`` is fixed or the missing task is created (ADR-0036).
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
@@ -165,9 +165,9 @@ _DISPATCHABLE_STATUSES = frozenset({"pending", "failed"})
 # status itself, ``running``, ``possibly_hung``, ...; ``block_dispatch``;
 # ``depends_on``), a snake_case phrase otherwise. ``depends_on`` is a
 # dependency that exists and has not completed; ``depends_on_missing`` one
-# that names no task at all (ADR-0036). A task held by readiness
-# is ``readiness_`` plus the categories of its unmet requirements, sorted
-# and joined by ``+`` (``readiness_missing_file``,
+# that cannot complete because no task by that id exists (ADR-0036). A
+# task held by readiness is ``readiness_`` plus the categories of its unmet
+# requirements, sorted and joined by ``+`` (``readiness_missing_file``,
 # ``readiness_awaiting_sidecar_response+missing_file``).
 _SKIP_UNPARSEABLE_TASK = "unparseable_task"
 _SKIP_BLOCK_DISPATCH = "block_dispatch"
@@ -411,7 +411,7 @@ def tick_dispatch(
         effort_levels=settings.effort_levels,
         skips=skips,
         on_park=tracker.note_park,
-        recorded_ids=state_ids.recorded,
+        may_complete_ids=state_ids.may_complete,
     )
     # A task the selector just parked (or a dispatch thread did since the
     # tick began) holds its account's slot from now on, not from next tick.
@@ -876,31 +876,41 @@ def _has_any_completed(queue_dir: Path) -> bool:
     return False
 
 
+_WORKER_STATUSES = frozenset({"running", "possibly_hung"})
+"""Statuses whose task a worker may still be running, and so may complete
+whether or not its YAML is still in ``todo/``."""
+
+
 class _StateIds(NamedTuple):
-    """The task ids the state directory records, from one pass over it."""
+    """Task ids read from the state directory, in one pass over it."""
 
     completed: set[str]
     """Ids whose state file parses and says ``completed``."""
-    recorded: set[str]
-    """Every id with a state file, parseable or not: the file name's stem,
-    as :func:`queue.store.state_file_path` names it."""
+    may_complete: set[str]
+    """Ids not completed whose task may still complete without a ``todo/``
+    YAML: a worker may be running it (``running``, ``possibly_hung``), or
+    its state file does not parse, so nothing can be told from it. A task
+    in any other status runs again only from its ``todo/`` YAML."""
 
 
 def _state_task_ids(queue_dir: Path) -> _StateIds:
-    """The completed and the recorded task ids, in the one pass over the
-    state files that the selector needs for ``completed`` anyway."""
+    """The completed task ids, and those that may yet complete, in the one
+    pass over the state files that the selector needs for ``completed``
+    anyway."""
     completed: set[str] = set()
-    recorded: set[str] = set()
+    may_complete: set[str] = set()
     for sp in iter_state_files(queue_dir):
-        recorded.add(sp.stem)
         try:
             state = load_state(sp)
         except Exception as exc:
             logger.warning("skipping unparseable state %s: %s", sp, exc)
+            may_complete.add(sp.stem)
             continue
         if state.status == "completed":
             completed.add(state.task_id)
-    return _StateIds(completed=completed, recorded=recorded)
+        elif state.status in _WORKER_STATUSES:
+            may_complete.add(state.task_id)
+    return _StateIds(completed=completed, may_complete=may_complete)
 
 
 def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
@@ -1137,7 +1147,7 @@ def _effort_hold_reason(task: Task, effort_levels: dict[str, list[str]]) -> str 
 
 _MISSING_DEPENDENCY_PREFIX = "missing dependency: "
 """Prefix of the ``deferred_reason`` the selector writes when it parks a task
-whose ``depends_on`` names a task the queue does not have (ADR-0036). Only a
+whose ``depends_on`` names a task that cannot complete (ADR-0036). Only a
 hold with this prefix is cleared once the dependency exists or leaves
 ``depends_on``; an operator's park, a hook deferral and the other gates'
 holds are not."""
@@ -1153,11 +1163,12 @@ def _missing_dependencies(task: Task, known_ids: Collection[str]) -> list[str]:
 def _missing_dependency_reason(missing: Sequence[str]) -> str:
     """The ``deferred_reason`` to park a task with whose ``depends_on``
     names the ``missing`` ids."""
-    which = "that id" if len(missing) == 1 else "those ids"
-    return (
-        f"{_MISSING_DEPENDENCY_PREFIX}depends_on names {', '.join(missing)}, but no task "
-        f"in todo/ or state/ has {which}"
+    tail = (
+        "which has no task file in todo/ and is not completed or running"
+        if len(missing) == 1
+        else "which have no task file in todo/ and are not completed or running"
     )
+    return f"{_MISSING_DEPENDENCY_PREFIX}depends_on names {', '.join(missing)}, {tail}"
 
 
 def _is_missing_dependency_reason(reason: str | None) -> bool:
@@ -1177,7 +1188,7 @@ def _eligible_candidates(
     held: dict[str, list[Task]] | None = None,
     read_only: bool = False,
     on_park: ParkCallback | None = None,
-    recorded_ids: Collection[str] | None = None,
+    may_complete_ids: Collection[str] | None = None,
     missing_dependencies: dict[str, list[str]] | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
@@ -1202,11 +1213,11 @@ def _eligible_candidates(
     # :func:`_skip_category`): the same tasks are returned and counted, and
     # no state file is written, nor ``todo/`` created.
     #
-    # ``recorded_ids`` is every task id with a state file
-    # (:func:`_state_task_ids`, the pass that also finds ``completed_ids``);
-    # ``None`` lists the state directory here. With the ``todo/`` YAMLs and
-    # ``completed_ids`` it makes the set of tasks that exist, which tells a
-    # ``depends_on`` that has not completed from one that never can.
+    # ``may_complete_ids`` are the ids :func:`_state_task_ids` finds may
+    # still complete without a ``todo/`` YAML, in the pass that also finds
+    # ``completed_ids``; ``None`` makes that pass here. With the ``todo/``
+    # YAMLs and ``completed_ids`` they are the tasks that exist, which tells
+    # a ``depends_on`` that has not completed from one that never can.
     # ``missing_dependencies``, when given, gets each task held
     # ``depends_on_missing`` with the ids it names that do not exist.
     tally: Counter[str] = skips if skips is not None else Counter()
@@ -1228,10 +1239,10 @@ def _eligible_candidates(
 
     pending = iter_pending_tasks if read_only else list_pending_tasks
     paths = list(pending(queue_dir))
-    if recorded_ids is None:
-        recorded_ids = {sp.stem for sp in iter_state_files(queue_dir)}
+    if may_complete_ids is None:
+        may_complete_ids = _state_task_ids(queue_dir).may_complete
     known_ids = {p.stem for p in paths}
-    known_ids.update(recorded_ids, completed_ids)
+    known_ids.update(may_complete_ids, completed_ids)
     for path in paths:
         try:
             task = load_task(path)
@@ -1290,8 +1301,10 @@ def _skip_category(
     :class:`IdleDispatchLog` prints cannot disagree with what the selector
     did.
 
-    ``known_ids`` are the tasks that exist: a ``todo/`` YAML or a state file.
-    A ``depends_on`` id outside them is missing, not merely unfinished.
+    ``known_ids`` are the tasks that exist: a ``todo/`` YAML, a completed
+    state, or a state a worker may still complete (or that does not parse).
+    A ``depends_on`` id outside them is missing, not merely unfinished: a
+    task with no YAML in ``todo/`` is never dispatched again.
 
     The effort, missing-dependency and readiness gates also park a held task
     as ``deferred`` and un-park it once its hold clears (see
@@ -1411,8 +1424,9 @@ def _skip_category(
     if not read_only:
         state = _unpark(queue_dir, task.id, state, effort_levels_mod.is_hold_reason)
 
-    # Missing-dependency gate (ADR-0036): a depends_on id that names no
-    # task (no todo/ YAML, no state file) can never complete, so waiting
+    # Missing-dependency gate (ADR-0036): a depends_on id with no todo/
+    # YAML whose state is not completed or running (none, or one left
+    # behind by a renamed or deleted task) can never complete, so waiting
     # for it would hold the task forever. Like an invalid effort it is an
     # authoring error: the task is parked `deferred` with a `missing
     # dependency: ...` reason and a WARNING, once per transition, and
@@ -1535,8 +1549,8 @@ class SelectionPreview:
     cannot be read has no :class:`Task` and is only counted."""
     missing_dependencies: dict[str, list[str]]
     """For each task held ``depends_on_missing``, the ids in its
-    ``depends_on`` that no task in ``todo/`` or ``state/`` has, in the order
-    it lists them."""
+    ``depends_on`` that have no ``todo/`` YAML and are not completed or
+    running, in the order it lists them."""
     queue_cap: int | None
     """The queue-wide cap on tasks in flight now (:func:`_target_concurrency`):
     ``[concurrency].initial_concurrency`` while warming up, else
@@ -1584,7 +1598,7 @@ def preview_selection(
         skips=skips,
         held=held,
         read_only=True,
-        recorded_ids=state_ids.recorded,
+        may_complete_ids=state_ids.may_complete,
         missing_dependencies=missing,
     )
     eligible.sort(key=priority_sort_key)

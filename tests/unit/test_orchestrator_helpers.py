@@ -196,28 +196,41 @@ def test_state_task_ids_empty(queue_dir: Path) -> None:
     assert _state_task_ids(queue_dir) == (set(), set())
 
 
-def test_state_task_ids_collects_completed_and_every_recorded_id(queue_dir: Path) -> None:
+def test_state_task_ids_sorts_every_status(queue_dir: Path) -> None:
+    """Completed tasks, and tasks a worker may still complete; a task in
+    any other status runs again only from its todo/ YAML, so it is in
+    neither set."""
     _seed_state(queue_dir, "t1", "completed")
     _seed_state(queue_dir, "t2", "completed")
-    _seed_state(queue_dir, "t3", "pending")
-    _seed_state(queue_dir, "t4", "failed")
+    _seed_state(queue_dir, "t3", "running")
+    _seed_state(queue_dir, "t4", "possibly_hung")
+    for status in (
+        "pending",
+        "failed",
+        "deferred",
+        "awaiting_sidecar",
+        "failed_circuit_breaker",
+        "weekly_paused",
+    ):
+        _seed_state(queue_dir, f"other-{status}", status)
     ids = _state_task_ids(queue_dir)
     assert ids.completed == {"t1", "t2"}
-    assert ids.recorded == {"t1", "t2", "t3", "t4"}
+    assert ids.may_complete == {"t3", "t4"}
 
 
-def test_state_task_ids_records_an_unparseable_state_but_not_as_completed(
+def test_state_task_ids_counts_an_unparseable_state_as_may_complete(
     queue_dir: Path,
 ) -> None:
-    """An unparseable state file still says its task exists, so a
-    depends_on naming it waits rather than being held as missing."""
+    """Nothing can be told from a state file that does not parse, so its
+    task is taken to exist: a depends_on naming it waits rather than being
+    held as missing."""
     bad = queue_dir / ".claude_task_runner" / "state" / "bad.yaml"
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text("not yaml: ][", encoding="utf-8")
     _seed_state(queue_dir, "good", "completed")
     ids = _state_task_ids(queue_dir)
     assert ids.completed == {"good"}
-    assert ids.recorded == {"bad", "good"}
+    assert ids.may_complete == {"bad"}
 
 
 # ---------------------------------------------------------------------------

@@ -330,11 +330,13 @@ or recent failures), follow the prioritized triage flow below.
          supervisor gets SIGHUP. This needs the operator: list each task
          with its reason.
        - `missing dependency:` — the task's `depends_on` names a task id
-         that has no task file in `todo/` and no state file, so it can
-         never complete (ADR-0036). It stays parked until the task's
-         `depends_on` is fixed or the missing task is created in `todo/`;
-         the supervisor un-parks it at its next check. This needs the
-         operator: list each task with the ids its reason names.
+         that has no task file in `todo/` and is not completed or running
+         (no task has it, or only a state left by a renamed or deleted
+         task), so it can never complete (ADR-0036). It stays parked
+         until the task's `depends_on` is fixed or the missing task is
+         created in `todo/`; the supervisor un-parks it at its next check.
+         This needs the operator: list each task with the ids its reason
+         names.
        - `pre-dispatch hook deferred (exit 1)` — the queue's pre-dispatch
          hook asked to wait. The hook runs again once the task's
          `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
@@ -373,9 +375,10 @@ or recent failures), follow the prioritized triage flow below.
        the rest (`block_dispatch`, `readiness_missing_file`, `depends_on`,
        `depends_on_missing`, `unanswered_sidecar`, a status name, ...).
        `depends_on` waits for a task that exists and has not finished;
-       `depends_on_missing` names one that does not exist, never clears by
-       waiting, and needs the operator: `missing_dependencies` lists each
-       such task with its `missing` ids. If tasks can start and
+       `depends_on_missing` names one with no task file in `todo/` that
+       is not completed or running, never clears by waiting, and needs
+       the operator: `missing_dependencies` lists each such task with its
+       `missing` ids. If tasks can start and
        an account has room but nothing runs, look in the supervisor's log
        for `dispatch skipped task` lines. The snapshot's **Last idle
        report** is the supervisor's own `no eligible tasks:` line, which is

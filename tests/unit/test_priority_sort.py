@@ -386,7 +386,8 @@ class TestTickDispatchPriorityScenarios:
         priority tasks dispatch ahead of it. Without this guarantee
         operators could starve a queue by marking everything ``high``."""
         write_state_atomic(
-            TaskState(task_id="unfinished-dep"), state_path_for(queue_dir, "unfinished-dep")
+            TaskState(task_id="unfinished-dep", status="running"),
+            state_path_for(queue_dir, "unfinished-dep"),
         )
         _make_task(queue_dir, "z-high", priority="high", depends_on=["unfinished-dep"])
         _make_task(queue_dir, "a-normal", priority="normal")

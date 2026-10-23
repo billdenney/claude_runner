@@ -22,12 +22,23 @@ said why.
 
 ## Decision
 
-The selector tells the two apart. The tasks that exist are the stems of the
-`todo/*.yaml` files the selector already lists, the stems of the state
-files `_state_task_ids` already reads to find the completed ones, and the
-completed ids themselves. A state file or a task file counts whether or not
-it parses. No directory is listed beyond the two the selector already reads
-every tick.
+The selector tells the two apart. A dependency exists, and may still
+complete, when any of these holds:
+
+- its YAML is in `todo/` (the stem of a file the selector already lists),
+  in any state, parseable or not: only tasks in `todo/` are dispatched;
+- its state is `completed`, wherever its YAML is (some queues move a
+  finished task's YAML to `done/`, which the runner does not read);
+- its state is `running` or `possibly_hung`: a worker may still finish it;
+- its state file does not parse, so nothing can be told from it.
+
+The state-file cases come from `_state_task_ids`, the one pass over the
+state files that already found the completed ids, so no directory is
+listed or file parsed beyond what each tick already did. Any other state
+with no `todo/` YAML (`pending`, `failed`, `deferred`, `awaiting_sidecar`,
+`failed_circuit_breaker`, `weekly_paused`) is a task that is never
+dispatched again, such as one whose YAML was renamed or deleted, so a
+dependency on it is missing.
 
 A task whose `depends_on` names an id outside that set is held under a new
 category, `depends_on_missing`. A task with both a missing and an
@@ -38,8 +49,9 @@ after the effort gate, so an invalid effort is reported first.
 
 The task is parked as the effort gate parks one (ADR-0010): status
 `deferred`, `deferred_reason` set to `missing dependency: depends_on names
-<ids>, but no task in todo/ or state/ has that id` (or "those ids"), no
-`next_eligible_at`, and no attempt or run recorded. The supervisor logs one
+<ids>, which has no task file in todo/ and is not completed or running` (or
+"which have ... and are ..."), no `next_eligible_at`, and no attempt or run
+recorded; the session, attempt count and runs are kept. The supervisor logs one
 WARNING when it parks the task, naming the task and the missing ids and
 saying to fix the task's `depends_on` or create the missing task. The state
 is written only when the status or reason changes, so a queue that keeps a
@@ -66,6 +78,12 @@ status it accepts, so it still starts such a task on request.
   the task as `pending` with no reason. That silence is what
   `_park_deferred` was written to end for the readiness and effort gates,
   and it is how this hold went unnoticed for months.
+- **Counting any state file as proof that the task exists.** That leaves
+  the case this ADR is for silent whenever a state file is left behind: a
+  task whose YAML was renamed (as the nlmixr2lib queue renames tasks to
+  generic drug names) or deleted keeps its `pending`, `failed` or
+  `deferred` state, and the selector itself writes a state for a task it
+  parks before it ever runs. None of these is dispatched again.
 - **Rejecting the task when it loads.** `load_task` reads one file and
   cannot see the rest of the queue, and the dependency may be created
   later. The hold has to be re-checked each tick.
@@ -78,8 +96,16 @@ status it accepts, so it still starts such a task on request.
   the idle line, `queue states`, `queue show` and `/runner-status`.
 - The first park of a task that has never run writes a state file for it,
   as the readiness and effort gates already do.
-- A dependency that exists but can never complete, such as one in
-  `failed_circuit_breaker`, still holds its dependents under `depends_on`.
+- A dependency whose YAML is in `todo/` but which will not run again, such
+  as one in `failed_circuit_breaker`, still holds its dependents under
+  `depends_on`.
+- As with the effort and readiness gates, the park and un-park return a
+  `failed` task, or an `awaiting_sidecar` one whose questions are answered,
+  as `pending`, not as the status it had.
+- As with those gates, the park replaces a `deferred_reason` set by hand
+  without a `next_eligible_at`, since such a reason does not hold the task.
+- As with those gates, a park whose state write fails is retried, and its
+  WARNING logged again, on every tick until the write succeeds.
 
 ## Reversibility
 
