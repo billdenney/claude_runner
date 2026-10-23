@@ -35,6 +35,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
@@ -433,8 +434,9 @@ def holds(
     ``readiness_missing_file``, ``in_flight``, a status such as
     ``possibly_hung``, ...), or ``completed``. ``depends_on`` waits for a
     dependency that has not completed; ``depends_on_missing`` names one
-    that no task file in ``todo/`` and no state file has, so the task can
-    never start until its ``depends_on`` is fixed or that task is created.
+    with no task file in ``todo/`` that is not completed or running, so
+    the task does not start until its ``depends_on`` is fixed or that task
+    is created.
     Of the eligible, ``can_start_now`` have an account that takes them now, and
     ``waiting_for_their_account`` are held to the account their session
     runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
@@ -453,8 +455,7 @@ def holds(
     selection read it) is left out of them and listed under
     ``unread_states`` with the error.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
-    the ``missing`` ids in its ``depends_on`` that no task has, in the
-    order it lists them.
+    the ``missing`` ids in its ``depends_on``, in the order it lists them.
 
     \b
     Exit codes:
@@ -544,11 +545,9 @@ def holds(
         )
     for task_id, ids in missing:
         console.print(
-            f"missing dependency: {task_id} depends on {', '.join(ids)}, "
-            "which no task in todo/ or state/ has",
-            style="yellow",
+            f"[bold]missing dependency:[/] {escape(task_id)} needs {escape(', '.join(ids))} "
+            "(no task file in todo/, not completed or running)",
             highlight=False,
-            markup=False,
         )
     for note in unread:
         console.print(

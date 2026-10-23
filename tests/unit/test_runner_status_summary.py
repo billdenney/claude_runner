@@ -727,11 +727,11 @@ def test_tasks_whose_dependency_does_not_exist(
         "exist; 0 finished.\n"
         + NO_QUESTIONS
         + _attention(
-            "2 tasks wait for tasks that do not exist, so they can never start (orphan-a needs "
+            "2 tasks wait for tasks that do not exist (orphan-a needs "
             "115-pouzin_2022_tusamitamab; orphan-b needs 122-yao_2018_guselkumab, "
-            "129-ng_2009_clozapine). The depends_on of each names a task id that has no task "
-            "file in todo/ and no state file: fix the depends_on in each task file, or add the "
-            "missing tasks to todo/."
+            "129-ng_2009_clozapine). No id named there has a task file in todo/, and none of "
+            "them has completed or is running. They will not start until each depends_on is "
+            "fixed or the missing tasks are added to todo/."
         )
         + _info("No task can start right now: every unfinished task is held, as Tasks shows.")
     )
@@ -743,6 +743,7 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
     """One such task is worded in the singular; the details list every
     task held for a missing dependency, not only the first few."""
     rows = [{"task_id": f"orphan-{i}", "missing": [f"gone-{i}"]} for i in range(5)]
+    rows[0]["missing"].append("gone-x")
     holds = {
         "eligible": {"count": 0, "task_ids": [], "by_status": {}},
         "held": {"depends_on_missing": 1},
@@ -752,9 +753,10 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
     }
     _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
     assert (
-        "- 1 task waits for a task that does not exist, so it can never start (orphan-0 needs "
-        "gone-0). Its depends_on names a task id that has no task file in todo/ and no state "
-        "file: fix the depends_on in its task file, or add the missing task to todo/.\n"
+        "- 1 task waits for a task that does not exist (orphan-0 needs gone-0, gone-x). No id "
+        "named there has a task file in todo/, and none of them has completed or is running. "
+        "It will not start until its depends_on is fixed or the missing task is added to "
+        "todo/.\n"
     ) in _summary(queue, bin_dir)
 
     holds["held"] = {"depends_on_missing": 5}
@@ -764,7 +766,7 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
     proc = _run(queue, bin_dir)
     summary = proc.stdout.partition("### Details\n")[0]
     assert (
-        "(orphan-0 needs gone-0; orphan-1 needs gone-1; orphan-2 needs gone-2; and 2 more)"
+        "(orphan-0 needs gone-0, gone-x; orphan-1 needs gone-1; orphan-2 needs gone-2; and 2 more)"
     ) in summary
     _, _, details = proc.stdout.partition("**What holds the tasks**")
     section = details.split("\n**Queue counts**")[0]
@@ -772,11 +774,11 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
         "| depends_on_missing | 5 |\n"
         "| completed | 0 |\n"
         "| todo/ tasks (total) | 5 |\n\n"
-        "_Counted under depends_on_missing, each naming in its depends_on a task id that has no "
-        "task file in todo/ and no state file:_\n\n"
+        "_Counted under depends_on_missing: no id listed has a task file in todo/, and none of "
+        "them has completed or is running:_\n\n"
         "| task | missing dependencies |\n"
         "|---|---|\n"
-        "| orphan-0 | gone-0 |\n"
+        "| orphan-0 | gone-0, gone-x |\n"
         "| orphan-1 | gone-1 |\n"
         "| orphan-2 | gone-2 |\n"
         "| orphan-3 | gone-3 |\n"

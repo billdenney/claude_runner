@@ -796,8 +796,8 @@ def _retry_notes(facts: Facts, holds: dict[str, Any], notes: Notes) -> None:
 
 def _missing_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]]]:
     """``queue holds``' ``missing_dependencies``: each task held
-    ``depends_on_missing``, with the ids its depends_on names that no task
-    has."""
+    ``depends_on_missing``, with the ids in its depends_on that have no task
+    file in todo/ and are not completed or running."""
     return [
         (str(r.get("task_id")), [str(m) for m in r.get("missing") or []])
         for r in holds.get("missing_dependencies") or []
@@ -806,27 +806,28 @@ def _missing_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]
 
 
 def _missing_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
-    """Tasks whose depends_on names a task that does not exist: they can
-    never start until someone fixes the task file or adds the task."""
+    """Tasks whose depends_on names a task that does not exist: they do not
+    start until someone fixes the depends_on or adds the missing task."""
     rows = _missing_dependency_rows(holds)
     if not rows:
         return
     items = [f"{task_id} needs {', '.join(missing)}" for task_id, missing in rows]
     n = len(rows)
-    if n == 1:
-        notes.attention.append(
-            "1 task waits for a task that does not exist, so it can never start "
-            f"({_listing(items)}). Its depends_on names a task id that has no task file in "
-            "todo/ and no state file: fix the depends_on in its task file, or add the missing "
-            "task to todo/."
-        )
-    else:
-        notes.attention.append(
-            f"{n} tasks wait for tasks that do not exist, so they can never start "
-            f"({_listing(items)}). The depends_on of each names a task id that has no task file "
-            "in todo/ and no state file: fix the depends_on in each task file, or add the "
-            "missing tasks to todo/."
-        )
+    lead = (
+        "1 task waits for a task that does not exist"
+        if n == 1
+        else f"{n} tasks wait for tasks that do not exist"
+    )
+    then = (
+        "It will not start until its depends_on is fixed or the missing task is added to todo/."
+        if n == 1
+        else "They will not start until each depends_on is fixed or the missing tasks are added "
+        "to todo/."
+    )
+    notes.attention.append(
+        f"{lead} ({_listing(items)}). No id named there has a task file in todo/, and none "
+        f"of them has completed or is running. {then}"
+    )
 
 
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:
@@ -1354,8 +1355,8 @@ def holds_section(facts: Facts) -> str:
     if missing:
         out += [
             "",
-            "_Counted under depends_on_missing, each naming in its depends_on a task id that has "
-            "no task file in todo/ and no state file:_",
+            "_Counted under depends_on_missing: no id listed has a task file in todo/, and none "
+            "of them has completed or is running:_",
             "",
             "| task | missing dependencies |",
             "|---|---|",

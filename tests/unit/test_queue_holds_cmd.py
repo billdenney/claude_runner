@@ -272,7 +272,7 @@ def test_text_output(queue: Path, tmp_path: Path) -> None:
 
 def test_text_output_names_each_missing_dependency(queue: Path) -> None:
     add_task(queue, "fresh")
-    add_task(queue, "orphan", depends_on=["fresh", "115-gone", "122-gone"])
+    add_task(queue, "orphan", depends_on=["fresh", "115-gone", "[122]-gone"])
 
     result = invoke_cli(["queue", "holds", "--queue", str(queue)])
     assert result.exit_code == 0, result.output
@@ -283,8 +283,8 @@ def test_text_output_names_each_missing_dependency(queue: Path) -> None:
         "completed: 0\n"
         "queue-wide cap: none\n"
         "selection runs every: 60 s\n"
-        "missing dependency: orphan depends on 115-gone, 122-gone, which no task in todo/ or "
-        "state/ has\n"
+        "missing dependency: orphan needs 115-gone, [122]-gone (no task file in todo/, not "
+        "completed or running)\n"
     )
 
 
