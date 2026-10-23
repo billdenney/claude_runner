@@ -208,7 +208,7 @@ class _DepthLimit(BaseResolver):
                 None if current_node is None else current_node.start_mark,
                 f"found a node nested more than {MAX_YAML_DEPTH} levels deep (MAX_YAML_DEPTH)",
             )
-        # types-PyYAML before 6.0.12.20260906 leaves both hooks unannotated,
+        # types-PyYAML before 6.0.12.20260815 leaves both hooks unannotated,
         # which strict mypy reports as untyped calls; newer stubs annotate
         # them, and ``unused-ignore`` keeps the ignore quiet there.
         super().descend_resolver(current_node, current_index)  # type: ignore[no-untyped-call, unused-ignore]

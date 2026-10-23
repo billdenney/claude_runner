@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Run mypy for the pre-commit hook in .pre-commit-config.yaml.
 #
-# pre-commit itself runs from the virtualenv it was installed in, but a
-# `language: system` hook runs its entry with the committer's PATH, which
-# holds no mypy unless that virtualenv is activated. This finds mypy, in
-# order: on PATH (an activated virtualenv, CI); in the checkout's own
+# A `language: system` hook runs its entry with the committer's PATH, which
+# holds no mypy unless the dev virtualenv is activated, although pre-commit
+# itself runs from that virtualenv. This finds the mypy that the dev extras
+# installed (pip install -e '.[dev]'), in order: in the checkout's own
 # `.venv`; in the main checkout's `.venv` when this is a linked worktree
-# (`git worktree add`), which has no virtualenv of its own.
+# (`git worktree add`), which has no virtualenv of its own; on PATH (an
+# activated virtualenv, CI). The virtualenvs come first because another
+# mypy on PATH, from the system or pipx, has neither the pydantic plugin
+# nor this project's stubs and would report errors that CI does not.
+# Outside a git checkout only PATH is searched.
 #
 # Usage: scripts/run_mypy.sh [mypy arguments...]
 #
@@ -14,19 +18,28 @@
 
 set -euo pipefail
 
+venvs=()
+if top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    venvs+=("$top/.venv")
+    common="$(git rev-parse --path-format=absolute --git-common-dir)"
+    if [ "${common%/*}/.venv" != "$top/.venv" ]; then
+        venvs+=("${common%/*}/.venv")
+    fi
+fi
+
+for venv in ${venvs[@]+"${venvs[@]}"}; do
+    if [ -x "$venv/bin/mypy" ]; then
+        exec "$venv/bin/mypy" "$@"
+    fi
+done
 if command -v mypy >/dev/null 2>&1; then
     exec mypy "$@"
 fi
 
-top="$(git rev-parse --show-toplevel)"
-common="$(git rev-parse --path-format=absolute --git-common-dir)"
-main_checkout="${common%/*}"
-for candidate in "$top/.venv/bin/mypy" "$main_checkout/.venv/bin/mypy"; do
-    if [ -x "$candidate" ]; then
-        exec "$candidate" "$@"
-    fi
+looked=""
+for venv in ${venvs[@]+"${venvs[@]}"}; do
+    looked+="$venv, "
 done
-
-echo "run_mypy.sh: no mypy on PATH, in $top/.venv or in $main_checkout/.venv;" \
-    "activate the virtualenv holding the dev extras (pip install -e '.[dev]')" >&2
+echo "run_mypy.sh: no mypy found (looked in: ${looked}PATH); activate the virtualenv" \
+    "holding the dev extras (pip install -e '.[dev]')" >&2
 exit 127
