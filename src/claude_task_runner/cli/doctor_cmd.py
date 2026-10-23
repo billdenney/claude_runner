@@ -15,6 +15,7 @@ from rich.console import Console
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    literal,
     load_settings_or_exit,
     resolve_per_queue_config,
 )
@@ -104,14 +105,16 @@ def doctor(
         print(_json.dumps(payload, indent=2))
     else:
         console = Console()
-        console.print(f"[bold]Queue:[/] {queue_path}\n")
+        console.print(literal(("Queue:", "bold"), " ", queue_path, "\n"))
         for r in results:
             color = _STATUS_COLOR[r.status]
             label = _STATUS_LABEL[r.status]
-            console.print(f"  [{color}][bold]{label}[/][/] [bold]{r.name}[/]: {r.detail}")
+            console.print(
+                literal("  ", (label, f"bold {color}"), " ", (r.name, "bold"), ": ", r.detail)
+            )
             if r.remediation:
                 for line in r.remediation.splitlines():
-                    console.print(f"      [dim]{line}[/]")
+                    console.print(literal("      ", (line, "dim")))
 
     failures = sum(1 for r in results if r.status is CheckStatus.FAIL)
     if failures:

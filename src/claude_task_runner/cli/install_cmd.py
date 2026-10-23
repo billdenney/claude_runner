@@ -19,6 +19,7 @@ from rich.prompt import Confirm
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
     broken_accounts_message,
+    literal,
     load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
@@ -157,8 +158,10 @@ def install(
 
     init_system = _detect_init_system(settings.supervisor.preferred_init_system)
     console.print(
-        f"[bold]Detected init system:[/] {init_system} "
-        f"(setting: {settings.supervisor.preferred_init_system})"
+        literal(
+            ("Detected init system:", "bold"),
+            f" {init_system} (setting: {settings.supervisor.preferred_init_system})",
+        )
     )
 
     if init_system == "systemd":
@@ -189,16 +192,23 @@ def install(
                 f"systemd install failed: {exc}. Nothing was written.",
                 style="bold red",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
             raise typer.Exit(code=2) from exc
         verb = "replace" if sd_plan.block_existed else "create"
-        console.print(f"\n[bold]Will {verb} systemd user unit at:[/]\n  {sd_plan.unit_path}\n")
+        console.print(
+            literal(
+                "\n", (f"Will {verb} systemd user unit at:", "bold"), f"\n  {sd_plan.unit_path}\n"
+            )
+        )
         console.print("[bold]Unit text:[/]")
         for line in sd_plan.unit_text.splitlines():
-            console.print(f"  {line}")
-        console.print(f"\n[bold]Then run:[/] {' '.join(sd_plan.enable_command)}\n")
+            console.print(literal("  ", line))
+        console.print(
+            literal("\n", ("Then run:", "bold"), f" {' '.join(sd_plan.enable_command)}\n")
+        )
         # Asked only when the new unit would start the supervisor
         # differently, so an unchanged or policy-only install asks nothing.
         changed = systemd_mod.changed_start_directives(sd_plan.existing_text, sd_plan.unit_text)
@@ -207,6 +217,7 @@ def install(
             console.print(
                 _running_unit_note(sd_plan.existing_text, changed, queue_path) + "\n",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
@@ -216,7 +227,7 @@ def install(
         try:
             systemd_mod.apply_plan(sd_plan)
         except systemd_mod.SystemdError as exc:
-            console.print(f"[bold red]systemd install failed:[/] {exc}")
+            console.print(literal(("systemd install failed:", "bold red"), " ", exc))
             raise typer.Exit(code=2) from exc
         if running:
             console.print(
@@ -231,11 +242,11 @@ def install(
     # cron path
     cron_plan = cron_install.build_install_plan(watchdog_path=_watchdog_script_path())
     verb = "replace" if cron_plan.block_existed else "add"
-    console.print(f"\n[bold]Will {verb} the managed block in your crontab:[/]\n")
+    console.print(literal("\n", (f"Will {verb} the managed block in your crontab:", "bold"), "\n"))
     if cron_plan.diff_lines:
         for line in cron_plan.diff_lines:
             color = "green" if line.startswith("+") else "red"
-            console.print(f"  [{color}]{line}[/]")
+            console.print(literal("  ", (line, color)))
     else:
         console.print("  [dim](no visible diff — block already up to date)[/]")
     # The crontab line runs `watchdog tick` with no --queue or --config: a
@@ -243,11 +254,17 @@ def install(
     # recorded for it, else <queue>/claude_runner.toml.
     recorded_config = resolved_config if config is not None else None
     registry = registry_mod.queues_registry_path()
-    console.print(f"\n[bold]Will register this queue with the watchdog in {registry}:[/]")
-    console.print(f"  {queue_path}")
+    console.print(
+        literal("\n", (f"Will register this queue with the watchdog in {registry}:", "bold"))
+    )
+    console.print(literal("  ", queue_path))
     if recorded_config is not None:
         console.print(
-            f"  with config {recorded_config}", markup=False, highlight=False, soft_wrap=True
+            f"  with config {recorded_config}",
+            markup=False,
+            emoji=False,
+            highlight=False,
+            soft_wrap=True,
         )
     _show_replaced_queues(console, queue_path)
     if not yes and not Confirm.ask("\nApply this change?", default=False):
@@ -260,21 +277,21 @@ def install(
     try:
         replaced = registry_mod.register_queue(queue_path, config=recorded_config)
     except OSError as exc:
-        console.print(f"[bold red]watchdog registration failed:[/] {exc}")
+        console.print(literal(("watchdog registration failed:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
-    console.print(f"[green]Registered {queue_path} with the watchdog.[/]")
+    console.print(literal(f"Registered {queue_path} with the watchdog.", style="green"))
 
     backup = cron_install.backup_crontab(cron_plan.existing_text, clock=RealClock())
-    console.print(f"[dim]Backed up existing crontab to {backup}[/]")
+    console.print(literal(f"Backed up existing crontab to {backup}", style="dim"))
     try:
         cron_install.apply_plan(cron_plan)
     except cron_install.CrontabError as exc:
-        console.print(f"[bold red]crontab install failed:[/] {exc}")
+        console.print(literal(("crontab install failed:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab updated.[/]")
     note = registry_mod.handover_note(queue_path, replaced)
     if note is not None:
-        console.print(note, markup=False, highlight=False, soft_wrap=True)
+        console.print(note, markup=False, emoji=False, highlight=False, soft_wrap=True)
 
 
 def _show_replaced_queues(console: Console, queue: Path) -> None:
@@ -292,6 +309,7 @@ def _show_replaced_queues(console: Console, queue: Path) -> None:
             f"It replaces the registry, which is unreadable ({exc}); "
             "a copy is kept as queues.json.broken.",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
@@ -301,7 +319,7 @@ def _show_replaced_queues(console: Console, queue: Path) -> None:
         return
     console.print("[bold]It replaces, since the watchdog manages one queue:[/]")
     for q in replaced:
-        console.print(f"  {q}", markup=False, highlight=False, soft_wrap=True)
+        console.print(f"  {q}", markup=False, emoji=False, highlight=False, soft_wrap=True)
 
 
 def _running_unit_note(existing_text: str | None, changed: list[str], queue: Path) -> str:
@@ -360,7 +378,7 @@ def uninstall(
     if init_system == "systemd":
         unit_path = systemd_mod.systemd_unit_path()
         if unit_path.exists():
-            console.print(f"[bold]systemd unit:[/] {unit_path} — will be removed")
+            console.print(literal(("systemd unit:", "bold"), f" {unit_path} — will be removed"))
             if not yes and not Confirm.ask("Remove systemd unit?", default=False):
                 console.print("[yellow]systemd uninstall skipped.[/]")
             else:
@@ -374,7 +392,7 @@ def uninstall(
     try:
         cron_plan = cron_install.build_uninstall_plan()
     except cron_install.CrontabError as exc:
-        console.print(f"[dim]No crontab access ({exc}); skipping cron.[/]")
+        console.print(literal(f"No crontab access ({exc}); skipping cron.", style="dim"))
         return
 
     if not cron_plan.block_existed:
@@ -385,17 +403,17 @@ def uninstall(
     console.print("\n[bold]crontab change:[/]")
     for line in cron_plan.diff_lines:
         color = "green" if line.startswith("+") else "red"
-        console.print(f"  [{color}]{line}[/]")
+        console.print(literal("  ", (line, color)))
     if not yes and not Confirm.ask("\nRemove the cron block?", default=False):
         console.print("[yellow]cron uninstall skipped.[/]")
         return
 
     backup = cron_install.backup_crontab(cron_plan.existing_text, clock=RealClock())
-    console.print(f"[dim]Backed up existing crontab to {backup}[/]")
+    console.print(literal(f"Backed up existing crontab to {backup}", style="dim"))
     try:
         cron_install.apply_plan(cron_plan)
     except cron_install.CrontabError as exc:
-        console.print(f"[bold red]cron uninstall failed:[/] {exc}")
+        console.print(literal(("cron uninstall failed:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
     console.print("[green]crontab block removed.[/]")
     _report_registered_queues(console)
@@ -418,6 +436,7 @@ def _report_registered_queues(console: Console) -> None:
             f"warning: {exc}; uninstall left it as it is.",
             style="yellow",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
@@ -429,6 +448,7 @@ def _report_registered_queues(console: Console) -> None:
         f"{registry} still lists {count}. No tick reads it without the cron block, and "
         f"a later cron install replaces the list with its own queue. To drop {them} now:",
         markup=False,
+        emoji=False,
         highlight=False,
         soft_wrap=True,
     )
@@ -436,6 +456,7 @@ def _report_registered_queues(console: Console) -> None:
         console.print(
             f"  claude-task-runner watchdog unregister --queue {q}",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )

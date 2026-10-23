@@ -30,10 +30,10 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    literal,
     load_settings_or_exit,
     queue_ceiling_json,
     queue_ceiling_text,
@@ -286,8 +286,7 @@ def list_accounts(
         for decl, row in zip(settings.accounts, rows, strict=True):
             _print_account(console, decl, loaded.get(decl.name), broken.get(decl.name), row)
         console.print(
-            f"[bold]queue ceiling:[/] {escape(queue_ceiling_text(ceiling, settings))}",
-            highlight=False,
+            literal(("queue ceiling:", "bold"), " ", queue_ceiling_text(ceiling, settings)),
             soft_wrap=True,
         )
     if resolution.broken:
@@ -302,22 +301,20 @@ def _print_account(
     row: dict[str, object],
 ) -> None:
     """The human-readable lines of one ``account list`` row."""
-    paused_tag = " [yellow](paused)[/]" if row["paused"] else ""
+    paused_tag = (" (paused)", "yellow") if row["paused"] else ""
     state_str = row["state"] or "—"
     util_5h_s = f"{row['last_5h_util_pct']}%" if row["state"] is not None else "—"
     util_w_s = f"{row['last_weekly_util_pct']}%" if row["state"] is not None else "—"
-    console.print(f"[bold]{decl.name}[/]{paused_tag}")
-    console.print(f"  config_dir:      {decl.config_dir or '(default ~/.claude)'}")
+    console.print(literal((decl.name, "bold"), paused_tag))
+    console.print(literal("  config_dir:      ", decl.config_dir or "(default ~/.claude)"))
     if decl.linux_user:
-        console.print(f"  linux_user:      {decl.linux_user}")
+        console.print(literal("  linux_user:      ", decl.linux_user))
     if broken is not None:
         console.print(
-            f"  [bold red]policy error:[/]    {escape(broken.error)}",
-            highlight=False,
-            soft_wrap=True,
+            literal("  ", ("policy error:", "bold red"), "    ", broken.error), soft_wrap=True
         )
     if acct is not None:
-        console.print(f"  max_concurrency: {acct.policy.concurrency.max_concurrency}")
+        console.print(literal("  max_concurrency: ", acct.policy.concurrency.max_concurrency))
         dp = acct.policy.dispatch_pct
         day_s = f"day {dp.day.fivehr_slowdown_pct or '~'}/{dp.day.fivehr_stop_pct or '~'}"
         night_s = (
@@ -328,24 +325,26 @@ def _print_account(
             f"week early={dp.week.early_pct or '~'}/eow={dp.week.eow_pct or '~'}"
             f"@{dp.week.eow_time_switch or '~'}"
         )
-        console.print(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}")
+        console.print(literal(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}"))
     console.print(
-        f"  state:           {state_str}   "
-        f"5h={util_5h_s}   weekly={util_w_s}   "
-        f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
+        literal(
+            f"  state:           {state_str}   "
+            f"5h={util_5h_s}   weekly={util_w_s}   "
+            f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
+        )
     )
     if row["weekly_catch_up_at"] is not None:
         console.print(
-            f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "
-            "under plan; scheduled_wakeup_at is only the next re-check)",
-            highlight=False,
+            literal(
+                f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "
+                "under plan; scheduled_wakeup_at is only the next re-check)"
+            )
         )
     usage_error = row["usage_error"]
     if isinstance(usage_error, dict):
         fix = "log it in again" if usage_error["kind"] == "auth" else "the usage page changed"
         console.print(
-            f"  [bold red]usage error:[/]     {escape(usage_error['message'])} ({fix})",
-            highlight=False,
+            literal("  ", ("usage error:", "bold red"), f"     {usage_error['message']} ({fix})"),
             soft_wrap=True,
         )
 
@@ -405,7 +404,7 @@ def pause_account(
     if json:
         print(_json.dumps({"changed": changed, "message": message}))
         return
-    console.print(("[green]" if changed else "[dim]") + message + "[/]")
+    console.print(literal(message, style="green" if changed else "dim"))
 
 
 @app.command("resume")
@@ -428,4 +427,4 @@ def resume_account(
     if json:
         print(_json.dumps({"changed": changed, "message": message}))
         return
-    console.print(("[green]" if changed else "[dim]") + message + "[/]")
+    console.print(literal(message, style="green" if changed else "dim"))
