@@ -59,14 +59,16 @@ repos:
   # have to mirror the whole typed dependency tree — pydantic + its mypy
   # plugin, structlog, typer, types-*, … — and would drift). Requires
   # ``pip install -e '.[dev]'`` first, same prerequisite as the hooks above.
-  # ``pass_filenames: false`` + ``entry: mypy src`` runs the whole-package
-  # check (mypy needs full type context, not just changed files);
-  # ``types: [python]`` skips it on docs-only commits.
+  # ``scripts/run_mypy.sh`` finds that mypy without an activated venv: on
+  # PATH, else in ``.venv`` of this checkout or, from a linked worktree, of
+  # the main checkout. ``pass_filenames: false`` + ``src`` runs the
+  # whole-package check (mypy needs full type context, not just changed
+  # files); ``types: [python]`` skips it on docs-only commits.
   - repo: local
     hooks:
       - id: mypy
         name: mypy (type check — mirrors CI `mypy src`)
-        entry: mypy src
+        entry: scripts/run_mypy.sh src
         language: system
         types: [python]
         pass_filenames: false
