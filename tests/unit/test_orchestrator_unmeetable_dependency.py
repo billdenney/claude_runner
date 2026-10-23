@@ -14,22 +14,27 @@ writes and logs nothing.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import inspect
 import logging
-import time
+import sys
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from claude_task_runner.config.loader import load_defaults, load_settings
-from claude_task_runner.queue.schema import Task, TaskState
+from claude_task_runner.queue.schema import RunRecord, Task, TaskState
+from claude_task_runner.queue.sidecar import write_response
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
     state_file_path,
     state_path_for,
     todo_dir,
+    write_state_atomic,
 )
 from claude_task_runner.runner import orchestrator as orchestrator_mod
 from claude_task_runner.runner.orchestrator import (
@@ -40,10 +45,15 @@ from claude_task_runner.runner.orchestrator import (
 )
 
 from ._mixed_queue import add_ring, add_state, add_task, forbid_selector_writes
+from ._sidecar_files import make_request, make_response, write_request
 
 DEFAULT_LEVELS: dict[str, list[str]] = load_defaults()["effort_levels"]
 ORCHESTRATOR_LOGGER = "claude_task_runner.runner.orchestrator"
 NOW = dt.datetime(2026, 10, 24, 12, 0, 0, tzinfo=dt.UTC)
+MISSING_GHOST = (
+    "missing dependency: depends_on names ghost, which has no task file in todo/ and is not "
+    "completed or running"
+)
 FIXES = {
     "self": "drop the task's own id from its depends_on",
     "cycle": "remove one depends_on entry along the cycle",
@@ -192,20 +202,43 @@ def test_dependencies_outside_the_tasks_are_ignored() -> None:
     assert _members(tasks, set()) == {"p": ("p", "q"), "q": ("p", "q")}
 
 
-def test_a_long_chain_and_a_long_ring_stay_iterative_and_linear() -> None:
-    """Far deeper than the recursion limit; one pass over 20,000 tasks
-    stays well within a tick."""
+@contextlib.contextmanager
+def _recursion_headroom(frames: int) -> Iterator[None]:
+    """Allow only ``frames`` more nested Python calls than the caller has."""
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(len(inspect.stack()) + frames)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(old)
+
+
+def test_a_long_chain_and_a_long_ring_need_no_recursion() -> None:
+    """A 10,000-task chain and a 10,000-task ring are found with 50 frames
+    to spare, so the pass is iterative and a long chain cannot exhaust the
+    recursion limit."""
     n = 10_000
     chain = [_task(f"c{i:05d}", f"c{i + 1:05d}") for i in range(n)]
     ring = [_task(f"r{i:05d}", f"r{(i + 1) % n:05d}") for i in range(n)]
 
-    started = time.perf_counter()
-    cycles = _members(chain + ring, set())
-    elapsed = time.perf_counter() - started
+    with _recursion_headroom(50):
+        cycles = _dependency_cycles(chain + ring, set())
 
     ring_ids = tuple(sorted(t.id for t in ring))
-    assert cycles == dict.fromkeys(ring_ids, ring_ids)
-    assert elapsed < 5.0
+    assert {task_id: cycle.members for task_id, cycle in cycles.items()} == dict.fromkeys(
+        ring_ids, ring_ids
+    )
+
+
+def test_the_headroom_check_catches_recursion() -> None:
+    """The check above fails a recursive pass: one call per task overruns
+    50 frames."""
+
+    def depth(i: int) -> int:
+        return i if i == 0 else depth(i - 1)
+
+    with pytest.raises(RecursionError), _recursion_headroom(50):
+        depth(1000)
 
 
 @pytest.mark.parametrize(
@@ -363,7 +396,25 @@ def test_a_missing_dependency_is_reported_first(queue_dir: Path) -> None:
     add_task(queue_dir, "t", depends_on=["t", "ghost"])
 
     assert _select(queue_dir)[:2] == ([], Counter({"depends_on_missing": 1}))
-    assert (_state(queue_dir, "t").deferred_reason or "").startswith("missing dependency: ")
+    assert _state(queue_dir, "t").deferred_reason == MISSING_GHOST
+
+
+def test_a_cycle_member_that_is_circuit_broken_is_named_as_in_the_cycle(
+    queue_dir: Path,
+) -> None:
+    """Breaking the cycle is the fix that also clears the other cause, so
+    the cycle is the one named; the stopped member is held by its status."""
+    add_task(queue_dir, "a", depends_on=["b"])
+    add_task(queue_dir, "b", depends_on=["a"])
+    add_state(queue_dir, "b", "failed_circuit_breaker")
+
+    eligible, skips, unmeetable = _select(queue_dir)
+
+    assert (eligible, skips) == (
+        [],
+        Counter({"depends_on_unmeetable": 1, "failed_circuit_breaker": 1}),
+    )
+    assert unmeetable == {"a": [UnmeetableDependency("b", "cycle", ("a", "b"))]}
 
 
 def test_an_unmeetable_dependency_holds_before_an_unfinished_one(queue_dir: Path) -> None:
@@ -488,7 +539,10 @@ def test_a_missing_dependency_created_into_a_cycle_changes_the_hold(
     gate parks the task under its own reason, with its own WARNING."""
     add_task(queue_dir, "a", depends_on=["b"])
     _select(queue_dir)
-    assert (_state(queue_dir, "a").deferred_reason or "").startswith("missing dependency: ")
+    assert _state(queue_dir, "a").deferred_reason == (
+        "missing dependency: depends_on names b, which has no task file in todo/ and is not "
+        "completed or running"
+    )
     add_task(queue_dir, "b", depends_on=["a"])
     caplog.clear()
 
@@ -501,6 +555,130 @@ def test_a_missing_dependency_created_into_a_cycle_changes_the_hold(
         _warning("a", reason, "cycle"),
         _warning("b", _reason("a (in a dependency cycle among a, b)"), "cycle"),
     ]
+
+
+def _run(attempt: int) -> RunRecord:
+    return RunRecord(
+        attempt=attempt,
+        started_at=NOW - dt.timedelta(hours=2),
+        finished_at=NOW - dt.timedelta(hours=1),
+        stop_reason="error",
+        duration_s=3600.0,
+    )
+
+
+def test_park_and_unpark_keep_the_session_attempts_and_runs(queue_dir: Path) -> None:
+    """A park and an un-park change the status and the reason only."""
+    add_task(queue_dir, "t", depends_on=["t"])
+    write_state_atomic(
+        TaskState(
+            task_id="t",
+            status="pending",
+            attempts=2,
+            runs=[_run(1), _run(2)],
+            session_id="session-t",
+            session_account="work",
+        ),
+        state_path_for(queue_dir, "t"),
+    )
+    before = _state(queue_dir, "t")
+
+    _select(queue_dir)
+    parked = _state(queue_dir, "t")
+    add_task(queue_dir, "t")
+    _select(queue_dir)
+
+    assert parked == before.model_copy(
+        update={"status": "deferred", "deferred_reason": _reason("t (the task itself)")}
+    )
+    assert _state(queue_dir, "t") == before
+
+
+@pytest.mark.parametrize("status", ["failed", "awaiting_sidecar"])
+def test_a_resumable_task_gaining_an_unmeetable_dependency(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, status: str
+) -> None:
+    """A failed task, or one whose questions are all answered, would be
+    dispatched again; it is parked instead, and un-parked as ``pending``
+    (not as the status it had), its session kept, as the other gates do."""
+    add_task(queue_dir, "t", depends_on=["t"])
+    write_state_atomic(
+        TaskState(task_id="t", status=status, attempts=1, session_id="session-t"),
+        state_path_for(queue_dir, "t"),
+    )
+    if status == "awaiting_sidecar":
+        write_request(queue_dir, make_request("t"))
+        write_response(queue_dir, make_response("t"))
+    reason = _reason("t (the task itself)")
+
+    with caplog.at_level(logging.WARNING, logger=ORCHESTRATOR_LOGGER):
+        assert _select(queue_dir)[:2] == ([], Counter({"depends_on_unmeetable": 1}))
+    parked = _state(queue_dir, "t")
+    assert (parked.status, parked.deferred_reason) == ("deferred", reason)
+    assert _warnings(caplog) == [_warning("t", reason, "self")]
+
+    add_task(queue_dir, "t")
+    assert _select(queue_dir)[:2] == (["t"], Counter())
+    state = _state(queue_dir, "t")
+    assert (state.status, state.deferred_reason, state.attempts, state.session_id) == (
+        "pending",
+        None,
+        1,
+        "session-t",
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "category"),
+    [
+        ("completed", "completed"),
+        ("running", "running"),
+        ("possibly_hung", "possibly_hung"),
+        ("failed_circuit_breaker", "failed_circuit_breaker"),
+    ],
+)
+def test_a_task_in_a_status_never_dispatched_is_never_parked(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, status: str, category: str
+) -> None:
+    add_task(queue_dir, "t", depends_on=["t"])
+    add_state(queue_dir, "t", status)
+    before = state_path_for(queue_dir, "t").read_bytes()
+
+    with caplog.at_level(logging.WARNING, logger=ORCHESTRATOR_LOGGER):
+        assert _select(queue_dir) == ([], Counter({category: 1}), {})
+
+    assert state_path_for(queue_dir, "t").read_bytes() == before
+    assert _warnings(caplog) == []
+
+
+def test_a_hook_cooldown_holds_first_and_is_left_alone(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    add_task(queue_dir, "t", depends_on=["t"])
+    add_state(
+        queue_dir,
+        "t",
+        "deferred",
+        deferred_reason="pre-dispatch hook deferred (exit 1): waiting",
+        next_eligible_at=NOW + dt.timedelta(hours=1),
+    )
+    before = state_path_for(queue_dir, "t").read_bytes()
+
+    with caplog.at_level(logging.WARNING, logger=ORCHESTRATOR_LOGGER):
+        assert _select(queue_dir) == ([], Counter({"deferred_cooldown": 1}), {})
+
+    assert state_path_for(queue_dir, "t").read_bytes() == before
+    assert _warnings(caplog) == []
+
+
+def test_an_unanswered_sidecar_holds_first(queue_dir: Path) -> None:
+    add_task(queue_dir, "t", depends_on=["t"])
+    add_state(queue_dir, "t", "awaiting_sidecar")
+    write_request(queue_dir, make_request("t"))
+    before = state_path_for(queue_dir, "t").read_bytes()
+
+    assert _select(queue_dir) == ([], Counter({"unanswered_sidecar": 1}), {})
+    assert state_path_for(queue_dir, "t").read_bytes() == before
 
 
 def test_only_its_own_hold_is_cleared(queue_dir: Path) -> None:
