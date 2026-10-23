@@ -896,13 +896,15 @@ def _unmeetable_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
         else f"{n} tasks wait for tasks that cannot finish"
     )
     then = (
-        "It will not start until its depends_on is fixed, the loop is broken or the stopped "
-        "task is reset."
+        "It will not start until its depends_on is fixed or the loop broken"
         if n == 1
-        else "They will not start until each depends_on is fixed, each loop is broken or the "
-        "stopped tasks are reset."
+        else "They will not start until each depends_on is fixed or each loop broken"
     )
-    notes.attention.append(f"{lead} ({_listing(items)}). {then}")
+    notes.attention.append(
+        f"{lead} ({_listing(items)}). {then}; a stopped task is restarted by setting "
+        "`status: pending` in its state file (.claude_task_runner/state/<id>.yaml) once the "
+        "cause of its failures is fixed, as no command resets it."
+    )
 
 
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:

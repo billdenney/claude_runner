@@ -493,8 +493,8 @@ def test_an_unmeetable_dependency_has_its_own_count_and_one_warning(
     ]
     assert warnings == [
         f"parking task {t} as deferred: unmeetable dependency: depends_on names {d} (in a "
-        "dependency cycle among a, b). Fix the task's depends_on, break the cycle, or reset "
-        "the stopped task"
+        "dependency cycle among a, b). To release it, remove one depends_on entry along the "
+        "cycle"
         for t, d in (("a", "b"), ("b", "a"))
     ]
     assert _idle_lines(caplog) == [

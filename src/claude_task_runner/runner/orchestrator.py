@@ -900,7 +900,8 @@ class _StateIds(NamedTuple):
     in any other status runs again only from its ``todo/`` YAML."""
     circuit_broken: set[str]
     """Ids whose state is ``failed_circuit_breaker``: the runner does not
-    dispatch them again until an operator resets the state."""
+    dispatch them again until an operator sets the state back to
+    ``pending`` by hand; ``queue force-dispatch`` refuses the status."""
 
 
 def _state_task_ids(queue_dir: Path) -> _StateIds:
@@ -1067,9 +1068,11 @@ def _park_deferred(
     """Park a task a selector gate is holding as ``deferred`` + ``reason``.
 
     Used by the selector's gates: the readiness gate (ADR-0030), the
-    effort gate (ADR-0010) and the missing-dependency gate (ADR-0036). Each
-    writes its own reason prefix, see :func:`readiness.hold_reason`,
-    :func:`effort_levels.hold_reason` and :func:`_missing_dependency_reason`.
+    effort gate (ADR-0010), and the missing- and unmeetable-dependency
+    gates (ADR-0036). Each writes its own reason prefix, see
+    :func:`readiness.hold_reason`, :func:`effort_levels.hold_reason`,
+    :func:`_missing_dependency_reason` and
+    :func:`_unmeetable_dependency_reason`.
 
     Makes a hold VISIBLE. Without this a gate is silent: the selector
     skips the task on every tick with only a debug log, so ``queue states``
@@ -1335,6 +1338,24 @@ def _unmeetable_dependency_reason(unmeetable: Sequence[UnmeetableDependency]) ->
     names the ``unmeetable`` dependencies."""
     names = "; ".join(u.describe() for u in unmeetable)
     return f"{_UNMEETABLE_DEPENDENCY_PREFIX}depends_on names {names}"
+
+
+_UNMEETABLE_FIXES: dict[UnmeetableCause, str] = {
+    "self": "drop the task's own id from its depends_on",
+    "cycle": "remove one depends_on entry along the cycle",
+    "failed_circuit_breaker": (
+        "drop the dependency, or set status: pending in the stopped task's state file, "
+        ".claude_task_runner/state/<id>.yaml, once the cause of its failures is fixed "
+        "(no queue command resets a circuit breaker)"
+    ),
+}
+"""What the WARNING tells the operator to do, per cause."""
+
+
+def _unmeetable_fix_hint(unmeetable: Sequence[UnmeetableDependency]) -> str:
+    """The fixes for the causes in ``unmeetable``, each once, in cause order."""
+    causes = {u.cause for u in unmeetable}
+    return "; or ".join(fix for cause, fix in _UNMEETABLE_FIXES.items() if cause in causes)
 
 
 def _is_unmeetable_dependency_reason(reason: str | None) -> bool:
@@ -1651,10 +1672,10 @@ def _skip_category(
         reason = _unmeetable_dependency_reason(unmeetable)
         if not read_only and not _is_parked_with(state, reason):
             logger.warning(
-                "parking task %s as deferred: %s. Fix the task's depends_on, break the "
-                "cycle, or reset the stopped task",
+                "parking task %s as deferred: %s. To release it, %s",
                 task.id,
                 reason,
+                _unmeetable_fix_hint(unmeetable),
             )
             _park_deferred(queue_dir, task.id, state, reason)
         return _SKIP_DEPENDS_ON_UNMEETABLE

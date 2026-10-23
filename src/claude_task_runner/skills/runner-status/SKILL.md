@@ -345,8 +345,12 @@ or recent failures), follow the prioritized triage flow below.
        - `unmeetable dependency:` — the task's `depends_on` names a task
          that exists but cannot complete: the task itself, a task in a
          dependency cycle with it, or a `failed_circuit_breaker` task
-         (ADR-0036). It stays parked until the depends_on is fixed, the
-         cycle broken or the stopped task reset. This needs the operator:
+         (ADR-0036). It stays parked until the depends_on is fixed or the
+         cycle broken, or, for a stopped task, until its state file
+         (`.claude_task_runner/state/<id>.yaml`) is edited back to
+         `status: pending` once the cause of its failures is fixed: no
+         `queue` command resets a circuit breaker, and `queue
+         force-dispatch` refuses that status. This needs the operator:
          list each task with the dependencies and causes its reason names.
        - `pre-dispatch hook deferred (exit 1)` — the queue's pre-dispatch
          hook asked to wait. The hook runs again once the task's
@@ -367,8 +371,8 @@ or recent failures), follow the prioritized triage flow below.
          "could not start its worker".
 
          Of the runner's own deferrals, these two set
-         `next_eligible_at`; the readiness, effort and missing-dependency
-         holds do not.
+         `next_eligible_at`; the readiness, effort, missing-dependency and
+         unmeetable-dependency holds do not.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,

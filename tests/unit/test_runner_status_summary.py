@@ -767,7 +767,9 @@ def test_tasks_whose_dependency_cannot_finish(
             "after repeated failures); loop-a needs loop-b (in a loop where loop-a, loop-b and "
             "loop-c wait on one another); loop-b needs loop-c (in a loop where loop-b, loop-a "
             "and loop-c wait on one another); and 1 more). They will not start until each "
-            "depends_on is fixed, each loop is broken or the stopped tasks are reset.",
+            "depends_on is fixed or each loop broken; a stopped task is restarted by setting "
+            "`status: pending` in its state file (.claude_task_runner/state/<id>.yaml) once the "
+            "cause of its failures is fixed, as no command resets it.",
             "Tasks that stopped after failing repeatedly and will not be retried: 1. Look with "
             f"`claude-task-runner queue states --status failed_circuit_breaker --queue {queue}`.",
         )
@@ -803,7 +805,9 @@ def test_one_task_whose_dependency_cannot_finish_and_the_details(
     assert (
         "- 1 task waits for a task that cannot finish (solo needs itself and pair (in a loop "
         "where solo and pair wait on one another)). It will not start until its depends_on is "
-        "fixed, the loop is broken or the stopped task is reset.\n"
+        "fixed or the loop broken; a stopped task is restarted by setting `status: pending` in "
+        "its state file (.claude_task_runner/state/<id>.yaml) once the cause of its failures is "
+        "fixed, as no command resets it.\n"
     ) in summary
     _, _, details = proc.stdout.partition("**What holds the tasks**")
     section = details.split("\n**Queue counts**")[0]

@@ -307,8 +307,8 @@ def _print_deferral(console: Console, state: dict[str, object]) -> None:
     prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
     the earliest time the supervisor tries the task again. Of the runner's
     own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
-    readiness hold (ADR-0030), an effort hold (ADR-0010) and a
-    missing-dependency hold (ADR-0036) do not, because their gate
+    readiness hold (ADR-0030), an effort hold (ADR-0010) and a missing- or
+    unmeetable-dependency hold (ADR-0036) do not, because their gate
     re-checks the task on every tick.
 
     Printed as written: Rich markup would drop the ``[effort_levels]`` in

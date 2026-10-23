@@ -44,7 +44,16 @@ from ._mixed_queue import add_ring, add_state, add_task, forbid_selector_writes
 DEFAULT_LEVELS: dict[str, list[str]] = load_defaults()["effort_levels"]
 ORCHESTRATOR_LOGGER = "claude_task_runner.runner.orchestrator"
 NOW = dt.datetime(2026, 10, 24, 12, 0, 0, tzinfo=dt.UTC)
-FIX_HINT = ". Fix the task's depends_on, break the cycle, or reset the stopped task"
+FIXES = {
+    "self": "drop the task's own id from its depends_on",
+    "cycle": "remove one depends_on entry along the cycle",
+    "failed_circuit_breaker": (
+        "drop the dependency, or set status: pending in the stopped task's state file, "
+        ".claude_task_runner/state/<id>.yaml, once the cause of its failures is fixed "
+        "(no queue command resets a circuit breaker)"
+    ),
+}
+"""The WARNING's advice per cause, in the order it gives them."""
 
 
 @pytest.fixture
@@ -94,8 +103,9 @@ def _reason(*described: str) -> str:
     return "unmeetable dependency: depends_on names " + "; ".join(described)
 
 
-def _warning(task_id: str, reason: str) -> str:
-    return f"parking task {task_id} as deferred: {reason}{FIX_HINT}"
+def _warning(task_id: str, reason: str, *causes: str) -> str:
+    advice = "; or ".join(fix for cause, fix in FIXES.items() if cause in causes)
+    return f"parking task {task_id} as deferred: {reason}. To release it, {advice}"
 
 
 def _task(task_id: str, *depends_on: str) -> Task:
@@ -250,7 +260,7 @@ def test_a_task_that_depends_on_itself(queue_dir: Path, caplog: pytest.LogCaptur
 
     assert (eligible, skips) == ([], Counter({"depends_on_unmeetable": 1}))
     assert unmeetable == {"t": [UnmeetableDependency("t", "self")]}
-    assert _warnings(caplog) == [_warning("t", reason)]
+    assert _warnings(caplog) == [_warning("t", reason, "self")]
     state = _state(queue_dir, "t")
     assert (state.status, state.deferred_reason, state.next_eligible_at) == (
         "deferred",
@@ -272,8 +282,8 @@ def test_a_two_task_cycle_holds_both(queue_dir: Path, caplog: pytest.LogCaptureF
         "b": [UnmeetableDependency("a", "cycle", ("a", "b"))],
     }
     assert _warnings(caplog) == [
-        _warning("a", _reason("b (in a dependency cycle among a, b)")),
-        _warning("b", _reason("a (in a dependency cycle among a, b)")),
+        _warning("a", _reason("b (in a dependency cycle among a, b)"), "cycle"),
+        _warning("b", _reason("a (in a dependency cycle among a, b)"), "cycle"),
     ]
 
 
@@ -321,13 +331,14 @@ def test_a_circuit_broken_dependency(queue_dir: Path, caplog: pytest.LogCaptureF
         Counter({"depends_on_unmeetable": 1, "failed_circuit_breaker": 1}),
     )
     assert unmeetable == {"t": [UnmeetableDependency("upstream", "failed_circuit_breaker")]}
-    assert _warnings(caplog) == [_warning("t", reason)]
+    assert _warnings(caplog) == [_warning("t", reason, "failed_circuit_breaker")]
 
 
 def test_every_unmeetable_dependency_is_named_once_in_depends_on_order(
-    queue_dir: Path,
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A met and an unfinished dependency beside them are left out."""
+    """A met and an unfinished dependency beside them are left out; the
+    WARNING gives the advice for each cause once, in a fixed order."""
     add_task(queue_dir, "broken")
     add_state(queue_dir, "broken", "failed_circuit_breaker")
     add_task(queue_dir, "done")
@@ -336,13 +347,16 @@ def test_every_unmeetable_dependency_is_named_once_in_depends_on_order(
     add_task(queue_dir, "b", depends_on=["t"])
     add_task(queue_dir, "t", depends_on=["broken", "done", "t", "pending-dep", "b", "broken"])
 
-    _select(queue_dir)
+    with caplog.at_level(logging.WARNING, logger=ORCHESTRATOR_LOGGER):
+        _select(queue_dir)
 
-    assert _state(queue_dir, "t").deferred_reason == _reason(
+    reason = _reason(
         "broken (failed_circuit_breaker)",
         "t (the task itself)",
         "b (in a dependency cycle among b, t)",
     )
+    assert _state(queue_dir, "t").deferred_reason == reason
+    assert _warnings(caplog)[-1] == _warning("t", reason, "self", "cycle", "failed_circuit_breaker")
 
 
 def test_a_missing_dependency_is_reported_first(queue_dir: Path) -> None:
@@ -395,7 +409,7 @@ def test_warned_once_across_ticks(queue_dir: Path, caplog: pytest.LogCaptureFixt
         for _ in range(3):
             _select(queue_dir)
 
-    assert _warnings(caplog) == [_warning("t", _reason("t (the task itself)"))]
+    assert _warnings(caplog) == [_warning("t", _reason("t (the task itself)"), "self")]
 
 
 def test_dropping_the_self_dependency_releases_the_task(
@@ -461,9 +475,9 @@ def test_a_cycle_that_grows_is_warned_again(
 
     cycle = "in a dependency cycle among a, b, c"
     assert _warnings(caplog) == [
-        _warning("a", _reason(f"b ({cycle})")),
-        _warning("b", _reason(f"c ({cycle})")),
-        _warning("c", _reason(f"a ({cycle})")),
+        _warning("a", _reason(f"b ({cycle})"), "cycle"),
+        _warning("b", _reason(f"c ({cycle})"), "cycle"),
+        _warning("c", _reason(f"a ({cycle})"), "cycle"),
     ]
 
 
@@ -484,8 +498,8 @@ def test_a_missing_dependency_created_into_a_cycle_changes_the_hold(
     reason = _reason("b (in a dependency cycle among a, b)")
     assert _state(queue_dir, "a").deferred_reason == reason
     assert _warnings(caplog) == [
-        _warning("a", reason),
-        _warning("b", _reason("a (in a dependency cycle among a, b)")),
+        _warning("a", reason, "cycle"),
+        _warning("b", _reason("a (in a dependency cycle among a, b)"), "cycle"),
     ]
 
 

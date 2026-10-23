@@ -115,7 +115,7 @@ until it next runs, but would not be held by it: a `deferred` state without
 `next_eligible_at` passes the status filter, and the selector's other
 checks decide.
 
-## Update (2026-10-24): dependencies that exist but cannot complete
+## Update (2026-10-23): dependencies that exist but cannot complete
 
 Three kinds of dependency still held their dependents silently under
 `depends_on`, though each has a task YAML in `todo/` and so exists:
@@ -123,7 +123,9 @@ Three kinds of dependency still held their dependents silently under
 - the task's own id;
 - a task in a dependency cycle with it (A depends on B, B on A, or longer);
 - a task in `failed_circuit_breaker`, which the runner does not dispatch
-  again until an operator resets its state.
+  again until an operator edits its state file back to `status: pending`
+  (no `queue` command resets a circuit breaker, and `queue force-dispatch`
+  refuses that status).
 
 None of these completes while nothing changes, so each is now held as a new
 category, `depends_on_unmeetable`, by the same mechanism as a missing
@@ -131,8 +133,9 @@ dependency: parked `deferred` with `unmeetable dependency: depends_on names
 <id> (<why>); ...`, where `<why>` is `the task itself`, `in a dependency
 cycle among <the cycle's first three tasks, sorted> [and N more]` or
 `failed_circuit_breaker`;
-one WARNING per transition; un-parked the first tick after the depends_on
-is fixed, the cycle broken or the stopped task reset, and only from a hold
+one WARNING per transition, which says what to do for each cause;
+un-parked the first tick after the depends_on is fixed, the cycle broken or
+the stopped task's state set back to `pending`, and only from a hold
 with that prefix; nothing written or logged by a read-only selection.
 `queue holds --json` lists each such task under `unmeetable_dependencies`,
 each dependency with its `id`, `cause` (`self`, `cycle`,
@@ -162,7 +165,7 @@ one, and an unmeetable one before an unfinished one.
 
 It is its own category rather than a second meaning of
 `depends_on_missing` because the fixes differ (fix an id or create a task;
-break a cycle or reset a stopped task), and because the details differ: a
+break a cycle or restart a stopped task), and because the details differ: a
 missing dependency is an id, an unmeetable one an id and a cause. Sharing
 the category would make `missing_dependencies` and its count mean two
 things, and the operator would have to read every reason to tell a typo

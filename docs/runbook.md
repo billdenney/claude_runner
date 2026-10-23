@@ -428,10 +428,16 @@ task that does not run.
      three tasks and how many more; `queue holds --json` lists them all
      under `dependency_cycles`),
      or a task stopped by its circuit breaker (`(failed_circuit_breaker)`).
-     The supervisor log has a WARNING from when the task was parked. Drop
-     the task's own id from its `depends_on`, break the cycle by removing
-     one `depends_on` entry along it, or reset the stopped task (its state
-     out of `failed_circuit_breaker`) or remove the dependency on it. The
+     The supervisor log has a WARNING from when the task was parked, which
+     says what to do. Drop the task's own id from its `depends_on`, break
+     the cycle by removing one `depends_on` entry along it, or remove the
+     dependency on the stopped task. To run the stopped task again instead,
+     fix the cause of its failures, then edit
+     `<queue>/.claude_task_runner/state/<id>.yaml` from `status:
+     failed_circuit_breaker` to `status: pending`: no `queue` command
+     resets a circuit breaker (`queue force-dispatch` refuses that status,
+     and `queue restart-fresh` clears only the session). Its failed runs
+     stay in `runs`, so one more failure trips the breaker again. The held
      task goes back to `pending` on the next tick. Every task of a cycle is
      parked, each naming the member it depends on; a task that only
      depends on a member waits under `depends_on`.
