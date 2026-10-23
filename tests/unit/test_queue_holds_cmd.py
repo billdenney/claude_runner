@@ -57,6 +57,7 @@ HELD = {
     "deferred_cooldown": 1,
     "depends_on": 1,
     "depends_on_missing": 1,
+    "depends_on_unmeetable": 1,
     "failed_circuit_breaker": 1,
     "in_flight": 1,
     "invalid_effort": 1,
@@ -141,7 +142,7 @@ def test_every_task_lands_in_one_place(mixed: Path) -> None:
         },
         "held": HELD,
         "completed": 2,
-        "todo_tasks": 23,
+        "todo_tasks": 24,
         "poll_interval_s": 60.0,
         "affinity_ttl_s": 5400.0,
         "queue_cap": None,
@@ -156,6 +157,18 @@ def test_every_task_lands_in_one_place(mixed: Path) -> None:
         ],
         "missing_dependencies": [
             {"task_id": "names-a-missing-task", "missing": ["no-such-task"]},
+        ],
+        "unmeetable_dependencies": [
+            {
+                "task_id": "waits-on-broken",
+                "unmeetable": [
+                    {
+                        "id": "status-failed_circuit_breaker",
+                        "cause": "failed_circuit_breaker",
+                        "cycle": [],
+                    }
+                ],
+            }
         ],
         "unread_states": [],
         "supervisor_json_error": None,
@@ -459,6 +472,38 @@ def test_parked_workers_and_retry_reasons(
             "deferred_reason": "cannot start the worker: config_dir /gone does not exist",
             "next_eligible_at": due.isoformat(),
         }
+    ]
+
+
+def test_unmeetable_dependencies_json_and_text(queue: Path) -> None:
+    """Each held task with its unmeetable dependencies in depends_on order,
+    the cause of each and, for a cycle, its tasks; and one text line per
+    task."""
+    _config(queue)
+    add_task(queue, "broken")
+    add_state(queue, "broken", "failed_circuit_breaker")
+    add_task(queue, "a", depends_on=["broken", "a", "b"])
+    add_task(queue, "b", depends_on=["a"])
+
+    holds = _holds(queue)
+
+    assert holds["held"] == {"depends_on_unmeetable": 2, "failed_circuit_breaker": 1}
+    assert holds["unmeetable_dependencies"] == [
+        {
+            "task_id": "a",
+            "unmeetable": [
+                {"id": "broken", "cause": "failed_circuit_breaker", "cycle": []},
+                {"id": "a", "cause": "self", "cycle": []},
+                {"id": "b", "cause": "cycle", "cycle": ["a", "b"]},
+            ],
+        },
+        {"task_id": "b", "unmeetable": [{"id": "a", "cause": "cycle", "cycle": ["a", "b"]}]},
+    ]
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)]).stdout
+    assert text.splitlines()[-2:] == [
+        "unmeetable dependency: a needs broken (failed_circuit_breaker); a (the task itself); "
+        "b (in a dependency cycle among a, b)",
+        "unmeetable dependency: b needs a (in a dependency cycle among a, b)",
     ]
 
 

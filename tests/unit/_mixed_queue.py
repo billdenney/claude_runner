@@ -98,6 +98,8 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     # that names no task at all is held apart, even beside an unfinished one.
     add_task(qd, "waits-on-upstream", depends_on=["status-running"])
     add_task(qd, "names-a-missing-task", depends_on=["status-running", "no-such-task"])
+    # depends_on_unmeetable: a dependency that exists but cannot complete.
+    add_task(qd, "waits-on-broken", depends_on=["status-failed_circuit_breaker"])
 
     add_task(qd, "needs-file", requires=[{"kind": "file", "path": str(missing_file)}])
 
@@ -161,6 +163,7 @@ MIXED_EXPECTED_SKIPS = Counter(
         "invalid_effort": 1,
         "depends_on": 1,
         "depends_on_missing": 1,
+        "depends_on_unmeetable": 1,
         "readiness_missing_file": 1,
         "readiness_awaiting_sidecar_response": 1,
         "readiness_awaiting_sidecar_response+missing_file": 1,
@@ -176,6 +179,14 @@ MIXED_EXPECTED_ELIGIBLE = [
 ]
 MIXED_EXPECTED_MISSING = {"names-a-missing-task": ["no-such-task"]}
 """The ``depends_on_missing`` task and the dependency it names that no task has."""
+MIXED_EXPECTED_UNMEETABLE = {
+    "waits-on-broken": [
+        orchestrator_mod.UnmeetableDependency(
+            "status-failed_circuit_breaker", "failed_circuit_breaker"
+        )
+    ]
+}
+"""The ``depends_on_unmeetable`` task and the circuit-broken task it names."""
 STALE_HOLDS = ("effort-fixed", "file-arrived")
 """The eligible tasks whose state still carries a gate's cleared hold."""
 

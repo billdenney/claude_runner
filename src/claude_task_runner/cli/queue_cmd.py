@@ -430,13 +430,16 @@ def holds(
     Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
     (it starts as soon as an account has a free slot), ``held`` under the
     category that holds it (``block_dispatch``, ``depends_on``,
-    ``depends_on_missing``, ``unanswered_sidecar``,
-    ``readiness_missing_file``, ``in_flight``, a status such as
-    ``possibly_hung``, ...), or ``completed``. ``depends_on`` waits for a
-    dependency that has not completed; ``depends_on_missing`` names one
-    with no task file in ``todo/`` that is not completed or running, so
-    the task does not start until its ``depends_on`` is fixed or that task
-    is created.
+    ``depends_on_missing``, ``depends_on_unmeetable``,
+    ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
+    status such as ``possibly_hung``, ...), or ``completed``.
+    ``depends_on`` waits for a dependency that has not completed;
+    ``depends_on_missing`` names one with no task file in ``todo/`` that
+    is not completed or running, so the task does not start until its
+    ``depends_on`` is fixed or that task is created;
+    ``depends_on_unmeetable`` names one that exists but cannot complete:
+    the task itself, a task in a dependency cycle with it, or a
+    ``failed_circuit_breaker`` task.
     Of the eligible, ``can_start_now`` have an account that takes them now, and
     ``waiting_for_their_account`` are held to the account their session
     runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
@@ -444,7 +447,7 @@ def holds(
     selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
     (the warm-up cap while ``warming_up``), ``null`` when there is none.
 
-    Three holds carry their tasks' details. ``parked_workers``: the
+    Four holds carry their tasks' details. ``parked_workers``: the
     ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
     ``worker_still_running``), each with its ``pid``, ``started_at``,
     whether it is still ``running``, its ``duration_cap_s`` (0: none) and
@@ -456,6 +459,10 @@ def holds(
     ``unread_states`` with the error.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
     the ``missing`` ids in its ``depends_on``, in the order it lists them.
+    ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
+    with its ``unmeetable`` dependencies in ``depends_on`` order, each an
+    ``id``, a ``cause`` (``self``, ``cycle`` or ``failed_circuit_breaker``)
+    and, for ``cycle``, the ``cycle``'s tasks, sorted (else empty).
 
     \b
     Exit codes:
@@ -484,6 +491,7 @@ def holds(
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
     missing = sorted(preview.missing_dependencies.items())
+    unmeetable = sorted(preview.unmeetable_dependencies.items())
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -502,6 +510,15 @@ def holds(
         "parked_workers": parked,
         "retrying": retrying,
         "missing_dependencies": [{"task_id": t, "missing": ids} for t, ids in missing],
+        "unmeetable_dependencies": [
+            {
+                "task_id": t,
+                "unmeetable": [
+                    {"id": u.id, "cause": u.cause, "cycle": list(u.cycle)} for u in deps
+                ],
+            }
+            for t, deps in unmeetable
+        ],
         "unread_states": unread,
         "supervisor_json_error": snapshot_error,
     }
@@ -553,6 +570,13 @@ def holds(
         console.print(
             f"[bold]missing dependency:[/] {escape(task_id)} needs {escape(', '.join(ids))} "
             "(no task file in todo/, not completed or running)",
+            highlight=False,
+            emoji=False,
+        )
+    for task_id, deps in unmeetable:
+        console.print(
+            f"[bold]unmeetable dependency:[/] {escape(task_id)} needs "
+            f"{escape('; '.join(u.describe() for u in deps))}",
             highlight=False,
             emoji=False,
         )

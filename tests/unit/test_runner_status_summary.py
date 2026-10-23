@@ -737,6 +737,87 @@ def test_tasks_whose_dependency_does_not_exist(
     )
 
 
+def test_tasks_whose_dependency_cannot_finish(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """Tasks that depend on themselves, on each other in a loop, or on a
+    task stopped after repeated failures need the operator; a task that
+    waits for a member of the loop is only waiting."""
+    _two_accounts(queue, tmp_path)
+    add_task(queue, "broken")
+    add_state(queue, "broken", "failed_circuit_breaker")
+    add_task(queue, "after-broken", depends_on=["broken"])
+    add_task(queue, "loop-a", depends_on=["loop-b"])
+    add_task(queue, "loop-b", depends_on=["loop-c"])
+    add_task(queue, "loop-c", depends_on=["loop-a", "loop-c"])
+    add_task(queue, "after-loop", depends_on=["loop-a"])
+    supervisor()
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 1 waits for another task to finish; 4 wait for a task that cannot finish; "
+        "1 stopped after repeated failures; 0 finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "4 tasks wait for tasks that cannot finish (after-broken needs broken (stopped "
+            "after repeated failures); loop-a needs loop-b (in a loop where loop-a, loop-b and "
+            "loop-c wait on one another); loop-b needs loop-c (in a loop where loop-b, loop-a "
+            "and loop-c wait on one another); and 1 more). They will not start until each "
+            "depends_on is fixed, each loop is broken or the stopped tasks are reset.",
+            "Tasks that stopped after failing repeatedly and will not be retried: 1. Look with "
+            f"`claude-task-runner queue states --status failed_circuit_breaker --queue {queue}`.",
+        )
+        + _info("No task can start right now: every unfinished task is held, as Tasks shows.")
+    )
+
+
+def test_one_task_whose_dependency_cannot_finish_and_the_details(
+    queue: Path, bin_dir: Path
+) -> None:
+    """One such task is worded in the singular, a task that depends on
+    itself as needing itself; the details list every such task."""
+    rows = [
+        {
+            "task_id": "solo",
+            "unmeetable": [
+                {"id": "solo", "cause": "self", "cycle": []},
+                {"id": "pair", "cause": "cycle", "cycle": ["pair", "solo"]},
+            ],
+        }
+    ]
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"depends_on_unmeetable": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "unmeetable_dependencies": rows,
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    summary = proc.stdout.partition("### Details\n")[0]
+    assert (
+        "- 1 task waits for a task that cannot finish (solo needs itself and pair (in a loop "
+        "where solo and pair wait on one another)). It will not start until its depends_on is "
+        "fixed, the loop is broken or the stopped task is reset.\n"
+    ) in summary
+    _, _, details = proc.stdout.partition("**What holds the tasks**")
+    section = details.split("\n**Queue counts**")[0]
+    assert section.endswith(
+        "| depends_on_unmeetable | 1 |\n"
+        "| completed | 0 |\n"
+        "| todo/ tasks (total) | 1 |\n\n"
+        "_Counted under depends_on_unmeetable: each dependency listed exists but cannot "
+        "finish:_\n\n"
+        "| task | dependencies that cannot finish |\n"
+        "|---|---|\n"
+        "| solo | itself; pair (in a loop where solo and pair wait on one another) |\n"
+    ), section
+
+
 def test_one_task_whose_dependency_does_not_exist_and_the_details(
     queue: Path, bin_dir: Path
 ) -> None:

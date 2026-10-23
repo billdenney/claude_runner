@@ -109,6 +109,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
         "waits for a task that does not exist",
         "wait for a task that does not exist",
     ),
+    "depends_on_unmeetable": (
+        "waits for a task that cannot finish",
+        "wait for a task that cannot finish",
+    ),
     "deferred_cooldown": ("waits for a retry time", "wait for a retry time"),
     "invalid_effort": (
         "is set to a model or effort the queue does not allow",
@@ -149,6 +153,7 @@ _HELD_ORDER = (
     "readiness_missing_file",
     "depends_on",
     "depends_on_missing",
+    "depends_on_unmeetable",
     "deferred_cooldown",
     "block_dispatch",
     "weekly_paused",
@@ -830,6 +835,60 @@ def _missing_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
     )
 
 
+def _unmeetable_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """``queue holds``' ``unmeetable_dependencies``: each task held
+    ``depends_on_unmeetable``, with each dependency that cannot finish
+    worded with its cause."""
+    rows = []
+    for r in holds.get("unmeetable_dependencies") or []:
+        if not isinstance(r, dict):
+            continue
+        task_id = str(r.get("task_id"))
+        deps = [
+            _unmeetable_words(task_id, u) for u in r.get("unmeetable") or [] if isinstance(u, dict)
+        ]
+        rows.append((task_id, deps))
+    return rows
+
+
+def _unmeetable_words(task_id: str, dep: dict[str, Any]) -> str:
+    """One dependency that cannot finish, with why, in plain words."""
+    dep_id = str(dep.get("id"))
+    cause = dep.get("cause")
+    if cause == "self":
+        return "itself"
+    if cause == "cycle":
+        members = [task_id, *(str(m) for m in dep.get("cycle") or [] if str(m) != task_id)]
+        joined = " and ".join([", ".join(members[:-1]), members[-1]])
+        return f"{dep_id} (in a loop where {joined} wait on one another)"
+    if cause == "failed_circuit_breaker":
+        return f"{dep_id} (stopped after repeated failures)"
+    return f"{dep_id} ({cause})"
+
+
+def _unmeetable_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks whose depends_on names a task that cannot finish: itself, a
+    task in a loop with it, or a task stopped after repeated failures."""
+    rows = _unmeetable_dependency_rows(holds)
+    if not rows:
+        return
+    items = [f"{task_id} needs {' and '.join(deps)}" for task_id, deps in rows]
+    n = len(rows)
+    lead = (
+        "1 task waits for a task that cannot finish"
+        if n == 1
+        else f"{n} tasks wait for tasks that cannot finish"
+    )
+    then = (
+        "It will not start until its depends_on is fixed, the loop is broken or the stopped "
+        "task is reset."
+        if n == 1
+        else "They will not start until each depends_on is fixed, each loop is broken or the "
+        "stopped tasks are reset."
+    )
+    notes.attention.append(f"{lead} ({_listing(items)}). {then}")
+
+
 def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str:
     holds = facts.holds.data
     if holds is None:
@@ -897,6 +956,7 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
     _parked_notes(facts, watching, exited, live, notes)
     _retry_notes(facts, holds, notes)
     _missing_dependency_notes(holds, notes)
+    _unmeetable_dependency_notes(holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."
@@ -1362,6 +1422,17 @@ def holds_section(facts: Facts) -> str:
             "|---|---|",
         ]
         out += [f"| {task_id} | {', '.join(ids)} |" for task_id, ids in missing]
+    unmeetable = _unmeetable_dependency_rows(data)
+    if unmeetable:
+        out += [
+            "",
+            "_Counted under depends_on_unmeetable: each dependency listed exists but cannot "
+            "finish:_",
+            "",
+            "| task | dependencies that cannot finish |",
+            "|---|---|",
+        ]
+        out += [f"| {task_id} | {'; '.join(deps)} |" for task_id, deps in unmeetable]
     if data.get("supervisor_json_error"):
         out += ["", f"_in-flight tasks unknown: {data['supervisor_json_error']}_"]
     return "\n".join(out) + "\n"

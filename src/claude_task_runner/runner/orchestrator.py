@@ -15,7 +15,10 @@ the daemon calls :func:`tick_dispatch`, which:
    ``depends_on`` ID with no ``todo/`` YAML whose state is not completed
    or running can never complete: the task is held as
    ``depends_on_missing`` and parked ``deferred`` with a WARNING until its
-   ``depends_on`` is fixed or the missing task is created (ADR-0036).
+   ``depends_on`` is fixed or the missing task is created (ADR-0036). So
+   is one that exists but cannot complete while nothing changes: the task
+   itself, another task in a dependency cycle with it, or a task stopped
+   by its circuit breaker, held as ``depends_on_unmeetable``.
 4. For each candidate calls :func:`runner.account_dispatch.choose_account`
    to pick the account to dispatch through (equal-priority across
    accounts, least 5h util wins). Skips the task when no account has
@@ -44,7 +47,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
@@ -165,7 +168,9 @@ _DISPATCHABLE_STATUSES = frozenset({"pending", "failed"})
 # status itself, ``running``, ``possibly_hung``, ...; ``block_dispatch``;
 # ``depends_on``), a snake_case phrase otherwise. ``depends_on`` is a
 # dependency that exists and has not completed; ``depends_on_missing`` one
-# that cannot complete because no task by that id exists (ADR-0036). A
+# that cannot complete because no task by that id exists, and
+# ``depends_on_unmeetable`` one that exists but cannot complete either: the
+# task itself, a dependency cycle, a circuit-broken task (ADR-0036). A
 # task held by readiness is ``readiness_`` plus the categories of its unmet
 # requirements, sorted and joined by ``+`` (``readiness_missing_file``,
 # ``readiness_awaiting_sidecar_response+missing_file``).
@@ -178,6 +183,7 @@ _SKIP_DEFERRED_COOLDOWN = "deferred_cooldown"
 _SKIP_INVALID_EFFORT = "invalid_effort"
 _SKIP_DEPENDS_ON = "depends_on"
 _SKIP_DEPENDS_ON_MISSING = "depends_on_missing"
+_SKIP_DEPENDS_ON_UNMEETABLE = "depends_on_unmeetable"
 _SKIP_READINESS_PREFIX = "readiness_"
 _SKIP_LIVE_WORKER = "live_worker"
 # Finished, not held: left out of the summary's unfinished count.
@@ -412,6 +418,7 @@ def tick_dispatch(
         skips=skips,
         on_park=tracker.note_park,
         may_complete_ids=state_ids.may_complete,
+        circuit_broken_ids=state_ids.circuit_broken,
     )
     # A task the selector just parked (or a dispatch thread did since the
     # tick began) holds its account's slot from now on, not from next tick.
@@ -891,14 +898,18 @@ class _StateIds(NamedTuple):
     YAML: a worker may be running it (``running``, ``possibly_hung``), or
     its state file does not parse, so nothing can be told from it. A task
     in any other status runs again only from its ``todo/`` YAML."""
+    circuit_broken: set[str]
+    """Ids whose state is ``failed_circuit_breaker``: the runner does not
+    dispatch them again until an operator resets the state."""
 
 
 def _state_task_ids(queue_dir: Path) -> _StateIds:
-    """The completed task ids, and those that may yet complete, in the one
-    pass over the state files that the selector needs for ``completed``
-    anyway."""
+    """The completed task ids, those that may yet complete and the
+    circuit-broken ones, in the one pass over the state files that the
+    selector needs for ``completed`` anyway."""
     completed: set[str] = set()
     may_complete: set[str] = set()
+    circuit_broken: set[str] = set()
     for sp in iter_state_files(queue_dir):
         try:
             state = load_state(sp)
@@ -910,7 +921,9 @@ def _state_task_ids(queue_dir: Path) -> _StateIds:
             completed.add(state.task_id)
         elif state.status in _WORKER_STATUSES:
             may_complete.add(state.task_id)
-    return _StateIds(completed=completed, may_complete=may_complete)
+        elif state.status == "failed_circuit_breaker":
+            circuit_broken.add(state.task_id)
+    return _StateIds(completed=completed, may_complete=may_complete, circuit_broken=circuit_broken)
 
 
 def _affined_account_for_task(queue_dir: Path, task_id: str) -> str | None:
@@ -1176,6 +1189,142 @@ def _is_missing_dependency_reason(reason: str | None) -> bool:
     return reason is not None and reason.startswith(_MISSING_DEPENDENCY_PREFIX)
 
 
+UnmeetableCause = Literal["self", "cycle", "failed_circuit_breaker"]
+
+
+class UnmeetableDependency(NamedTuple):
+    """A ``depends_on`` id that exists but cannot complete while nothing
+    changes (ADR-0036): the task itself (``self``), another task in a
+    dependency cycle with it (``cycle``), or a task stopped by its circuit
+    breaker (``failed_circuit_breaker``)."""
+
+    id: str
+    cause: UnmeetableCause
+    cycle: tuple[str, ...] = ()
+    """For ``cycle``, every task in the cycle, sorted; empty otherwise."""
+
+    def describe(self) -> str:
+        """The id and its cause, as the hold's reason and ``queue holds`` print it."""
+        if self.cause == "self":
+            return f"{self.id} (the task itself)"
+        if self.cause == "cycle":
+            return f"{self.id} (in a dependency cycle among {', '.join(self.cycle)})"
+        return f"{self.id} (failed_circuit_breaker)"
+
+
+_UNMEETABLE_DEPENDENCY_PREFIX = "unmeetable dependency: "
+"""Prefix of the ``deferred_reason`` the selector writes when it parks a task
+whose ``depends_on`` names a task that exists but cannot complete (ADR-0036).
+Only a hold with this prefix is cleared once that changes."""
+
+
+@dataclass(frozen=True)
+class _DependencyView:
+    """What the dependency gates know of the queue, built once per selector
+    pass from what it already read."""
+
+    known: set[str]
+    """Ids of the tasks that exist (see :func:`_skip_category`)."""
+    circuit_broken: Collection[str]
+    """Ids whose state is ``failed_circuit_breaker``."""
+    cycles: dict[str, tuple[str, ...]]
+    """For each task in a dependency cycle, the cycle's members, sorted
+    (:func:`_dependency_cycles`)."""
+
+
+def _dependency_cycles(
+    tasks: Sequence[Task], may_finish: Collection[str]
+) -> dict[str, tuple[str, ...]]:
+    """For each task in a dependency cycle, the cycle's members, sorted.
+
+    ``may_finish`` are the tasks that have completed or may complete
+    whatever they depend on: completed ones, and ones a worker may be
+    running. The graph has an edge from each of ``tasks`` not in it to each
+    such task its ``depends_on`` names; a task in ``may_finish`` ends every
+    path through it, since a cycle through it may yet be met. A cycle is a
+    strongly connected component of two or more tasks, or one task that
+    depends on itself. Tarjan's algorithm finds them all in one pass,
+    linear in tasks plus dependencies, run iteratively so that a long chain
+    of tasks cannot exhaust the recursion limit.
+    """
+    graph: dict[str, list[str]] = {
+        t.id: list(dict.fromkeys(t.depends_on)) for t in tasks if t.id not in may_finish
+    }
+    for node, deps in graph.items():
+        graph[node] = [d for d in deps if d in graph]
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    cycles: dict[str, tuple[str, ...]] = {}
+    for root in graph:
+        if root in index:
+            continue
+        index[root] = low[root] = len(index)
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, 0)]
+        while work:
+            node, pos = work[-1]
+            deps = graph[node]
+            if pos < len(deps):
+                work[-1] = (node, pos + 1)
+                dep = deps[pos]
+                if dep not in index:
+                    index[dep] = low[dep] = len(index)
+                    stack.append(dep)
+                    on_stack.add(dep)
+                    work.append((dep, 0))
+                elif dep in on_stack:
+                    low[node] = min(low[node], index[dep])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] != index[node]:
+                continue
+            members: list[str] = []
+            while True:
+                member = stack.pop()
+                on_stack.discard(member)
+                members.append(member)
+                if member == node:
+                    break
+            if len(members) > 1 or node in deps:
+                cycle = tuple(sorted(members))
+                for member in members:
+                    cycles[member] = cycle
+    return cycles
+
+
+def _unmeetable_dependencies(task: Task, view: _DependencyView) -> list[UnmeetableDependency]:
+    """The ids in ``task.depends_on`` that exist but cannot complete, each
+    once, in the order ``depends_on`` lists them."""
+    cycle = view.cycles.get(task.id, ())
+    out: list[UnmeetableDependency] = []
+    for dep in dict.fromkeys(task.depends_on):
+        if dep == task.id:
+            out.append(UnmeetableDependency(dep, "self"))
+        elif dep in cycle:
+            out.append(UnmeetableDependency(dep, "cycle", cycle))
+        elif dep in view.circuit_broken:
+            out.append(UnmeetableDependency(dep, "failed_circuit_breaker"))
+    return out
+
+
+def _unmeetable_dependency_reason(unmeetable: Sequence[UnmeetableDependency]) -> str:
+    """The ``deferred_reason`` to park a task with whose ``depends_on``
+    names the ``unmeetable`` dependencies."""
+    names = "; ".join(u.describe() for u in unmeetable)
+    return f"{_UNMEETABLE_DEPENDENCY_PREFIX}depends_on names {names}"
+
+
+def _is_unmeetable_dependency_reason(reason: str | None) -> bool:
+    """True iff ``reason`` is a ``deferred_reason`` :func:`_unmeetable_dependency_reason` wrote."""
+    return reason is not None and reason.startswith(_UNMEETABLE_DEPENDENCY_PREFIX)
+
+
 def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: Collection[str],
@@ -1189,7 +1338,9 @@ def _eligible_candidates(
     read_only: bool = False,
     on_park: ParkCallback | None = None,
     may_complete_ids: Collection[str] | None = None,
+    circuit_broken_ids: Collection[str] | None = None,
     missing_dependencies: dict[str, list[str]] | None = None,
+    unmeetable_dependencies: dict[str, list[UnmeetableDependency]] | None = None,
 ) -> list[Task]:
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
@@ -1213,13 +1364,16 @@ def _eligible_candidates(
     # :func:`_skip_category`): the same tasks are returned and counted, and
     # no state file is written, nor ``todo/`` created.
     #
-    # ``may_complete_ids`` are the ids :func:`_state_task_ids` finds may
-    # still complete without a ``todo/`` YAML, in the pass that also finds
-    # ``completed_ids``; ``None`` makes that pass here. With the ``todo/``
-    # YAMLs and ``completed_ids`` they are the tasks that exist, which tells
-    # a ``depends_on`` that has not completed from one that never can.
-    # ``missing_dependencies``, when given, gets each task held
-    # ``depends_on_missing`` with the ids it names that do not exist.
+    # ``may_complete_ids`` and ``circuit_broken_ids`` are what
+    # :func:`_state_task_ids` finds in the pass that also finds
+    # ``completed_ids``; ``None`` for either makes that pass here. With the
+    # ``todo/`` YAMLs and ``completed_ids``, the first are the tasks that
+    # exist, which tells a ``depends_on`` that has not completed from one
+    # that never can. Every task YAML is read before any is classified, so
+    # the dependency cycles among them are found once per pass.
+    # ``missing_dependencies`` and ``unmeetable_dependencies``, when given,
+    # get each task held ``depends_on_missing`` or
+    # ``depends_on_unmeetable`` with the dependencies that hold it.
     tally: Counter[str] = skips if skips is not None else Counter()
     out: list[Task] = []
     in_flight_ids = set(in_flight_slots)
@@ -1239,15 +1393,30 @@ def _eligible_candidates(
 
     pending = iter_pending_tasks if read_only else list_pending_tasks
     paths = list(pending(queue_dir))
-    if may_complete_ids is None:
-        may_complete_ids = _state_task_ids(queue_dir).may_complete
-    known_ids = {p.stem for p in paths}
-    known_ids.update(may_complete_ids, completed_ids)
+    if may_complete_ids is None or circuit_broken_ids is None:
+        state_ids = _state_task_ids(queue_dir)
+        if may_complete_ids is None:
+            may_complete_ids = state_ids.may_complete
+        if circuit_broken_ids is None:
+            circuit_broken_ids = state_ids.circuit_broken
+    loaded: list[Task | None] = []
     for path in paths:
         try:
-            task = load_task(path)
+            loaded.append(load_task(path))
         except Exception as exc:
             logger.warning("skipping unparseable task at %s: %s", path, exc)
+            loaded.append(None)
+    known_ids = {p.stem for p in paths}
+    known_ids.update(may_complete_ids, completed_ids)
+    view = _DependencyView(
+        known=known_ids,
+        circuit_broken=circuit_broken_ids,
+        cycles=_dependency_cycles(
+            [t for t in loaded if t is not None], {*completed_ids, *may_complete_ids}
+        ),
+    )
+    for task in loaded:
+        if task is None:
             tally[_SKIP_UNPARSEABLE_TASK] += 1
             continue
         category = _skip_category(
@@ -1261,7 +1430,7 @@ def _eligible_candidates(
             effort_levels=effort_levels,
             read_only=read_only,
             on_park=on_park,
-            known_ids=known_ids,
+            dependencies=view,
         )
         if category is None:
             out.append(task)
@@ -1273,6 +1442,8 @@ def _eligible_candidates(
                 held.setdefault(category, []).append(task)
             if category == _SKIP_DEPENDS_ON_MISSING and missing_dependencies is not None:
                 missing_dependencies[task.id] = _missing_dependencies(task, known_ids)
+            if category == _SKIP_DEPENDS_ON_UNMEETABLE and unmeetable_dependencies is not None:
+                unmeetable_dependencies[task.id] = _unmeetable_dependencies(task, view)
     return out
 
 
@@ -1288,7 +1459,7 @@ def _skip_category(
     effort_levels: dict[str, list[str]],
     read_only: bool,
     on_park: ParkCallback | None = None,
-    known_ids: Collection[str],
+    dependencies: _DependencyView,
 ) -> str | None:
     """Decide whether the selector admits ``task`` this tick.
 
@@ -1301,14 +1472,17 @@ def _skip_category(
     :class:`IdleDispatchLog` prints cannot disagree with what the selector
     did.
 
-    ``known_ids`` are the tasks that exist: a ``todo/`` YAML, a completed
-    state, or a state a worker may still complete (or that does not parse).
-    A ``depends_on`` id outside them is missing, not merely unfinished: a
-    task with no YAML in ``todo/`` is never dispatched again.
+    ``dependencies.known`` are the tasks that exist: a ``todo/`` YAML, a
+    completed state, or a state a worker may still complete (or that does
+    not parse). A ``depends_on`` id outside them is missing, not merely
+    unfinished: a task with no YAML in ``todo/`` is never dispatched again.
+    Of those that exist, the task itself, a task in a dependency cycle with
+    it and a circuit-broken task cannot complete either: they are
+    unmeetable.
 
-    The effort, missing-dependency and readiness gates also park a held task
-    as ``deferred`` and un-park it once its hold clears (see
-    :func:`_park_deferred`).
+    The effort, missing-dependency, unmeetable-dependency and readiness
+    gates also park a held task as ``deferred`` and un-park it once its
+    hold clears (see :func:`_park_deferred`).
     ``read_only`` skips that bookkeeping and its warning, for a caller that
     only wants to know what the selector would do (:func:`preview_selection`);
     the category returned is the same.
@@ -1433,7 +1607,7 @@ def _skip_category(
     # un-parked the first tick after its depends_on is fixed or the missing
     # task is created. A task with both a missing and an unfinished
     # dependency is held as missing, since waiting cannot clear that one.
-    missing = _missing_dependencies(task, known_ids)
+    missing = _missing_dependencies(task, dependencies.known)
     if missing:
         reason = _missing_dependency_reason(missing)
         if not read_only and not _is_parked_with(state, reason):
@@ -1447,6 +1621,28 @@ def _skip_category(
         return _SKIP_DEPENDS_ON_MISSING
     if not read_only:
         state = _unpark(queue_dir, task.id, state, _is_missing_dependency_reason)
+
+    # Unmeetable-dependency gate (ADR-0036): a dependency that exists can
+    # still never complete while nothing changes when it is the task
+    # itself, depends back on the task through a cycle, or was stopped by
+    # its circuit breaker. Same park, WARNING and un-park as above, under
+    # its own reason prefix; a missing dependency is reported first. A task
+    # that merely depends on a cycle member waits under depends_on: the
+    # member is held here, and breaking the cycle releases both.
+    unmeetable = _unmeetable_dependencies(task, dependencies)
+    if unmeetable:
+        reason = _unmeetable_dependency_reason(unmeetable)
+        if not read_only and not _is_parked_with(state, reason):
+            logger.warning(
+                "parking task %s as deferred: %s. Fix the task's depends_on, break the "
+                "cycle, or reset the stopped task",
+                task.id,
+                reason,
+            )
+            _park_deferred(queue_dir, task.id, state, reason)
+        return _SKIP_DEPENDS_ON_UNMEETABLE
+    if not read_only:
+        state = _unpark(queue_dir, task.id, state, _is_unmeetable_dependency_reason)
 
     if any(d not in completed_ids for d in task.depends_on):
         return _SKIP_DEPENDS_ON
@@ -1551,6 +1747,10 @@ class SelectionPreview:
     """For each task held ``depends_on_missing``, the ids in its
     ``depends_on`` that have no ``todo/`` YAML and are not completed or
     running, in the order it lists them."""
+    unmeetable_dependencies: dict[str, list[UnmeetableDependency]]
+    """For each task held ``depends_on_unmeetable``, the dependencies in its
+    ``depends_on`` that exist but cannot complete, in the order it lists
+    them."""
     queue_cap: int | None
     """The queue-wide cap on tasks in flight now (:func:`_target_concurrency`):
     ``[concurrency].initial_concurrency`` while warming up, else
@@ -1587,6 +1787,7 @@ def preview_selection(
     skips: Counter[str] = Counter()
     held: dict[str, list[Task]] = {}
     missing: dict[str, list[str]] = {}
+    unmeetable: dict[str, list[UnmeetableDependency]] = {}
     state_ids = _state_task_ids(queue_dir)
     eligible = _eligible_candidates(
         queue_dir,
@@ -1599,7 +1800,9 @@ def preview_selection(
         held=held,
         read_only=True,
         may_complete_ids=state_ids.may_complete,
+        circuit_broken_ids=state_ids.circuit_broken,
         missing_dependencies=missing,
+        unmeetable_dependencies=unmeetable,
     )
     eligible.sort(key=priority_sort_key)
 
@@ -1646,6 +1849,7 @@ def preview_selection(
         skips=skips,
         held=held,
         missing_dependencies=missing,
+        unmeetable_dependencies=unmeetable,
         queue_cap=_target_concurrency(queue_dir, settings),
         warming_up=(
             settings.concurrency.initial_concurrency is not None

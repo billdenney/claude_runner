@@ -78,6 +78,7 @@ def _select(
         skips=skips,
         read_only=read_only,
         may_complete_ids=ids.may_complete,
+        circuit_broken_ids=ids.circuit_broken,
         missing_dependencies=missing,
     )
     return sorted(t.id for t in eligible), skips, missing
@@ -134,11 +135,6 @@ def _todo_yaml(qd: Path, task_id: str) -> None:
     add_task(qd, task_id)
 
 
-def _todo_yaml_circuit_broken(qd: Path, task_id: str) -> None:
-    add_task(qd, task_id)
-    add_state(qd, task_id, "failed_circuit_breaker")
-
-
 def _unparseable_todo_yaml(qd: Path, task_id: str) -> None:
     (todo_dir(qd) / f"{task_id}.yaml").write_text("not: valid: yaml: [\n", encoding="utf-8")
 
@@ -158,11 +154,6 @@ def _state_only(status: str) -> Callable[[Path, str], None]:
     ("make_dependency", "expected_eligible", "expected_skips"),
     [
         (_todo_yaml, ["upstream"], Counter({"depends_on": 1})),
-        (
-            _todo_yaml_circuit_broken,
-            [],
-            Counter({"depends_on": 1, "failed_circuit_breaker": 1}),
-        ),
         (_unparseable_todo_yaml, [], Counter({"depends_on": 1, "unparseable_task": 1})),
         (_state_only("completed"), ["waits"], Counter()),
         (_state_only("running"), [], Counter({"depends_on": 1})),
@@ -171,7 +162,6 @@ def _state_only(status: str) -> Callable[[Path, str], None]:
     ],
     ids=[
         "todo-yaml",
-        "todo-yaml-circuit-broken",
         "unparseable-todo-yaml",
         "state-only-completed",
         "state-only-running",
@@ -186,10 +176,11 @@ def test_a_dependency_that_exists(
     expected_eligible: list[str],
     expected_skips: Counter[str],
 ) -> None:
-    """A todo/ YAML in any state, readable or not, a completed state, a
-    state a worker may still complete, or a state that cannot be read: the
-    waiting task waits for it (or runs, once it completed), unparked and
-    without a WARNING."""
+    """A todo/ YAML, readable or not, a completed state, a state a worker
+    may still complete, or a state that cannot be read: the waiting task
+    waits for it (or runs, once it completed), unparked and without a
+    WARNING. A circuit-broken task with a todo/ YAML exists too, but cannot
+    complete: tests/unit/test_orchestrator_unmeetable_dependency.py."""
     make_dependency(queue_dir, "upstream")
     add_task(queue_dir, "waits", depends_on=["upstream"])
 
@@ -315,6 +306,7 @@ def test_given_the_ids_that_may_complete_the_selector_reads_no_state_directory(
         skips=skips,
         read_only=True,
         may_complete_ids={"running-elsewhere"},
+        circuit_broken_ids=set(),
     )
 
     assert skips == Counter({"depends_on": 1})

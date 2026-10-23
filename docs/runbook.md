@@ -421,6 +421,18 @@ task that does not run.
      `depends_on` (to the renamed task's new id, or remove it), or create
      the missing task in `todo/`. The task goes back to `pending` on the
      next tick, then waits for the dependency to complete if it now exists.
+   - `unmeetable dependency:` — the task's `depends_on` names a task that
+     exists but cannot complete while nothing changes (ADR-0036): the task
+     itself (`(the task itself)`), a task in a dependency cycle with it
+     (`(in a dependency cycle among a, b, ...)`, every task of the cycle),
+     or a task stopped by its circuit breaker (`(failed_circuit_breaker)`).
+     The supervisor log has a WARNING from when the task was parked. Drop
+     the task's own id from its `depends_on`, break the cycle by removing
+     one `depends_on` entry along it, or reset the stopped task (its state
+     out of `failed_circuit_breaker`) or remove the dependency on it. The
+     task goes back to `pending` on the next tick. Every task of a cycle is
+     parked, each naming the member it depends on; a task that only
+     depends on a member waits under `depends_on`.
    - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
      `next_eligible_at` printed below the reason has passed, the supervisor
@@ -488,15 +500,23 @@ not paused or throttled.
    - `depends_on` — a task named in `depends_on` has not completed. It
      exists: it has a task file in `todo/`, or its state is `running` or
      `possibly_hung` (a worker may still finish it), or its state file
-     cannot be read. If its task file is in `todo/` but it is
-     `failed_circuit_breaker` or will otherwise never run again, this holds
-     until you fix or remove it.
+     cannot be read. A dependency that will not complete for another
+     reason it reports itself (its YAML does not parse, it is held by an
+     invalid effort or the block list) holds the task here until that is
+     fixed.
    - `depends_on_missing` — a task named in `depends_on` cannot complete:
      it has no task file in `todo/` and its state is not `completed`,
      `running` or `possibly_hung` (no state at all, or one left by a
      renamed or deleted task), so waiting will never release the task.
      `queue holds` names each such task and the ids it is missing; see "A
      task stays `deferred`". A task with both a missing and an unfinished
+     dependency is counted here.
+   - `depends_on_unmeetable` — a task named in `depends_on` exists but
+     cannot complete: it is the task itself, it is in a dependency cycle
+     with the task, or it is `failed_circuit_breaker`. `queue holds` names
+     each such task and why for each dependency; see "A task stays
+     `deferred`". A task with a missing dependency is counted under
+     `depends_on_missing` first; one with an unmeetable and an unfinished
      dependency is counted here.
    - `deferred_cooldown` — a `deferred` state whose `next_eligible_at` has
      not passed, whoever wrote it: a pre-dispatch hook deferral or a
