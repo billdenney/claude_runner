@@ -586,6 +586,7 @@ def holds(
             style="yellow",
             highlight=False,
             markup=False,
+            emoji=False,
         )
     if snapshot_error:
         console.print(

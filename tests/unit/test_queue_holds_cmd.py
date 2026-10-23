@@ -11,6 +11,7 @@ state writer and leaves every state file as it was.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 from collections.abc import Callable, Iterator
@@ -507,40 +508,64 @@ def test_unmeetable_dependencies_json_and_text(queue: Path) -> None:
     ]
 
 
-def test_text_output_of_the_detail_lines(queue: Path) -> None:
-    """Each detail line's label renders as markup rather than as a literal
-    "[bold]...[/]", and what a hook, an operator or the queue wrote (task
-    ids, a deferral reason with brackets and an emoji code, a broken
-    supervisor.json's error) prints as written."""
+def test_text_output_of_the_detail_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each line's label renders as markup rather than as a literal
+    "[bold]...[/]", and everything a task file, a hook, the settings or the
+    file system supplies prints as written: brackets that read as markup
+    and ``:b:``, an emoji code, in every task id, the route, a reason, a
+    state's load error and supervisor.json's error. The queue's own path
+    carries both, so every path in an error does too. Account names cannot
+    hold either, so the route is set on the selection's result."""
+    queue = tmp_path / "q[x]:b:"
+    queue.mkdir()
+    queue_runtime_dir(queue)
+    todo_dir(queue)
     _config(queue)
     now = datetime.now(UTC).replace(microsecond=0)
     started, due = now - timedelta(minutes=10), now + timedelta(minutes=15)
-    add_task(queue, "exited")
+    add_task(queue, "e[x]:b:")
+    add_task(queue, "p[x]:b:")
     gone = _exited_pid()
-    _parked(queue, "exited", gone, None, started)
-    add_task(queue, "hooked")
+    _parked(queue, "p[x]:b:", gone, None, started)
     reason = "pre-dispatch hook deferred (exit 1): see [effort_levels], [/] and /data/:b:/x"
-    add_state(queue, "hooked", "deferred", deferred_reason=reason, next_eligible_at=due)
-    add_task(queue, "orphan", depends_on=["[gone]"])
+    for task_id in ("n[x]:b:", "r[x]:b:"):
+        add_task(queue, task_id)
+        add_state(queue, task_id, "deferred", deferred_reason=reason, next_eligible_at=due)
+    add_task(queue, "m[x]:b:", depends_on=["[gone]:b:"])
+    add_task(queue, "u[x]:b:", depends_on=["u[x]:b:"])
     persist_mod.supervisor_state_path(queue).write_text("[bold]", encoding="utf-8")
+    real_preview = orch_mod.preview_selection
+
+    def hostile_route_then_unreadable(*args: object, **kwargs: object) -> orch_mod.SelectionPreview:
+        preview = real_preview(*args, **kwargs)  # type: ignore[arg-type]
+        state_path_for(queue, "n[x]:b:").unlink()
+        return dataclasses.replace(preview, routes={"e[x]:b:": "w[x]:b:"})
+
+    monkeypatch.setattr(orch_mod, "preview_selection", hostile_route_then_unreadable)
 
     result = invoke_cli(["queue", "holds", "--queue", str(queue)])
 
     assert result.exit_code == 0, result.output
     path = persist_mod.supervisor_state_path(queue)
+    with pytest.raises(OSError) as unread:
+        load_state(state_path_for(queue, "n[x]:b:"))
     assert result.stdout == (
-        "eligible: 0 (0 can start now, 0 waiting for the account their session runs on)\n"
-        "held, deferred_cooldown: 1\n"
+        "eligible: 1 (1 can start now, 0 waiting for the account their session runs on)\n"
+        "  e[x]:b: (new; w[x]:b:)\n"
+        "held, deferred_cooldown: 2\n"
         "held, depends_on_missing: 1\n"
+        "held, depends_on_unmeetable: 1\n"
         "held, possibly_hung: 1\n"
         "completed: 0\n"
         "queue-wide cap: none\n"
         "selection runs every: 60 s\n"
-        f"parked worker: exited pid {gone} since {started.isoformat()}, exited (within its "
+        f"parked worker: p[x]:b: pid {gone} since {started.isoformat()}, exited (within its "
         "time limit)\n"
-        f"retries at {due.isoformat()}: hooked: {reason}\n"
-        "missing dependency: orphan needs [gone] (no task file in todo/, not completed or "
+        f"retries at {due.isoformat()}: r[x]:b:: {reason}\n"
+        "missing dependency: m[x]:b: needs [gone]:b: (no task file in todo/, not completed or "
         "running)\n"
+        "unmeetable dependency: u[x]:b: needs u[x]:b: (the task itself)\n"
+        f"state of n[x]:b: not read, so not detailed above: {unread.value}\n"
         f"supervisor.json not read, in-flight tasks unknown: {path}: invalid JSON: Expecting "
         "value: line 1 column 2 (char 1)\n"
     )
