@@ -573,14 +573,15 @@ if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
   echo
   echo "==> Deduping duplicate canonical headers in $UNION_FILE"
   "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global "$UNION_FILE" \
-    || die 5 "dedup_canonical_headers.py failed on $UNION_FILE"
+    || die 5 "dedup_canonical_headers.py failed on $UNION_FILE (exit 3: a duplicate needs a hand union, see above)"
   if ! git diff --quiet -- "$UNION_FILE"; then
     git add "$UNION_FILE"
     git commit -m "Dedup duplicate canonical headers in $UNION_FILE
 
 Two branches that each added the same brand-new ### CANONICAL block
 leave exact-duplicate H3 headings after the -X theirs bulk merge.
-Collapse each to a single entry, unioning example .R filenames." >/dev/null
+Collapse each to a single entry, carrying the dropped copies' example
+models and source aliases." >/dev/null
     echo "    committed canonical-header dedup"
   else
     echo "    no duplicate canonical headers."
@@ -606,7 +607,7 @@ for reg in "${REGISTER_FILES[@]:-}"; do
   echo
   echo "==> Deduping duplicate canonical headers in $reg (per-section)"
   "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$reg" \
-    || die 5 "dedup_canonical_headers.py failed on $reg"
+    || die 5 "dedup_canonical_headers.py failed on $reg (exit 3: a duplicate needs a hand union, see above)"
   if ! git diff --quiet -- "$reg"; then
     git add "$reg"
     git commit -m "Dedup duplicate canonical headers in $reg" >/dev/null
@@ -656,7 +657,7 @@ if (( ${#RESTORE_TARGETS[@]} )); then
   for rf in "${REGISTER_FILES[@]:-}"; do
     [[ -n "$rf" && -f "$rf" ]] || continue
     "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$rf" >/dev/null \
-      || die 5 "dedup_canonical_headers.py failed on $rf"
+      || die 5 "dedup_canonical_headers.py failed on $rf (exit 3: a duplicate needs a hand union, see above)"
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
       git commit -m "Dedup duplicate canonical headers in $rf" >/dev/null

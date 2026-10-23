@@ -223,9 +223,15 @@ exists to repair. Repair, then regenerate.
    (both branched from an older main, so `-X theirs` keeps one copy per
    branch). `verify_section_headers.py` only checks headers *survived*,
    not that they are *unique*, so these slip through (8 such pairs were
-   on origin/main on 2026-07-25). This step collapses each to one entry
-   (unioning example `.R` filenames) and then re-runs with `--check`;
-   any duplicate that survives **aborts the run**. `--global` (whole-file
+   on origin/main on 2026-07-25). This step collapses each to one entry,
+   carrying into the kept copy the dropped copies' example models it does
+   not name (each with its own annotation, or the bare filename) and their
+   source-alias sub-bullets, and then re-runs with `--check`; any duplicate
+   that survives **aborts the run**. Copies that differ in anything else
+   (the heading, Description, Role, Notes, ...) are two definitions of one
+   canonical: the script leaves them, prints `HAND UNION NEEDED` with the
+   fields, and exits 3, which also aborts the run. Merge such a pair by
+   hand and re-run. `--global` (whole-file
    uniqueness) is correct for the covariate register; the default
    per-`##`-section scope is what you'd use on `compartment-names.md`,
    where the same token is legitimately both a compartment and a suffix.

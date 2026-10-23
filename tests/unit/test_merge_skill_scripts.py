@@ -1490,7 +1490,7 @@ class TestDedupCanonicalHeaders:
 
 ### col (**canonical for colistin**)
 
-- **Example models:** `B_2021_col.R` (with a longer annotation), `A_2020_col.R` (merged from a duplicate register entry during merge dedup).
+- **Example models:** `B_2021_col.R` (with a longer annotation), `A_2020_col.R`.
 
 ## Metabolites
 
@@ -1500,7 +1500,8 @@ class TestDedupCanonicalHeaders:
 """
 
     def test_collapses_a_duplicate_within_a_section(self, tmp_path: Path) -> None:
-        """The longest block is kept and gains the other's example model.
+        """The longest block is kept and gains the other's example model,
+        which has no annotation, so it is carried as the bare filename.
 
         The ``col`` under Metabolites is legitimate reuse in another section
         and stays: that is the default, per-section scope.
@@ -1552,6 +1553,194 @@ class TestDedupCanonicalHeaders:
         assert (proc.returncode, proc.stdout) == (2, "")
         assert proc.stderr == f"ERROR: (dedup) no such file: {missing}\n"
         assert register.read_text() == self.DUPLICATED
+
+
+class TestDedupCarriesWhatOnlyTheDroppedCopyHas:
+    """Known-answer fixtures: what a dropped duplicate carries into the kept
+    one, in which form, and when the two copies need a person instead."""
+
+    @staticmethod
+    def _dedup(tmp_path: Path, text: str) -> tuple[subprocess.CompletedProcess[str], str]:
+        register = tmp_path / "covariate-columns.md"
+        register.write_text(text)
+        proc = run_helper("dedup_canonical_headers.py", "--global", register)
+        return proc, register.read_text()
+
+    def test_an_inline_entry_keeps_its_own_annotation(self, tmp_path: Path) -> None:
+        text = (
+            "## Body size\n\n"
+            "### WT (**canonical for weight**)\n"
+            "- **Description:** Body weight.\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n"
+            "- **Example models:** `A_2020_a.R` (allometric on CL, `(WT/70)^0.75`), "
+            "`B_2021_b.R` (on V).\n\n"
+            "### WT (**canonical for weight**)\n"
+            "- **Description:** Body weight.\n"
+            "- **Example models:** `A_2020_a.R` (allometric), `C_2022_c.R` (power, "
+            "`exp(0.5 * log(WT / 70))`), `D_2023_d.R`.\n"
+        )
+        proc, out = self._dedup(tmp_path, text)
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert out == (
+            "## Body size\n\n"
+            "### WT (**canonical for weight**)\n"
+            "- **Description:** Body weight.\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n"
+            "- **Example models:** `A_2020_a.R` (allometric on CL, `(WT/70)^0.75`), "
+            "`B_2021_b.R` (on V), `C_2022_c.R` (power, `exp(0.5 * log(WT / 70))`), "
+            "`D_2023_d.R`.\n"
+        )
+        assert "merge dedup" not in out
+
+    def test_an_empty_list_style_line_gets_sub_bullets(self, tmp_path: Path) -> None:
+        """The label alone, with nothing after it: entries go under it as
+        sub-bullets, not after the label as ", `X.R`"."""
+        text = (
+            "### pk (**canonical for a PK compartment**)\n"
+            "- **Role:** state\n"
+            "- **Example models:**\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n\n"
+            "### pk (**canonical for a PK compartment**)\n"
+            "- **Role:** state\n"
+            "- **Example models:** `E_2024_e.R` (two-compartment).\n"
+        )
+        proc, out = self._dedup(tmp_path, text)
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert out == (
+            "### pk (**canonical for a PK compartment**)\n"
+            "- **Role:** state\n"
+            "- **Example models:**\n"
+            "  - `E_2024_e.R` (two-compartment)\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n"
+        )
+
+    def test_list_and_inline_forms_meet(self, tmp_path: Path) -> None:
+        """A list-style keeper gains sub-bullets; an inline keeper gains a
+        list entry as ``(text)``."""
+        listed = (
+            "### Z (**canonical for z**)\n"
+            "- **Example models:**\n"
+            "  - `A_2020_a.R` -- first, with a long description of the model.\n\n"
+            "### Z (**canonical for z**)\n"
+            "- **Example models:** `B_2021_b.R` (second).\n"
+        )
+        proc, out = self._dedup(tmp_path, listed)
+        assert proc.returncode == 0
+        assert out == (
+            "### Z (**canonical for z**)\n"
+            "- **Example models:**\n"
+            "  - `A_2020_a.R` -- first, with a long description of the model.\n"
+            "  - `B_2021_b.R` (second)\n"
+        )
+
+        inline = (
+            "### Y (**canonical for y**)\n"
+            "- **Example models:** `A_2020_a.R` (first, with a long description of the model).\n\n"
+            "### Y (**canonical for y**)\n"
+            "- **Example models:**\n"
+            "  - `B_2021_b.R` -- second.\n"
+        )
+        proc, out = self._dedup(tmp_path, inline)
+        assert proc.returncode == 0
+        assert out == (
+            "### Y (**canonical for y**)\n"
+            "- **Example models:** `A_2020_a.R` (first, with a long description of the model), "
+            "`B_2021_b.R` (second).\n"
+        )
+
+    def test_source_alias_sub_bullets_are_unioned(self, tmp_path: Path) -> None:
+        text = (
+            "### SEX (**canonical for sex**)\n"
+            "- **Source aliases:**\n"
+            "  - `GENDER` -- used in `A_2020_a.R`, which codes 1 = female and 0 = male.\n"
+            "- **Example models:** `A_2020_a.R`.\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n\n"
+            "### SEX (**canonical for sex**)\n"
+            "- **Source aliases:**\n"
+            "  - `GENDER` -- used in `A_2020_a.R`, which codes 1 = female and 0 = male.\n"
+            "  - `MALE` -- inverted; used in `B_2021_b.R`.\n"
+            "- **Example models:** `B_2021_b.R`.\n"
+        )
+        proc, out = self._dedup(tmp_path, text)
+        assert proc.returncode == 0
+        assert proc.stdout.endswith(
+            "  SEX: 2 -> 1  (+examples ['B_2021_b.R']; +1 source alias(es))\n"
+        )
+        assert out == (
+            "### SEX (**canonical for sex**)\n"
+            "- **Source aliases:**\n"
+            "  - `GENDER` -- used in `A_2020_a.R`, which codes 1 = female and 0 = male.\n"
+            "  - `MALE` -- inverted; used in `B_2021_b.R`.\n"
+            "- **Example models:** `A_2020_a.R`, `B_2021_b.R`.\n"
+            "- **Notes:** Only this copy has notes, which makes it the longest, the one kept.\n"
+        )
+
+    @pytest.mark.parametrize(
+        ("kept", "dropped", "fields"),
+        [
+            ("- **Notes:** First note, the longer one.", "- **Notes:** Other note.", "Notes"),
+            ("- **Role:** state, the longer one.", "- **Role:** output", "Role"),
+            ("- **Units:** kg, the longer one.", "", None),
+        ],
+        ids=["notes", "role", "keeper-only-field"],
+    )
+    def test_prose_that_differs_is_left_for_a_hand_union(
+        self, tmp_path: Path, kept: str, dropped: str, fields: str | None
+    ) -> None:
+        """Nothing is discarded silently: a group whose dropped copy says
+        something the keeper words differently is left whole, reported, and
+        exit 3; the other group in the file is still collapsed. A field only
+        the keeper has loses nothing, so that group collapses."""
+        group = (
+            "### Q (**canonical for q**)\n"
+            f"{kept}\n"
+            "- **Example models:** `A_2020_a.R`.\n\n"
+            "### Q (**canonical for q**)\n"
+            + (f"{dropped}\n" if dropped else "")
+            + "- **Example models:** `B_2021_b.R`.\n\n"
+        )
+        other = (
+            "### R (**canonical for r**)\n"
+            "- **Example models:** `C_2022_c.R`.\n\n"
+            "### R (**canonical for r**)\n"
+            "- **Example models:** `D_2023_d.R`.\n"
+        )
+        proc, out = self._dedup(tmp_path, group + other)
+        register = tmp_path / "covariate-columns.md"
+        collapsed_other = (
+            "### R (**canonical for r**)\n- **Example models:** `C_2022_c.R`, `D_2023_d.R`.\n"
+        )
+        if fields is None:
+            assert (proc.returncode, proc.stderr) == (0, "")
+            assert out == (
+                "### Q (**canonical for q**)\n"
+                f"{kept}\n"
+                "- **Example models:** `A_2020_a.R`, `B_2021_b.R`.\n\n" + collapsed_other
+            )
+            return
+        assert proc.returncode == 3
+        assert proc.stderr == (
+            f"# HAND UNION NEEDED in {register}: ### Q (lines [1, 5]): the copies differ in "
+            f"{fields}; left as they are, merge them by hand\n"
+        )
+        assert out == group + collapsed_other
+        check = run_helper("dedup_canonical_headers.py", "--global", "--check", register)
+        assert check.returncode == 1
+
+    def test_a_different_heading_is_two_meanings(self, tmp_path: Path) -> None:
+        text = (
+            "### col (**canonical for colistin**)\n"
+            "- **Example models:** `A_2020_a.R`.\n\n"
+            "### col (**canonical for colestipol**)\n"
+            "- **Example models:** `B_2021_b.R`.\n"
+        )
+        proc, out = self._dedup(tmp_path, text)
+        register = tmp_path / "covariate-columns.md"
+        assert (proc.returncode, out) == (3, text)
+        assert proc.stderr == (
+            f"# HAND UNION NEEDED in {register}: ### col (lines [1, 4]): the copies differ in "
+            "heading; left as they are, merge them by hand\n"
+        )
 
 
 class TestVerifyVignettesParallel:
