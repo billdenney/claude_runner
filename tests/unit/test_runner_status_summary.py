@@ -693,6 +693,89 @@ def test_tasks_that_need_the_operator(
     )
 
 
+def test_tasks_whose_dependency_does_not_exist(
+    queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
+) -> None:
+    """A task whose depends_on names a task that does not exist can never
+    start, unlike one waiting for a task that does: it needs the operator,
+    and the summary names each such task with the ids it is missing."""
+    _two_accounts(queue, tmp_path)
+    _tasks(queue, depends=1)
+    add_task(queue, "orphan-a", depends_on=["115-pouzin_2022_tusamitamab"])
+    add_task(
+        queue,
+        "orphan-b",
+        depends_on=["never-finishes", "122-yao_2018_guselkumab", "129-ng_2009_clozapine"],
+    )
+    supervisor()
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: taking tasks, 0 of 5 slots in use", "work: taking tasks, 0 of 3 slots in use"
+        )
+        + f"- **How many can run:** {EIGHT} Right now 0 running, with room for 8 more.\n"
+        "- **Tasks:** 1 waits for another task to finish; 2 wait for a task that does not "
+        "exist; 0 finished.\n"
+        + NO_QUESTIONS
+        + _attention(
+            "2 tasks wait for tasks that do not exist, so they can never start (orphan-a needs "
+            "115-pouzin_2022_tusamitamab; orphan-b needs 122-yao_2018_guselkumab, "
+            "129-ng_2009_clozapine). The depends_on of each names a task id that has no task "
+            "file in todo/ and no state file: fix the depends_on in each task file, or add the "
+            "missing tasks to todo/."
+        )
+        + _info("No task can start right now: every unfinished task is held, as Tasks shows.")
+    )
+
+
+def test_one_task_whose_dependency_does_not_exist_and_the_details(
+    queue: Path, bin_dir: Path
+) -> None:
+    """One such task is worded in the singular; the details list every
+    task held for a missing dependency, not only the first few."""
+    rows = [{"task_id": f"orphan-{i}", "missing": [f"gone-{i}"]} for i in range(5)]
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"depends_on_missing": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "missing_dependencies": rows[:1],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    assert (
+        "- 1 task waits for a task that does not exist, so it can never start (orphan-0 needs "
+        "gone-0). Its depends_on names a task id that has no task file in todo/ and no state "
+        "file: fix the depends_on in its task file, or add the missing task to todo/.\n"
+    ) in _summary(queue, bin_dir)
+
+    holds["held"] = {"depends_on_missing": 5}
+    holds["todo_tasks"] = 5
+    holds["missing_dependencies"] = rows
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    summary = proc.stdout.partition("### Details\n")[0]
+    assert (
+        "(orphan-0 needs gone-0; orphan-1 needs gone-1; orphan-2 needs gone-2; and 2 more)"
+    ) in summary
+    _, _, details = proc.stdout.partition("**What holds the tasks**")
+    section = details.split("\n**Queue counts**")[0]
+    assert section.endswith(
+        "| depends_on_missing | 5 |\n"
+        "| completed | 0 |\n"
+        "| todo/ tasks (total) | 5 |\n\n"
+        "_Counted under depends_on_missing, each naming in its depends_on a task id that has no "
+        "task file in todo/ and no state file:_\n\n"
+        "| task | missing dependencies |\n"
+        "|---|---|\n"
+        "| orphan-0 | gone-0 |\n"
+        "| orphan-1 | gone-1 |\n"
+        "| orphan-2 | gone-2 |\n"
+        "| orphan-3 | gone-3 |\n"
+        "| orphan-4 | gone-4 |\n"
+    ), section
+
+
 def test_nothing_running_although_tasks_can_start(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:
