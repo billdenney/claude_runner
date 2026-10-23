@@ -44,6 +44,7 @@ from ._mixed_queue import (
     MIXED_EXPECTED_MISSING,
     NOW,
     STALE_HOLDS,
+    add_ring,
     add_state,
     add_task,
     build_mixed_queue,
@@ -166,11 +167,12 @@ def test_every_task_lands_in_one_place(mixed: Path) -> None:
                     {
                         "id": "status-failed_circuit_breaker",
                         "cause": "failed_circuit_breaker",
-                        "cycle": [],
+                        "cycle": None,
                     }
                 ],
             }
         ],
+        "dependency_cycles": [],
         "unread_states": [],
         "supervisor_json_error": None,
     }
@@ -493,19 +495,47 @@ def test_unmeetable_dependencies_json_and_text(queue: Path) -> None:
         {
             "task_id": "a",
             "unmeetable": [
-                {"id": "broken", "cause": "failed_circuit_breaker", "cycle": []},
-                {"id": "a", "cause": "self", "cycle": []},
-                {"id": "b", "cause": "cycle", "cycle": ["a", "b"]},
+                {"id": "broken", "cause": "failed_circuit_breaker", "cycle": None},
+                {"id": "a", "cause": "self", "cycle": None},
+                {"id": "b", "cause": "cycle", "cycle": 0},
             ],
         },
-        {"task_id": "b", "unmeetable": [{"id": "a", "cause": "cycle", "cycle": ["a", "b"]}]},
+        {"task_id": "b", "unmeetable": [{"id": "a", "cause": "cycle", "cycle": 0}]},
     ]
+    assert holds["dependency_cycles"] == [["a", "b"]]
     text = invoke_cli(["queue", "holds", "--queue", str(queue)]).stdout
     assert text.splitlines()[-2:] == [
         "unmeetable dependency: a needs broken (failed_circuit_breaker); a (the task itself); "
         "b (in a dependency cycle among a, b)",
         "unmeetable dependency: b needs a (in a dependency cycle among a, b)",
     ]
+
+
+def test_a_long_cycle_is_listed_once(queue: Path) -> None:
+    """A 1,000-task ring: its tasks are listed once in dependency_cycles,
+    each held task points at it, and each text line names three of its
+    tasks, so neither output grows with the square of its length."""
+    _config(queue)
+    n = 1000
+    ids = add_ring(queue, n)
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue), "--json"])
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)]).stdout
+
+    holds = json.loads(result.stdout)
+    assert holds["dependency_cycles"] == [ids]
+    assert holds["unmeetable_dependencies"][:2] == [
+        {"task_id": "r0000", "unmeetable": [{"id": "r0001", "cause": "cycle", "cycle": 0}]},
+        {"task_id": "r0001", "unmeetable": [{"id": "r0002", "cause": "cycle", "cycle": 0}]},
+    ]
+    assert len(holds["unmeetable_dependencies"]) == n
+    assert len(result.stdout) < 400 * n
+    lines = [line for line in text.splitlines() if line.startswith("unmeetable dependency:")]
+    assert len(lines) == n
+    assert lines[-1] == (
+        "unmeetable dependency: r0999 needs r0000 (in a dependency cycle among r0000, r0001, "
+        "r0002 and 997 more)"
+    )
 
 
 def test_text_output_of_the_detail_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

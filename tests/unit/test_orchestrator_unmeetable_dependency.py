@@ -39,7 +39,7 @@ from claude_task_runner.runner.orchestrator import (
     _state_task_ids,
 )
 
-from ._mixed_queue import add_state, add_task, forbid_selector_writes
+from ._mixed_queue import add_ring, add_state, add_task, forbid_selector_writes
 
 DEFAULT_LEVELS: dict[str, list[str]] = load_defaults()["effort_levels"]
 ORCHESTRATOR_LOGGER = "claude_task_runner.runner.orchestrator"
@@ -102,6 +102,17 @@ def _task(task_id: str, *depends_on: str) -> Task:
     return Task(id=task_id, title=task_id, prompt="p", depends_on=list(depends_on))
 
 
+def _members(tasks: list[Task], may_finish: set[str]) -> dict[str, tuple[str, ...]]:
+    """:func:`_dependency_cycles` as each task's cycle's sorted members,
+    checking that the members of a cycle share one cycle object whose
+    membership set holds the same tasks."""
+    cycles = _dependency_cycles(tasks, may_finish)
+    for cycle in {id(c): c for c in cycles.values()}.values():
+        assert cycle.ids == frozenset(cycle.members)
+        assert all(cycles[m] is cycle for m in cycle.members)
+    return {task_id: cycle.members for task_id, cycle in cycles.items()}
+
+
 # ---------------------------------------------------------------------------
 # _dependency_cycles
 # ---------------------------------------------------------------------------
@@ -120,7 +131,7 @@ def test_cycles_of_one_two_and_three_tasks() -> None:
         _task("chain-b"),
     ]
 
-    assert _dependency_cycles(tasks, set()) == {
+    assert _members(tasks, set()) == {
         "self": ("self",),
         "p": ("p", "q"),
         "q": ("p", "q"),
@@ -142,14 +153,14 @@ def test_a_cycle_with_a_tail_and_two_loops_sharing_a_task() -> None:
     ]
 
     cycle = ("a", "b", "hub")
-    assert _dependency_cycles(tasks, set()) == {"a": cycle, "b": cycle, "hub": cycle}
+    assert _members(tasks, set()) == {"a": cycle, "b": cycle, "hub": cycle}
 
 
 def test_a_completed_task_breaks_the_cycle() -> None:
     """Depending on a completed task is met, so no path runs through it."""
     tasks = [_task("p", "q"), _task("q", "p"), _task("s", "s")]
 
-    assert _dependency_cycles(tasks, {"q", "s"}) == {}
+    assert _members(tasks, {"q", "s"}) == {}
 
 
 def test_a_member_a_worker_may_finish_breaks_the_cycle(queue_dir: Path) -> None:
@@ -168,7 +179,7 @@ def test_dependencies_outside_the_tasks_are_ignored() -> None:
     node of the graph."""
     tasks = [_task("p", "ghost", "q"), _task("q", "p", "ghost")]
 
-    assert _dependency_cycles(tasks, set()) == {"p": ("p", "q"), "q": ("p", "q")}
+    assert _members(tasks, set()) == {"p": ("p", "q"), "q": ("p", "q")}
 
 
 def test_a_long_chain_and_a_long_ring_stay_iterative_and_linear() -> None:
@@ -179,12 +190,50 @@ def test_a_long_chain_and_a_long_ring_stay_iterative_and_linear() -> None:
     ring = [_task(f"r{i:05d}", f"r{(i + 1) % n:05d}") for i in range(n)]
 
     started = time.perf_counter()
-    cycles = _dependency_cycles(chain + ring, set())
+    cycles = _members(chain + ring, set())
     elapsed = time.perf_counter() - started
 
     ring_ids = tuple(sorted(t.id for t in ring))
     assert cycles == dict.fromkeys(ring_ids, ring_ids)
     assert elapsed < 5.0
+
+
+@pytest.mark.parametrize(
+    ("cycle", "described"),
+    [
+        (("a", "b"), "b (in a dependency cycle among a, b)"),
+        (("a", "b", "c"), "b (in a dependency cycle among a, b, c)"),
+        (("a", "b", "c", "d"), "b (in a dependency cycle among a, b, c and 1 more)"),
+        (tuple(f"t{i:04d}" for i in range(1000)), None),
+    ],
+    ids=["two", "three", "four", "a-thousand"],
+)
+def test_a_cycle_is_described_by_its_first_three_tasks(
+    cycle: tuple[str, ...], described: str | None
+) -> None:
+    if described is None:
+        described = "b (in a dependency cycle among t0000, t0001, t0002 and 997 more)"
+    assert UnmeetableDependency("b", "cycle", cycle).describe() == described
+
+
+def test_a_long_rings_reasons_stay_short(queue_dir: Path) -> None:
+    """Every task of a 1,000-task ring is held, and each reason names three
+    of its tasks and how many more, not all of them."""
+    n = 1000
+    add_ring(queue_dir, n)
+
+    _eligible, skips, unmeetable = _select(queue_dir, read_only=True)
+
+    assert skips == Counter({"depends_on_unmeetable": n})
+    reasons = {
+        task_id: orchestrator_mod._unmeetable_dependency_reason(deps)
+        for task_id, deps in unmeetable.items()
+    }
+    assert reasons["r0999"] == (
+        "unmeetable dependency: depends_on names r0000 (in a dependency cycle among r0000, "
+        "r0001, r0002 and 997 more)"
+    )
+    assert max(len(reason) for reason in reasons.values()) == len(reasons["r0999"])
 
 
 # ---------------------------------------------------------------------------

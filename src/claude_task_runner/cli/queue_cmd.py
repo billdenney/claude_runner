@@ -462,7 +462,10 @@ def holds(
     ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
     with its ``unmeetable`` dependencies in ``depends_on`` order, each an
     ``id``, a ``cause`` (``self``, ``cycle`` or ``failed_circuit_breaker``)
-    and, for ``cycle``, the ``cycle``'s tasks, sorted (else empty).
+    and, for ``cycle``, the index of its cycle in ``dependency_cycles``
+    (else ``null``). ``dependency_cycles`` lists each such cycle once,
+    every task of it, sorted, so the output grows with the queue, not with
+    the square of a cycle's length.
 
     \b
     Exit codes:
@@ -492,6 +495,7 @@ def holds(
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
     missing = sorted(preview.missing_dependencies.items())
     unmeetable = sorted(preview.unmeetable_dependencies.items())
+    cycles, cycle_index = _dependency_cycles_json(unmeetable)
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -514,11 +518,17 @@ def holds(
             {
                 "task_id": t,
                 "unmeetable": [
-                    {"id": u.id, "cause": u.cause, "cycle": list(u.cycle)} for u in deps
+                    {
+                        "id": u.id,
+                        "cause": u.cause,
+                        "cycle": cycle_index[u.cycle[0]] if u.cause == "cycle" else None,
+                    }
+                    for u in deps
                 ],
             }
             for t, deps in unmeetable
         ],
+        "dependency_cycles": cycles,
         "unread_states": unread,
         "supervisor_json_error": snapshot_error,
     }
@@ -594,6 +604,22 @@ def holds(
             highlight=False,
             emoji=False,
         )
+
+
+def _dependency_cycles_json(
+    unmeetable: list[tuple[str, list[orch_mod.UnmeetableDependency]]],
+) -> tuple[list[list[str]], dict[str, int]]:
+    """Each dependency cycle in ``unmeetable`` once, in order of first
+    appearance, and its index by its first task. Cycles share no task, so
+    the first (smallest) task names one."""
+    cycles: list[list[str]] = []
+    index: dict[str, int] = {}
+    for _task_id, deps in unmeetable:
+        for u in deps:
+            if u.cause == "cycle" and u.cycle[0] not in index:
+                index[u.cycle[0]] = len(cycles)
+                cycles.append(list(u.cycle))
+    return cycles, index
 
 
 def _held_states(

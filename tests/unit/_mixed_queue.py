@@ -40,6 +40,21 @@ def add_task(qd: Path, task_id: str, **fields: Any) -> Task:
     return task
 
 
+def add_ring(qd: Path, n: int) -> list[str]:
+    """``n`` tasks ``r0000``, ``r0001``, ... each depending on the next, the
+    last on the first: one dependency cycle. The files are written plainly,
+    without :func:`add_task`'s fsync per file, so a long ring is quick to
+    build. Returns the ids in order."""
+    ids = [f"r{i:04d}" for i in range(n)]
+    for i, task_id in enumerate(ids):
+        (todo_dir(qd) / f"{task_id}.yaml").write_text(
+            f"schema_version: 2\nid: {task_id}\ntitle: {task_id}\nprompt: p\n"
+            f"depends_on: [{ids[(i + 1) % n]}]\n",
+            encoding="utf-8",
+        )
+    return ids
+
+
 def add_state(qd: Path, task_id: str, status: str, **fields: Any) -> None:
     state = TaskState.model_validate({"task_id": task_id, "status": status, **fields})
     write_state_atomic(state, state_path_for(qd, task_id))

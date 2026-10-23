@@ -393,7 +393,8 @@ or recent failures), follow the prioritized triage flow below.
        waiting, and both need the operator: `missing_dependencies` lists
        each missing task with its `missing` ids, `unmeetable_dependencies`
        each unmeetable one with its `unmeetable` dependencies and their
-       `cause`. If tasks can start and
+       `cause`, a cycle's by its index in `dependency_cycles`, which lists
+       every task of each cycle once. If tasks can start and
        an account has room but nothing runs, look in the supervisor's log
        for `dispatch skipped task` lines. The snapshot's **Last idle
        report** is the supervisor's own `no eligible tasks:` line, which is

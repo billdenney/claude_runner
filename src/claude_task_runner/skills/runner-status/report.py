@@ -839,28 +839,44 @@ def _unmeetable_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[s
     """``queue holds``' ``unmeetable_dependencies``: each task held
     ``depends_on_unmeetable``, with each dependency that cannot finish
     worded with its cause."""
+    cycles = [c for c in holds.get("dependency_cycles") or [] if isinstance(c, list)]
     rows = []
     for r in holds.get("unmeetable_dependencies") or []:
         if not isinstance(r, dict):
             continue
         task_id = str(r.get("task_id"))
         deps = [
-            _unmeetable_words(task_id, u) for u in r.get("unmeetable") or [] if isinstance(u, dict)
+            _unmeetable_words(task_id, u, cycles)
+            for u in r.get("unmeetable") or []
+            if isinstance(u, dict)
         ]
         rows.append((task_id, deps))
     return rows
 
 
-def _unmeetable_words(task_id: str, dep: dict[str, Any]) -> str:
-    """One dependency that cannot finish, with why, in plain words."""
+def _unmeetable_words(task_id: str, dep: dict[str, Any], cycles: list[list[Any]]) -> str:
+    """One dependency that cannot finish, with why, in plain words. A loop
+    is named by the task and the first others in it, up to :data:`LISTED`,
+    and how many more there are."""
     dep_id = str(dep.get("id"))
     cause = dep.get("cause")
     if cause == "self":
         return "itself"
-    if cause == "cycle":
-        members = [task_id, *(str(m) for m in dep.get("cycle") or [] if str(m) != task_id)]
-        joined = " and ".join([", ".join(members[:-1]), members[-1]])
-        return f"{dep_id} (in a loop where {joined} wait on one another)"
+    index = dep.get("cycle")
+    if cause == "cycle" and isinstance(index, int) and 0 <= index < len(cycles):
+        cycle = cycles[index]
+        named = [task_id]
+        for member in cycle:
+            if len(named) == LISTED:
+                break
+            if str(member) != task_id:
+                named.append(str(member))
+        more = len(cycle) - len(named)
+        if more > 0:
+            who = f"{', '.join(named)} and {more} more"
+        else:
+            who = f"{', '.join(named[:-1])} and {named[-1]}"
+        return f"{dep_id} (in a loop where {who} wait on one another)"
     if cause == "failed_circuit_breaker":
         return f"{dep_id} (stopped after repeated failures)"
     return f"{dep_id} ({cause})"

@@ -1192,6 +1192,11 @@ def _is_missing_dependency_reason(reason: str | None) -> bool:
 UnmeetableCause = Literal["self", "cycle", "failed_circuit_breaker"]
 
 
+_CYCLE_TASKS_NAMED = 3
+"""How many of a cycle's tasks a reason names before it says how many more,
+so that a reason stays short however long the cycle."""
+
+
 class UnmeetableDependency(NamedTuple):
     """A ``depends_on`` id that exists but cannot complete while nothing
     changes (ADR-0036): the task itself (``self``), another task in a
@@ -1201,14 +1206,20 @@ class UnmeetableDependency(NamedTuple):
     id: str
     cause: UnmeetableCause
     cycle: tuple[str, ...] = ()
-    """For ``cycle``, every task in the cycle, sorted; empty otherwise."""
+    """For ``cycle``, every task in the cycle, sorted; empty otherwise.
+    Every member's dependencies share the one tuple."""
 
     def describe(self) -> str:
-        """The id and its cause, as the hold's reason and ``queue holds`` print it."""
+        """The id and its cause, as the hold's reason and ``queue holds`` print
+        it: a cycle by its first :data:`_CYCLE_TASKS_NAMED` tasks."""
         if self.cause == "self":
             return f"{self.id} (the task itself)"
         if self.cause == "cycle":
-            return f"{self.id} (in a dependency cycle among {', '.join(self.cycle)})"
+            named = ", ".join(self.cycle[:_CYCLE_TASKS_NAMED])
+            more = len(self.cycle) - _CYCLE_TASKS_NAMED
+            if more > 0:
+                named += f" and {more} more"
+            return f"{self.id} (in a dependency cycle among {named})"
         return f"{self.id} (failed_circuit_breaker)"
 
 
@@ -1227,15 +1238,21 @@ class _DependencyView:
     """Ids of the tasks that exist (see :func:`_skip_category`)."""
     circuit_broken: Collection[str]
     """Ids whose state is ``failed_circuit_breaker``."""
-    cycles: dict[str, tuple[str, ...]]
-    """For each task in a dependency cycle, the cycle's members, sorted
-    (:func:`_dependency_cycles`)."""
+    cycles: dict[str, _Cycle]
+    """For each task in a dependency cycle, the cycle (:func:`_dependency_cycles`)."""
 
 
-def _dependency_cycles(
-    tasks: Sequence[Task], may_finish: Collection[str]
-) -> dict[str, tuple[str, ...]]:
-    """For each task in a dependency cycle, the cycle's members, sorted.
+class _Cycle(NamedTuple):
+    """One dependency cycle, shared by all its tasks."""
+
+    members: tuple[str, ...]
+    """Its tasks, sorted."""
+    ids: frozenset[str]
+    """The same tasks, to test membership in constant time."""
+
+
+def _dependency_cycles(tasks: Sequence[Task], may_finish: Collection[str]) -> dict[str, _Cycle]:
+    """For each task in a dependency cycle, the cycle, one object per cycle.
 
     ``may_finish`` are the tasks that have completed or may complete
     whatever they depend on: completed ones, and ones a worker may be
@@ -1256,7 +1273,7 @@ def _dependency_cycles(
     low: dict[str, int] = {}
     stack: list[str] = []
     on_stack: set[str] = set()
-    cycles: dict[str, tuple[str, ...]] = {}
+    cycles: dict[str, _Cycle] = {}
     for root in graph:
         if root in index:
             continue
@@ -1292,7 +1309,7 @@ def _dependency_cycles(
                 if member == node:
                     break
             if len(members) > 1 or node in deps:
-                cycle = tuple(sorted(members))
+                cycle = _Cycle(tuple(sorted(members)), frozenset(members))
                 for member in members:
                     cycles[member] = cycle
     return cycles
@@ -1301,13 +1318,13 @@ def _dependency_cycles(
 def _unmeetable_dependencies(task: Task, view: _DependencyView) -> list[UnmeetableDependency]:
     """The ids in ``task.depends_on`` that exist but cannot complete, each
     once, in the order ``depends_on`` lists them."""
-    cycle = view.cycles.get(task.id, ())
+    cycle = view.cycles.get(task.id)
     out: list[UnmeetableDependency] = []
     for dep in dict.fromkeys(task.depends_on):
         if dep == task.id:
             out.append(UnmeetableDependency(dep, "self"))
-        elif dep in cycle:
-            out.append(UnmeetableDependency(dep, "cycle", cycle))
+        elif cycle is not None and dep in cycle.ids:
+            out.append(UnmeetableDependency(dep, "cycle", cycle.members))
         elif dep in view.circuit_broken:
             out.append(UnmeetableDependency(dep, "failed_circuit_breaker"))
     return out

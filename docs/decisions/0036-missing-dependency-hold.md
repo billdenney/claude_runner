@@ -129,14 +129,19 @@ None of these completes while nothing changes, so each is now held as a new
 category, `depends_on_unmeetable`, by the same mechanism as a missing
 dependency: parked `deferred` with `unmeetable dependency: depends_on names
 <id> (<why>); ...`, where `<why>` is `the task itself`, `in a dependency
-cycle among <every task of the cycle, sorted>` or `failed_circuit_breaker`;
+cycle among <the cycle's first three tasks, sorted> [and N more]` or
+`failed_circuit_breaker`;
 one WARNING per transition; un-parked the first tick after the depends_on
 is fixed, the cycle broken or the stopped task reset, and only from a hold
 with that prefix; nothing written or logged by a read-only selection.
 `queue holds --json` lists each such task under `unmeetable_dependencies`,
 each dependency with its `id`, `cause` (`self`, `cycle`,
-`failed_circuit_breaker`) and the cycle's tasks, and `/runner-status`
-lists them under "Not normal right now".
+`failed_circuit_breaker`) and, for a cycle, the index of its cycle in
+`dependency_cycles`, which lists every task of each cycle once; and
+`/runner-status` lists them under "Not normal right now". A reason, the
+WARNING, the text output and the status report name a cycle by three of its
+tasks and how many more, so that none of them, nor the JSON, grows with the
+square of a cycle's length.
 
 The cycles are found once per selector pass, not per task: the selector
 reads every task YAML before classifying any (it read each once anyway),

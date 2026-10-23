@@ -784,8 +784,8 @@ def test_one_task_whose_dependency_cannot_finish_and_the_details(
         {
             "task_id": "solo",
             "unmeetable": [
-                {"id": "solo", "cause": "self", "cycle": []},
-                {"id": "pair", "cause": "cycle", "cycle": ["pair", "solo"]},
+                {"id": "solo", "cause": "self", "cycle": None},
+                {"id": "pair", "cause": "cycle", "cycle": 0},
             ],
         }
     ]
@@ -795,6 +795,7 @@ def test_one_task_whose_dependency_cannot_finish_and_the_details(
         "completed": 0,
         "todo_tasks": 1,
         "unmeetable_dependencies": rows,
+        "dependency_cycles": [["pair", "solo"]],
     }
     _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
     proc = _run(queue, bin_dir)
@@ -816,6 +817,27 @@ def test_one_task_whose_dependency_cannot_finish_and_the_details(
         "|---|---|\n"
         "| solo | itself; pair (in a loop where solo and pair wait on one another) |\n"
     ), section
+
+
+def test_a_long_loop_is_named_by_three_of_its_tasks(queue: Path, bin_dir: Path) -> None:
+    """The task itself first, then the first others, and how many more."""
+    ids = [f"r{i:04d}" for i in range(1000)]
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"depends_on_unmeetable": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "unmeetable_dependencies": [
+            {"task_id": "r0500", "unmeetable": [{"id": "r0501", "cause": "cycle", "cycle": 0}]}
+        ],
+        "dependency_cycles": [ids],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    proc = _run(queue, bin_dir)
+    words = "r0501 (in a loop where r0500, r0000, r0001 and 997 more wait on one another)"
+    summary, _, details = proc.stdout.partition("### Details\n")
+    assert f"(r0500 needs {words})" in summary
+    assert f"| r0500 | {words} |\n" in details
 
 
 def test_one_task_whose_dependency_does_not_exist_and_the_details(

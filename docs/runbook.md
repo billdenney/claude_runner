@@ -424,7 +424,9 @@ task that does not run.
    - `unmeetable dependency:` — the task's `depends_on` names a task that
      exists but cannot complete while nothing changes (ADR-0036): the task
      itself (`(the task itself)`), a task in a dependency cycle with it
-     (`(in a dependency cycle among a, b, ...)`, every task of the cycle),
+     (`(in a dependency cycle among a, b, c and 4 more)`, the cycle's first
+     three tasks and how many more; `queue holds --json` lists them all
+     under `dependency_cycles`),
      or a task stopped by its circuit breaker (`(failed_circuit_breaker)`).
      The supervisor log has a WARNING from when the task was parked. Drop
      the task's own id from its `depends_on`, break the cycle by removing
