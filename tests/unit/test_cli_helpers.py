@@ -211,7 +211,7 @@ class TestLiteral:
         ids=["None", "int", "float", "Path", "exception", "tuple", "markup"],
     )
     def test_any_other_part_is_its_str_unstyled(self, part: object, text: str) -> None:
-        """A 2-tuple ending in a str was once taken for a (value, style) pair."""
+        """Only a ``Text`` part carries a style: a 2-tuple ending in a str is a value."""
         line = literal("> ", part)
         assert (line.plain, line.spans) == (f"> {text}", [])
 
