@@ -15,11 +15,21 @@ inside a ``Text``, built with :func:`claude_task_runner.cli._helpers.literal`
 This gate reads the source: each argument rendered must be a string
 constant, a ``Text`` line, a conditional expression choosing between such,
 or printed with markup and emoji off. A console is any name holding
-``console``, bound to ``Console(...)`` or annotated ``Console``; a name
-bound to its ``print`` or ``log``, or imported as Rich's ``print``, prints
-too. :data:`ALLOWLIST` may name a printed expression proven to
-hold no free text; it must stay exact. The tests at the bottom show the
-gate fails on each way a site can be reintroduced.
+``console``, bound to ``Console(...)`` (``Console`` imported under any
+name) or annotated ``Console``; a name or attribute bound to its ``print``
+or ``log`` (``self.say = console.print``), or Rich's ``print`` imported
+under any name, prints too. :data:`ALLOWLIST` may name a printed expression
+proven to hold no free text; it must stay exact. The tests at the bottom
+show the gate fails on each way a site can be reintroduced.
+
+It reads one module at a time, by name, and does not follow values. It
+does not see a console's ``log``, ``input``, ``rule`` or ``status`` on a
+parameter neither named for a console nor annotated ``Console`` (its
+``print`` it does see, on any receiver), a method reached through
+``functools.partial``, ``getattr`` or a container, or Rich renderables it
+does not list (``Panel``, ``Table(title=...)``, ``Status.update``,
+``Progress`` descriptions). None is used in the package; a new use needs
+the gate extended, or a test of its own.
 """
 
 from __future__ import annotations
@@ -95,21 +105,27 @@ def _name(node: ast.expr) -> str | None:
     return None
 
 
-def _is_console_type(node: ast.expr | None) -> bool:
-    return node is not None and _name(node) == "Console"
+def _console_types(tree: ast.AST) -> set[str]:
+    """``Console``, and each name ``tree`` imports it as."""
+    out = {"Console"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "rich.console":
+            out |= {a.asname for a in node.names if a.name == "Console" and a.asname}
+    return out
 
 
 def _consoles(tree: ast.AST) -> set[str]:
     """Names in ``tree`` bound to a ``Console(...)`` or annotated ``Console``."""
+    types = _console_types(tree)
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-            if _is_console_type(node.value.func):
+            if _name(node.value.func) in types:
                 out |= {n for t in node.targets if (n := _name(t)) is not None}
-        elif isinstance(node, ast.AnnAssign) and _is_console_type(node.annotation):
+        elif isinstance(node, ast.AnnAssign) and _name(node.annotation) in types:
             if (n := _name(node.target)) is not None:
                 out.add(n)
-        elif isinstance(node, ast.arg) and _is_console_type(node.annotation):
+        elif isinstance(node, ast.arg) and node.annotation and _name(node.annotation) in types:
             out.add(node.arg)
     return out
 
@@ -128,15 +144,27 @@ def _print_method(node: ast.expr, consoles: set[str]) -> bool:
     return _is_console(node.value, consoles)
 
 
+def _callee(node: ast.expr) -> str | None:
+    """What a call is made through: ``say`` for ``say(...)``, ``self.say``
+    for ``self.say(...)``."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and (receiver := _name(node.value)) is not None:
+        return f"{receiver}.{node.attr}"
+    return None
+
+
 def _print_names(tree: ast.AST, consoles: set[str]) -> set[str]:
-    """Bare names that print with markup: Rich's ``print`` imported with
-    ``from rich import print``, and aliases such as ``p = console.print``."""
+    """Callees (see :func:`_callee`) that print with markup: Rich's ``print``
+    imported with ``from rich import print``, and names or attributes bound
+    to a console's ``print`` or ``log`` (``say = console.print``,
+    ``self.say = console.print``)."""
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "rich":
             out |= {a.asname or a.name for a in node.names if a.name == "print"}
         elif isinstance(node, ast.Assign) and _print_method(node.value, consoles):
-            out |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            out |= {c for t in node.targets if (c := _callee(t)) is not None}
     return out
 
 
@@ -148,9 +176,9 @@ def _first(call: ast.Call, keywords: tuple[str, ...]) -> list[ast.expr]:
 def _rendered(call: ast.Call, consoles: set[str], print_names: set[str]) -> list[ast.expr] | None:
     """What ``call`` hands Rich to render as markup; ``None`` when it renders nothing."""
     func = call.func
+    if _callee(func) in print_names:
+        return call.args
     if isinstance(func, ast.Name):
-        if func.id in print_names:
-            return call.args
         if func.id in PROMPT_CLASSES:
             return _first(call, ("prompt",))
         return None
@@ -296,6 +324,17 @@ def test_the_gate_flags_every_other_renderer() -> None:
         "cli/x.py:21: literal(msg) if ok else msg",
     ]
     assert findings("from rich import print\nprint(msg)\n", "cli/y.py") == ["cli/y.py:2: msg"]
+    renamed = (
+        "from rich.console import Console as C\n"
+        "out = C()\n"
+        "out.log(msg)\n"
+        "class Shown:\n"
+        "    def __init__(self, console):\n"
+        "        self.say = console.print\n"
+        "    def show(self, msg):\n"
+        "        self.say(msg)\n"
+    )
+    assert findings(renamed, "cli/z.py") == ["cli/z.py:3: msg", "cli/z.py:8: msg"]
 
 
 def test_the_gate_passes_constants_lines_and_plain_prints() -> None:
