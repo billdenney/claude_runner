@@ -40,6 +40,21 @@ def add_task(qd: Path, task_id: str, **fields: Any) -> Task:
     return task
 
 
+def add_ring(qd: Path, n: int) -> list[str]:
+    """``n`` tasks ``r0000``, ``r0001``, ... each depending on the next, the
+    last on the first: one dependency cycle. The files are written plainly,
+    without :func:`add_task`'s fsync per file, so a long ring is quick to
+    build. Returns the ids in order."""
+    ids = [f"r{i:04d}" for i in range(n)]
+    for i, task_id in enumerate(ids):
+        (todo_dir(qd) / f"{task_id}.yaml").write_text(
+            f"schema_version: 2\nid: {task_id}\ntitle: {task_id}\nprompt: p\n"
+            f"depends_on: [{ids[(i + 1) % n]}]\n",
+            encoding="utf-8",
+        )
+    return ids
+
+
 def add_state(qd: Path, task_id: str, status: str, **fields: Any) -> None:
     state = TaskState.model_validate({"task_id": task_id, "status": status, **fields})
     write_state_atomic(state, state_path_for(qd, task_id))
@@ -51,7 +66,9 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     that has cleared. ``missing_file`` is an absolute path that does not exist,
     so two copies of this queue write identical readiness reasons. The task
     ``inflight`` is in flight only for a caller that says so. The cooldowns
-    are a year either side of :data:`NOW`, so a real clock sees the same."""
+    are a year either side of :data:`NOW`, the time every caller must select
+    at: a caller selecting at the wall clock would see ``cooldown`` become
+    eligible once ``NOW`` is a year past."""
     (todo_dir(qd) / "broken.yaml").write_text("not: valid: yaml: [\n", encoding="utf-8")
 
     # block_dispatch row; the second id's task is completed, so it counts
@@ -96,6 +113,8 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
     # that names no task at all is held apart, even beside an unfinished one.
     add_task(qd, "waits-on-upstream", depends_on=["status-running"])
     add_task(qd, "names-a-missing-task", depends_on=["status-running", "no-such-task"])
+    # depends_on_unmeetable: a dependency that exists but cannot complete.
+    add_task(qd, "waits-on-broken", depends_on=["status-failed_circuit_breaker"])
 
     add_task(qd, "needs-file", requires=[{"kind": "file", "path": str(missing_file)}])
 
@@ -159,6 +178,7 @@ MIXED_EXPECTED_SKIPS = Counter(
         "invalid_effort": 1,
         "depends_on": 1,
         "depends_on_missing": 1,
+        "depends_on_unmeetable": 1,
         "readiness_missing_file": 1,
         "readiness_awaiting_sidecar_response": 1,
         "readiness_awaiting_sidecar_response+missing_file": 1,
@@ -174,6 +194,14 @@ MIXED_EXPECTED_ELIGIBLE = [
 ]
 MIXED_EXPECTED_MISSING = {"names-a-missing-task": ["no-such-task"]}
 """The ``depends_on_missing`` task and the dependency it names that no task has."""
+MIXED_EXPECTED_UNMEETABLE = {
+    "waits-on-broken": [
+        orchestrator_mod.UnmeetableDependency(
+            "status-failed_circuit_breaker", "failed_circuit_breaker"
+        )
+    ]
+}
+"""The ``depends_on_unmeetable`` task and the circuit-broken task it names."""
 STALE_HOLDS = ("effort-fixed", "file-arrived")
 """The eligible tasks whose state still carries a gate's cleared hold."""
 

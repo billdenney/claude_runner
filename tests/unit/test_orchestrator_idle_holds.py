@@ -56,6 +56,7 @@ from ._mixed_queue import (
     MIXED_EXPECTED_ELIGIBLE,
     MIXED_EXPECTED_MISSING,
     MIXED_EXPECTED_SKIPS,
+    MIXED_EXPECTED_UNMEETABLE,
     NOW,
     STALE_HOLDS,
     add_state,
@@ -125,7 +126,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
     eligible = _select(queue_dir, skips)
 
     n_yamls = len(list(todo_dir(queue_dir).glob("*.yaml")))
-    assert n_yamls == 23
+    assert n_yamls == 24
     assert len(eligible) + sum(skips.values()) == n_yamls
 
 
@@ -220,6 +221,7 @@ def test_preview_is_the_selector_without_its_side_effects(
     assert [t.id for t in preview.eligible] == ticked_ids == MIXED_EXPECTED_ELIGIBLE
     assert preview.skips == skips == MIXED_EXPECTED_SKIPS
     assert preview.missing_dependencies == MIXED_EXPECTED_MISSING
+    assert preview.unmeetable_dependencies == MIXED_EXPECTED_UNMEETABLE
     assert preview.eligible_statuses == {
         "cooldown-over": "deferred",
         "effort-fixed": "deferred",
@@ -466,6 +468,39 @@ def test_a_missing_dependency_has_its_own_count_and_one_warning(
         (
             logging.INFO,
             "no eligible tasks: 2 unfinished held (depends_on 1, depends_on_missing 1)",
+        )
+    ]
+
+
+def test_an_unmeetable_dependency_has_its_own_count_and_one_warning(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, no_spawn: None
+) -> None:
+    """Through real ticks: a dependency cycle is counted apart from a task
+    waiting for one of its members, and each member is warned about once."""
+    caplog.set_level(logging.INFO, logger=ORCHESTRATOR_LOGGER)
+    idle_log = IdleDispatchLog()
+    add_task(queue_dir, "a", depends_on=["b"])
+    add_task(queue_dir, "b", depends_on=["a"])
+    add_task(queue_dir, "after", depends_on=["a"])
+
+    for _ in range(3):
+        _tick(queue_dir, idle_log)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == ORCHESTRATOR_LOGGER and r.levelno == logging.WARNING
+    ]
+    assert warnings == [
+        f"parking task {t} as deferred: unmeetable dependency: depends_on names {d} (in a "
+        "dependency cycle among a, b). To release it, remove one depends_on entry along the "
+        "cycle"
+        for t, d in (("a", "b"), ("b", "a"))
+    ]
+    assert _idle_lines(caplog) == [
+        (
+            logging.INFO,
+            "no eligible tasks: 3 unfinished held (depends_on_unmeetable 2, depends_on 1)",
         )
     ]
 

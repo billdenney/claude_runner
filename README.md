@@ -70,8 +70,11 @@ pre-commit install
 ```
 
 Each subsequent `git commit` runs the same ruff lint / ruff format / yaml /
-toml hooks that CI runs, plus a "no large binaries" guard. If a hook auto-
-fixes something it aborts the commit; re-stage and try again:
+toml hooks and `mypy src` that CI runs, plus a "no large binaries" guard.
+The mypy hook (`scripts/run_mypy.sh`) uses the mypy in the checkout's `.venv`
+or, from a linked worktree, the main checkout's, else the one on `PATH`, so
+no virtualenv needs activating. If a hook auto-fixes something it aborts
+the commit; re-stage and try again:
 
 ```sh
 git add -u && git commit

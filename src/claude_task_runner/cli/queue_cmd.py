@@ -307,8 +307,8 @@ def _print_deferral(console: Console, state: dict[str, object]) -> None:
     prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
     the earliest time the supervisor tries the task again. Of the runner's
     own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
-    readiness hold (ADR-0030), an effort hold (ADR-0010) and a
-    missing-dependency hold (ADR-0036) do not, because their gate
+    readiness hold (ADR-0030), an effort hold (ADR-0010) and a missing- or
+    unmeetable-dependency hold (ADR-0036) do not, because their gate
     re-checks the task on every tick.
 
     Printed as written: Rich markup would drop the ``[effort_levels]`` in
@@ -430,13 +430,16 @@ def holds(
     Every task YAML in ``todo/`` lands in exactly one place: ``eligible``
     (it starts as soon as an account has a free slot), ``held`` under the
     category that holds it (``block_dispatch``, ``depends_on``,
-    ``depends_on_missing``, ``unanswered_sidecar``,
-    ``readiness_missing_file``, ``in_flight``, a status such as
-    ``possibly_hung``, ...), or ``completed``. ``depends_on`` waits for a
-    dependency that has not completed; ``depends_on_missing`` names one
-    with no task file in ``todo/`` that is not completed or running, so
-    the task does not start until its ``depends_on`` is fixed or that task
-    is created.
+    ``depends_on_missing``, ``depends_on_unmeetable``,
+    ``unanswered_sidecar``, ``readiness_missing_file``, ``in_flight``, a
+    status such as ``possibly_hung``, ...), or ``completed``.
+    ``depends_on`` waits for a dependency that has not completed;
+    ``depends_on_missing`` names one with no task file in ``todo/`` that
+    is not completed or running, so the task does not start until its
+    ``depends_on`` is fixed or that task is created;
+    ``depends_on_unmeetable`` names one that exists but cannot complete:
+    the task itself, a task in a dependency cycle with it, or a
+    ``failed_circuit_breaker`` task.
     Of the eligible, ``can_start_now`` have an account that takes them now, and
     ``waiting_for_their_account`` are held to the account their session
     runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
@@ -444,7 +447,7 @@ def holds(
     selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
     (the warm-up cap while ``warming_up``), ``null`` when there is none.
 
-    Three holds carry their tasks' details. ``parked_workers``: the
+    Four holds carry their tasks' details. ``parked_workers``: the
     ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
     ``worker_still_running``), each with its ``pid``, ``started_at``,
     whether it is still ``running``, its ``duration_cap_s`` (0: none) and
@@ -456,6 +459,13 @@ def holds(
     ``unread_states`` with the error.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
     the ``missing`` ids in its ``depends_on``, in the order it lists them.
+    ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
+    with its ``unmeetable`` dependencies in ``depends_on`` order, each an
+    ``id``, a ``cause`` (``self``, ``cycle`` or ``failed_circuit_breaker``)
+    and, for ``cycle``, the index of its cycle in ``dependency_cycles``
+    (else ``null``). ``dependency_cycles`` lists each such cycle once,
+    every task of it, sorted, so the output grows with the queue, not with
+    the square of a cycle's length.
 
     \b
     Exit codes:
@@ -473,17 +483,19 @@ def holds(
         snapshot = persist_mod.load(state_path)
     except persist_mod.SupervisorPersistenceError as exc:
         snapshot, snapshot_error = None, str(exc)
-    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=RealClock().now())
+    now = RealClock().now()
+    preview = orch_mod.preview_selection(qd, settings, snapshot=snapshot, now=now)
     held = {k: n for k, n in sorted(preview.skips.items()) if k != "completed"}
     by_status: dict[str, int] = {}
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
     can_start_now = sum(1 for account in preview.routes.values() if account is not None)
-    now = RealClock().now()
     unread: list[dict[str, str]] = []
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
     missing = sorted(preview.missing_dependencies.items())
+    unmeetable = sorted(preview.unmeetable_dependencies.items())
+    cycles, cycle_index = _dependency_cycles_json(unmeetable)
     payload: dict[str, object] = {
         "eligible": {
             "count": len(preview.eligible),
@@ -502,12 +514,30 @@ def holds(
         "parked_workers": parked,
         "retrying": retrying,
         "missing_dependencies": [{"task_id": t, "missing": ids} for t, ids in missing],
+        "unmeetable_dependencies": [
+            {
+                "task_id": t,
+                "unmeetable": [
+                    {
+                        "id": u.id,
+                        "cause": u.cause,
+                        "cycle": cycle_index[u.cycle[0]] if u.cause == "cycle" else None,
+                    }
+                    for u in deps
+                ],
+            }
+            for t, deps in unmeetable
+        ],
+        "dependency_cycles": cycles,
         "unread_states": unread,
         "supervisor_json_error": snapshot_error,
     }
     if json:
         print(_json.dumps(payload, indent=2))
         return
+    # Labels are Rich markup; every task id, reason and error is escaped and
+    # printed without emoji codes, so a "[/]" in a hook's stderr or a ":b:"
+    # in a path prints as written.
     console.print(
         f"[bold]eligible:[/] {len(preview.eligible)} ({can_start_now} can start now, "
         f"{len(preview.affinity_held)} waiting for the account their session runs on)",
@@ -516,7 +546,9 @@ def holds(
     for task in preview.eligible:
         route = preview.routes[task.id] or "no account now"
         console.print(
-            f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})", highlight=False
+            f"  {escape(task.id)} ({preview.eligible_statuses[task.id]}; {escape(route)})",
+            highlight=False,
+            emoji=False,
         )
     for category, n in held.items():
         console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
@@ -532,22 +564,31 @@ def holds(
         cap = "past its time limit" if worker["past_cap"] else "within its time limit"
         state = "still running" if worker["running"] else "exited"
         console.print(
-            f"[bold]parked worker:[/] {worker['task_id']} pid {worker['pid']} since "
-            f"{worker['started_at']}, {state} ({cap})",
+            f"[bold]parked worker:[/] {escape(str(worker['task_id']))} pid {worker['pid']} "
+            f"since {worker['started_at']}, {state} ({cap})",
             highlight=False,
+            emoji=False,
         )
     for item in retrying:
         console.print(
-            f"[bold]retries at {item['next_eligible_at']}:[/] {item['task_id']}: "
-            f"{item['deferred_reason']}",
+            f"[bold]retries at {item['next_eligible_at']}:[/] {escape(str(item['task_id']))}: "
+            f"{escape(str(item['deferred_reason']))}",
             highlight=False,
-            markup=False,
+            emoji=False,
         )
     for task_id, ids in missing:
         console.print(
             f"[bold]missing dependency:[/] {escape(task_id)} needs {escape(', '.join(ids))} "
             "(no task file in todo/, not completed or running)",
             highlight=False,
+            emoji=False,
+        )
+    for task_id, deps in unmeetable:
+        console.print(
+            f"[bold]unmeetable dependency:[/] {escape(task_id)} needs "
+            f"{escape('; '.join(u.describe() for u in deps))}",
+            highlight=False,
+            emoji=False,
         )
     for note in unread:
         console.print(
@@ -555,12 +596,30 @@ def holds(
             style="yellow",
             highlight=False,
             markup=False,
+            emoji=False,
         )
     if snapshot_error:
         console.print(
-            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {snapshot_error}",
+            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {escape(snapshot_error)}",
             highlight=False,
+            emoji=False,
         )
+
+
+def _dependency_cycles_json(
+    unmeetable: list[tuple[str, list[orch_mod.UnmeetableDependency]]],
+) -> tuple[list[list[str]], dict[str, int]]:
+    """Each dependency cycle in ``unmeetable`` once, in order of first
+    appearance, and its index by its first task. Cycles share no task, so
+    the first (smallest) task names one."""
+    cycles: list[list[str]] = []
+    index: dict[str, int] = {}
+    for _task_id, deps in unmeetable:
+        for u in deps:
+            if u.cause == "cycle" and u.cycle[0] not in index:
+                index[u.cycle[0]] = len(cycles)
+                cycles.append(list(u.cycle))
+    return cycles, index
 
 
 def _held_states(

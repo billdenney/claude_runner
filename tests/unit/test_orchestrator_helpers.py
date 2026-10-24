@@ -193,13 +193,13 @@ def test_has_any_completed_skips_unparseable(queue_dir: Path) -> None:
 
 
 def test_state_task_ids_empty(queue_dir: Path) -> None:
-    assert _state_task_ids(queue_dir) == (set(), set())
+    assert _state_task_ids(queue_dir) == (set(), set(), set())
 
 
 def test_state_task_ids_sorts_every_status(queue_dir: Path) -> None:
-    """Completed tasks, and tasks a worker may still complete; a task in
-    any other status runs again only from its todo/ YAML, so it is in
-    neither set."""
+    """Completed tasks, tasks a worker may still complete, and
+    circuit-broken ones; a task in any other status runs again only from
+    its todo/ YAML, so it is in none of the sets."""
     _seed_state(queue_dir, "t1", "completed")
     _seed_state(queue_dir, "t2", "completed")
     _seed_state(queue_dir, "t3", "running")
@@ -216,6 +216,7 @@ def test_state_task_ids_sorts_every_status(queue_dir: Path) -> None:
     ids = _state_task_ids(queue_dir)
     assert ids.completed == {"t1", "t2"}
     assert ids.may_complete == {"t3", "t4"}
+    assert ids.circuit_broken == {"other-failed_circuit_breaker"}
 
 
 def test_state_task_ids_counts_an_unparseable_state_as_may_complete(
@@ -231,6 +232,7 @@ def test_state_task_ids_counts_an_unparseable_state_as_may_complete(
     ids = _state_task_ids(queue_dir)
     assert ids.completed == {"good"}
     assert ids.may_complete == {"bad"}
+    assert ids.circuit_broken == set()
 
 
 # ---------------------------------------------------------------------------

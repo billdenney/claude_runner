@@ -11,6 +11,7 @@ state writer and leaves every state file as it was.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 from collections.abc import Callable, Iterator
@@ -19,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from claude_task_runner.cli import queue_cmd as queue_cmd_mod
+from claude_task_runner.clock import FakeClock
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
@@ -39,7 +42,9 @@ from ._concurrency_fixtures import invoke_cli, write_account_cap
 from ._mixed_queue import (
     BLOCK_FILE,
     MIXED_EXPECTED_MISSING,
+    NOW,
     STALE_HOLDS,
+    add_ring,
     add_state,
     add_task,
     build_mixed_queue,
@@ -54,6 +59,7 @@ HELD = {
     "deferred_cooldown": 1,
     "depends_on": 1,
     "depends_on_missing": 1,
+    "depends_on_unmeetable": 1,
     "failed_circuit_breaker": 1,
     "in_flight": 1,
     "invalid_effort": 1,
@@ -105,10 +111,20 @@ def _states(queue: Path) -> dict[str, bytes]:
     return {p.name: p.read_bytes() for p in state_path_for(queue, "x").parent.glob("*.yaml")}
 
 
-def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
+@pytest.fixture
+def mixed(queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``queue`` holding the mixed queue, with the command's clock at the
+    queue's :data:`NOW`: its cooldowns are set from ``NOW``, so the command
+    must select at that time, whatever day the test runs."""
+    build_mixed_queue(queue, tmp_path / "absent.md")
+    monkeypatch.setattr(queue_cmd_mod, "RealClock", lambda: FakeClock(NOW))
+    return queue
+
+
+def test_every_task_lands_in_one_place(mixed: Path) -> None:
     """supervisor.json records no account state, so no account can take a
     task yet (a cold start): every eligible task waits for a slot."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
     _in_flight(queue, "inflight")
 
@@ -128,7 +144,7 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
         },
         "held": HELD,
         "completed": 2,
-        "todo_tasks": 23,
+        "todo_tasks": 24,
         "poll_interval_s": 60.0,
         "affinity_ttl_s": 5400.0,
         "queue_cap": None,
@@ -144,15 +160,28 @@ def test_every_task_lands_in_one_place(queue: Path, tmp_path: Path) -> None:
         "missing_dependencies": [
             {"task_id": "names-a-missing-task", "missing": ["no-such-task"]},
         ],
+        "unmeetable_dependencies": [
+            {
+                "task_id": "waits-on-broken",
+                "unmeetable": [
+                    {
+                        "id": "status-failed_circuit_breaker",
+                        "cause": "failed_circuit_breaker",
+                        "cycle": None,
+                    }
+                ],
+            }
+        ],
+        "dependency_cycles": [],
         "unread_states": [],
         "supervisor_json_error": None,
     }
 
 
-def test_missing_dependencies_match_the_selector(queue: Path, tmp_path: Path) -> None:
+def test_missing_dependencies_match_the_selector(mixed: Path) -> None:
     """``missing_dependencies`` is the selector's own record, one row per
     task held ``depends_on_missing``, so it cannot disagree with ``held``."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
 
     holds = _holds(queue)
@@ -180,11 +209,11 @@ def test_missing_dependencies_list_every_missing_id_in_depends_on_order(queue: P
     ]
 
 
-def test_writes_no_state_file(queue: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_writes_no_state_file(mixed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A supervisor tick would park needs-file and bad-effort as deferred
     and un-park the two stale holds; the command calls no state writer and
     leaves every state file as it was."""
-    build_mixed_queue(queue, tmp_path / "absent.md")
+    queue = mixed
     _config(queue)
     _in_flight(queue, "inflight")
     before = _states(queue)
@@ -447,6 +476,129 @@ def test_parked_workers_and_retry_reasons(
             "next_eligible_at": due.isoformat(),
         }
     ]
+
+
+def test_unmeetable_dependencies_json_and_text(queue: Path) -> None:
+    """Each held task with its unmeetable dependencies in depends_on order,
+    the cause of each and, for a cycle, its tasks; and one text line per
+    task."""
+    _config(queue)
+    add_task(queue, "broken")
+    add_state(queue, "broken", "failed_circuit_breaker")
+    add_task(queue, "a", depends_on=["broken", "a", "b"])
+    add_task(queue, "b", depends_on=["a"])
+
+    holds = _holds(queue)
+
+    assert holds["held"] == {"depends_on_unmeetable": 2, "failed_circuit_breaker": 1}
+    assert holds["unmeetable_dependencies"] == [
+        {
+            "task_id": "a",
+            "unmeetable": [
+                {"id": "broken", "cause": "failed_circuit_breaker", "cycle": None},
+                {"id": "a", "cause": "self", "cycle": None},
+                {"id": "b", "cause": "cycle", "cycle": 0},
+            ],
+        },
+        {"task_id": "b", "unmeetable": [{"id": "a", "cause": "cycle", "cycle": 0}]},
+    ]
+    assert holds["dependency_cycles"] == [["a", "b"]]
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)]).stdout
+    assert text.splitlines()[-2:] == [
+        "unmeetable dependency: a needs broken (failed_circuit_breaker); a (the task itself); "
+        "b (in a dependency cycle among a, b)",
+        "unmeetable dependency: b needs a (in a dependency cycle among a, b)",
+    ]
+
+
+def test_a_long_cycle_is_listed_once(queue: Path) -> None:
+    """A 1,000-task ring: its tasks are listed once in dependency_cycles,
+    each held task points at it, and each text line names three of its
+    tasks, so neither output grows with the square of its length."""
+    _config(queue)
+    n = 1000
+    ids = add_ring(queue, n)
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue), "--json"])
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)]).stdout
+
+    holds = json.loads(result.stdout)
+    assert holds["dependency_cycles"] == [ids]
+    assert holds["unmeetable_dependencies"][:2] == [
+        {"task_id": "r0000", "unmeetable": [{"id": "r0001", "cause": "cycle", "cycle": 0}]},
+        {"task_id": "r0001", "unmeetable": [{"id": "r0002", "cause": "cycle", "cycle": 0}]},
+    ]
+    assert len(holds["unmeetable_dependencies"]) == n
+    assert len(result.stdout) < 400 * n
+    lines = [line for line in text.splitlines() if line.startswith("unmeetable dependency:")]
+    assert len(lines) == n
+    assert lines[-1] == (
+        "unmeetable dependency: r0999 needs r0000 (in a dependency cycle among r0000, r0001, "
+        "r0002 and 997 more)"
+    )
+
+
+def test_text_output_of_the_detail_lines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each line's label renders as markup rather than as a literal
+    "[bold]...[/]", and everything a task file, a hook, the settings or the
+    file system supplies prints as written: brackets that read as markup
+    and ``:b:``, an emoji code, in every task id, the route, a reason, a
+    state's load error and supervisor.json's error. The queue's own path
+    carries both, so every path in an error does too. Account names cannot
+    hold either, so the route is set on the selection's result."""
+    queue = tmp_path / "q[x]:b:"
+    queue.mkdir()
+    queue_runtime_dir(queue)
+    todo_dir(queue)
+    _config(queue)
+    now = datetime.now(UTC).replace(microsecond=0)
+    started, due = now - timedelta(minutes=10), now + timedelta(minutes=15)
+    add_task(queue, "e[x]:b:")
+    add_task(queue, "p[x]:b:")
+    gone = _exited_pid()
+    _parked(queue, "p[x]:b:", gone, None, started)
+    reason = "pre-dispatch hook deferred (exit 1): see [effort_levels], [/] and /data/:b:/x"
+    for task_id in ("n[x]:b:", "r[x]:b:"):
+        add_task(queue, task_id)
+        add_state(queue, task_id, "deferred", deferred_reason=reason, next_eligible_at=due)
+    add_task(queue, "m[x]:b:", depends_on=["[gone]:b:"])
+    add_task(queue, "u[x]:b:", depends_on=["u[x]:b:"])
+    persist_mod.supervisor_state_path(queue).write_text("[bold]", encoding="utf-8")
+    real_preview = orch_mod.preview_selection
+
+    def hostile_route_then_unreadable(*args: object, **kwargs: object) -> orch_mod.SelectionPreview:
+        preview = real_preview(*args, **kwargs)  # type: ignore[arg-type]
+        state_path_for(queue, "n[x]:b:").unlink()
+        return dataclasses.replace(preview, routes={"e[x]:b:": "w[x]:b:"})
+
+    monkeypatch.setattr(orch_mod, "preview_selection", hostile_route_then_unreadable)
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue)])
+
+    assert result.exit_code == 0, result.output
+    path = persist_mod.supervisor_state_path(queue)
+    with pytest.raises(OSError) as unread:
+        load_state(state_path_for(queue, "n[x]:b:"))
+    assert result.stdout == (
+        "eligible: 1 (1 can start now, 0 waiting for the account their session runs on)\n"
+        "  e[x]:b: (new; w[x]:b:)\n"
+        "held, deferred_cooldown: 2\n"
+        "held, depends_on_missing: 1\n"
+        "held, depends_on_unmeetable: 1\n"
+        "held, possibly_hung: 1\n"
+        "completed: 0\n"
+        "queue-wide cap: none\n"
+        "selection runs every: 60 s\n"
+        f"parked worker: p[x]:b: pid {gone} since {started.isoformat()}, exited (within its "
+        "time limit)\n"
+        f"retries at {due.isoformat()}: r[x]:b:: {reason}\n"
+        "missing dependency: m[x]:b: needs [gone]:b: (no task file in todo/, not completed or "
+        "running)\n"
+        "unmeetable dependency: u[x]:b: needs u[x]:b: (the task itself)\n"
+        f"state of n[x]:b: not read, so not detailed above: {unread.value}\n"
+        f"supervisor.json not read, in-flight tasks unknown: {path}: invalid JSON: Expecting "
+        "value: line 1 column 2 (char 1)\n"
+    )
 
 
 def test_a_parked_worker_supervisor_json_lists_is_held_by_its_status(

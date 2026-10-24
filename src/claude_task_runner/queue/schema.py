@@ -231,7 +231,9 @@ class Task(_StrictBase):
     """Task ids that must be ``completed`` before this task dispatches. An id
     with no ``todo/<id>.yaml`` whose state is not completed or running can
     never complete: the supervisor parks the task ``deferred`` with a
-    WARNING until the id is fixed or that task is created (ADR-0036)."""
+    WARNING until the id is fixed or that task is created (ADR-0036). It
+    does the same for the task's own id, a task in a dependency cycle with
+    it and a ``failed_circuit_breaker`` task."""
     requires: list[ReadinessRequirement] = Field(default_factory=list)
     """Mechanical (no-AI, no-dispatch) preconditions the supervisor checks
     each tick before selecting this task — e.g. an input file that must

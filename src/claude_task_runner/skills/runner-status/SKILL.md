@@ -50,8 +50,8 @@ non-specialist can read in ten seconds, as five short lines:
   `todo/`: how many run, how many can start as soon as a slot is free
   (and how many of those were answered after asking), how many wait for
   your answer, a file, another task or a retry time, how many wait for a
-  task that does not exist, how many the block list holds, how many look
-  stuck or failed for good, how many finished.
+  task that does not exist or cannot finish, how many the block list
+  holds, how many look stuck or failed for good, how many finished.
 - **Questions for you**: the open sidecar questions, and notices to
   acknowledge.
 
@@ -60,7 +60,9 @@ operator, saying what it means and what to do (an account that cannot take
 tasks until a problem is fixed, a paused account, an expired login or an unreadable usage page, a
 binding queue-wide cap, tasks that look stuck, failed for good or cannot be
 read, tasks whose `depends_on` names a task that does not exist (each with
-the ids it is missing), tasks whose worker could not be started, an
+the ids it is missing) or that cannot finish (itself, a loop of tasks
+waiting on one another, a task stopped after repeated failures; each with
+why), tasks whose worker could not be started, an
 unwatched worker past its time limit while no supervisor runs to stop it,
 or one that exited unrecorded, unreadable sidecar requests,
 a supervisor that is down or stuck, an unreadable `supervisor.json` or
@@ -78,8 +80,9 @@ The facts come from the runner, not from re-reading its files:
 pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
 candidate selection run once, read-only, with the poll interval, the
-parked workers, why each task waiting for a retry time was deferred, and
-the missing dependency ids of each task held `depends_on_missing`) and
+parked workers, why each task waiting for a retry time was deferred, the
+missing dependency ids of each task held `depends_on_missing`, and the
+dependencies that cannot finish of each task held `depends_on_unmeetable`) and
 `claude-task-runner sidecar list --json`. The script passes the live
 supervisor's own `--config` to `account list` and `queue holds`
 (`sidecar list` reads no settings), resolving a relative path against the
@@ -125,8 +128,10 @@ with a line saying what it shows and defining its terms:
   ADR-0022 ramp while `slowing_down`, 0 while throttled, "—" when no
   decision has set one.
 - **What holds the tasks**: `queue holds`' counts per category, why the
-  tasks waiting for a retry time were deferred, the parked workers, and
-  every task held `depends_on_missing` with its missing dependency ids.
+  tasks waiting for a retry time were deferred, the parked workers, every
+  task held `depends_on_missing` with its missing dependency ids, and every
+  task held `depends_on_unmeetable` with its dependencies that cannot
+  finish and why.
 - **Queue counts**: a row for every task status across every state file,
   finished tasks included, one for any status the runner does not know,
   and one for files it could not read or that name no status (the rows
@@ -337,6 +342,16 @@ or recent failures), follow the prioritized triage flow below.
          created in `todo/`; the supervisor un-parks it at its next check.
          This needs the operator: list each task with the ids its reason
          names.
+       - `unmeetable dependency:` — the task's `depends_on` names a task
+         that exists but cannot complete: the task itself, a task in a
+         dependency cycle with it, or a `failed_circuit_breaker` task
+         (ADR-0036). It stays parked until the depends_on is fixed or the
+         cycle broken, or, for a stopped task, until its state file
+         (`.claude_task_runner/state/<id>.yaml`) is edited back to
+         `status: pending` once the cause of its failures is fixed: no
+         `queue` command resets a circuit breaker, and `queue
+         force-dispatch` refuses that status. This needs the operator:
+         list each task with the dependencies and causes its reason names.
        - `pre-dispatch hook deferred (exit 1)` — the queue's pre-dispatch
          hook asked to wait. The hook runs again once the task's
          `next_eligible_at` passes, which is `deferral_recheck_cooldown_s`
@@ -356,8 +371,8 @@ or recent failures), follow the prioritized triage flow below.
          "could not start its worker".
 
          Of the runner's own deferrals, these two set
-         `next_eligible_at`; the readiness, effort and missing-dependency
-         holds do not.
+         `next_eligible_at`; the readiness, effort, missing-dependency and
+         unmeetable-dependency holds do not.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,
@@ -373,12 +388,17 @@ or recent failures), follow the prioritized triage flow below.
        is open for dispatch, `queue holds --json` says why now: no task
        can start when `eligible.count` is 0 and `held` counts what holds
        the rest (`block_dispatch`, `readiness_missing_file`, `depends_on`,
-       `depends_on_missing`, `unanswered_sidecar`, a status name, ...).
-       `depends_on` waits for a task that exists and has not finished;
-       `depends_on_missing` names one with no task file in `todo/` that
-       is not completed or running, never clears by waiting, and needs
-       the operator: `missing_dependencies` lists each such task with its
-       `missing` ids. If tasks can start and
+       `depends_on_missing`, `depends_on_unmeetable`,
+       `unanswered_sidecar`, a status name, ...). `depends_on` waits for a
+       task that exists and has not finished; `depends_on_missing` names
+       one with no task file in `todo/` that is not completed or running,
+       and `depends_on_unmeetable` one that exists but cannot complete
+       (the task itself, a cycle, a circuit-broken task). Neither clears by
+       waiting, and both need the operator: `missing_dependencies` lists
+       each missing task with its `missing` ids, `unmeetable_dependencies`
+       each unmeetable one with its `unmeetable` dependencies and their
+       `cause`, a cycle's by its index in `dependency_cycles`, which lists
+       every task of each cycle once. If tasks can start and
        an account has room but nothing runs, look in the supervisor's log
        for `dispatch skipped task` lines. The snapshot's **Last idle
        report** is the supervisor's own `no eligible tasks:` line, which is

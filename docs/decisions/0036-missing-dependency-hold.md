@@ -114,3 +114,64 @@ parked with the `missing dependency: ` prefix would keep that stale reason
 until it next runs, but would not be held by it: a `deferred` state without
 `next_eligible_at` passes the status filter, and the selector's other
 checks decide.
+
+## Update (2026-10-23): dependencies that exist but cannot complete
+
+Three kinds of dependency still held their dependents silently under
+`depends_on`, though each has a task YAML in `todo/` and so exists:
+
+- the task's own id;
+- a task in a dependency cycle with it (A depends on B, B on A, or longer);
+- a task in `failed_circuit_breaker`, which the runner does not dispatch
+  again until an operator edits its state file back to `status: pending`
+  (no `queue` command resets a circuit breaker, and `queue force-dispatch`
+  refuses that status).
+
+None of these completes while nothing changes, so each is now held as a new
+category, `depends_on_unmeetable`, by the same mechanism as a missing
+dependency: parked `deferred` with `unmeetable dependency: depends_on names
+<id> (<why>); ...`, where `<why>` is `the task itself`, `in a dependency
+cycle among <the cycle's first three tasks, sorted> [and N more]` or
+`failed_circuit_breaker`;
+one WARNING per transition, which says what to do for each cause;
+un-parked the first tick after the depends_on is fixed, the cycle broken or
+the stopped task's state set back to `pending`, and only from a hold
+with that prefix; nothing written or logged by a read-only selection.
+`queue holds --json` lists each such task under `unmeetable_dependencies`,
+each dependency with its `id`, `cause` (`self`, `cycle`,
+`failed_circuit_breaker`) and, for a cycle, the index of its cycle in
+`dependency_cycles`, which lists every task of each cycle once; and
+`/runner-status` lists them under "Not normal right now". A reason, the
+WARNING, the text output and the status report name a cycle by three of its
+tasks and how many more, so that none of them, nor the JSON, grows with the
+square of a cycle's length.
+
+The cycles are found once per selector pass, not per task: the selector
+reads every task YAML before classifying any (it read each once anyway),
+and Tarjan's strongly connected components algorithm runs over the graph of
+the tasks and their dependencies on one another, in time linear in tasks
+plus dependencies, iteratively so a long chain cannot exhaust the recursion
+limit. A completed task, or one a worker may be running (`running`,
+`possibly_hung`, or an unreadable state), is no node: depending on it is
+met, or may yet be. The circuit-broken ids come from the one pass over the state
+files that already finds the completed ones. No directory is listed or file
+parsed beyond what each tick already did.
+
+Every task in a cycle is held, each naming the member it depends on. A task
+that only depends on a member of a cycle, or on any task held by its own
+gate, waits under `depends_on`: one WARNING per cause, and fixing that
+cause releases it. A missing dependency is reported before an unmeetable
+one, and an unmeetable one before an unfinished one.
+
+It is its own category rather than a second meaning of
+`depends_on_missing` because the fixes differ (fix an id or create a task;
+break a cycle or restart a stopped task), and because the details differ: a
+missing dependency is an id, an unmeetable one an id and a cause. Sharing
+the category would make `missing_dependencies` and its count mean two
+things, and the operator would have to read every reason to tell a typo
+from a loop.
+
+This replaces the consequence above that a `failed_circuit_breaker`
+dependency with its YAML in `todo/` holds its dependents under
+`depends_on`. A dependency whose own hold is reported (an unparseable YAML,
+an invalid effort, the block list) still holds its dependents there.
