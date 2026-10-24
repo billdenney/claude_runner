@@ -276,9 +276,12 @@ def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
     ) in out, out
 
 
-def test_a_canonical_two_branches_added_differently_names_the_other_copy(repo: Path) -> None:
-    """Both copies were lost; one is restored, and the other's text is printed
-    for a hand union instead of being skipped without a word."""
+def test_a_canonical_two_branches_added_differently_names_the_other_copy(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Both copies were lost; one is restored, and the other's text is printed,
+    and appended to the hand-union report, instead of being skipped without a
+    word."""
     make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "first")
     make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "second")
     git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")
@@ -313,6 +316,56 @@ def test_a_canonical_two_branches_added_differently_names_the_other_copy(repo: P
         "    ### TWICE (**canonical for TWICE**)\n"
         "    - **Type:** y, as the second branch words it\n"
     ) in out, out
+    report = tmp_path / "hand-union.md"
+    report.write_text("# Hand union needed in an earlier register\n")
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--branch",
+            "consolidation",
+            "--base",
+            "main",
+            "--file",
+            REGISTER,
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert "### TWICE (**canonical for TWICE**)\n- **Type:** x\n" in (repo / REGISTER).read_text()
+    assert report.read_text() == (
+        "# Hand union needed in an earlier register\n"
+        "# Hand union needed in refs.md\n"
+        "\n"
+        "Two merged branches added each canonical below in different words, and the\n"
+        "merge lost both. The restore put the first branch's copy back; the other is\n"
+        "below, verbatim. Union it into the register by hand, keeping each source's\n"
+        "attribution, and commit.\n"
+        "\n"
+        "## TWICE\n"
+        "\n"
+        "### claude/second's copy (the register has claude/first's)\n"
+        "\n"
+        "In the register:\n"
+        "\n"
+        "````\n"
+        "### TWICE (**canonical for TWICE**)\n"
+        "- **Type:** x\n"
+        "````\n"
+        "\n"
+        "In that copy:\n"
+        "\n"
+        "````\n"
+        "### TWICE (**canonical for TWICE**)\n"
+        "- **Type:** y, as the second branch words it\n"
+        "````\n"
+        "\n"
+    )
 
 
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:

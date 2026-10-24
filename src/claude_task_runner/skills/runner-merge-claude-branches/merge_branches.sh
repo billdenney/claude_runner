@@ -19,11 +19,13 @@
 #   7. R-side registry regeneration (buildModelDb + document)
 #   8. devtools::check pre-push gate
 #   9. Parallel vignette validation pre-push gate
-#  10. Push branch + print PR title/body. When a dedup collapsed copies of
-#      a canonical that were worded differently, the run stops first (exit
-#      9): the register keeps one wording, the others are in a hand-union
-#      report, and after the hand union is committed --finish pushes and
-#      prints the PR text from the same worktree.
+#  10. Push branch + print PR title/body. When a repair set wording aside
+#      (copies of a canonical worded differently, a model annotated two ways,
+#      a canonical two branches added in different words), the run stops
+#      first (exit 9): the register keeps one wording, the others are in a
+#      hand-union report, and after the hand union is committed --finish
+#      --hand-union-done pushes and prints the PR text from the same
+#      worktree. Every later failure names that report too.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -77,10 +79,17 @@
 #   --skip-push             Don't push the branch (steps 1-9 only).
 #   --finish                Only push the existing worktree's branch and print
 #                           the PR text: the way to complete a run that stopped
-#                           for a hand union (exit 9), once it is committed.
-#                           Takes the same --repo, --base and --branch-name;
-#                           refuses a worktree with uncommitted changes, and
-#                           checks again that no duplicate canonical remains.
+#                           for a hand union (exit 9), or failed a later gate,
+#                           once the fix is committed. Takes the same --repo,
+#                           --base, --branch-name, --union-file,
+#                           --register-file and --no-register-files as the run
+#                           (the stop message prints them); refuses a worktree
+#                           with uncommitted changes, checks again that no
+#                           duplicate canonical remains, and prints a pending
+#                           hand-union report and stops (exit 9) unless
+#                           --hand-union-done is given.
+#   --hand-union-done       With --finish: the report's wording is unioned into
+#                           the register and committed; push anyway.
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
 #                           Required when stdin is not a terminal, as in an
@@ -103,18 +112,22 @@
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
-#      script crashed, duplicate canonical headers survived dedup, the
+#      script crashed, duplicate canonical headers survived dedup (or a
+#      register on --base is missing from the worktree at --finish), the
 #      verifier could not run, the revert check found base content the merge
 #      reverted (or could not run), or the R registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
-#   9  a hand union is needed: duplicate canonical blocks worded differently
-#      were collapsed and every step but the push ran; the message names the
-#      worktree, the report of the wording the register lacks, and the
-#      --finish command to run once the hand union is committed
+#   9  a hand union is needed: a repair set wording aside and every step but
+#      the push ran; the message names the worktree, the report of the
+#      wording the register lacks, and the --finish command to run once the
+#      hand union is committed. --finish without --hand-union-done also
+#      exits 9 while that report holds anything.
 set -euo pipefail
 trap 'echo "ERROR: unexpected failure (exit $?) at line $LINENO" >&2; exit 1' ERR
+trap 'remind_hand_union $?' EXIT
+HAND_UNION_REPORT=""
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -142,6 +155,7 @@ VIGNETTE_JOBS=""
 VIGNETTE_TIMEOUT=900
 SKIP_PUSH=0
 FINISH=0
+HAND_UNION_DONE=0
 DRY_RUN=0
 ASSUME_YES=0
 EXTRA_REFS=()
@@ -165,28 +179,45 @@ need_value() {
   [[ $# -ge 2 ]] || die 2 "$1 needs a value"
 }
 
-run_dedup() {  # <register> [flags]: fix duplicates, their differing wording to the report
-  local file=$1 rc=0
-  shift
-  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$@" --report "$HAND_UNION_REPORT" "$file" \
-    || rc=$?
-  if (( rc == 3 )); then
-    die 5 "dedup_canonical_headers.py left a duplicate in $file for a hand union (see above)."
-  elif (( rc != 0 )); then
-    die 5 "dedup_canonical_headers.py crashed on $file (exit $rc); see its output above."
+remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
+  local rc=$1
+  if (( rc != 0 && rc != 9 )) && [[ -n "$HAND_UNION_REPORT" && -s "$HAND_UNION_REPORT" ]]; then
+    {
+      echo
+      echo "NOTE: a hand union is still pending. The wording the register lacks is in"
+      echo "    $HAND_UNION_REPORT"
+      echo "  Union it into the register and commit before the push; the report goes"
+      echo "  with the worktree (git worktree remove), so copy it elsewhere to keep it."
+    } >&2
   fi
 }
 
+run_dedup() {  # <register> [flags]: fix duplicates, their differing wording to the report
+  local file=$1 base_copy
+  shift
+  # The register as the base has it: of a canonical's copies, the dedup keeps
+  # the one the base has, so the merge reverts none of the base's wording.
+  base_copy="$(git rev-parse --path-format=absolute --git-path dedup-base-copy.md)"
+  git show "$BASE:$file" > "$base_copy" 2>/dev/null || : > "$base_copy"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$@" --report "$HAND_UNION_REPORT" \
+    --prefer "$base_copy" "$file" \
+    || die 5 "dedup_canonical_headers.py crashed on $file (exit $?); see its output above."
+}
+
 check_no_duplicates() {  # gate: no duplicate canonical remains in any register
-  local reg
-  if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
-    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global --check "$UNION_FILE" \
-      || die 5 "duplicate canonical headers remain in $UNION_FILE."
-  fi
-  for reg in "${REGISTER_FILES[@]:-}"; do
-    [[ -n "$reg" && -f "$reg" && "$reg" != "$UNION_FILE" ]] || continue
-    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$reg" \
-      || die 5 "duplicate canonicals remain in $reg."
+  local reg scope
+  for reg in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+    [[ -n "$reg" ]] || continue
+    scope=()
+    if [[ "$reg" == "$UNION_FILE" ]]; then scope=(--global); fi
+    if [[ -f "$reg" ]]; then
+      "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "${scope[@]}" --check "$reg" \
+        || die 5 "duplicate canonical headers remain in $reg."
+    elif git cat-file -e "$BASE:$reg" 2>/dev/null; then
+      die 5 "$reg is on $BASE but missing from the worktree; restore it before the push."
+    else
+      echo "    (duplicates) $reg is not in this repository; nothing to check."
+    fi
   done
 }
 
@@ -209,60 +240,61 @@ finish_command() {  # this run's --finish command line, every value shell-quoted
 stop_for_hand_union() {
   {
     echo
-    echo "STOP: duplicate canonical blocks were collapsed and every later step ran, but"
-    echo "  their copies were worded differently. The register keeps one copy's wording;"
-    echo "  each other copy's wording is in"
+    echo "STOP: every step but the push ran, but a repair set wording aside: copies of"
+    echo "  a canonical, or of a model's annotation, worded differently. The register"
+    echo "  keeps one wording; each other is in"
     echo "    $HAND_UNION_REPORT"
+    echo "  (it goes with the worktree, git worktree remove, so copy it to keep it)."
     echo "  1. In the worktree $WT_ABS, union that wording into the register"
     echo "     by hand, keeping each source's attribution, and commit."
     echo "  2. Then push the branch and print the PR text:"
-    echo "     $(finish_command)"
+    echo "     $(finish_command) --hand-union-done"
   } >&2
   exit 9
 }
 
 push_and_report() {  # push the branch (unless --skip-push) and print the PR text
-if (( SKIP_PUSH )); then
-  echo
-  echo "==> --skip-push set; skipping push."
-else
-  echo
-  echo "==> Pushing $BRANCH_NAME to origin"
-  if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
-    echo "ERROR: push failed." >&2
-    exit 7
+  if (( SKIP_PUSH )); then
+    echo
+    echo "==> --skip-push set; skipping push."
+  else
+    echo
+    echo "==> Pushing $BRANCH_NAME to origin"
+    if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
+      echo "ERROR: push failed." >&2
+      exit 7
+    fi
   fi
-fi
 
-# Print PR title + body.
-PR_TITLE_LIMIT=70
-NEW_MODELS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
-ASCII_FIXES=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
-OTHER_COMMITS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
+  # Print PR title + body.
+  PR_TITLE_LIMIT=70
+  NEW_MODELS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
+  ASCII_FIXES=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
+  OTHER_COMMITS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
 
-# Compose a short title.
-SUFFIX_BITS=()
-[[ "$NEW_MODELS" -gt 0 ]] && SUFFIX_BITS+=("$NEW_MODELS new models")
-[[ "$ASCII_FIXES" -gt 0 ]] && SUFFIX_BITS+=("$ASCII_FIXES ASCII fixes")
-PR_TITLE="Merge $SUCCESS claude/* branches"
-if [[ ${#SUFFIX_BITS[@]} -gt 0 ]]; then
-  PR_TITLE="$PR_TITLE ($(IFS=, ; echo "${SUFFIX_BITS[*]}"))"
-fi
+  # Compose a short title.
+  SUFFIX_BITS=()
+  [[ "$NEW_MODELS" -gt 0 ]] && SUFFIX_BITS+=("$NEW_MODELS new models")
+  [[ "$ASCII_FIXES" -gt 0 ]] && SUFFIX_BITS+=("$ASCII_FIXES ASCII fixes")
+  PR_TITLE="Merge $SUCCESS claude/* branches"
+  if [[ ${#SUFFIX_BITS[@]} -gt 0 ]]; then
+    PR_TITLE="$PR_TITLE ($(IFS=, ; echo "${SUFFIX_BITS[*]}"))"
+  fi
 
-# Trim title to limit.
-if (( ${#PR_TITLE} > PR_TITLE_LIMIT )); then
-  PR_TITLE="${PR_TITLE:0:$((PR_TITLE_LIMIT-1))}…"
-fi
+  # Trim title to limit.
+  if (( ${#PR_TITLE} > PR_TITLE_LIMIT )); then
+    PR_TITLE="${PR_TITLE:0:$((PR_TITLE_LIMIT-1))}…"
+  fi
 
-echo
-echo "================================================================"
-echo "Suggested PR title (≤${PR_TITLE_LIMIT} chars):"
-echo
-echo "$PR_TITLE"
-echo
-echo "Suggested PR body:"
-echo
-cat <<EOF
+  echo
+  echo "================================================================"
+  echo "Suggested PR title (≤${PR_TITLE_LIMIT} chars):"
+  echo
+  echo "$PR_TITLE"
+  echo
+  echo "Suggested PR body:"
+  echo
+  cat <<EOF
 ## Summary
 
 Consolidates $SUCCESS unmerged \`claude/<task-id>\` branches from the
@@ -315,17 +347,17 @@ source branches can then be deleted at the operator's discretion
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
-echo
-echo "================================================================"
-echo
-echo "Open the PR via:"
-echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
-echo
-echo "Worktree left at: $WT_ABS"
-echo
-echo "Source branches were folded in with real merges, so after this PR"
-echo "lands on main they show as \"Merged\" automatically (git branch"
-echo "--merged origin/main lists them). No post-merge advance step needed."
+  echo
+  echo "================================================================"
+  echo
+  echo "Open the PR via:"
+  echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
+  echo
+  echo "Worktree left at: $WT_ABS"
+  echo
+  echo "Source branches were folded in with real merges, so after this PR"
+  echo "lands on main they show as \"Merged\" automatically (git branch"
+  echo "--merged origin/main lists them). No post-merge advance step needed."
 }
 
 
@@ -353,6 +385,7 @@ while [[ $# -gt 0 ]]; do
     --vignette-timeout) need_value "$@"; VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
     --finish) FINISH=1; shift ;;
+    --hand-union-done) HAND_UNION_DONE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -394,7 +427,22 @@ if (( FINISH )); then
     || die 3 "--finish: $WT_ABS is not on branch $BRANCH_NAME."
   [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
     || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
+  HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
   echo "==> Finishing $BRANCH_NAME in $WT_ABS"
+  if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
+    {
+      cat "$HAND_UNION_REPORT"
+      echo
+      echo "STOP: the hand-union report above is not empty:"
+      echo "    $HAND_UNION_REPORT"
+      echo "  Union its wording into the register in $WT_ABS and commit, then run"
+      echo "     $(finish_command) --hand-union-done"
+    } >&2
+    exit 9
+  fi
+  if [[ -s "$HAND_UNION_REPORT" ]]; then
+    echo "    hand union confirmed (--hand-union-done); the report stays at $HAND_UNION_REPORT"
+  fi
   check_no_duplicates
   SUCCESS=$(git log --first-parent --format=%s "$BASE..HEAD" \
     | grep -c "^Merge branch '.*' into ${BRANCH_NAME}\$" || true)
@@ -564,6 +612,12 @@ WT_REL=".worktrees/${BRANCH_NAME}"
 WT_ABS="$REPO/$WT_REL"
 if [[ -d "$WT_ABS" ]]; then
   echo "ERROR: worktree already exists at $WT_ABS" >&2
+  pending="$(git -C "$WT_ABS" rev-parse --path-format=absolute --git-path hand-union-report.md 2>/dev/null || true)"
+  if [[ -n "$pending" && -s "$pending" ]]; then
+    echo "  It holds a hand-union report, which removing it deletes; finish that run" >&2
+    echo "  with --finish, or copy the report first:" >&2
+    echo "    $pending" >&2
+  fi
   echo "  Remove via:" >&2
   echo "    git -C $REPO worktree remove --force $WT_REL" >&2
   echo "    git -C $REPO branch -D $BRANCH_NAME" >&2
@@ -745,7 +799,7 @@ if [[ -n "$UNION_FILE" ]]; then
       --file "$UNION_FILE"
     )
     union_args+=("${EXTRA_REF_ARGS[@]}")
-    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" \
+    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" --report "$HAND_UNION_REPORT" \
       || die 5 "union_merge_lines.py failed on $UNION_FILE"
     if git diff --quiet -- "$UNION_FILE"; then
       echo "    no diff after union-merge (nothing was lost from -X theirs)."
@@ -847,6 +901,7 @@ if (( ${#RESTORE_TARGETS[@]} )); then
     )
     echo "    -- $rf"
     "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}" \
+      --report "$HAND_UNION_REPORT" \
       || die 5 "restore_dropped_sections.py failed on $rf"
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
@@ -1014,7 +1069,9 @@ if (( ! SKIP_CHECK )); then
   else
     echo "ERROR: devtools::check failed. The worktree is left in place at" >&2
     echo "  $WT_ABS" >&2
-    echo "Fix the failures, re-run check, and push manually when green." >&2
+    echo "Fix the failures and re-run check; when it is green, commit, then push" >&2
+    echo "and print the PR text with" >&2
+    echo "  $(finish_command)" >&2
     exit 6
   fi
 fi
@@ -1064,10 +1121,12 @@ if (( ! SKIP_VIGNETTES )); then
     echo "Per-file JSONL: $VIGNETTE_RESULTS" >&2
     echo >&2
     echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
-    echo "validator's setup), re-run validation, and push manually when green:" >&2
+    echo "validator's setup) and re-run validation:" >&2
     echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\" >&2
     echo "    --worktree $WT_ABS \\" >&2
     echo "    --jobs $VIGNETTE_JOBS" >&2
+    echo "When it is green, commit, then push and print the PR text with" >&2
+    echo "  $(finish_command)" >&2
     exit 8
   fi
   echo "    all vignettes rendered cleanly"

@@ -285,10 +285,11 @@ class TestMergeBranches:
         )
         assert "\nUsage:\n  merge_branches.sh [OPTIONS]\n" in proc.stdout
         assert proc.stdout.endswith(
-            "  9  a hand union is needed: duplicate canonical blocks worded differently\n"
-            "     were collapsed and every step but the push ran; the message names the\n"
-            "     worktree, the report of the wording the register lacks, and the\n"
-            "     --finish command to run once the hand union is committed\n"
+            "  9  a hand union is needed: a repair set wording aside and every step but\n"
+            "     the push ran; the message names the worktree, the report of the\n"
+            "     wording the register lacks, and the --finish command to run once the\n"
+            "     hand union is committed. --finish without --hand-union-done also\n"
+            "     exits 9 while that report holds anything.\n"
         )
 
     def test_unknown_argument_exits_2(self) -> None:
@@ -652,17 +653,27 @@ class TestMergeBranchesHandUnion:
             env=env,
         )
 
+    @staticmethod
+    def _report(wt: Path) -> Path:
+        return Path(
+            git(wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md")
+        )
+
+    @staticmethod
+    def _printed_finish(stderr: str) -> list[str]:
+        """The --finish command the STOP message prints, as words."""
+        return shlex.split(stderr.rstrip("\n").splitlines()[-1])
+
     def test_a_hand_union_stops_before_the_push_and_finish_completes_it(
         self, hand_repo: Path
     ) -> None:
         """Every step but the push runs; the register is collapsed and
         committed, the dropped wording is only in the report, and the command
-        the message prints pushes once the hand union is committed."""
+        the message prints pushes once the hand union is committed. --finish
+        without --hand-union-done prints the report and pushes nothing."""
         proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
         wt = hand_repo / ".worktrees" / CONSOLIDATION
-        report = Path(
-            git(wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md")
-        )
+        report = self._report(wt)
         assert proc.returncode == 9, proc.stdout + proc.stderr
         finish = (
             f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
@@ -670,19 +681,21 @@ class TestMergeBranchesHandUnion:
         )
         assert proc.stderr.endswith(
             "\n"
-            "STOP: duplicate canonical blocks were collapsed and every later step ran, but\n"
-            "  their copies were worded differently. The register keeps one copy's wording;\n"
-            "  each other copy's wording is in\n"
+            "STOP: every step but the push ran, but a repair set wording aside: copies of\n"
+            "  a canonical, or of a model's annotation, worded differently. The register\n"
+            "  keeps one wording; each other is in\n"
             f"    {report}\n"
+            "  (it goes with the worktree, git worktree remove, so copy it to keep it).\n"
             f"  1. In the worktree {wt}, union that wording into the register\n"
             "     by hand, keeping each source's attribution, and commit.\n"
             "  2. Then push the branch and print the PR text:\n"
-            f"     {finish}\n"
+            f"     {finish} --hand-union-done\n"
         )
         assert (
             f"# HAND UNION NEEDED in {REGISTER}: ### FOO: the copies differ in Notes; collapsed,"
             f" the dropped wording is in {report}\n"
         ) in proc.stderr
+        assert "NOTE: a hand union is still pending" not in proc.stderr
         assert "(placement) OK" in proc.stdout
         assert "==> Pushing" not in proc.stdout
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
@@ -697,21 +710,69 @@ class TestMergeBranchesHandUnion:
 
         unioned = collapsed.replace("the longer one.", "the longer one. Alpha note.")
         (wt / REGISTER).write_text(unioned)
-        refused = run(*shlex.split(finish))
+        printed = self._printed_finish(proc.stderr)
+        refused = run(*printed)
         assert (refused.returncode, refused.stderr) == (
             3,
             f"ERROR: --finish: {wt} has uncommitted changes; commit the hand union first.\n",
         )
         git(wt, "commit", "-qam", "Union the FOO notes by hand")
 
-        done = run(*shlex.split(finish))
+        unconfirmed = run(*shlex.split(finish))
+        assert unconfirmed.returncode == 9, unconfirmed.stdout + unconfirmed.stderr
+        assert unconfirmed.stderr == (
+            report.read_text() + "\nSTOP: the hand-union report above is not empty:\n"
+            f"    {report}\n"
+            f"  Union its wording into the register in {wt} and commit, then run\n"
+            f"     {finish} --hand-union-done\n"
+        )
+        assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
+        done = run(*printed)
         assert done.returncode == 0, done.stdout + done.stderr
         assert f"==> Finishing {CONSOLIDATION} in {wt}\n" in done.stdout
+        assert f"    hand union confirmed (--hand-union-done); the report stays at {report}\n" in (
+            done.stdout
+        )
         assert f"==> Pushing {CONSOLIDATION} to origin\n" in done.stdout
         assert "\nMerge 2 claude/* branches (2 new models)\n" in done.stdout
         pushed = git(hand_repo, "ls-remote", "origin", f"refs/heads/{CONSOLIDATION}").split()[0]
         assert pushed == git(wt, "rev-parse", "HEAD")
         assert git(wt, "show", f"{pushed}:{REGISTER}") + "\n" == unioned
+
+    def test_a_later_failure_names_the_pending_report(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """A gate that fails after the dedup used to advise a manual push and
+        never mention the report; the push would have shipped one wording."""
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"Rscript": DYING_VALIDATOR}))
+        proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", env=env)
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 8, proc.stdout + proc.stderr
+        assert "push manually" not in proc.stderr
+        assert proc.stderr.endswith(
+            "When it is green, commit, then push and print the PR text with\n"
+            f"  bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
+            f" --base origin/main --branch-name {CONSOLIDATION} --finish\n"
+            "\n"
+            "NOTE: a hand union is still pending. The wording the register lacks is in\n"
+            f"    {self._report(wt)}\n"
+            "  Union it into the register and commit before the push; the report goes\n"
+            "  with the worktree (git worktree remove), so copy it elsewhere to keep it.\n"
+        )
+
+    def test_a_rerun_over_the_worktree_names_its_report(self, hand_repo: Path) -> None:
+        first = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        assert first.returncode == 9, first.stderr
+        again = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert again.returncode == 3
+        assert (
+            f"ERROR: worktree already exists at {wt}\n"
+            "  It holds a hand-union report, which removing it deletes; finish that run\n"
+            "  with --finish, or copy the report first:\n"
+            f"    {self._report(wt)}\n"
+        ) in again.stderr
 
     def test_finish_needs_the_worktree(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--finish")
@@ -724,40 +785,124 @@ class TestMergeBranchesHandUnion:
     def test_finish_refuses_a_duplicate_left_in_the_register(self, hand_repo: Path) -> None:
         """A hand union that put a second copy back is caught before the push."""
         wt = consolidate(hand_repo, ["origin/claude/fa", "origin/claude/fb"], CONSOLIDATION)
-        proc = self._run(hand_repo, "--finish")
+        proc = self._run(hand_repo, "--finish", "--no-register-files")
         assert proc.returncode == 5, proc.stdout + proc.stderr
         assert proc.stderr.endswith(f"ERROR: duplicate canonical headers remain in {REGISTER}.\n")
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
         assert wt.is_dir()
 
-    @pytest.mark.parametrize(
-        ("code", "message"),
-        [
-            (
-                3,
-                f"dedup_canonical_headers.py left a duplicate in {REGISTER} for a hand union (see above).",
-            ),
-            (
-                1,
-                f"dedup_canonical_headers.py crashed on {REGISTER} (exit 1); see its output above.",
-            ),
-        ],
-        ids=["left-whole", "crashed"],
-    )
-    def test_a_dedup_that_fails_stops_the_run(
-        self, hand_repo: Path, tmp_path: Path, code: int, message: str
+    def test_finish_refuses_a_register_the_base_has_and_the_worktree_lost(
+        self, hand_repo: Path
     ) -> None:
-        """Only exit 3 speaks of a hand union; anything else is a crash."""
+        """It used to skip a missing register and push."""
+        wt = consolidate(hand_repo, ["origin/claude/fa"], CONSOLIDATION)
+        git(wt, "rm", "-q", REGISTER)
+        git(wt, "commit", "-qm", "lose the register")
+        proc = self._run(hand_repo, "--finish", "--no-register-files")
+        assert (proc.returncode, proc.stderr.splitlines()[-1]) == (
+            5,
+            f"ERROR: {REGISTER} is on origin/main but missing from the worktree; restore it"
+            " before the push.",
+        )
+
+    def test_a_dedup_that_crashes_stops_the_run(self, hand_repo: Path, tmp_path: Path) -> None:
         failing = (
-            f'#!/bin/bash\ncase "$1" in */dedup_canonical_headers.py) exit {code} ;; esac\n'
+            '#!/bin/bash\ncase "$1" in */dedup_canonical_headers.py) exit 1 ;; esac\n'
             f'exec {sys.executable} "$@"\n'
         )
         env = _env_with_first(_bin_dir(tmp_path, "bin", {"python3": failing}))
         proc = self._run(
             hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes", env=env
         )
-        assert (proc.returncode, proc.stderr.splitlines()[-1]) == (5, f"ERROR: {message}")
-        assert ("hand union" in proc.stderr) == (code == 3)
+        assert (proc.returncode, proc.stderr.splitlines()[-1]) == (
+            5,
+            f"ERROR: dedup_canonical_headers.py crashed on {REGISTER} (exit 1); see its output"
+            " above.",
+        )
+        assert "hand union" not in proc.stderr.lower()
+
+    def test_the_copy_main_has_is_kept_so_the_revert_check_stays_quiet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """claude/late, cut before main registered FOO, registers it too, at more
+        length. Keeping the longer copy dropped main's: the revert check stopped
+        the run (exit 5), and its advice put the duplicate back."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER + AGE_SECTION})
+        late = BASE_REGISTER + AGE_SECTION + FOO_B
+        push_task_branch(repo, "claude/late", {REGISTER: late}, "Add Fb 2021 model")
+        main = BASE_REGISTER + FOO_A + AGE_SECTION
+        update_main(repo, {REGISTER: main}, "Register FOO")
+        proc = self._run(repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        assert "(reverts) OK" in proc.stdout
+        assert (wt / REGISTER).read_text() == BASE_REGISTER + FOO_A.replace(
+            "(a).", "(a), `Fb_2021_b.R` (b)."
+        ) + AGE_SECTION
+        assert "- **Notes:** Beta note, the longer one.\n" in self._report(wt).read_text()
+
+    @pytest.mark.parametrize(
+        "registers",
+        [
+            ("--no-register-files",),
+            ("--no-register-files", "--register-file", "refs/comp names.md"),
+        ],
+        ids=["none", "custom"],
+    )
+    def test_the_printed_finish_carries_the_runs_registers_and_the_report_accumulates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registers: tuple[str, ...]
+    ) -> None:
+        """A custom union file and register: both hand unions are in one report,
+        and the printed --finish, run as printed, finds both files."""
+        union_file = "refs/covariates.md"
+        comp = "refs/comp names.md"
+        comp_base = "## Compartments\n\n### depot (**dosing compartment**)\n\n- **Role:** state.\n"
+        bar = "\n### BAR (**canonical for bar**)\n\n- **Role:** {role}\n- **Example models:** `{m}` (x).\n"
+        repo = new_repo(
+            tmp_path, monkeypatch, {union_file: BASE_REGISTER + AGE_SECTION, comp: comp_base}
+        )
+        files_a = {
+            union_file: BASE_REGISTER + FOO_A + AGE_SECTION,
+            comp: comp_base.replace(
+                "\n### depot", bar.format(role="a.", m="Fa_2020_a.R") + "\n### depot"
+            ),
+        }
+        files_b = {
+            union_file: BASE_REGISTER + AGE_SECTION + FOO_B,
+            comp: comp_base + bar.format(role="b, the longer role.", m="Fb_2021_b.R"),
+        }
+        push_task_branch(repo, "claude/fa", files_a, "Add Fa 2020 model")
+        push_task_branch(repo, "claude/fb", files_b, "Add Fb 2021 model")
+        proc = self._run(
+            repo,
+            "--yes",
+            "--skip-r-regen",
+            "--skip-check",
+            "--skip-vignettes",
+            "--union-file",
+            union_file,
+            *registers,
+        )
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        printed = self._printed_finish(proc.stderr)
+        assert printed[printed.index("--branch-name") + 2 :] == [
+            "--union-file",
+            union_file,
+            *registers,
+            "--finish",
+            "--hand-union-done",
+        ]
+        report = self._report(wt).read_text()
+        assert f"# Hand union needed in {union_file}\n" in report
+        assert (f"# Hand union needed in {comp}\n" in report) == (comp in registers)
+        done = run(*printed)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert f"# clean (no whole-file duplicate canonicals): {union_file}\n" in done.stderr
+        assert (f"# clean (no per-##-section duplicate canonicals): {comp}\n" in done.stderr) == (
+            comp in registers
+        )
+        assert git(repo, "ls-remote", "origin", f"refs/heads/{CONSOLIDATION}") != ""
 
 
 class TestVerifyBranchContributions:

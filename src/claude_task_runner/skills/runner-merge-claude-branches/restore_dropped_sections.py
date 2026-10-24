@@ -21,7 +21,8 @@ filed them under, creating that section only if it does not already exist.
 Every ``### `` heading counts, a backticked name (``prob_<endpoint>`` in
 backticks, keyed without them) or prose included. When two branches added the same
 canonical in different words and the merge lost it, the first branch's copy is
-restored and each other copy is printed in full for a hand union.
+restored and each other copy is printed in full, and with ``--report FILE``
+appended to the hand-union report, for a hand union.
 
 Idempotent: a canonical already present is left alone, so re-running is safe.
 
@@ -46,7 +47,15 @@ import sys
 import traceback
 from pathlib import Path
 
+import dedup_canonical_headers as register
 import merge_set
+
+RESTORE_INTRO = (
+    "Two merged branches added each canonical below in different words, and the",
+    "merge lost both. The restore put the first branch's copy back; the other is",
+    "below, verbatim. Union it into the register by hand, keeping each source's",
+    "attribution, and commit.",
+)
 
 HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
 SECTION_RE = re.compile(r"^## +(.*?)\s*$")
@@ -139,6 +148,12 @@ def main() -> int:
     ap.add_argument("--file", required=True, help="repo-relative path to the register file")
     ap.add_argument(
         "--check", action="store_true", help="report only; exit 1 if anything is missing"
+    )
+    ap.add_argument(
+        "--report",
+        metavar="FILE",
+        help="append each copy the restore did not put back, beside the one it did, to FILE"
+        " for a hand union (not with --check)",
     )
     args = ap.parse_args()
 
@@ -298,6 +313,22 @@ def main() -> int:
             f" {first}'s copy. Union this one by hand:"
         )
         print("".join(f"    {line}" for line in block.splitlines(keepends=True)), end="")
+    if differing and args.report is not None and not args.check:
+        hand = [
+            register.HandUnion(
+                name,
+                [],
+                [
+                    register.Difference(
+                        f"{ref}'s copy (the register has {first}'s)",
+                        restored_from[name][1].splitlines(),
+                        block.splitlines(),
+                    )
+                ],
+            )
+            for name, ref, first, block in differing
+        ]
+        register.append_report(args.report, args.file, hand, RESTORE_INTRO, "In that copy:")
     if not restored:
         print(f"# no dropped canonicals in {args.file}")
         return 1 if (args.check and lost_names) else 0
