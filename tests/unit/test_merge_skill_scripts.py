@@ -114,8 +114,8 @@ PLACEMENT_REPORT = (
     "    Source-aliases and Example-models with the dropped one's, keeping ONE block.\n"
 )
 VERIFIER_OK = (
-    "    (placement) OK — every (canonical, model) pair a branch recorded is still filed"
-    f" under that canonical in {REGISTER}\n"
+    "    (placement) OK — every (canonical, model) pair and source alias a branch recorded is"
+    f" still filed under that canonical in {REGISTER}\n"
     "    (verifier) OK — all per-branch *.R additions and brand-new ##/### canonical-section"
     f" headers are present in {REGISTER}\n"
 )
@@ -939,6 +939,105 @@ class TestRegisterPlacement:
             "ERROR: (placement) --branch 'no-such-branch' does not resolve to a commit in"
             f" {shared_repo}; refusing to report a vacuous pass.\n"
         )
+
+    @pytest.mark.parametrize(
+        ("block", "filed"),
+        [
+            ("- **Example models:** `A_2020_a.R` (refits the `B_2021_b.R` data).", {"A_2020_a.R"}),
+            (
+                "- **Example models:** `A_2020_a.R` and `B_2021_b.R` (y); `C_2022_c.R`.",
+                {"A_2020_a.R", "B_2021_b.R", "C_2022_c.R"},
+            ),
+            (
+                "- **Example models:** Fits of the chain: `A_2020_a.R` for the base case.",
+                {"A_2020_a.R"},
+            ),
+            (
+                "- **Example models:**\n  * `A_2020_a.R` -- star bullet.\n"
+                "  - fitted in `B_2021_b.R` -- a bullet that opens with prose.",
+                {"A_2020_a.R", "B_2021_b.R"},
+            ),
+            (
+                "- **Example models:** `A_2020_a.R` (inline).\n  - `B_2021_b.R` -- under the inline list.",
+                {"A_2020_a.R", "B_2021_b.R"},
+            ),
+            ("- **Source aliases:**\n  - `GENDER` -- used in `D_2023_d.R`.", set()),
+            ("- **Notes:** Example models elsewhere cite `E_2024_e.R`.", set()),
+        ],
+        ids=[
+            "mention-in-annotation",
+            "and-semicolon",
+            "prose-led",
+            "sub-bullets",
+            "sub-bullets-under-inline",
+            "alias-mention",
+            "notes-mention",
+        ],
+    )
+    def test_a_model_is_filed_only_as_an_example_models_entry(
+        self, block: str, filed: set[str]
+    ) -> None:
+        """A model named inside another entry's annotation, an alias bullet or
+        Notes prose that says "Example models" used to count as filed there;
+        one in a ``*`` bullet, or a bullet opening with prose, did not."""
+        placement = load_helper("verify_register_placement")
+        text = f"## S\n\n### Q, Q2 (**canonical for q**)\n{block}\n\n### R (**r**)\n- **Type:** x\n"
+        assert dict(placement.parse(text)) == ({"Q": filed, "Q2": filed} if filed else {})
+
+    def test_a_model_left_only_in_another_entrys_annotation_is_reported(
+        self, repo: Path, worktree: Path
+    ) -> None:
+        """The WT line lost claude/a's entry, and only claude/b's annotation still
+        names its model: the old check found the filename on the line and passed."""
+        mention = "`B_2021_b.R` (b note, refitting the `A_2020_a.R` data)"
+        (worktree / REGISTER).write_text(_with_models(mention) + BMI_BLOCK + HT_BLOCK)
+        proc = run_helper("verify_register_placement.py", *_verifier_args(repo))
+        assert proc.returncode == 1, proc.stdout
+        assert (
+            "ERROR: (placement) 1 (canonical, model) pair(s) a branch recorded are NOT filed under"
+            f" that canonical in {REGISTER}:\n"
+            "    WT  <-  A_2020_a.R   (from claude/a)\n"
+        ) in proc.stdout
+
+    @pytest.mark.parametrize(
+        ("merged_alias", "lost"),
+        [
+            ("", True),
+            ("  - `BW`  --  used in `S_2020_s.R`\n", False),
+            ("  * `BW` -- used in `S_2020_s.R`; also `BW_KG` in `T_2021_t.R`.\n", False),
+        ],
+        ids=["lost", "respaced", "said-more"],
+    )
+    def test_a_source_alias_a_branch_added_must_survive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, merged_alias: str, lost: bool
+    ) -> None:
+        """Alias bullets used to count only as places a model was named, so a
+        lost alias passed whenever its model was still listed. A merged bullet
+        that holds the same words, respaced or inside a longer one (a hand
+        union of two wordings), keeps it."""
+        models = "(base model), `S_2020_s.R` (s)."
+        with_alias = BASE_REGISTER.replace(
+            "- **Example models:**",
+            "- **Source aliases:**\n  - `BW` -- used in `S_2020_s.R`.\n- **Example models:**",
+        ).replace("(base model).", models)
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER})
+        push_task_branch(repo, "claude/s", {REGISTER: with_alias}, "Add S 2020 model")
+        wt = consolidate(repo, ["origin/claude/s"], CONSOLIDATION)
+        aliases = f"- **Source aliases:**\n{merged_alias}" if merged_alias else ""
+        merged = BASE_REGISTER.replace("- **Example models:**", f"{aliases}- **Example models:**")
+        (wt / REGISTER).write_text(merged.replace("(base model).", models))
+        proc = run_helper("verify_register_placement.py", *_verifier_args(repo))
+        if not lost:
+            assert (proc.returncode, proc.stderr) == (0, ""), proc.stdout
+            return
+        assert proc.returncode == 1, proc.stdout
+        assert proc.stdout.endswith(
+            "\n"
+            "ERROR: (placement) 1 source-alias bullet(s) a branch added are NOT under that"
+            f" canonical in {REGISTER}:\n"
+            "    WT  <-  `BW` -- used in `S_2020_s.R`.   (from claude/s)\n"
+        )
+        assert "(canonical, model)" not in proc.stdout
 
 
 # The helpers that read the consolidation worktree, and the prefix of their errors.

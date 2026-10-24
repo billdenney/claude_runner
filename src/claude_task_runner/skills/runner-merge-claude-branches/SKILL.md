@@ -354,7 +354,13 @@ exists to repair. Repair, then regenerate.
       `##` / `### CANONICAL` header the branch introduced must survive.
    c. **Placement** (`verify_register_placement.py`) — every
       *(canonical, model.R)* pair the branch recorded must still be filed
-      **under that canonical**.
+      **under that canonical**, and every source-alias bullet it added must
+      still be under that canonical (the same words; inside a longer bullet
+      counts). A model is filed only as an Example-models entry, inline or in
+      a `-`/`*` sub-bullet, read the way the dedup reads entries: a filename
+      inside another entry's parentheses, an alias bullet or Notes prose is a
+      mention, and counting mentions passed a merge that kept only the
+      mention of a lost model.
 
    Check (c) was added 2026-08-31 because (a) and (b) both pass in the case
    that matters most: two branches register the SAME canonical from mains
