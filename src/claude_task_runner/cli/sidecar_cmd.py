@@ -146,7 +146,7 @@ def list_sidecars(
             styled(row["task_id"], "bold"), " ", styled(f"#{row['sequence']:03d}", "dim")
         )
         if "error" in row:
-            console.print(literal(head, styled(" unreadable:", "red"), " ", row["error"]))
+            console.print(literal(literal(head, " unreadable:", style="red"), " ", row["error"]))
             continue
         outstanding = cast("list[str]", row["outstanding"])
         answered = cast("list[str]", row["answered"])
