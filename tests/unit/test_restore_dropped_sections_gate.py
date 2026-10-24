@@ -313,3 +313,19 @@ def test_a_canonical_two_branches_added_differently_names_the_other_copy(repo: P
         "    ### TWICE (**canonical for TWICE**)\n"
         "    - **Type:** y, as the second branch words it\n"
     ) in out, out
+
+
+def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
+    """Its second name used to be reported as dropped from a heading that the
+    restore itself had just put back."""
+    added = ["KEEP_ME", "NEW_NAME", "MULTI_A, MULTI_B"]
+    make_remote_branch(repo, "adds", "main", added, "adds one")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    merge(repo, "clobbers")
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "# 1 canonical(s) dropped by the merge and missing from refs.md:\n" in out, out
+    assert "    MULTI_A  (## Section A)\n" in out, out
+    assert "HEADER-NAME LOST" not in out, out
