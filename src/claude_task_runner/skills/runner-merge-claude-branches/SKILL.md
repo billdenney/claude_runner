@@ -65,7 +65,8 @@ confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
 prints every flag and exit code. Each exit code has one meaning; the ones that
 stop a run partway are 5 (a repair or verification step failed, the verifier
 could not run, or the revert check found base content the merge reverted),
-6 (`devtools::check`), 7 (push) and 8 (vignettes).
+6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
+before the push; finish with `--finish`, step 6b).
 
 ## The merge set
 
@@ -216,7 +217,7 @@ exists to repair. Repair, then regenerate.
    a branch's model missing from it.
 
 6b. **Dedup duplicate canonical headers** via
-   `dedup_canonical_headers.py --global inst/references/covariate-columns.md`.
+   `dedup_canonical_headers.py --global --report <report> inst/references/covariate-columns.md`.
    The union-merger folds Example-model *lines* but cannot collapse a
    whole duplicate `### CANONICAL` *block* — which is exactly what
    survives when two branches each ADD the same brand-new canonical
@@ -224,14 +225,25 @@ exists to repair. Repair, then regenerate.
    branch). `verify_section_headers.py` only checks headers *survived*,
    not that they are *unique*, so these slip through (8 such pairs were
    on origin/main on 2026-07-25). This step collapses each to one entry,
-   carrying into the kept copy the dropped copies' example models it does
-   not name (each with its own annotation, or the bare filename) and their
+   keeping the longest copy and carrying into it every model a dropped copy
+   lists as an Example-models entry that it lacks (each as written, with
+   its annotation, or the bare filename; an entry starts at every
+   backticked `*.R` filename outside parentheses, so `` `A.R` and `B.R` ``
+   is two entries and a filename inside an annotation is none) and the
+   dropped copies'
    source-alias sub-bullets, and then re-runs with `--check`; any duplicate
-   that survives **aborts the run**. Copies that differ in anything else
-   (the heading, Description, Role, Notes, ...) are two definitions of one
-   canonical: the script leaves them, prints `HAND UNION NEEDED` with the
-   fields, and exits 3, which also aborts the run. Merge such a pair by
-   hand and re-run. `--global` (whole-file
+   that survives **aborts the run**. What a dropped copy words differently
+   (the heading, Description, Role, Notes, an Example-models entry for a
+   model both copies list, ...) cannot be unioned mechanically; the
+   register keeps the kept copy's wording, the script prints `HAND UNION
+   NEEDED` with the fields, and the dropped wording goes verbatim to a
+   hand-union report in the worktree's git directory, never into the
+   register. Every later step still runs; the run then stops before the
+   push (exit 9) and prints the worktree, the report and the `--finish`
+   command. Union the wording into the register by hand, keeping each
+   source's attribution, commit in the worktree, and run that command: it
+   checks for duplicates again, pushes the branch and prints the PR text,
+   without redoing the merge. `--global` (whole-file
    uniqueness) is correct for the covariate register; the default
    per-`##`-section scope is what you'd use on `compartment-names.md`,
    where the same token is legitimately both a compartment and a suffix.
@@ -672,7 +684,9 @@ then run again with `--yes` once the operator agrees.
 ### Idempotence
 
 The script aborts cleanly if the target worktree already exists.
-To re-run, remove the worktree first:
+A run that stopped for a hand union (exit 9) is finished with `--finish`
+on the same worktree, which keeps the hand edits; see step 6b. To re-run
+from scratch, remove the worktree first:
 
 ```bash
 git -C <repo> worktree remove --force .worktrees/<branch-name>
