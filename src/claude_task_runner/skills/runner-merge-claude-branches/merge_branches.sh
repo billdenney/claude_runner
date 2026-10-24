@@ -127,7 +127,12 @@
 set -euo pipefail
 trap 'echo "ERROR: unexpected failure (exit $?) at line $LINENO" >&2; exit 1' ERR
 trap 'remind_hand_union $?' EXIT
+# An interrupt or a kill exits with its own status, so the EXIT trap names a
+# pending report then too, rather than seeing the status of the last command.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 HAND_UNION_REPORT=""
+HAND_UNION_DONE=0
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -155,7 +160,6 @@ VIGNETTE_JOBS=""
 VIGNETTE_TIMEOUT=900
 SKIP_PUSH=0
 FINISH=0
-HAND_UNION_DONE=0
 DRY_RUN=0
 ASSUME_YES=0
 EXTRA_REFS=()
@@ -181,7 +185,9 @@ need_value() {
 
 remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
   local rc=$1
-  if (( rc != 0 && rc != 9 )) && [[ -n "$HAND_UNION_REPORT" && -s "$HAND_UNION_REPORT" ]]; then
+  # --hand-union-done: the operator has already unioned the report's wording.
+  if (( rc != 0 && rc != 9 && ! HAND_UNION_DONE )) \
+    && [[ -n "$HAND_UNION_REPORT" && -s "$HAND_UNION_REPORT" ]]; then
     {
       echo
       echo "NOTE: a hand union is still pending. The wording the register lacks is in"
@@ -211,7 +217,7 @@ check_no_duplicates() {  # gate: no duplicate canonical remains in any register
     scope=()
     if [[ "$reg" == "$UNION_FILE" ]]; then scope=(--global); fi
     if [[ -f "$reg" ]]; then
-      "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "${scope[@]}" --check "$reg" \
+      "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" ${scope[@]+"${scope[@]}"} --check "$reg" \
         || die 5 "duplicate canonical headers remain in $reg."
     elif git cat-file -e "$BASE:$reg" 2>/dev/null; then
       die 5 "$reg is on $BASE but missing from the worktree; restore it before the push."
@@ -404,6 +410,10 @@ if [[ -z "$VIGNETTE_JOBS" ]]; then
 fi
 [[ "$VIGNETTE_JOBS" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-jobs must be a positive integer, not '$VIGNETTE_JOBS'"
 [[ "$VIGNETTE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-timeout must be a positive integer, not '$VIGNETTE_TIMEOUT'"
+
+if (( HAND_UNION_DONE && ! FINISH )); then
+  die 2 "--hand-union-done goes with --finish"
+fi
 
 if [[ -z "$BRANCH_NAME" ]]; then
   BRANCH_NAME="merge-all-claude-branches-$(date -u +%F)"

@@ -885,6 +885,39 @@ class TestMergeBranchesHandUnion:
         assert "In a merged copy:\n\n````\n`N_2020_n.R` (short)\n````\n" in report
         assert "In that copy:\n\n````\n### TWICE (**canonical for twice**)\n" in report
 
+    def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
+        proc = self._run(hand_repo, "--yes", "--hand-union-done")
+        assert (proc.returncode, proc.stderr) == (
+            2,
+            "ERROR: --hand-union-done goes with --finish\n",
+        )
+
+    def test_a_confirmed_finish_whose_push_fails_says_nothing_of_a_pending_union(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        assert proc.returncode == 9, proc.stderr
+        shutil.rmtree(tmp_path / "origin.git")
+        done = run(*self._printed_finish(proc.stderr))
+        assert done.returncode == 7, done.stdout + done.stderr
+        assert "hand union is still pending" not in done.stderr
+
+    def test_a_run_killed_after_the_dedup_names_the_report(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """A TERM (or Ctrl-C) exits with its own status, so the EXIT trap names
+        the pending report."""
+        killer = (
+            '#!/bin/bash\ncase "$1" in */restore_dropped_sections.py) kill -TERM "$PPID"; exit 0 ;;'
+            f' esac\nexec {sys.executable} "$@"\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"python3": killer}))
+        proc = self._run(
+            hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes", env=env
+        )
+        assert proc.returncode == 143, proc.stdout + proc.stderr
+        assert "NOTE: a hand union is still pending." in proc.stderr
+
     @pytest.mark.parametrize(
         "registers",
         [
