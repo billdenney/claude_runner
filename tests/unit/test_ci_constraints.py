@@ -65,29 +65,51 @@ def _runs(node: object) -> list[str]:
     return []
 
 
+PIP = re.compile(r"pip(?:3(?:\.\d+)?)?")
+"""``pip``, ``pip3`` or ``pip3.12``, as a command's basename."""
+
+
 def _commands(script: str) -> list[list[str]]:
     """The commands of a ``run:`` script, each as words: backslash-continued
-    lines joined, and lines split at ``&&``, ``||``, ``;`` and ``|``."""
-    joined = re.sub(r"\\\n", " ", script)
+    lines joined, each line tokenised as a shell does (quotes kept together,
+    comments dropped), then split at operator tokens (``&&``, ``||``,
+    ``;``, ``|``, ``&``, parentheses). Splitting the text before tokenising
+    broke a quoted ``|`` or ``;`` (``grep -E 'a|b'``), and shlex then raised."""
     out = []
-    for line in joined.splitlines():
-        for command in re.split(r"&&|\|\||;|\|", line):
-            words = shlex.split(command, comments=True)
-            if words:
-                out.append(words)
+    for line in re.sub(r"\\\n", " ", script).splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words: list[str] = []
+        for token in [*lexer, ";"]:
+            if token and set(token) <= set("();|&"):
+                if words:
+                    out.append(words)
+                words = []
+            else:
+                words.append(token)
     return out
 
 
+def _package(word: str) -> str:
+    """A requirement's distribution name, normalised: ``types_PyYAML>=6`` is
+    ``types-pyyaml``."""
+    return re.sub(r"[-_.]+", "-", re.split(r"[<>=!~;\[ ]", word, maxsplit=1)[0]).lower()
+
+
 def _installs_pinned_tools(words: list[str]) -> bool:
-    """``words`` is a pip install of the dev extras, mypy or types-PyYAML."""
-    at = next(
-        (i for i, w in enumerate(words[:-1]) if w.rsplit("/", 1)[-1] in ("pip", "pip3")), None
-    )
-    if at is None or words[at + 1] != "install":
+    """``words`` is a pip install of the dev extras, mypy or types-PyYAML:
+    ``pip``, ``pip3``, ``pip3.12`` or ``python -m pip``, with any options
+    before ``install``."""
+    at = next((i for i, w in enumerate(words) if PIP.fullmatch(w.rsplit("/", 1)[-1])), None)
+    if at is None:
         return False
-    for word in words[at + 2 :]:
-        name = re.split(r"[<>=!~;\[ ]", word, maxsplit=1)[0].lower()
-        if re.search(r"\[[^]]*\bdev\b[^]]*\]", word) or name in PINNED:
+    rest = words[at + 1 :]
+    while rest and rest[0].startswith("-"):
+        rest = rest[1:]
+    if not rest or rest[0] != "install":
+        return False
+    for word in rest[1:]:
+        if re.search(r"\[[^]]*\bdev\b[^]]*\]", word) or _package(word) in PINNED:
             return True
     return False
 
@@ -189,6 +211,16 @@ def test_every_documented_install_uses_the_pins() -> None:
             ["pip install -e . -c .github/other.txt mypy"],
         ),
         ("python -m pip install --upgrade pip\npip install build", 0, []),
+        ("pip -q install mypy", 1, ["pip -q install mypy"]),
+        (
+            "pip --disable-pip-version-check install -e '.[dev]' -c .github/ci-constraints.txt",
+            1,
+            [],
+        ),
+        ("python -m pip -q install types_PyYAML", 1, ["python -m pip -q install types_PyYAML"]),
+        ("pip3.12 install mypy==2.4.0", 1, ["pip3.12 install mypy==2.4.0"]),
+        ("(pip install mypy)", 1, ["pip install mypy"]),
+        ("grep -E 'a|b' f && echo \"a; b\" | tee out", 0, []),
     ],
     ids=[
         "one-line",
@@ -199,6 +231,12 @@ def test_every_documented_install_uses_the_pins() -> None:
         "comment",
         "other-file",
         "no-dev",
+        "pip-option",
+        "pip-long-option",
+        "module-option-underscore",
+        "pip3.12",
+        "subshell",
+        "quoted-operators",
     ],
 )
 def test_the_install_check_reads_whole_commands(
