@@ -254,3 +254,62 @@ def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
     assert rc == 0, out
     assert "OLD_SPELLING" not in out, out
     assert "deliberate rename/retire" in out, out
+
+
+def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
+    """Only headings of letters, digits, ``_`` and ``<>`` used to count, so a
+    lost ``### `prob_<endpoint>``` block or a prose heading was not restored
+    and not reported either."""
+    added = ["KEEP_ME", "NEW_NAME", "`prob_<endpoint>`", "Why kon is not canonical"]
+    make_remote_branch(repo, "adds", "main", added, "adds two")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    merge(repo, "clobbers")
+    assert "prob_" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# 2 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    prob_<endpoint>  (## Section A)\n"
+        "    Why kon is not canonical  (## Section A)\n"
+    ) in out, out
+
+
+def test_a_canonical_two_branches_added_differently_names_the_other_copy(repo: Path) -> None:
+    """Both copies were lost; one is restored, and the other's text is printed
+    for a hand union instead of being skipped without a word."""
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")
+    text = (
+        (repo / REGISTER)
+        .read_text()
+        .replace(
+            "### TWICE (**canonical for TWICE**)\n- **Type:** x",
+            "### TWICE (**canonical for TWICE**)\n- **Type:** y, as the second branch words it",
+        )
+    )
+    (repo / REGISTER).write_text(text)
+    commit(repo, "second wording")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "TWICE" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "    TWICE  (## Section A)\n" in out, out
+    assert (
+        "# TWICE: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n"
+        "    ### TWICE (**canonical for TWICE**)\n"
+        "    - **Type:** y, as the second branch words it\n"
+    ) in out, out

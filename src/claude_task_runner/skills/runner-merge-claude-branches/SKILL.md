@@ -302,6 +302,13 @@ exists to repair. Repair, then regenerate.
    loss of `fm_cysmer` / `fm_gluc` / `fm_sulf` surfaced when no register
    verifier caught it.
 
+   Every `### ` heading counts, a backticked one (`` ### `prob_<endpoint>` ``)
+   or prose included; only letters, digits, `_` and `<>` used to, and a lost
+   block under any other heading was neither restored nor reported. When two
+   branches added the same canonical in different words and the merge lost
+   it, the first branch's copy is restored and each other copy is printed in
+   full, for a hand union.
+
    Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.
 
 6d. **Union-merge NEWS.md** via `union_merge_news.py`. NEWS.md has ONE
