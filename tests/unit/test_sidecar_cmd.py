@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from claude_task_runner.cli.sidecar_cmd import app
@@ -352,6 +354,24 @@ class TestListReportsOutstandingQuestions:
         payload = json.loads(result.stdout)
         assert payload["n_open"] == 1
         assert "invalid JSON" in payload["sidecars"][0]["error"]
+
+    def test_an_unreadable_request_has_a_red_head(
+        self, runner: CliRunner, queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task id, sequence and "unreadable:" in red; the error as written."""
+        path = request_path(queue_dir, "t1", 1)
+        path.write_text("{not json")
+        monkeypatch.setattr(
+            "claude_task_runner.cli.sidecar_cmd.Console",
+            functools.partial(Console, force_terminal=True, color_system="standard", width=500),
+        )
+        result = runner.invoke(app, ["list", "--queue", str(queue_dir)])
+        assert result.exit_code == 0
+        assert result.stdout.splitlines()[0] == (
+            "\x1b[1;31mt1\x1b[0m\x1b[31m \x1b[0m\x1b[2;31m#001\x1b[0m\x1b[31m unreadable:\x1b[0m"
+            f" {path}: invalid JSON: Expecting property name enclosed in double quotes:"
+            " line 1 column 2 (char 1)"
+        )
 
 
 class TestAnswerRejectsPartialResponses:

@@ -23,8 +23,9 @@ from typing import cast
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.text import Text
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, require_queue_option
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, literal, require_queue_option, styled
 from claude_task_runner.queue.schema import (
     SidecarAnswer,
     SidecarResponse,
@@ -141,29 +142,38 @@ def list_sidecars(
         console.print("[dim]No open sidecars.[/]")
         return
     for row in items:
-        head = f"[bold]{row['task_id']}[/] [dim]#{row['sequence']:03d}[/]"
+        head = literal(
+            styled(row["task_id"], "bold"), " ", styled(f"#{row['sequence']:03d}", "dim")
+        )
         if "error" in row:
-            console.print(f"[red]{head} unreadable:[/] {row['error']}")
+            console.print(literal(literal(head, " unreadable:", style="red"), " ", row["error"]))
             continue
         outstanding = cast("list[str]", row["outstanding"])
         answered = cast("list[str]", row["answered"])
         # A response that credits none of the asked ids is a different fault
         # from a half-finished one -- usually an answer written against the
         # wrong id -- and saying "partial" for it would misdescribe it.
-        if not row["partial"]:
-            marker = ""
-        elif answered:
-            marker = "[yellow]partial[/] "
-        else:
-            marker = "[red]unmatched[/] "
+        marker: Text | str = ""
+        if row["partial"]:
+            marker = styled("partial ", "yellow") if answered else styled("unmatched ", "red")
         ids = ", ".join(outstanding) or "(no questions)"
-        console.print(f"{head} {marker}[cyan]{ids}[/] {_one_line(row.get('summary'))}")
+        console.print(
+            literal(head, " ", marker, styled(ids, "cyan"), " ", _one_line(row.get("summary")))
+        )
         if row["partial"] and answered:
-            console.print(f"    [dim]already answered: {', '.join(answered)}[/]")
+            console.print(
+                literal("    ", styled(f"already answered: {', '.join(answered)}", "dim"))
+            )
         elif row["partial"]:
             console.print("    [dim]a response exists but answers none of the asked ids[/]")
     console.print(
-        f"\n[bold]{len(items)}[/] open request(s), [bold]{n_questions}[/] unanswered question(s)."
+        literal(
+            "\n",
+            styled(len(items), "bold"),
+            " open request(s), ",
+            styled(n_questions, "bold"),
+            " unanswered question(s).",
+        )
     )
 
 
@@ -197,19 +207,25 @@ def show_sidecar(
         return
 
     console = Console()
-    console.print(f"[bold]task:[/] {req.task_id}  [bold]seq:[/] {req.sequence}")
-    console.print(f"[bold]summary:[/] {req.summary}")
+    console.print(
+        literal(
+            styled("task:", "bold"), f" {req.task_id}  ", styled("seq:", "bold"), f" {req.sequence}"
+        )
+    )
+    console.print(literal(styled("summary:", "bold"), " ", req.summary))
     if req.context:
         console.print("[bold]context:[/]")
         for line in req.context.splitlines():
-            console.print(f"  {line}")
+            console.print(literal("  ", line))
     for q in req.questions:
-        console.print(f"\n[bold cyan]Q[/] [bold]{q.id}[/]: {q.prompt}")
+        console.print(
+            literal("\n", styled("Q", "bold cyan"), " ", styled(q.id, "bold"), ": ", q.prompt)
+        )
         for opt in q.options:
             marker = "*" if opt.value == q.recommended else " "
-            console.print(f"  {marker} {opt.value}: {opt.label}")
+            console.print(literal(f"  {marker} {opt.value}: {opt.label}"))
             if opt.description:
-                console.print(f"      [dim]{opt.description}[/]")
+                console.print(literal("      ", styled(opt.description, "dim")))
         if q.allow_free_text:
             console.print("  [dim](free-text answer permitted)[/]")
         if q.multi_select:

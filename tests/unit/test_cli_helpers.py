@@ -15,11 +15,14 @@ from pathlib import Path
 import pytest
 import typer
 from rich.console import Console
+from rich.text import Span, Text
 
 from claude_task_runner.cli._helpers import (
     PER_QUEUE_CONFIG_NAME,
+    literal,
     require_queue_option,
     resolve_per_queue_config,
+    styled,
 )
 
 
@@ -167,3 +170,58 @@ class TestRequireQueueOption:
             "error": f"--queue is not an existing directory: {missing.resolve()}",
         }
         assert out.getvalue() == ""
+
+
+class TestLiteral:
+    """A ``literal`` line is the parts' text, with a span for each
+    :func:`styled` part; no part is read as markup or emoji, nor sniffed for
+    a style by its shape."""
+
+    def test_styled_parts_style_their_own_span(self) -> None:
+        line = literal("a ", styled("[B]", "bold"), " c", styled(":d:", "red"))
+        assert (line.plain, line.style, line.spans) == (
+            "a [B] c:d:",
+            "",
+            [Span(2, 5, "bold"), Span(7, 10, "red")],
+        )
+
+    def test_the_base_style_styles_the_whole_line(self) -> None:
+        line = literal("x ", styled("y", "bold"), style="red")
+        assert (line.plain, line.style, line.spans) == ("x y", "red", [Span(2, 3, "bold")])
+
+    def test_a_nested_line_keeps_its_base_style_and_spans(self) -> None:
+        head = literal(styled("id", "bold"), " #1", style="red")
+        line = literal(head, " error")
+        assert (line.plain, line.spans) == (
+            "id #1 error",
+            [Span(0, 5, "red"), Span(0, 2, "bold")],
+        )
+
+    @pytest.mark.parametrize(
+        ("part", "text"),
+        [
+            (None, "None"),
+            (3, "3"),
+            (2.5, "2.5"),
+            (Path("/q[x]/:b:"), "/q[x]/:b:"),
+            (OSError(2, "No such file", "/q[/]"), "[Errno 2] No such file: '/q[/]'"),
+            (("[x]", "bold"), "('[x]', 'bold')"),
+            ("[bold]x[/] :b:", "[bold]x[/] :b:"),
+        ],
+        ids=["None", "int", "float", "Path", "exception", "tuple", "markup"],
+    )
+    def test_any_other_part_is_its_str_unstyled(self, part: object, text: str) -> None:
+        """Only a ``Text`` part carries a style: a 2-tuple ending in a str is a value."""
+        line = literal("> ", part)
+        assert (line.plain, line.spans) == (f"> {text}", [])
+
+    def test_styled_is_the_value_in_the_style(self) -> None:
+        span = styled(404, "dim")
+        assert isinstance(span, Text)
+        assert (span.plain, span.style, span.spans) == ("404", "dim", [])
+
+    def test_it_prints_as_written_in_colour(self) -> None:
+        out = io.StringIO()
+        console = Console(file=out, force_terminal=True, color_system="standard", width=80)
+        console.print(literal(styled("[x]", "bold"), " :b: ", Path("/q")))
+        assert out.getvalue() == "\x1b[1m[x]\x1b[0m :b: /q\n"

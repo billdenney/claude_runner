@@ -34,6 +34,8 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
+from claude_task_runner.cli._helpers import literal, styled
+
 app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
 
 
@@ -286,6 +288,7 @@ def install_skills(
             f"cannot create {target}: {exc}",
             style="bold red",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
@@ -301,6 +304,7 @@ def install_skills(
                 f"missing skill: {exc}",
                 style="bold red",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
@@ -308,12 +312,17 @@ def install_skills(
         plan.append((name, src))
 
     console.print(
-        f"[bold]Skills target:[/] {target}    [dim]mode: {'symlink' if use_symlinks else 'copy'}[/]"
+        literal(
+            styled("Skills target:", "bold"),
+            f" {target}    ",
+            styled(f"mode: {'symlink' if use_symlinks else 'copy'}", "dim"),
+        )
     )
     for name, src in plan:
         console.print(
             f"  • {name}: {src}{_plan_note(target / name, overwrite=overwrite)}",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
@@ -339,6 +348,7 @@ def install_skills(
                 f"  failed to install {name}: {exc}",
                 style="bold red",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
@@ -347,11 +357,14 @@ def install_skills(
             f"  {'installed' if installed else 'skipped'} {name}: {detail}",
             style="green" if installed else "dim",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
     if failed:
-        console.print(f"[bold red]Failed to install {failed} of {len(plan)} skills.[/]")
+        console.print(
+            literal(f"Failed to install {failed} of {len(plan)} skills.", style="bold red")
+        )
         raise typer.Exit(code=2)
 
 
@@ -388,6 +401,7 @@ def uninstall_skills(
                 f"  cannot check {name}: {exc}",
                 style="bold red",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
@@ -396,20 +410,25 @@ def uninstall_skills(
             present.append((name, state))
     if not present:
         if unchecked:
-            console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+            console.print(
+                literal(
+                    f"Could not check {unchecked} of {len(SKILL_NAMES)} skills.", style="bold red"
+                )
+            )
             raise typer.Exit(code=2)
         console.print(
             f"No task-runner skills found under {target}",
             style="dim",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
         return
 
-    console.print(f"[bold]Will remove:[/] {target}")
+    console.print(literal(styled("Will remove:", "bold"), " ", target))
     for name, state in present:
-        console.print(f"  • {name} ({_REMOVAL_KINDS[state]})")
+        console.print(literal(f"  • {name} ({_REMOVAL_KINDS[state]})"))
 
     if not yes and not Confirm.ask("\nRemove?", default=False):
         console.print("[yellow]Aborted.[/]")
@@ -429,15 +448,20 @@ def uninstall_skills(
                 f"  failed to remove {name}: {exc}",
                 style="red",
                 markup=False,
+                emoji=False,
                 highlight=False,
                 soft_wrap=True,
             )
             continue
-        console.print(f"  [green]removed[/] {name}")
+        console.print(literal("  ", styled("removed", "green"), " ", name))
     if failed:
-        console.print(f"[bold red]Failed to remove {failed} of {len(present)} skills.[/]")
+        console.print(
+            literal(f"Failed to remove {failed} of {len(present)} skills.", style="bold red")
+        )
     if unchecked:
-        console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+        console.print(
+            literal(f"Could not check {unchecked} of {len(SKILL_NAMES)} skills.", style="bold red")
+        )
     if failed or unchecked:
         raise typer.Exit(code=2)
 
@@ -473,7 +497,9 @@ def list_installed() -> None:
         except OSError as exc:
             unchecked += 1
             line, style = f"  ? {name}: cannot check: {exc}", "bold red"
-        console.print(line, style=style, markup=False, highlight=False, soft_wrap=True)
+        console.print(line, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
     if unchecked:
-        console.print(f"[bold red]Could not check {unchecked} of {len(SKILL_NAMES)} skills.[/]")
+        console.print(
+            literal(f"Could not check {unchecked} of {len(SKILL_NAMES)} skills.", style="bold red")
+        )
         raise typer.Exit(code=2)

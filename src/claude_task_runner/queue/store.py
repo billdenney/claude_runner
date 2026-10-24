@@ -210,7 +210,9 @@ class _DepthLimit(BaseResolver):
             )
         # types-PyYAML before 6.0.12.20260815 leaves both hooks unannotated,
         # which strict mypy reports as untyped calls; newer stubs annotate
-        # them, and ``unused-ignore`` keeps the ignore quiet there.
+        # them, and ``unused-ignore`` keeps the ignore quiet there. The dev
+        # extras require 6.0.12.20260815 or later, so only an older install
+        # needs the ignore.
         super().descend_resolver(current_node, current_index)  # type: ignore[no-untyped-call, unused-ignore]
 
     def ascend_resolver(self) -> None:

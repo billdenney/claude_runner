@@ -99,7 +99,7 @@ def test_a_stale_branchs_copy_of_a_block_is_reported(stale_merge: Path) -> None:
         "    ### fm_a, fm_b (**canonical for a fraction metabolised**)\n"
         "      missing heading name: fm_b\n"
         "      missing Example-models entry: `B_2021_b.R`\n"
-        "      missing Example-models annotation of `B_2021_b.R`: (b)\n"
+        "      missing Example-models annotation of `B_2021_b.R`: b\n"
         "      missing line: - **Notes:** New wording.\n" + FOOTER,
         "",
     )
@@ -288,22 +288,44 @@ class TestParsing:
             "(**canonical (nested) x**)",
         )
 
-    def test_an_example_models_line_is_its_entries(self) -> None:
-        """How many full stops end the line does not matter; prose after it does."""
-        atoms = self.v.line_atoms("- **Example models:** `A.R` (a (b] c)..., `B.R`. See the Notes.")
+    def test_an_example_models_field_is_its_entries(self) -> None:
+        """Read whole: the separators and the full stops that end it do not
+        matter; prose before, between or after the entries does, and a note
+        counts by what it says, inline or in a sub-bullet."""
+        atoms = self.v.field_atoms(
+            ["- **Example models:** `A.R` (a (b] c)..., `B.R`. See the Notes."]
+        )
         assert atoms == [
+            ("prose", "See the Notes"),
             ("example", "A.R"),
-            ("annotation", "A.R", "(a (b] c)..."),
+            ("annotation", "A.R", "(a (b] c)"),
             ("example", "B.R"),
-            ("after", "See the Notes"),
         ]
-        assert self.v.line_atoms("- **Example models:** `A.R` (a).....") == [
+        atoms = self.v.field_atoms(
+            [
+                "- **Example models:** Fits: `A.R` for the base case; `B.R` (b),",
+                "  `C.R` (c).",
+                "  - `D.R` -- d.",
+            ]
+        )
+        assert atoms == [
+            ("prose", "Fits"),
             ("example", "A.R"),
-            ("annotation", "A.R", "(a)"),
+            ("annotation", "A.R", "for the base case"),
+            ("example", "B.R"),
+            ("annotation", "B.R", "b"),
+            ("example", "C.R"),
+            ("annotation", "C.R", "c"),
+            ("example", "D.R"),
+            ("annotation", "D.R", "d"),
+        ]
+        assert self.v.field_atoms(["- **Example models:** `A.R` (a)....."]) == [
+            ("example", "A.R"),
+            ("annotation", "A.R", "a"),
         ]
 
     def test_any_other_line_is_itself(self) -> None:
-        assert self.v.line_atoms("- **Example models:**") == [("line", "- **Example models:**")]
+        assert self.v.field_atoms(["- **Example models:**"]) == [("line", "- **Example models:**")]
         assert self.v.line_atoms("  - `A.R` (a sub-bullet)") == [
             ("line", "  - `A.R` (a sub-bullet)")
         ]

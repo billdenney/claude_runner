@@ -1,0 +1,7 @@
+# Scripts run through their shebang must keep LF line endings in every
+# checkout: with CRLF the kernel looks for an interpreter named "bash\r" or
+# "python3\r" and the script does not start. core.autocrlf=true checkouts
+# would otherwise convert them.
+*.sh text eol=lf
+# Executed by path by the integration tests.
+tests/fixtures/claude_shim/claude text eol=lf

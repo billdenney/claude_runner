@@ -65,7 +65,8 @@ confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
 prints every flag and exit code. Each exit code has one meaning; the ones that
 stop a run partway are 5 (a repair or verification step failed, the verifier
 could not run, or the revert check found base content the merge reverted),
-6 (`devtools::check`), 7 (push) and 8 (vignettes).
+6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
+before the push; finish with `--finish --hand-union-done`, step 6b).
 
 ## The merge set
 
@@ -179,9 +180,12 @@ exists to repair. Repair, then regenerate.
      merely inherited is main's, and main may have renamed or removed it
      since: on 2026-09-29 the pre-rename `Willmann_2018_rivaroxaban.R` came
      back twice that way, from branches that had been merged.
-   - Buckets the entries by (covariate header, subsection) and unions them
-     with the base's, keeping the most informative (longest) annotation per
-     filename.
+   - Reads each Example-models field whole with the dedup's parser (label
+     line, wrapped lines, sub-bullets), buckets the entries by (covariate
+     header, subsection) and unions them with the base's, keeping the most
+     informative (longest) annotation per filename. Every other annotation
+     that sets aside goes to the hand-union report (step 6b), beside the one
+     kept.
    - Honours what a branch removed or corrected, not only what it added. An
      entry the branch removed (a rename, a re-filing under another heading)
      is dropped where the base still has it, and a renamed one keeps the old
@@ -193,39 +197,66 @@ exists to repair. Repair, then regenerate.
      counts only where the branch still has entries under that heading (a
      renamed heading is not a removal of its entries), and a line every
      entry of which was removed is left as it is and reported.
-   - Rebuilds each Example-models line the union adds to: the line's own
-     models first, then the branches' additions. The line keeps its prefix
-     and the text after its last entry.
+   - Edits each Example-models field the union changes in place: the field's
+     own entries keep their places and their text, prose before, between and
+     after them stays, a model listed twice stays listed twice, and the
+     branches' additions go after the field's last entry, in its form.
 
-   **The emitter is idempotent (fixed 2026-09-29).** It used to rebuild every
-   line as `", ".join(entries) + "."`. Where an annotation opens a `(` it never
-   closes, the parser ran to the end of the line, so the annotation took the
-   line's final full stop and the emitter appended another: one per round,
-   until three lines of nlmixr2lib's covariate register (in the
-   `BACT_PTT_LOG10CFU`, `CONMED_QPRL_ORAL` and `FORM_VINP_IR` blocks) ended in
-   13 or more. It also turned `; ` separators into `, ` and dropped prose
-   between or after the entries. Now an unclosed annotation ends before the
-   next entry, else after its last `)`, else before the trailing full stops;
-   the text after the last entry is kept as it is; and a line the union adds
-   nothing to is left byte for byte, so running the union twice gives what
-   running it once gives. A line it does add to is still rebuilt with `, `
-   between entries, and text between two entries is not kept. Existing runs
-   of full stops are left as they are; they no longer grow. An Example-models
-   line with no inline list (a list-style heading with one sub-bullet per
-   model, or prose) is never rewritten; the placement check (step 7) reports
-   a branch's model missing from it.
+   **The emitter is idempotent.** Running the union twice, or three times,
+   gives what running it once gives. Each entry is its filename and note, up
+   to the next entry, a `;` or the full stop that ends a sentence, outside
+   parentheses and code, wherever the entry stands; a closing remark after
+   the last entry belongs to the field, so it never moves onto an added
+   entry and is never doubled. Notes are compared by what they say, not by
+   their form (`(text)` inline and `-- text` in a sub-bullet are the same
+   note), so a carried note does not flip between forms. A `(` that nothing
+   closes, and either bracket of a half-open interval (`(4.87, 8.56]`), is
+   text and hides no entry, and the full stops that end a field are left as
+   they are. A field the union changes nothing in is left byte for byte.
+   Prose a branch added to a field that the result lacks, and a branch's
+   models for a field that lists none (prose such as "none yet", which is
+   never rewritten), go to the hand-union report (step 6b).
 
 6b. **Dedup duplicate canonical headers** via
-   `dedup_canonical_headers.py --global inst/references/covariate-columns.md`.
+   `dedup_canonical_headers.py --global --report <report> inst/references/covariate-columns.md`.
    The union-merger folds Example-model *lines* but cannot collapse a
    whole duplicate `### CANONICAL` *block* — which is exactly what
    survives when two branches each ADD the same brand-new canonical
    (both branched from an older main, so `-X theirs` keeps one copy per
    branch). `verify_section_headers.py` only checks headers *survived*,
    not that they are *unique*, so these slip through (8 such pairs were
-   on origin/main on 2026-07-25). This step collapses each to one entry
-   (unioning example `.R` filenames) and then re-runs with `--check`;
-   any duplicate that survives **aborts the run**. `--global` (whole-file
+   on origin/main on 2026-07-25). This step collapses each to one entry,
+   keeping the copy the base has (`--prefer`, the register as `--base` has
+   it), else the longest, and carrying into it every model a dropped copy
+   lists as an Example-models entry that it lacks (each as written, with
+   its annotation, or the bare filename; an entry starts at every
+   backticked `*.R` filename outside parentheses, so `` `A.R` and `B.R` ``
+   is two entries and a filename inside an annotation is none). A field is
+   read whole: the label line, the lines that continue it, and its `-` or
+   `*` sub-bullets, under an inline list too. It also carries the dropped
+   copies' source-alias sub-bullets, and then re-runs with `--check`; any
+   duplicate that survives **aborts the run**. Keeping the base's copy
+   means a branch that re-registered a canonical main already had leaves
+   main's wording in place, so the revert check finds nothing reverted.
+   What a dropped copy words differently
+   (the heading, Description, Role, Notes, an Example-models entry for a
+   model both copies list, ...) cannot be unioned mechanically; the
+   register keeps the kept copy's wording, the script prints `HAND UNION
+   NEEDED` with the fields, and the dropped wording goes verbatim to a
+   hand-union report in the worktree's git directory, never into the
+   register. The union merge (step 6) and the restore (step 6c) append to
+   the same report: an annotation "longest wins" set aside, and a canonical
+   two branches added in different words. Every later step still runs; the
+   run then stops before the push (exit 9) and prints the worktree, the
+   report and the `--finish --hand-union-done` command, and any later
+   failure (check, vignettes) names the report too. Union the wording into
+   the register by hand, keeping each source's attribution, commit in the
+   worktree, and run that command: it checks for duplicates again, pushes
+   the branch and prints the PR text, without redoing the merge. Without
+   `--hand-union-done`, `--finish` prints the report and stops (exit 9)
+   while it holds anything. The report lives in the worktree's git
+   directory and goes with the worktree; copy it before removing one.
+   `--global` (whole-file
    uniqueness) is correct for the covariate register; the default
    per-`##`-section scope is what you'd use on `compartment-names.md`,
    where the same token is legitimately both a compartment and a suffix.
@@ -284,6 +315,14 @@ exists to repair. Repair, then regenerate.
    loss of `fm_cysmer` / `fm_gluc` / `fm_sulf` surfaced when no register
    verifier caught it.
 
+   Every `### ` heading counts, a backticked one (`` ### `prob_<endpoint>` ``)
+   or prose included. When two
+   branches added the same canonical in different words and the merge lost
+   it, the first branch's copy is restored and each other copy is printed in
+   full and appended to the hand-union report (step 6b), for a hand union.
+   So is a name a branch added to a multi-name heading that the merge kept
+   without it.
+
    Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.
 
 6d. **Union-merge NEWS.md** via `union_merge_news.py`. NEWS.md has ONE
@@ -336,7 +375,13 @@ exists to repair. Repair, then regenerate.
       `##` / `### CANONICAL` header the branch introduced must survive.
    c. **Placement** (`verify_register_placement.py`) — every
       *(canonical, model.R)* pair the branch recorded must still be filed
-      **under that canonical**.
+      **under that canonical**, and every source-alias bullet it added must
+      still be under that canonical (the same words; inside a longer bullet
+      counts). A model is filed only as an Example-models entry, inline or in
+      a `-`/`*` sub-bullet, read the way the dedup reads entries: a filename
+      inside another entry's parentheses, an alias bullet or Notes prose is a
+      mention, so a merge that kept only the mention of a lost model reports
+      it.
 
    Check (c) was added 2026-08-31 because (a) and (b) both pass in the case
    that matters most: two branches register the SAME canonical from mains
@@ -666,7 +711,11 @@ then run again with `--yes` once the operator agrees.
 ### Idempotence
 
 The script aborts cleanly if the target worktree already exists.
-To re-run, remove the worktree first:
+A run that stopped for a hand union (exit 9) is finished with `--finish
+--hand-union-done` on the same worktree, which keeps the hand edits; see
+step 6b. Removing the worktree deletes its hand-union report (the run that
+finds the worktree says where it is), so copy the report first. To re-run
+from scratch, remove the worktree first:
 
 ```bash
 git -C <repo> worktree remove --force .worktrees/<branch-name>

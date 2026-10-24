@@ -35,13 +35,14 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
+    literal,
     load_settings_or_exit,
     require_queue_option,
     resolve_per_queue_config,
+    styled,
 )
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.schema import Settings
@@ -279,22 +280,23 @@ def list_tasks(
         return
     for item in out:
         if "error" in item:
-            console.print(f"[red]{item['id']}[/]: {item['error']}")
+            console.print(literal(styled(item["id"], "red"), ": ", item["error"]))
             continue
-        rank_prefix = f"[dim]#{item['dispatch_rank']:>3}[/] " if "dispatch_rank" in item else ""
-        console.print(
-            f"{rank_prefix}[bold]{item['id']}[/]  "
-            f"[dim]({item['model']}, {item['effort']}, "
-            f"priority={item['priority']})[/]"
+        rank_part = (
+            styled(f"#{item['dispatch_rank']:>3} ", "dim") if "dispatch_rank" in item else ""
         )
-        console.print(f"  {item['title']}")
+        console.print(
+            literal(
+                rank_part,
+                styled(item["id"], "bold"),
+                "  ",
+                styled(f"({item['model']}, {item['effort']}, priority={item['priority']})", "dim"),
+            )
+        )
+        console.print(literal("  ", item["title"]))
         if item["effort_error"] is not None:
             console.print(
-                f"  invalid effort: {item['effort_error']}",
-                style="red",
-                markup=False,
-                highlight=False,
-                soft_wrap=True,
+                literal(f"  invalid effort: {item['effort_error']}", style="red"), soft_wrap=True
             )
 
 
@@ -403,10 +405,16 @@ def list_states(
             if status in ("failed", "failed_circuit_breaker")
             else "yellow"
         )
-        console.print(f"[bold]{item.get('task_id', item.get('id', '?'))}[/]  [{color}]{status}[/]")
+        console.print(
+            literal(
+                styled(item.get("task_id", item.get("id", "?")), "bold"),
+                "  ",
+                styled(status, color),
+            )
+        )
         _print_deferral(console, item)
         if item.get("error"):
-            console.print(f"  [dim]error:[/] {item['error']}")
+            console.print(literal("  ", styled("error:", "dim"), " ", item["error"]))
 
 
 @app.command("holds")
@@ -535,74 +543,72 @@ def holds(
     if json:
         print(_json.dumps(payload, indent=2))
         return
-    # Labels are Rich markup; every task id, reason and error is escaped and
-    # printed without emoji codes, so a "[/]" in a hook's stderr or a ":b:"
-    # in a path prints as written.
     console.print(
-        f"[bold]eligible:[/] {len(preview.eligible)} ({can_start_now} can start now, "
-        f"{len(preview.affinity_held)} waiting for the account their session runs on)",
-        highlight=False,
+        literal(
+            styled("eligible:", "bold"),
+            f" {len(preview.eligible)} ({can_start_now} can start now, "
+            f"{len(preview.affinity_held)} waiting for the account their session runs on)",
+        )
     )
     for task in preview.eligible:
         route = preview.routes[task.id] or "no account now"
-        console.print(
-            f"  {escape(task.id)} ({preview.eligible_statuses[task.id]}; {escape(route)})",
-            highlight=False,
-            emoji=False,
-        )
+        console.print(literal(f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})"))
     for category, n in held.items():
-        console.print(f"[bold]held, {category}:[/] {n}", highlight=False)
-    console.print(f"[bold]completed:[/] {payload['completed']}", highlight=False)
+        console.print(literal(styled(f"held, {category}:", "bold"), f" {n}"))
+    console.print(literal(styled("completed:", "bold"), f" {payload['completed']}"))
     cap = "none" if preview.queue_cap is None else str(preview.queue_cap)
     if preview.warming_up:
         cap += " (warm-up, until a first task completes)"
-    console.print(f"[bold]queue-wide cap:[/] {cap}", highlight=False)
+    console.print(literal(styled("queue-wide cap:", "bold"), f" {cap}"))
     console.print(
-        f"[bold]selection runs every:[/] {settings.usage.poll_interval_s:g} s", highlight=False
+        literal(styled("selection runs every:", "bold"), f" {settings.usage.poll_interval_s:g} s")
     )
     for worker in parked:
         cap = "past its time limit" if worker["past_cap"] else "within its time limit"
         state = "still running" if worker["running"] else "exited"
         console.print(
-            f"[bold]parked worker:[/] {escape(str(worker['task_id']))} pid {worker['pid']} "
-            f"since {worker['started_at']}, {state} ({cap})",
-            highlight=False,
-            emoji=False,
+            literal(
+                styled("parked worker:", "bold"),
+                f" {worker['task_id']} pid {worker['pid']} "
+                f"since {worker['started_at']}, {state} ({cap})",
+            )
         )
     for item in retrying:
         console.print(
-            f"[bold]retries at {item['next_eligible_at']}:[/] {escape(str(item['task_id']))}: "
-            f"{escape(str(item['deferred_reason']))}",
-            highlight=False,
-            emoji=False,
+            literal(
+                styled(f"retries at {item['next_eligible_at']}:", "bold"),
+                f" {item['task_id']}: {item['deferred_reason']}",
+            )
         )
     for task_id, ids in missing:
         console.print(
-            f"[bold]missing dependency:[/] {escape(task_id)} needs {escape(', '.join(ids))} "
-            "(no task file in todo/, not completed or running)",
-            highlight=False,
-            emoji=False,
+            literal(
+                styled("missing dependency:", "bold"),
+                f" {task_id} needs {', '.join(ids)} "
+                "(no task file in todo/, not completed or running)",
+            )
         )
     for task_id, deps in unmeetable:
         console.print(
-            f"[bold]unmeetable dependency:[/] {escape(task_id)} needs "
-            f"{escape('; '.join(u.describe() for u in deps))}",
-            highlight=False,
-            emoji=False,
+            literal(
+                styled("unmeetable dependency:", "bold"),
+                f" {task_id} needs {'; '.join(u.describe() for u in deps)}",
+            )
         )
     for note in unread:
         console.print(
-            f"state of {note['task_id']} not read, so not detailed above: {note['error']}",
-            style="yellow",
-            highlight=False,
-            markup=False,
-            emoji=False,
+            literal(
+                f"state of {note['task_id']} not read, so not detailed above: {note['error']}",
+                style="yellow",
+            )
         )
     if snapshot_error:
         console.print(
-            f"[yellow]supervisor.json not read, in-flight tasks unknown:[/] {escape(snapshot_error)}",
-            highlight=False,
-            emoji=False,
+            literal(
+                styled("supervisor.json not read, in-flight tasks unknown:", "yellow"),
+                " ",
+                snapshot_error,
+            )
         )
 
 
@@ -734,30 +740,35 @@ def show_task(
         print(_json.dumps(payload, default=str, indent=2))
         return
 
-    console.print(f"[bold]{task_id}[/]")
+    console.print(literal(styled(task_id, "bold")))
     task_payload = payload.get("task")
     if isinstance(task_payload, dict):
-        console.print(f"  title: {task_payload.get('title')}")
-        console.print(f"  model: {task_payload.get('model')}  effort: {task_payload.get('effort')}")
+        console.print(literal("  title: ", task_payload.get("title")))
+        console.print(
+            literal(f"  model: {task_payload.get('model')}  effort: {task_payload.get('effort')}")
+        )
     if "task_error" in payload:
-        console.print(f"  [red]task error:[/] {payload['task_error']}")
+        console.print(literal("  ", styled("task error:", "red"), " ", payload["task_error"]))
     state_payload = payload.get("state")
     if isinstance(state_payload, dict):
         console.print(
-            f"  status: {state_payload.get('status')}  attempts: {state_payload.get('attempts')}"
+            literal(
+                f"  status: {state_payload.get('status')}  "
+                f"attempts: {state_payload.get('attempts')}"
+            )
         )
-        console.print(f"  session_id: {state_payload.get('session_id')}")
+        console.print(literal("  session_id: ", state_payload.get("session_id")))
         _print_deferral(console, state_payload)
     if "state_error" in payload:
-        console.print(f"  [red]state error:[/] {payload['state_error']}")
+        console.print(literal("  ", styled("state error:", "red"), " ", payload["state_error"]))
     readiness = payload.get("readiness")
     if isinstance(readiness, dict):
         satisfied = readiness["satisfied"]
         required = readiness["required"]
         colour = "green" if satisfied == required else "yellow"
-        console.print(f"  requires: [{colour}]{satisfied}/{required} satisfied[/]")
+        console.print(literal("  requires: ", styled(f"{satisfied}/{required} satisfied", colour)))
         for reason in readiness.get("unmet", []):
-            console.print(f"    [yellow]✗[/] {reason}")
+            console.print(literal("    ", styled("✗", "yellow"), " ", reason))
 
 
 @app.command("add")
@@ -832,11 +843,15 @@ def add_task(
     settings = load_settings_or_exit(resolve_per_queue_config(config, qd), console)
 
     if not _ID_RE.match(task_id):
-        console.print(f"[bold red]invalid task id:[/] {task_id!r} (allowed: {_ID_RE.pattern})")
+        console.print(
+            literal(
+                styled("invalid task id:", "bold red"), f" {task_id!r} (allowed: {_ID_RE.pattern})"
+            )
+        )
         raise typer.Exit(code=2)
 
     if priority not in ("low", "normal", "high"):
-        console.print(f"[bold red]invalid priority:[/] {priority!r}")
+        console.print(literal(styled("invalid priority:", "bold red"), f" {priority!r}"))
         raise typer.Exit(code=2)
 
     if prompt is None and prompt_file is None:
@@ -851,7 +866,7 @@ def add_task(
         try:
             prompt_text = prompt_file.read_text()
         except OSError as exc:
-            console.print(f"[bold red]read failed:[/] {exc}")
+            console.print(literal(styled("read failed:", "bold red"), " ", exc))
             raise typer.Exit(code=2) from exc
 
     try:
@@ -863,6 +878,7 @@ def add_task(
             f"invalid effort: {exc}",
             style="bold red",
             markup=False,
+            emoji=False,
             highlight=False,
             soft_wrap=True,
         )
@@ -870,7 +886,7 @@ def add_task(
 
     target = task_path_for(qd, task_id)
     if target.exists() and not overwrite:
-        console.print(f"[bold red]task already exists:[/] {target}")
+        console.print(literal(styled("task already exists:", "bold red"), " ", target))
         raise typer.Exit(code=2)
 
     # Validate each --add-dir: warn (don't fail) on missing entries so the
@@ -878,7 +894,11 @@ def add_task(
     # later (e.g. a worktree the pre-dispatch hook creates).
     for d in add_dir:
         if not d.is_dir():
-            console.print(f"[yellow]warning:[/] --add-dir {d} is not an existing directory")
+            console.print(
+                literal(
+                    styled("warning:", "yellow"), f" --add-dir {d} is not an existing directory"
+                )
+            )
 
     # Resolve the task's working_dir.
     #
@@ -905,7 +925,7 @@ def add_task(
                 settings.queue.working_dir_template, task_id
             )
         except WorkingDirTemplateError as exc:
-            console.print(f"[bold red]{exc}[/]")
+            console.print(literal(exc, style="bold red"))
             raise typer.Exit(code=2) from exc
 
     task = Task(
@@ -925,10 +945,10 @@ def add_task(
     try:
         write_task_atomic(task, target)
     except QueueIOError as exc:
-        console.print(f"[bold red]write failed:[/] {exc}")
+        console.print(literal(styled("write failed:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
 
-    console.print(f"[green]wrote {target}[/]")
+    console.print(literal(f"wrote {target}", style="green"))
     sys.stdout.flush()
 
 
@@ -975,7 +995,7 @@ def backfill_working_dir(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2)
 
     updated: list[dict[str, str]] = []
@@ -1033,13 +1053,15 @@ def backfill_working_dir(
         print(_json.dumps(payload, indent=2))
     else:
         verb = "would update" if dry_run else "updated"
-        console.print(f"[green]{verb} {len(updated)} task(s)[/]; skipped {len(skipped)}")
+        console.print(
+            literal(styled(f"{verb} {len(updated)} task(s)", "green"), f"; skipped {len(skipped)}")
+        )
         for u in updated:
-            console.print(f"  [bold]{u['id']}[/]  -> {u['working_dir']}")
+            console.print(literal("  ", styled(u["id"], "bold"), f"  -> {u['working_dir']}"))
         if errors:
-            console.print(f"[bold red]{len(errors)} error(s):[/]")
+            console.print(literal(f"{len(errors)} error(s):", style="bold red"))
             for e in errors:
-                console.print(f"  [red]{e['id']}[/]: {e['error']}")
+                console.print(literal("  ", styled(e["id"], "red"), ": ", e["error"]))
     if errors:
         raise typer.Exit(code=1)
 
@@ -1104,7 +1126,7 @@ def restart_fresh(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2)
     try:
         state = load_state(state_path)
@@ -1113,7 +1135,7 @@ def restart_fresh(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2) from exc
 
     if state.status not in _RESTART_FRESH_ALLOWED:
@@ -1126,7 +1148,7 @@ def restart_fresh(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2)
 
     if state.session_id is None and state.session_account is None:
@@ -1142,7 +1164,9 @@ def restart_fresh(
                 )
             )
         else:
-            console.print(f"[dim]task {task_id} has no active session; nothing to clear.[/]")
+            console.print(
+                literal(f"task {task_id} has no active session; nothing to clear.", style="dim")
+            )
         return
 
     prior_session = state.session_id
@@ -1169,9 +1193,11 @@ def restart_fresh(
         )
     else:
         console.print(
-            f"[green]cleared session for task {task_id}:[/] "
-            f"session_id={prior_session!r}, session_account={prior_account!r}. "
-            "Next dispatch starts fresh on any available account."
+            literal(
+                styled(f"cleared session for task {task_id}:", "green"),
+                f" session_id={prior_session!r}, session_account={prior_account!r}. "
+                "Next dispatch starts fresh on any available account.",
+            )
         )
 
 
@@ -1261,7 +1287,7 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2)
     try:
         task = load_task(task_path)
@@ -1270,7 +1296,7 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2) from exc
 
     state_path = state_path_for(qd, task_id)
@@ -1286,14 +1312,16 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg, "pid": current_state.pid}))
         else:
-            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                msg, style="bold red", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         raise typer.Exit(code=2)
     if current_status not in fd_mod.FORCE_DISPATCHABLE:
         msg = f"task {task_id} status={current_status!r} is not dispatchable"
         if json:
             print(_json.dumps({"ok": False, "error": msg, "status": current_status}))
         else:
-            console.print(f"[bold red]{msg}[/]")
+            console.print(literal(msg, style="bold red"))
         raise typer.Exit(code=2)
 
     live = fd_mod.live_worker_of(qd, task_id, current_state)
@@ -1302,7 +1330,9 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg, "pid": live.pid}))
         else:
-            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                msg, style="bold red", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         raise typer.Exit(code=2)
 
     # ADR-0010. Checked here as well as by both force paths so that, with a
@@ -1314,7 +1344,9 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                msg, style="bold red", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         raise typer.Exit(code=2)
 
     # ADR-0030, checked here for the same reason: both force paths refuse a
@@ -1325,7 +1357,9 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg, "unmet": unmet}))
         else:
-            console.print(msg, style="bold red", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                msg, style="bold red", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         raise typer.Exit(code=2)
 
     if _supervisor_is_alive(qd):
@@ -1335,9 +1369,15 @@ def force_dispatch(
         )
         if not json:
             console.print(
-                f"[green]request written:[/] {path}\n"
-                f"[dim]supervisor will pick it up on the next tick "
-                f"(allow_over_limit={over_limit}).[/]"
+                literal(
+                    styled("request written:", "green"),
+                    f" {path}\n",
+                    styled(
+                        "supervisor will pick it up on the next tick "
+                        f"(allow_over_limit={over_limit}).",
+                        "dim",
+                    ),
+                )
             )
         picked_up = _poll_until_running(qd, task_id, wait_seconds)
         not_started = (
@@ -1354,7 +1394,7 @@ def force_dispatch(
         if json:
             print(_json.dumps(payload))
         elif picked_up:
-            console.print(f"[green]task {task_id} entered `running` status.[/]")
+            console.print(literal(f"task {task_id} entered `running` status.", style="green"))
         elif wait_seconds > 0:
             # The supervisor deletes the request both when it dispatches the
             # task and when it drops the request, so only a file still on
@@ -1380,7 +1420,9 @@ def force_dispatch(
                     "deferred it) or dropped the request, logging a WARNING that says "
                     f"why. Check `queue show {task_id}`."
                 )
-            console.print(msg, style="yellow", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                msg, style="yellow", markup=False, emoji=False, highlight=False, soft_wrap=True
+            )
         return
 
     # No supervisor running: do it inline. No race possible.
@@ -1398,7 +1440,7 @@ def force_dispatch(
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
         else:
-            console.print(f"[bold red]force-dispatch failed:[/] {msg}")
+            console.print(literal(styled("force-dispatch failed:", "bold red"), " ", msg))
         raise typer.Exit(code=2) from exc
 
     if json:
@@ -1419,8 +1461,11 @@ def force_dispatch(
         return
     color = "green" if new_state.status == "completed" else "yellow"
     console.print(
-        f"[{color}]task {task_id} finished with status={new_state.status}"
-        f", attempts={new_state.attempts}, stop_reason={new_state.stop_reason}[/]"
+        literal(
+            f"task {task_id} finished with status={new_state.status}"
+            f", attempts={new_state.attempts}, stop_reason={new_state.stop_reason}",
+            style=color,
+        )
     )
     if new_state.status == "deferred" and new_state.deferred_reason:
         console.print(

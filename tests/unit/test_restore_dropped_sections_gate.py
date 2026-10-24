@@ -254,3 +254,194 @@ def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
     assert rc == 0, out
     assert "OLD_SPELLING" not in out, out
     assert "deliberate rename/retire" in out, out
+
+
+def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
+    """A lost block under a backticked heading (``### `prob_<endpoint>```) or a
+    prose heading is restored like any other, keyed without its backticks."""
+    added = ["KEEP_ME", "NEW_NAME", "`prob_<endpoint>`", "Why kon is not canonical"]
+    make_remote_branch(repo, "adds", "main", added, "adds two")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    merge(repo, "clobbers")
+    assert "prob_" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# 2 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    prob_<endpoint>  (## Section A)\n"
+        "    Why kon is not canonical  (## Section A)\n"
+    ) in out, out
+
+
+def test_a_canonical_two_branches_added_differently_names_the_other_copy(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Both copies were lost; one is restored, and the other's text is printed,
+    and appended to the hand-union report, instead of being skipped without a
+    word."""
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", "TWICE"], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")
+    text = (
+        (repo / REGISTER)
+        .read_text()
+        .replace(
+            "### TWICE (**canonical for TWICE**)\n- **Type:** x",
+            "### TWICE (**canonical for TWICE**)\n- **Type:** y, as the second branch words it",
+        )
+    )
+    (repo / REGISTER).write_text(text)
+    commit(repo, "second wording")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "TWICE" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "    TWICE  (## Section A)\n" in out, out
+    assert (
+        "# TWICE: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n"
+        "    ### TWICE (**canonical for TWICE**)\n"
+        "    - **Type:** y, as the second branch words it\n"
+    ) in out, out
+    report = tmp_path / "hand-union.md"
+    report.write_text("# Hand union needed in the union file\n")
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--branch",
+            "consolidation",
+            "--base",
+            "main",
+            "--file",
+            REGISTER,
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert "### TWICE (**canonical for TWICE**)\n- **Type:** x\n" in (repo / REGISTER).read_text()
+    assert report.read_text() == (
+        "# Hand union needed in the union file\n"
+        "# Hand union needed in refs.md\n"
+        "\n"
+        "Two merged branches added each canonical below in different words, and the\n"
+        "merge lost both. The restore put the first branch's copy back; the other is\n"
+        "below, verbatim. Union it into the register by hand, keeping each source's\n"
+        "attribution, and commit.\n"
+        "\n"
+        "## TWICE\n"
+        "\n"
+        "### claude/second's copy (the register has claude/first's)\n"
+        "\n"
+        "In the register:\n"
+        "\n"
+        "````\n"
+        "### TWICE (**canonical for TWICE**)\n"
+        "- **Type:** x\n"
+        "````\n"
+        "\n"
+        "In that copy:\n"
+        "\n"
+        "````\n"
+        "### TWICE (**canonical for TWICE**)\n"
+        "- **Type:** y, as the second branch words it\n"
+        "````\n"
+        "\n"
+    )
+
+
+def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
+    """A restored multi-name heading's other names count as present: none is
+    reported as dropped from a heading the restore put back."""
+    added = ["KEEP_ME", "NEW_NAME", "MULTI_A, MULTI_B"]
+    make_remote_branch(repo, "adds", "main", added, "adds one")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    merge(repo, "clobbers")
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert "# 1 canonical(s) dropped by the merge and missing from refs.md:\n" in out, out
+    assert "    MULTI_A  (## Section A)\n" in out, out
+    assert "HEADER-NAME LOST" not in out, out
+
+
+def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The block is there under its other name, so the repair is the heading;
+    it is printed and, with --report, added to the hand-union report."""
+    write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
+    commit(repo, "main registers fm_a")
+    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", "fm_a, fm_b"], "adds fm_b")
+    git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
+    text = (repo / REGISTER).read_text()
+    (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
+    commit(repo, "reword fm_a")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/keeps",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    merge(repo, "keeps")
+    assert "fm_b" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    report = tmp_path / "hand-union.md"
+    out = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--branch",
+            "consolidation",
+            "--base",
+            "main",
+            "--file",
+            REGISTER,
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "# HEADER-NAME LOST" in out.stdout
+    assert report.read_text().endswith(
+        "## fm_a\n"
+        "\n"
+        "### heading name fm_b, which claude/adds added\n"
+        "\n"
+        "In the register:\n"
+        "\n"
+        "````\n"
+        "### fm_a (**canonical for fm_a, reworded**)\n"
+        "````\n"
+        "\n"
+        "In that branch's copy:\n"
+        "\n"
+        "````\n"
+        "### fm_a, fm_b (**canonical for fm_a, fm_b**)\n"
+        "````\n"
+        "\n"
+    )

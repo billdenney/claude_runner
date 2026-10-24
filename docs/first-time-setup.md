@@ -7,12 +7,14 @@ subcommand referenced in older docs (see ADR-0017).
 ## 1. Install the package
 
 ```sh
-pip install -e '/path/to/claude_task_runner[dev]'
+pip install -e '/path/to/claude_task_runner[dev]' \
+  -c /path/to/claude_task_runner/.github/ci-constraints.txt
 which claude-task-runner   # verify on PATH
 ```
 
 The `dev` extras add the test and lint tools (`pytest`, `ruff`, `mypy`,
-`pre-commit`). The runner and the doctor need none of them.
+`pre-commit`). The runner and the doctor need none of them. The
+constraints file holds mypy and types-PyYAML at the versions CI uses.
 
 Then install the skills into `~/.claude/skills/`:
 

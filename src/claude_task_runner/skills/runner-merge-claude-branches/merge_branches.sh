@@ -19,7 +19,13 @@
 #   7. R-side registry regeneration (buildModelDb + document)
 #   8. devtools::check pre-push gate
 #   9. Parallel vignette validation pre-push gate
-#  10. Push branch + print PR title/body
+#  10. Push branch + print PR title/body. When a repair set wording aside
+#      (copies of a canonical worded differently, a model annotated two ways,
+#      a canonical two branches added in different words), the run stops
+#      first (exit 9): the register keeps one wording, the others are in a
+#      hand-union report, and after the hand union is committed --finish
+#      --hand-union-done pushes and prints the PR text from the same
+#      worktree. Every later failure names that report too.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -71,6 +77,19 @@
 #                           (default: 900). Increase if you have a model
 #                           that legitimately needs >15 minutes.
 #   --skip-push             Don't push the branch (steps 1-9 only).
+#   --finish                Only push the existing worktree's branch and print
+#                           the PR text: the way to complete a run that stopped
+#                           for a hand union (exit 9), or failed a later gate,
+#                           once the fix is committed. Takes the same --repo,
+#                           --base, --branch-name, --union-file,
+#                           --register-file and --no-register-files as the run
+#                           (the stop message prints them); refuses a worktree
+#                           with uncommitted changes, checks again that no
+#                           duplicate canonical remains, and prints a pending
+#                           hand-union report and stops (exit 9) unless
+#                           --hand-union-done is given.
+#   --hand-union-done       With --finish: the report's wording is unioned into
+#                           the register and committed; push anyway.
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
 #                           Required when stdin is not a terminal, as in an
@@ -88,18 +107,32 @@
 #      Rscript missing while an R step is enabled, git fetch failed, --base or
 #      an --extra-ref does not resolve, no branch matched, a survey diff
 #      failed (no merge base, or a shallow clone), no --yes without a
-#      terminal, or the worktree already exists
+#      terminal, or the worktree already exists; for --finish, no worktree,
+#      a worktree on another branch, or one with uncommitted changes
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
-#      script failed, duplicate canonical headers survived dedup, the
+#      script crashed, duplicate canonical headers survived dedup (or a
+#      register on --base is missing from the worktree at --finish), the
 #      verifier could not run, the revert check found base content the merge
 #      reverted (or could not run), or the R registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
+#   9  a hand union is needed: a repair set wording aside and every step but
+#      the push ran; the message names the worktree, the report of the
+#      wording the register lacks, and the --finish command to run once the
+#      hand union is committed. --finish without --hand-union-done also
+#      exits 9 while that report holds anything.
 set -euo pipefail
 trap 'echo "ERROR: unexpected failure (exit $?) at line $LINENO" >&2; exit 1' ERR
+trap 'remind_hand_union $?' EXIT
+# An interrupt or a kill exits with its own status, so the EXIT trap names a
+# pending report then too, rather than seeing the status of the last command.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+HAND_UNION_REPORT=""
+HAND_UNION_DONE=0
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -110,13 +143,15 @@ REPO="${PWD}"
 BASE="origin/main"
 PATTERN="origin/claude/*"
 BRANCH_NAME=""
-UNION_FILE="inst/references/covariate-columns.md"
+DEFAULT_UNION_FILE="inst/references/covariate-columns.md"
+UNION_FILE="$DEFAULT_UNION_FILE"
 # Register files that are NOT the Example-models union file but are still
 # structured '### CANONICAL' registers that -X theirs can silently gut.  The
 # 2026-08-31 consolidation had 23 branches touching compartment-names.md and 11
 # touching parameter-names.md while every repair ran only against UNION_FILE;
 # 11 canonical blocks were lost.  These get restore + dedup + placement checks.
-REGISTER_FILES=("inst/references/compartment-names.md" "inst/references/parameter-names.md")
+DEFAULT_REGISTER_FILES=("inst/references/compartment-names.md" "inst/references/parameter-names.md")
+REGISTER_FILES=("${DEFAULT_REGISTER_FILES[@]}")
 FORBID_PATHS=("inst/modeldb.qs2")
 SKIP_R_REGEN=0
 SKIP_CHECK=0
@@ -124,6 +159,7 @@ SKIP_VIGNETTES=0
 VIGNETTE_JOBS=""
 VIGNETTE_TIMEOUT=900
 SKIP_PUSH=0
+FINISH=0
 DRY_RUN=0
 ASSUME_YES=0
 EXTRA_REFS=()
@@ -146,6 +182,190 @@ die() {  # <exit code> <message>
 need_value() {
   [[ $# -ge 2 ]] || die 2 "$1 needs a value"
 }
+
+remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
+  local rc=$1
+  # --hand-union-done: the operator has already unioned the report's wording.
+  if (( rc != 0 && rc != 9 && ! HAND_UNION_DONE )) \
+    && [[ -n "$HAND_UNION_REPORT" && -s "$HAND_UNION_REPORT" ]]; then
+    {
+      echo
+      echo "NOTE: a hand union is still pending. The wording the register lacks is in"
+      echo "    $HAND_UNION_REPORT"
+      echo "  Union it into the register and commit before the push; the report goes"
+      echo "  with the worktree (git worktree remove), so copy it elsewhere to keep it."
+    } >&2
+  fi
+}
+
+run_dedup() {  # <register> [flags]: fix duplicates, their differing wording to the report
+  local file=$1 base_copy
+  shift
+  # The register as the base has it: of a canonical's copies, the dedup keeps
+  # the one the base has, so the merge reverts none of the base's wording.
+  base_copy="$(git rev-parse --path-format=absolute --git-path dedup-base-copy.md)"
+  git show "$BASE:$file" > "$base_copy" 2>/dev/null || : > "$base_copy"
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$@" --report "$HAND_UNION_REPORT" \
+    --prefer "$base_copy" "$file" \
+    || die 5 "dedup_canonical_headers.py crashed on $file (exit $?); see its output above."
+}
+
+check_no_duplicates() {  # gate: no duplicate canonical remains in any register
+  local reg scope
+  for reg in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+    [[ -n "$reg" ]] || continue
+    scope=()
+    if [[ "$reg" == "$UNION_FILE" ]]; then scope=(--global); fi
+    if [[ -f "$reg" ]]; then
+      "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" ${scope[@]+"${scope[@]}"} --check "$reg" \
+        || die 5 "duplicate canonical headers remain in $reg."
+    elif git cat-file -e "$BASE:$reg" 2>/dev/null; then
+      die 5 "$reg is on $BASE but missing from the worktree; restore it before the push."
+    else
+      echo "    (duplicates) $reg is not in this repository; nothing to check."
+    fi
+  done
+}
+
+finish_command() {  # this run's --finish command line, every value shell-quoted
+  local cmd reg
+  cmd="bash $(printf '%q' "$SCRIPT_DIR/merge_branches.sh") --repo $(printf '%q' "$REPO")"
+  cmd+=" --base $(printf '%q' "$BASE") --branch-name $(printf '%q' "$BRANCH_NAME")"
+  if [[ "$UNION_FILE" != "$DEFAULT_UNION_FILE" ]]; then
+    cmd+=" --union-file $(printf '%q' "$UNION_FILE")"
+  fi
+  if [[ "${REGISTER_FILES[*]:-}" != "${DEFAULT_REGISTER_FILES[*]}" ]]; then
+    cmd+=" --no-register-files"
+    for reg in "${REGISTER_FILES[@]:-}"; do
+      if [[ -n "$reg" ]]; then cmd+=" --register-file $(printf '%q' "$reg")"; fi
+    done
+  fi
+  echo "$cmd --finish"
+}
+
+stop_for_hand_union() {
+  {
+    echo
+    echo "STOP: every step but the push ran, but a repair set wording aside: copies of"
+    echo "  a canonical, or of a model's annotation, worded differently. The register"
+    echo "  keeps one wording; each other is in"
+    echo "    $HAND_UNION_REPORT"
+    echo "  (it goes with the worktree, git worktree remove, so copy it to keep it)."
+    echo "  1. In the worktree $WT_ABS, union that wording into the register"
+    echo "     by hand, keeping each source's attribution, and commit."
+    echo "  2. Then push the branch and print the PR text:"
+    echo "     $(finish_command) --hand-union-done"
+  } >&2
+  exit 9
+}
+
+push_and_report() {  # push the branch (unless --skip-push) and print the PR text
+  if (( SKIP_PUSH )); then
+    echo
+    echo "==> --skip-push set; skipping push."
+  else
+    echo
+    echo "==> Pushing $BRANCH_NAME to origin"
+    if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
+      echo "ERROR: push failed." >&2
+      exit 7
+    fi
+  fi
+
+  # Print PR title + body.
+  PR_TITLE_LIMIT=70
+  NEW_MODELS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
+  ASCII_FIXES=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
+  OTHER_COMMITS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
+
+  # Compose a short title.
+  SUFFIX_BITS=()
+  [[ "$NEW_MODELS" -gt 0 ]] && SUFFIX_BITS+=("$NEW_MODELS new models")
+  [[ "$ASCII_FIXES" -gt 0 ]] && SUFFIX_BITS+=("$ASCII_FIXES ASCII fixes")
+  PR_TITLE="Merge $SUCCESS claude/* branches"
+  if [[ ${#SUFFIX_BITS[@]} -gt 0 ]]; then
+    PR_TITLE="$PR_TITLE ($(IFS=, ; echo "${SUFFIX_BITS[*]}"))"
+  fi
+
+  # Trim title to limit.
+  if (( ${#PR_TITLE} > PR_TITLE_LIMIT )); then
+    PR_TITLE="${PR_TITLE:0:$((PR_TITLE_LIMIT-1))}…"
+  fi
+
+  echo
+  echo "================================================================"
+  echo "Suggested PR title (≤${PR_TITLE_LIMIT} chars):"
+  echo
+  echo "$PR_TITLE"
+  echo
+  echo "Suggested PR body:"
+  echo
+  cat <<EOF
+## Summary
+
+Consolidates $SUCCESS unmerged \`claude/<task-id>\` branches from the
+nlmixr2lib popPK ingestion runner queue into one review-ready
+branch.
+
+### Categorical breakdown
+
+- $NEW_MODELS new-model addition(s)
+- $ASCII_FIXES vignette ASCII-gate cleanup(s)
+- $OTHER_COMMITS other (follow-up edits, model updates, etc.)
+
+### Mechanical regeneration commit
+
+After the merges, ran:
+
+\`\`\`sh
+Rscript -e 'devtools::load_all("."); nlmixr2lib:::buildModelDb(); devtools::document()'
+\`\`\`
+
+to canonically rebuild \`data/modeldb.rda\`, \`inst/modeldb.qs2\`, the
+\`_pkgdown.yml\` navbar, and \`man/modeldb.Rd\` from all model \`.R\`
+files now on the branch.
+
+### Procedural note for future merges
+
+The merge strategy was \`-X theirs\` for binary registry files +
+metadata. This strategy clobbers \`$UNION_FILE\` because multiple
+branches independently rewrite the same \`**Example models:**\`
+lines. The script's union-merger step reconstructs the file by
+parsing each branch's diff and unioning per-model annotations.
+**Do not skip the union-merge step on future runs.**
+
+### Per-task tracking after this PR merges
+
+Each source \`claude/<task-id>\` branch was folded in with a real
+\`git merge\`, so its tip is a true ancestor of this branch. Once
+this PR lands on main, every consolidated branch is reported as
+merged by \`git branch --merged origin/main\` and GitHub marks each
+as "Merged" automatically — no force-advance step required. The
+source branches can then be deleted at the operator's discretion
+(\`git push --delete origin claude/<task-id>\`).
+
+## Test plan
+
+- [ ] \`devtools::check(error_on = "error", args = "--no-build-vignettes")\` (already run; passed pre-push)
+- [ ] \`nlmixr2lib::modellib()\` lists all newly-added models
+- [ ] Spot-check one of the new models: \`nlmixr2lib::readModelDb(name = "<one>")\` returns a function
+- [ ] Rendered pkgdown navbar shows the new vignettes under the right section
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+  echo
+  echo "================================================================"
+  echo
+  echo "Open the PR via:"
+  echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
+  echo
+  echo "Worktree left at: $WT_ABS"
+  echo
+  echo "Source branches were folded in with real merges, so after this PR"
+  echo "lands on main they show as \"Merged\" automatically (git branch"
+  echo "--merged origin/main lists them). No post-merge advance step needed."
+}
+
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -170,6 +390,8 @@ while [[ $# -gt 0 ]]; do
     --vignette-jobs) need_value "$@"; VIGNETTE_JOBS="$2"; shift 2 ;;
     --vignette-timeout) need_value "$@"; VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
+    --finish) FINISH=1; shift ;;
+    --hand-union-done) HAND_UNION_DONE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -189,6 +411,10 @@ fi
 [[ "$VIGNETTE_JOBS" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-jobs must be a positive integer, not '$VIGNETTE_JOBS'"
 [[ "$VIGNETTE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-timeout must be a positive integer, not '$VIGNETTE_TIMEOUT'"
 
+if (( HAND_UNION_DONE && ! FINISH )); then
+  die 2 "--hand-union-done goes with --finish"
+fi
+
 if [[ -z "$BRANCH_NAME" ]]; then
   BRANCH_NAME="merge-all-claude-branches-$(date -u +%F)"
 fi
@@ -200,6 +426,39 @@ REPO="$(pwd)"
 
 # Repo sanity.
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 3 "$REPO is not a git working tree."
+
+if (( FINISH )); then
+  [[ -n "$PYTHON3" ]] || die 3 "python3 is not on PATH; the duplicate check needs it."
+  git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
+  WT_ABS="$REPO/.worktrees/${BRANCH_NAME}"
+  [[ -d "$WT_ABS" ]] || die 3 "--finish: no worktree at $WT_ABS; run without --finish first."
+  cd "$WT_ABS"
+  [[ "$(git rev-parse --abbrev-ref HEAD)" == "$BRANCH_NAME" ]] \
+    || die 3 "--finish: $WT_ABS is not on branch $BRANCH_NAME."
+  [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
+    || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
+  HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
+  echo "==> Finishing $BRANCH_NAME in $WT_ABS"
+  if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
+    {
+      cat "$HAND_UNION_REPORT"
+      echo
+      echo "STOP: the hand-union report above is not empty:"
+      echo "    $HAND_UNION_REPORT"
+      echo "  Union its wording into the register in $WT_ABS and commit, then run"
+      echo "     $(finish_command) --hand-union-done"
+    } >&2
+    exit 9
+  fi
+  if [[ -s "$HAND_UNION_REPORT" ]]; then
+    echo "    hand union confirmed (--hand-union-done); the report stays at $HAND_UNION_REPORT"
+  fi
+  check_no_duplicates
+  SUCCESS=$(git log --first-parent --format=%s "$BASE..HEAD" \
+    | grep -c "^Merge branch '.*' into ${BRANCH_NAME}\$" || true)
+  push_and_report
+  exit 0
+fi
 
 # Fetch so origin refs are current.
 echo "==> Fetching $BASE / source refs (--prune)"
@@ -363,6 +622,12 @@ WT_REL=".worktrees/${BRANCH_NAME}"
 WT_ABS="$REPO/$WT_REL"
 if [[ -d "$WT_ABS" ]]; then
   echo "ERROR: worktree already exists at $WT_ABS" >&2
+  pending="$(git -C "$WT_ABS" rev-parse --path-format=absolute --git-path hand-union-report.md 2>/dev/null || true)"
+  if [[ -n "$pending" && -s "$pending" ]]; then
+    echo "  It holds a hand-union report, which removing it deletes; finish that run" >&2
+    echo "  with --finish, or copy the report first:" >&2
+    echo "    $pending" >&2
+  fi
   echo "  Remove via:" >&2
   echo "    git -C $REPO worktree remove --force $WT_REL" >&2
   echo "    git -C $REPO branch -D $BRANCH_NAME" >&2
@@ -402,6 +667,9 @@ git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 # (modify/delete, rename/rename); those are aborted and logged, and
 # the remaining branches continue.
 cd "$WT_ABS"
+# Kept in the worktree's own git directory, so no step can commit it.
+HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
+rm -f "$HAND_UNION_REPORT"
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
 echo "    binaries regenerated and covariate-columns.md union-merged after)"
@@ -541,7 +809,7 @@ if [[ -n "$UNION_FILE" ]]; then
       --file "$UNION_FILE"
     )
     union_args+=("${EXTRA_REF_ARGS[@]}")
-    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" \
+    "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" --report "$HAND_UNION_REPORT" \
       || die 5 "union_merge_lines.py failed on $UNION_FILE"
     if git diff --quiet -- "$UNION_FILE"; then
       echo "    no diff after union-merge (nothing was lost from -X theirs)."
@@ -572,15 +840,16 @@ fi
 if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then
   echo
   echo "==> Deduping duplicate canonical headers in $UNION_FILE"
-  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global "$UNION_FILE" \
-    || die 5 "dedup_canonical_headers.py failed on $UNION_FILE"
+  run_dedup "$UNION_FILE" --global
   if ! git diff --quiet -- "$UNION_FILE"; then
     git add "$UNION_FILE"
     git commit -m "Dedup duplicate canonical headers in $UNION_FILE
 
 Two branches that each added the same brand-new ### CANONICAL block
 leave exact-duplicate H3 headings after the -X theirs bulk merge.
-Collapse each to a single entry, unioning example .R filenames." >/dev/null
+Collapse each to a single entry, carrying the dropped copies' example
+models and source aliases. Wording only a dropped copy had is in the
+hand-union report, for a hand union before the push." >/dev/null
     echo "    committed canonical-header dedup"
   else
     echo "    no duplicate canonical headers."
@@ -605,8 +874,7 @@ for reg in "${REGISTER_FILES[@]:-}"; do
   [[ "$reg" == "$UNION_FILE" ]] && continue
   echo
   echo "==> Deduping duplicate canonical headers in $reg (per-section)"
-  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$reg" \
-    || die 5 "dedup_canonical_headers.py failed on $reg"
+  run_dedup "$reg"
   if ! git diff --quiet -- "$reg"; then
     git add "$reg"
     git commit -m "Dedup duplicate canonical headers in $reg" >/dev/null
@@ -643,6 +911,7 @@ if (( ${#RESTORE_TARGETS[@]} )); then
     )
     echo "    -- $rf"
     "$PYTHON3" "$SCRIPT_DIR/restore_dropped_sections.py" "${restore_args[@]}" \
+      --report "$HAND_UNION_REPORT" \
       || die 5 "restore_dropped_sections.py failed on $rf"
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
@@ -655,8 +924,7 @@ if (( ${#RESTORE_TARGETS[@]} )); then
   # register which is globally unique and deduped with --global above.
   for rf in "${REGISTER_FILES[@]:-}"; do
     [[ -n "$rf" && -f "$rf" ]] || continue
-    "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$rf" >/dev/null \
-      || die 5 "dedup_canonical_headers.py failed on $rf"
+    run_dedup "$rf" >/dev/null
     if ! git diff --quiet -- "$rf"; then
       git add "$rf"
       git commit -m "Dedup duplicate canonical headers in $rf" >/dev/null
@@ -811,7 +1079,9 @@ if (( ! SKIP_CHECK )); then
   else
     echo "ERROR: devtools::check failed. The worktree is left in place at" >&2
     echo "  $WT_ABS" >&2
-    echo "Fix the failures, re-run check, and push manually when green." >&2
+    echo "Fix the failures and re-run check; when it is green, commit, then push" >&2
+    echo "and print the PR text with" >&2
+    echo "  $(finish_command)" >&2
     exit 6
   fi
 fi
@@ -861,117 +1131,19 @@ if (( ! SKIP_VIGNETTES )); then
     echo "Per-file JSONL: $VIGNETTE_RESULTS" >&2
     echo >&2
     echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
-    echo "validator's setup), re-run validation, and push manually when green:" >&2
+    echo "validator's setup) and re-run validation:" >&2
     echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\" >&2
     echo "    --worktree $WT_ABS \\" >&2
     echo "    --jobs $VIGNETTE_JOBS" >&2
+    echo "When it is green, commit, then push and print the PR text with" >&2
+    echo "  $(finish_command)" >&2
     exit 8
   fi
   echo "    all vignettes rendered cleanly"
 fi
 
-# Push.
-if (( SKIP_PUSH )); then
-  echo
-  echo "==> --skip-push set; skipping push."
-else
-  echo
-  echo "==> Pushing $BRANCH_NAME to origin"
-  if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
-    echo "ERROR: push failed." >&2
-    exit 7
-  fi
+# Push, and print the PR text; stops first when a hand union is pending.
+if [[ -s "$HAND_UNION_REPORT" ]]; then
+  stop_for_hand_union
 fi
-
-# Print PR title + body.
-PR_TITLE_LIMIT=70
-NEW_MODELS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
-ASCII_FIXES=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
-OTHER_COMMITS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
-
-# Compose a short title.
-SUFFIX_BITS=()
-[[ "$NEW_MODELS" -gt 0 ]] && SUFFIX_BITS+=("$NEW_MODELS new models")
-[[ "$ASCII_FIXES" -gt 0 ]] && SUFFIX_BITS+=("$ASCII_FIXES ASCII fixes")
-PR_TITLE="Merge $SUCCESS claude/* branches"
-if [[ ${#SUFFIX_BITS[@]} -gt 0 ]]; then
-  PR_TITLE="$PR_TITLE ($(IFS=, ; echo "${SUFFIX_BITS[*]}"))"
-fi
-
-# Trim title to limit.
-if (( ${#PR_TITLE} > PR_TITLE_LIMIT )); then
-  PR_TITLE="${PR_TITLE:0:$((PR_TITLE_LIMIT-1))}…"
-fi
-
-echo
-echo "================================================================"
-echo "Suggested PR title (≤${PR_TITLE_LIMIT} chars):"
-echo
-echo "$PR_TITLE"
-echo
-echo "Suggested PR body:"
-echo
-cat <<EOF
-## Summary
-
-Consolidates $SUCCESS unmerged \`claude/<task-id>\` branches from the
-nlmixr2lib popPK ingestion runner queue into one review-ready
-branch.
-
-### Categorical breakdown
-
-- $NEW_MODELS new-model addition(s)
-- $ASCII_FIXES vignette ASCII-gate cleanup(s)
-- $OTHER_COMMITS other (follow-up edits, model updates, etc.)
-
-### Mechanical regeneration commit
-
-After the merges, ran:
-
-\`\`\`sh
-Rscript -e 'devtools::load_all("."); nlmixr2lib:::buildModelDb(); devtools::document()'
-\`\`\`
-
-to canonically rebuild \`data/modeldb.rda\`, \`inst/modeldb.qs2\`, the
-\`_pkgdown.yml\` navbar, and \`man/modeldb.Rd\` from all model \`.R\`
-files now on the branch.
-
-### Procedural note for future merges
-
-The merge strategy was \`-X theirs\` for binary registry files +
-metadata. This strategy clobbers \`$UNION_FILE\` because multiple
-branches independently rewrite the same \`**Example models:**\`
-lines. The script's union-merger step reconstructs the file by
-parsing each branch's diff and unioning per-model annotations.
-**Do not skip the union-merge step on future runs.**
-
-### Per-task tracking after this PR merges
-
-Each source \`claude/<task-id>\` branch was folded in with a real
-\`git merge\`, so its tip is a true ancestor of this branch. Once
-this PR lands on main, every consolidated branch is reported as
-merged by \`git branch --merged origin/main\` and GitHub marks each
-as "Merged" automatically — no force-advance step required. The
-source branches can then be deleted at the operator's discretion
-(\`git push --delete origin claude/<task-id>\`).
-
-## Test plan
-
-- [ ] \`devtools::check(error_on = "error", args = "--no-build-vignettes")\` (already run; passed pre-push)
-- [ ] \`nlmixr2lib::modellib()\` lists all newly-added models
-- [ ] Spot-check one of the new models: \`nlmixr2lib::readModelDb(name = "<one>")\` returns a function
-- [ ] Rendered pkgdown navbar shows the new vignettes under the right section
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-EOF
-echo
-echo "================================================================"
-echo
-echo "Open the PR via:"
-echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
-echo
-echo "Worktree left at: $WT_ABS"
-echo
-echo "Source branches were folded in with real merges, so after this PR"
-echo "lands on main they show as \"Merged\" automatically (git branch"
-echo "--merged origin/main lists them). No post-merge advance step needed."
+push_and_report

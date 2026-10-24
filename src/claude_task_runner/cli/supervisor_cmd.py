@@ -19,17 +19,18 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
 from claude_task_runner import process_signals
 from claude_task_runner.cli._helpers import (
     CWD_DEFAULT_LABEL,
     broken_accounts_message,
+    literal,
     load_settings_or_exit,
     queue_ceiling_json,
     queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
+    styled,
 )
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import (
@@ -288,11 +289,14 @@ def start(
             config_path=config,
         )
     except pidfile_mod.SupervisorAlreadyRunning as exc:
-        console.print(f"[bold red]supervisor already running:[/] {exc}")
+        console.print(literal(styled("supervisor already running:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
 
     console.print(
-        f"[green]Supervisor exited.[/] State at {handle.state_path}, PID file at {handle.pid_path}"
+        literal(
+            styled("Supervisor exited.", "green"),
+            f" State at {handle.state_path}, PID file at {handle.pid_path}",
+        )
     )
 
 
@@ -636,10 +640,14 @@ def status(
         print(_json.dumps(payload, default=str, indent=2))
         return
 
-    console.print(f"[bold]Queue:[/]            {queue_path}")
+    console.print(literal(styled("Queue:", "bold"), "            ", queue_path))
     console.print(
-        f"[bold]Supervisor PID:[/]   {pid} "
-        f"({'[green]alive[/]' if alive else '[yellow]not running[/]'})"
+        literal(
+            styled("Supervisor PID:", "bold"),
+            f"   {pid} (",
+            styled("alive", "green") if alive else styled("not running", "yellow"),
+            ")",
+        )
     )
     if snapshot is None:
         console.print("[dim]No supervisor.json — never started here.[/]")
@@ -650,28 +658,42 @@ def status(
             else ("yellow" if snapshot.state is SupervisorState.SLOWING_DOWN else "red")
         )
         console.print(
-            f"[bold]State:[/]            "
-            f"[{state_color}]{snapshot.state.value}[/]  (since {snapshot.since})"
+            literal(
+                styled("State:", "bold"),
+                "            ",
+                styled(snapshot.state.value, state_color),
+                f"  (since {snapshot.since})",
+            )
         )
         console.print(
-            f"[bold]5h util:[/]          {snapshot.last_5h_util_pct}%"
-            f"   [bold]Weekly util:[/] {snapshot.last_weekly_util_pct}%"
+            literal(
+                styled("5h util:", "bold"),
+                f"          {snapshot.last_5h_util_pct}%   ",
+                styled("Weekly util:", "bold"),
+                f" {snapshot.last_weekly_util_pct}%",
+            )
         )
-        console.print(f"[bold]Last reading:[/]     {snapshot.last_reading_at or 'none yet'}")
+        console.print(
+            literal(
+                styled("Last reading:", "bold"), "     ", snapshot.last_reading_at or "none yet"
+            )
+        )
         if snapshot.scheduled_wakeup_at is not None:
-            console.print(f"[bold]Next wakeup:[/]      {snapshot.scheduled_wakeup_at}")
+            console.print(
+                literal(styled("Next wakeup:", "bold"), "      ", snapshot.scheduled_wakeup_at)
+            )
         if snapshot.last_drift_message:
-            console.print(f"[red]Last drift:[/]       {snapshot.last_drift_message}")
-    console.print(f"[bold]Pending:[/]          {payload['pending']}")
-    console.print(f"[bold]In-flight:[/]        {payload['in_flight']}")
+            console.print(
+                literal(styled("Last drift:", "red"), "       ", snapshot.last_drift_message)
+            )
+    console.print(literal(styled("Pending:", "bold"), "          ", payload["pending"]))
+    console.print(literal(styled("In-flight:", "bold"), "        ", payload["in_flight"]))
     console.print(
-        f"[bold]Queue ceiling:[/]    {escape(queue_ceiling_text(ceiling, settings))}",
-        highlight=False,
+        literal(styled("Queue ceiling:", "bold"), "    ", queue_ceiling_text(ceiling, settings)),
         soft_wrap=True,
     )
     for b in resolution.broken:
         console.print(
-            f"[bold red]Account error:[/]    {escape(b.name)}: {escape(b.error)}",
-            highlight=False,
+            literal(styled("Account error:", "bold red"), f"    {b.name}: {b.error}"),
             soft_wrap=True,
         )

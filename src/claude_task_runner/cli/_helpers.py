@@ -16,6 +16,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.text import Text
 
 from claude_task_runner.config.loader import (
     AccountResolution,
@@ -92,6 +93,30 @@ def resolve_per_queue_config(config: Path | None, queue_dir: Path) -> Path | Non
     return None
 
 
+def literal(*parts: object, style: str = "") -> Text:
+    """A line for ``Console.print`` that prints exactly as given.
+
+    Rich reads markup (``[bold]``, ``[/]``) and emoji codes (``:b:``) in a
+    ``str`` it prints, so a task id, path, reason or error message holding
+    either would be restyled, cut short, turned into a symbol, or raise.
+    A ``Text`` is printed as it is, so every value from outside the code
+    goes into the line through this. Each part is printed as
+    ``str(part)``, whatever its type, except a ``Text`` (a :func:`styled`
+    span, or another ``literal`` line), which goes in with its styles;
+    ``style`` styles the whole line. ``tests/unit/test_cli_markup_gate.py``
+    fails on a print that passes free text as markup.
+    """
+    line = Text(style=style)
+    for part in parts:
+        line.append(part if isinstance(part, Text) else str(part))
+    return line
+
+
+def styled(value: object, style: str) -> Text:
+    """``str(value)`` in ``style``, as a part of a :func:`literal` line."""
+    return Text(str(value), style=style)
+
+
 def require_queue_option(queue_dir: Path, console: Console, *, json: bool = False) -> Path:
     """Resolve ``--queue`` for a command that writes under it, or exit 2.
 
@@ -99,8 +124,9 @@ def require_queue_option(queue_dir: Path, console: Console, *, json: bool = Fals
     helpers that create the queue's subdirectories would recreate a
     mistyped, deleted or moved ``--queue`` as an empty queue.
 
-    The error is one line on ``console``, printed without Rich markup so
-    a ``[`` in the path stays as typed, and without wrapping. With
+    The error is one line on ``console``, printed without Rich markup or
+    emoji codes so a ``[`` or ``:b:`` in the path stays as typed, and
+    without wrapping. With
     ``json`` it goes to stdout as ``{"ok": false, "error": ...}``, the
     shape ``queue force-dispatch --json`` uses for its other errors.
     """
@@ -111,7 +137,14 @@ def require_queue_option(queue_dir: Path, console: Console, *, json: bool = Fals
         if json:
             print(_json.dumps({"ok": False, "error": message}))
         else:
-            console.print(message, style="bold red", markup=False, highlight=False, soft_wrap=True)
+            console.print(
+                message,
+                style="bold red",
+                markup=False,
+                emoji=False,
+                highlight=False,
+                soft_wrap=True,
+            )
         raise typer.Exit(code=2) from exc
 
 

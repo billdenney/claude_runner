@@ -122,6 +122,17 @@ def read_file(repo: Path, commit: str, path: str) -> str | None:
     return git(repo, "cat-file", "blob", f"{commit}:{path}")
 
 
+def blob_id(repo: Path, commit: str, path: str) -> str | None:
+    """The id of ``path``'s blob at ``commit``, or None when it has no such file:
+    the same id means the same text, so a reader can parse each once."""
+    proc = _run(repo, ["rev-parse", "--verify", "--quiet", f"{commit}:{path}"])
+    if proc.returncode != 0:
+        if not resolves(repo, commit):
+            raise GitError(f"{commit!r} does not resolve to a commit in {repo}")
+        return None
+    return proc.stdout.strip()
+
+
 def candidate_refs(repo: Path, pattern: str, extra_refs: Sequence[str]) -> list[str]:
     """Refs under ``refs/remotes/<pattern>``, sorted, then any extra refs not among them."""
     listing = git(repo, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{pattern}")

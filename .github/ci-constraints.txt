@@ -1,0 +1,6 @@
+# Exact versions of the type checker and its stubs for CI's
+# `pip install -e '.[dev]' -c .github/ci-constraints.txt`, so a new release
+# cannot turn CI red without a change here. How and when to bump them:
+# README.md, "Development".
+mypy==2.4.0
+types-PyYAML==6.0.12.20260906

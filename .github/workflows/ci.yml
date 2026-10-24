@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[dev]'
+          pip install -e '.[dev]' -c .github/ci-constraints.txt
 
       - name: Lint (ruff)
         run: ruff check src tests
@@ -91,7 +91,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[dev]'
+          pip install -e '.[dev]' -c .github/ci-constraints.txt
       - name: Drift canary against fake claude shim
         env:
           PATH: ${{ github.workspace }}/tests/fixtures/claude_shim:${{ env.PATH }}

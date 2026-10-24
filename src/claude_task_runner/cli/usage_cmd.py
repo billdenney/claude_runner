@@ -30,7 +30,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from claude_task_runner.cli._helpers import load_settings_or_exit
+from claude_task_runner.cli._helpers import literal, load_settings_or_exit, styled
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.schema import AccountSettings, Settings
 from claude_task_runner.usage import capture as capture_mod
@@ -149,17 +149,21 @@ def render(ctx: typer.Context) -> None:
         )
         reading = parser_mod.parse(raw, clock.now(), clock)
     except UsageCaptureSpawnError as exc:
-        console.print(f"[bold red]spawn error:[/] {exc}")
+        console.print(literal(styled("spawn error:", "bold red"), " ", exc))
         raise typer.Exit(code=EXIT_SPAWN_ERROR) from exc
     except UsageCaptureTimeout as exc:
-        console.print(f"[bold red]capture timeout:[/] {exc}")
+        console.print(literal(styled("capture timeout:", "bold red"), " ", exc))
         raise typer.Exit(code=EXIT_CAPTURE_TIMEOUT) from exc
     except UsageFormatDrift as exc:
-        console.print(f"[bold red]format drift:[/] {exc}")
+        console.print(literal(styled("format drift:", "bold red"), " ", exc))
         raise typer.Exit(code=EXIT_PARSE_DRIFT) from exc
 
     console.print(
-        f"[bold]Claude Code Usage[/]  [dim]{clock.now().strftime('%Y-%m-%d %H:%M:%S UTC')}[/]"
+        literal(
+            styled("Claude Code Usage", "bold"),
+            "  ",
+            styled(clock.now().strftime("%Y-%m-%d %H:%M:%S UTC"), "dim"),
+        )
     )
     for label, window in (
         ("5-hour session", reading.five_hour),
@@ -168,17 +172,21 @@ def render(ctx: typer.Context) -> None:
         pct = window.utilization_pct
         color = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
         bar = _bar(pct)
-        console.print(f"  [bold]{label:<16}[/] [{color}]{bar}[/] {pct:>3}%")
+        console.print(
+            literal("  ", styled(f"{label:<16}", "bold"), " ", styled(bar, color), f" {pct:>3}%")
+        )
         if window.resets_at_raw:
-            console.print(f"  [dim]Resets {window.resets_at_raw}[/]")
+            console.print(literal("  ", styled(f"Resets {window.resets_at_raw}", "dim")))
     for w in reading.extra_windows:
         pct = w.utilization_pct
         color = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
         bar = _bar(pct)
         label = f"7-day {w.label}"
-        console.print(f"  [bold]{label:<24}[/] [{color}]{bar}[/] {pct:>3}%")
+        console.print(
+            literal("  ", styled(f"{label:<24}", "bold"), " ", styled(bar, color), f" {pct:>3}%")
+        )
         if w.resets_at_raw:
-            console.print(f"  [dim]Resets {w.resets_at_raw}[/]")
+            console.print(literal("  ", styled(f"Resets {w.resets_at_raw}", "dim")))
 
 
 @app.command("json")
@@ -260,16 +268,16 @@ def healthcheck(ctx: typer.Context) -> None:
         )
         reading = parser_mod.parse(raw, clock.now(), clock)
     except UsageCaptureSpawnError as exc:
-        console.print(f"[bold red]FAIL[/] spawn error: {exc}")
+        console.print(literal(styled("FAIL", "bold red"), f" spawn error: {exc}"))
         raise typer.Exit(code=EXIT_SPAWN_ERROR) from exc
     except UsageCaptureTimeout as exc:
-        console.print(f"[bold red]FAIL[/] capture timeout: {exc}")
+        console.print(literal(styled("FAIL", "bold red"), f" capture timeout: {exc}"))
         raise typer.Exit(code=EXIT_CAPTURE_TIMEOUT) from exc
     except UsageFormatDrift as exc:
-        console.print(f"[bold red]FAIL[/] parser drift: {exc}")
+        console.print(literal(styled("FAIL", "bold red"), f" parser drift: {exc}"))
         raise typer.Exit(code=EXIT_PARSE_DRIFT) from exc
     except Exception as exc:
-        console.print(f"[bold red]FAIL[/] unexpected: {exc}")
+        console.print(literal(styled("FAIL", "bold red"), f" unexpected: {exc}"))
         raise typer.Exit(code=EXIT_UNEXPECTED) from exc
 
     warns: list[str] = []
@@ -279,11 +287,14 @@ def healthcheck(ctx: typer.Context) -> None:
         warns.append("weekly resets_at unparseable")
 
     if warns:
-        console.print(f"[bold yellow]WARN[/] parse OK; {', '.join(warns)}")
+        console.print(literal(styled("WARN", "bold yellow"), f" parse OK; {', '.join(warns)}"))
     else:
         console.print(
-            f"[bold green]PASS[/] 5h={reading.five_hour.utilization_pct}% "
-            f"weekly={reading.seven_day.utilization_pct}%"
+            literal(
+                styled("PASS", "bold green"),
+                f" 5h={reading.five_hour.utilization_pct}% "
+                f"weekly={reading.seven_day.utilization_pct}%",
+            )
         )
 
 
@@ -359,25 +370,39 @@ def whoami(
                 claude_config_dir=config_dir,
             )
         except UsageCaptureSpawnError as exc:
-            console.print(f"[bold red]spawn error:[/] {exc}")
+            console.print(literal(styled("spawn error:", "bold red"), " ", exc))
             raise typer.Exit(code=EXIT_SPAWN_ERROR) from exc
         except UsageCaptureTimeout as exc:
             console.print(
-                f"[bold yellow]capture timeout:[/] {exc}\n"
-                "Falling back to credentials-only identity."
+                literal(
+                    styled("capture timeout:", "bold yellow"),
+                    f" {exc}\nFalling back to credentials-only identity.",
+                )
             )
             snap = whoami_mod.from_credentials_only(config_dir)
         else:
             snap = whoami_mod.from_capture(raw, config_dir)
 
     config_label = snap.config_dir or "<default ~/.claude>"
-    console.print(f"[bold]Config dir:[/]      {config_label}")
-    console.print(f"[bold]Subscription:[/]    {snap.subscription_type or '[dim](unknown)[/]'}")
-    console.print(f"[bold]Rate limit:[/]      {snap.rate_limit_tier or '[dim](unknown)[/]'}")
+    console.print(literal(styled("Config dir:", "bold"), "      ", config_label))
+    console.print(
+        literal(
+            styled("Subscription:", "bold"),
+            "    ",
+            snap.subscription_type or styled("(unknown)", "dim"),
+        )
+    )
+    console.print(
+        literal(
+            styled("Rate limit:", "bold"),
+            "      ",
+            snap.rate_limit_tier or styled("(unknown)", "dim"),
+        )
+    )
     if snap.welcome_label:
-        console.print(f"[bold]Org / account:[/]   {snap.welcome_label}")
+        console.print(literal(styled("Org / account:", "bold"), "   ", snap.welcome_label))
     if snap.scopes:
-        console.print(f"[bold]Scopes:[/]          {', '.join(snap.scopes)}")
+        console.print(literal(styled("Scopes:", "bold"), "          ", ", ".join(snap.scopes)))
     if snap.is_team():
         console.print("[bold cyan]Account class:[/]   Team / Enterprise")
     elif snap.is_personal():
@@ -433,9 +458,17 @@ def refresh(ctx: typer.Context) -> None:
     ok = sum(1 for r in results if r.success)
     fail = len(results) - ok
     for r in results:
-        marker = "[bold green]PASS[/]" if r.success else "[bold red]FAIL[/]"
-        console.print(f"  {marker} {r.account} ({r.config_dir or '~/.claude'}): {r.detail}")
-    console.print(f"\n[bold]Summary:[/] {ok} refreshed, {fail} failed of {len(results)} accounts.")
+        marker = styled("PASS", "bold green") if r.success else styled("FAIL", "bold red")
+        console.print(
+            literal("  ", marker, f" {r.account} ({r.config_dir or '~/.claude'}): {r.detail}")
+        )
+    console.print(
+        literal(
+            "\n",
+            styled("Summary:", "bold"),
+            f" {ok} refreshed, {fail} failed of {len(results)} accounts.",
+        )
+    )
     if fail:
         raise typer.Exit(code=EXIT_CAPTURE_TIMEOUT)
 
