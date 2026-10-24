@@ -18,6 +18,7 @@ import pytest
 from claude_task_runner.queue.schema import SidecarOption, SidecarQuestion
 from claude_task_runner.queue.store import queue_runtime_dir, state_path_for, todo_dir
 from claude_task_runner.usage.drift import UsageCaptureSpawnError
+from claude_task_runner.usage.whoami import IdentitySnapshot
 
 from ._concurrency_fixtures import invoke_cli
 from ._mixed_queue import add_state, add_task
@@ -252,3 +253,26 @@ def test_usage_render_error() -> None:
 
     assert EMOJI_B not in result.output
     assert result.output.splitlines() == [f"spawn error: {HOSTILE}"]
+
+
+def test_usage_whoami() -> None:
+    snap = IdentitySnapshot(
+        config_dir="/home/u[x]:b:/.claude",
+        subscription_type="t[x]:b:",
+        rate_limit_tier="",
+        scopes=("s[x]", ":b:"),
+        welcome_label=f"W {HOSTILE}",
+    )
+    with patch(
+        "claude_task_runner.cli.usage_cmd.whoami_mod.from_credentials_only", return_value=snap
+    ):
+        lines = _out(["usage", "whoami", "--quick"])
+
+    assert lines == [
+        "Config dir:      /home/u[x]:b:/.claude",
+        "Subscription:    t[x]:b:",
+        "Rate limit:      (unknown)",
+        f"Org / account:   W {HOSTILE}",
+        "Scopes:          s[x], :b:",
+        "Account class:   unknown — verify before relying on usage numbers",
+    ]

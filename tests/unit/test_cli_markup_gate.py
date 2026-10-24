@@ -1,17 +1,23 @@
 """No print in the package hands free text to Rich as markup.
 
 Rich reads markup (``[bold]``, ``[/]``) and emoji codes (``:b:``) in every
-``str`` that ``Console.print`` (and ``Confirm.ask``) is given. A task id,
+``str`` it is given to render: by ``Console.print``, ``log``, ``input``,
+``rule`` and ``status``, ``Table.add_row`` and ``add_column``, a prompt
+(``Prompt``, ``Confirm``, ``IntPrompt``, ``FloatPrompt``, built or asked),
+and ``rich.print``. A task id,
 path, sidecar answer, account error or exception message holding either
 would be restyled, cut short, turned into a symbol, or raise
 ``MarkupError``. So every value from outside the code reaches a print
 inside a ``Text``, built with :func:`claude_task_runner.cli._helpers.literal`
-(or ``Text`` itself), or the print turns both off (``markup=False,
-emoji=False``).
+(or ``styled``, ``Text`` or ``Text.assemble``), or the print turns both off
+(``markup=False, emoji=False``).
 
-This gate reads the source: each argument printed must be a string
-constant, a ``literal(...)``/``Text(...)`` line, or printed with markup
-and emoji off. :data:`ALLOWLIST` may name a printed expression proven to
+This gate reads the source: each argument rendered must be a string
+constant, a ``Text`` line, a conditional expression choosing between such,
+or printed with markup and emoji off. A console is any name holding
+``console``, bound to ``Console(...)`` or annotated ``Console``; a name
+bound to its ``print`` or ``log``, or imported as Rich's ``print``, prints
+too. :data:`ALLOWLIST` may name a printed expression proven to
 hold no free text; it must stay exact. The tests at the bottom show the
 gate fails on each way a site can be reintroduced.
 """
@@ -23,8 +29,23 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parents[2] / "src" / "claude_task_runner"
 
-SAFE_LINES = frozenset({"literal", "Text", "assemble"})
-"""Calls whose result is a ``Text``, which Rich prints as it is."""
+SAFE_LINES = frozenset({"literal", "styled", "Text"})
+"""Calls whose result is a ``Text``, which Rich prints as it is; so is
+``Text.assemble``, whose ``str`` parts are plain text too."""
+
+CONSOLE_PRINTS = frozenset({"print", "log"})
+"""``Console`` methods that render every positional argument. ``print`` is
+matched on any receiver but ``typer``; ``log`` only on a console's."""
+
+CONSOLE_PROMPTS = {"input": "prompt", "rule": "title", "status": "status"}
+"""``Console`` methods that render their first argument, by its keyword name."""
+
+TABLE_CELLS = {"add_row": (), "add_column": ("header", "footer")}
+"""``Table`` methods that render every positional argument, and the
+keywords that are rendered too."""
+
+PROMPT_CLASSES = frozenset({"Prompt", "Confirm", "IntPrompt", "FloatPrompt"})
+"""Built or asked with a prompt, which they render: ``X(prompt)``, ``X.ask(prompt)``."""
 
 ALLOWLIST: dict[tuple[str, str], str] = {}
 """``(path under the package, source of a printed argument)`` -> why it
@@ -39,6 +60,25 @@ def _constant(node: ast.expr) -> bool:
     return False
 
 
+def _safe(node: ast.expr) -> bool:
+    """A string constant, a ``Text``-building call, or a conditional
+    expression both of whose branches are safe."""
+    if _constant(node):
+        return True
+    if isinstance(node, ast.IfExp):
+        return _safe(node.body) and _safe(node.orelse)
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in SAFE_LINES
+    if isinstance(func, ast.Attribute):
+        if func.attr == "assemble":
+            return isinstance(func.value, ast.Name) and func.value.id == "Text"
+        return func.attr in SAFE_LINES
+    return False
+
+
 def _keyword_is_false(call: ast.Call, name: str) -> bool:
     return any(
         k.arg == name and isinstance(k.value, ast.Constant) and k.value.value is False
@@ -46,37 +86,117 @@ def _keyword_is_false(call: ast.Call, name: str) -> bool:
     )
 
 
-def _prints(tree: ast.AST) -> list[ast.Call]:
-    """``x.print(...)`` calls other than ``typer``'s, and ``Confirm.ask`` /
-    ``Prompt.ask``: everything that renders a ``str`` as markup."""
+def _name(node: ast.expr) -> str | None:
+    """The last name in ``node``: ``console`` for ``console`` and ``self.console``."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _is_console_type(node: ast.expr | None) -> bool:
+    return node is not None and _name(node) == "Console"
+
+
+def _consoles(tree: ast.AST) -> set[str]:
+    """Names in ``tree`` bound to a ``Console(...)`` or annotated ``Console``."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            if _is_console_type(node.value.func):
+                out |= {n for t in node.targets if (n := _name(t)) is not None}
+        elif isinstance(node, ast.AnnAssign) and _is_console_type(node.annotation):
+            if (n := _name(node.target)) is not None:
+                out.add(n)
+        elif isinstance(node, ast.arg) and _is_console_type(node.annotation):
+            out.add(node.arg)
+    return out
+
+
+def _is_console(node: ast.expr, consoles: set[str]) -> bool:
+    name = _name(node)
+    return name is not None and ("console" in name.lower() or name in consoles)
+
+
+def _print_method(node: ast.expr, consoles: set[str]) -> bool:
+    """``node`` is ``x.print`` (not ``typer.print``) or a console's ``log``."""
+    if not isinstance(node, ast.Attribute) or node.attr not in CONSOLE_PRINTS:
+        return False
+    if node.attr == "print":
+        return _name(node.value) != "typer"
+    return _is_console(node.value, consoles)
+
+
+def _print_names(tree: ast.AST, consoles: set[str]) -> set[str]:
+    """Bare names that print with markup: Rich's ``print`` imported with
+    ``from rich import print``, and aliases such as ``p = console.print``."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "rich":
+            out |= {a.asname or a.name for a in node.names if a.name == "print"}
+        elif isinstance(node, ast.Assign) and _print_method(node.value, consoles):
+            out |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return out
+
+
+def _first(call: ast.Call, keywords: tuple[str, ...]) -> list[ast.expr]:
+    """The first positional argument and the ``keywords`` given."""
+    return call.args[:1] + [k.value for k in call.keywords if k.arg in keywords]
+
+
+def _rendered(call: ast.Call, consoles: set[str], print_names: set[str]) -> list[ast.expr] | None:
+    """What ``call`` hands Rich to render as markup; ``None`` when it renders nothing."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        if func.id in print_names:
+            return call.args
+        if func.id in PROMPT_CLASSES:
+            return _first(call, ("prompt",))
+        return None
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr in PROMPT_CLASSES:
+        return _first(call, ("prompt",))
+    if _print_method(func, consoles):
+        return call.args
+    if func.attr in CONSOLE_PROMPTS and _is_console(func.value, consoles):
+        return _first(call, (CONSOLE_PROMPTS[func.attr],))
+    if func.attr in TABLE_CELLS:
+        rendered = TABLE_CELLS[func.attr]
+        return call.args + [k.value for k in call.keywords if k.arg in rendered]
+    if func.attr == "ask" and _name(func.value) in PROMPT_CLASSES:
+        return _first(call, ("prompt",))
+    return None
+
+
+def _renders(tree: ast.AST) -> list[tuple[ast.Call, list[ast.expr]]]:
+    """Every call in ``tree`` that hands Rich a ``str`` to render as markup:
+    a console's ``print``, ``log``, ``input``, ``rule`` and ``status``, a
+    table's ``add_row`` and ``add_column``, a prompt built or asked, Rich's
+    own ``print``, and a name bound to one of them; with what it renders."""
+    consoles = _consoles(tree)
+    print_names = _print_names(tree, consoles)
     out = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        receiver = node.func.value
-        name = receiver.id if isinstance(receiver, ast.Name) else None
-        is_print = node.func.attr == "print" and name != "typer"
-        if is_print or (node.func.attr == "ask" and name in ("Confirm", "Prompt")):
-            out.append(node)
+        if isinstance(node, ast.Call):
+            rendered = _rendered(node, consoles, print_names)
+            if rendered is not None:
+                out.append((node, rendered))
     return out
 
 
 def findings(source: str, path: str) -> list[str]:
-    """Each argument a print in ``source`` hands to Rich as markup, as
+    """Each argument a call in ``source`` hands to Rich as markup, as
     ``path:line: source of the argument``."""
     tree = ast.parse(source)
     out = []
-    for call in sorted(_prints(tree), key=lambda c: c.lineno):
+    for call, rendered in sorted(_renders(tree), key=lambda r: r[0].lineno):
         if _keyword_is_false(call, "markup") and _keyword_is_false(call, "emoji"):
             continue
-        for arg in call.args:
-            if _constant(arg):
+        for arg in rendered:
+            if _safe(arg):
                 continue
-            if isinstance(arg, ast.Call):
-                func = arg.func
-                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                if called in SAFE_LINES:
-                    continue
             text = ast.get_source_segment(source, arg) or ""
             if (path, text) in ALLOWLIST:
                 continue
@@ -102,8 +222,8 @@ def test_the_allowlist_is_exact() -> None:
     for file in sorted(PACKAGE.rglob("*.py")):
         rel = file.relative_to(PACKAGE).as_posix()
         source = file.read_text(encoding="utf-8")
-        for call in _prints(ast.parse(source)):
-            printed |= {(rel, ast.get_source_segment(source, a) or "") for a in call.args}
+        for _, rendered in _renders(ast.parse(source)):
+            printed |= {(rel, ast.get_source_segment(source, a) or "") for a in rendered}
     assert sorted(set(ALLOWLIST) - printed) == []
 
 
@@ -133,14 +253,65 @@ def test_the_gate_flags_free_text_in_markup() -> None:
     ]
 
 
+def test_the_gate_flags_every_other_renderer() -> None:
+    source = (
+        "from rich import print as rprint\n"
+        "out = Console(stderr=True)\n"
+        "def show(term: Console, table, msg, ok):\n"
+        "    console.log(f'{msg}')\n"
+        "    console.input(f'{msg}? ', password=True)\n"
+        "    console.rule(title=msg)\n"
+        "    with out.status(msg):\n"
+        "        pass\n"
+        "    term.log(msg)\n"
+        "    table.add_row(msg, literal(msg))\n"
+        "    table.add_column(header=msg)\n"
+        "    IntPrompt.ask(msg)\n"
+        "    FloatPrompt.ask(prompt=msg)\n"
+        "    Prompt(msg).ask()\n"
+        "    rich.prompt.Confirm(msg)\n"
+        "    rprint(msg)\n"
+        "    say = console.print\n"
+        "    say(msg)\n"
+        "    console.print(Text.from_markup(msg))\n"
+        "    console.print(other.assemble(msg))\n"
+        "    console.print(literal(msg) if ok else msg)\n"
+    )
+    assert findings(source, "cli/x.py") == [
+        "cli/x.py:4: f'{msg}'",
+        "cli/x.py:5: f'{msg}? '",
+        "cli/x.py:6: msg",
+        "cli/x.py:7: msg",
+        "cli/x.py:9: msg",
+        "cli/x.py:10: msg",
+        "cli/x.py:11: msg",
+        "cli/x.py:12: msg",
+        "cli/x.py:13: msg",
+        "cli/x.py:14: msg",
+        "cli/x.py:15: msg",
+        "cli/x.py:16: msg",
+        "cli/x.py:18: msg",
+        "cli/x.py:19: Text.from_markup(msg)",
+        "cli/x.py:20: other.assemble(msg)",
+        "cli/x.py:21: literal(msg) if ok else msg",
+    ]
+    assert findings("from rich import print\nprint(msg)\n", "cli/y.py") == ["cli/y.py:2: msg"]
+
+
 def test_the_gate_passes_constants_lines_and_plain_prints() -> None:
     source = (
         'console.print("[bold]Queue:[/]")\n'
         'console.print(f"[bold]no fields[/]")\n'
-        'console.print(literal(("failed:", "bold red"), " ", exc))\n'
+        'console.print(literal(styled("failed:", "bold red"), " ", exc))\n'
         'console.print(Text(f"{reason}", style="dim"))\n'
+        'console.print(Text.assemble(("x", "bold"), reason))\n'
+        'console.print(literal(reason) if ok else "[dim]none[/]")\n'
         "console.print(message, markup=False, emoji=False)\n"
         "console.print()\n"
+        'table.add_row("[bold]id[/]", literal(task_id), styled(reason, "dim"))\n'
+        'Confirm.ask("Apply?", default=False)\n'
+        "logger.log(logging.INFO, message)\n"
+        "job.status(message)\n"
         'typer.echo(f"{anything}")\n'
         'print(f"{anything}")\n'
     )
