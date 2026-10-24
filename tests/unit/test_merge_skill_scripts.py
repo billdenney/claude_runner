@@ -743,8 +743,8 @@ class TestMergeBranchesHandUnion:
     def test_a_later_failure_names_the_pending_report(
         self, hand_repo: Path, tmp_path: Path
     ) -> None:
-        """A gate that fails after the dedup used to advise a manual push and
-        never mention the report; the push would have shipped one wording."""
+        """A gate that fails after the dedup names the pending report and points
+        at --finish, which will not push past it, rather than at a manual push."""
         env = _env_with_first(_bin_dir(tmp_path, "bin", {"Rscript": DYING_VALIDATOR}))
         proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", env=env)
         wt = hand_repo / ".worktrees" / CONSOLIDATION
@@ -794,7 +794,7 @@ class TestMergeBranchesHandUnion:
     def test_finish_refuses_a_register_the_base_has_and_the_worktree_lost(
         self, hand_repo: Path
     ) -> None:
-        """It used to skip a missing register and push."""
+        """A register the base has and the worktree lacks stops the push."""
         wt = consolidate(hand_repo, ["origin/claude/fa"], CONSOLIDATION)
         git(wt, "rm", "-q", REGISTER)
         git(wt, "commit", "-qm", "lose the register")
@@ -825,8 +825,9 @@ class TestMergeBranchesHandUnion:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """claude/late, cut before main registered FOO, registers it too, at more
-        length. Keeping the longer copy dropped main's: the revert check stopped
-        the run (exit 5), and its advice put the duplicate back."""
+        length. The dedup keeps main's copy and reports the branch's wording, so
+        the revert check finds nothing of main's reverted and the run stops for
+        the hand union (exit 9)."""
         repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER + AGE_SECTION})
         late = BASE_REGISTER + AGE_SECTION + FOO_B
         push_task_branch(repo, "claude/late", {REGISTER: late}, "Add Fb 2021 model")
@@ -840,6 +841,49 @@ class TestMergeBranchesHandUnion:
             "(a).", "(a), `Fb_2021_b.R` (b)."
         ) + AGE_SECTION
         assert "- **Notes:** Beta note, the longer one.\n" in self._report(wt).read_text()
+
+    def test_a_wrapped_field_the_dedup_adds_to_is_no_revert(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Main's FOO lists its models over two lines. The dedup keeps main's
+        copy and adds claude/late's model to the second line; the revert check
+        reads the field whole, so it finds nothing of main's gone."""
+        wrapped = FOO_A.replace("(a).", "(a),\n  `Fa2_2020_a.R` (a2).")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER + AGE_SECTION})
+        late = BASE_REGISTER + AGE_SECTION + FOO_B
+        push_task_branch(repo, "claude/late", {REGISTER: late}, "Add Fb 2021 model")
+        update_main(repo, {REGISTER: BASE_REGISTER + wrapped + AGE_SECTION}, "Register FOO")
+        proc = self._run(repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        assert "(reverts) OK" in proc.stdout
+        assert (wt / REGISTER).read_text() == BASE_REGISTER + wrapped.replace(
+            "(a2).", "(a2), `Fb_2021_b.R` (b)."
+        ) + AGE_SECTION
+
+    def test_the_union_and_the_restore_add_to_the_same_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """claude/long and claude/short annotate N differently on the WT line;
+        claude/one and claude/two add TWICE in different words and claude/zap
+        overwrites the region after them. The report holds the union's
+        set-aside note and the restore's other copy."""
+        twice = "\n### TWICE (**canonical for twice**)\n\n- **Notes:** {}\n"
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER + AGE_SECTION})
+        for name, note in (("long", "(a longer note on N)"), ("short", "(short)")):
+            text = _with_models(f"`N_2020_n.R` {note}") + AGE_SECTION
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Add N ({name})")
+        for name, words in (("one", "First wording."), ("two", "Second wording, longer.")):
+            text = BASE_REGISTER + AGE_SECTION + twice.format(words)
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Register TWICE ({name})")
+        zap = BASE_REGISTER + AGE_SECTION + "\n### ZAP (**canonical for zap**)\n"
+        push_task_branch(repo, "claude/zap", {REGISTER: zap}, "Register ZAP")
+        proc = self._run(repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        report = self._report(wt).read_text()
+        assert "In a merged copy:\n\n````\n`N_2020_n.R` (short)\n````\n" in report
+        assert "In that copy:\n\n````\n### TWICE (**canonical for twice**)\n" in report
 
     @pytest.mark.parametrize(
         "registers",
@@ -1123,8 +1167,8 @@ class TestRegisterPlacement:
         self, block: str, filed: set[str]
     ) -> None:
         """A model named inside another entry's annotation, an alias bullet or
-        Notes prose that says "Example models" used to count as filed there;
-        one in a ``*`` bullet, or a bullet opening with prose, did not."""
+        Notes prose that says "Example models" is not filed there; one in a
+        ``*`` bullet, or a bullet opening with prose, is."""
         placement = load_helper("verify_register_placement")
         text = f"## S\n\n### Q, Q2 (**canonical for q**)\n{block}\n\n### R (**r**)\n- **Type:** x\n"
         assert dict(placement.parse(text)) == ({"Q": filed, "Q2": filed} if filed else {})
@@ -1133,7 +1177,7 @@ class TestRegisterPlacement:
         self, repo: Path, worktree: Path
     ) -> None:
         """The WT line lost claude/a's entry, and only claude/b's annotation still
-        names its model: the old check found the filename on the line and passed."""
+        names its model: a mention is no filing, so the pair is reported."""
         mention = "`B_2021_b.R` (b note, refitting the `A_2020_a.R` data)"
         (worktree / REGISTER).write_text(_with_models(mention) + BMI_BLOCK + HT_BLOCK)
         proc = run_helper("verify_register_placement.py", *_verifier_args(repo))
@@ -1156,10 +1200,10 @@ class TestRegisterPlacement:
     def test_a_source_alias_a_branch_added_must_survive(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, merged_alias: str, lost: bool
     ) -> None:
-        """Alias bullets used to count only as places a model was named, so a
-        lost alias passed whenever its model was still listed. A merged bullet
-        that holds the same words, respaced or inside a longer one (a hand
-        union of two wordings), keeps it."""
+        """Each source-alias bullet a branch added is checked on its own, apart
+        from any model it names. A merged bullet that holds the same words,
+        respaced or inside a longer one (a hand union of two wordings), keeps
+        it."""
         models = "(base model), `S_2020_s.R` (s)."
         with_alias = BASE_REGISTER.replace(
             "- **Example models:**",
@@ -1578,32 +1622,31 @@ class TestUnionIsIdempotent:
     u = load_helper("union_merge_lines")
 
     @pytest.mark.parametrize(
-        ("body", "entries", "tail"),
+        ("body", "entries", "prose"),
         [
             (
                 f"{NAGY}.............",
                 [("Nagy_2017_x.R", NAGY.split(" ", 1)[1])],
-                ".............",
+                [],
             ),
             (
                 "`P_1998_p.R` (effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4)."
                 " The CL effect (oral only (paper p. 3)......................",
-                [
-                    (
-                        "P_1998_p.R",
-                        "(effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4). The CL"
-                        " effect (oral only (paper p. 3)",
-                    )
-                ],
-                "......................",
+                [("P_1998_p.R", "(effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4)")],
+                ["The CL effect (oral only (paper p. 3)"],
             ),
             (
                 "`A.R` (a), `B.R`, `C.R` (c (nested) note). Prose after the list.",
                 [("A.R", "(a)"), ("B.R", ""), ("C.R", "(c (nested) note)")],
-                ". Prose after the list.",
+                ["Prose after the list"],
             ),
-            ("`A.R` (a)", [("A.R", "(a)")], ""),
-            ("`A.R` (a (b] c)..., `B.R` (b).", [("A.R", "(a (b] c)"), ("B.R", "(b)")], "."),
+            ("`A.R` (a)", [("A.R", "(a)")], []),
+            ("`A.R` (a (b] c)..., `B.R` (b).", [("A.R", "(a (b] c)"), ("B.R", "(b)")], []),
+            (
+                "`A.R` -- a note. Closing remark; `B.R` -- b; see Notes.",
+                [("A.R", "-- a note"), ("B.R", "-- b")],
+                ["Closing remark", "see Notes"],
+            ),
         ],
         ids=[
             "unclosed-then-stops",
@@ -1611,19 +1654,21 @@ class TestUnionIsIdempotent:
             "prose-after",
             "no-final-stop",
             "interval",
+            "sentences",
         ],
     )
-    def test_each_note_and_what_follows_the_last(
-        self, body: str, entries: list[tuple[str, str]], tail: str
+    def test_an_entry_ends_where_its_note_does(
+        self, body: str, entries: list[tuple[str, str]], prose: list[str]
     ) -> None:
-        """The union reads entries with the dedup's parser. The text after the
-        last entry's note closes the line and is kept as it is, so its run of
-        full stops never grows."""
+        """The union reads entries with the dedup's parser. An entry is its
+        filename and note, up to the next entry, a ``;`` or a full stop that
+        ends a sentence, wherever it stands: a closing remark belongs to the
+        field. The full stops that end the field are no entry's, so their
+        run never grows."""
         dd = load_helper("dedup_canonical_headers")
         examples = dd._examples(dd._Field("Example models", [f"- **Example models:** {body}"]))
-        notes = dd._notes(examples)
-        assert [(e.model, n.text) for e, n in zip(examples.entries, notes, strict=True)] == entries
-        assert examples.runs[0].text[notes[-1].end :] == tail
+        assert [(e.model, e.note) for e in examples.entries] == entries
+        assert examples.prose == prose
 
     def test_a_run_with_nothing_to_add_changes_no_byte(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1669,10 +1714,9 @@ class TestUnionIsIdempotent:
 
 class TestUnionEditsFieldsInPlace:
     """The union reads each Example-models field whole, with the dedup's
-    parser, and edits it where it stands. It used to rebuild the label line
-    as its entries joined by ", ": prose before and between the entries was
-    lost, the last entry's trailing words moved onto an added one, and a
-    model listed twice became one entry with the longer annotation."""
+    parser, and edits it where it stands: prose before, between and after
+    the entries stays where it is, an added entry takes none of the last
+    entry's words, and a model listed twice stays listed twice."""
 
     HEAD = "## Body size\n\n### WT (**canonical for weight**)\n\n"
 
@@ -1726,6 +1770,113 @@ class TestUnionEditsFieldsInPlace:
         emitted = self._merge(base, branch)
         assert (emitted.text, emitted.hand) == (self.HEAD + result, [])
 
+    def _thrice(self, base: str, branches: list[str], current: str) -> Any:
+        """emit_merged run once, and checked against twice and three times."""
+        u = load_helper("union_merge_lines")
+        base_text = self.HEAD + base
+        fork = u.entry_map(base_text)
+        union = u.collect_entries(base_text, [(self.HEAD + b, fork) for b in branches])
+        once = u.emit_merged(self.HEAD + current, union)
+        twice = u.emit_merged(once.text, union)
+        thrice = u.emit_merged(twice.text, union)
+        assert once.text == twice.text == thrice.text
+        return once
+
+    def test_a_closing_remark_after_a_run_on_note_stays(self) -> None:
+        """The remark belongs to the field, not to B's note: a branch that put
+        C after B neither shortened B's note nor took the remark away."""
+        base = (
+            "- **Example models:** `A_2020_a.R` (a), `B_2021_b.R` -- b-note."
+            " Closing remark about all of them.\n"
+        )
+        branch = base.replace("b-note.", "b-note, `C_2022_c.R` (c).")
+        emitted = self._thrice(base, [branch], base)
+        assert emitted.text == self.HEAD + branch
+        assert emitted.hand == []
+
+    @pytest.mark.parametrize(
+        ("base", "branch", "result"),
+        [
+            (
+                "- **Example models:** `A.R` (note). Closing remark.\n",
+                "- **Example models:**\n  - `A.R` (note). Extra sentence.\n",
+                "- **Example models:** `A.R` (note). Closing remark.\n",
+            ),
+            (
+                "- **Example models:** `A.R` (a). Closing remark.\n",
+                "- **Example models:** `A.R` (a) (more words). Closing remark.\n",
+                "- **Example models:** `A.R` (a) (more words). Closing remark.\n",
+            ),
+            (
+                "- **Example models:** `A.R` (a), `B.R` (b). Closing remark.\n",
+                "- **Example models:** `A.R` (a), `B.R` (b) -- extra words. Closing remark.\n",
+                "- **Example models:** `A.R` (a), `B.R` (b) -- extra words. Closing remark.\n",
+            ),
+            (
+                "- **Example models:** `A.R` (a).\n",
+                "- **Example models:** `A.R` (a).\n  - `N.R` -- why it is here\n",
+                "- **Example models:** `A.R` (a), `N.R` (why it is here).\n",
+            ),
+        ],
+        ids=["bullet-sentence", "longer-note", "run-on-note", "bullet-form"],
+    )
+    def test_running_twice_or_three_times_is_running_once(
+        self, base: str, branch: str, result: str
+    ) -> None:
+        """A note is compared by what it says, inline or in a sub-bullet, and a
+        closing remark is no note's: nothing grows, doubles or flips form.
+        Prose a branch added that the field lacks goes to the report."""
+        emitted = self._thrice(base, [branch], base)
+        assert emitted.text == self.HEAD + result
+        set_aside = [d.dropped for h in emitted.hand for d in h.differences]
+        assert set_aside == ([["Extra sentence"]] if "Extra" in branch else [])
+
+    def test_two_copies_of_a_block_trade_entries_and_keep_one_closing_remark(self) -> None:
+        """FVIII_BL on 2026-10-23: two branches registered it, one inline with a
+        closing remark, one with sub-bullets, and both copies survived the
+        merge. Each copy gains the other's models; the remark stays once."""
+        u = load_helper("union_merge_lines")
+        head = "## Coagulation\n\n### FVIII_BL (**canonical for baseline FVIII**)\n"
+        inline = (
+            head + "- **Example models:** `deJager_2020_factorviii.R` (observation"
+            " `Cc = central / vc + FVIII_BL`; Supplement 1 Eq. 2). Set to 0 to simulate the"
+            " drug-attributable FVIII only.\n"
+        )
+        listed = (
+            head + "- **Example models:**\n  - `Bukkems_2022_factorviii.R` (observation; Eq. 2)."
+            " `Bukkems_2022_factorviii_thrombinPeak.R` also drives its Emax with it.\n"
+        )
+        base = "## Coagulation\n\n### PLT (**canonical for platelets**)\n- **Units:** 1/nL\n"
+        union = u.collect_entries(
+            base, [(base + inline, u.entry_map(base)), (base + listed, u.entry_map(base))]
+        )
+        current = base + inline + "\n" + listed
+        once = u.emit_merged(current, union)
+        assert u.emit_merged(u.emit_merged(once.text, union).text, union).text == once.text
+        assert once.text == (
+            base
+            + inline.replace(
+                "Eq. 2). Set",
+                "Eq. 2), `Bukkems_2022_factorviii.R` (observation; Eq. 2),"
+                " `Bukkems_2022_factorviii_thrombinPeak.R` also drives its Emax with it. Set",
+            )
+            + "\n"
+            + listed
+            + "  - `deJager_2020_factorviii.R` (observation `Cc = central / vc + FVIII_BL`;"
+            " Supplement 1 Eq. 2)\n"
+        )
+        assert once.text.count("Set to 0 to simulate") == 1
+        assert once.hand == []
+
+    def test_a_branch_model_for_a_field_that_lists_none_goes_to_the_report(self) -> None:
+        base = "- **Example models:** none yet.\n"
+        branch = "- **Example models:** `N.R` (n).\n"
+        emitted = self._thrice(base, [branch], base)
+        assert emitted.text == self.HEAD + base
+        assert [(d.what, d.dropped) for h in emitted.hand for d in h.differences] == [
+            ("Example models entry for N.R", ["`N.R` (n)"])
+        ]
+
     def test_a_field_whose_own_entries_all_went_takes_the_others(self) -> None:
         """The merged copy lists only Old, which a branch removed; K, which the
         base has, comes back with no ", " left before it."""
@@ -1758,12 +1909,12 @@ class TestUnionEditsFieldsInPlace:
             push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Add N ({name})")
         wt = consolidate(repo, ["origin/claude/long", "origin/claude/short"], CONSOLIDATION)
         report = tmp_path / "hand-union.md"
-        report.write_text("# Hand union needed in an earlier register\n")
+        report.write_text("# Hand union needed in the union file\n")
         proc = run_helper("union_merge_lines.py", *_verifier_args(repo), "--report", report)
         assert proc.returncode == 0, proc.stderr
         assert (wt / REGISTER).read_text() == _with_models("`N_2020_n.R` (a longer note on N)")
         assert report.read_text() == (
-            "# Hand union needed in an earlier register\n"
+            "# Hand union needed in the union file\n"
             f"# Hand union needed in {REGISTER}\n"
             "\n"
             "Two merged copies of the register annotate each model below differently.\n"
@@ -2444,7 +2595,7 @@ class TestDedupKeepsEveryModelAndWord:
         )
 
     def test_dropping_the_last_block_keeps_the_final_line_break(self, tmp_path: Path) -> None:
-        """With no blank line between the copies, the file ended without one."""
+        """With no blank line between the copies, the file still ends with a line break."""
         example = "- **Example models:** `A_2020_a.R`.\n"
         text = _pair(example, example).replace(f"{KEPT_NOTES}\n", KEPT_NOTES)
         proc, out, _ = self._dedup(tmp_path, text)
@@ -2634,16 +2785,17 @@ class TestDedupKeepsEveryModelAndWord:
         self, tmp_path: Path, kept: str, dropped: str, result: str
     ) -> None:
         """The label line, the lines that continue it and the sub-bullets,
-        under an inline list too. Only the label line, or only the
-        sub-bullets, used to be read: C_2022_c.R vanished with its copy, and
-        a wrapped keeper got B_2021_b.R twice and ``(b),, `C_2022_c.R```."""
+        under an inline list too: C_2022_c.R under the dropped copy's list is
+        carried, and a wrapped keeper lists B_2021_b.R once and takes the new
+        entry after its real last one."""
         proc, out, report = self._dedup(tmp_path, _pair(kept, dropped))
         assert (proc.returncode, proc.stderr, report) == (0, "", "")
         assert out == f"### Q (**canonical for q**)\n{result}{KEPT_NOTES}"
 
     def test_source_alias_text_outside_a_bullet_is_kept_or_reported(self, tmp_path: Path) -> None:
-        """The keeper's lines under the label used to be replaced by the
-        label alone when it had no bullets; a dropped copy's were dropped."""
+        """The keeper's text under its label stays when the dropped copy's
+        bullets are added, and a dropped copy's text outside a bullet goes to
+        the report."""
         kept = "- **Source aliases:**\n  Read from the dataset's own header.\n"
         dropped = "- **Source aliases:**\n  Named by the sponsor.\n  - `BW` -- weight.\n"
         proc, out, report = self._dedup(tmp_path, _pair(kept, dropped))
@@ -2662,20 +2814,44 @@ class TestDedupKeepsEveryModelAndWord:
             ("`A.R` (unclosed note, `B.R` (b).", ["A.R", "B.R"]),
             ("`A.R` (+28.5% (4, 5], +33.3% (5, 6] h; `T_CONMED`), `B.R`.", ["A.R", "B.R"]),
             ("`A.R` (refits `B.R`; window (4, 5] h), `C.R`.", ["A.R", "C.R"]),
+            ("`A.R` (uses `)` then `B.R` data), `C.R`.", ["A.R", "C.R"]),
             (
                 "`P_1998_p.R` (effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4)."
                 " The CL effect (oral only (paper p. 3)......................",
                 ["P_1998_p.R"],
             ),
         ],
-        ids=["nagy", "interval-then-stops", "unclosed", "two-intervals", "mention", "never-closed"],
+        ids=[
+            "nagy",
+            "interval-then-stops",
+            "unclosed",
+            "two-intervals",
+            "mention",
+            "paren-in-code",
+            "never-closed",
+        ],
     )
     def test_an_open_paren_hides_no_entry(self, body: str, models: list[str]) -> None:
-        """A ``(`` nothing closes, or a half-open interval's bracket, used to
-        hide every entry after it, so a carried entry became part of the one
-        before and was carried again by the next dedup."""
+        """A ``(`` nothing closes, and either bracket of a half-open interval,
+        is text: the entries after it are entries, so a carried entry is not
+        carried again by the next dedup."""
         dd = load_helper("dedup_canonical_headers")
         assert [e.model for e in dd._split_entries(body)[1]] == models
+
+    def test_text_is_kept_only_as_whole_words(self, tmp_path: Path) -> None:
+        """ "No" is not kept by "Nothing", nor "word" by "worde.g.": a dropped
+        copy's prose and notes compare on word boundaries."""
+        dd = load_helper("dedup_canonical_headers")
+        assert (dd._within("No", "Nothing more"), dd._within("word", "worde.g. x")) == (
+            False,
+            False,
+        )
+        assert dd._within("a  b", "x a b, y") is True
+        kept = "- **Example models:** `A_2020_a.R` (a). Nothing more is known.\n"
+        dropped = "- **Example models:** `A_2020_a.R` (a). No.\n"
+        proc, _, report = self._dedup(tmp_path, _pair(kept, dropped))
+        assert proc.returncode == 0
+        assert "In a dropped copy:\n\n````\nNo\n````\n" in report
 
     @pytest.mark.parametrize(
         ("kept", "result"),
@@ -2733,10 +2909,10 @@ class TestDedupKeepsEveryModelAndWord:
         """Every duplicate group a consolidation of nlmixr2lib met, as the
         register had it before the dedup ran (the commit is in the file name).
 
-        Read without the dedup's parser: every word of every copy is in the
-        kept block or the report, and every backticked ``*.R`` of a copy's
-        Example models is in the kept block. With it: every model a copy
-        lists as an entry is an entry of the kept block. --check is clean.
+        Read without the dedup's parser: every word of every copy, and every
+        backticked ``*.R`` of a copy's Example models, is in the kept block
+        or the report. With it: every model a copy lists as an entry is an
+        entry of the kept block. --check is clean.
         """
         dd = load_helper("dedup_canonical_headers")
         before = fixture.read_text()
@@ -2754,9 +2930,10 @@ class TestDedupKeepsEveryModelAndWord:
             result = kept[name][0]
             lost = {w for c in copies for w in _words(c)} - _words(result) - _words(report)
             assert lost - UNCOUNTED == set(), name
+            kept_text = _example_text(result) + report
             for copy in copies:
                 models = set(re.findall(r"`([A-Za-z0-9_.-]+\.R)`", _example_text(copy)))
-                assert {m for m in models if f"`{m}`" not in _example_text(result)} == set()
+                assert {m for m in models if f"`{m}`" not in kept_text} == set()
             listed = {e.model for c in _blocks(dd, before)[name] for e in _entries(dd, c)}
             assert listed <= {e.model for e in _entries(dd, _blocks(dd, after)[name][0])}
 
@@ -2772,11 +2949,10 @@ class TestDedupKeepsEveryModelAndWord:
     def test_a_real_shape_dropped_loses_no_model_and_no_word(
         self, fixture: Path, name: str, tmp_path: Path
     ) -> None:
-        """The 24 blocks of the 2026-10-23 nlmixr2lib registers that an earlier
-        reader lost words or models from, each the dropped copy beside a
-        longer one that lists a single other model: an Example-models field
-        with sub-bullets under an inline list, wrapped over lines, or with a
-        "(" that never closes."""
+        """The 24 blocks of the 2026-10-23 nlmixr2lib registers with an
+        Example-models field that has sub-bullets under an inline list, is
+        wrapped over lines, or has a "(" that never closes: each is the dropped
+        copy beside a longer one that lists a single other model."""
         dd = load_helper("dedup_canonical_headers")
         block = _plain_blocks(fixture.read_text())[name][0].rstrip("\n")
         keeper, skipping = [], False
@@ -2797,7 +2973,8 @@ class TestDedupKeepsEveryModelAndWord:
         (result,) = _plain_blocks(after)[name]
         assert _words(block) - _words(result) - _words(report) - UNCOUNTED == set()
         models = set(re.findall(r"`([A-Za-z0-9_.-]+\.R)`", _example_text(block)))
-        assert {m for m in models if f"`{m}`" not in _example_text(result)} == set()
+        kept_text = _example_text(result) + report
+        assert {m for m in models if f"`{m}`" not in kept_text} == set()
         dropped = _blocks(dd, "## S\n\n" + block)[name][0]
         kept = _blocks(dd, after)[name][0]
         assert {e.model for e in _entries(dd, dropped)} <= {e.model for e in _entries(dd, kept)}

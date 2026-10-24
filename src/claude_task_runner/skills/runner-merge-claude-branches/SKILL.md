@@ -202,24 +202,20 @@ exists to repair. Repair, then regenerate.
      after them stays, a model listed twice stays listed twice, and the
      branches' additions go after the field's last entry, in its form.
 
-   **The emitter is idempotent (fixed 2026-09-29).** It used to rebuild every
-   line as `", ".join(entries) + "."`. Where an annotation opens a `(` it never
-   closes, the parser ran to the end of the line, so the annotation took the
-   line's final full stop and the emitter appended another: one per round,
-   until three lines of nlmixr2lib's covariate register (in the
-   `BACT_PTT_LOG10CFU`, `CONMED_QPRL_ORAL` and `FORM_VINP_IR` blocks) ended in
-   13 or more. It also turned `; ` separators into `, ` and dropped prose
-   between or after the entries. Now an unclosed annotation ends before the
-   next entry, else after its last `)`, else before the trailing full stops;
-   the text after the last entry is kept as it is; and a line the union adds
-   nothing to is left byte for byte, so running the union twice gives what
-   running it once gives. Existing runs of full stops are left as they are;
-   they no longer grow. Since 2026-10-24 it uses the dedup's parser, which
-   treats a `(` that nothing closes, and either bracket of a half-open
-   interval (`(4.87, 8.56]`), as text, and it edits fields in place; a line
-   it added to used to be rebuilt with `, ` between entries, losing prose
-   before and between them. A field that lists no model (prose such as
-   "none yet") is never rewritten.
+   **The emitter is idempotent.** Running the union twice, or three times,
+   gives what running it once gives. Each entry is its filename and note, up
+   to the next entry, a `;` or the full stop that ends a sentence, outside
+   parentheses and code, wherever the entry stands; a closing remark after
+   the last entry belongs to the field, so it never moves onto an added
+   entry and is never doubled. Notes are compared by what they say, not by
+   their form (`(text)` inline and `-- text` in a sub-bullet are the same
+   note), so a carried note does not flip between forms. A `(` that nothing
+   closes, and either bracket of a half-open interval (`(4.87, 8.56]`), is
+   text and hides no entry, and the full stops that end a field are left as
+   they are. A field the union changes nothing in is left byte for byte.
+   Prose a branch added to a field that the result lacks, and a branch's
+   models for a field that lists none (prose such as "none yet", which is
+   never rewritten), go to the hand-union report (step 6b).
 
 6b. **Dedup duplicate canonical headers** via
    `dedup_canonical_headers.py --global --report <report> inst/references/covariate-columns.md`.
@@ -240,9 +236,9 @@ exists to repair. Repair, then regenerate.
    `*` sub-bullets, under an inline list too. It also carries the dropped
    copies' source-alias sub-bullets, and then re-runs with `--check`; any
    duplicate that survives **aborts the run**. Keeping the base's copy
-   matters: when a branch re-registered a canonical main already had, the
-   longer branch copy used to win, main's wording was dropped, and the
-   revert check stopped the run. What a dropped copy words differently
+   means a branch that re-registered a canonical main already had leaves
+   main's wording in place, so the revert check finds nothing reverted.
+   What a dropped copy words differently
    (the heading, Description, Role, Notes, an Example-models entry for a
    model both copies list, ...) cannot be unioned mechanically; the
    register keeps the kept copy's wording, the script prints `HAND UNION
@@ -320,11 +316,12 @@ exists to repair. Repair, then regenerate.
    verifier caught it.
 
    Every `### ` heading counts, a backticked one (`` ### `prob_<endpoint>` ``)
-   or prose included; only letters, digits, `_` and `<>` used to, and a lost
-   block under any other heading was neither restored nor reported. When two
+   or prose included. When two
    branches added the same canonical in different words and the merge lost
    it, the first branch's copy is restored and each other copy is printed in
    full and appended to the hand-union report (step 6b), for a hand union.
+   So is a name a branch added to a multi-name heading that the merge kept
+   without it.
 
    Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.
 
@@ -383,8 +380,8 @@ exists to repair. Repair, then regenerate.
       counts). A model is filed only as an Example-models entry, inline or in
       a `-`/`*` sub-bullet, read the way the dedup reads entries: a filename
       inside another entry's parentheses, an alias bullet or Notes prose is a
-      mention, and counting mentions passed a merge that kept only the
-      mention of a lost model.
+      mention, so a merge that kept only the mention of a lost model reports
+      it.
 
    Check (c) was added 2026-08-31 because (a) and (b) both pass in the case
    that matters most: two branches register the SAME canonical from mains

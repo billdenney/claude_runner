@@ -26,8 +26,9 @@ This script repairs that loss after the merge:
    and sub-bullets) and buckets the ``(filename, note)`` entries by
    ``(covariate header, subsection header)`` resolved from the most recent
    ``##``/``###`` markdown headings. An entry's note is what follows its
-   filename up to the next entry; for a run's last entry, a closing remark
-   after a full stop belongs to the field, not the entry.
+   filename up to the next entry, a ``;`` or the full stop that ends a
+   sentence, the same wherever the entry stands: a closing remark belongs to
+   the field. Notes are compared by what they say, not by their form.
 4. Builds a union of the base's entries and those each branch changed:
    ones it added, or whose annotation it changed, relative to its fork
    point. An entry a branch only inherited is main's; main may have
@@ -36,7 +37,8 @@ This script repairs that loss after the merge:
    a note the base still has as the branch inherited it: that
    correction wins whatever its length. Every other note "longest wins"
    sets aside goes to the hand-union report (``--report FILE``), beside the
-   one kept, or to stderr without it. An entry a branch removed (a
+   one kept, or to stderr without it, and so does prose a branch added to a
+   field that the result lacks. An entry a branch removed (a
    rename, a re-filing under another heading) is dropped when the base
    still has it, so the merge does not put the old name back.
 5. Walks the CURRENT (post-merge) file and edits each Example-models field
@@ -67,7 +69,7 @@ import difflib
 import re
 import sys
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,19 +133,36 @@ def _fields(lines: list[str]) -> Iterator[tuple[Bucket, int, register._Field]]:
 def _entries(text: str) -> Iterator[tuple[Bucket, str, str, bool]]:
     """``(bucket, filename, note, listed)`` for every Example-models entry in
     ``text``; ``listed`` when it is in a sub-bullet."""
-    lines = text.split("\n")
-    for bucket, _, found in _fields(lines):
+    for bucket, _, found in _fields(text.split("\n")):
         examples = register._examples(found)
-        for entry, note in zip(examples.entries, register._notes(examples), strict=True):
-            yield bucket, entry.model, note.text, examples.runs[entry.run].bullet
+        for entry in examples.entries:
+            yield bucket, entry.model, entry.note, examples.runs[entry.run].bullet
+
+
+def _prose(text: str) -> dict[Bucket, Counter[str]]:
+    """Each bucket's Example-models prose (text that belongs to no entry),
+    whitespace normalised, with how often each piece occurs."""
+    out: dict[Bucket, Counter[str]] = defaultdict(Counter)
+    for bucket, _, found in _fields(text.split("\n")):
+        out[bucket].update(register._norm([p]) for p in register._examples(found).prose)
+    return out
 
 
 def _contains(longer: str, shorter: str) -> bool:
-    return register._norm([shorter]) in register._norm([longer])
+    """True when note ``shorter`` says nothing ``longer`` does not, in either form."""
+    return register._within(register._bare(shorter), register._bare(longer))
+
+
+def _same(one: str | None, other: str | None) -> bool:
+    """Two notes that say the same, whatever form each is written in."""
+    if one is None or other is None:
+        return one is other
+    return register._norm([register._bare(one)]) == register._norm([register._bare(other)])
 
 
 def _longer(current: str, other: str) -> str:
-    return other if len(other) > len(current) else current
+    """The note that says more, ``current`` on a tie; the form does not count."""
+    return other if len(register._bare(other)) > len(register._bare(current)) else current
 
 
 @dataclass
@@ -167,6 +186,9 @@ class Union:
     """Base entries a branch removed from the bucket."""
     renamed: dict[Bucket, dict[str, str]] = field(default_factory=dict)
     """A removed entry -> the entry the branch put in its place."""
+    prose: dict[Bucket, Counter[str]] = field(default_factory=dict)
+    """Prose a branch added to a field, with how many times a branch has it:
+    a piece counts as added when the branch has it more often than its fork."""
     notes: list[str] = field(default_factory=list)
 
     def order(self, bucket: Bucket) -> list[str]:
@@ -176,32 +198,39 @@ class Union:
         return ordered
 
 
-Entries = dict[tuple[Bucket, str], str]
+class Entries(dict[tuple[Bucket, str], str]):
+    """``(bucket, filename) -> note``, and each bucket's prose (:attr:`prose`,
+    see :func:`_prose`), for telling what a branch added to the copy it forked."""
+
+    prose: dict[Bucket, Counter[str]]
 
 
 Found = list[tuple[Bucket, str, str, bool]]
 
 
-def _as_map(found: Found) -> Entries:
-    entries: Entries = {}
+def _as_map(found: Found, prose: dict[Bucket, Counter[str]]) -> Entries:
+    entries = Entries()
     for bucket, filename, note, _ in found:
         entries[(bucket, filename)] = _longer(entries.get((bucket, filename), ""), note)
+    entries.prose = prose
     return entries
 
 
 def entry_map(text: str) -> Entries:
     """``(bucket, filename) -> note`` for ``text``, the longest on a repeat."""
-    return _as_map(list(_entries(text)))
+    return _as_map(list(_entries(text)), _prose(text))
 
 
 def _fold(
     found: Found, union: Union, order: dict[Bucket, list[str]], inherited: Entries | None = None
 ) -> None:
     for bucket, filename, note, listed in found:
-        if inherited is not None and inherited.get((bucket, filename)) == note:
+        if inherited is not None and _same(inherited.get((bucket, filename)), note):
             continue
         known = union.annotations.setdefault(bucket, {})
-        if filename not in known or len(note) > len(known[filename]):
+        if filename not in known or len(register._bare(note)) > len(
+            register._bare(known[filename])
+        ):
             known[filename] = note
             union.listed.setdefault(bucket, {})[filename] = listed
         union.seen.setdefault(bucket, {}).setdefault(filename, []).append(note)
@@ -237,17 +266,23 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
     """
     union = Union()
     base_found = list(_entries(base_text))
-    base = _as_map(base_found)
+    base = _as_map(base_found, {})
     _fold(base_found, union, union.base_order)
     kept_by_branch: set[tuple[Bucket, str]] = set()
     for text, inherited in branch_copies:
         found = list(_entries(text))
         _fold(found, union, union.branch_order, inherited)
-        mine = _as_map(found)
+        mine = _as_map(found, {})
         kept_by_branch.update(k for k in mine if k not in inherited)
+        forked = getattr(inherited, "prose", {})
+        for bucket, pieces in _prose(text).items():
+            added = pieces - forked.get(bucket, Counter())
+            if added:
+                union.prose.setdefault(bucket, Counter())
+                union.prose[bucket] |= Counter({p: pieces[p] for p in added})
         for entry, note in mine.items():
             was = inherited.get(entry)
-            if was is None or was == note or base.get(entry) != was:
+            if was is None or _same(was, note) or not _same(base.get(entry), was):
                 continue
             bucket, filename = entry
             fixes = union.corrected.setdefault(bucket, {})
@@ -264,7 +299,7 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
         # the field rewritten, and its entries did not go anywhere.
         my_buckets = {bucket for bucket, _ in mine}
         for entry, was in inherited.items():
-            if entry in mine or base.get(entry) != was:
+            if entry in mine or not _same(base.get(entry), was):
                 continue
             if entry[0] in my_buckets:
                 union.removed.setdefault(entry[0], set()).add(entry[1])
@@ -316,24 +351,21 @@ def _rewrite(found: register._Field, run: register._Run, text: str) -> None:
     register._replace(found, run, prefix, len(old) - suffix, text[prefix : len(text) - suffix])
 
 
-def _rebuilt(
-    run: register._Run, kept: list[tuple[register._Entry, register._Note, str | None]]
-) -> str:
+def _rebuilt(run: register._Run, kept: list[tuple[register._Entry, str | None]]) -> str:
     """``run``'s text with each entry's text replaced: by the text given, or
-    gone when that is None. What precedes the first entry, what joins each
-    to the next and what follows the last stay as they were."""
+    gone when that is None. What precedes the first entry and follows the
+    last stays; what joins two entries stays while an entry follows it, and
+    whatever it holds besides separators stays regardless."""
     text = run.text
-    lead = text[: kept[0][0].start]
-    tail = text[kept[-1][1].end :]
-    pieces: list[tuple[str, str]] = []
-    for n, (_, note, new) in enumerate(kept):
-        joint = text[note.end : kept[n + 1][0].start] if n + 1 < len(kept) else ""
+    out = text[: kept[0][0].start]
+    for n, (entry, new) in enumerate(kept):
         if new is not None:
-            pieces.append((new, joint))
-    body = "".join(
-        piece + (joint if n + 1 < len(pieces) else "") for n, (piece, joint) in enumerate(pieces)
-    )
-    return lead + body + tail
+            out += new
+        joint = text[entry.stop : kept[n + 1][0].start] if n + 1 < len(kept) else ""
+        later = any(other is not None for _, other in kept[n + 1 :])
+        if register._prose(joint) or (new is not None and later):
+            out += joint
+    return out + text[kept[-1][0].stop :]
 
 
 @dataclass
@@ -346,17 +378,21 @@ class _Emitted:
 def emit_merged(current_text: str, union: Union) -> _Emitted:
     """Edit each Example-models field in ``current_text`` the union changes.
 
-    A field is read whole, by the dedup's parser. Its own entries keep their
-    places and their text; one a merged branch removed goes, or is replaced
-    where it stood by the entry the branch renamed it to; one whose note the
-    union lengthened or a branch corrected gets that note. Entries the union
-    adds go after the field's last entry, in its form. Prose before, between
-    and after the entries stays, and a model listed twice stays listed twice.
-    A field the union changes nothing in is kept exactly, so re-running
-    changes nothing.
+    A field is read whole, by the dedup's parser, and each entry is its
+    filename and note as the parser defines them, wherever it stands. Its
+    own entries keep their places and their text; one a merged branch
+    removed goes, or is replaced where it stood by the entry the branch
+    renamed it to; one whose note the union lengthened or a branch corrected
+    gets that note, inline in parentheses. Entries the union adds go after
+    the field's last entry, in its form. Prose before, between and after the
+    entries stays, and a model listed twice stays listed twice. Notes are
+    compared by what they say, not their form, so a second run changes
+    nothing.
 
-    Every note "longest wins" sets aside is returned as a hand union, beside
-    the one kept. Lines are split on "\\n" only, and rejoined the same way.
+    Returned as hand unions, beside what the field keeps: every note
+    "longest wins" sets aside, prose a branch added that the field lacks,
+    and the models a branch added to a field that lists none. Lines are
+    split on "\\n" only, and rejoined the same way.
     """
     lines = current_text.split("\n")
     notes = list(union.notes)
@@ -365,13 +401,29 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
     left_alone: list[str] = []
     hand: dict[str, list[register.Difference]] = defaultdict(list)
     changes: list[tuple[int, int, list[str]]] = []
+    have: dict[Bucket, tuple[Counter[str], list[str]]] = {}
+    """Per bucket, the prose its fields hold after the edits, and the first's lines."""
     for bucket, start, found in _fields(lines):
         known = union.annotations.get(bucket)
         if not known:
+            have.setdefault(bucket, (Counter(), found.lines))[0].update(
+                register._norm([p]) for p in register._examples(found).prose
+            )
             continue
         examples = register._examples(found)
         if not examples.entries:
+            have.setdefault(bucket, (Counter(), found.lines))[0].update(
+                register._norm([p]) for p in examples.prose
+            )
             left_alone.append(_label(bucket))
+            for name in union.branch_order.get(bucket, []):
+                hand[_label(bucket)].append(
+                    register.Difference(
+                        f"{register.EXAMPLES} entry for {name}",
+                        found.lines,
+                        [_written(name, known.get(name, ""))],
+                    )
+                )
             continue
         own = [e.model for e in examples.entries]
         gone = union.removed.get(bucket, set())
@@ -379,41 +431,41 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
         swaps = union.renamed.get(bucket, {})
         seen = union.seen.get(bucket, {})
         replaced = union.superseded.get(bucket, {})
-        entries = list(zip(examples.entries, register._notes(examples), strict=True))
         kept_notes: dict[str, list[str]] = defaultdict(list)
         placed: list[str] = []
-        per_run: dict[int, list[tuple[register._Entry, register._Note, str | None]]] = defaultdict(
-            list
-        )
-        for entry, note in entries:
+        per_run: dict[int, list[tuple[register._Entry, str | None]]] = defaultdict(list)
+        for entry in examples.entries:
             name = entry.model
-            new: str | None = examples.runs[entry.run].text[entry.start : note.end]
+            new: str | None = entry.text
+            inline = not examples.runs[entry.run].bullet
             if name in gone:
                 new = None
                 target = swaps.get(name)
                 if target and target not in own and target not in placed:
                     new = _written(target, known.get(target, ""))
+                    new = register._as_inline(new) if inline else new
                     placed.append(target)
                 dropped.append(_label(bucket, name))
             elif own.count(name) > 1:
                 # Listed twice: both stay as written.
-                kept_notes[name].append(note.text)
+                kept_notes[name].append(entry.note)
                 placed.append(name)
             else:
-                final = fixes[name] if name in fixes else _longer(note.text, known.get(name, ""))
-                if final != note.text:
+                final = fixes[name] if name in fixes else _longer(entry.note, known.get(name, ""))
+                if not _same(final, entry.note):
                     new = _written(name, final)
+                    new = register._as_inline(new) if inline else new
                 kept_notes[name] = [final]
                 placed.append(name)
-            per_run[entry.run].append((entry, note, new))
+            per_run[entry.run].append((entry, new))
         additions = [n for n in union.order(bucket) if n not in placed and n not in gone]
         for name in additions:
             kept_notes[name] = [known.get(name, "")]
         for name, finals in kept_notes.items():
             for other in dict.fromkeys(seen.get(name, [])):
                 if (
-                    other
-                    and other != replaced.get(name)
+                    register._bare(other)
+                    and not _same(other, replaced.get(name))
                     and not any(_contains(f, other) for f in finals)
                 ):
                     hand[_label(bucket)].append(
@@ -424,13 +476,16 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
                         )
                     )
         if not placed and not additions:
+            have.setdefault(bucket, (Counter(), found.lines))[0].update(
+                register._norm([p]) for p in examples.prose
+            )
             emptied.append(_label(bucket))
             continue
         work = register._Field(found.name, list(found.lines))
         for run_index in sorted(per_run, reverse=True):
             run = examples.runs[run_index]
             kept = per_run[run_index]
-            if run.bullet and all(new is None for _, _, new in kept):
+            if run.bullet and all(new is None for _, new in kept):
                 first, last = run.spans[0][0], run.spans[-1][0]
                 del work.lines[first : last + 1]
             else:
@@ -441,8 +496,18 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
                 for n in additions
             ]
             register._insert_entries(work, texts, register._eol(work.lines[0]))
+        have.setdefault(bucket, (Counter(), work.lines))[0].update(
+            register._norm([p]) for p in register._examples(work).prose
+        )
         if work.lines != found.lines:
             changes.append((start, start + len(found.lines), work.lines))
+    for bucket, wanted in union.prose.items():
+        held, field_lines = have.get(bucket, (Counter(), []))
+        for piece, need in wanted.items():
+            if field_lines and held[piece] < need:
+                hand[_label(bucket)].append(
+                    register.Difference(f"{register.EXAMPLES} prose", field_lines, [piece])
+                )
     for first, end, new_lines in sorted(changes, reverse=True):
         lines[first:end] = new_lines
     if dropped:
@@ -458,13 +523,14 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
     if left_alone:
         notes.append(
             f"# left {len(left_alone)} Example-models field(s) that list no model as they are"
-            f" (prose): {'; '.join(left_alone)}"
+            f" (prose); a branch's models for them are in the hand-union report:"
+            f" {'; '.join(left_alone)}"
         )
     unions = [register.HandUnion(name, [], diffs) for name, diffs in hand.items()]
     if unions:
         notes.append(
-            f"# kept one note of {sum(len(h.differences) for h in unions)} model(s) whose merged"
-            " copies annotate them differently; the others are in the hand-union report"
+            f"# set aside {sum(len(h.differences) for h in unions)} note(s), prose or model(s)"
+            " the field does not keep; they are in the hand-union report"
         )
     return _Emitted("\n".join(lines), notes, unions)
 

@@ -93,24 +93,47 @@ def heading_names(text: str) -> tuple[frozenset[str], str]:
 
 
 def line_atoms(line: str) -> list[Atom]:
-    """What one body line holds: its entries if it is an Example-models label
-    line that lists models, read by the dedup's parser, else itself."""
-    match = register.FIELD.match(line)
-    if match is None or match.group(1).strip() != register.EXAMPLES:
-        return [("line", line)]
-    examples = register._examples(register._Field(register.EXAMPLES, [line]))
+    """What one body line outside an Example-models field holds: itself."""
+    return [("line", line)]
+
+
+def field_atoms(lines: list[str]) -> list[Atom]:
+    """What an Example-models field holds, read whole by the dedup's parser:
+    the label line, the lines that continue it and its sub-bullets. Each
+    entry is its model and its note, compared by what the note says, not by
+    its form; the prose around the entries counts, the separators and the
+    full stops that end it do not. A field that lists no model is its lines."""
+    examples = register._examples(register._Field(register.EXAMPLES, lines))
     if not examples.entries:
-        return [("line", line)]
-    atoms: list[Atom] = [("before", prose) for prose in examples.prose]
-    notes = register._notes(examples)
-    for entry, note in zip(examples.entries, notes, strict=True):
+        return [("line", line) for line in lines if line]
+    atoms: list[Atom] = [("prose", prose) for prose in examples.prose]
+    for entry in examples.entries:
         atoms.append(("example", entry.model))
-        if note.text:
-            atoms.append(("annotation", entry.model, note.text))
-    # Only prose after the list counts; how many full stops end it does not.
-    after = examples.runs[0].text[notes[-1].end :].strip(" \t.")
-    if after:
-        atoms.append(("after", after))
+        if register._bare(entry.note):
+            atoms.append(("annotation", entry.model, register._norm([register._bare(entry.note)])))
+    return atoms
+
+
+def body_atoms(lines: list[str]) -> list[Atom]:
+    """What a unit's body lines hold: each Example-models field as its
+    :func:`field_atoms`, up to the next field, every other line as itself."""
+    atoms: list[Atom] = []
+    field: list[str] | None = None
+    for line in [*lines, None]:
+        label = register.FIELD.match(line) if line is not None else None
+        if field is not None and (line is None or label):
+            while field and not field[-1]:
+                field.pop()
+            atoms += field_atoms(field)
+            field = None
+        if line is None:
+            break
+        if label and label.group(1).strip() == register.EXAMPLES:
+            field = [line]
+        elif field is not None:
+            field.append(line)
+        elif line:
+            atoms += line_atoms(line)
     return atoms
 
 
@@ -142,9 +165,7 @@ class Unit:
                 atoms[("description", description)] += 1
         elif self.title:
             atoms[("section", self.title)] += 1
-        for line in self.lines:
-            if line:
-                atoms.update(line_atoms(line))
+        atoms.update(body_atoms(self.lines))
         return atoms
 
 
@@ -305,8 +326,8 @@ def describe(atom: Atom) -> str:
         return f"missing Example-models entry: `{rest[0]}`"
     if kind == "annotation":
         return f"missing Example-models annotation of `{rest[0]}`: {_shown(rest[1])}"
-    if kind == "after":
-        return f"missing text after the Example-models entries: {_shown(rest[0])}"
+    if kind == "prose":
+        return f"missing Example-models text outside an entry: {_shown(rest[0])}"
     if kind == "cut":
         return f"line cut in two, the rest now ending a line of {rest[1]}: {_shown(rest[0])}"
     return f"missing line: {_shown(rest[0])}"
@@ -332,7 +353,7 @@ def report(findings: Sequence[Finding], path: str, base: str) -> Iterator[str]:
     yield "    was repaired automatically: which copy is right needs judgement."
 
 
-_KINDS = ("section", "name", "description", "example", "annotation", "after", "cut", "line")
+_KINDS = ("section", "name", "description", "example", "annotation", "prose", "cut", "line")
 
 
 def _order(atom: Atom) -> tuple[int, Atom]:

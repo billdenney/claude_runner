@@ -22,7 +22,9 @@ Every ``### `` heading counts, a backticked name (``prob_<endpoint>`` in
 backticks, keyed without them) or prose included. When two branches added the same
 canonical in different words and the merge lost it, the first branch's copy is
 restored and each other copy is printed in full, and with ``--report FILE``
-appended to the hand-union report, for a hand union.
+appended to the hand-union report, for a hand union. So is a name a branch
+added to a multi-name heading that survived without it: the block is there,
+so the repair is the heading, by hand.
 
 Idempotent: a canonical already present is left alone, so re-running is safe.
 
@@ -55,6 +57,12 @@ RESTORE_INTRO = (
     "merge lost both. The restore put the first branch's copy back; the other is",
     "below, verbatim. Union it into the register by hand, keeping each source's",
     "attribution, and commit.",
+)
+
+NAME_INTRO = (
+    "A merged branch added each name below to a heading that the merge kept",
+    "without it; the block is in the register under its other names. Add the name",
+    "to the register's heading by hand and commit: buildModelDb() fails until then.",
 )
 
 HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
@@ -246,7 +254,7 @@ def main() -> int:
     differing: list[tuple[str, str, str, str]] = []
     inherited = 0
     deliberate = 0
-    lost_names: list[tuple[str, str, str]] = []
+    lost_names: list[tuple[str, str, str, str]] = []
     for member in found.members:
         ref = member.ref
         text = merge_set.read_file(repo, member.merged, args.file)
@@ -278,7 +286,7 @@ def main() -> int:
                 # different name, so the block is present but the name was
                 # dropped from its header list. Re-inserting the block would
                 # duplicate it; the repair is a header edit, so report only.
-                lost_names.append((name, owner, ref))
+                lost_names.append((name, owner, ref.replace("origin/", ""), block))
                 continue
             restored.append((name, section, block))
             restored_from[owner] = (ref.replace("origin/", ""), block)
@@ -297,7 +305,7 @@ def main() -> int:
             f"# merge-set gate: skipped {inherited} block(s) present at a branch's own "
             f"fork point (inherited, then renamed/removed on {args.base}) -- NOT merge losses"
         )
-    for name, owner, ref in lost_names:
+    for name, owner, ref, _ in lost_names:
         print(
             f"# HEADER-NAME LOST (repair by hand, not a block insert): '{name}' was added to "
             f"the '### {owner}, ...' header by {ref} and is missing from the merged header"
@@ -329,6 +337,22 @@ def main() -> int:
             for name, ref, first, block in differing
         ]
         register.append_report(args.report, args.file, hand, RESTORE_INTRO, "In that copy:")
+    if lost_names and args.report is not None and not args.check:
+        lost = [
+            register.HandUnion(
+                owner,
+                [],
+                [
+                    register.Difference(
+                        f"heading name {name}, which {ref} added",
+                        merged_blocks[owner][1].splitlines()[:1],
+                        block.splitlines()[:1],
+                    )
+                ],
+            )
+            for name, owner, ref, block in lost_names
+        ]
+        register.append_report(args.report, args.file, lost, NAME_INTRO, "In that branch's copy:")
     if not restored:
         print(f"# no dropped canonicals in {args.file}")
         return 1 if (args.check and lost_names) else 0

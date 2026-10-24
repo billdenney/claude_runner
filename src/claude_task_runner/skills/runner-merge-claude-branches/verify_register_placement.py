@@ -75,7 +75,7 @@ def _blocks(text: str) -> Iterator[tuple[list[str], register._Block]]:
     a name as a different canonical and report every model under it as lost,
     so each name is indexed separately.
     """
-    lines = text.splitlines()
+    lines = text.split("\n")
     heads, bounds = register._parse(lines)
     for start, _, _ in heads:
         heading = lines[start]
@@ -110,6 +110,21 @@ def aliases(text: str) -> dict[str, dict[str, str]]:
                 for name in names:
                     out[name][key] = bullet
     return out
+
+
+Read = tuple[dict[str, set[str]], dict[str, dict[str, str]]]
+
+
+def _read(repo: Path, commit: str, path: str, cache: dict[str, Read]) -> Read | None:
+    """``path``'s filings and alias bullets at ``commit``, parsed once per
+    blob; None when the commit has no such file, or it is empty."""
+    blob = merge_set.blob_id(repo, commit, path)
+    if blob is None:
+        return None
+    if blob not in cache:
+        text = merge_set.read_file(repo, commit, path) or ""
+        cache[blob] = (parse(text), aliases(text))
+    return cache[blob] if any(cache[blob]) else None
 
 
 def main() -> int:
@@ -178,23 +193,26 @@ def main() -> int:
 
     gaps: dict[tuple[str, str], list[str]] = collections.defaultdict(list)
     alias_gaps: dict[tuple[str, str], list[str]] = collections.defaultdict(list)
+    read: dict[str, Read] = {}
     for member in found.members:
-        txt = merge_set.read_file(repo, member.merged, args.file)
-        if not txt:
+        tip = _read(repo, member.merged, args.file, read)
+        fork = _read(repo, member.fork, args.file, read)
+        if tip is None or tip is fork:
             continue
-        fork_text = merge_set.read_file(repo, member.fork, args.file) or ""
         branch = member.ref.replace("origin/", "")
-        inherited = parse(fork_text)
-        for canon, models in parse(txt).items():
+        inherited, inherited_aliases = fork or ({}, {})
+        models_at_tip, aliases_at_tip = tip
+        for canon, models in models_at_tip.items():
             for m in models - inherited.get(canon, set()) - merged.get(canon, set()):
                 gaps[(canon, m)].append(branch)
-        inherited_aliases = aliases(fork_text)
-        for canon, bullets in aliases(txt).items():
+        for canon, bullets in aliases_at_tip.items():
             kept = merged_aliases.get(canon, {})
             for key, bullet in bullets.items():
-                # A merged bullet that says more (a hand union of two branches'
+                # A merged bullet that says more (a hand union of two
                 # wordings) still holds every word of this one.
-                if key not in inherited_aliases.get(canon, {}) and not any(key in k for k in kept):
+                if key in inherited_aliases.get(canon, {}):
+                    continue
+                if not any(register._within(key, k) for k in kept):
                     alias_gaps[(canon, bullet)].append(branch)
 
     if not gaps and not alias_gaps:

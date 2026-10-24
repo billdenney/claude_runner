@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import itertools
 import os
 import re
 import sys
@@ -239,8 +240,8 @@ class _Entry:
 
     model: str
     text: str
-    """Its text as written: the backticked filename through everything up
-    to the next entry, without the separator before that one."""
+    """Its text as written: the backticked filename and its note (see
+    :func:`_split_entries`), without what joins it to the next."""
     start: int
     """Where in its run's text (see :class:`_Run`) the entry starts."""
     end: int
@@ -248,6 +249,16 @@ class _Entry:
     the parenthesised annotation that directly follows it, if any."""
     run: int = 0
     """The index of its run in the field's runs."""
+
+    @property
+    def stop(self) -> int:
+        """Where in its run's text the entry's text ends."""
+        return self.start + len(self.text)
+
+    @property
+    def note(self) -> str:
+        """What follows the filename in the entry's text."""
+        return self.text[len(self.model) + 2 :].strip()
 
 
 def _pairs(text: str) -> dict[int, int]:
@@ -278,17 +289,39 @@ def _closing_paren(text: str, start: int, pairs: dict[int, int] | None = None) -
     return start if closing is None else closing + 1
 
 
-def _split_entries(text: str) -> tuple[str, list[_Entry]]:
-    """The prose before the first entry, and the entries. An entry starts at
-    every backticked ``*.R`` filename outside parentheses, whatever comes
-    before it (``, ``, ``; ``, ``and`` or prose); a filename inside an
-    entry's parentheses is a mention within its annotation."""
+LEADING = re.compile(r"^(?:[\s,;:/.]|\b(?:and|or|plus)\b)+")
+"""What joins one entry to the next, at the start of the text after an entry."""
+SENTENCE_END = re.compile(r"\.\s+[^\sa-z]")
+"""A full stop that ends a sentence: whitespace, then no lowercase letter."""
+
+
+def _prose(piece: str) -> str:
+    """``piece`` without the separators around it; empty when that is all it is."""
+    return LEADING.sub("", CONNECTOR.sub("", piece))
+
+
+def _split_entries(text: str) -> tuple[list[str], list[_Entry]]:
+    """The prose of ``text`` that belongs to no entry, and its entries.
+
+    An entry starts at every backticked ``*.R`` filename outside
+    parentheses, whatever comes before it (``, ``, ``; ``, ``and`` or prose);
+    a filename inside an entry's parentheses is a mention within its
+    annotation. An entry's text is the filename and its note: the
+    parenthesised annotation that follows it, then any text up to the next
+    entry, a ``;`` or the full stop that ends a sentence, outside
+    parentheses and code. It is the same wherever the entry stands: a
+    closing remark after the last entry belongs to the field, not to that
+    entry. The prose is what lies before the first entry, between two and
+    after the last, without the separators.
+    """
     pairs = _pairs(text)
     depth = [0] * (len(text) + 1)
     for opening, closing in pairs.items():
         depth[opening + 1] += 1
         depth[closing] -= 1
     starts: list[int] = []
+    open_at = [False] * len(text)
+    """True where a character is inside parentheses or a code span."""
     inside = 0
     in_code = False
     for i, ch in enumerate(text):
@@ -297,6 +330,9 @@ def _split_entries(text: str) -> tuple[str, list[_Entry]]:
             if not in_code and inside == 0 and MODEL.match(text, i):
                 starts.append(i)
             in_code = not in_code
+            open_at[i] = True
+        else:
+            open_at[i] = in_code or inside > 0
     entries = []
     for n, start in enumerate(starts):
         stop = starts[n + 1] if n + 1 < len(starts) else len(text)
@@ -308,10 +344,18 @@ def _split_entries(text: str) -> tuple[str, list[_Entry]]:
             closed = _closing_paren(text, end + after, pairs)
             if closed > end + after:
                 end = closed
-        raw = CONNECTOR.sub("", text[start:stop])
-        entries.append(_Entry(match.group(1), raw, start, end))
-    lead = CONNECTOR.sub("", text[: starts[0]] if starts else text)
-    return lead, entries
+        cut = stop
+        for i in range(end, stop):
+            if open_at[i]:
+                continue
+            if text[i] == ";" or (text[i] == "." and SENTENCE_END.match(text, i)):
+                cut = i
+                break
+        entries.append(_Entry(match.group(1), CONNECTOR.sub("", text[start:cut]), start, end))
+    pieces = [text[: starts[0]] if starts else text]
+    pieces += [text[e.stop : nxt.start] for e, nxt in itertools.pairwise(entries)]
+    pieces += [text[entries[-1].stop :]] if entries else []
+    return [p for piece in pieces if (p := _prose(piece))], entries
 
 
 @dataclass
@@ -371,7 +415,7 @@ class _Examples:
 
     runs: list[_Run]
     prose: list[str]
-    """Text in the field that belongs to no entry: each run's before its first."""
+    """Text in the field that belongs to no entry (see :func:`_split_entries`)."""
     entries: list[_Entry]
 
 
@@ -380,40 +424,12 @@ def _examples(field: _Field) -> _Examples:
     prose: list[str] = []
     entries: list[_Entry] = []
     for n, run in enumerate(runs):
-        lead, found = _split_entries(run.text)
-        if lead:
-            prose.append(lead)
+        found_prose, found = _split_entries(run.text)
+        prose += found_prose
         for entry in found:
             entry.run = n
         entries += found
     return _Examples(runs, prose, entries)
-
-
-@dataclass
-class _Note:
-    """What follows an entry's filename: its annotation and any prose up to
-    the next entry, as the union merge compares and carries it."""
-
-    text: str
-    start: int
-    """Where it starts in its run's text: after the filename."""
-    end: int
-    """Where it ends: at the next entry, or, for the last entry of a run of
-    text, before what closes the run (see :func:`_closes_run`)."""
-
-
-def _notes(examples: _Examples) -> list[_Note]:
-    """Each entry's :class:`_Note`, in order."""
-    out = []
-    entries = examples.entries
-    for n, entry in enumerate(entries):
-        run = examples.runs[entry.run]
-        last = n + 1 == len(entries) or entries[n + 1].run != entry.run
-        closes = last and not run.bullet and _closes_run(run.text, entry)
-        end = entry.end if closes else entry.start + len(entry.text)
-        start = entry.start + len(entry.model) + 2
-        out.append(_Note(run.text[start:end].strip(), start, end))
-    return out
 
 
 def _replace(field: _Field, run: _Run, start: int, end: int, new: str) -> None:
@@ -466,16 +482,35 @@ def _norm(lines: list[str]) -> str:
     return " ".join(" ".join(ln.split()) for ln in lines if ln.strip())
 
 
+def _within(part: str, whole: str) -> bool:
+    """True when ``part`` is in ``whole`` as whole words, whitespace aside:
+    "No" is not within "Nothing", nor "word" within "worde.g."."""
+    part, whole = _norm([part]), _norm([whole])
+    if not part:
+        return True
+    return re.search(rf"(?<!\w){re.escape(part)}(?!\w)", whole) is not None
+
+
+def _bare(note: str) -> str:
+    """An entry's note without the form it is written in: ``(text)`` and
+    ``-- text`` are both ``text``, so the same note inline and in a
+    sub-bullet compares equal."""
+    note = note.strip()
+    if note.startswith("(") and _closing_paren(note, 0) == len(note):
+        return note[1:-1].strip()
+    return note.removeprefix("--").removeprefix(":").strip()
+
+
 def _as_inline(entry: str) -> str:
-    """A list-style entry as an inline one: the model, then any text after it
-    in parentheses (``-- text`` becomes ``(text)``)."""
+    """A list-style entry as an inline one: a note written ``-- text`` or
+    ``: text`` becomes ``(text)``; any other reads the same inline."""
     match = MODEL.match(entry)
     if match is None:
         return entry
     rest = entry[match.end() :].strip()
     if not rest:
         return match.group(0)
-    if rest.startswith("(") and _closing_paren(rest, 0) == len(rest):
+    if not rest.startswith(("--", ":")):
         return f"{match.group(0)} {rest}"
     rest = rest.removeprefix("--").removeprefix(":").strip()
     return f"{match.group(0)} ({rest})"
@@ -509,7 +544,7 @@ def _differences(keeper: _Block, other: _Block) -> list[Difference]:
         mine_lines = [ln for f in mine for ln in f.lines]
         if theirs.name == ALIASES and not theirs.inline:
             prose = theirs.prose()
-            if prose and _norm(prose) not in _norm(mine_lines):
+            if prose and not _within(" ".join(prose), " ".join(mine_lines)):
                 out.append(Difference(ALIASES, mine_lines, prose))
             continue
         if _norm(theirs.lines) not in {_norm(f.lines) for f in mine}:
@@ -537,13 +572,13 @@ def _carry_examples(keeper: _Block, other: _Block) -> tuple[list[str], list[Diff
     for field in other.named(EXAMPLES):
         theirs = _examples(field)
         for prose in theirs.prose:
-            if _norm([prose]) not in kept_text:
+            if not _within(prose, kept_text):
                 differences.append(Difference(EXAMPLES, kept_lines, [prose]))
         for e in theirs.entries:
             if e.model in kept:
                 # Nothing is lost when the keeper's entry already says it all
-                # (a bare filename, or the same annotation).
-                if not any(_norm([e.text]) in _norm([k.text]) for k in kept[e.model]):
+                # (a bare filename, or the same note in either form).
+                if not any(_within(_bare(e.note), _bare(k.note)) for k in kept[e.model]):
                     differences.append(
                         Difference(
                             f"{EXAMPLES} entry for {e.model}",
@@ -569,23 +604,11 @@ def _carry_examples(keeper: _Block, other: _Block) -> tuple[list[str], list[Diff
     return models, differences
 
 
-def _closes_run(text: str, entry: _Entry) -> bool:
-    """True when what follows ``entry``, the last entry of a run's ``text``,
-    belongs to the run rather than to the entry: nothing, the full stops that
-    end it, or a closing remark after a ``.`` or ``;``."""
-    after = text[entry.end :]
-    return not after.strip() or after.lstrip()[:1] in (".", ";")
-
-
 def _insertion_point(rest: str, entries: list[_Entry]) -> int:
     """Where in an inline ``Example models`` text new entries go: right after
-    the last entry when what follows closes the run (:func:`_closes_run`), so
-    a closing remark stays last; otherwise at the end, before the full stops
-    that end it, as when the last entry runs on (``-- text``) or there is none."""
-    end = len(rest.rstrip("."))
-    if entries and _closes_run(rest, entries[-1]):
-        return entries[-1].end
-    return end
+    the last entry's text, so prose that follows it stays last; at the end,
+    before the full stops that end it, when there is none."""
+    return entries[-1].stop if entries else len(rest.rstrip("."))
 
 
 def _carry_aliases(keeper: _Block, other: _Block) -> int:
