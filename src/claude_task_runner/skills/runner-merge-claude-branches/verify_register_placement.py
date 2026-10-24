@@ -39,10 +39,10 @@ A model is filed under a canonical when it is an entry of the block's
 ``**Example models:**`` field, inline or in a sub-bullet (``-`` or ``*``), as
 dedup_canonical_headers.py reads entries: a filename named inside another
 entry's parentheses, in a source-alias bullet or in Notes prose is not filed
-there. Counting every ``*.R`` on those lines passed a merge that kept only a
-mention of a lost model. Each source-alias sub-bullet a branch added must also
-still be under its canonical, word for word (inside a longer bullet counts),
-whitespace and closing punctuation aside.
+there, so a merge that keeps only a mention of a lost model reports it. Each
+source-alias sub-bullet a branch added must also still be under its
+canonical, word for word (inside a longer bullet counts), whitespace and
+closing punctuation aside.
 
 Exit codes: 0 clean (or the merged file is not in the worktree), 1 missing
 placements found, 2 the check could not run: a bad argument, a --base, --branch

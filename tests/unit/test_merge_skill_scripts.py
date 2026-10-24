@@ -1910,6 +1910,39 @@ class TestUnionEditsFieldsInPlace:
             ("Example models entry for N.R", ["`N.R` (n)"])
         ]
 
+    def test_a_corrected_note_in_a_wrapped_field_keeps_the_line_breaks(self) -> None:
+        base = "- **Example models:** `A.R` (a: 12 mg),\n  `B.R` (b).\n"
+        corrected = base.replace("12 mg", "21 mg")
+        assert self._thrice(base, [corrected], base).text == self.HEAD + corrected
+
+    def test_a_change_of_form_alone_is_no_correction(self) -> None:
+        """claude/move only moves A to a sub-bullet; claude/fix corrects its dose.
+        The correction is the one that counts, and nothing is reported."""
+        base = "- **Example models:** `A.R` (a: 12 mg), `C.R` (c).\n"
+        moved = "- **Example models:** `C.R` (c).\n  - `A.R` -- a: 12 mg\n"
+        fixed = base.replace("12 mg", "21 mg")
+        emitted = self._thrice(base, [moved, fixed], base)
+        assert emitted.text == self.HEAD + fixed
+        assert not any("correct" in note for note in emitted.notes)
+
+    def test_prose_a_branch_repeats_is_counted(self) -> None:
+        """claude/b's new entry ends with the sentence A's has; the result holds
+        it once, the branch twice, so the second is reported."""
+        base = "- **Example models:** `A.R` (a). See Notes.\n"
+        branch = base + "  - `B.R` (b). See Notes.\n"
+        emitted = self._thrice(base, [branch], base)
+        assert (
+            emitted.text == self.HEAD + "- **Example models:** `A.R` (a), `B.R` (b). See Notes.\n"
+        )
+        assert [d.dropped for h in emitted.hand for d in h.differences] == [["See Notes"]]
+
+    def test_prose_after_a_removed_entry_stays(self) -> None:
+        """It is the field's, not the removed entry's."""
+        base = "- **Example models:** `Old.R` (old); see the table, `C.R` (c).\n"
+        removed = "- **Example models:** see the table, `C.R` (c).\n"
+        emitted = self._thrice(base, [removed], base)
+        assert emitted.text == self.HEAD + removed
+
     def test_a_field_whose_own_entries_all_went_takes_the_others(self) -> None:
         """The merged copy lists only Old, which a branch removed; K, which the
         base has, comes back with no ", " left before it."""
@@ -2805,6 +2838,11 @@ class TestDedupKeepsEveryModelAndWord:
                 "- **Example models:** `B_2021_b.R`, `C_2022_c.R` (c).\n",
                 "- **Example models:** `A_2020_a.R` (a),\n  `B_2021_b.R` (b), `C_2022_c.R` (c).\n",
             ),
+            (
+                "- **Example models:**\n  * `A_2020_a.R` -- a.\n\n",
+                "- **Example models:** `B_2021_b.R` (b).\n",
+                "- **Example models:**\n  * `A_2020_a.R` -- a.\n  * `B_2021_b.R` (b)\n\n",
+            ),
         ],
         ids=[
             "sub-bullet-under-inline",
@@ -2812,6 +2850,7 @@ class TestDedupKeepsEveryModelAndWord:
             "label-then-text",
             "keeper-bullets-last",
             "keeper-wrapped",
+            "bullets-then-blank",
         ],
     )
     def test_the_whole_field_is_read(

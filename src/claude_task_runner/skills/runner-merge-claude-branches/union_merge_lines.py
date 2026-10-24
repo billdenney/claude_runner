@@ -364,7 +364,8 @@ def _rebuilt(run: register._Run, kept: list[tuple[register._Entry, str | None]])
         joint = text[entry.stop : kept[n + 1][0].start] if n + 1 < len(kept) else ""
         later = any(other is not None for _, other in kept[n + 1 :])
         if register._prose(joint) or (new is not None and later):
-            out += joint
+            # Prose that now opens the run sheds the separator before it.
+            out += joint if out.strip() else register.LEADING.sub("", joint)
     return out + text[kept[-1][0].stop :]
 
 
