@@ -154,17 +154,38 @@ def _callee(node: ast.expr) -> str | None:
     return None
 
 
+def _bindings(node: ast.AST) -> list[tuple[ast.expr, ast.expr]]:
+    """``(target, value)`` for each name or attribute ``node`` binds: an
+    assignment, one unpacking a tuple into a tuple, an annotated assignment
+    with a value, or a walrus."""
+    if isinstance(node, ast.Assign):
+        pairs = []
+        for target in node.targets:
+            if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                pairs += list(zip(target.elts, node.value.elts, strict=False))
+            else:
+                pairs.append((target, node.value))
+        return pairs
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [(node.target, node.value)]
+    if isinstance(node, ast.NamedExpr):
+        return [(node.target, node.value)]
+    return []
+
+
 def _print_names(tree: ast.AST, consoles: set[str]) -> set[str]:
     """Callees (see :func:`_callee`) that print with markup: Rich's ``print``
     imported with ``from rich import print``, and names or attributes bound
-    to a console's ``print`` or ``log`` (``say = console.print``,
-    ``self.say = console.print``)."""
+    to a console's ``print`` or ``log`` by any assignment (``say =
+    console.print``, ``self.say: Callable = console.print``, ``a, say = x,
+    console.print``, ``(say := console.print)``)."""
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "rich":
             out |= {a.asname or a.name for a in node.names if a.name == "print"}
-        elif isinstance(node, ast.Assign) and _print_method(node.value, consoles):
-            out |= {c for t in node.targets if (c := _callee(t)) is not None}
+        for target, value in _bindings(node):
+            if _print_method(value, consoles) and (callee := _callee(target)) is not None:
+                out.add(callee)
     return out
 
 
@@ -335,6 +356,18 @@ def test_the_gate_flags_every_other_renderer() -> None:
         "        self.say(msg)\n"
     )
     assert findings(renamed, "cli/z.py") == ["cli/z.py:3: msg", "cli/z.py:8: msg"]
+    bound = (
+        "a, say = 1, console.print\n"
+        "say(msg)\n"
+        "if (shout := console.log):\n"
+        "    shout(msg)\n"
+        "class Shown:\n"
+        "    def __init__(self, console):\n"
+        "        self.say: object = console.print\n"
+        "    def show(self, msg):\n"
+        "        self.say(msg)\n"
+    )
+    assert findings(bound, "cli/w.py") == ["cli/w.py:2: msg", "cli/w.py:4: msg", "cli/w.py:9: msg"]
 
 
 def test_the_gate_passes_constants_lines_and_plain_prints() -> None:
