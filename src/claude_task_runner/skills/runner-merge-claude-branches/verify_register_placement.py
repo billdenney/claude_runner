@@ -83,21 +83,13 @@ def _blocks(text: str) -> Iterator[tuple[list[str], register._Block]]:
         yield names, register._parse_block(lines[start : register._block_end(start, bounds)])
 
 
-def _entries(field: register._Field) -> list[register._Entry]:
-    """The Example-models entries of ``field``: its inline list and the
-    sub-bullets under it, which a field may have both of."""
-    examples = register._examples(field)
-    if not examples.inline:
-        return examples.entries
-    label_only = register._Field(field.name, [f"- **{field.name}:**", *field.lines[1:]])
-    return examples.entries + register._examples(label_only).entries
-
-
 def parse(text: str) -> dict[str, set[str]]:
     """canonical -> the model .R filenames filed under it as Example-models entries."""
     out: dict[str, set[str]] = collections.defaultdict(set)
     for names, block in _blocks(text):
-        models = {e.model for f in block.named(register.EXAMPLES) for e in _entries(f)}
+        models = {
+            e.model for f in block.named(register.EXAMPLES) for e in register._examples(f).entries
+        }
         if models:
             for name in names:
                 out[name].update(models)
@@ -111,7 +103,7 @@ def aliases(text: str) -> dict[str, dict[str, str]]:
     for names, block in _blocks(text):
         for field in block.named(register.ALIASES):
             bullets = [" ".join(ln.strip() for ln in item)[2:] for item in field.items()]
-            if field.rest and field.rest.lower() not in register.NONE_TEXT:
+            if field.inline:
                 bullets.append(field.rest)
             for bullet in bullets:
                 key = register.CONNECTOR.sub("", register._norm([bullet]))

@@ -2020,6 +2020,43 @@ def _entries(dd: ModuleType, block: Any) -> list[Any]:
     return [e for f in block.named("Example models") for e in dd._examples(f).entries]
 
 
+SHAPES = HISTORY.parent / "dedup_shapes"
+WORD = re.compile(r"[A-Za-z0-9_.\-]+")
+UNCOUNTED = frozenset({"and", "or", "plus", "none"})
+"""Words a dedup may drop: what joins two entries, and the "none" of a field that lists nothing."""
+FIELD_LINE = re.compile(r"^- \*\*[^*]+:\*\*")
+
+
+def _words(text: str) -> set[str]:
+    return {w.strip(".-") for w in WORD.findall(text)} - {""}
+
+
+def _plain_blocks(text: str) -> dict[str, list[str]]:
+    """Each ``### NAME`` block's text, by NAME, split on headings alone: the
+    oracle reads the register without the dedup's parser."""
+    out: dict[str, list[str]] = defaultdict(list)
+    name, lines = None, []
+    for line in [*text.split("\n"), "# end"]:
+        if line.startswith("#"):
+            if name is not None:
+                out[name].append("\n".join(lines))
+            name, lines = (line.split()[1], [line]) if line.startswith("### ") else (None, [])
+        elif name is not None:
+            lines.append(line)
+    return out
+
+
+def _example_text(block: str) -> str:
+    """The text of a block's Example-models fields, up to the next field."""
+    out, inside = [], False
+    for line in block.split("\n"):
+        if FIELD_LINE.match(line):
+            inside = line.startswith("- **Example models:**")
+        if inside:
+            out.append(line)
+    return "\n".join(out)
+
+
 class TestDedupKeepsEveryModelAndWord:
     """With ``--report``, as merge_branches.sh runs it, every group collapses.
 
@@ -2235,9 +2272,9 @@ class TestDedupKeepsEveryModelAndWord:
             f"# Hand union needed in {register}\n"
             "\n"
             "Each canonical below was registered more than once. The register keeps\n"
-            "one copy (the longest); what a dropped copy said differently is below,\n"
-            "verbatim. Union it into the register by hand, keeping each source's\n"
-            "attribution, and commit.\n"
+            "one copy (the one the base has, else the longest); what a dropped copy\n"
+            "said differently is below, verbatim. Union it into the register by hand,\n"
+            "keeping each source's attribution, and commit.\n"
             "\n"
             "## Q (lines [1, 7] before the dedup)\n"
             "\n"
@@ -2287,15 +2324,152 @@ class TestDedupKeepsEveryModelAndWord:
         check = run_helper("dedup_canonical_headers.py", "--global", "--check", register)
         assert check.returncode == 0
 
+    @pytest.mark.parametrize(
+        ("kept", "dropped", "result"),
+        [
+            (
+                "- **Example models:** `A_2020_a.R` (a).\n",
+                "- **Example models:** `B_2021_b.R` (b).\n  - `C_2022_c.R` -- under the list.\n",
+                "- **Example models:** `A_2020_a.R` (a), `B_2021_b.R` (b),"
+                " `C_2022_c.R` (under the list).\n",
+            ),
+            (
+                "- **Example models:** `A_2020_a.R` (a).\n",
+                "- **Example models:** `B_2021_b.R` (b),\n  `C_2022_c.R` (c).\n",
+                "- **Example models:** `A_2020_a.R` (a), `B_2021_b.R` (b), `C_2022_c.R` (c).\n",
+            ),
+            (
+                "- **Example models:** `A_2020_a.R` (a).\n",
+                "- **Example models:**\n  `B_2021_b.R` is the chain case.\n",
+                "- **Example models:** `A_2020_a.R` (a), `B_2021_b.R` is the chain case.\n",
+            ),
+            (
+                "- **Example models:** `A_2020_a.R` (a).\n  * `C_2022_c.R` -- under the list.\n",
+                "- **Example models:** `B_2021_b.R` (b).\n",
+                "- **Example models:** `A_2020_a.R` (a).\n  * `C_2022_c.R` -- under the list.\n"
+                "  * `B_2021_b.R` (b)\n",
+            ),
+            (
+                "- **Example models:** `A_2020_a.R` (a),\n  `B_2021_b.R` (b).\n",
+                "- **Example models:** `B_2021_b.R`, `C_2022_c.R` (c).\n",
+                "- **Example models:** `A_2020_a.R` (a),\n  `B_2021_b.R` (b), `C_2022_c.R` (c).\n",
+            ),
+        ],
+        ids=[
+            "sub-bullet-under-inline",
+            "wrapped",
+            "label-then-text",
+            "keeper-bullets-last",
+            "keeper-wrapped",
+        ],
+    )
+    def test_the_whole_field_is_read(
+        self, tmp_path: Path, kept: str, dropped: str, result: str
+    ) -> None:
+        """The label line, the lines that continue it and the sub-bullets,
+        under an inline list too. Only the label line, or only the
+        sub-bullets, used to be read: C_2022_c.R vanished with its copy, and
+        a wrapped keeper got B_2021_b.R twice and ``(b),, `C_2022_c.R```."""
+        proc, out, report = self._dedup(tmp_path, _pair(kept, dropped))
+        assert (proc.returncode, proc.stderr, report) == (0, "", "")
+        assert out == f"### Q (**canonical for q**)\n{result}{KEPT_NOTES}"
+
+    def test_source_alias_text_outside_a_bullet_is_kept_or_reported(self, tmp_path: Path) -> None:
+        """The keeper's lines under the label used to be replaced by the
+        label alone when it had no bullets; a dropped copy's were dropped."""
+        kept = "- **Source aliases:**\n  Read from the dataset's own header.\n"
+        dropped = "- **Source aliases:**\n  Named by the sponsor.\n  - `BW` -- weight.\n"
+        proc, out, report = self._dedup(tmp_path, _pair(kept, dropped))
+        assert proc.returncode == 0
+        assert out == (
+            "### Q (**canonical for q**)\n- **Source aliases:**\n"
+            "  Read from the dataset's own header.\n  - `BW` -- weight.\n" + KEPT_NOTES
+        )
+        assert "In a dropped copy:\n\n````\n  Named by the sponsor.\n````\n" in report
+
+    @pytest.mark.parametrize(
+        ("body", "models"),
+        [
+            (f"{NAGY}............., `B_2021_b.R` (b).", ["Nagy_2017_x.R", "B_2021_b.R"]),
+            ("`A.R` (a (b] c)..., `B.R` (b).", ["A.R", "B.R"]),
+            ("`A.R` (unclosed note, `B.R` (b).", ["A.R", "B.R"]),
+            ("`A.R` (+28.5% (4, 5], +33.3% (5, 6] h; `T_CONMED`), `B.R`.", ["A.R", "B.R"]),
+            ("`A.R` (refits `B.R`; window (4, 5] h), `C.R`.", ["A.R", "C.R"]),
+            (
+                "`P_1998_p.R` (effect on Ka: `ka <- exp(lka + e * X)` (29% lower; Table 4)."
+                " The CL effect (oral only (paper p. 3)......................",
+                ["P_1998_p.R"],
+            ),
+        ],
+        ids=["nagy", "interval-then-stops", "unclosed", "two-intervals", "mention", "never-closed"],
+    )
+    def test_an_open_paren_hides_no_entry(self, body: str, models: list[str]) -> None:
+        """A ``(`` nothing closes, or a half-open interval's bracket, used to
+        hide every entry after it, so a carried entry became part of the one
+        before and was carried again by the next dedup."""
+        dd = load_helper("dedup_canonical_headers")
+        assert [e.model for e in dd._split_entries(body)[1]] == models
+
+    @pytest.mark.parametrize(
+        ("kept", "result"),
+        [
+            (f"{NAGY}.............", f"{NAGY}, `B_2021_b.R` (b)............."),
+            ("`A_2020_a.R` (unclosed note.", "`A_2020_a.R` (unclosed note, `B_2021_b.R` (b)."),
+            (
+                "`P_1998_p.R` (CL effect (oral only (paper p. 3)......",
+                "`P_1998_p.R` (CL effect (oral only (paper p. 3), `B_2021_b.R` (b)......",
+            ),
+        ],
+        ids=["nagy", "unclosed", "never-closed"],
+    )
+    def test_dedup_twice_is_dedup_once(self, tmp_path: Path, kept: str, result: str) -> None:
+        """The entry carried after an open paren is an entry: a second copy
+        listing it again carries nothing."""
+        dropped = "- **Example models:** `B_2021_b.R` (b).\n"
+        proc, once, _ = self._dedup(tmp_path, _pair(f"- **Example models:** {kept}\n", dropped))
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert once == f"### Q (**canonical for q**)\n- **Example models:** {result}\n{KEPT_NOTES}"
+        again = once + "\n### Q (**canonical for q**)\n" + dropped
+        proc, twice, report = self._dedup(tmp_path, again)
+        assert (proc.returncode, proc.stderr, report, twice) == (0, "", "", once)
+        assert proc.stdout.endswith("  Q: 2 -> 1\n")
+
+    def test_the_copy_on_the_base_is_kept(self, tmp_path: Path) -> None:
+        """With --prefer, the base's wording stays even when a branch's copy is
+        longer; the branch's own words go to the report, so the merge reverts
+        nothing of the base's."""
+        base_copy = (
+            "### Q (**canonical for q**)\n- **Notes:** As main words it.\n"
+            "- **Example models:** `A_2020_a.R` (a).\n"
+        )
+        branch_copy = (
+            "### Q (**canonical for q**)\n- **Notes:** As the branch words it, at more length.\n"
+            "- **Example models:** `B_2021_b.R` (b).\n"
+        )
+        base = tmp_path / "base.md"
+        base.write_text(base_copy)
+        register = tmp_path / "covariate-columns.md"
+        report = tmp_path / "hand-union.md"
+        register.write_text(branch_copy + "\n" + base_copy)
+        proc = run_helper(
+            "dedup_canonical_headers.py", "--global", "--report", report, "--prefer", base, register
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert register.read_text() == base_copy.replace("(a).", "(a), `B_2021_b.R` (b).")
+        assert "- **Notes:** As the branch words it, at more length.\n" in report.read_text()
+        missing = tmp_path / "no-base.md"
+        proc = run_helper("dedup_canonical_headers.py", "--prefer", missing, register)
+        assert (proc.returncode, proc.stderr) == (2, f"ERROR: (dedup) no such file: {missing}\n")
+
     @pytest.mark.parametrize("fixture", sorted(HISTORY.glob("*.md")), ids=lambda p: p.stem)
     def test_real_duplicates_lose_no_model_and_no_word(self, fixture: Path, tmp_path: Path) -> None:
         """Every duplicate group a consolidation of nlmixr2lib met, as the
         register had it before the dedup ran (the commit is in the file name).
 
-        Every model any copy lists as an entry is an entry of the kept block,
-        and every alias of every copy is in it. Each entry and other field of
-        a dropped copy is in it or in the report, every ``*.R`` any copy names
-        is in one of them, and --check is clean.
+        Read without the dedup's parser: every word of every copy is in the
+        kept block or the report, and every backticked ``*.R`` of a copy's
+        Example models is in the kept block. With it: every model a copy
+        lists as an entry is an entry of the kept block. --check is clean.
         """
         dd = load_helper("dedup_canonical_headers")
         before = fixture.read_text()
@@ -2307,34 +2481,59 @@ class TestDedupKeepsEveryModelAndWord:
         check = run_helper("dedup_canonical_headers.py", *scope, "--check", register)
         assert check.returncode == 0, check.stderr
 
-        kept = _blocks(dd, after)
-        report_text = dd._norm(report.split("\n"))
-        for name, copies in _blocks(dd, before).items():
+        kept = _plain_blocks(after)
+        for name, copies in _plain_blocks(before).items():
             assert (len(copies), len(kept[name])) == (2, 1), name
             result = kept[name][0]
-            result_text = dd._norm(result.lines())
-            listed = {e.model for c in copies for e in _entries(dd, c)}
-            assert listed <= {e.model for e in _entries(dd, result)}, name
-            keeper = max(copies, key=lambda c: sum(len(ln) for ln in c.lines()))
+            lost = {w for c in copies for w in _words(c)} - _words(result) - _words(report)
+            assert lost - UNCOUNTED == set(), name
             for copy in copies:
-                aliases = [item for f in copy.named("Source aliases") for item in f.items()]
-                assert all(dd._norm(item) in result_text for item in aliases), name
-                mentioned = set(re.findall(r"`([\w.-]+\.R)`", "\n".join(copy.lines())))
-                assert {m for m in mentioned if m not in result_text + report_text} == set()
-                if copy is keeper:
+                models = set(re.findall(r"`([A-Za-z0-9_.-]+\.R)`", _example_text(copy)))
+                assert {m for m in models if f"`{m}`" not in _example_text(result)} == set()
+            listed = {e.model for c in _blocks(dd, before)[name] for e in _entries(dd, c)}
+            assert listed <= {e.model for e in _entries(dd, _blocks(dd, after)[name][0])}
+
+    @pytest.mark.parametrize(
+        ("fixture", "name"),
+        [
+            (path, name)
+            for path in sorted(SHAPES.glob("*.md"))
+            for name in _plain_blocks(path.read_text())
+        ],
+        ids=lambda v: v.stem if isinstance(v, Path) else v,
+    )
+    def test_a_real_shape_dropped_loses_no_model_and_no_word(
+        self, fixture: Path, name: str, tmp_path: Path
+    ) -> None:
+        """The 24 blocks of the 2026-10-23 nlmixr2lib registers that an earlier
+        reader lost words or models from, each the dropped copy beside a
+        longer one that lists a single other model: an Example-models field
+        with sub-bullets under an inline list, wrapped over lines, or with a
+        "(" that never closes."""
+        dd = load_helper("dedup_canonical_headers")
+        block = _plain_blocks(fixture.read_text())[name][0].rstrip("\n")
+        keeper, skipping = [], False
+        for line in block.split("\n"):
+            if FIELD_LINE.match(line):
+                skipping = line.startswith("- **Example models:**")
+                if skipping:
+                    line = "- **Example models:** `Zkeeper_2099_z.R` (the keeper's only model)."
+                    keeper.append(line)
                     continue
-                # An entry is carried as written, or as ``(text)`` from a
-                # list-style copy into an inline keeper.
-                forms = [(e.text, dd._as_inline(e.text)) for e in _entries(dd, copy)]
-                forms += [(p,) for f in copy.named("Example models") for p in dd._examples(f).prose]
-                forms += [
-                    ("\n".join(f.lines),)
-                    for f in copy.fields
-                    if f.name not in ("Example models", "Source aliases")
-                ]
-                for texts in forms:
-                    norms = [dd._norm(text.split("\n")) for text in texts]
-                    assert any(n in result_text or n in report_text for n in norms), (name, texts)
+            if not skipping:
+                keeper.append(line)
+        keeper.append("- **Notes:** " + "padding " * 400)
+        scope = () if "compartment-names" in fixture.name else ("--global",)
+        text = "## S\n\n" + "\n".join(keeper) + "\n\n" + block + "\n"
+        proc, after, report = self._dedup(tmp_path, text, *scope)
+        assert proc.returncode == 0, proc.stderr
+        (result,) = _plain_blocks(after)[name]
+        assert _words(block) - _words(result) - _words(report) - UNCOUNTED == set()
+        models = set(re.findall(r"`([A-Za-z0-9_.-]+\.R)`", _example_text(block)))
+        assert {m for m in models if f"`{m}`" not in _example_text(result)} == set()
+        dropped = _blocks(dd, "## S\n\n" + block)[name][0]
+        kept = _blocks(dd, after)[name][0]
+        assert {e.model for e in _entries(dd, dropped)} <= {e.model for e in _entries(dd, kept)}
 
 
 class TestVerifyVignettesParallel:
