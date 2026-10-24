@@ -65,16 +65,35 @@ def _runs(node: object) -> list[str]:
     return []
 
 
-PIP = re.compile(r"pip(?:3(?:\.\d+)?)?")
-"""``pip``, ``pip3`` or ``pip3.12``, as a command's basename."""
+PIP = re.compile(r"pip(?:3(?:\.\d+)?)?|pipx")
+"""``pip``, ``pip3``, ``pip3.12`` or ``pipx``, as a command's basename."""
+PIP_VALUE_OPTIONS = frozenset(
+    {
+        "--python",
+        "--log",
+        "--proxy",
+        "--retries",
+        "--timeout",
+        "--exists-action",
+        "--trusted-host",
+        "--cert",
+        "--client-cert",
+        "--cache-dir",
+        "--keyring-provider",
+        "--use-feature",
+        "--use-deprecated",
+        "--resume-retries",
+    }
+)
+"""pip's general options that take a value, which may stand before ``install``."""
 
 
 def _commands(script: str) -> list[list[str]]:
     """The commands of a ``run:`` script, each as words: backslash-continued
     lines joined, each line tokenised as a shell does (quotes kept together,
     comments dropped), then split at operator tokens (``&&``, ``||``,
-    ``;``, ``|``, ``&``, parentheses). Splitting the text before tokenising
-    broke a quoted ``|`` or ``;`` (``grep -E 'a|b'``), and shlex then raised."""
+    ``;``, ``|``, ``&``, parentheses), so a quoted ``|`` or ``;``
+    (``grep -E 'a|b'``) stays inside its word."""
     out = []
     for line in re.sub(r"\\\n", " ", script).splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -105,7 +124,7 @@ def _installs_pinned_tools(words: list[str]) -> bool:
         return False
     rest = words[at + 1 :]
     while rest and rest[0].startswith("-"):
-        rest = rest[1:]
+        rest = rest[2:] if rest[0] in PIP_VALUE_OPTIONS else rest[1:]
     if not rest or rest[0] != "install":
         return False
     for word in rest[1:]:
@@ -120,6 +139,9 @@ def _is_constraints_file(path: str) -> bool:
 
 
 def _constrained(words: list[str]) -> bool:
+    """The constraints file is passed: ``-c FILE``, ``--constraint FILE`` or
+    ``--constraint=FILE``, as words or inside one (``--pip-args '-c FILE'``)."""
+    words = [part for word in words for part in word.split()]
     for i, word in enumerate(words):
         following = words[i + 1] if i + 1 < len(words) else ""
         if word in ("-c", "--constraint") and _is_constraints_file(following):
@@ -221,6 +243,14 @@ def test_every_documented_install_uses_the_pins() -> None:
         ("pip3.12 install mypy==2.4.0", 1, ["pip3.12 install mypy==2.4.0"]),
         ("(pip install mypy)", 1, ["pip install mypy"]),
         ("grep -E 'a|b' f && echo \"a; b\" | tee out", 0, []),
+        ("pip --timeout 60 install mypy", 1, ["pip --timeout 60 install mypy"]),
+        (
+            "pip --python /usr/bin/python3 install mypy",
+            1,
+            ["pip --python /usr/bin/python3 install mypy"],
+        ),
+        ("pipx install mypy", 1, ["pipx install mypy"]),
+        ("pipx install mypy --pip-args '-c .github/ci-constraints.txt'", 1, []),
     ],
     ids=[
         "one-line",
@@ -237,6 +267,10 @@ def test_every_documented_install_uses_the_pins() -> None:
         "pip3.12",
         "subshell",
         "quoted-operators",
+        "value-option",
+        "python-option",
+        "pipx",
+        "pipx-pinned",
     ],
 )
 def test_the_install_check_reads_whole_commands(
