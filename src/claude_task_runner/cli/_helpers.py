@@ -100,18 +100,21 @@ def literal(*parts: object, style: str = "") -> Text:
     ``str`` it prints, so a task id, path, reason or error message holding
     either would be restyled, cut short, turned into a symbol, or raise.
     A ``Text`` is printed as it is, so every value from outside the code
-    goes into the line through this. Each part is a value, printed as
-    ``str(value)``, or a ``(value, style)`` pair for a styled span;
+    goes into the line through this. Each part is printed as
+    ``str(part)``, whatever its type, except a ``Text`` (a :func:`styled`
+    span, or another ``literal`` line), which goes in with its styles;
     ``style`` styles the whole line. ``tests/unit/test_cli_markup_gate.py``
     fails on a print that passes free text as markup.
     """
     line = Text(style=style)
     for part in parts:
-        if isinstance(part, tuple) and len(part) == 2 and isinstance(part[1], str):
-            line.append(str(part[0]), style=part[1])
-        else:
-            line.append(str(part))
+        line.append(part if isinstance(part, Text) else str(part))
     return line
+
+
+def styled(value: object, style: str) -> Text:
+    """``str(value)`` in ``style``, as a part of a :func:`literal` line."""
+    return Text(str(value), style=style)
 
 
 def require_queue_option(queue_dir: Path, console: Console, *, json: bool = False) -> Path:

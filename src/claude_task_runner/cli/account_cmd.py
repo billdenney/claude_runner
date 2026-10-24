@@ -39,6 +39,7 @@ from claude_task_runner.cli._helpers import (
     queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
+    styled,
 )
 from claude_task_runner.config.loader import (
     BrokenAccount,
@@ -286,7 +287,7 @@ def list_accounts(
         for decl, row in zip(settings.accounts, rows, strict=True):
             _print_account(console, decl, loaded.get(decl.name), broken.get(decl.name), row)
         console.print(
-            literal(("queue ceiling:", "bold"), " ", queue_ceiling_text(ceiling, settings)),
+            literal(styled("queue ceiling:", "bold"), " ", queue_ceiling_text(ceiling, settings)),
             soft_wrap=True,
         )
     if resolution.broken:
@@ -301,17 +302,17 @@ def _print_account(
     row: dict[str, object],
 ) -> None:
     """The human-readable lines of one ``account list`` row."""
-    paused_tag = (" (paused)", "yellow") if row["paused"] else ""
+    paused_tag = styled(" (paused)", "yellow") if row["paused"] else ""
     state_str = row["state"] or "—"
     util_5h_s = f"{row['last_5h_util_pct']}%" if row["state"] is not None else "—"
     util_w_s = f"{row['last_weekly_util_pct']}%" if row["state"] is not None else "—"
-    console.print(literal((decl.name, "bold"), paused_tag))
+    console.print(literal(styled(decl.name, "bold"), paused_tag))
     console.print(literal("  config_dir:      ", decl.config_dir or "(default ~/.claude)"))
     if decl.linux_user:
         console.print(literal("  linux_user:      ", decl.linux_user))
     if broken is not None:
         console.print(
-            literal("  ", ("policy error:", "bold red"), "    ", broken.error), soft_wrap=True
+            literal("  ", styled("policy error:", "bold red"), "    ", broken.error), soft_wrap=True
         )
     if acct is not None:
         console.print(literal("  max_concurrency: ", acct.policy.concurrency.max_concurrency))
@@ -344,7 +345,9 @@ def _print_account(
     if isinstance(usage_error, dict):
         fix = "log it in again" if usage_error["kind"] == "auth" else "the usage page changed"
         console.print(
-            literal("  ", ("usage error:", "bold red"), f"     {usage_error['message']} ({fix})"),
+            literal(
+                "  ", styled("usage error:", "bold red"), f"     {usage_error['message']} ({fix})"
+            ),
             soft_wrap=True,
         )
 

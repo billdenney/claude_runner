@@ -18,6 +18,7 @@ from claude_task_runner.cli._helpers import (
     literal,
     load_settings_or_exit,
     resolve_per_queue_config,
+    styled,
 )
 from claude_task_runner.doctor.checks import CheckStatus, all_checks
 
@@ -105,16 +106,23 @@ def doctor(
         print(_json.dumps(payload, indent=2))
     else:
         console = Console()
-        console.print(literal(("Queue:", "bold"), " ", queue_path, "\n"))
+        console.print(literal(styled("Queue:", "bold"), " ", queue_path, "\n"))
         for r in results:
             color = _STATUS_COLOR[r.status]
             label = _STATUS_LABEL[r.status]
             console.print(
-                literal("  ", (label, f"bold {color}"), " ", (r.name, "bold"), ": ", r.detail)
+                literal(
+                    "  ",
+                    styled(label, f"bold {color}"),
+                    " ",
+                    styled(r.name, "bold"),
+                    ": ",
+                    r.detail,
+                )
             )
             if r.remediation:
                 for line in r.remediation.splitlines():
-                    console.print(literal("      ", (line, "dim")))
+                    console.print(literal("      ", styled(line, "dim")))
 
     failures = sum(1 for r in results if r.status is CheckStatus.FAIL)
     if failures:

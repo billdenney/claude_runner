@@ -30,6 +30,7 @@ from claude_task_runner.cli._helpers import (
     queue_ceiling_text,
     require_queue_option,
     resolve_per_queue_config,
+    styled,
 )
 from claude_task_runner.clock import RealClock
 from claude_task_runner.config.loader import (
@@ -288,12 +289,12 @@ def start(
             config_path=config,
         )
     except pidfile_mod.SupervisorAlreadyRunning as exc:
-        console.print(literal(("supervisor already running:", "bold red"), " ", exc))
+        console.print(literal(styled("supervisor already running:", "bold red"), " ", exc))
         raise typer.Exit(code=2) from exc
 
     console.print(
         literal(
-            ("Supervisor exited.", "green"),
+            styled("Supervisor exited.", "green"),
             f" State at {handle.state_path}, PID file at {handle.pid_path}",
         )
     )
@@ -639,12 +640,12 @@ def status(
         print(_json.dumps(payload, default=str, indent=2))
         return
 
-    console.print(literal(("Queue:", "bold"), "            ", queue_path))
+    console.print(literal(styled("Queue:", "bold"), "            ", queue_path))
     console.print(
         literal(
-            ("Supervisor PID:", "bold"),
+            styled("Supervisor PID:", "bold"),
             f"   {pid} (",
-            ("alive", "green") if alive else ("not running", "yellow"),
+            styled("alive", "green") if alive else styled("not running", "yellow"),
             ")",
         )
     )
@@ -658,34 +659,41 @@ def status(
         )
         console.print(
             literal(
-                ("State:", "bold"),
+                styled("State:", "bold"),
                 "            ",
-                (snapshot.state.value, state_color),
+                styled(snapshot.state.value, state_color),
                 f"  (since {snapshot.since})",
             )
         )
         console.print(
             literal(
-                ("5h util:", "bold"),
+                styled("5h util:", "bold"),
                 f"          {snapshot.last_5h_util_pct}%   ",
-                ("Weekly util:", "bold"),
+                styled("Weekly util:", "bold"),
                 f" {snapshot.last_weekly_util_pct}%",
             )
         )
         console.print(
-            literal(("Last reading:", "bold"), "     ", snapshot.last_reading_at or "none yet")
+            literal(
+                styled("Last reading:", "bold"), "     ", snapshot.last_reading_at or "none yet"
+            )
         )
         if snapshot.scheduled_wakeup_at is not None:
-            console.print(literal(("Next wakeup:", "bold"), "      ", snapshot.scheduled_wakeup_at))
+            console.print(
+                literal(styled("Next wakeup:", "bold"), "      ", snapshot.scheduled_wakeup_at)
+            )
         if snapshot.last_drift_message:
-            console.print(literal(("Last drift:", "red"), "       ", snapshot.last_drift_message))
-    console.print(literal(("Pending:", "bold"), "          ", payload["pending"]))
-    console.print(literal(("In-flight:", "bold"), "        ", payload["in_flight"]))
+            console.print(
+                literal(styled("Last drift:", "red"), "       ", snapshot.last_drift_message)
+            )
+    console.print(literal(styled("Pending:", "bold"), "          ", payload["pending"]))
+    console.print(literal(styled("In-flight:", "bold"), "        ", payload["in_flight"]))
     console.print(
-        literal(("Queue ceiling:", "bold"), "    ", queue_ceiling_text(ceiling, settings)),
+        literal(styled("Queue ceiling:", "bold"), "    ", queue_ceiling_text(ceiling, settings)),
         soft_wrap=True,
     )
     for b in resolution.broken:
         console.print(
-            literal(("Account error:", "bold red"), f"    {b.name}: {b.error}"), soft_wrap=True
+            literal(styled("Account error:", "bold red"), f"    {b.name}: {b.error}"),
+            soft_wrap=True,
         )

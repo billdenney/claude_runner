@@ -34,7 +34,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from claude_task_runner.cli._helpers import literal
+from claude_task_runner.cli._helpers import literal, styled
 
 app = typer.Typer(no_args_is_help=False, invoke_without_command=False, rich_markup_mode=None)
 
@@ -313,9 +313,9 @@ def install_skills(
 
     console.print(
         literal(
-            ("Skills target:", "bold"),
+            styled("Skills target:", "bold"),
             f" {target}    ",
-            (f"mode: {'symlink' if use_symlinks else 'copy'}", "dim"),
+            styled(f"mode: {'symlink' if use_symlinks else 'copy'}", "dim"),
         )
     )
     for name, src in plan:
@@ -426,7 +426,7 @@ def uninstall_skills(
         )
         return
 
-    console.print(literal(("Will remove:", "bold"), " ", target))
+    console.print(literal(styled("Will remove:", "bold"), " ", target))
     for name, state in present:
         console.print(literal(f"  • {name} ({_REMOVAL_KINDS[state]})"))
 
@@ -453,7 +453,7 @@ def uninstall_skills(
                 soft_wrap=True,
             )
             continue
-        console.print(literal("  ", ("removed", "green"), " ", name))
+        console.print(literal("  ", styled("removed", "green"), " ", name))
     if failed:
         console.print(
             literal(f"Failed to remove {failed} of {len(present)} skills.", style="bold red")

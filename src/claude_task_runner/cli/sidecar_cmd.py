@@ -23,8 +23,9 @@ from typing import cast
 import typer
 from pydantic import ValidationError
 from rich.console import Console
+from rich.text import Text
 
-from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, literal, require_queue_option
+from claude_task_runner.cli._helpers import CWD_DEFAULT_LABEL, literal, require_queue_option, styled
 from claude_task_runner.queue.schema import (
     SidecarAnswer,
     SidecarResponse,
@@ -141,32 +142,36 @@ def list_sidecars(
         console.print("[dim]No open sidecars.[/]")
         return
     for row in items:
-        head = ((row["task_id"], "bold"), " ", (f"#{row['sequence']:03d}", "dim"))
+        head = literal(
+            styled(row["task_id"], "bold"), " ", styled(f"#{row['sequence']:03d}", "dim")
+        )
         if "error" in row:
-            console.print(literal(*head, (" unreadable:", "red"), " ", row["error"]))
+            console.print(literal(head, styled(" unreadable:", "red"), " ", row["error"]))
             continue
         outstanding = cast("list[str]", row["outstanding"])
         answered = cast("list[str]", row["answered"])
         # A response that credits none of the asked ids is a different fault
         # from a half-finished one -- usually an answer written against the
         # wrong id -- and saying "partial" for it would misdescribe it.
-        marker: tuple[str, str] = ("", "")
+        marker: Text | str = ""
         if row["partial"]:
-            marker = ("partial ", "yellow") if answered else ("unmatched ", "red")
+            marker = styled("partial ", "yellow") if answered else styled("unmatched ", "red")
         ids = ", ".join(outstanding) or "(no questions)"
         console.print(
-            literal(*head, " ", marker, (ids, "cyan"), " ", _one_line(row.get("summary")))
+            literal(head, " ", marker, styled(ids, "cyan"), " ", _one_line(row.get("summary")))
         )
         if row["partial"] and answered:
-            console.print(literal("    ", (f"already answered: {', '.join(answered)}", "dim")))
+            console.print(
+                literal("    ", styled(f"already answered: {', '.join(answered)}", "dim"))
+            )
         elif row["partial"]:
             console.print("    [dim]a response exists but answers none of the asked ids[/]")
     console.print(
         literal(
             "\n",
-            (len(items), "bold"),
+            styled(len(items), "bold"),
             " open request(s), ",
-            (n_questions, "bold"),
+            styled(n_questions, "bold"),
             " unanswered question(s).",
         )
     )
@@ -203,20 +208,24 @@ def show_sidecar(
 
     console = Console()
     console.print(
-        literal(("task:", "bold"), f" {req.task_id}  ", ("seq:", "bold"), f" {req.sequence}")
+        literal(
+            styled("task:", "bold"), f" {req.task_id}  ", styled("seq:", "bold"), f" {req.sequence}"
+        )
     )
-    console.print(literal(("summary:", "bold"), " ", req.summary))
+    console.print(literal(styled("summary:", "bold"), " ", req.summary))
     if req.context:
         console.print("[bold]context:[/]")
         for line in req.context.splitlines():
             console.print(literal("  ", line))
     for q in req.questions:
-        console.print(literal("\n", ("Q", "bold cyan"), " ", (q.id, "bold"), ": ", q.prompt))
+        console.print(
+            literal("\n", styled("Q", "bold cyan"), " ", styled(q.id, "bold"), ": ", q.prompt)
+        )
         for opt in q.options:
             marker = "*" if opt.value == q.recommended else " "
             console.print(literal(f"  {marker} {opt.value}: {opt.label}"))
             if opt.description:
-                console.print(literal("      ", (opt.description, "dim")))
+                console.print(literal("      ", styled(opt.description, "dim")))
         if q.allow_free_text:
             console.print("  [dim](free-text answer permitted)[/]")
         if q.multi_select:
