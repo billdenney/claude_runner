@@ -1458,28 +1458,27 @@ class TestUnionIsIdempotent:
                 ". Prose after the list.",
             ),
             ("`A.R` (a)", [("A.R", "(a)")], ""),
+            ("`A.R` (a (b] c)..., `B.R` (b).", [("A.R", "(a (b] c)"), ("B.R", "(b)")], "."),
         ],
-        ids=["unclosed-then-stops", "unclosed-never-closed", "prose-after", "no-final-stop"],
+        ids=[
+            "unclosed-then-stops",
+            "unclosed-never-closed",
+            "prose-after",
+            "no-final-stop",
+            "interval",
+        ],
     )
-    def test_the_entries_and_what_follows_them_rebuild_the_body(
+    def test_each_note_and_what_follows_the_last(
         self, body: str, entries: list[tuple[str, str]], tail: str
     ) -> None:
-        """The text after the last entry is kept, not replaced by one full stop."""
-        assert self.u.split_example_body(body) == (entries, tail)
-        rebuilt = ", ".join(f"`{f}` {a}" if a else f"`{f}`" for f, a in entries) + tail
-        assert rebuilt == body
-
-    def test_an_unclosed_annotation_stops_before_the_final_stops_and_the_next_entry(
-        self,
-    ) -> None:
-        assert self.u.split_example_body(f"{NAGY}.............") == (
-            [("Nagy_2017_x.R", NAGY.split(" ", 1)[1])],
-            ".............",
-        )
-        assert self.u.split_example_body("`A.R` (a (b] c)..., `B.R` (b).") == (
-            [("A.R", "(a (b] c)..."), ("B.R", "(b)")],
-            ".",
-        )
+        """The union reads entries with the dedup's parser. The text after the
+        last entry's note closes the line and is kept as it is, so its run of
+        full stops never grows."""
+        dd = load_helper("dedup_canonical_headers")
+        examples = dd._examples(dd._Field("Example models", [f"- **Example models:** {body}"]))
+        notes = dd._notes(examples)
+        assert [(e.model, n.text) for e, n in zip(examples.entries, notes, strict=True)] == entries
+        assert examples.runs[0].text[notes[-1].end :] == tail
 
     def test_a_run_with_nothing_to_add_changes_no_byte(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1521,6 +1520,129 @@ class TestUnionIsIdempotent:
         assert second.returncode == 0, second.stderr
         assert second.stderr.endswith(f"# nothing to add; left unchanged: {wt / REGISTER}\n")
         assert (wt / REGISTER).read_bytes() == once
+
+
+class TestUnionEditsFieldsInPlace:
+    """The union reads each Example-models field whole, with the dedup's
+    parser, and edits it where it stands. It used to rebuild the label line
+    as its entries joined by ", ": prose before and between the entries was
+    lost, the last entry's trailing words moved onto an added one, and a
+    model listed twice became one entry with the longer annotation."""
+
+    HEAD = "## Body size\n\n### WT (**canonical for weight**)\n\n"
+
+    def _merge(self, base: str, *branches: str, current: str | None = None) -> Any:
+        """What emit_merged makes of ``current`` (the base by default), with
+        each branch cut from the base."""
+        u = load_helper("union_merge_lines")
+        base_text = self.HEAD + base
+        fork = u.entry_map(base_text)
+        union = u.collect_entries(base_text, [(self.HEAD + b, fork) for b in branches])
+        return u.emit_merged(self.HEAD + (base if current is None else current), union)
+
+    @pytest.mark.parametrize(
+        ("base", "branch", "result"),
+        [
+            (
+                "- **Example models:** Fits: `A.R` for the base case; `B.R` for the chain case.\n",
+                "- **Example models:** Fits: `A.R` for the base case; `B.R` for the chain case,"
+                " `C.R` (new).\n",
+                "- **Example models:** Fits: `A.R` for the base case; `B.R` for the chain case,"
+                " `C.R` (new).\n",
+            ),
+            (
+                "- **Example models:** `A.R` (a). Set to 0 to simulate the drug effect only.\n",
+                "- **Example models:** `A.R` (a), `B.R` (b). Set to 0 to simulate the drug effect"
+                " only.\n",
+                "- **Example models:** `A.R` (a), `B.R` (b). Set to 0 to simulate the drug effect"
+                " only.\n",
+            ),
+            (
+                "- **Example models:** `A.R` (first), `A.R` (second, longer).\n",
+                "- **Example models:** `A.R` (first), `A.R` (second, longer), `B.R` (b).\n",
+                "- **Example models:** `A.R` (first), `A.R` (second, longer), `B.R` (b).\n",
+            ),
+            (
+                "- **Example models:**\n  - `A.R` -- a.\n",
+                "- **Example models:**\n  - `A.R` -- a.\n  - `B.R` -- b.\n",
+                "- **Example models:**\n  - `A.R` -- a.\n  - `B.R` -- b\n",
+            ),
+            (
+                "- **Example models:** `A.R` (a),\n  `B.R` (b).\n",
+                "- **Example models:** `A.R` (a),\n  `B.R` (b), `C.R` (c).\n",
+                "- **Example models:** `A.R` (a),\n  `B.R` (b), `C.R` (c).\n",
+            ),
+        ],
+        ids=["prose-around-entries", "closing-remark", "listed-twice", "sub-bullets", "wrapped"],
+    )
+    def test_a_lost_entry_comes_back_and_nothing_else_moves(
+        self, base: str, branch: str, result: str
+    ) -> None:
+        emitted = self._merge(base, branch)
+        assert (emitted.text, emitted.hand) == (self.HEAD + result, [])
+
+    def test_a_field_whose_own_entries_all_went_takes_the_others(self) -> None:
+        """The merged copy lists only Old, which a branch removed; K, which the
+        base has, comes back with no ", " left before it."""
+        base = "- **Example models:** `Old.R` (old), `K.R` (k).\n"
+        removed = "- **Example models:** `K.R` (k).\n"
+        stale = "- **Example models:** `Old.R` (old).\n"
+        emitted = self._merge(base, removed, current=stale)
+        assert emitted.text == self.HEAD + removed
+
+    def test_a_removed_entry_takes_only_its_own_text(self) -> None:
+        line = "- **Example models:** `A.R` (a), `Old.R` (old), `C.R` (c). Closing remark.\n"
+        base = line.replace(", `C.R` (c)", "")
+        removed = base.replace(", `Old.R` (old)", "")
+        emitted = self._merge(base, removed, line, current=line)
+        assert emitted.text == self.HEAD + line.replace("`Old.R` (old), ", "")
+        assert (
+            emitted.notes[-1]
+            == "# dropped 1 entry a merged branch removed: Body size / WT (**canonical for weight**) / Old.R"
+        )
+
+    def test_every_note_longest_wins_sets_aside_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two branches add one model to one line in different words; -X theirs
+        keeps the second. The union keeps the longer note and sends the other,
+        verbatim, to the hand-union report it shares with the dedup."""
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER})
+        for name, note in (("long", "(a longer note on N)"), ("short", "(short)")):
+            text = _with_models(f"`N_2020_n.R` {note}")
+            push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Add N ({name})")
+        wt = consolidate(repo, ["origin/claude/long", "origin/claude/short"], CONSOLIDATION)
+        report = tmp_path / "hand-union.md"
+        report.write_text("# Hand union needed in an earlier register\n")
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo), "--report", report)
+        assert proc.returncode == 0, proc.stderr
+        assert (wt / REGISTER).read_text() == _with_models("`N_2020_n.R` (a longer note on N)")
+        assert report.read_text() == (
+            "# Hand union needed in an earlier register\n"
+            f"# Hand union needed in {REGISTER}\n"
+            "\n"
+            "Two merged copies of the register annotate each model below differently.\n"
+            "The union kept the longer annotation, or a branch's correction; the other\n"
+            "is below, verbatim. Union it into the register by hand, keeping each\n"
+            "source's attribution, and commit.\n"
+            "\n"
+            "## Body size / WT (**canonical for body weight**)\n"
+            "\n"
+            "### Example models entry for N_2020_n.R\n"
+            "\n"
+            "In the register:\n"
+            "\n"
+            "````\n"
+            "`N_2020_n.R` (a longer note on N)\n"
+            "````\n"
+            "\n"
+            "In a merged copy:\n"
+            "\n"
+            "````\n"
+            "`N_2020_n.R` (short)\n"
+            "````\n"
+            "\n"
+        )
 
 
 class TestUnionHonoursWhatABranchRemovedOrCorrected:
@@ -1711,9 +1833,9 @@ class TestUnionHonoursWhatABranchRemovedOrCorrected:
         union.base_order[bucket] = ["A_2020_a.R"]
         union.removed[bucket] = {"A_2020_a.R"}
         text = "## Body size\n\n### WT (**canonical for weight**)\n\n- **Example models:** `A_2020_a.R` (a).\n"
-        out, report = u.emit_merged(text, union)
-        assert out == text
-        assert any("every entry" in note for note in report)
+        emitted = u.emit_merged(text, union)
+        assert emitted.text == text
+        assert any("every entry" in note for note in emitted.notes)
 
 
 class TestDedupCanonicalHeaders:

@@ -289,13 +289,23 @@ class TestParsing:
         )
 
     def test_an_example_models_line_is_its_entries(self) -> None:
-        """How many full stops end the line does not matter; prose after it does."""
+        """How many full stops end the line does not matter; prose after it does,
+        and so does prose before or between the entries, which used to be
+        invisible to the check."""
         atoms = self.v.line_atoms("- **Example models:** `A.R` (a (b] c)..., `B.R`. See the Notes.")
         assert atoms == [
             ("example", "A.R"),
-            ("annotation", "A.R", "(a (b] c)..."),
+            ("annotation", "A.R", "(a (b] c)"),
             ("example", "B.R"),
             ("after", "See the Notes"),
+        ]
+        atoms = self.v.line_atoms("- **Example models:** Fits: `A.R` for the base case; `B.R` (b).")
+        assert atoms == [
+            ("before", "Fits"),
+            ("example", "A.R"),
+            ("annotation", "A.R", "for the base case"),
+            ("example", "B.R"),
+            ("annotation", "B.R", "(b)"),
         ]
         assert self.v.line_atoms("- **Example models:** `A.R` (a).....") == [
             ("example", "A.R"),

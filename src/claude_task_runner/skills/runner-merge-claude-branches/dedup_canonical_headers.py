@@ -79,6 +79,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import re
 import sys
@@ -115,10 +116,8 @@ def _parse(lines: list[str]) -> tuple[list[tuple[int, str, str]], list[int]]:
 
 
 def _block_end(i: int, bounds: list[int]) -> int:
-    for b in bounds:
-        if b > i:
-            return b
-    return bounds[-1]
+    """The first boundary after line ``i``; ``bounds`` is sorted."""
+    return bounds[min(bisect.bisect_right(bounds, i), len(bounds) - 1)]
 
 
 def _key(name: str, sect: str, global_unique: bool) -> Key:
@@ -390,6 +389,33 @@ def _examples(field: _Field) -> _Examples:
     return _Examples(runs, prose, entries)
 
 
+@dataclass
+class _Note:
+    """What follows an entry's filename: its annotation and any prose up to
+    the next entry, as the union merge compares and carries it."""
+
+    text: str
+    start: int
+    """Where it starts in its run's text: after the filename."""
+    end: int
+    """Where it ends: at the next entry, or, for the last entry of a run of
+    text, before what closes the run (see :func:`_closes_run`)."""
+
+
+def _notes(examples: _Examples) -> list[_Note]:
+    """Each entry's :class:`_Note`, in order."""
+    out = []
+    entries = examples.entries
+    for n, entry in enumerate(entries):
+        run = examples.runs[entry.run]
+        last = n + 1 == len(entries) or entries[n + 1].run != entry.run
+        closes = last and not run.bullet and _closes_run(run.text, entry)
+        end = entry.end if closes else entry.start + len(entry.text)
+        start = entry.start + len(entry.model) + 2
+        out.append(_Note(run.text[start:end].strip(), start, end))
+    return out
+
+
 def _replace(field: _Field, run: _Run, start: int, end: int, new: str) -> None:
     """Replace ``run.text[start:end]`` with ``new`` in ``field``'s lines; a
     span that crosses lines leaves them one line."""
@@ -419,7 +445,7 @@ def _insert_entries(field: _Field, texts: list[tuple[str, bool]], eol: str) -> N
         entries = [e for e in examples.entries if e.run == len(examples.runs) - 1]
         at = _insertion_point(last.text, entries)
         added = ", ".join(_as_inline(text) if listed else text for text, listed in texts)
-        _replace(field, last, at, at, f", {added}")
+        _replace(field, last, at, at, f", {added}" if last.text[:at].strip() else added)
         return
     marker = next(m for ln in reversed(field.lines) if (m := BULLET.match(ln)))
     end = max(i for i, ln in enumerate(field.lines) if ln.strip())

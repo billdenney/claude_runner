@@ -67,8 +67,8 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 
+import dedup_canonical_headers as register
 import merge_set
-from union_merge_lines import EXAMPLE_LINE_RE, split_example_body
 
 Atom = tuple[str, ...]
 # How much of a long line a report prints.
@@ -93,18 +93,22 @@ def heading_names(text: str) -> tuple[frozenset[str], str]:
 
 
 def line_atoms(line: str) -> list[Atom]:
-    """What one body line holds: its entries if it lists Example models, else itself."""
-    match = EXAMPLE_LINE_RE.match(line)
-    entries, tail = split_example_body(match.group(1)) if match else ([], "")
-    if not entries:
+    """What one body line holds: its entries if it is an Example-models label
+    line that lists models, read by the dedup's parser, else itself."""
+    match = register.FIELD.match(line)
+    if match is None or match.group(1).strip() != register.EXAMPLES:
         return [("line", line)]
-    atoms: list[Atom] = []
-    for filename, annotation in entries:
-        atoms.append(("example", filename))
-        if annotation:
-            atoms.append(("annotation", filename, annotation))
+    examples = register._examples(register._Field(register.EXAMPLES, [line]))
+    if not examples.entries:
+        return [("line", line)]
+    atoms: list[Atom] = [("before", prose) for prose in examples.prose]
+    notes = register._notes(examples)
+    for entry, note in zip(examples.entries, notes, strict=True):
+        atoms.append(("example", entry.model))
+        if note.text:
+            atoms.append(("annotation", entry.model, note.text))
     # Only prose after the list counts; how many full stops end it does not.
-    after = tail.strip(" \t.")
+    after = examples.runs[0].text[notes[-1].end :].strip(" \t.")
     if after:
         atoms.append(("after", after))
     return atoms
