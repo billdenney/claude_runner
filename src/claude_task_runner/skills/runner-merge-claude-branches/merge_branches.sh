@@ -138,11 +138,10 @@
 set -Eeuo pipefail
 # errtrace (-E): functions and subshells inherit the ERR trap, so a command
 # that fails inside a function is reported and exits 1 like one at the top
-# level, instead of ending the run with its own status and no message. In a
-# subshell (a command substitution, a pipeline stage) the trap exits with the
-# failing status and leaves the message to the shell that started it, so a
-# failure is reported once, with that status. A command substitution therefore
-# stops at its first failing command, not only its last.
+# level. In a subshell (a command substitution, a pipeline stage) the trap
+# exits with the failing status and leaves the message to the shell that
+# started it, so a failure is reported once, with that status. A command
+# substitution therefore stops at its first failing command, not only its last.
 trap 'err_rc=$?; (( BASH_SUBSHELL == 0 )) || exit "$err_rc"; echo "ERROR: unexpected failure (exit $err_rc) at line $LINENO" >&2; exit 1' ERR
 trap 'remind_hand_union $?' EXIT
 # An interrupt or a kill exits with its own status, so the EXIT trap names a

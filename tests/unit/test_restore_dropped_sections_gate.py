@@ -375,9 +375,8 @@ def test_a_later_copy_whose_heading_leads_with_another_name_reaches_the_report(
     """A second copy of a restored ``### ALPHA, BETA`` block is that block's
     copy whatever its heading leads with: the names reordered, only some of
     them, or a new name beside one of them. Its words are printed and reach
-    the hand-union report, and no second block declaring ALPHA or BETA is
-    inserted. Keyed on the first name alone, the second copy was dropped
-    without a word, and with it the Notes line only it carries."""
+    the hand-union report, the Notes line only it carries included, and no
+    second block declaring ALPHA or BETA is inserted."""
     make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "ALPHA, BETA"], "first")
     make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", heading], "second")
     git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")

@@ -510,8 +510,8 @@ class TestMergeBranches:
         self, repo: Path, tmp_path: Path, fails: str, at: str
     ) -> None:
         """A git command that fails inside a function (run_dedup) exits 1 with
-        the unexpected-failure message, as the header documents, not with
-        git's own 128 and no message. One that fails in a command substitution
+        the unexpected-failure message, as the header documents, and the
+        message gives git's status. One that fails in a command substitution
         is reported once, by the shell that ran it, with git's status."""
         real = shutil.which("git")
         assert real is not None
