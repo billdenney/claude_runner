@@ -664,3 +664,28 @@ def test_daemon_starts_with_a_worker_log_mtime_past_year_9999(
         assert (reloaded.status, reloaded.stop_reason) == ("failed", ORPHAN_STOP_REASON)
     finally:
         shutil.rmtree(root)
+
+
+def test_daemon_records_an_exited_worker_whose_log_mtime_is_past_year_9999(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exited-worker finalize dates the run by its log's last write. An
+    mtime no datetime can hold dates it at now, like any mtime after now,
+    and the finished run is still recorded rather than left for the
+    demotion as a failed finalize."""
+    root = _far_future_mtime_dir(tmp_path)
+    try:
+        qd = _queue(root)
+        log = _seed_exited(
+            qd, "t-mtime-done", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70)
+        )
+        os.utime(log, (253402300800, 253402300800))
+        monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+
+        _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+        reloaded = load_state(state_path_for(qd, "t-mtime-done"))
+        assert reloaded.status == "completed"
+        assert [run.finished_at for run in reloaded.runs] == [_NOW]
+    finally:
+        shutil.rmtree(root)

@@ -53,13 +53,13 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import IO
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock, utc_from_timestamp
+from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.linux_user import current_username as _resolve_self_user
 from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
@@ -2475,11 +2475,12 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
     found it, which can be hours later. The mtime is capped at ``now`` and
     floored at ``started_at``, the floor winning if the two conflict, since
     a negative duration fails RunRecord validation. ``now`` when the log
-    can't be stat'ed.
+    can't be stat'ed, and for an mtime no datetime can hold (past year
+    9999, which tmpfs stores as given), as for any mtime after ``now``.
     """
     try:
-        mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
-    except OSError:
+        mtime = utc_from_timestamp(log_path.stat().st_mtime)
+    except (OSError, TimestampOutOfRange):
         return now
     return max(started_at, min(mtime, now))
 

@@ -33,6 +33,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -712,6 +713,20 @@ def test_log_finished_at_clamps_to_the_attempt(
     got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
 
     assert got == expected
+
+
+@pytest.mark.parametrize("timestamp", [253402300800.0, 1e20], ids=["year-10000", "past-time_t"])
+def test_log_finished_at_dates_an_out_of_range_mtime_now(timestamp: float) -> None:
+    """tmpfs stores an mtime past year 9999 as given. No datetime can hold
+    it, so the finish is dated now, as any mtime after now is."""
+
+    class _Log:
+        def stat(self) -> SimpleNamespace:
+            return SimpleNamespace(st_mtime=timestamp)
+
+    got = dispatcher_mod._log_finished_at(_Log(), started_at=_STARTED, now=_RESTART)  # type: ignore[arg-type]
+
+    assert got == _RESTART
 
 
 # ---------------------------------------------------------------------------
