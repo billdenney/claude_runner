@@ -64,11 +64,11 @@ has confirmed the scope (step 2): without it the script stops at its
 confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
 prints every flag and exit code. Each exit code has one meaning; the ones that
 stop a run partway are 5 (a repair or verification step failed, the verifier
-reported a loss no repair put back or could not run, or the revert check found
-base content the merge reverted; `--accept-verifier-losses` lets a run carry on
-past reported losses, step 7),
+could not run, or the revert check found base content the merge reverted),
 6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
-before the push; finish with `--finish --hand-union-done`, step 6b).
+before the push, for wording a repair set aside or a loss the verifier
+reported; finish with `--finish --hand-union-done`, plus
+`--accept-verifier-losses` after a loss, steps 6b and 7).
 
 ## The merge set
 
@@ -254,7 +254,8 @@ exists to repair. Repair, then regenerate.
    hand-union report in the worktree's git directory, never into the
    register. The union merge (step 6) and the restore (step 6c) append to
    the same report: an annotation "longest wins" set aside, and a canonical
-   two branches added in different words. Every later step still runs; the
+   two branches added in different words, and so does the verifier (step 7):
+   each contribution it reports missing. Every later step still runs; the
    run then stops before the push (exit 9) and prints the worktree, the
    report and the `--finish --hand-union-done` command, and any later
    failure (check, vignettes) names the report too. Union the wording into
@@ -418,17 +419,21 @@ exists to repair. Repair, then regenerate.
      *gained* a name is not read as a different canonical with everything
      under it lost.
 
-   The verifier exits 1 when it finds losses. `merge_branches.sh` checks every
-   register and then stops with exit 5, naming the files: each loss is one no
-   repair could put back (a canonical two branches filed under different `##`
-   sections, a new section header the union does not relocate), and settling
-   it needs judgement. Reconcile each by hand before the PR opens. To run the
-   remaining steps first, remove the worktree and its branch (the message
-   prints both commands) and re-run the same command with
-   `--accept-verifier-losses`, which turns each verdict into a WARNING. The
-   verifier exits 2 when it cannot run at all: a `--base`, `--branch` or
-   `--extra-ref` that does not resolve, no worktree for the branch, a
-   `--pattern` matching nothing, an empty merge set, or no `python3`. Each of those used to pass silently -- a verifier
+   The verifier exits 1 when it finds losses. Each is one no repair could put
+   back (a canonical two branches filed under different `##` sections, a new
+   section header the union does not relocate), and settling it needs
+   judgement, so `merge_branches.sh` appends the verifier's report for every
+   register with losses to the hand-union report, runs every later step, and
+   stops before the push (exit 9) with one message naming the files, the
+   report and the `--finish` command. Reconcile each loss by hand in the
+   worktree and commit; `--finish --hand-union-done --accept-verifier-losses`
+   then pushes, and `--finish` without `--accept-verifier-losses` refuses
+   (exit 9) while the run's losses are recorded. Passed on the run itself,
+   `--accept-verifier-losses` turns each loss into a WARNING and the run goes
+   on to the push. The verifier exits 2 when it cannot run at all: a `--base`,
+   `--branch` or `--extra-ref` that does not resolve, no worktree for the
+   branch, a `--pattern` matching nothing, an empty merge set, or no
+   `python3`. Each of those used to pass silently -- a verifier
    that checks nothing reports everything present -- and `merge_branches.sh`
    now stops with exit 5 on them. The helpers it calls (`union_merge_lines.py`,
    `restore_dropped_sections.py`, `union_merge_news.py`, the two delegated

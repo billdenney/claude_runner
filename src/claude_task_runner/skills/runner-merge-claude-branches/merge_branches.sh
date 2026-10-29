@@ -11,10 +11,10 @@
 #   5. Register repairs: union-merge of covariate-columns.md (recovers the
 #      annotations -X theirs would have lost), dedup of duplicate canonical
 #      headers, restore of dropped canonical blocks, then the contribution
-#      verifier, whose reported losses stop the run (exit 5) unless
-#      --accept-verifier-losses. Every repair and verify step reads only the
-#      merge set: the branches this run merged, each at the commit it merged
-#      (merge_set.py).
+#      verifier: a loss it reports goes into the hand-union report and stops
+#      the run before the push (step 10), unless --accept-verifier-losses.
+#      Every repair and verify step reads only the merge set: the branches
+#      this run merged, each at the commit it merged (merge_set.py).
 #   6. Union-merge of NEWS.md, then the revert check: register content the
 #      base has that the merge lost and no merged branch removed stops the
 #      run (verify_no_base_reverts.py)
@@ -23,11 +23,12 @@
 #   9. Parallel vignette validation pre-push gate
 #  10. Push branch + print PR title/body. When a repair set wording aside
 #      (copies of a canonical worded differently, a model annotated two ways,
-#      a canonical two branches added in different words), the run stops
-#      first (exit 9): the register keeps one wording, the others are in a
-#      hand-union report, and after the hand union is committed --finish
-#      --hand-union-done pushes and prints the PR text from the same
-#      worktree. Every later failure names that report too.
+#      a canonical two branches added in different words), or the verifier
+#      reported a loss, the run stops first (exit 9): the register keeps one
+#      wording, the others and the losses are in a hand-union report, and
+#      after the hand union is committed --finish --hand-union-done (with
+#      --accept-verifier-losses after a loss) pushes and prints the PR text
+#      from the same worktree. Every later failure names that report too.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -65,12 +66,13 @@
 #   --no-register-files     Clear the register list, defaults included; a
 #                           later --register-file adds to the emptied list.
 #   --accept-verifier-losses
-#                           Carry on when the contribution verifier reports a
-#                           model, header or source alias missing from a
-#                           register: print a WARNING instead of stopping with
-#                           exit 5. Pass it once every reported loss is
-#                           understood, and reconcile them by hand before
-#                           opening the PR.
+#                           Accept the models, headers or source aliases the
+#                           contribution verifier reports missing from a
+#                           register. With --finish: push although the run
+#                           recorded such losses, once each is reconciled by
+#                           hand or deliberately left. On a run: print a
+#                           WARNING for each instead of recording it and
+#                           stopping before the push.
 #   --skip-r-regen          Skip step 7 (buildModelDb / document). Use when
 #                           merging into a repo that doesn't have these.
 #   --skip-check            Skip step 8 (devtools::check). Use for fast
@@ -96,7 +98,8 @@
 #                           with uncommitted changes, checks again that no
 #                           duplicate canonical remains, and prints a pending
 #                           hand-union report and stops (exit 9) unless
-#                           --hand-union-done is given.
+#                           --hand-union-done is given, and, when the run
+#                           recorded verifier losses, --accept-verifier-losses.
 #   --hand-union-done       With --finish: the report's wording is unioned into
 #                           the register and committed; push anyway.
 #   --dry-run               Print the survey and exit before creating the worktree.
@@ -123,18 +126,18 @@
 #   5  a repair or verification step failed: a union-merge, dedup or restore
 #      script crashed, duplicate canonical headers survived dedup (or a
 #      register on --base is missing from the worktree at --finish), the
-#      verifier reported missing contributions (without
-#      --accept-verifier-losses) or could not run, the revert check found
-#      base content the merge reverted (or could not run), or the R registry
-#      regeneration failed
+#      verifier could not run, the revert check found base content the merge
+#      reverted (or could not run), or the R registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
-#   9  a hand union is needed: a repair set wording aside and every step but
-#      the push ran; the message names the worktree, the report of the
-#      wording the register lacks, and the --finish command to run once the
-#      hand union is committed. --finish without --hand-union-done also
-#      exits 9 while that report holds anything.
+#   9  a hand union is needed: a repair set wording aside, or the verifier
+#      reported a contribution missing, and every step but the push ran; the
+#      message names the worktree, the report of what the register lacks, and
+#      the --finish command to run once the hand union is committed. --finish
+#      also exits 9 while that report holds anything and --hand-union-done is
+#      not given, or while the run's verifier losses are not accepted with
+#      --accept-verifier-losses.
 set -Eeuo pipefail
 # errtrace (-E): functions and subshells inherit the ERR trap, so a command
 # that fails inside a function is reported and exits 1 like one at the top
@@ -149,6 +152,7 @@ trap 'remind_hand_union $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 HAND_UNION_REPORT=""
+VERIFIER_LOSSES=""
 HAND_UNION_DONE=0
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
@@ -271,7 +275,51 @@ finish_command() {  # this run's --finish command line, every value shell-quoted
   echo "$cmd --finish"
 }
 
+finish_flags() {  # what --finish needs: --hand-union-done, and --accept-verifier-losses after losses
+  local flags=" --hand-union-done"
+  if [[ -s "$VERIFIER_LOSSES" ]]; then flags+=" --accept-verifier-losses"; fi
+  echo "$flags"
+}
+
+record_verifier_losses() {  # <register> <verifier output>: into the hand-union report
+  local file=$1 out=$2
+  echo "$file" >> "$VERIFIER_LOSSES"
+  {
+    echo "# Contributions missing from $file"
+    echo
+    echo "The contribution verifier reports each model, header or source alias below,"
+    echo "which a merged branch added, missing from $file; no repair put it back."
+    echo "Reconcile each by hand and commit; --accept-verifier-losses accepts any you"
+    echo "leave."
+    echo
+    echo '````'
+    cat "$out"
+    echo '````'
+    echo
+  } >> "$HAND_UNION_REPORT"
+}
+
 stop_for_hand_union() {
+  if [[ -s "$VERIFIER_LOSSES" ]]; then
+    local files
+    files="$(paste -sd, "$VERIFIER_LOSSES" | sed 's/,/, /g')"
+    {
+      echo
+      echo "STOP: every step but the push ran, but the verifier reported a model, header"
+      echo "  or source alias a merged branch added missing from $files, and no repair"
+      echo "  put it back. Each is in the hand-union report, with any wording a repair"
+      echo "  set aside:"
+      echo "    $HAND_UNION_REPORT"
+      echo "  (it goes with the worktree, git worktree remove, so copy it to keep it)."
+      echo "  1. In the worktree $WT_ABS, reconcile each by hand, union any wording"
+      echo "     set aside into the register, keeping each source's attribution, and"
+      echo "     commit."
+      echo "  2. Then push the branch and print the PR text; --accept-verifier-losses"
+      echo "     accepts any loss you leave:"
+      echo "     $(finish_command)$(finish_flags)"
+    } >&2
+    exit 9
+  fi
   {
     echo
     echo "STOP: every step but the push ran, but a repair set wording aside: copies of"
@@ -467,20 +515,31 @@ if (( FINISH )); then
   [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
     || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
   HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
+  VERIFIER_LOSSES="$(git rev-parse --path-format=absolute --git-path verifier-losses)"
   echo "==> Finishing $BRANCH_NAME in $WT_ABS"
-  if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
+  if { [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); } \
+    || { [[ -s "$VERIFIER_LOSSES" ]] && (( ! ACCEPT_VERIFIER_LOSSES )); }; then
     {
       cat "$HAND_UNION_REPORT"
       echo
       echo "STOP: the hand-union report above is not empty:"
       echo "    $HAND_UNION_REPORT"
-      echo "  Union its wording into the register in $WT_ABS and commit, then run"
-      echo "     $(finish_command) --hand-union-done"
+      if [[ -s "$VERIFIER_LOSSES" ]]; then
+        echo "  It lists contributions the verifier reports missing; reconcile each by hand"
+        echo "  and commit (--accept-verifier-losses accepts any you leave), and union any"
+        echo "  wording a repair set aside. Then run"
+      else
+        echo "  Union its wording into the register in $WT_ABS and commit, then run"
+      fi
+      echo "     $(finish_command)$(finish_flags)"
     } >&2
     exit 9
   fi
   if [[ -s "$HAND_UNION_REPORT" ]]; then
     echo "    hand union confirmed (--hand-union-done); the report stays at $HAND_UNION_REPORT"
+  fi
+  if [[ -s "$VERIFIER_LOSSES" ]]; then
+    echo "    verifier losses accepted (--accept-verifier-losses)"
   fi
   check_no_duplicates
   SUCCESS=$(git log --first-parent --format=%s "$BASE..HEAD" \
@@ -698,7 +757,8 @@ git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 cd "$WT_ABS"
 # Kept in the worktree's own git directory, so no step can commit it.
 HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
-rm -f "$HAND_UNION_REPORT"
+VERIFIER_LOSSES="$(git rev-parse --path-format=absolute --git-path verifier-losses)"
+rm -f "$HAND_UNION_REPORT" "$VERIFIER_LOSSES"
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
 echo "    binaries regenerated and covariate-columns.md union-merged after)"
@@ -963,13 +1023,14 @@ fi
 # (exit 1) is one no repair could put back -- a canonical two branches filed
 # under different ## sections, a brand-new section header the union-merger does
 # not relocate (SAPS_II in the 2026-05-20 consolidation) -- and settling it
-# needs judgement, so every register is checked and then the run stops (exit 5),
-# unless --accept-verifier-losses turns each verdict into a WARNING to reconcile
-# by hand before opening the PR. Any other non-zero exit means the verifier
+# needs judgement. Its report goes into the hand-union report, the later steps
+# run, and the run stops before the push, where --finish pushes only with
+# --accept-verifier-losses; given on the run itself, that flag turns each
+# verdict into a WARNING instead. Any other non-zero exit means the verifier
 # could not run at all, and carrying on would ship an unverified merge.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
-VERIFY_LOSSES=()
+VERIFY_OUT="$(git rev-parse --path-format=absolute --git-path verifier-output.txt)"
 for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
   verify_args=(
     --repo "$REPO"
@@ -980,9 +1041,11 @@ for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
     "${EXTRA_REF_ARGS[@]}"
   )
   verify_rc=0
-  "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}" || verify_rc=$?
+  "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}" | tee "$VERIFY_OUT" \
+    || verify_rc=$?
   if (( verify_rc == 1 && ! ACCEPT_VERIFIER_LOSSES )); then
-    VERIFY_LOSSES+=("$vf")
+    record_verifier_losses "$vf" "$VERIFY_OUT"
+    echo "    (verifier) the contributions missing from $vf are in the hand-union report; the run stops before the push."
   elif (( verify_rc == 1 )); then
     echo "WARNING: verifier reported missing contributions in $vf."
     echo "         Reconcile by hand before opening the PR (the union-merger does"
@@ -993,20 +1056,6 @@ for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
     die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
   fi
 done
-if (( ${#VERIFY_LOSSES[@]} )); then
-  {
-    echo "ERROR: the verifier reported missing contributions in ${VERIFY_LOSSES[*]} (listed above):"
-    echo "  a model, header or source alias a merged branch added that no repair put back."
-    echo "  Reconcile each by hand before opening the PR; the placement report names the"
-    echo "  canonical and the model. The run stopped before the NEWS union, the revert"
-    echo "  check, the regeneration and the gates. To run them, remove the worktree and"
-    echo "  its branch:"
-    echo "    git -C $REPO worktree remove --force $WT_REL"
-    echo "    git -C $REPO branch -D $BRANCH_NAME"
-    echo "  and re-run the same command with --accept-verifier-losses."
-  } >&2
-  exit 5
-fi
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
 # every branch edits the same lines and -X theirs takes the last branch's whole
@@ -1183,7 +1232,8 @@ if (( ! SKIP_VIGNETTES )); then
   echo "    all vignettes rendered cleanly"
 fi
 
-# Push, and print the PR text; stops first when a hand union is pending.
+# Push, and print the PR text; stops first when a hand union is pending, which
+# includes a loss the verifier reported.
 if [[ -s "$HAND_UNION_REPORT" ]]; then
   stop_for_hand_union
 fi
