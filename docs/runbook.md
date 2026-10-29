@@ -258,7 +258,9 @@ account file is broken"). A start refused because a file could not be read
 yet exits 1 and is retried. `install` writes
 those three from the queue's `[watchdog].restart_cooldown_s`,
 `[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
-(30 s, 5 and 600 s by default). After changing them, re-run
+(30 s, 5 and 600 s by default). The cron watchdog reads the cooldown only
+when cron runs it, once a minute, so under cron a cooldown under a minute
+acts as one minute. After changing them, re-run
 `claude-task-runner install`: it rewrites the unit and reloads systemd, and
 the next crash uses the new values without the supervisor being restarted.
 Read the exception with `journalctl --user -u claude-task-runner`. Once the
@@ -890,7 +892,9 @@ On 2026-09-25 the nlmixr2lib queue had 305 of them, holding 36 GB.
    ```
 
    Each pass removes at most `max_per_pass` worktrees, so clear a large
-   backlog with the CLI first. Task YAMLs are read from `todo/` and `done/`
+   backlog with the CLI first. A pass runs every `interval_s` (an hour by
+   default); the supervisor checks it once a tick, so the settings refuse
+   an `interval_s` under `[usage].poll_interval_s`. Task YAMLs are read from `todo/` and `done/`
    (`[worktree_reclaim].task_dirs`). A task whose YAML has moved anywhere else
    is invisible to the runner: add that directory to `task_dirs`, or remove
    its worktree by hand.

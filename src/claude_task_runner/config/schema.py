@@ -298,6 +298,11 @@ class TaskCapsSettings(_StrictModel):
 
 class WatchdogSettings(_StrictModel):
     restart_cooldown_s: float = Field(gt=0, le=MAX_DURATION_S)
+    """Seconds after a restart before the watchdog restarts the supervisor
+    again; the systemd unit's ``RestartSec``. The cron watchdog checks it
+    only when cron runs it, once a minute by default, so under cron a value
+    below the cron interval acts as that interval. Nothing checks this at
+    load, since the cron schedule is not in the settings."""
     restart_backoff_max_s: float = Field(gt=0, le=MAX_DURATION_S)
     crash_loop_threshold: int = Field(ge=1)
     transient_config_escalation_s: float = Field(default=600.0, ge=0, le=MAX_DURATION_S)
@@ -420,7 +425,10 @@ class WorktreeReclaimSettings(_StrictModel):
     interval_s: float = Field(default=3600.0, gt=0, le=MAX_DURATION_S)
     """Seconds between two periodic supervisor passes. The first pass runs on
     the supervisor's first tick; a pass that raises still waits a full
-    interval before the next attempt."""
+    interval before the next attempt. Must be at least
+    ``[usage].poll_interval_s``: the supervisor checks it once a tick, so
+    one interval of a tick runs the pass every tick, and a shorter one
+    could not mean what it says (see ``Settings``)."""
 
     max_per_pass: int = Field(default=20, ge=1)
     """Upper bound on removals attempted by one periodic pass. The pass runs
@@ -1126,5 +1134,27 @@ class Settings(_StrictModel):
                 f"{2 * poll_s:.10g} s. Deferred tasks are checked once a tick, so a shorter "
                 "cooldown re-dispatches a still-blocked task every tick. Raise "
                 "deferral_recheck_cooldown_s or lower poll_interval_s."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_reclaim_interval_spans_a_tick(self) -> Settings:
+        """Reject a worktree-reclaim interval shorter than one supervisor tick.
+
+        The supervisor checks whether the periodic pass is due once a tick,
+        so an ``interval_s`` of one tick already runs it every tick, and a
+        shorter one would quietly mean the same. Checked only while
+        ``periodic`` is on, since nothing reads the interval otherwise.
+        """
+        if not self.worktree_reclaim.periodic:
+            return self
+        interval_s = self.worktree_reclaim.interval_s
+        poll_s = self.usage.poll_interval_s
+        if interval_s < poll_s:
+            raise ValueError(
+                f"[worktree_reclaim].interval_s = {interval_s:.10g} s is under one supervisor "
+                f"tick, [usage].poll_interval_s = {poll_s:.10g} s. The pass is checked once a "
+                "tick, so a shorter interval runs it every tick. Raise interval_s or lower "
+                "poll_interval_s."
             )
         return self

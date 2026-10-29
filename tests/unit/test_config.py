@@ -532,3 +532,42 @@ class TestDeferralCooldownSpansATick:
         toml.write_text("[usage]\npoll_interval_s = 451\nmax_reading_age_s = 902\n")
         with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under two"):
             load_settings(toml)
+
+
+class TestReclaimIntervalSpansATick:
+    """``[worktree_reclaim].interval_s`` must be at least one tick while the
+    periodic pass is on: the pass is checked once a tick, so a shorter
+    interval runs it every tick, the same as one tick."""
+
+    def _toml(self, tmp_path: Path, *, interval: float, periodic: bool = True) -> Path:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(
+            "[usage]\npoll_interval_s = 60\n\n[worktree_reclaim]\n"
+            f"periodic = {'true' if periodic else 'false'}\ninterval_s = {interval}\n"
+        )
+        return toml
+
+    def test_exactly_one_tick_loads(self, tmp_path: Path) -> None:
+        assert load_settings(self._toml(tmp_path, interval=60)).worktree_reclaim.interval_s == 60
+
+    def test_under_one_tick_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(self._toml(tmp_path, interval=59.5))
+        assert (
+            "[worktree_reclaim].interval_s = 59.5 s is under one supervisor tick, "
+            "[usage].poll_interval_s = 60 s. The pass is checked once a tick, so a shorter "
+            "interval runs it every tick. Raise interval_s or lower poll_interval_s."
+        ) in str(excinfo.value)
+
+    def test_not_checked_while_the_pass_is_off(self, tmp_path: Path) -> None:
+        settings = load_settings(self._toml(tmp_path, interval=1, periodic=False))
+        assert settings.worktree_reclaim.interval_s == 1
+
+    def test_default_loads_with_the_longest_default_compatible_poll(self, tmp_path: Path) -> None:
+        """The 3600 s default allows any poll the 900 s cooldown default does."""
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(
+            "[usage]\npoll_interval_s = 450\nmax_reading_age_s = 900\n"
+            "\n[worktree_reclaim]\nperiodic = true\n"
+        )
+        assert load_settings(toml).worktree_reclaim.interval_s == 3600
