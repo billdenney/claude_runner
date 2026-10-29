@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from claude_task_runner.process_signals import PID_MAX
+from claude_task_runner.process_signals import PID_T_MAX
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     RunRecord,
@@ -197,7 +197,7 @@ class TestRunRecord:
             finished_at=t,
             stop_reason="end_turn",
             duration_s=1,
-            pid=PID_MAX,
+            pid=PID_T_MAX,
         )
         assert r.pid == 2**31 - 1
 
@@ -211,7 +211,7 @@ class TestTaskState:
             TaskState(task_id="001-foo", status="running", pid=pid)
 
     def test_pid_field_accepts_pid_max(self) -> None:
-        assert TaskState(task_id="001-foo", pid=PID_MAX).pid == 2**31 - 1
+        assert TaskState(task_id="001-foo", pid=PID_T_MAX).pid == 2**31 - 1
 
     def test_defaults(self) -> None:
         s = TaskState(task_id="001-foo")

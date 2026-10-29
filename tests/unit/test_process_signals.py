@@ -24,7 +24,7 @@ import claude_task_runner
 from claude_task_runner import process_signals
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
-from claude_task_runner.process_signals import PID_MAX, UnsafeSignalTarget
+from claude_task_runner.process_signals import PID_T_MAX, UnsafeSignalTarget
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -108,7 +108,7 @@ def test_kill_refuses_a_pid_above_pid_max(
 ) -> None:
     message = (
         f"refusing to send SIGTERM to pid {pid}: "
-        f"no process has a pid above {PID_MAX}, the largest a C pid_t holds"
+        f"no process has a pid above {PID_T_MAX}, the largest a C pid_t holds"
     )
     with pytest.raises(UnsafeSignalTarget) as exc_info:
         process_signals.kill(pid, signal.SIGTERM)
@@ -123,7 +123,7 @@ def test_killpg_refuses_a_group_above_pid_max(
 ) -> None:
     message = (
         f"refusing to send SIGKILL to process group {pgid}: "
-        f"no process group has an id above {PID_MAX}, the largest a C pid_t holds"
+        f"no process group has an id above {PID_T_MAX}, the largest a C pid_t holds"
     )
     with pytest.raises(UnsafeSignalTarget) as exc_info:
         process_signals.killpg(pgid, signal.SIGKILL)
@@ -144,18 +144,21 @@ def test_signal_group_of_refuses_a_pid_above_pid_max_before_asking_its_group(
 def test_pid_max_itself_reaches_os_kill(sent: Recorder) -> None:
     """The bound is the C ``pid_t`` maximum: one below the first value
     ``os.kill`` cannot take is still sent, and the kernel answers ESRCH."""
-    process_signals.kill(PID_MAX, signal.SIGTERM)
-    process_signals.killpg(PID_MAX, signal.SIGTERM)
-    assert sent.calls == [("kill", PID_MAX, signal.SIGTERM), ("killpg", PID_MAX, signal.SIGTERM)]
+    process_signals.kill(PID_T_MAX, signal.SIGTERM)
+    process_signals.killpg(PID_T_MAX, signal.SIGTERM)
+    assert sent.calls == [
+        ("kill", PID_T_MAX, signal.SIGTERM),
+        ("killpg", PID_T_MAX, signal.SIGTERM),
+    ]
 
 
 def test_pid_max_is_the_largest_pid_os_kill_accepts() -> None:
-    """Known answer against the real ``os.kill``: :data:`PID_MAX` gets an
+    """Known answer against the real ``os.kill``: :data:`PID_T_MAX` gets an
     answer from the kernel, one more overflows before any syscall."""
     with pytest.raises(ProcessLookupError):
-        os.kill(PID_MAX, 0)
+        os.kill(PID_T_MAX, 0)
     with pytest.raises(OverflowError):
-        os.kill(PID_MAX + 1, 0)
+        os.kill(PID_T_MAX + 1, 0)
 
 
 def test_kill_refuses_its_own_pid(sent: Recorder, caplog: pytest.LogCaptureFixture) -> None:
