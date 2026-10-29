@@ -718,17 +718,30 @@ def test_log_finished_at_clamps_to_the_attempt(
 
 
 @pytest.mark.parametrize("timestamp", [253402300800.0, 1e20], ids=["year-10000", "past-time_t"])
-def test_log_finished_at_dates_an_out_of_range_mtime_now(timestamp: float) -> None:
+def test_log_finished_at_dates_an_out_of_range_mtime_now(
+    caplog: pytest.LogCaptureFixture, timestamp: float
+) -> None:
     """tmpfs stores an mtime past year 9999 as given. No datetime can hold
-    it, so the finish is dated now, as any mtime after now is."""
+    it, so the finish is dated now, as any mtime after now is, with a
+    WARNING like the reaper's for the same mtime."""
 
     class _Log:
         def stat(self) -> SimpleNamespace:
             return SimpleNamespace(st_mtime=timestamp)
 
-    got = dispatcher_mod._log_finished_at(_Log(), started_at=_STARTED, now=_RESTART)  # type: ignore[arg-type]
+        def __str__(self) -> str:
+            return "attempt-1.stream.jsonl"
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.runner.dispatcher"):
+        got = dispatcher_mod._log_finished_at(_Log(), started_at=_STARTED, now=_RESTART)  # type: ignore[arg-type]
 
     assert got == _RESTART
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        f"worker log attempt-1.stream.jsonl has an mtime out of range (timestamp {timestamp!r} "
+    )
+    assert warnings[0].endswith("); dating the run at now")
 
 
 # ---------------------------------------------------------------------------

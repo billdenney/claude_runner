@@ -2601,8 +2601,15 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
     9999, which tmpfs stores as given), as for any mtime after ``now``.
     """
     try:
-        mtime = utc_from_timestamp(log_path.stat().st_mtime)
-    except (OSError, TimestampOutOfRange):
+        raw_mtime = log_path.stat().st_mtime
+    except OSError:
+        return now
+    try:
+        mtime = utc_from_timestamp(raw_mtime)
+    except TimestampOutOfRange as exc:
+        logger.warning(
+            "worker log %s has an mtime out of range (%s); dating the run at now", log_path, exc
+        )
         return now
     return max(started_at, min(mtime, now))
 
