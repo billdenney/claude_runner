@@ -1713,14 +1713,42 @@ def _sha(repo: Path, ref: str) -> str:
 class TestMergeSet:
     """merge_set.py decides, for every helper, which refs a consolidation merged."""
 
-    def test_read_file_tells_an_absent_path_from_an_unreadable_one(self, repo: Path) -> None:
-        """No such file is None; a file the commit has whose blob cannot be read
-        is a GitError, not an empty or absent file."""
+    def test_read_file_reads_an_absent_path_as_absent(self, repo: Path) -> None:
+        """No such path, a path through a file, and a file another ref removed
+        are all None."""
         ms = load_helper("merge_set")
+        git(repo, "checkout", "-q", "-b", "gone", "main")
+        git(repo, "rm", "-q", REGISTER)
+        git(repo, "commit", "-q", "-m", "remove the register")
+        git(repo, "checkout", "-q", "main")
         assert ms.read_file(repo, "main", "no/such/file.md") is None
-        blob = git(repo, "rev-parse", f"main:{REGISTER}").strip()
-        (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
-        with pytest.raises(ms.GitError, match=f"cat-file blob main:{REGISTER} failed"):
+        assert ms.read_file(repo, "main", f"{REGISTER}/below") is None
+        assert ms.read_file(repo, "gone", REGISTER) is None
+        assert ms.read_file(repo, "main", REGISTER) == BASE_REGISTER
+
+    def test_read_file_raises_for_a_directory(self, repo: Path) -> None:
+        ms = load_helper("merge_set")
+        with pytest.raises(ms.GitError, match="inst/references at main is a tree, not a file"):
+            ms.read_file(repo, "main", "inst/references")
+
+    @pytest.mark.parametrize(
+        ("missing", "message"),
+        [
+            (f"main:{REGISTER}", "cat-file blob .* failed"),
+            ("main:inst/references", "ls-tree -z main -- .* failed"),
+            ("main^{tree}", "ls-tree -z main -- .* failed"),
+        ],
+        ids=["blob", "subtree", "root-tree"],
+    )
+    def test_read_file_raises_when_the_file_cannot_be_read(
+        self, repo: Path, missing: str, message: str
+    ) -> None:
+        """A blob or a tree on the way that git cannot read is a GitError, not
+        an absent file."""
+        ms = load_helper("merge_set")
+        oid = git(repo, "rev-parse", missing).strip()
+        (repo / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+        with pytest.raises(ms.GitError, match=message):
             ms.read_file(repo, "main", REGISTER)
 
     def test_prints_each_member_with_its_merged_commit_and_fork_point(

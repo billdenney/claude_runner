@@ -113,10 +113,8 @@ def merge_base(repo: Path, one: str, other: str) -> str | None:
 
 
 def read_file(repo: Path, commit: str, path: str) -> str | None:
-    """``path`` as of ``commit``, or None when that commit has no such file.
-
-    The probe reads the commit's tree only, so a file the tree lists whose
-    blob cannot be read is a GitError, not an absent file."""
+    """``path`` as of ``commit``, or None when that commit has no such file; a
+    GitError when the file, or a tree on the way to it, cannot be read."""
     if blob_id(repo, commit, path) is None:
         return None
     return git(repo, "cat-file", "blob", f"{commit}:{path}")
@@ -124,13 +122,20 @@ def read_file(repo: Path, commit: str, path: str) -> str | None:
 
 def blob_id(repo: Path, commit: str, path: str) -> str | None:
     """The id of ``path``'s blob at ``commit``, or None when it has no such file:
-    the same id means the same text, so a reader can parse each once."""
-    proc = _run(repo, ["rev-parse", "--verify", "--quiet", f"{commit}:{path}"])
-    if proc.returncode != 0:
-        if not resolves(repo, commit):
-            raise GitError(f"{commit!r} does not resolve to a commit in {repo}")
-        return None
-    return proc.stdout.strip()
+    the same id means the same text, so a reader can parse each once.
+
+    ``git ls-tree`` lists nothing, and exits 0, for a path the commit's tree
+    does not have (a path through a file included), and exits non-zero when
+    the commit or a tree on the way cannot be read; ``rev-parse`` answers both
+    the same way. A path naming a directory is a GitError too."""
+    for entry in git(repo, "ls-tree", "-z", commit, "--", path).split("\0"):
+        meta, _, name = entry.partition("\t")
+        if name == path:
+            _, kind, oid = meta.split()
+            if kind != "blob":
+                raise GitError(f"{path} at {commit} is a {kind}, not a file")
+            return oid
+    return None
 
 
 def candidate_refs(repo: Path, pattern: str, extra_refs: Sequence[str]) -> list[str]:
