@@ -27,7 +27,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -1046,6 +1046,38 @@ def test_unreadable_supervisor_json(
         "account's last usage reading said are unknown. A running supervisor rewrites it at "
         "every check; if this lasts, look at the file and the supervisor's log.\n"
     ) in summary
+
+
+@pytest.mark.parametrize(
+    ("mtime", "error"),
+    [
+        pytest.param(253402300800.0, "year 10000 is out of range", id="year-10000"),
+        pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
+    ],
+)
+def test_a_supervisor_json_mtime_no_datetime_can_hold_is_reported(
+    queue: Path, monkeypatch: pytest.MonkeyPatch, mtime: float, error: str
+) -> None:
+    """The record's save time comes from its mtime. One no datetime can hold
+    (``ValueError`` or ``OverflowError`` from ``fromtimestamp``) is reported
+    as the record being unreadable, not raised out of the report."""
+    report = _report_module()
+    path = persist_mod.supervisor_state_path(queue)
+    _supervisor_json(queue, {})
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args: object, **kwargs: object) -> object:
+        if self == path:
+            return SimpleNamespace(st_mtime=mtime)
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setenv("RS_QUEUE", str(queue))
+    monkeypatch.setenv("RS_NOW", _report_now().isoformat())
+
+    facts = report.gather()
+
+    assert facts.snapshot_error == error
 
 
 def test_supervisor_json_details_count_the_in_flight_records(
