@@ -466,14 +466,18 @@ def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> No
     assert "HEADER-NAME LOST" not in out, out
 
 
+@pytest.mark.parametrize("heading", ["fm_a, fm_b", "fm_b, fm_a"])
 def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
-    repo: Path, tmp_path: Path
+    repo: Path, tmp_path: Path, heading: str
 ) -> None:
     """The block is there under its other name, so the repair is the heading;
-    it is printed and, with --report, added to the hand-union report."""
+    it is printed and, with --report, added to the hand-union report, wherever
+    the branch put the new name in the heading. Nothing is inserted: a block
+    headed ``### fm_b, fm_a`` beside the surviving ``### fm_a`` would declare
+    fm_a twice."""
     write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
     commit(repo, "main registers fm_a")
-    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", "fm_a, fm_b"], "adds fm_b")
+    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", heading], "adds fm_b")
     git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
     text = (repo / REGISTER).read_text()
     (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
@@ -488,7 +492,8 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
     git(repo, "checkout", "-q", "-b", "consolidation", "main")
     merge(repo, "adds")
     merge(repo, "keeps")
-    assert "fm_b" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    merged = (repo / REGISTER).read_text()
+    assert "fm_b" not in merged, "fixture did not reproduce the loss"
     report = tmp_path / "hand-union.md"
     out = subprocess.run(
         [
@@ -509,7 +514,12 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
         text=True,
     )
     assert out.returncode == 0, out.stdout + out.stderr
-    assert "# HEADER-NAME LOST" in out.stdout
+    assert (
+        "# HEADER-NAME LOST (repair by hand, not a block insert): 'fm_b' was added to the"
+        " '### fm_a, ...' header by claude/adds and is missing from the merged header\n"
+    ) in out.stdout
+    assert "# no dropped canonicals in refs.md\n" in out.stdout
+    assert (repo / REGISTER).read_text() == merged
     assert report.read_text().endswith(
         "## fm_a\n"
         "\n"
@@ -524,7 +534,7 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
         "In that branch's copy:\n"
         "\n"
         "````\n"
-        "### fm_a, fm_b (**canonical for fm_a, fm_b**)\n"
+        f"### {heading} (**canonical for {heading}**)\n"
         "````\n"
         "\n"
     )

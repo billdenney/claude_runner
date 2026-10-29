@@ -295,12 +295,14 @@ def main() -> int:
                 # it -- main has since renamed or removed it. Not a merge loss.
                 inherited += 1
                 continue
-            if owner != name and owner in merged_blocks:
-                # The branch added this name to a header that SURVIVED under a
-                # different name, so the block is present but the name was
-                # dropped from its header list. Re-inserting the block would
-                # duplicate it; the repair is a header edit, so report only.
-                lost_names.append((name, owner, ref.replace("origin/", ""), block))
+            survivor = next((n for n in names if n != name and n in merged_blocks), None)
+            if survivor is not None:
+                # The branch added this name to a header that SURVIVED under
+                # another of its names, first or not, so the block is present
+                # but the name was dropped from its header list. Re-inserting
+                # the block would duplicate it; the repair is a header edit,
+                # so report only.
+                lost_names.append((name, survivor, ref.replace("origin/", ""), block))
                 continue
             restored.append((name, section, block))
             # Every name the restored heading declares is present now.
