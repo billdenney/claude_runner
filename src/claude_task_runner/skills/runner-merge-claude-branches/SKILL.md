@@ -225,7 +225,10 @@ exists to repair. Repair, then regenerate.
    (both branched from an older main, so `-X theirs` keeps one copy per
    branch). `verify_section_headers.py` only checks headers *survived*,
    not that they are *unique*, so these slip through (8 such pairs were
-   on origin/main on 2026-07-25). This step collapses each to one entry,
+   on origin/main on 2026-07-25). Headings that declare a name in common
+   are copies of one entry, whatever else they declare and in whatever
+   order (`### fm_a` and `### fm_b, fm_a`), as nlmixr2lib's own register
+   parsers read a heading. This step collapses each to one entry,
    keeping the copy the base has (`--prefer`, the register as `--base` has
    it), else the longest, and carrying into it every model a dropped copy
    lists as an Example-models entry that it lacks (each as written, with

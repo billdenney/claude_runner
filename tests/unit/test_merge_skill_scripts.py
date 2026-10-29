@@ -2305,6 +2305,58 @@ class TestDedupCanonicalHeaders:
             "#   col x2 (lines [5, 11])\n"
         )
 
+    MULTI_NAME = """\
+# Parameters
+
+## Fractions
+
+### fm_a (**fraction metabolised to a**)
+
+- **Example models:** `A_2020_a.R`.
+
+### fm_b, fm_a (**fractions metabolised to b and a**)
+
+- **Example models:** `B_2021_b.R`.
+
+### alpha, beta (**a pair**)
+
+- **Example models:** `C_2022_c.R`.
+
+### beta, alpha (**a pair**)
+
+- **Example models:** `D_2023_d.R`.
+
+### Why kon is not canonical
+
+### Why kel is not canonical
+"""
+
+    def test_headings_that_share_any_name_are_duplicates(self, tmp_path: Path) -> None:
+        """A heading declares every name before its description, as
+        nlmixr2lib's register parsers read it: ``### fm_a`` and
+        ``### fm_b, fm_a`` both register fm_a, and ``### alpha, beta`` and
+        ``### beta, alpha`` both register both names. Two prose headings that
+        only begin with the same word register different things."""
+        register = tmp_path / "parameter-names.md"
+        register.write_text(self.MULTI_NAME)
+        proc = run_helper("dedup_canonical_headers.py", "--check", register)
+        assert (proc.returncode, proc.stdout) == (1, "")
+        assert proc.stderr == (
+            f"# DUPLICATE canonical headers (per-##-section) in {register}: 2\n"
+            "#   [Fractions] alpha, beta x2 (lines [13, 17])\n"
+            "#   [Fractions] fm_a x2 (lines [5, 9])\n"
+        )
+        # The headings differ, which no mechanical union can settle.
+        proc = run_helper("dedup_canonical_headers.py", register)
+        assert (proc.returncode, proc.stdout) == (3, "")
+        assert proc.stderr == (
+            f"# HAND UNION NEEDED in {register}: ### fm_a (lines [5, 9]): the copies differ"
+            " in heading; left as they are, merge them by hand\n"
+            f"# HAND UNION NEEDED in {register}: ### alpha, beta (lines [13, 17]): the copies"
+            " differ in heading; left as they are, merge them by hand\n"
+        )
+        assert register.read_text() == self.MULTI_NAME
+
     @pytest.mark.parametrize("check", [True, False], ids=["--check", "fix"])
     def test_a_missing_file_is_an_error_and_nothing_is_edited(
         self, check: bool, tmp_path: Path
@@ -2519,12 +2571,13 @@ def _pair(kept: str, dropped: str) -> str:
 
 
 def _blocks(dd: ModuleType, text: str) -> dict[str, list[Any]]:
-    """Every ``### NAME`` block of ``text``, by name, parsed by the dedup itself."""
+    """Every ``### NAME`` block of ``text``, parsed by the dedup itself, by its
+    heading's first word, as :func:`_plain_blocks` keys it."""
     lines = text.split("\n")
     heads, bounds = dd._parse(lines)
     out: dict[str, list[Any]] = defaultdict(list)
-    for i, name, _ in heads:
-        out[name].append(dd._parse_block(lines[i : dd._block_end(i, bounds)]))
+    for i, _, _ in heads:
+        out[lines[i].split()[1]].append(dd._parse_block(lines[i : dd._block_end(i, bounds)]))
     return out
 
 
