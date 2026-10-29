@@ -1316,6 +1316,27 @@ class TestMergeBranchesHandUnion:
         assert "WARN: worktree was already dirty" not in done.stdout
         assert git(wt, "status", "--porcelain") == ""
 
+    def test_finish_regenerates_once_and_commits_what_it_wrote(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """The regeneration edits a tracked file and creates one: --finish
+        commits both, records the commit after it, and a second --finish does
+        not regenerate again."""
+        update_main(hand_repo, {"man/modeldb.Rd": "old\n"}, "Ship the registry docs")
+        env, log, flags = self._r_env(tmp_path, fail="regen")
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        finish = _printed_after(proc.stderr, "and commit, then run")
+        (flags / "fail-regen").unlink()
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        for _ in range(2):
+            done = run(*finish, "--skip-push", env=env)
+            assert done.returncode == 0, done.stdout + done.stderr
+        assert log.read_text() == "regen\nregen\ncheck\nvignettes\n"
+        assert git(wt, "show", "HEAD:man/modeldb.Rd") == "regenerated"
+        assert git(wt, "show", "HEAD:data/modeldb.rda") == "new"
+        assert git(wt, "status", "--porcelain") == ""
+
     def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")
         assert (proc.returncode, proc.stderr) == (
