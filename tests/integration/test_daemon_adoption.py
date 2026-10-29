@@ -599,3 +599,25 @@ def test_daemon_demotes_task_whose_pid_another_process_has(
     demoted = load_state(state_path_for(qd, "t-reused"))
     assert (demoted.status, demoted.stop_reason) == ("failed", ORPHAN_STOP_REASON)
     assert dispatcher_mod._pid_alive(live_worker_pid)
+
+
+@pytest.mark.parametrize("pid", [2**31, 10**20], ids=["2**31", "10**20"])
+def test_daemon_starts_with_an_out_of_range_task_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int
+) -> None:
+    """No process can have a pid outside the C ``pid_t`` range, and
+    ``os.kill`` raises ``OverflowError`` (not ``OSError``) for one. A
+    ``running`` state YAML recording such a pid must not crash supervisor
+    startup: the corrupt-state quarantine (ADR-0028) takes it, and the
+    task reverts to pending."""
+    qd = _queue(tmp_path)
+    _seed_exited(qd, "t-pid", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70))
+    path = state_path_for(qd, "t-pid")
+    path.write_text(path.read_text().replace(f"pid: {_EXITED_PID}\n", f"pid: {pid}\n"))
+
+    _notifications, events = _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+    assert not path.exists()
+    assert [
+        (p["task_id"], p["preserved_status"]) for k, p in events if k == "corrupt_state_quarantined"
+    ] == [("t-pid", None)]

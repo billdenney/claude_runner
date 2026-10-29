@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_task_runner.queue.schema import TaskState
+from claude_task_runner.queue.schema import RunRecord, TaskState
 from claude_task_runner.queue.store import (
     QueueSchemaError,
     load_state,
@@ -172,3 +172,36 @@ def test_repeat_corruption_same_task_keeps_both_copies(tmp_path: Path) -> None:
     quarantine_corrupt_state_files(qd, now=_NOW)
     parked = list((state_dir(qd) / CORRUPT_DIRNAME).glob("t-bad.*.yaml"))
     assert len(parked) == 2  # unique-suffix collision avoidance
+
+
+@pytest.mark.parametrize("pid", [2**31, 10**20], ids=["2**31", "10**20"])
+def test_a_pid_no_process_can_have_is_quarantined(tmp_path: Path, pid: int) -> None:
+    """A running state recording a pid above the C ``pid_t`` maximum fails
+    to load (``os.kill`` would raise ``OverflowError`` on it), so it is
+    quarantined like any corrupt state, and the task reverts to pending."""
+    qd = _queue(tmp_path)
+    p = state_path_for(qd, "t-pid")
+    write_state_atomic(TaskState(task_id="t-pid", status="running", pid=4242), p)
+    p.write_text(p.read_text().replace("pid: 4242\n", f"pid: {pid}\n"), encoding="utf-8")
+
+    results = quarantine_corrupt_state_files(qd, now=_NOW)
+
+    assert [(r.task_id, r.preserved_status) for r in results] == [("t-pid", None)]
+    assert not p.exists()
+
+
+def test_a_completed_state_with_such_a_run_pid_keeps_completed(tmp_path: Path) -> None:
+    """A run record's pid has the same bound; a completed task whose history
+    holds one is quarantined with its completion preserved."""
+    qd = _queue(tmp_path)
+    p = state_path_for(qd, "t-run-pid")
+    run = RunRecord(
+        attempt=1, started_at=_NOW, finished_at=_NOW, stop_reason="end_turn", duration_s=1, pid=4242
+    )
+    write_state_atomic(TaskState(task_id="t-run-pid", status="completed", runs=[run]), p)
+    p.write_text(p.read_text().replace("pid: 4242\n", f"pid: {10**20}\n"), encoding="utf-8")
+
+    results = quarantine_corrupt_state_files(qd, now=_NOW)
+
+    assert [(r.task_id, r.preserved_status) for r in results] == [("t-run-pid", "completed")]
+    assert load_state(p).status == "completed"

@@ -24,7 +24,7 @@ import claude_task_runner
 from claude_task_runner import process_signals
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
-from claude_task_runner.process_signals import UnsafeSignalTarget
+from claude_task_runner.process_signals import PID_MAX, UnsafeSignalTarget
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     load_state,
@@ -96,6 +96,66 @@ def test_kill_refuses_a_pid_of_one_or_less(
     assert str(exc_info.value) == message
     assert _errors(caplog) == [message]
     assert sent.calls == []
+
+
+OUT_OF_RANGE = [pytest.param(2**31, id="2**31"), pytest.param(10**20, id="10**20")]
+"""Pids no process can have: ``os.kill`` raises ``OverflowError`` for them."""
+
+
+@pytest.mark.parametrize("pid", OUT_OF_RANGE)
+def test_kill_refuses_a_pid_above_pid_max(
+    sent: Recorder, caplog: pytest.LogCaptureFixture, pid: int
+) -> None:
+    message = (
+        f"refusing to send SIGTERM to pid {pid}: "
+        f"no process has a pid above {PID_MAX}, the largest a C pid_t holds"
+    )
+    with pytest.raises(UnsafeSignalTarget) as exc_info:
+        process_signals.kill(pid, signal.SIGTERM)
+    assert str(exc_info.value) == message
+    assert _errors(caplog) == [message]
+    assert sent.calls == []
+
+
+@pytest.mark.parametrize("pgid", OUT_OF_RANGE)
+def test_killpg_refuses_a_group_above_pid_max(
+    sent: Recorder, caplog: pytest.LogCaptureFixture, pgid: int
+) -> None:
+    message = (
+        f"refusing to send SIGKILL to process group {pgid}: "
+        f"no process group has an id above {PID_MAX}, the largest a C pid_t holds"
+    )
+    with pytest.raises(UnsafeSignalTarget) as exc_info:
+        process_signals.killpg(pgid, signal.SIGKILL)
+    assert str(exc_info.value) == message
+    assert _errors(caplog) == [message]
+    assert sent.calls == []
+
+
+@pytest.mark.parametrize("pid", OUT_OF_RANGE)
+def test_signal_group_of_refuses_a_pid_above_pid_max_before_asking_its_group(
+    sent: Recorder, pid: int
+) -> None:
+    with pytest.raises(UnsafeSignalTarget):
+        process_signals.signal_group_of(pid, signal.SIGTERM)
+    assert sent.calls == []
+
+
+def test_pid_max_itself_reaches_os_kill(sent: Recorder) -> None:
+    """The bound is the C ``pid_t`` maximum: one below the first value
+    ``os.kill`` cannot take is still sent, and the kernel answers ESRCH."""
+    process_signals.kill(PID_MAX, signal.SIGTERM)
+    process_signals.killpg(PID_MAX, signal.SIGTERM)
+    assert sent.calls == [("kill", PID_MAX, signal.SIGTERM), ("killpg", PID_MAX, signal.SIGTERM)]
+
+
+def test_pid_max_is_the_largest_pid_os_kill_accepts() -> None:
+    """Known answer against the real ``os.kill``: :data:`PID_MAX` gets an
+    answer from the kernel, one more overflows before any syscall."""
+    with pytest.raises(ProcessLookupError):
+        os.kill(PID_MAX, 0)
+    with pytest.raises(OverflowError):
+        os.kill(PID_MAX + 1, 0)
 
 
 def test_kill_refuses_its_own_pid(sent: Recorder, caplog: pytest.LogCaptureFixture) -> None:
@@ -253,6 +313,23 @@ def test_nothing_in_src_signals_a_process_except_process_signals() -> None:
 def test_pid_alive_reports_a_pid_of_one_or_less_dead(sent: Recorder, pid: int) -> None:
     """Probing pid 1 fails with EPERM, which read as a live worker."""
     assert dispatcher_mod._pid_alive(pid) is False
+    assert sent.calls == []
+
+
+@pytest.mark.parametrize("pid", OUT_OF_RANGE)
+def test_pid_alive_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) -> None:
+    """``os.kill`` raises ``OverflowError`` here, which no ``except OSError``
+    around a probe catches: supervisor startup crashed on one."""
+    assert dispatcher_mod._pid_alive(pid) is False
+    assert sent.calls == []
+
+
+@pytest.mark.parametrize("pid", OUT_OF_RANGE)
+def test_probe_worker_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) -> None:
+    assert (
+        dispatcher_mod.probe_worker(pid, log_path=None, started_at=None)
+        is dispatcher_mod.WorkerProbe.DEAD
+    )
     assert sent.calls == []
 
 
