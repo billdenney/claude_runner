@@ -1788,8 +1788,9 @@ class SelectionPreview:
     A task in ``unread_states`` has none."""
     unread_states: dict[str, str]
     """Admitted tasks whose state no longer loads when the preview reads
-    its status (rewritten or removed since the selector read it), each with
-    the error. The next tick's selector skips such a state."""
+    its status (a hand edit since the selector read it, say), each with the
+    error. A state removed since makes the task ``new`` instead. The next
+    tick's selector skips a state that does not load."""
     routes: dict[str, str | None]
     """For each admitted task, the account a tick would dispatch it through
     now (:func:`_route`, session affinity and its TTL included), or ``None``
