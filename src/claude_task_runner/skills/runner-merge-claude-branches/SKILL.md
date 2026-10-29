@@ -67,9 +67,11 @@ stop a run partway are 5 (a repair or verification step failed, the verifier
 could not run, or the revert check found base content the merge reverted),
 6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
 before the push, for wording a repair set aside or a loss the verifier
-reported, steps 6b and 7). Every stop prints the `--finish` command that
-completes the run from the same worktree: it runs the gates again on the
-branch and every R step the run did not complete, then pushes (step 6b).
+reported, steps 6b and 7). A run whose repairs completed is completed from
+the same worktree by the `--finish` command its stop prints: it runs the
+gates again on the branch and every R step that is not up to date, then
+pushes (step 6b). A run that stopped before its repairs completed is re-run
+on a fresh `--branch-name`.
 
 ## The merge set
 
@@ -278,9 +280,19 @@ exists to repair. Repair, then regenerate.
    not). A step the run skipped stays skipped, and a `--skip-*` given to
    `--finish` skips a step still due.
    A pending step with no `Rscript` on PATH stops it (exit 3). Then it
-   pushes the branch and prints the PR text. Every stop that leaves work
-   for `--finish` -- the revert check, a failed regeneration (exit 5),
-   check (exit 6) or vignette run (exit 8) -- prints the same command. Without
+   pushes the branch and prints the PR text. `--finish` completes any run
+   whose repairs (the union, the dedups, the restore and the NEWS union)
+   completed: one that stopped for a hand union (exit 9), at the revert check
+   or a failed regeneration (exit 5), at check (exit 6), at the push
+   (exit 7) or at the vignettes (exit 8), or was interrupted after its
+   repairs; each of those prints the `--finish` command, bare except at the
+   hand-union stop, so `--finish` itself says when the report needs
+   `--hand-union-done`. A run that stopped before its repairs completed (a
+   repair that crashed, duplicates left after the dedup, a verifier that
+   could not run) is refused (exit 3), since `--finish` redoes no repair:
+   re-run it on a fresh `--branch-name`. `--finish` also refuses a worktree
+   with uncommitted changes or untracked files, listing them, since a step
+   that failed or was interrupted can leave partial output. Without
    `--hand-union-done`, `--finish` prints the report and stops (exit 9)
    while it holds anything. The report lives in the worktree's git
    directory and goes with the worktree; copy it before removing one.

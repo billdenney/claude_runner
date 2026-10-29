@@ -28,8 +28,14 @@
 #      wording, the others and the losses are in a hand-union report, and
 #      after the hand union is committed --finish --hand-union-done pushes
 #      and prints the PR text from the same worktree, once the gates pass
-#      again. Every stop prints that --finish command, and every later
-#      failure names the report too.
+#      again. --finish completes any run whose repairs completed: one that
+#      stopped for a hand union (exit 9), at the revert check (5), a failed
+#      regeneration (5), check (6), push (7) or vignette run (8), or was
+#      interrupted after its repairs; each of those prints the --finish
+#      command, and every failure names a pending report. A run that
+#      stopped before its repairs completed (a repair that crashed,
+#      duplicates left after the dedup, a verifier that could not run)
+#      cannot be completed: re-run it on a fresh --branch-name.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -103,9 +109,11 @@
 #                           -- from the worktree, refusing a conflicting one
 #                           given here (exit 2) and stopping when a ref the
 #                           run merged no longer exists (exit 3). It refuses
-#                           a worktree with uncommitted
-#                           changes; prints a pending hand-union report and
-#                           stops (exit 9) unless --hand-union-done is given;
+#                           a worktree whose run stopped before its repairs
+#                           completed (exit 3), and one with uncommitted
+#                           changes or untracked files, listing them. It
+#                           prints a pending hand-union report and stops
+#                           (exit 9) unless --hand-union-done is given;
 #                           runs the duplicate check, the revert check and the
 #                           contribution verifier, stopping (exit 9) while the
 #                           verifier reports a loss unless
@@ -136,8 +144,9 @@
 #      an --extra-ref does not resolve, no branch matched, a survey diff
 #      failed (no merge base, or a shallow clone), no --yes without a
 #      terminal, or the worktree already exists; for --finish, no worktree,
-#      a worktree on another branch, one with uncommitted changes, no
-#      recorded inputs, a ref the run merged that no longer exists, or no
+#      a worktree on another branch, one with uncommitted changes or
+#      untracked files, no recorded inputs, a run that stopped before its
+#      repairs completed, a ref the run merged that no longer exists, or no
 #      Rscript while an R step is still pending
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
@@ -167,8 +176,8 @@ trap 'err_rc=$?; (( BASH_SUBSHELL == 0 )) || exit "$err_rc"; echo "ERROR: unexpe
 trap 'remind_hand_union $?' EXIT
 # An interrupt or a kill exits with its own status, so the EXIT trap names a
 # pending report then too, rather than seeing the status of the last command.
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
 HAND_UNION_REPORT=""
 # Which of steps 7-9 the run skipped, and the commit each completed at
 # (stage_get); kept in the worktree's git directory for --finish.
@@ -233,6 +242,18 @@ die() {  # <exit code> <message>
 
 need_value() {
   [[ $# -ge 2 ]] || die 2 "$1 needs a value"
+}
+
+interrupted() {  # <status>: INT/TERM; says how to complete the run when --finish can
+  if [[ -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] && [[ "$(stage_get repairs)" != pending ]]; then
+    {
+      echo
+      echo "Interrupted. The repairs had completed: commit or discard any partial output"
+      echo "in $WT_ABS, then run"
+      echo "     $(finish_command)"
+    } >&2
+  fi
+  exit "$1"
 }
 
 remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
@@ -527,7 +548,10 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
     echo
     echo "==> Pushing $BRANCH_NAME to origin"
     if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
-      echo "ERROR: push failed." >&2
+      {
+        echo "ERROR: push failed. Fix the remote or the network, then run"
+        echo "     $(finish_command)"
+      } >&2
       exit 7
     fi
   fi
@@ -910,12 +934,23 @@ if (( FINISH )); then
   cd "$WT_ABS"
   [[ "$(git rev-parse --abbrev-ref HEAD)" == "$BRANCH_NAME" ]] \
     || die 3 "--finish: $WT_ABS is not on branch $BRANCH_NAME."
-  [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
-    || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
+  DIRTY="$(git status --porcelain)"
+  if [[ -n "$DIRTY" ]]; then
+    {
+      echo "ERROR: --finish: $WT_ABS has uncommitted changes:"
+      printf '%s\n' "$DIRTY" | sed 's/^/    /'
+      echo "  Commit what belongs on the branch and discard the rest (a step that failed"
+      echo "  or was interrupted can leave partial output), then run --finish again."
+    } >&2
+    exit 3
+  fi
   HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
   STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
   INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
   read_inputs
+  if [[ "$(stage_get repairs)" == pending ]]; then
+    die 3 "--finish: the run that made $WT_ABS stopped before its repairs completed, which --finish does not redo; re-run on a fresh --branch-name."
+  fi
   git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
   echo "==> Finishing $BRANCH_NAME in $WT_ABS"
   if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
@@ -1453,6 +1488,9 @@ if [[ -f NEWS.md ]]; then
     echo "    committed NEWS.md union"
   fi
 fi
+# Every repair has run: --finish can complete the run from here, since it
+# runs the gates and the R steps again but none of the repairs.
+stage_set repairs "$(git rev-parse HEAD)"
 
 # Revert check. -X theirs resolves a conflicting hunk with the incoming side,
 # so a branch cut from an older main can put back its older copy of a whole

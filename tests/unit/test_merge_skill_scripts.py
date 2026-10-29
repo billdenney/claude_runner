@@ -1117,7 +1117,10 @@ class TestMergeBranchesHandUnion:
         refused = run(*printed)
         assert (refused.returncode, refused.stderr) == (
             3,
-            f"ERROR: --finish: {wt} has uncommitted changes; commit the hand union first.\n",
+            f"ERROR: --finish: {wt} has uncommitted changes:\n"
+            f"     M {REGISTER}\n"
+            "  Commit what belongs on the branch and discard the rest (a step that failed\n"
+            "  or was interrupted can leave partial output), then run --finish again.\n",
         )
         git(wt, "commit", "-qam", "Union the FOO notes by hand")
 
@@ -1512,9 +1515,73 @@ class TestMergeBranchesHandUnion:
         proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
         assert proc.returncode == 9, proc.stderr
         shutil.rmtree(tmp_path / "origin.git")
-        done = run(*self._printed_finish(proc.stderr))
+        printed = self._printed_finish(proc.stderr)
+        done = run(*printed)
         assert done.returncode == 7, done.stdout + done.stderr
         assert "hand union is still pending" not in done.stderr
+        assert done.stderr.endswith(
+            "ERROR: push failed. Fix the remote or the network, then run\n"
+            f"     {' '.join(printed[:-1])}\n"
+        )
+
+    def test_finish_refuses_a_run_that_stopped_before_its_repairs(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """The restore crashed, so a repair never ran; --finish does not redo
+        repairs, so it refuses rather than push a half-repaired merge."""
+        crash = (
+            '#!/bin/bash\ncase "$1" in */restore_dropped_sections.py) exit 2 ;; esac\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"python3": crash}))
+        proc = self._run(
+            hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes", env=env
+        )
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        refused = self._run(hand_repo, "--finish", "--hand-union-done")
+        assert (refused.returncode, refused.stderr) == (
+            3,
+            f"ERROR: --finish: the run that made {wt} stopped before its repairs completed,"
+            " which --finish does not redo; re-run on a fresh --branch-name.\n",
+        )
+
+    def test_finish_lists_partial_output_a_failed_step_left(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        env, _, _ = self._r_env(tmp_path, fail="regen")
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / "inst").mkdir(exist_ok=True)
+        (wt / "inst" / "partial.txt").write_text("half\n")
+        refused = run(*_printed_after(proc.stderr, "and commit, then run"), env=env)
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert refused.stderr == (
+            f"ERROR: --finish: {wt} has uncommitted changes:\n"
+            "    ?? inst/partial.txt\n"
+            "  Commit what belongs on the branch and discard the rest (a step that failed\n"
+            "  or was interrupted can leave partial output), then run --finish again.\n"
+        )
+
+    def test_an_interrupt_after_the_repairs_says_how_to_finish(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """A TERM during check, after the repairs completed, still exits 143,
+        and says that --finish completes the run."""
+        killer = (
+            '#!/bin/bash\ncase "$*" in *devtools::check*) kill -TERM "$PPID"; sleep 1 ;; esac\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"Rscript": killer}))
+        proc = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-vignettes", env=env)
+        assert proc.returncode == 143, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert (
+            "\nInterrupted. The repairs had completed: commit or discard any partial output\n"
+            f"in {wt}, then run\n"
+            f"     bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
+            f" --branch-name {CONSOLIDATION} --finish\n"
+        ) in proc.stderr
 
     def test_a_run_killed_after_the_dedup_names_the_report(
         self, hand_repo: Path, tmp_path: Path
