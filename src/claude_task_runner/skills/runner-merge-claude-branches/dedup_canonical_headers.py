@@ -104,10 +104,13 @@ def heading_names(text: str) -> tuple[tuple[str, ...], str]:
     """The names a ``### `` heading declares, in its order, and its description.
 
     ``"fm_a, fm_b (**canonical ...**)"`` gives ``(("fm_a", "fm_b"), "(**canonical ...**)")``.
+    The names end at the first " (", as nlmixr2lib's checkNamingRegisters.R
+    cuts a heading, so a "(" inside a name is part of it, and a backticked
+    name keeps its backticks: ``### `prob` `` is not ``### prob``.
     """
-    names_part, paren, rest = text.partition("(")
+    names_part, cut, rest = text.partition(" (")
     names = tuple(dict.fromkeys(name.strip() for name in names_part.split(",") if name.strip()))
-    return names or (text.strip(),), (paren + rest).strip()
+    return names or (text.strip(),), (f"({rest}".strip() if cut else "")
 
 
 Head = tuple[int, tuple[str, ...], str]

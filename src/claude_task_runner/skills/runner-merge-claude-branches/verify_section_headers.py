@@ -52,12 +52,12 @@ with ``--exclude-ref`` or pushed after the survey is not checked):
 6. Extract all ``##`` and ``###`` headers from the merged file.
 7. Assert ``new_headers - merged_headers == set()``.
 
-The ``###`` regex captures only the canonical-name tokens (e.g.
-``WT`` from ``### WT (**canonical for body weight ...**)``) so that
-benign annotation drift between branch and merged file does NOT
-register as a regression. Section identity is the token, not the
+A ``###`` header counts by the names it declares, read by the dedup's
+``heading_names`` (e.g. ``WT`` from ``### WT (**canonical for body weight
+...**)``), so that benign annotation drift between branch and merged file
+does NOT register as a regression. Section identity is the name, not the
 prose. A header naming several canonicals (``### QTc, QTcF, QTcI``)
-yields one token per name, so a branch that adds a name to such a
+yields one name each, so a branch that adds a name to such a
 header is checked for that name, and a merged header whose list grew
 further still passes.
 
@@ -90,10 +90,10 @@ import sys
 import traceback
 from pathlib import Path
 
+import dedup_canonical_headers as register
 import merge_set
 
 H2_RE = re.compile(r"^## (.+)$", re.M)
-H3_RE = re.compile(r"^### ([A-Za-z0-9_, ]+)\b", re.M)
 
 
 def fail(message: str) -> int:
@@ -109,9 +109,9 @@ def is_work_tree(repo: Path) -> bool:
 
 
 def extract_headers(text: str) -> tuple[set[str], set[str]]:
-    """The ``##`` headers, and the names in the ``###`` headers (one per name)."""
-    names = {name.strip() for header in H3_RE.findall(text) for name in header.split(",")}
-    return set(H2_RE.findall(text)), names - {""}
+    """The ``##`` headers, and every name the ``###`` headers declare."""
+    heads, _ = register._parse(text.split("\n"))
+    return set(H2_RE.findall(text)), {name for _, names, _ in heads for name in names}
 
 
 def main(argv: list[str]) -> int:

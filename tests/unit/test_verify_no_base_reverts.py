@@ -288,6 +288,13 @@ class TestParsing:
             "(**canonical (nested) x**)",
         )
 
+    def test_names_end_where_nlmixr2lib_ends_them(self) -> None:
+        """At the first " (", as checkNamingRegisters.R cuts a heading: a "("
+        inside a name is part of the name."""
+        names = self.v.register.heading_names
+        assert names("`f(t)`, bar (**x**)") == (("`f(t)`", "bar"), "(**x**)")
+        assert names("fm_a(**x**)") == (("fm_a(**x**)",), "")
+
     def test_an_example_models_field_is_its_entries(self) -> None:
         """Read whole: the separators and the full stops that end it do not
         matter; prose before, between or after the entries does, and a note

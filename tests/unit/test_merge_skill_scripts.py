@@ -1429,6 +1429,20 @@ def test_worktree_helpers_skip_a_file_the_worktree_lacks(
     assert not merged.exists()
 
 
+def test_the_section_verifier_reads_heading_names_as_the_dedup_does() -> None:
+    """Every name a ``###`` heading declares, as heading_names reads it: a
+    backticked pattern heading, a hyphenated name and each name of a
+    multi-name heading."""
+    sections = load_helper("verify_section_headers")
+    text = (
+        "## S\n\n### `prob_<endpoint>` (**x**)\n\n### CONMED_RTV-CC (**y**)\n\n### a, b (**z**)\n"
+    )
+    assert sections.extract_headers(text) == (
+        {"S"},
+        {"`prob_<endpoint>`", "CONMED_RTV-CC", "a", "b"},
+    )
+
+
 def test_union_merge_lines_restores_the_dropped_example_model(repo: Path, worktree: Path) -> None:
     """Merged order first, then each branch's new models, keeping each annotation."""
     merged = worktree / REGISTER
