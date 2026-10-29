@@ -268,6 +268,10 @@ def main() -> int:
         branch_blocks = blocks(text)
         for name, (section, block, names) in branch_blocks.items():
             owner = names[0]
+            if name in base_blocks:
+                # The base's own canonical, which no branch added, even when a
+                # restored heading declares it too.
+                continue
             earlier = next((restored_from[n] for n in names if n in restored_from), None)
             if earlier is not None:
                 # A copy of a block already restored: its heading shares a name
@@ -278,7 +282,7 @@ def main() -> int:
                     branch = ref.replace("origin/", "")
                     differing.append((kept, branch, first, first_block, block))
                 continue
-            if name in base_blocks or name in merged_blocks:
+            if name in merged_blocks:
                 continue
             if name in deliberately_removed:
                 # Present in the file at some merge commit on this branch and
