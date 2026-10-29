@@ -93,8 +93,10 @@ def read_registry() -> Registry:
     if not path.exists():
         return Registry()
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        # ValueError: JSONDecodeError, text that is not UTF-8, and the bare
+        # one json raises for an integer past the interpreter's digit limit.
         raise RegistryError(f"corrupt queues registry at {path} ({exc})") from exc
     if not isinstance(payload, dict):
         raise RegistryError(f"queues registry at {path} is not a JSON object")

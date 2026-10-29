@@ -378,9 +378,7 @@ def _load_settings(per_queue_toml: Path | None) -> Settings:
 
     if per_queue_toml is not None:
         try:
-            override = tomllib.loads(_read_regular_file(per_queue_toml).decode("utf-8"))
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-            raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
+            data = _read_regular_file(per_queue_toml)
         except OSError as exc:
             raise _queue_toml_read_error(per_queue_toml, exc) from exc
         except _NotARegularFile as exc:
@@ -390,6 +388,12 @@ def _load_settings(per_queue_toml: Path | None) -> Settings:
         except ValueError as exc:
             # A NUL byte in the path: no file can have that name.
             raise ConfigError(f"Cannot read {per_queue_toml}: {exc}") from exc
+        try:
+            override = tomllib.loads(data.decode("utf-8"))
+        except ValueError as exc:
+            # TOMLDecodeError, UnicodeDecodeError, and the bare ValueError
+            # tomllib raises for an integer past the interpreter's digit limit.
+            raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
         _reject_retired_keys(override, str(per_queue_toml))
         _rename_retired_effort_levels(override, str(per_queue_toml))
@@ -483,7 +487,9 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
         )
     try:
         payload = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
+        # TOMLDecodeError, UnicodeDecodeError, and the bare ValueError
+        # tomllib raises for an integer past the interpreter's digit limit.
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
     except RecursionError as exc:
         raise ConfigError(f"{path} is nested too deeply to load") from exc
