@@ -468,45 +468,67 @@ class TestMaxReadingAge:
 
 
 class TestDeferralCooldownSpansATick:
-    """``[failure_classifier].deferral_recheck_cooldown_s`` must be at least one tick.
+    """``[failure_classifier].deferral_recheck_cooldown_s`` must be at least two ticks.
 
     The selector checks a deferred task's ``next_eligible_at`` once a tick
-    and nothing wakes the supervisor for it, so a shorter cooldown (``0``
-    included) re-dispatches a still-blocked task every tick.
+    and nothing wakes the supervisor for it. A deferral is stamped just after
+    one selection and the next comes a poll interval plus that tick's work
+    later, so a cooldown of one interval has passed by then and a
+    still-blocked task is re-dispatched every tick.
     """
 
-    def _toml(self, tmp_path: Path, *, cooldown: float, poll: float = 60) -> Path:
+    def _toml(
+        self, tmp_path: Path, *, cooldown: float, poll: float = 60, accounts: int = 1
+    ) -> Path:
+        names = "".join(
+            f'[[accounts]]\nname = "a{i}"\nconfig_dir = "{tmp_path}"\n' for i in range(accounts)
+        )
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(
-            f"[usage]\npoll_interval_s = {poll}\nmax_reading_age_s = {2 * poll}\n"
-            f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {cooldown}\n"
+            f"[usage]\npoll_interval_s = {poll}\nmax_reading_age_s = {2 * poll * accounts}\n"
+            f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {cooldown}\n\n{names}"
         )
         return toml
 
     def test_default_is_900_seconds(self) -> None:
         assert load_settings(None).failure_classifier.deferral_recheck_cooldown_s == 900
 
-    def test_exactly_one_tick_loads(self, tmp_path: Path) -> None:
-        settings = load_settings(self._toml(tmp_path, cooldown=60))
-        assert settings.failure_classifier.deferral_recheck_cooldown_s == 60
+    @pytest.mark.parametrize("accounts", [1, 2, 5])
+    def test_exactly_two_ticks_loads(self, tmp_path: Path, accounts: int) -> None:
+        """The floor is two ticks whatever the number of accounts: every
+        tick's selection checks every deferred task."""
+        settings = load_settings(self._toml(tmp_path, cooldown=120, accounts=accounts))
+        assert settings.failure_classifier.deferral_recheck_cooldown_s == 120
+        assert len(settings.accounts) == accounts
 
-    def test_under_one_tick_is_rejected(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("accounts", [1, 2, 5])
+    def test_under_two_ticks_is_rejected(self, tmp_path: Path, accounts: int) -> None:
         with pytest.raises(ConfigError) as excinfo:
-            load_settings(self._toml(tmp_path, cooldown=59.5))
+            load_settings(self._toml(tmp_path, cooldown=119.5, accounts=accounts))
         assert (
-            "[failure_classifier].deferral_recheck_cooldown_s = 59.5 s is under one "
-            "supervisor tick, [usage].poll_interval_s = 60 s. Deferred tasks are checked "
-            "once a tick, so a shorter cooldown re-dispatches a still-blocked task every "
-            "tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+            "[failure_classifier].deferral_recheck_cooldown_s = 119.5 s is under two "
+            "supervisor ticks, 2 x [usage].poll_interval_s 60 s = 120 s. Deferred tasks are "
+            "checked once a tick, so a shorter cooldown re-dispatches a still-blocked task "
+            "every tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
         ) in str(excinfo.value)
 
+    def test_one_tick_is_rejected(self, tmp_path: Path) -> None:
+        """One interval has passed by the next selection, so it skips nothing."""
+        with pytest.raises(ConfigError, match="cooldown_s = 60 s is under two"):
+            load_settings(self._toml(tmp_path, cooldown=60))
+
     def test_zero_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 0 s is under one"):
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 0 s is under two"):
             load_settings(self._toml(tmp_path, cooldown=0))
 
-    def test_default_rejects_a_poll_longer_than_it(self, tmp_path: Path) -> None:
-        """The 900 s default needs polls of 900 s or less."""
+    def test_a_value_just_under_is_not_rounded_up(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match=r"cooldown_s = 119\.99999 s is under two"):
+            load_settings(self._toml(tmp_path, cooldown=119.99999))
+
+    def test_default_needs_polls_of_450_seconds_or_less(self, tmp_path: Path) -> None:
         toml = tmp_path / "claude_runner.toml"
-        toml.write_text("[usage]\npoll_interval_s = 901\nmax_reading_age_s = 1802\n")
-        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under one"):
+        toml.write_text("[usage]\npoll_interval_s = 450\nmax_reading_age_s = 900\n")
+        assert load_settings(toml).usage.poll_interval_s == 450
+        toml.write_text("[usage]\npoll_interval_s = 451\nmax_reading_age_s = 902\n")
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under two"):
             load_settings(toml)

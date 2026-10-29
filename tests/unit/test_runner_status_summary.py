@@ -1386,8 +1386,12 @@ def test_poll_interval_is_the_supervisors_own(
     with the queue's own file (60 s) it would look stuck."""
     dirs = _config(queue, tmp_path, {"personal": 5, "work": 3})
     other = tmp_path / "other.toml"
-    # max_reading_age_s must cover two capture cycles of the accounts.
-    usage = "[usage]\npoll_interval_s = 600\nmax_reading_age_s = 3600\n"
+    # max_reading_age_s must cover two capture cycles of the accounts, and the
+    # deferral cooldown two polls.
+    usage = (
+        "[usage]\npoll_interval_s = 600\nmax_reading_age_s = 3600\n"
+        "\n[failure_classifier]\ndeferral_recheck_cooldown_s = 1200\n"
+    )
     other.write_text(_config_text(dirs, usage), encoding="utf-8")
     states = {
         "personal": _state(SupervisorState.DISPATCHING),

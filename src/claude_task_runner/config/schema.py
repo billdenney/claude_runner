@@ -157,9 +157,12 @@ class FailureClassifierSettings(_StrictModel):
     often a still-blocked task is tried again, so a long wait (e.g. a paper
     awaiting operator re-acquisition, a mount not up yet) re-checks
     periodically instead of being re-picked every tick and starving ready
-    work. Default 15 min. Must be at least ``[usage].poll_interval_s``: the
-    selector checks the cooldown once a tick, so a shorter one would re-pick
-    the task every tick (see ``Settings``)."""
+    work. Default 15 min. Must be at least twice ``[usage].poll_interval_s``:
+    the selector checks the cooldown once a tick, and a deferral is stamped
+    just after one selection while the next comes a poll interval plus that
+    tick's work later, so a cooldown of one interval has passed by then and
+    the task would be re-picked every tick. Two intervals make it skip at
+    least one tick (see ``Settings``)."""
     sidecar_refile_loop_threshold: int = Field(default=4, ge=1)
     """Consecutive no-progress sidecar re-files (a dispatch that ends
     ``awaiting_sidecar`` without committing anything) after which the
@@ -1101,20 +1104,27 @@ class Settings(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_deferral_cooldown_spans_a_tick(self) -> Settings:
-        """Reject a deferral cooldown shorter than one supervisor tick.
+        """Reject a deferral cooldown shorter than two supervisor ticks.
 
         The selector compares a deferred task's ``next_eligible_at`` with the
-        clock once a tick, and nothing wakes the supervisor for it. A shorter
-        cooldown therefore cannot mean what it says: a still-blocked task is
-        re-dispatched, its hook re-run and its slot held, every tick.
+        clock once a tick, and nothing wakes the supervisor for it. A deferral
+        is stamped just after a selection; the next selection comes one poll
+        interval later plus that tick's own work (the usage capture among
+        it). A cooldown of one interval has passed by then, so a
+        still-blocked task would be re-dispatched, its hook re-run and its
+        slot held, every tick. Two intervals make it skip at least one tick
+        while a tick's work stays under one interval. Unlike
+        ``max_reading_age_s``, this does not scale with the accounts: every
+        tick's selection checks every deferred task.
         """
         cooldown_s = self.failure_classifier.deferral_recheck_cooldown_s
         poll_s = self.usage.poll_interval_s
-        if cooldown_s < poll_s:
+        if cooldown_s < 2 * poll_s:
             raise ValueError(
-                f"[failure_classifier].deferral_recheck_cooldown_s = {cooldown_s:g} s is under "
-                f"one supervisor tick, [usage].poll_interval_s = {poll_s:g} s. Deferred tasks "
-                "are checked once a tick, so a shorter cooldown re-dispatches a still-blocked "
-                "task every tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+                f"[failure_classifier].deferral_recheck_cooldown_s = {cooldown_s:.10g} s is "
+                f"under two supervisor ticks, 2 x [usage].poll_interval_s {poll_s:.10g} s = "
+                f"{2 * poll_s:.10g} s. Deferred tasks are checked once a tick, so a shorter "
+                "cooldown re-dispatches a still-blocked task every tick. Raise "
+                "deferral_recheck_cooldown_s or lower poll_interval_s."
             )
         return self

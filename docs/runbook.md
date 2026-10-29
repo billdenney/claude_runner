@@ -443,8 +443,10 @@ task that does not run.
      depends on a member waits under `depends_on`.
    - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
-     `next_eligible_at` printed below the reason has passed, the supervisor
-     tries the task again and runs the hook again.
+     `next_eligible_at` printed below the reason has passed
+     (`[failure_classifier].deferral_recheck_cooldown_s` after the deferral,
+     15 minutes by default), the supervisor tries the task again and runs
+     the hook again.
    - `cannot start the worker:` — the supervisor could not start `claude`
      for the task: the `claude` binary is not on PATH, the account's
      `config_dir` does not exist or names an unknown `~user`, `sudo` is
@@ -456,8 +458,11 @@ task that does not run.
      the circuit breaker is not fed. Fix the cause; the supervisor tries
      again once `next_eligible_at` has passed
      (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
-     default, and never less than `[usage].poll_interval_s`, since the
-     cooldown is checked once a tick), and the task runs.
+     default), and the task runs. The cooldown is checked once a tick, and
+     the next tick's selection comes a little more than one
+     `[usage].poll_interval_s` after the deferral, so the settings refuse a
+     cooldown under two poll intervals: one would have passed by then and
+     the task would be tried every tick.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.
