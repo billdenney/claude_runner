@@ -547,8 +547,10 @@ exists to repair. Repair, then regenerate.
     gate. The worker also forces `knitr::opts_chunk$set(error = FALSE)`
     so a chunk error fails the render instead of being written into the
     HTML and reported as success. Continues on failure and
-    writes a JSON-lines report (`.vignette_results.jsonl` in the
-    worktree). The orchestrator script (`merge_branches.sh`) runs this
+    writes a JSON-lines report (`vignette-results.jsonl`, beside the build
+    log `vignette-build.log`, in the worktree's git directory, so neither
+    dirties the tree; the failure message prints both paths). The
+    orchestrator script (`merge_branches.sh`) runs this
     automatically before push; in that script's own step list it is
     step 9 (the `--skip-vignettes` gate).
 
@@ -562,7 +564,7 @@ exists to repair. Repair, then regenerate.
     bug pattern that broke 12 vignettes in the 2026-06-17 merge) in
     one batch.
 
-    **What to do on failure.** The `.vignette_results.jsonl` lists
+    **What to do on failure.** The `vignette-results.jsonl` lists
     every failing vignette with its error message. Common patterns:
 
     - `chol(): decomposition failed` — model has a rank-1 / numerically

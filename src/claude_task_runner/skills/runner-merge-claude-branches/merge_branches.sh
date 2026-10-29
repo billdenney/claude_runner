@@ -614,8 +614,14 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
     echo "    WARN: worktree was already dirty before the regen step; staging"
     echo "          only known artifact paths to avoid committing unrelated edits:"
     printf '%s\n' "$pre_dirty" | sed 's/^/            /'
-    git add -A _pkgdown.yml data/ inst/ man/ NAMESPACE 2>/dev/null || true
-  elif ! git diff --quiet; then
+    local known=() path
+    for path in _pkgdown.yml data inst man NAMESPACE; do
+      if [[ -e "$path" ]]; then known+=("$path"); fi
+    done
+    if (( ${#known[@]} )); then git add -A -- "${known[@]}"; fi
+  elif [[ -n "$(git status --porcelain)" ]]; then
+    # status, not diff: a regeneration that only creates files changes no
+    # tracked one.
     git add -A
   fi
   if ! git diff --staged --quiet; then
@@ -662,8 +668,10 @@ run_vignettes() {  # step 9: every vignette renders
   echo
   echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
   echo "    jobs=$VIGNETTE_JOBS  timeout=${VIGNETTE_TIMEOUT}s/vignette"
-  VIGNETTE_RESULTS="${WT_ABS}/.vignette_results.jsonl"
-  VIGNETTE_LOG="${WT_ABS}/.vignette_build.log"
+  # In the worktree's git directory, so they never dirty the tree a later
+  # regeneration commits.
+  VIGNETTE_RESULTS="$(git rev-parse --path-format=absolute --git-path vignette-results.jsonl)"
+  VIGNETTE_LOG="$(git rev-parse --path-format=absolute --git-path vignette-build.log)"
   rm -f "$VIGNETTE_RESULTS"  # never judge this run by an earlier run's results
   local vignette_rc=0
   Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \

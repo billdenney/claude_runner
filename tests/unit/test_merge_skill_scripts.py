@@ -895,19 +895,30 @@ FOO_B = (
 )
 
 
-def _stub_rscript(log: Path, fail_regen: Path) -> str:
+def _stub_rscript(log: Path, flags: Path) -> str:
     """An Rscript that writes each R stage it is asked for to ``log``, in
-    order: the regeneration fails while ``fail_regen`` exists, and the
-    vignette validator records one rendered vignette."""
+    order. A stage fails while ``flags/fail-<stage>`` exists. The
+    regeneration writes man/modeldb.Rd (an edit when the branch has it) and
+    creates data/modeldb.rda; the vignette validator records one vignette."""
+    flag = {stage: shlex.quote(str(flags / f"fail-{stage}")) for stage in ("regen", "check", "vig")}
+    out = shlex.quote(str(log))
     return f"""#!/bin/bash
 case "$*" in
   *buildModelDb*)
-    echo regen >> {shlex.quote(str(log))}
-    if [[ -e {shlex.quote(str(fail_regen))} ]]; then echo "Error: a convention check failed"; exit 1; fi ;;
-  *devtools::check*) echo check >> {shlex.quote(str(log))} ;;
+    echo regen >> {out}
+    if [[ -e {flag["regen"]} ]]; then echo "Error: a convention check failed"; exit 1; fi
+    mkdir -p man data
+    echo "regenerated" > man/modeldb.Rd
+    echo "new" > data/modeldb.rda ;;
+  *devtools::check*)
+    echo check >> {out}
+    if [[ -e {flag["check"]} ]]; then echo "Error: check failed"; exit 1; fi ;;
   *verify_vignettes_parallel.R*)
-    echo vignettes >> {shlex.quote(str(log))}
+    echo vignettes >> {out}
     while [[ $# -gt 0 ]]; do [[ "$1" == --results ]] && results="$2"; shift; done
+    if [[ -e {flag["vig"]} ]]; then
+      echo '{{"ok":false,"file":"x.Rmd"}}' > "$results"; echo "[FAIL] x.Rmd"; exit 1
+    fi
     echo '{{"ok":true,"file":"x.Rmd"}}' > "$results"
     echo "SUMMARY: 1 ok / 0 failed / 1 total" ;;
 esac
@@ -1184,12 +1195,15 @@ class TestMergeBranchesHandUnion:
         assert "In a merged copy:\n\n````\n`N_2020_n.R` (short)\n````\n" in report
         assert "In that copy:\n\n````\n### TWICE (**canonical for twice**)\n" in report
 
-    def _r_env(self, tmp_path: Path, fail: bool) -> tuple[dict[str, str], Path, Path]:
-        log, flag = tmp_path / "r-stages.log", tmp_path / "fail-regen"
+    def _r_env(self, tmp_path: Path, fail: str | None = None) -> tuple[dict[str, str], Path, Path]:
+        """The stub Rscript on PATH, its log, and its flag directory, with
+        ``fail-<fail>`` set when given."""
+        log, flags = tmp_path / "r-stages.log", tmp_path / "flags"
+        flags.mkdir()
         if fail:
-            flag.touch()
-        bin_dir = _bin_dir(tmp_path, "bin", {"Rscript": _stub_rscript(log, flag)})
-        return _env_with_first(bin_dir), log, flag
+            (flags / f"fail-{fail}").touch()
+        bin_dir = _bin_dir(tmp_path, "bin", {"Rscript": _stub_rscript(log, flags)})
+        return _env_with_first(bin_dir), log, flags
 
     def test_finish_runs_the_stages_a_failed_regen_left(
         self, hand_repo: Path, tmp_path: Path
@@ -1197,7 +1211,7 @@ class TestMergeBranchesHandUnion:
         """The regeneration fails: the run stops (exit 5) and says to run
         --finish, which runs the regeneration, check and the vignettes, in
         that order, and then pushes."""
-        env, log, flag = self._r_env(tmp_path, fail=True)
+        env, log, flags = self._r_env(tmp_path, fail="regen")
         proc = self._run(hand_repo, "--yes", env=env)
         assert proc.returncode == 5, proc.stdout + proc.stderr
         assert "ERROR: the registry regeneration failed (its last output is above).\n" in (
@@ -1206,7 +1220,7 @@ class TestMergeBranchesHandUnion:
         assert log.read_text() == "regen\n"
         finish = _printed_after(proc.stderr, "and commit, then run")
         assert finish[-2:] == ["--finish", "--hand-union-done"]
-        flag.unlink()
+        (flags / "fail-regen").unlink()
         done = run(*finish, env=env)
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\ncheck\nvignettes\n"
@@ -1219,7 +1233,7 @@ class TestMergeBranchesHandUnion:
         """Every stage completed before the stop. A hand edit committed after
         it makes --finish regenerate again, since the artifacts must match the
         tree pushed; check and the vignettes, completed, do not run again."""
-        env, log, _ = self._r_env(tmp_path, fail=False)
+        env, log, _ = self._r_env(tmp_path)
         proc = self._run(hand_repo, "--yes", env=env)
         assert proc.returncode == 9, proc.stdout + proc.stderr
         assert log.read_text() == "regen\ncheck\nvignettes\n"
@@ -1240,10 +1254,10 @@ class TestMergeBranchesHandUnion:
     ) -> None:
         """A stage the run skipped stays skipped without the flag being given
         again; a --skip-* given to --finish skips a stage still pending."""
-        env, log, flag = self._r_env(tmp_path, fail=True)
+        env, log, flags = self._r_env(tmp_path, fail="regen")
         proc = self._run(hand_repo, "--yes", "--skip-vignettes", env=env)
         assert proc.returncode == 5, proc.stdout + proc.stderr
-        flag.unlink()
+        (flags / "fail-regen").unlink()
         done = run(*_printed_after(proc.stderr, "and commit, then run"), "--skip-check", env=env)
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\n"
@@ -1253,7 +1267,7 @@ class TestMergeBranchesHandUnion:
     def test_finish_refuses_a_pending_stage_without_rscript(
         self, hand_repo: Path, tmp_path: Path
     ) -> None:
-        env, _, _ = self._r_env(tmp_path, fail=True)
+        env, _, _ = self._r_env(tmp_path, fail="regen")
         proc = self._run(hand_repo, "--yes", env=env)
         assert proc.returncode == 5, proc.stdout + proc.stderr
         finish = _printed_after(proc.stderr, "and commit, then run")
@@ -1265,6 +1279,42 @@ class TestMergeBranchesHandUnion:
             " --skip-check --skip-vignettes to push without them.\n"
         )
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
+    def test_a_regeneration_that_only_creates_files_is_committed(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """The branch has no man/ or data/, so the regeneration only creates
+        files; both are committed, and the vignette files stay in the git
+        directory: the worktree is clean at the stop."""
+        env, _, _ = self._r_env(tmp_path)
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert git(wt, "show", "HEAD:man/modeldb.Rd") == "regenerated"
+        assert git(wt, "show", "HEAD:data/modeldb.rda") == "new"
+        assert git(wt, "status", "--porcelain") == ""
+        log = git(wt, "rev-parse", "--path-format=absolute", "--git-path", "vignette-build.log")
+        assert Path(log.strip()).read_text() == "SUMMARY: 1 ok / 0 failed / 1 total\n"
+
+    def test_a_regeneration_after_the_vignettes_commits_like_the_first(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """The vignettes fail; a fix is committed and --finish regenerates
+        again. The vignette files left nothing in the worktree, so it is not
+        taken for dirty and every artifact is committed."""
+        env, _, flags = self._r_env(tmp_path, fail="vig")
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 8, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / "inst").mkdir(exist_ok=True)
+        (wt / "inst" / "fix.txt").write_text("fixed\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "Fix the vignette")
+        (flags / "fail-vig").unlink()
+        done = run(*_printed_after(proc.stderr, "and commit, then run"), "--skip-push", env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "WARN: worktree was already dirty" not in done.stdout
+        assert git(wt, "status", "--porcelain") == ""
 
     def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")
