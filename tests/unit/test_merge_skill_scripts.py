@@ -1635,11 +1635,15 @@ class TestMergeBranchesHandUnion:
         )
         assert proc.returncode == 5, proc.stdout + proc.stderr
         wt = hand_repo / ".worktrees" / CONSOLIDATION
-        refused = self._run(hand_repo, "--finish", "--hand-union-done")
+        refused = self._run(hand_repo, "--finish")
         assert (refused.returncode, refused.stderr) == (
             3,
             f"ERROR: --finish: the run that made {wt} stopped before its repairs completed,"
-            " which --finish does not redo; re-run on a fresh --branch-name.\n",
+            " which --finish does not redo; re-run on a fresh --branch-name.\n"
+            "\nNOTE: this run's repairs did not complete, so --finish cannot complete it;\n"
+            "  re-run on a fresh --branch-name, copying its hand-union report first if you\n"
+            "  want it:\n"
+            f"    {self._report(wt)}\n",
         )
 
     def test_finish_lists_partial_output_a_failed_step_left(
@@ -1679,11 +1683,12 @@ class TestMergeBranchesHandUnion:
             f" --branch-name {CONSOLIDATION} --finish\n"
         ) in proc.stderr
 
-    def test_a_run_killed_after_the_dedup_names_the_report(
+    def test_a_run_killed_during_its_repairs_says_to_run_it_again(
         self, hand_repo: Path, tmp_path: Path
     ) -> None:
-        """A TERM (or Ctrl-C) exits with its own status, so the EXIT trap names
-        the pending report."""
+        """A TERM (or Ctrl-C) during the restore, with a hand union pending,
+        exits with its own status, and the EXIT trap says the run cannot be
+        finished, naming the report to copy, rather than to union it."""
         killer = (
             '#!/bin/bash\ncase "$1" in */restore_dropped_sections.py) kill -TERM "$PPID"; exit 0 ;;'
             f' esac\nexec {sys.executable} "$@"\n'
@@ -1693,7 +1698,15 @@ class TestMergeBranchesHandUnion:
             hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes", env=env
         )
         assert proc.returncode == 143, proc.stdout + proc.stderr
-        assert "NOTE: a hand union is still pending." in proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert proc.stderr.endswith(
+            "\nNOTE: this run's repairs did not complete, so --finish cannot complete it;\n"
+            "  re-run on a fresh --branch-name, copying its hand-union report first if you\n"
+            "  want it:\n"
+            f"    {self._report(wt)}\n"
+        )
+        assert "a hand union is still pending" not in proc.stderr
+        assert "Interrupted." not in proc.stderr
 
     @pytest.mark.parametrize(
         "registers",

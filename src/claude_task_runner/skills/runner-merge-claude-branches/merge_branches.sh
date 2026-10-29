@@ -266,14 +266,25 @@ interrupted() {  # <status>: INT/TERM; says how to complete the run when --finis
 remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
   local rc=$1
   # --hand-union-done: the operator has already unioned the report's wording.
-  if (( rc != 0 && rc != 9 && ! HAND_UNION_DONE )) \
-    && [[ -n "$HAND_UNION_REPORT" && -s "$HAND_UNION_REPORT" ]]; then
+  if (( rc == 0 || rc == 9 || HAND_UNION_DONE )) \
+    || [[ -z "$HAND_UNION_REPORT" || ! -s "$HAND_UNION_REPORT" ]]; then
+    return 0
+  fi
+  if [[ -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] && [[ "$(stage_get repairs)" != pending ]]; then
     {
       echo
       echo "NOTE: a hand union is still pending. The wording the register lacks is in"
       echo "    $HAND_UNION_REPORT"
       echo "  Union it into the register and commit before the push; the report goes"
       echo "  with the worktree (git worktree remove), so copy it elsewhere to keep it."
+    } >&2
+  else
+    {
+      echo
+      echo "NOTE: this run's repairs did not complete, so --finish cannot complete it;"
+      echo "  re-run on a fresh --branch-name, copying its hand-union report first if you"
+      echo "  want it:"
+      echo "    $HAND_UNION_REPORT"
     } >&2
   fi
 }
