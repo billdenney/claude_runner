@@ -392,10 +392,11 @@ class TaskState(_StrictBase):
     stop_reason: str | None = None
     error: str | None = None
     deferral_count: int = Field(ge=0, default=0)
-    """Consecutive pre-dispatch deferrals (hook exit code 1) since the
-    task last actually dispatched. Deferrals are NOT failures and are
+    """Deferrals in a row since the task last dispatched: pre-dispatch
+    hook exits 1, and workers that could not be started
+    (``worker_start_deferred``). Deferrals are NOT failures and are
     deliberately kept out of ``runs`` so they never reach the
-    circuit-breaker counter. Reset to 0 once the task dispatches. ``0``
+    circuit-breaker counter. Reset to 0 by the ``running`` write. ``0``
     on legacy state YAMLs that pre-date the field."""
     sidecar_refile_count: int = Field(ge=0, default=0)
     """Consecutive sidecars this task has filed WITHOUT committing any
@@ -410,13 +411,13 @@ class TaskState(_StrictBase):
     """When ``status == "deferred"``, the earliest time the orchestrator
     will re-attempt dispatch (and so re-run the pre-dispatch hook). Until
     then the parked task is skipped, so a still-deferring hook re-checks
-    on a cooldown instead of being re-picked at every tick. ``None`` when
-    not parked / on legacy state YAMLs."""
+    on a cooldown instead of being re-picked at every tick. Cleared by the
+    ``running`` write. ``None`` when not parked / on legacy state YAMLs."""
     deferred_reason: str | None = None
     """Last pre-dispatch deferral message (hook stderr) while a task is
     parked in ``deferred`` — operator-visible context for *why* it's
-    waiting (which input awaits re-acquisition/trim). ``None`` when not
-    parked."""
+    waiting (which input awaits re-acquisition/trim). Cleared by the
+    ``running`` write. ``None`` when not parked."""
     runs: list[RunRecord] = Field(default_factory=list)
 
     def session_host_account(self) -> str | None:

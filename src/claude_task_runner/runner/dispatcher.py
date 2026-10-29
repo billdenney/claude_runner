@@ -1985,6 +1985,12 @@ def dispatch(
             # must not point at that worker.
             "pid": None,
             "log_path": None,
+            # The task is dispatching, so any deferral has ended. A worker
+            # that then fails to start defers from ``state``, which keeps
+            # the count of deferrals in a row.
+            "deferral_count": 0,
+            "deferred_reason": None,
+            "next_eligible_at": None,
         }
     )
     if persist_state:

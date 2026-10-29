@@ -303,9 +303,9 @@ def list_tasks(
 def _print_deferral(console: Console, state: dict[str, object]) -> None:
     """Print why a ``deferred`` task is parked, for ``queue states`` and ``queue show``.
 
-    Prints nothing for any other status: a task that dispatches after a
-    deferral keeps its old ``deferred_reason`` and ``next_eligible_at``,
-    so a completed task can still carry both. For a ``deferred`` task,
+    Prints nothing for any other status: a dispatch clears
+    ``deferred_reason`` and ``next_eligible_at``, but a state written by an
+    older runner can still carry both after the task ran. For a ``deferred`` task,
     prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
     the earliest time the supervisor tries the task again. Of the runner's
     own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
