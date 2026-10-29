@@ -95,6 +95,16 @@ ANY_HEAD = re.compile(r"^#{2,6}\s")  # any block boundary (## or ###+)
 Key = str | tuple[str, str]
 
 
+def heading_names(text: str) -> tuple[frozenset[str], str]:
+    """The names a ``### `` heading declares, and its description.
+
+    ``"fm_a, fm_b (**canonical ...**)"`` gives ``({"fm_a", "fm_b"}, "(**canonical ...**)")``.
+    """
+    names_part, paren, rest = text.partition("(")
+    names = frozenset(name.strip() for name in names_part.split(",") if name.strip())
+    return names or frozenset({text.strip()}), (paren + rest).strip()
+
+
 def _parse(lines: list[str]) -> tuple[list[tuple[int, str, str]], list[int]]:
     """Return (heads, bounds) where:
     heads    = list of (line_idx, name, section) for each ### heading

@@ -82,16 +82,6 @@ def fail(message: str) -> int:
     return 2
 
 
-def heading_names(text: str) -> tuple[frozenset[str], str]:
-    """The names a ``### `` heading declares, and its description.
-
-    ``"fm_a, fm_b (**canonical ...**)"`` gives ``({"fm_a", "fm_b"}, "(**canonical ...**)")``.
-    """
-    names_part, paren, rest = text.partition("(")
-    names = frozenset(name.strip() for name in names_part.split(",") if name.strip())
-    return names or frozenset({text.strip()}), (paren + rest).strip()
-
-
 def line_atoms(line: str) -> list[Atom]:
     """What one body line outside an Example-models field holds: itself."""
     return [("line", line)]
@@ -159,7 +149,7 @@ class Unit:
     def atoms(self) -> Counter[Atom]:
         atoms: Counter[Atom] = Counter()
         if self.title.startswith("### "):
-            names, description = heading_names(self.title[4:])
+            names, description = register.heading_names(self.title[4:])
             atoms.update(("name", name) for name in names)
             if description:
                 atoms[("description", description)] += 1
@@ -180,7 +170,7 @@ def units(text: str) -> list[Unit]:
             current = Unit(section, line, frozenset())
             found.append(current)
         elif line.startswith("### "):
-            current = Unit(section, line, heading_names(line[4:])[0])
+            current = Unit(section, line, register.heading_names(line[4:])[0])
             found.append(current)
         else:
             current.lines.append(line)
