@@ -363,6 +363,42 @@ status.
    `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
    stopped) and the supervisor resumes its session.
 
+## A task's state file was quarantined at startup
+
+**Symptom:** the supervisor's log says
+`quarantined N corrupt state file(s) on startup: [...]`, with a `warning`
+notification (`corrupt-state quarantine: task <id> ...`) and a
+`corrupt_state_quarantined` event per task. The task's state file is now
+`<queue>/.claude_task_runner/state/.corrupt/<id>.<timestamp>.yaml`.
+
+**Cause:** at startup, before any other recovery pass, the supervisor moves
+every state file it cannot load into `state/.corrupt/` (ADR-0028), so that
+no pass skips the task forever. A file fails to load when a crash or power
+loss truncated it, when a hand edit broke it, or when it records a value no
+process or date can hold: a `pid` (the task's or a run's) above 2147483647,
+the C `pid_t` maximum, or an integer of more than 4300 digits. The runner
+never writes such a value; only a hand edit or bit rot does. The quarantine
+then decides the task from what it can still read at the head of the file:
+
+- A `completed` task gets a minimal state that keeps `completed`, so its
+  finished work is not redone. Its runs and session id are not kept.
+- A task whose worker still runs (the recorded worker, or a process writing
+  the task's stream log) is parked `possibly_hung` with that worker on
+  record (see the section above), so no second worker starts.
+- Any other task has no state, reverts to pending and runs again from the
+  start, even if its last worker had finished: the quarantined file's
+  record of that run is not read.
+
+**Steps:**
+1. The quarantined copy keeps the original bytes:
+   `ls <queue>/.claude_task_runner/state/.corrupt/`. Compare it with the
+   task's log, `<queue>/.claude_task_runner/logs/<id>/`, to see what the
+   last attempt did.
+2. To keep a task from running again (its work is done, say), stop the
+   supervisor, fix the copy and move it back to
+   `<queue>/.claude_task_runner/state/<id>.yaml`, then start the
+   supervisor. A copy moved back unfixed is quarantined again.
+
 ## Weekly throttled, no dispatch resuming
 
 **Symptom:** Supervisor in `ThrottledWeekly`, observed weekly
