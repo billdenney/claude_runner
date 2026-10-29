@@ -295,7 +295,8 @@ def main() -> int:
     for name, owner, ref, _ in lost_names:
         print(
             f"# HEADER-NAME LOST (repair by hand, not a block insert): '{name}' was added to "
-            f"the '### {owner}, ...' header by {ref} and is missing from the merged header"
+            f"the '{merged_blocks[owner][1].splitlines()[0]}' header by {ref} and is missing"
+            " from the merged header"
         )
     if lost_names:
         print(

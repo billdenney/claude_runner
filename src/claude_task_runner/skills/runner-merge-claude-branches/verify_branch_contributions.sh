@@ -54,8 +54,9 @@
 #      branch matching --pattern, an empty merge set, python3 missing, or a
 #      failed git command
 set -euo pipefail
-# merge_branches.sh reads exit 1 as a verdict ("contributions missing") and
-# carries on, so an unexpected failure must not exit 1 as well.
+# merge_branches.sh reads exit 1 as a verdict ("contributions missing"): it
+# records the losses and stops before the push. An unexpected failure must not
+# exit 1 as well.
 trap 'echo "ERROR: (verifier) unexpected failure (exit $?) at line $LINENO" >&2; exit 2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

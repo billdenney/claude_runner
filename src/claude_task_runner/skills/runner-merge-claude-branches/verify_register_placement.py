@@ -30,10 +30,12 @@ while the filename check passed on all of them:
                              later one won and took the earlier ratification's
                              example models with it.
 
-That is the "two branches register the same canonical" case, which neither the
-union-merger (it rebuilds only Example-models LINES that already share a
-bucket) nor restore_dropped_sections.py (it restores only blocks that vanished
-ENTIRELY) repairs.
+That is the "two branches register the same canonical" case. The union-merger
+folds the dropped copy's Example-models entries back in when both copies stand
+under one ``##`` section (a copy's heading stands for the merge result's heading
+of that canonical), but not across sections and not source aliases, and
+restore_dropped_sections.py restores only blocks that vanished ENTIRELY; this
+check reports what is left.
 
 A model is filed under a canonical when it is an entry of the block's
 ``**Example models:**`` field, inline or in a sub-bullet (``-`` or ``*``), as

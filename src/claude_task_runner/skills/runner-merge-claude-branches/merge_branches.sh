@@ -1048,10 +1048,10 @@ for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
     echo "    (verifier) the contributions missing from $vf are in the hand-union report; the run stops before the push."
   elif (( verify_rc == 1 )); then
     echo "WARNING: verifier reported missing contributions in $vf."
-    echo "         Reconcile by hand before opening the PR (the union-merger does"
-    echo "         not relocate brand-new section headers, and neither it nor"
-    echo "         restore_dropped_sections.py unions two branches' competing"
-    echo "         entries for the SAME canonical -- see the placement report)."
+    echo "         --accept-verifier-losses: the run goes on. Reconcile them by hand"
+    echo "         before opening the PR (see the placement report): no repair"
+    echo "         relocates a brand-new section header, or unions two branches'"
+    echo "         entries for one canonical filed under different ## sections."
   elif (( verify_rc != 0 )); then
     die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
   fi

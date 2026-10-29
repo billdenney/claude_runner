@@ -545,21 +545,30 @@ def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> No
     assert "HEADER-NAME LOST" not in out, out
 
 
-@pytest.mark.parametrize("heading", ["fm_a, fm_b", "fm_b, fm_a"])
+@pytest.mark.parametrize(
+    ("heading", "kept"),
+    [
+        ("fm_a, fm_b", "fm_a (**canonical for fm_a, reworded**)"),
+        ("fm_b, fm_a", "fm_a (**canonical for fm_a, reworded**)"),
+        ("fm_a, fm_b", "fm_z, fm_a (**canonical for fm_a, reworded**)"),
+    ],
+    ids=["after", "before", "survivor-not-first"],
+)
 def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
-    repo: Path, tmp_path: Path, heading: str
+    repo: Path, tmp_path: Path, heading: str, kept: str
 ) -> None:
     """The block is there under its other name, so the repair is the heading;
     it is printed and, with --report, added to the hand-union report, wherever
-    the branch put the new name in the heading. Nothing is inserted: a block
-    headed ``### fm_b, fm_a`` beside the surviving ``### fm_a`` would declare
-    fm_a twice."""
+    the branch put the new name in the heading, and the message quotes the
+    merged heading as it stands. Nothing is inserted: a block headed
+    ``### fm_b, fm_a`` beside the surviving ``### fm_a`` would declare fm_a
+    twice."""
     write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
     commit(repo, "main registers fm_a")
     make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", heading], "adds fm_b")
     git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
     text = (repo / REGISTER).read_text()
-    (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
+    (repo / REGISTER).write_text(text.replace("### fm_a (**canonical for fm_a**)", f"### {kept}"))
     commit(repo, "reword fm_a")
     git(
         repo,
@@ -595,7 +604,7 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
     assert out.returncode == 0, out.stdout + out.stderr
     assert (
         "# HEADER-NAME LOST (repair by hand, not a block insert): 'fm_b' was added to the"
-        " '### fm_a, ...' header by claude/adds and is missing from the merged header\n"
+        f" '### {kept}' header by claude/adds and is missing from the merged header\n"
     ) in out.stdout
     assert "# no dropped canonicals in refs.md\n" in out.stdout
     assert (repo / REGISTER).read_text() == merged
@@ -607,7 +616,7 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
         "In the register:\n"
         "\n"
         "````\n"
-        "### fm_a (**canonical for fm_a, reworded**)\n"
+        f"### {kept}\n"
         "````\n"
         "\n"
         "In that branch's copy:\n"
