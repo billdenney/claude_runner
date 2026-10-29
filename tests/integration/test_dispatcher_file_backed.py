@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -400,25 +401,6 @@ _INIT_LINES = 1
 """The shim's first line is its ``system/init`` event."""
 
 
-def _loop_raising_after(monkeypatch: pytest.MonkeyPatch, *, lines_before: int | None) -> None:
-    """Make ``_dispatch_loop`` raise ``RuntimeError("boom")`` from its own
-    iteration, after it has consumed ``lines_before`` lines, or after the
-    last one when ``None``: the real loop runs until then."""
-    real_loop = dispatcher_mod._dispatch_loop
-
-    def _loop(*, lines: object, **kwargs: object) -> object:
-        def _failing() -> object:
-            for count, line in enumerate(lines, start=1):  # type: ignore[call-overload]
-                yield line
-                if count == lines_before:
-                    raise RuntimeError("boom")
-            raise RuntimeError("boom")
-
-        return real_loop(lines=_failing(), **kwargs)
-
-    monkeypatch.setattr(dispatcher_mod, "_dispatch_loop", _loop)
-
-
 @pytest.fixture
 def spawned(monkeypatch: pytest.MonkeyPatch) -> object:
     """Keeps every worker ``dispatch`` spawns, and kills any still running
@@ -450,6 +432,7 @@ def test_a_loop_that_raises_mid_run_stops_the_worker_and_records_a_failure(
     monkeypatch: pytest.MonkeyPatch,
     reset_shim_env: None,
     spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
     adopt: bool,
 ) -> None:
     """The loop raises after the init event while the worker still runs. The
@@ -458,7 +441,7 @@ def test_a_loop_that_raises_mid_run_stops_the_worker_and_records_a_failure(
     had already seen."""
     monkeypatch.setenv("SHIM_SESSION_ID", "sess-loop")
     monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
-    _loop_raising_after(monkeypatch, lines_before=_INIT_LINES)
+    raise_in_dispatch_loop(_INIT_LINES)
 
     outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
     assert isinstance(outcome, DispatchOutcome)
@@ -491,13 +474,14 @@ def test_a_terminal_result_written_before_the_loop_raised_stands(
     monkeypatch: pytest.MonkeyPatch,
     reset_shim_env: None,
     spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
     adopt: bool,
 ) -> None:
     """The loop raises only after the worker's terminal result: the worker
     finished its work, so its result is the run's record and the task is
     completed, not failed and dispatched again."""
     monkeypatch.setenv("SHIM_SESSION_ID", "sess-done")
-    _loop_raising_after(monkeypatch, lines_before=None)
+    raise_in_dispatch_loop(None)
 
     outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
     assert isinstance(outcome, DispatchOutcome)
@@ -521,6 +505,7 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     monkeypatch: pytest.MonkeyPatch,
     reset_shim_env: None,
     spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
     adopt: bool,
 ) -> None:
     """When the worker cannot be stopped it may still run, so the attempt is
@@ -528,7 +513,7 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     worker's pid, so it is not dispatched again and its run is recorded
     once it exits, and dispatch raises."""
     monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
-    _loop_raising_after(monkeypatch, lines_before=_INIT_LINES)
+    raise_in_dispatch_loop(_INIT_LINES)
 
     def _cannot_stop(process: subprocess.Popen[str]) -> None:
         raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
