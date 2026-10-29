@@ -102,7 +102,9 @@ def fail(message: str) -> int:
 
 
 def _sections(lines: Sequence[str], headings: Headings | None = None) -> list[Bucket]:
-    """``(cov, sub)`` for each line: the latest ``##`` heading and the latest deeper one.
+    """``(cov, sub)`` for each line: the latest ``##`` heading and the latest
+    ``###`` heading under it. A deeper heading, or a ``#`` line, is part of
+    the ``###`` entry it stands in, as nlmixr2lib's register parsers read it.
 
     The bucket key is the pair, so the same subsection name under different
     covariates is kept distinct. With ``headings`` (the edited file's), a
@@ -121,9 +123,9 @@ def _sections(lines: Sequence[str], headings: Headings | None = None) -> list[Bu
             if depth == 2:
                 cov = match.group(2)
                 sub = ""
-            elif depth >= 3:
+            elif depth == 3:
                 sub = match.group(2)
-                if depth == 3 and headings:
+                if headings:
                     sub = _resolved(cov, sub, headings)
         found.append((cov, sub))
     return found

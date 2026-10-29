@@ -94,7 +94,9 @@ from dataclasses import dataclass
 
 H3 = re.compile(r"^###\s+(.*\S)")
 SECT2 = re.compile(r"^##\s+(.+?)\s*$")  # depth-2 section header
-ANY_HEAD = re.compile(r"^#{2,6}\s")  # any block boundary (## or ###+)
+# A block runs to the next ## or ### heading, as nlmixr2lib's register parsers
+# read an entry: a #### subsection or a # line inside it is part of it.
+ANY_HEAD = re.compile(r"^#{2,3}\s")
 
 
 Key = str | tuple[str, str]

@@ -2126,6 +2126,53 @@ class TestABacktickedHeadingIsNotTheBareName:
         assert (wt / REGISTER).read_text() == zap + new_block
 
 
+class TestABlockRunsToTheNextSectionOrEntry:
+    """A ``### `` entry runs to the next ``##`` or ``###`` heading, as
+    nlmixr2lib's register parsers read it: a ``####`` subsection and a ``# ``
+    line inside it are part of it, for the dedup, the union and the restore."""
+
+    DEEP = (
+        "### DEEP (**canonical for deep**)\n\n#### Detail\n\nMore on deep.\n\n"
+        "# An aside, still deep's\n\n- **Example models:** {models}.\n"
+    )
+
+    def test_the_dedup_collapses_the_whole_block(self, tmp_path: Path) -> None:
+        register = tmp_path / "register.md"
+        register.write_text(
+            "## S\n\n"
+            + self.DEEP.format(models="`A_2020_a.R` (a)")
+            + "\n"
+            + self.DEEP.format(models="`A_2020_a.R` (a), `B_2021_b.R` (b)")
+        )
+        proc = run_helper("dedup_canonical_headers.py", register)
+        assert (proc.returncode, proc.stderr) == (0, "")
+        assert register.read_text() == "## S\n\n" + self.DEEP.format(
+            models="`A_2020_a.R` (a), `B_2021_b.R` (b)"
+        )
+
+    def test_the_union_reads_a_field_after_a_subsection(self) -> None:
+        u = load_helper("union_merge_lines")
+        base = "## S\n\n" + self.DEEP.format(models="`A_2020_a.R` (a)")
+        branch = "## S\n\n" + self.DEEP.format(models="`A_2020_a.R` (a), `N_2021_n.R` (n)")
+        headings = u.headings_of(base)
+        union = u.collect_entries(base, [(branch, u.entry_map(base, headings))], headings)
+        assert u.emit_merged(base, union).text == branch
+
+    def test_the_restore_puts_the_whole_block_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        deep = self.DEEP.format(models="`D_2020_d.R` (d)")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER})
+        push_task_branch(repo, "claude/adds", {REGISTER: BASE_REGISTER + "\n" + deep}, "Add D")
+        zap = BASE_REGISTER + "\n### ZAP (**canonical for zap**)\n"
+        push_task_branch(repo, "claude/zap", {REGISTER: zap}, "Register ZAP")
+        wt = consolidate(repo, ["origin/claude/adds", "origin/claude/zap"], CONSOLIDATION)
+        assert (wt / REGISTER).read_text() == zap, "the fixture lost nothing"
+        proc = run_helper("restore_dropped_sections.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (wt / REGISTER).read_text() == zap + "\n" + deep
+
+
 class TestUnionFindsAFieldUnderAnyOfItsHeadingsNames:
     """A field is the canonical's, whatever its heading says about it. When
     one branch adds a name to a heading, reorders its names or rewords its

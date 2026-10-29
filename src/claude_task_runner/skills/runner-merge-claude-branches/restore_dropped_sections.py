@@ -82,38 +82,18 @@ def fail(message: str) -> int:
 
 def blocks(text: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
     """Map every canonical name -> (parent ``## section``, block text, the
-    names its heading declares, in order).
+    names its heading declares, in order), read by the dedup's parser: a
+    block runs to the next ``##`` or ``###`` heading.
 
     A multi-name header (``### fm_a, fm_b, fm_c``) contributes one entry per
-    name so that "is this canonical present?" is answered correctly; the
-    owning name is the first, which is what insertion keys on.
+    name so that "is this canonical present?" is answered correctly.
     """
     found: dict[str, tuple[str, str, tuple[str, ...]]] = {}
-    section = ""
     lines = text.splitlines(keepends=True)
-    i = 0
-    while i < len(lines):
-        sec = SECTION_RE.match(lines[i])
-        if sec:
-            section = sec.group(1)
-            i += 1
-            continue
-        heading = lines[i][4:].strip() if lines[i].startswith("### ") else ""
-        if not heading:
-            i += 1
-            continue
-        start = i
-        i += 1
-        while i < len(lines) and not (
-            lines[i].startswith("### ") or lines[i].startswith("## ") or lines[i].startswith("# ")
-        ):
-            i += 1
-        names = register.heading_names(heading)[0]
-        block = "".join(lines[start:i]).rstrip("\n") + "\n"
+    heads, bounds = register._parse(lines)
+    for start, names, section in heads:
+        block = "".join(lines[start : register._block_end(start, bounds)]).rstrip("\n") + "\n"
         for nm in names:
-            # Key every name a multi-name header declares, so presence checks
-            # answer correctly for `### fm_a, fm_b, fm_c`. The first name owns
-            # the block for insertion purposes.
             found.setdefault(nm, (section, block, names))
     return found
 
@@ -132,7 +112,7 @@ def insert(text: str, section: str, block: str) -> str:
         return text + f"{tail}\n## {section}\n\n{block}"
     end = len(lines)
     for idx in range(sec_start + 1, len(lines)):
-        if SECTION_RE.match(lines[idx]) or lines[idx].startswith("# "):
+        if SECTION_RE.match(lines[idx]):
             end = idx
             break
     while end > sec_start + 1 and not lines[end - 1].strip():
