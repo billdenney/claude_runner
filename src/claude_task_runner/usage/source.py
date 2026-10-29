@@ -74,7 +74,9 @@ class ClaudeUsageSource:
             claude_config_dir=self._claude_config_dir,
         )
         reading = parser_mod.parse(raw, self._clock.now(), self._clock)
-        return reading.model_copy(update={"capture_path": str(cap_path)})
+        # None when the forensics .cap could not be written.
+        path = str(cap_path) if cap_path is not None else None
+        return reading.model_copy(update={"capture_path": path})
 
 
 class ApiThenTtyUsageSource:

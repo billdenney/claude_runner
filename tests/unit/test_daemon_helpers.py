@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,6 +44,10 @@ from claude_task_runner.usage.drift import (
     UsageFormatDrift,
 )
 from claude_task_runner.usage.models import UsageReading, WindowReading
+from claude_task_runner.usage.multi_account_source import (
+    MultiAccountSourceError,
+    MultiAccountUsageSource,
+)
 from claude_task_runner.usage.source import FakeUsageSource
 
 # ---------------------------------------------------------------------------
@@ -100,6 +105,47 @@ def test_safe_poll_spawn_error_returned_not_raised() -> None:
     src.read.side_effect = spawn
     result = safe_poll(src)
     assert result is spawn
+
+
+def test_safe_poll_turns_an_oserror_into_a_spawn_error(caplog: pytest.LogCaptureFixture) -> None:
+    """An OSError the capture did not wrap skips the tick like a capture that
+    could not start, instead of escaping and ending the supervisor loop."""
+    error = OSError(24, "Too many open files")
+    src = MagicMock(spec=FakeUsageSource)
+    src.read.side_effect = error
+    with caplog.at_level("ERROR", logger="claude_task_runner.supervisor.daemon"):
+        result = safe_poll(src)
+    assert type(result) is UsageCaptureSpawnError
+    assert str(result) == "usage capture failed: [Errno 24] Too many open files"
+    assert [r.getMessage() for r in caplog.records] == [
+        "usage poll failed: [Errno 24] Too many open files"
+    ]
+    assert caplog.records[0].exc_info is not None
+
+
+def test_safe_poll_keeps_the_account_an_oserror_came_from() -> None:
+    """The multi-account source names the account it polled; the spawn error
+    still does, so the failure is booked against that account."""
+    inner = MagicMock(spec=FakeUsageSource)
+    inner.read.side_effect = OSError(5, "out of pty devices")
+    snapshot = SimpleNamespace(accounts={"work": SimpleNamespace(last_capture_at=None)})
+    src = MultiAccountUsageSource({"work": inner}, lambda: snapshot)
+    result = safe_poll(src)
+    assert isinstance(result, UsageCaptureSpawnError)
+    assert isinstance(result, MultiAccountSourceError)
+    assert result.account == "work"
+    assert str(result) == (
+        "account 'work' usage capture failed: usage capture failed: [Errno 5] out of pty devices"
+    )
+
+
+def test_safe_poll_lets_other_exceptions_through() -> None:
+    """Only OSError is an environment failure; anything else is a bug and
+    still stops the loop loudly."""
+    src = MagicMock(spec=FakeUsageSource)
+    src.read.side_effect = KeyError("bug")
+    with pytest.raises(KeyError):
+        safe_poll(src)
 
 
 # ---------------------------------------------------------------------------
