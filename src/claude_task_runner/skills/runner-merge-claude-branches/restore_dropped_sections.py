@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -68,11 +67,6 @@ NAME_INTRO = (
 )
 
 SECTION_RE = re.compile(r"^## +(.*?)\s*$")
-
-
-def git(args: list[str], cwd: Path) -> str:
-    out = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
-    return out.stdout if out.returncode == 0 else ""
 
 
 def fail(message: str) -> int:
@@ -168,7 +162,7 @@ def main() -> int:
         print(f"{args.file} not present on {args.branch}; nothing to do")
         return 0
 
-    base_blocks = blocks(git(["show", f"{args.base}:{args.file}"], repo))
+    base_blocks = blocks(merge_set.read_file(repo, args.base, args.file) or "")
     merged_text = target.read_text()
     merged_blocks = blocks(merged_text)
 
@@ -216,11 +210,11 @@ def main() -> int:
     #         exists to repair, and must not be mistaken for a deliberate one.
     #         Testing "present at any merge commit" gets this backwards.
     deliberately_removed: set[str] = set()
-    for sha in git(
-        ["rev-list", "--no-merges", f"{args.base}..{args.branch}", "--", args.file], repo
+    for sha in merge_set.git(
+        repo, "rev-list", "--no-merges", f"{args.base}..{args.branch}", "--", args.file
     ).split():
-        after = blocks(git(["show", f"{sha}:{args.file}"], repo))
-        before = blocks(git(["show", f"{sha}^:{args.file}"], repo))
+        after = blocks(merge_set.read_file(repo, sha, args.file) or "")
+        before = blocks(merge_set.read_file(repo, f"{sha}^", args.file) or "")
         deliberately_removed.update(set(before) - set(after))
 
     found = merge_set.compute(repo, args.branch, args.base, refs)

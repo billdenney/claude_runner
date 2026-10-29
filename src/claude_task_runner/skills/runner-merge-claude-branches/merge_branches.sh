@@ -228,6 +228,17 @@ run_dedup() {  # <register> [flags]: fix duplicates, their differing wording to 
     || die 5 "dedup_canonical_headers.py crashed on $file (exit $?); see its output above."
 }
 
+check_dedup() {  # <register> [flags]: dedup --check; exit 1 is the verdict, any other a crash
+  local file=$1 rc=0
+  shift
+  "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" "$@" --check "$file" || rc=$?
+  if (( rc == 1 )); then
+    die 5 "duplicate canonical headers remain in $file."
+  elif (( rc != 0 )); then
+    die 5 "dedup_canonical_headers.py could not run on $file (exit $rc)."
+  fi
+}
+
 check_no_duplicates() {  # gate: no duplicate canonical remains in any register
   local reg scope
   for reg in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
@@ -235,8 +246,7 @@ check_no_duplicates() {  # gate: no duplicate canonical remains in any register
     scope=()
     if [[ "$reg" == "$UNION_FILE" ]]; then scope=(--global); fi
     if [[ -f "$reg" ]]; then
-      "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" ${scope[@]+"${scope[@]}"} --check "$reg" \
-        || die 5 "duplicate canonical headers remain in $reg."
+      check_dedup "$reg" ${scope[@]+"${scope[@]}"}
     elif git cat-file -e "$BASE:$reg" 2>/dev/null; then
       die 5 "$reg is on $BASE but missing from the worktree; restore it before the push."
     else
@@ -873,9 +883,7 @@ hand-union report, for a hand union before the push." >/dev/null
   else
     echo "    no duplicate canonical headers."
   fi
-  if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --global --check "$UNION_FILE"; then
-    die 5 "duplicate canonical headers remain in $UNION_FILE after dedup."
-  fi
+  check_dedup "$UNION_FILE" --global
 fi
 
 # Dedup the OTHER register files too. The step above only sweeps $UNION_FILE,
@@ -899,9 +907,7 @@ for reg in "${REGISTER_FILES[@]:-}"; do
     git commit -m "Dedup duplicate canonical headers in $reg" >/dev/null
     echo "    committed dedup of $reg"
   fi
-  if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$reg"; then
-    die 5 "duplicate canonicals remain in $reg after dedup."
-  fi
+  check_dedup "$reg"
 done
 
 # Restore whole `### CANONICAL` blocks that -X theirs dropped. The union-merger
@@ -949,9 +955,7 @@ if (( ${#RESTORE_TARGETS[@]} )); then
       git commit -m "Dedup duplicate canonical headers in $rf" >/dev/null
       echo "    deduped headers in $rf"
     fi
-    if ! "$PYTHON3" "$SCRIPT_DIR/dedup_canonical_headers.py" --check "$rf" >/dev/null; then
-      die 5 "duplicate canonical headers remain in $rf after dedup."
-    fi
+    check_dedup "$rf"
   done
 fi
 

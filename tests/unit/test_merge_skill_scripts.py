@@ -553,6 +553,19 @@ class TestMergeBranches:
             f"ERROR: verify_branch_contributions.sh could not run on {REGISTER} (exit 2).\n"
         )
 
+    def test_a_dedup_check_that_crashes_could_not_run(self, repo: Path, tmp_path: Path) -> None:
+        """Exit 2 from the dedup's --check is a crash, not "duplicates remain"."""
+        crash = (
+            '#!/bin/bash\ncase "$*" in *dedup_canonical_headers.py*--check*) exit 2 ;; esac\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"python3": crash}))
+        proc = self._full_run(repo, env, "--skip-vignettes")
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        assert proc.stderr.endswith(
+            f"ERROR: dedup_canonical_headers.py could not run on {REGISTER} (exit 2).\n"
+        )
+
     @pytest.mark.parametrize("accept", [False, True], ids=["stops", "accepted"])
     def test_a_loss_the_repairs_cannot_fix_stops_the_run_unless_accepted(
         self, repo: Path, tmp_path: Path, accept: bool
@@ -1565,6 +1578,16 @@ def _sha(repo: Path, ref: str) -> str:
 
 class TestMergeSet:
     """merge_set.py decides, for every helper, which refs a consolidation merged."""
+
+    def test_read_file_tells_an_absent_path_from_an_unreadable_one(self, repo: Path) -> None:
+        """No such file is None; a file the commit has whose blob cannot be read
+        is a GitError, not an empty or absent file."""
+        ms = load_helper("merge_set")
+        assert ms.read_file(repo, "main", "no/such/file.md") is None
+        blob = git(repo, "rev-parse", f"main:{REGISTER}").strip()
+        (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        with pytest.raises(ms.GitError, match=f"cat-file blob main:{REGISTER} failed"):
+            ms.read_file(repo, "main", REGISTER)
 
     def test_prints_each_member_with_its_merged_commit_and_fork_point(
         self, shared_repo: Path
@@ -2588,6 +2611,16 @@ class TestDedupCanonicalHeaders:
             0,
             f"# clean (no per-##-section duplicate canonicals): {register}\n",
         )
+
+    @pytest.mark.parametrize("check", [True, False], ids=["--check", "fix"])
+    def test_a_crash_exits_2_not_the_duplicates_verdict(self, check: bool, tmp_path: Path) -> None:
+        """A register it cannot read (not UTF-8) is a crash, exit 2, which no
+        caller can take for --check's exit 1, "duplicates remain"."""
+        register = tmp_path / "register.md"
+        register.write_bytes(b"## S\n\n### \xff (**x**)\n")
+        proc = run_helper("dedup_canonical_headers.py", *(["--check"] if check else []), register)
+        assert (proc.returncode, proc.stdout) == (2, "")
+        assert "UnicodeDecodeError" in proc.stderr
 
     @pytest.mark.parametrize("check", [True, False], ids=["--check", "fix"])
     def test_a_missing_file_is_an_error_and_nothing_is_edited(

@@ -516,6 +516,19 @@ def test_a_reworded_base_canonical_is_never_a_copy(repo: Path) -> None:
     )
 
 
+def test_an_unreadable_base_is_an_error_not_an_empty_register(repo: Path) -> None:
+    """A base whose register cannot be read stops the restore with exit 2:
+    read as empty, every name the base has would look added by a branch."""
+    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", "ADDED"], "adds one")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    blob = git(repo, "rev-parse", f"main:{REGISTER}").strip()
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    rc, out = run(repo, "consolidation")
+    assert rc == 2, out
+    assert f"GitError: git cat-file blob main:{REGISTER} failed" in out, out
+
+
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
     """A restored multi-name heading's other names count as present: none is
     reported as dropped from a heading the restore put back."""

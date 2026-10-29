@@ -113,11 +113,11 @@ def merge_base(repo: Path, one: str, other: str) -> str | None:
 
 
 def read_file(repo: Path, commit: str, path: str) -> str | None:
-    """``path`` as of ``commit``, or None when that commit has no such file."""
-    probe = _run(repo, ["cat-file", "-e", f"{commit}:{path}"])
-    if probe.returncode != 0:
-        if not resolves(repo, commit):
-            raise GitError(f"{commit!r} does not resolve to a commit in {repo}")
+    """``path`` as of ``commit``, or None when that commit has no such file.
+
+    The probe reads the commit's tree only, so a file the tree lists whose
+    blob cannot be read is a GitError, not an absent file."""
+    if blob_id(repo, commit, path) is None:
         return None
     return git(repo, "cat-file", "blob", f"{commit}:{path}")
 

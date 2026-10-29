@@ -73,7 +73,8 @@ Modes:
   --check     report duplicates and exit 1 if any remain (a merge gate);
               exit 0 when clean. Makes no edits.
 Either mode exits 2, before touching any file, when a named file does not
-exist: a gate must not pass on a path it never read.
+exist: a gate must not pass on a path it never read. A crash (a register that
+is not UTF-8, say) exits 2 too, never 1, which --check gives for duplicates.
 
 Usage:
     python3 dedup_canonical_headers.py <file.md> [<file2.md> ...]
@@ -89,6 +90,7 @@ import itertools
 import os
 import re
 import sys
+import traceback
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -959,4 +961,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Exception:
+        # Exit 1 is --check's "duplicates remain"; a crash must not read as it.
+        traceback.print_exc()
+        raise SystemExit(2) from None
