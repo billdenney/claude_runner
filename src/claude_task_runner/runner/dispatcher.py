@@ -536,11 +536,12 @@ def _pid_alive(pid: int) -> bool:
     treated as alive so the adopt monitor doesn't finalize a worker
     prematurely on a transient probe failure (ADR-0025).
 
-    A pid no worker can have, 1 or less or this process's own, is refused
-    by :mod:`claude_task_runner.process_signals` and reported dead: probing
+    A pid no worker can have, 1 or less, this process's own, or above
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, is refused by
+    :mod:`claude_task_runner.process_signals` and reported dead: probing
     pid 1 fails with EPERM, which would otherwise read as a live worker
     and lead the reapers to signal its process group, every process the
-    user owns.
+    user owns, and ``os.kill`` raises ``OverflowError`` above ``PID_T_MAX``.
     """
     try:
         process_signals.kill(pid, 0)

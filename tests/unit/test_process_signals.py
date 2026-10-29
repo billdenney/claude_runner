@@ -321,8 +321,8 @@ def test_pid_alive_reports_a_pid_of_one_or_less_dead(sent: Recorder, pid: int) -
 
 @pytest.mark.parametrize("pid", OUT_OF_RANGE)
 def test_pid_alive_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) -> None:
-    """``os.kill`` raises ``OverflowError`` here, which no ``except OSError``
-    around a probe catches: supervisor startup crashed on one."""
+    """A pid above PID_T_MAX is refused before ``os.kill``, which would raise
+    ``OverflowError`` (not an ``OSError``) for it, and reported dead."""
     assert dispatcher_mod._pid_alive(pid) is False
     assert sent.calls == []
 

@@ -510,9 +510,8 @@ def test_log_written_at_is_the_log_mtime(tmp_path: Path) -> None:
 def test_a_log_mtime_no_datetime_can_hold_is_no_sign_of_life(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """tmpfs stores an mtime past year 9999 as given, and turning it into a
-    datetime raised out of the startup reaper. It counts as no sign of
-    life, with a WARNING."""
+    """tmpfs stores an mtime past year 9999 as given. No datetime can hold
+    it, so it counts as no sign of life, with a WARNING."""
     log = tmp_path / "attempt-1.stream.jsonl"
     log.write_text("{}\n")
     real_stat = os.stat

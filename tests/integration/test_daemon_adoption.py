@@ -13,9 +13,8 @@ Covers the wiring (not ``adopt_worker``'s own logic — that's in
   worker's task is demoted (the legacy behaviour), and a live one's is
   parked ``possibly_hung``, so no second worker is dispatched beside it;
 * a worker that exited while no supervisor ran, leaving a terminal
-  ``result`` event in its log, is recorded from the log (the 2026-09-26
-  restart incident) whatever its heartbeat age; one that left no result
-  event is still demoted, as before;
+  ``result`` event in its log, is recorded from the log whatever its
+  heartbeat age; one that left no result event is still demoted;
 * against real worker processes and the host's ``/proc`` (the 2026-10-16
   restart incident): a worker in a long tool call, whose agent heartbeat
   is minutes old, is adopted and finalized from its log; one with no sign
@@ -233,7 +232,7 @@ def test_daemon_kill_switch_adopts_nothing(
 
 
 # ---------------------------------------------------------------------------
-# A worker that exited while no supervisor ran (2026-09-26 restart incident)
+# A worker that exited while no supervisor ran
 # ---------------------------------------------------------------------------
 
 _EXITED_PID = 4101117
@@ -295,12 +294,11 @@ def _seed_exited(qd: Path, task_id: str, lines: list[str], *, heartbeat_age: tim
 @pytest.mark.parametrize(
     "heartbeat_age",
     [
-        # The incident: the new supervisor started ~70 s after the old one
-        # stopped, inside the 300 s alert window, so reconcile_orphans
-        # demoted the finished task to failed for a re-dispatch.
+        # Inside the 300 s alert window, where reconcile_orphans would
+        # demote an unrecorded task to failed for a re-dispatch.
         pytest.param(timedelta(seconds=70), id="restart-inside-alert-window"),
-        # A longer gap: the silent-orphan reaper would park the finished
-        # task possibly_hung for the operator instead.
+        # Past it, where the silent-orphan reaper would park it
+        # possibly_hung for the operator.
         pytest.param(timedelta(hours=1), id="restart-past-alert-window"),
     ],
 )

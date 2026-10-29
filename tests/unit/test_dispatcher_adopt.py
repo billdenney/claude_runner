@@ -422,10 +422,10 @@ def _set_mtime(path: Path, when: datetime) -> None:
 
 
 def test_finalize_exited_success_result_completes(queue_dir: Path) -> None:
-    """The 2026-09-26 restart incident: the worker finished in the restart
-    gap and its log ends in a success result. It is recorded as completed
-    with one RunRecord, the session id from the log and the account passed
-    in. ``finished_at`` is the log's last write, not the restart."""
+    """The worker finished in the restart gap and its log ends in a success
+    result. It is recorded as completed with one RunRecord, the session id
+    from the log and the account passed in. ``finished_at`` is the log's
+    last write, not the restart."""
     task = Task(id="020-exited-ok", title="t", prompt="p", working_dir=None)
     log = _attempt_log(queue_dir, task.id)
     _write_log(log, [_init_line("sess-exited"), _assistant_line(), _result_line("end_turn")])

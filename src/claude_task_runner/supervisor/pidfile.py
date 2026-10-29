@@ -124,11 +124,12 @@ def read_existing_pid(path: Path) -> int | None:
 def is_pid_alive(pid: int) -> bool:
     """Cheap liveness check via a signal-0 probe.
 
-    A pid no supervisor can have, 1 or less or the caller's own, is
-    refused by :mod:`claude_task_runner.process_signals`, logged at ERROR
-    and reported dead. Probing pid 1 fails with EPERM, so a PID file
-    holding ``1`` used to read as a live supervisor, and ``supervisor
-    stop`` would then signal init.
+    A pid no supervisor can have, 1 or less, the caller's own, or above
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, is refused by
+    :mod:`claude_task_runner.process_signals`, logged at ERROR and reported
+    dead. Probing pid 1 fails with EPERM, which would read a PID file
+    holding ``1`` as a live supervisor that ``supervisor stop`` then
+    signals.
     """
     try:
         process_signals.kill(pid, 0)
