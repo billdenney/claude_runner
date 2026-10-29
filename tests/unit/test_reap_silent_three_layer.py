@@ -594,16 +594,18 @@ def test_the_walk_leaves_out_an_mtime_no_datetime_can_hold(
     far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The newest usable mtime wins, not the stray's: as the maximum it
-    would hide every other file. One WARNING names the count and a path."""
+    would hide every other file. One WARNING names the count and a path;
+    the reaper walks the tree on every pass, and the next walk adds none."""
     recent_at = _now() - timedelta(seconds=60)
     work, stray = _mixed_tree(far_future_mtime_dir, recent_at)
 
     with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
-        assert _latest_mtime_in_tree(work) == recent_at.timestamp()
+        walks = [_latest_mtime_in_tree(work), _latest_mtime_in_tree(work)]
 
+    assert walks == [recent_at.timestamp(), recent_at.timestamp()]
     assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
-        f"silent-orphan reaper: left out 1 file(s) under {work} whose mtime no "
-        f"datetime can hold, e.g. {stray}"
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {stray}; each such file is reported once"
     ]
 
 

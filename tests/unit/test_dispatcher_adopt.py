@@ -35,7 +35,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -717,31 +716,34 @@ def test_log_finished_at_clamps_to_the_attempt(
     assert got == expected
 
 
-@pytest.mark.parametrize("timestamp", [253402300800.0, 1e20], ids=["year-10000", "past-time_t"])
+@pytest.mark.parametrize(
+    ("timestamp", "reason"),
+    [
+        pytest.param(253402300800.0, "year 10000 is out of range", id="year-10000"),
+        pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
+    ],
+)
 def test_log_finished_at_dates_an_out_of_range_mtime_now(
-    caplog: pytest.LogCaptureFixture, timestamp: float
+    tmp_path: Path,
+    stub_mtime: Callable[[Path, float], None],
+    caplog: pytest.LogCaptureFixture,
+    timestamp: float,
+    reason: str,
 ) -> None:
     """tmpfs stores an mtime past year 9999 as given. No datetime can hold
     it, so the finish is dated now, as any mtime after now is, with a
-    WARNING like the reaper's for the same mtime."""
+    WARNING."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    stub_mtime(log, timestamp)
 
-    class _Log:
-        def stat(self) -> SimpleNamespace:
-            return SimpleNamespace(st_mtime=timestamp)
-
-        def __str__(self) -> str:
-            return "attempt-1.stream.jsonl"
-
-    with caplog.at_level("WARNING", logger="claude_task_runner.runner.dispatcher"):
-        got = dispatcher_mod._log_finished_at(_Log(), started_at=_STARTED, now=_RESTART)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
+        got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
 
     assert got == _RESTART
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == 1
-    assert warnings[0].startswith(
-        f"worker log attempt-1.stream.jsonl has an mtime out of range (timestamp {timestamp!r} "
-    )
-    assert warnings[0].endswith("); dating the run at now")
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"{log} has an mtime no datetime can hold (timestamp {timestamp!r} is out of range: "
+        f"{reason}); dating the run that wrote it at now"
+    ]
 
 
 # ---------------------------------------------------------------------------

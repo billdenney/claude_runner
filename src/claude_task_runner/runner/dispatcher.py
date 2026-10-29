@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import IO
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
+from claude_task_runner.clock import Clock, utc_from_timestamp
 from claude_task_runner.config.linux_user import current_username as _resolve_self_user
 from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
@@ -68,6 +68,7 @@ from claude_task_runner.config.schema import (
     HookSettings,
     TaskCapsSettings,
 )
+from claude_task_runner.file_mtime import file_mtime_utc
 from claude_task_runner.queue.schema import (
     RunRecord,
     Task,
@@ -2601,16 +2602,8 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
     can't be stat'ed, and for an mtime no datetime can hold (past year
     9999, which tmpfs stores as given), as for any mtime after ``now``.
     """
-    try:
-        raw_mtime = log_path.stat().st_mtime
-    except OSError:
-        return now
-    try:
-        mtime = utc_from_timestamp(raw_mtime)
-    except TimestampOutOfRange as exc:
-        logger.warning(
-            "worker log %s has an mtime out of range (%s); dating the run at now", log_path, exc
-        )
+    mtime = file_mtime_utc(log_path, consequence="dating the run that wrote it at now")
+    if mtime is None:
         return now
     return max(started_at, min(mtime, now))
 

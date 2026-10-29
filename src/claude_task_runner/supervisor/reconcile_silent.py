@@ -196,6 +196,7 @@ from typing import Literal
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.schema import TaskCapsSettings
+from claude_task_runner.file_mtime import file_mtime_utc, report_once
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
@@ -391,9 +392,11 @@ def _latest_mtime_in_tree(
     file deletion) are swallowed silently — the caller should treat
     ``None`` as "no observable activity" and proceed accordingly.
 
-    An entry whose mtime :func:`_usable_mtime` rejects is left out, with
-    one WARNING per walk: as the maximum it would hide every other file's
-    activity.
+    An entry whose mtime :func:`_usable_mtime` rejects is left out: as
+    the maximum it would hide every other file's activity. A directory left
+    out is still walked. One WARNING per walk counts the entries
+    :func:`~claude_task_runner.file_mtime.report_once` has not seen before
+    and names one, so each is reported once per process.
     """
     try:
         if not root.exists() or not root.is_dir():
@@ -402,10 +405,11 @@ def _latest_mtime_in_tree(
         return None
 
     latest: float | None = None
-    unusable: list[str] = []
+    unreported = 0
+    example: str | None = None
 
     def _walk(current: Path, depth: int) -> None:
-        nonlocal latest
+        nonlocal latest, unreported, example
         if depth > max_depth:
             return
         try:
@@ -423,20 +427,22 @@ def _latest_mtime_in_tree(
                 continue
             mtime = stat.st_mtime
             if not _usable_mtime(mtime):
-                unusable.append(entry.path)
+                if report_once(entry.path, mtime):
+                    unreported += 1
+                    example = example or entry.path
             elif latest is None or mtime > latest:
                 latest = mtime
             if entry.is_dir(follow_symlinks=False):
                 _walk(Path(entry.path), depth + 1)
 
     _walk(root, depth=0)
-    if unusable:
+    if unreported:
         logger.warning(
-            "silent-orphan reaper: left out %d file(s) under %s whose mtime no "
-            "datetime can hold, e.g. %s",
-            len(unusable),
+            "silent-orphan reaper: leaving out %d file(s) under %s whose mtime no "
+            "datetime can hold, e.g. %s; each such file is reported once",
+            unreported,
             root,
-            unusable[0],
+            example,
         )
     return latest
 
@@ -996,26 +1002,18 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
 def _log_written_at(state: TaskState) -> datetime | None:
     """When the worker last wrote its stream log, or ``None`` with no log.
 
-    Also ``None``, with a WARNING, for an mtime no datetime can hold (past
-    year 9999, which tmpfs stores as given): that is no sign of life.
+    Also ``None``, with a WARNING the first time, for an mtime no datetime
+    can hold (past year 9999, which tmpfs stores as given): that is no sign
+    of life.
     """
     if state.log_path is None:
         return None
-    try:
-        mtime = os.stat(state.log_path).st_mtime
-    except OSError:
-        return None
-    try:
-        return utc_from_timestamp(mtime)
-    except TimestampOutOfRange as exc:
-        logger.warning(
-            "silent-orphan reaper: %s: worker log %s has an mtime out of range (%s); "
-            "not counting it as a sign of life",
-            state.task_id,
-            state.log_path,
-            exc,
-        )
-        return None
+    return file_mtime_utc(
+        state.log_path,
+        consequence=(
+            f"the silent-orphan reaper does not count it as a sign of life for {state.task_id}"
+        ),
+    )
 
 
 def _sign_of_life_fresh(liveness: _Liveness, settings: TaskCapsSettings, now: datetime) -> bool:

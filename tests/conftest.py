@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -93,6 +94,24 @@ def far_future_mtime_dir() -> Iterator[Path]:
         yield root
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def stub_mtime(monkeypatch: pytest.MonkeyPatch) -> Callable[[Path, float], None]:
+    """Arm ``os.stat`` to report ``mtime`` for one path, for an mtime no
+    filesystem stores (past ``time_t``, say) or where tmpfs is missing.
+    Every other path is stat'ed as usual."""
+    real_stat = os.stat
+
+    def _arm(path: Path, mtime: float) -> None:
+        def _stat(target: Any, *args: Any, **kwargs: Any) -> Any:
+            if os.fspath(target) == os.fspath(path):
+                return SimpleNamespace(st_mtime=mtime)
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", _stat)
+
+    return _arm
 
 
 @pytest.fixture
