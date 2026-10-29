@@ -100,7 +100,8 @@
 #                           gates again on the worktree's branch, run every R
 #                           step the run did not complete, push, and print the
 #                           PR text. Takes the run's --repo and
-#                           --branch-name (every stop prints them) and reads
+#                           --branch-name (every stop --finish can complete
+#                           prints them, with any vignette settings) and reads
 #                           the run's other inputs -- --base, --pattern,
 #                           --extra-ref, --union-file and the register files
 #                           -- from the worktree, refusing a conflicting one
@@ -257,7 +258,7 @@ interrupted() {  # <status>: INT/TERM; says how to complete the run when --finis
       echo
       echo "Interrupted. The repairs had completed: commit or discard any partial output"
       echo "in $WT_ABS, then run"
-      echo "     $(finish_command)"
+      echo "     $(finish_command)$(given_flags)"
     } >&2
   fi
   exit "$1"
@@ -435,6 +436,13 @@ read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given 
   done
 }
 
+given_flags() {  # the --finish flags given here, for a command printed to resume this one
+  local flags=""
+  if (( HAND_UNION_DONE )); then flags+=" --hand-union-done"; fi
+  if (( ACCEPT_VERIFIER_LOSSES )); then flags+=" --accept-verifier-losses"; fi
+  echo "$flags"
+}
+
 join_paths() {  # <path>...: one line, ", " between
   local joined="" path
   for path in "$@"; do joined+="${joined:+, }$path"; done
@@ -597,7 +605,7 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
     if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
       {
         echo "ERROR: push failed. Fix the remote or the network, then run"
-        echo "     $(finish_command)"
+        echo "     $(finish_command)$(given_flags)"
       } >&2
       exit 7
     fi
@@ -716,9 +724,22 @@ EOF
 }
 
 run_regen() {  # step 7: regenerate the registry artifacts and commit them
-  local pre_dirty
+  local dirty
   echo
-  pre_dirty="$(git status --porcelain)"
+  # Every earlier step commits its own work and --finish starts from a clean
+  # tree, so anything here now is no step's output, and the regeneration's
+  # commit would take it along.
+  dirty="$(git status --porcelain)"
+  if [[ -n "$dirty" ]]; then
+    {
+      echo "ERROR: the worktree is not clean before the regeneration, whose commit would"
+      echo "  take these along:"
+      printf '%s\n' "$dirty" | sed 's/^/    /'
+      echo "  Commit what belongs on the branch and discard the rest in $WT_ABS, then run"
+      echo "     $(finish_command)"
+    } >&2
+    exit 5
+  fi
   echo "==> Regenerating registry artifacts (Rscript)"
   if ! Rscript -e '
     suppressPackageStartupMessages(library(devtools))
@@ -743,27 +764,12 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
     exit 5
   fi
 
-  # Stage whatever the regen actually wrote, not a fixed artifact list: the
-  # package renames its derived artifacts (inst/modeldb.qs2 became
-  # inst/modeldb.rds), and a fixed list would leave a renamed one unstaged.
-  #
-  # Every earlier step commits its own work, so the worktree is clean on entry
-  # here and anything dirty now is regen output.  Assert that rather than
-  # assume it: if the tree was already dirty the operator needs to know, since
-  # `git add -A` would sweep unrelated edits into the regen commit, so only
-  # the artifact paths that exist are staged.
-  if [[ -n "$pre_dirty" ]]; then
-    echo "    WARN: worktree was already dirty before the regen step; staging"
-    echo "          only known artifact paths to avoid committing unrelated edits:"
-    printf '%s\n' "$pre_dirty" | sed 's/^/            /'
-    local known=() path
-    for path in _pkgdown.yml data inst man NAMESPACE; do
-      if [[ -e "$path" ]]; then known+=("$path"); fi
-    done
-    if (( ${#known[@]} )); then git add -A -- "${known[@]}"; fi
-  elif [[ -n "$(git status --porcelain)" ]]; then
-    # status, not diff: a regeneration that only creates files changes no
-    # tracked one.
+  # The tree was clean, so whatever is there now is what the regeneration
+  # wrote: stage all of it, not a fixed artifact list, since the package
+  # renames its derived artifacts (inst/modeldb.qs2 became inst/modeldb.rds).
+  # status, not diff: a regeneration that only creates files changes no
+  # tracked one.
+  if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
   fi
   if ! git diff --staged --quiet; then

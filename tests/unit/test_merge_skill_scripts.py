@@ -1657,6 +1657,29 @@ class TestMergeBranchesHandUnion:
             assert f"\n{line}\n" in done.stdout, line
         assert "still pending" not in done.stdout
 
+    def test_a_stray_file_before_the_regeneration_stops_the_run(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """Every step commits its own work, so a file left in the worktree before
+        the regeneration is no step's output: the run names it and stops
+        rather than commit it with the regenerated artifacts."""
+        stray = (
+            '#!/bin/bash\ncase "$*" in *verify_no_base_reverts.py*) echo x > stray.txt ;; esac\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
+        )
+        env, log, _ = self._r_env(tmp_path)
+        env = {**env, "PATH": f"{_bin_dir(tmp_path, 'pybin', {'python3': stray})}:{env['PATH']}"}
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        assert (
+            "ERROR: the worktree is not clean before the regeneration, whose commit would\n"
+            "  take these along:\n"
+            "    ?? stray.txt\n"
+            f"  Commit what belongs on the branch and discard the rest in {wt}, then run\n"
+        ) in proc.stderr
+        assert not log.exists()
+
     def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")
         assert (proc.returncode, proc.stderr) == (
@@ -1676,7 +1699,7 @@ class TestMergeBranchesHandUnion:
         assert "hand union is still pending" not in done.stderr
         assert done.stderr.endswith(
             "ERROR: push failed. Fix the remote or the network, then run\n"
-            f"     {' '.join(printed[:-1])}\n"
+            f"     {' '.join(printed)}\n"
         )
 
     def test_finish_refuses_a_run_that_stopped_before_its_repairs(
