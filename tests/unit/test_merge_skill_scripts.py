@@ -2948,13 +2948,15 @@ class TestDedupKeepsEveryModelAndWord:
         assert [e.model for e in dd._split_entries(body)[1]] == models
 
     def test_text_is_kept_only_as_whole_words(self, tmp_path: Path) -> None:
-        """ "No" is not kept by "Nothing", nor "word" by "worde.g.": a dropped
-        copy's prose and notes compare on word boundaries."""
+        """ "No" is not kept by "Nothing", "word" by "worde.g.", nor "12 mg" by
+        "112 mg": a dropped copy's prose and notes compare on word boundaries,
+        at both ends."""
         dd = load_helper("dedup_canonical_headers")
-        assert (dd._within("No", "Nothing more"), dd._within("word", "worde.g. x")) == (
-            False,
-            False,
-        )
+        assert (
+            dd._within("No", "Nothing more"),
+            dd._within("word", "worde.g. x"),
+            dd._within("12 mg", "dosed at 112 mg"),
+        ) == (False, False, False)
         assert dd._within("a  b", "x a b, y") is True
         kept = "- **Example models:** `A_2020_a.R` (a). Nothing more is known.\n"
         dropped = "- **Example models:** `A_2020_a.R` (a). No.\n"
@@ -2982,9 +2984,11 @@ class TestDedupKeepsEveryModelAndWord:
         self, tmp_path: Path, kept: str, dropped: str, reported: str
     ) -> None:
         """ "120" is not kept by "1200": a dropped copy's entry notes and
-        source-alias text compare on word boundaries, as its prose does."""
-        proc, _, report = self._dedup(tmp_path, _pair(kept, dropped))
+        source-alias text compare on word boundaries, as its prose does. The
+        kept copy is written unchanged."""
+        proc, out, report = self._dedup(tmp_path, _pair(kept, dropped))
         assert proc.returncode == 0
+        assert out == f"### Q (**canonical for q**)\n{kept}{KEPT_NOTES}"
         assert f"In a dropped copy:\n\n````\n{reported}\n````\n" in report
 
     @pytest.mark.parametrize(
