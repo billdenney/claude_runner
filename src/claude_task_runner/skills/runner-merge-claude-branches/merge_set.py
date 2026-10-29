@@ -117,13 +117,19 @@ def normalise_path(path: str) -> str:
     """``path`` relative to the repository root, as a tree holds it: ``./``
     and doubled ``/`` dropped and ``..`` folded in. A GitError when nothing is
     left, it is absolute or climbs out of the root, it ends in ``/`` (a
-    directory), or it starts with ``:``, which git reads as pathspec magic."""
+    directory), it starts with ``:``, which git reads as pathspec magic, or
+    it is a Windows path (a backslash, or a drive letter), which no tree
+    holds."""
     if not path:
         raise GitError("an empty path names no file")
     if path.startswith(":"):
         raise GitError(f"{path!r} starts with ':', which git reads as pathspec magic")
     if path.endswith("/"):
         raise GitError(f"{path!r} names a directory, not a file")
+    if "\\" in path:
+        raise GitError(f"{path!r} holds a backslash; a path in git's trees uses '/'")
+    if len(path) > 1 and path[1] == ":" and path[0].isascii() and path[0].isalpha():
+        raise GitError(f"{path!r} starts with a drive letter; give it relative to the repository")
     norm = posixpath.normpath(path)
     if path.startswith("/") or norm == ".." or norm.startswith("../"):
         raise GitError(f"{path!r} is outside the repository")

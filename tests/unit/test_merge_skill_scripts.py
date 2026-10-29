@@ -298,6 +298,26 @@ class TestMergeBranches:
         proc = run("bash", MERGE_BRANCHES, "--no-such-flag")
         assert (proc.returncode, proc.stderr) == (2, "unknown arg: --no-such-flag\n")
 
+    @pytest.mark.parametrize(
+        ("flag", "value", "shown"),
+        [
+            ("--union-file", "inst/references/co\tmp.md", "$'inst/references/co\\tmp.md'"),
+            ("--register-file", "inst/references/co\nmp.md", "$'inst/references/co\\nmp.md'"),
+            ("--base", "origin/ma\tin", "$'origin/ma\\tin'"),
+            ("--pattern", "origin/claude/\n*", "$'origin/claude/\\n*'"),
+        ],
+        ids=["union-file-tab", "register-file-newline", "base-tab", "pattern-newline"],
+    )
+    def test_a_tab_or_newline_in_an_input_exits_2(self, flag: str, value: str, shown: str) -> None:
+        """Each input is one line of the recorded inputs, its fields split by
+        tabs: a tab or a newline would cut it short there, and --finish would
+        check a truncated path."""
+        proc = run("bash", MERGE_BRANCHES, flag, value)
+        assert (proc.returncode, proc.stderr) == (
+            2,
+            f"ERROR: {flag} {shown} holds a tab or a newline\n",
+        )
+
     def test_flag_without_a_value_exits_2(self) -> None:
         proc = run("bash", MERGE_BRANCHES, "--repo")
         assert (proc.returncode, proc.stderr) == (2, "ERROR: --repo needs a value\n")
@@ -2337,7 +2357,7 @@ class TestReadFilePaths:
 
     ms = load_helper("merge_set")
 
-    @pytest.mark.parametrize("name", [n for n in NAMES if not n.startswith(":")])
+    @pytest.mark.parametrize("name", [n for n in NAMES if n[0] != ":" and "\\" not in n])
     def test_every_name_reads_as_written(self, odd_names: Path, name: str) -> None:
         assert self.ms.read_file(odd_names, "main", name) == name + "\n"
 
@@ -2377,6 +2397,20 @@ class TestReadFilePaths:
             ("/plain.md", "'/plain.md' is outside the repository"),
             ("sub dir", "sub dir at main is a tree, not a file"),
             ("subm", "subm at main is a commit, not a file"),
+            ("a\\b.md", "'a\\\\b.md' holds a backslash; a path in git's trees uses '/'"),
+            (
+                "inst\\references\\x.md",
+                "'inst\\\\references\\\\x.md' holds a backslash; a path in git's trees uses '/'",
+            ),
+            (
+                "\\\\server\\share\\x.md",
+                "'\\\\\\\\server\\\\share\\\\x.md' holds a backslash; a path in git's trees"
+                " uses '/'",
+            ),
+            (
+                "C:/x/y.md",
+                "'C:/x/y.md' starts with a drive letter; give it relative to the repository",
+            ),
         ],
         ids=[
             "empty",
@@ -2389,6 +2423,10 @@ class TestReadFilePaths:
             "absolute",
             "directory",
             "gitlink",
+            "backslash-name",
+            "windows-path",
+            "unc-path",
+            "drive-letter",
         ],
     )
     def test_a_path_that_names_no_file_is_an_error(

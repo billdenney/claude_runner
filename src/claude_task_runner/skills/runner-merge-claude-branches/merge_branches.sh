@@ -961,6 +961,15 @@ if (( HAND_UNION_DONE && ! FINISH )); then
   die 2 "--hand-union-done goes with --finish"
 fi
 
+# Each input is one line of the recorded inputs (record_inputs), fields split
+# by tabs, so a tab or a newline in one would cut it short there.
+for item in "--base=$BASE" "--pattern=$PATTERN" "--union-file=$UNION_FILE" \
+  "${REGISTER_FILES[@]/#/--register-file=}" "${EXTRA_REFS[@]/#/--extra-ref=}"; do
+  if [[ "$item" == *$'\t'* || "$item" == *$'\n'* ]]; then
+    die 2 "${item%%=*} $(printf '%q' "${item#*=}") holds a tab or a newline"
+  fi
+done
+
 # The same hand-picked refs for every repair and verify step: a step that
 # skips them repairs nothing those branches lost.
 EXTRA_REF_ARGS=()
