@@ -141,6 +141,10 @@ def main() -> int:
     ap.add_argument("--extra-ref", action="append", default=[])
     ap.add_argument("--file", required=True)
     args = ap.parse_args()
+    try:
+        args.file = merge_set.normalise_path(args.file)
+    except merge_set.GitError as err:
+        return fail(f"--file: {err}")
 
     repo = Path(args.repo)
     if not repo.is_dir():

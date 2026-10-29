@@ -138,6 +138,10 @@ def main(argv: list[str]) -> int:
         help="Additional fully-qualified ref to include (repeatable).",
     )
     args = ap.parse_args(argv)
+    try:
+        args.file = merge_set.normalise_path(args.file)
+    except merge_set.GitError as err:
+        return fail(f"--file: {err}")
 
     repo: Path = args.repo
     if not repo.is_dir() or not is_work_tree(repo):

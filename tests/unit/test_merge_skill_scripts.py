@@ -1890,6 +1890,113 @@ def _sha(repo: Path, ref: str) -> str:
     return git(repo, "rev-parse", ref)
 
 
+NAMES = (
+    "plain.md",
+    "with space.md",
+    "new\nline.md",
+    "-dash.md",
+    "--also.md",
+    "tab\tname.md",
+    "gl[ob]*.md",
+    "sub dir/in side.md",
+    ":colon.md",
+    "a\\b.md",
+    "\u00fcn\u00ef.md",
+    'quote".md',
+)
+
+
+@pytest.fixture(scope="module")
+def odd_names(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A repository holding a file under each name in NAMES (its text is its
+    name), a symlink to plain.md, and a gitlink."""
+    repo = tmp_path_factory.mktemp("odd") / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "t@example.com")
+    git(repo, "config", "user.name", "t")
+    for name in NAMES:
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(name + "\n")
+    (repo / "link").symlink_to("plain.md")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "files")
+    head = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{head},subm")
+    git(repo, "commit", "-q", "-m", "gitlink")
+    return repo
+
+
+class TestReadFilePaths:
+    """read_file takes a path relative to the repository root, whatever the
+    directory it runs in, and reads every file name git can hold."""
+
+    ms = load_helper("merge_set")
+
+    @pytest.mark.parametrize("name", [n for n in NAMES if not n.startswith(":")])
+    def test_every_name_reads_as_written(self, odd_names: Path, name: str) -> None:
+        assert self.ms.read_file(odd_names, "main", name) == name + "\n"
+
+    @pytest.mark.parametrize(
+        ("path", "text"),
+        [
+            ("./plain.md", "plain.md\n"),
+            ("sub dir//in side.md", "sub dir/in side.md\n"),
+            ("sub dir/../plain.md", "plain.md\n"),
+            ("link", "plain.md"),
+        ],
+        ids=["dot-slash", "double-slash", "dot-dot-inside", "symlink"],
+    )
+    def test_a_path_is_read_as_git_would_name_it(
+        self, odd_names: Path, path: str, text: str
+    ) -> None:
+        assert self.ms.read_file(odd_names, "main", path) == text
+
+    @pytest.mark.parametrize(
+        "path",
+        ["nope.md", "plain.md/x", "*.md", "plain", "PLAIN.md"],
+        ids=["absent", "through-a-file", "glob", "prefix", "case"],
+    )
+    def test_a_path_the_tree_lacks_is_absent(self, odd_names: Path, path: str) -> None:
+        assert self.ms.read_file(odd_names, "main", path) is None
+
+    @pytest.mark.parametrize(
+        ("path", "message"),
+        [
+            ("", "an empty path names no file"),
+            (".", "'.' names no file"),
+            (":colon.md", "':colon.md' starts with ':', which git reads as pathspec magic"),
+            ("sub dir/", "'sub dir/' names a directory, not a file"),
+            ("plain.md/", "'plain.md/' names a directory, not a file"),
+            ("../plain.md", "'../plain.md' is outside the repository"),
+            ("sub dir/../../plain.md", "'sub dir/../../plain.md' is outside the repository"),
+            ("/plain.md", "'/plain.md' is outside the repository"),
+            ("sub dir", "sub dir at main is a tree, not a file"),
+            ("subm", "subm at main is a commit, not a file"),
+        ],
+        ids=[
+            "empty",
+            "dot",
+            "colon",
+            "dir-slash",
+            "file-slash",
+            "dot-dot",
+            "dot-dot-deep",
+            "absolute",
+            "directory",
+            "gitlink",
+        ],
+    )
+    def test_a_path_that_names_no_file_is_an_error(
+        self, odd_names: Path, path: str, message: str
+    ) -> None:
+        with pytest.raises(self.ms.GitError, match=re.escape(message)):
+            self.ms.read_file(odd_names, "main", path)
+
+    def test_a_root_relative_path_reads_from_a_subdirectory(self, odd_names: Path) -> None:
+        assert self.ms.read_file(odd_names / "sub dir", "main", "plain.md") == "plain.md\n"
+
+
 class TestMergeSet:
     """merge_set.py decides, for every helper, which refs a consolidation merged."""
 
@@ -1915,8 +2022,8 @@ class TestMergeSet:
         ("missing", "message"),
         [
             (f"main:{REGISTER}", "cat-file blob .* failed"),
-            ("main:inst/references", "ls-tree -z main -- .* failed"),
-            ("main^{tree}", "ls-tree -z main -- .* failed"),
+            ("main:inst/references", "ls-tree --full-tree -z main -- .* failed"),
+            ("main^{tree}", "ls-tree --full-tree -z main -- .* failed"),
         ],
         ids=["blob", "subtree", "root-tree"],
     )

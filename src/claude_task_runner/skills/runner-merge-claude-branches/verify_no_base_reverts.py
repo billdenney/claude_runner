@@ -373,6 +373,10 @@ def main(argv: list[str]) -> int:
         help="repo-relative path to a register file to check (repeatable)",
     )
     args = ap.parse_args(argv)
+    try:
+        args.file = [merge_set.normalise_path(path) for path in args.file]
+    except merge_set.GitError as err:
+        return fail(f"--file: {err}")
 
     repo = Path(args.repo)
     if not repo.is_dir():

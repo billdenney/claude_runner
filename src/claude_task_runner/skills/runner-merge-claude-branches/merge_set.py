@@ -42,6 +42,7 @@ matching ``--pattern``, an empty merge set, or a failed git command.
 from __future__ import annotations
 
 import argparse
+import posixpath
 import subprocess
 import sys
 import traceback
@@ -112,9 +113,29 @@ def merge_base(repo: Path, one: str, other: str) -> str | None:
     )
 
 
+def normalise_path(path: str) -> str:
+    """``path`` relative to the repository root, as a tree holds it: ``./``
+    and doubled ``/`` dropped and ``..`` folded in. A GitError when nothing is
+    left, it is absolute or climbs out of the root, it ends in ``/`` (a
+    directory), or it starts with ``:``, which git reads as pathspec magic."""
+    if not path:
+        raise GitError("an empty path names no file")
+    if path.startswith(":"):
+        raise GitError(f"{path!r} starts with ':', which git reads as pathspec magic")
+    if path.endswith("/"):
+        raise GitError(f"{path!r} names a directory, not a file")
+    norm = posixpath.normpath(path)
+    if path.startswith("/") or norm == ".." or norm.startswith("../"):
+        raise GitError(f"{path!r} is outside the repository")
+    if norm == ".":
+        raise GitError(f"{path!r} names no file")
+    return norm
+
+
 def read_file(repo: Path, commit: str, path: str) -> str | None:
     """``path`` as of ``commit``, or None when that commit has no such file; a
     GitError when the file, or a tree on the way to it, cannot be read."""
+    path = normalise_path(path)
     if blob_id(repo, commit, path) is None:
         return None
     return git(repo, "cat-file", "blob", f"{commit}:{path}")
@@ -127,8 +148,13 @@ def blob_id(repo: Path, commit: str, path: str) -> str | None:
     ``git ls-tree`` lists nothing, and exits 0, for a path the commit's tree
     does not have (a path through a file included), and exits non-zero when
     the commit or a tree on the way cannot be read; ``rev-parse`` answers both
-    the same way. A path naming a directory is a GitError too."""
-    for entry in git(repo, "ls-tree", "-z", commit, "--", path).split("\0"):
+    the same way. A path naming a directory is a GitError too, and so is one
+    normalise_path refuses. ``--full-tree`` reads the path from the root
+    whatever directory ``repo`` is, and ``--literal-pathspecs`` reads it as
+    written."""
+    path = normalise_path(path)
+    listed = git(repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-z", commit, "--", path)
+    for entry in listed.split("\0"):
         meta, _, name = entry.partition("\t")
         if name == path:
             _, kind, oid = meta.split()

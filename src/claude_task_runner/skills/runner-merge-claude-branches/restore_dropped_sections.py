@@ -139,6 +139,10 @@ def main() -> int:
         " for a hand union (not with --check)",
     )
     args = ap.parse_args()
+    try:
+        args.file = merge_set.normalise_path(args.file)
+    except merge_set.GitError as err:
+        return fail(f"--file: {err}")
 
     repo = Path(args.repo)
     if not repo.is_dir():

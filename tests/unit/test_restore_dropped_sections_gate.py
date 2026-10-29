@@ -68,7 +68,7 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
-def run(repo: Path, branch: str, base: str = "main") -> tuple[int, str]:
+def run(repo: Path, branch: str, base: str = "main", file: str = REGISTER) -> tuple[int, str]:
     """Exit code and output of a --check run: 1 means something is missing."""
     out = subprocess.run(
         [
@@ -83,7 +83,7 @@ def run(repo: Path, branch: str, base: str = "main") -> tuple[int, str]:
             "--pattern",
             "origin/claude/*",
             "--file",
-            REGISTER,
+            file,
             "--check",
         ],
         capture_output=True,
@@ -165,6 +165,23 @@ def test_genuine_loss_is_still_reported(repo: Path) -> None:
     rc, out = run(repo, "consolidation")
     assert rc == 1, out
     assert "    REALLY_NEW  (## Section A)\n" in out, out
+    assert run(repo, "consolidation", file=f"./{REGISTER}") == (rc, out)
+
+
+@pytest.mark.parametrize(
+    ("file", "message"),
+    [
+        ("../refs.md", "'../refs.md' is outside the repository"),
+        (":refs.md", "':refs.md' starts with ':', which git reads as pathspec magic"),
+        ("refs.md/", "'refs.md/' names a directory, not a file"),
+    ],
+    ids=["outside", "colon", "trailing-slash"],
+)
+def test_a_file_path_that_names_no_file_is_refused(repo: Path, file: str, message: str) -> None:
+    """Refused before anything is read (exit 2): read as absent, it would make
+    the restore check nothing and pass."""
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    assert run(repo, "consolidation", file=file) == (2, f"ERROR: (restore) --file: {message}\n")
 
 
 def merge(repo: Path, name: str) -> None:
