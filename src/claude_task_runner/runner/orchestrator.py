@@ -45,7 +45,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -180,6 +180,7 @@ _SKIP_IN_FLIGHT = "in_flight"
 _SKIP_UNPARSEABLE_STATE = "unparseable_state"
 _SKIP_UNANSWERED_SIDECAR = "unanswered_sidecar"
 _SKIP_DEFERRED_COOLDOWN = "deferred_cooldown"
+_SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE = "next_eligible_at_without_timezone"
 _SKIP_INVALID_EFFORT = "invalid_effort"
 _SKIP_DEPENDS_ON = "depends_on"
 _SKIP_DEPENDS_ON_MISSING = "depends_on_missing"
@@ -1580,6 +1581,21 @@ def _skip_category(
                 # pass it proceeds, otherwise the dispatcher re-parks it
                 # with a fresh cooldown. The cooldown is what keeps a
                 # still-blocked task from being re-picked every tick.
+                retry_at = state.next_eligible_at
+                if retry_at is not None and retry_at.utcoffset() is None:
+                    # A hand edit without an offset. Comparing it with the
+                    # aware clock raises TypeError, which would stop the
+                    # whole selector; guessing a zone could release the task
+                    # hours early or late. Hold just this task until fixed.
+                    logger.error(
+                        "holding task %s: %s: next_eligible_at %s has no timezone; "
+                        "write it in UTC with an offset, e.g. %s",
+                        task.id,
+                        sp,
+                        retry_at,
+                        retry_at.replace(tzinfo=UTC).isoformat(),
+                    )
+                    return _SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE
                 if (
                     now is not None
                     and state.next_eligible_at is not None

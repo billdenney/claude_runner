@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import functools
 import threading
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
@@ -403,6 +404,51 @@ def test_deferred_without_next_eligible_at_is_eligible(queue_dir: Path) -> None:
     _write_task_yaml(queue_dir, task)
     write_state_atomic(
         _make_deferred_state(task.id, None),
+        state_path_for(queue_dir, task.id),
+    )
+    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
+    assert task.id in {t.id for t in eligible}
+
+
+def test_deferred_with_a_timezone_less_next_eligible_at_holds_only_itself(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``next_eligible_at`` written by hand without a timezone cannot be
+    compared with the aware clock. That task is held, with an ERROR that names
+    the file and the field; the rest of the queue still dispatches. Comparing it
+    raised TypeError out of the selector, which stopped dispatch for every task
+    on every tick."""
+    naive = _make_task("t-deferred-naive")
+    ready = _make_task("t-ready")
+    _write_task_yaml(queue_dir, naive)
+    _write_task_yaml(queue_dir, ready)
+    sp = state_path_for(queue_dir, naive.id)
+    write_state_atomic(_make_deferred_state(naive.id, _NOW + dt.timedelta(days=1)), sp)
+    # The hand edit: an operator parks the task with a date and no offset.
+    payload = yaml.safe_load(sp.read_text(encoding="utf-8"))
+    payload["next_eligible_at"] = "2099-01-01T00:00:00"
+    sp.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    skips: Counter[str] = Counter()
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW, skips=skips)
+
+    assert [t.id for t in eligible] == [ready.id]
+    assert skips == Counter({"next_eligible_at_without_timezone": 1})
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [
+        f"holding task {naive.id}: {sp}: next_eligible_at 2099-01-01 00:00:00 has no "
+        "timezone; write it in UTC with an offset, e.g. 2099-01-01T00:00:00+00:00"
+    ]
+
+
+def test_deferred_with_a_non_utc_offset_is_compared_as_written(queue_dir: Path) -> None:
+    """An aware value in another offset still compares correctly, so it is not
+    held: 13:00+02:00 is 11:00 UTC, before ``_NOW`` (12:00 UTC)."""
+    task = _make_task("t-deferred-offset")
+    _write_task_yaml(queue_dir, task)
+    plus_two = dt.timezone(dt.timedelta(hours=2))
+    write_state_atomic(
+        _make_deferred_state(task.id, dt.datetime(2026, 6, 21, 13, 0, tzinfo=plus_two)),
         state_path_for(queue_dir, task.id),
     )
     eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)

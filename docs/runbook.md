@@ -530,6 +530,12 @@ not paused or throttled.
    - `deferred_cooldown` — a `deferred` state whose `next_eligible_at` has
      not passed, whoever wrote it: a pre-dispatch hook deferral or a
      deferral written by hand. See "A task stays `deferred`".
+   - `next_eligible_at_without_timezone` — a `deferred` state whose
+     `next_eligible_at` has no timezone, as a hand edit such as
+     `2099-01-01T00:00:00` does. It cannot be compared with the clock, so the
+     task is held until the value is fixed, and every tick logs an ERROR
+     naming the state file. Timestamps are UTC: write it with an offset, e.g.
+     `2099-01-01T00:00:00+00:00`. Other tasks dispatch as usual.
    - `invalid_effort` — see "A task stays `deferred`".
    - A status name (`possibly_hung`, `running`, `failed_circuit_breaker`,
      `weekly_paused`, ...) — the task's state has that status, which is
