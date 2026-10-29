@@ -301,8 +301,8 @@ record_verifier_losses() {  # <register> <verifier output>: into the hand-union 
 
 stop_for_hand_union() {
   if [[ -s "$VERIFIER_LOSSES" ]]; then
-    local files
-    files="$(paste -sd, "$VERIFIER_LOSSES" | sed 's/,/, /g')"
+    local files="" file
+    while IFS= read -r file; do files+="${files:+, }$file"; done < "$VERIFIER_LOSSES"
     {
       echo
       echo "STOP: every step but the push ran, but the verifier reported a model, header"

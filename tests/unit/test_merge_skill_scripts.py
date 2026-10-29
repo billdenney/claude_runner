@@ -583,14 +583,14 @@ class TestMergeBranches:
             push_task_branch(repo, f"claude/{name}", files, f"Register LKST ({name})")
 
     @staticmethod
-    def _loss_stop(repo: Path, files: str) -> str:
+    def _loss_stop(repo: Path, files: str, finish_extra: str = "") -> str:
         wt = repo / ".worktrees" / CONSOLIDATION
         report = git(
             wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md"
         )
         finish = (
             f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION} --finish"
+            f" --base origin/main --branch-name {CONSOLIDATION}{finish_extra} --finish"
         )
         return (
             "\n"
@@ -698,17 +698,35 @@ class TestMergeBranches:
         assert "    verifier losses accepted (--accept-verifier-losses)\n" in done.stdout
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) != ""
 
+    @pytest.mark.parametrize(
+        ("comp", "flags", "finish_extra"),
+        [
+            ("inst/references/compartment-names.md", (), ""),
+            (
+                "refs/comp,names.md",
+                ("--no-register-files", "--register-file", "refs/comp,names.md"),
+                " --no-register-files --register-file refs/comp\\,names.md",
+            ),
+        ],
+        ids=["default-register", "comma-in-path"],
+    )
     def test_every_register_is_checked_before_the_stop(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        comp: str,
+        flags: tuple[str, ...],
+        finish_extra: str,
     ) -> None:
-        comp = "inst/references/compartment-names.md"
+        """Every register's losses are recorded before the stop, which names
+        each register's path as it is, a comma in it included."""
         repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER, comp: BASE_REGISTER})
         self._lose_lkst(repo, (REGISTER, comp))
         proc = self._full_run(
-            repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes"
+            repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes", *flags
         )
         assert proc.returncode == 9, proc.stdout + proc.stderr
-        assert proc.stderr.endswith(self._loss_stop(repo, f"{REGISTER}, {comp}"))
+        assert proc.stderr.endswith(self._loss_stop(repo, f"{REGISTER}, {comp}", finish_extra))
         wt = repo / ".worktrees" / CONSOLIDATION
         report = git(
             wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md"
