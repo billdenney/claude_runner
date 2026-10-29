@@ -744,7 +744,7 @@ class TestMergeBranches:
         assert done.stderr.endswith(
             "ERROR: the merge reverted register content origin/main has (listed above). Nothing\n"
             f"  was repaired: restore it by hand in {wt} and commit, then run\n"
-            f"     {printed}\n"
+            f"     {printed.removesuffix(' --hand-union-done')}\n"
         )
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
 
@@ -1062,7 +1062,7 @@ class TestMergeBranchesHandUnion:
             "Fix the failing vignettes (or the underlying model .R files, or the\n"
             "validator's setup) and commit, then run\n"
             f"     bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION} --finish --hand-union-done\n"
+            f" --base origin/main --branch-name {CONSOLIDATION} --finish\n"
             "which runs the validation again before the push.\n"
             "\n"
             "NOTE: a hand union is still pending. The wording the register lacks is in\n"
@@ -1219,9 +1219,9 @@ class TestMergeBranchesHandUnion:
         )
         assert log.read_text() == "regen\n"
         finish = _printed_after(proc.stderr, "and commit, then run")
-        assert finish[-2:] == ["--finish", "--hand-union-done"]
+        assert finish[-1] == "--finish"
         (flags / "fail-regen").unlink()
-        done = run(*finish, env=env)
+        done = run(*finish, "--hand-union-done", env=env)
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\ncheck\nvignettes\n"
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) != ""
@@ -1258,7 +1258,12 @@ class TestMergeBranchesHandUnion:
         proc = self._run(hand_repo, "--yes", "--skip-vignettes", env=env)
         assert proc.returncode == 5, proc.stdout + proc.stderr
         (flags / "fail-regen").unlink()
-        done = run(*_printed_after(proc.stderr, "and commit, then run"), "--skip-check", env=env)
+        done = run(
+            *_printed_after(proc.stderr, "and commit, then run"),
+            "--hand-union-done",
+            "--skip-check",
+            env=env,
+        )
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\n"
         assert "    (check: still pending, skipped with --skip-check on --finish)\n" in done.stdout
@@ -1271,13 +1276,35 @@ class TestMergeBranchesHandUnion:
         proc = self._run(hand_repo, "--yes", env=env)
         assert proc.returncode == 5, proc.stdout + proc.stderr
         finish = _printed_after(proc.stderr, "and commit, then run")
-        refused = run(*finish, env=_env_without(tmp_path, "Rscript"))
+        refused = run(*finish, "--hand-union-done", env=_env_without(tmp_path, "Rscript"))
         assert refused.returncode == 3, refused.stdout + refused.stderr
         assert refused.stderr.endswith(
             f"ERROR: Rscript is not on PATH, and these stages are still pending on {CONSOLIDATION}:"
             " regen, check, vignettes. Install R and run --finish again, or add --skip-r-regen"
             " --skip-check --skip-vignettes to push without them.\n"
         )
+        assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
+    def test_a_stop_after_a_gate_does_not_confirm_the_hand_union(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """The vignettes fail with a hand union pending. Their stop prints the
+        bare --finish, so an operator who fixes only the vignette and runs it
+        is stopped at the unconfirmed report (exit 9), not pushed past it."""
+        env, _, flags = self._r_env(tmp_path, fail="vig")
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 8, proc.stdout + proc.stderr
+        finish = _printed_after(proc.stderr, "and commit, then run")
+        assert "--hand-union-done" not in finish
+        (flags / "fail-vig").unlink()
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / "inst").mkdir(exist_ok=True)
+        (wt / "inst" / "fix.txt").write_text("fixed\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "Fix the vignette")
+        refused = run(*finish, env=env)
+        assert refused.returncode == 9, refused.stdout + refused.stderr
+        assert "STOP: the hand-union report above is not empty:\n" in refused.stderr
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
 
     def test_a_regeneration_that_only_creates_files_is_committed(
@@ -1311,7 +1338,8 @@ class TestMergeBranchesHandUnion:
         git(wt, "add", "-A")
         git(wt, "commit", "-qm", "Fix the vignette")
         (flags / "fail-vig").unlink()
-        done = run(*_printed_after(proc.stderr, "and commit, then run"), "--skip-push", env=env)
+        finish = _printed_after(proc.stderr, "and commit, then run")
+        done = run(*finish, "--hand-union-done", "--skip-push", env=env)
         assert done.returncode == 0, done.stdout + done.stderr
         assert "WARN: worktree was already dirty" not in done.stdout
         assert git(wt, "status", "--porcelain") == ""
@@ -1330,7 +1358,7 @@ class TestMergeBranchesHandUnion:
         (flags / "fail-regen").unlink()
         wt = hand_repo / ".worktrees" / CONSOLIDATION
         for _ in range(2):
-            done = run(*finish, "--skip-push", env=env)
+            done = run(*finish, "--hand-union-done", "--skip-push", env=env)
             assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\ncheck\nvignettes\n"
         assert git(wt, "show", "HEAD:man/modeldb.Rd") == "regenerated"

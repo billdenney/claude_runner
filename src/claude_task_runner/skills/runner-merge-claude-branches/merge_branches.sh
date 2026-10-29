@@ -302,13 +302,6 @@ finish_command() {  # this run's --finish command line, every value shell-quoted
   echo "$cmd --finish"
 }
 
-finish_line() {  # the --finish command every message prints: --hand-union-done while the report holds anything
-  local line
-  line="$(finish_command)"
-  if [[ -s "$HAND_UNION_REPORT" ]]; then line+=" --hand-union-done"; fi
-  echo "$line"
-}
-
 join_paths() {  # <path>...: one line, ", " between
   local joined="" path
   for path in "$@"; do joined+="${joined:+, }$path"; done
@@ -418,7 +411,7 @@ revert_check() {  # gate: register content the base has that the merge, or a han
     {
       echo "ERROR: the merge reverted register content $BASE has (listed above). Nothing"
       echo "  was repaired: restore it by hand in $WT_ABS and commit, then run"
-      echo "     $(finish_line)"
+      echo "     $(finish_command)"
     } >&2
     exit 5
   elif (( revert_rc != 0 )); then
@@ -442,7 +435,7 @@ stop_for_hand_union() {
       echo "  2. Then push the branch and print the PR text. --finish runs the checks"
       echo "     again first, and stops while a loss is left unless you add"
       echo "     --accept-verifier-losses:"
-      echo "     $(finish_line)"
+      echo "     $(finish_command) --hand-union-done"
     } >&2
     exit 9
   fi
@@ -456,7 +449,7 @@ stop_for_hand_union() {
     echo "  1. In the worktree $WT_ABS, union that wording into the register"
     echo "     by hand, keeping each source's attribution, and commit."
     echo "  2. Then push the branch and print the PR text:"
-    echo "     $(finish_line)"
+    echo "     $(finish_command) --hand-union-done"
   } >&2
   exit 9
 }
@@ -590,7 +583,7 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
     {
       echo "ERROR: the registry regeneration failed (its last output is above)."
       echo "  Fix it in $WT_ABS and commit, then run"
-      echo "     $(finish_line)"
+      echo "     $(finish_command)"
       echo "  which runs it again, and every later stage still pending, before the push."
     } >&2
     exit 5
@@ -640,7 +633,7 @@ run_check() {  # step 8: the devtools::check gate
   else
     {
       echo "ERROR: devtools::check failed. Fix the failures in $WT_ABS and commit, then run"
-      echo "     $(finish_line)"
+      echo "     $(finish_command)"
       echo "  which runs check again, and the vignettes if still pending, before the push."
     } >&2
     exit 6
@@ -695,7 +688,7 @@ run_vignettes() {  # step 9: every vignette renders
     echo >&2
     echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
     echo "validator's setup) and commit, then run" >&2
-    echo "     $(finish_line)" >&2
+    echo "     $(finish_command)" >&2
     echo "which runs the validation again before the push." >&2
     exit 8
   fi
@@ -834,7 +827,7 @@ if (( FINISH )); then
       echo "    $HAND_UNION_REPORT"
       echo "  Union its wording into the register in $WT_ABS, reconcile any contribution"
       echo "  it lists as missing, and commit, then run"
-      echo "     $(finish_line)"
+      echo "     $(finish_command) --hand-union-done"
     } >&2
     exit 9
   fi
@@ -853,7 +846,7 @@ if (( FINISH )); then
       echo "  branch added missing from $(join_paths "${VERIFY_LOSS_FILES[@]}") (listed above)."
       echo "  Reconcile each by hand in $WT_ABS and commit, then run --finish again; to"
       echo "  push with what is left, accept it:"
-      echo "     $(finish_line) --accept-verifier-losses"
+      echo "     $(finish_command)$( (( HAND_UNION_DONE )) && echo " --hand-union-done") --accept-verifier-losses"
     } >&2
     exit 9
   fi
