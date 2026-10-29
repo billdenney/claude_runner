@@ -45,6 +45,7 @@ from claude_task_runner.supervisor.reconcile_silent import (
     STEADY_SILENT_STOP_REASON,
     ReapResult,
     _latest_mtime_in_tree,
+    _usable_mtime,
     liveness_verdict,
     reap_silent_orphans_tick,
     reconcile_silent_orphans,
@@ -607,6 +608,87 @@ def test_the_walk_leaves_out_an_mtime_no_datetime_can_hold(
         f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
         f"datetime can hold, e.g. {stray}; each such file is reported once"
     ]
+
+
+def _walk_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "claude_task_runner.supervisor.reconcile_silent"
+    ]
+
+
+def test_one_warning_counts_the_strays_a_walk_has_not_reported(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two strays make one WARNING with a count of two, naming either one
+    (the walk's order is the directory's). A third, added before the next
+    walk, is the only one that walk reports."""
+    recent_at = _now() - timedelta(seconds=60)
+    work, stray = _mixed_tree(far_future_mtime_dir, recent_at)
+    second = work / "second.bin"
+    second.write_text("x")
+    os.utime(second, (253402300801, 253402300801))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        first_walk = _latest_mtime_in_tree(work)
+        third = work / "third.bin"
+        third.write_text("x")
+        os.utime(third, (253402300802, 253402300802))
+        second_walk = _latest_mtime_in_tree(work)
+
+    assert (first_walk, second_walk) == (recent_at.timestamp(), recent_at.timestamp())
+    warnings = _walk_warnings(caplog)
+    assert len(warnings) == 2, warnings
+    assert warnings[0] in [
+        f"silent-orphan reaper: leaving out 2 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {example}; each such file is reported once"
+        for example in (stray, second)
+    ]
+    assert warnings[1] == (
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {third}; each such file is reported once"
+    )
+
+
+def test_the_walk_searches_a_directory_whose_own_mtime_is_left_out(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory's own mtime is left out like a file's, but what it
+    holds is still walked: the file written inside it is the newest."""
+    work = far_future_mtime_dir / "work"
+    sub = work / "sub"
+    sub.mkdir(parents=True)
+    recent_at = _now() - timedelta(seconds=60)
+    inside = sub / "output.txt"
+    inside.write_text("x")
+    os.utime(inside, (recent_at.timestamp(), recent_at.timestamp()))
+    os.utime(sub, (253402300800, 253402300800))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        assert _latest_mtime_in_tree(work) == recent_at.timestamp()
+
+    assert _walk_warnings(caplog) == [
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {sub}; each such file is reported once"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mtime", "usable"),
+    [
+        pytest.param(0.0, True, id="epoch"),
+        pytest.param(253402300799.0, True, id="last-second-of-9999"),
+        pytest.param(253402300800.0, False, id="year-10000"),
+        pytest.param(1e20, False, id="past-time_t"),
+        pytest.param(float("nan"), False, id="nan"),
+        pytest.param(float("inf"), False, id="inf"),
+        pytest.param(float("-inf"), False, id="-inf"),
+    ],
+)
+def test_usable_mtime_known_answers(mtime: float, usable: bool) -> None:
+    """Usable means a datetime can hold it, up to the last second of 9999."""
+    assert _usable_mtime(mtime) is usable
 
 
 def test_a_stray_far_future_file_does_not_hide_recent_activity(far_future_mtime_dir: Path) -> None:
