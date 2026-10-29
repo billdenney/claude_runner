@@ -270,10 +270,13 @@ exists to repair. Repair, then regenerate.
    runs the run's gates again on the branch as the hand edits left it: the
    duplicate check, the revert check (a hand edit that drops base content
    stops it, exit 5) and the contribution verifier. Then it runs the
-   regeneration if the run's never completed or HEAD has moved since it did,
-   since the committed artifacts must match the tree pushed, and check and
-   the vignettes if they never completed; a step the run skipped stays
-   skipped, and a `--skip-*` given to `--finish` skips a step still pending.
+   regeneration and check if the run's never completed or HEAD has moved
+   since they did -- both read the registers, so a hand union counts, and
+   the committed artifacts must match the tree pushed -- and the vignettes
+   if they never completed or a commit since touched a file other than the
+   run's registers (a model or vignette fix does; a hand union alone does
+   not). A step the run skipped stays skipped, and a `--skip-*` given to
+   `--finish` skips a step still due.
    A pending step with no `Rscript` on PATH stops it (exit 3). Then it
    pushes the branch and prints the PR text. Every stop that leaves work
    for `--finish` -- the revert check, a failed regeneration (exit 5),

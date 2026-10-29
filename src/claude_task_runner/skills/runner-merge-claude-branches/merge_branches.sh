@@ -109,10 +109,12 @@
 #                           runs the duplicate check, the revert check and the
 #                           contribution verifier, stopping (exit 9) while the
 #                           verifier reports a loss unless
-#                           --accept-verifier-losses; then runs the
-#                           regeneration if it never completed or HEAD has
-#                           moved since it did, and check and the vignettes
-#                           if they never completed, each unless skipped.
+#                           --accept-verifier-losses; then runs, each unless
+#                           skipped, the regeneration and check if they never
+#                           completed or HEAD has moved since they did, and
+#                           the vignettes if they never completed or a commit
+#                           since touched a file other than the run's
+#                           registers.
 #   --hand-union-done       With --finish: the report's wording is unioned into
 #                           the register and committed; push anyway.
 #   --dry-run               Print the survey and exit before creating the worktree.
@@ -767,35 +769,67 @@ stage_flag() {  # <stage>: the flag that skips it
   esac
 }
 
-finish_r_stages() {  # --finish: every R stage the run did not complete, in order
-  local stage state skipped head flags="" pending=()
-  head="$(git rev-parse HEAD)"
+stage_stale() {  # <stage> <commit it completed at>: whether the branch has moved under it since
+  local stage=$1 done_at=$2 path register
+  if [[ "$done_at" == "$(git rev-parse HEAD)" ]]; then return 1; fi
+  if [[ "$stage" != vignettes ]]; then return 0; fi
+  # The regeneration and check read the registers; the vignettes read the
+  # models and the artifacts, so commits that changed only the run's
+  # registers leave them standing.
+  git rev-parse --verify --quiet "$done_at^{commit}" >/dev/null || return 0
+  while IFS= read -r -d '' path; do
+    for register in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+      if [[ -n "$register" && "$path" == "$register" ]]; then continue 2; fi
+    done
+    return 0
+  done < <(git diff -z --name-only "$done_at" HEAD)
+  return 1
+}
+
+stage_status() {  # <stage>: due, done, run-skip or finish-skip, for --finish now
+  local stage=$1 state skipped
+  state="$(stage_get "$stage")"
+  case "$stage" in
+    regen) skipped=$SKIP_R_REGEN ;;
+    check) skipped=$SKIP_CHECK ;;
+    vignettes) skipped=$SKIP_VIGNETTES ;;
+  esac
+  if [[ "$state" == skip ]]; then
+    echo run-skip
+  elif [[ "$state" != pending ]] && ! stage_stale "$stage" "$state"; then
+    echo done
+  elif (( skipped )); then
+    echo finish-skip
+  else
+    echo due
+  fi
+}
+
+finish_r_stages() {  # --finish: every R stage the run did not complete, or that is out of date
+  local stage state flags="" due=()
   for stage in regen check vignettes; do
-    state="$(stage_get "$stage")"
-    case "$stage" in
-      regen) skipped=$SKIP_R_REGEN ;;
-      check) skipped=$SKIP_CHECK ;;
-      vignettes) skipped=$SKIP_VIGNETTES ;;
-    esac
-    if [[ "$state" == skip ]]; then
-      echo "    ($stage: skipped on the run with $(stage_flag "$stage"))"
-    elif [[ "$state" != pending && ( "$stage" != regen || "$state" == "$head" ) ]]; then
-      echo "    ($stage: completed at ${state:0:12})"
-    elif (( skipped )); then
-      echo "    ($stage: still pending, skipped with $(stage_flag "$stage") on --finish)"
-    else
-      pending+=("$stage")
+    if [[ "$(stage_status "$stage")" == due ]]; then
+      due+=("$stage")
       flags+=" $(stage_flag "$stage")"
     fi
   done
-  if (( ${#pending[@]} )) && ! command -v Rscript >/dev/null 2>&1; then
-    die 3 "Rscript is not on PATH, and these stages are still pending on $BRANCH_NAME: $(join_paths "${pending[@]}"). Install R and run --finish again, or add$flags to push without them."
+  if (( ${#due[@]} )) && ! command -v Rscript >/dev/null 2>&1; then
+    die 3 "Rscript is not on PATH, and these stages are still pending on $BRANCH_NAME: $(join_paths "${due[@]}"). Install R and run --finish again, or add$flags to push without them."
   fi
-  for stage in "${pending[@]:-}"; do
-    case "$stage" in
-      regen) run_regen ;;
-      check) run_check ;;
-      vignettes) run_vignettes ;;
+  # Each stage is judged at its turn: a regeneration that commits makes the
+  # stages after it out of date.
+  for stage in regen check vignettes; do
+    state="$(stage_get "$stage")"
+    case "$(stage_status "$stage")" in
+      run-skip) echo "    ($stage: skipped on the run with $(stage_flag "$stage"))" ;;
+      finish-skip) echo "    ($stage: still pending, skipped with $(stage_flag "$stage") on --finish)" ;;
+      done) echo "    ($stage: completed at ${state:0:12})" ;;
+      due)
+        case "$stage" in
+          regen) run_regen ;;
+          check) run_check ;;
+          vignettes) run_vignettes ;;
+        esac ;;
     esac
   done
 }

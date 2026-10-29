@@ -1328,28 +1328,60 @@ class TestMergeBranchesHandUnion:
         assert log.read_text() == "regen\nregen\ncheck\nvignettes\n"
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) != ""
 
-    @pytest.mark.parametrize("edit", [True, False], ids=["hand-edit", "no-new-commit"])
-    def test_finish_runs_the_regen_again_only_when_head_moved(
-        self, hand_repo: Path, tmp_path: Path, edit: bool
+    @pytest.mark.parametrize(
+        ("edit", "again"),
+        [
+            (None, ""),
+            ("register", "regen\ncheck\n"),
+            ("model", "regen\ncheck\nvignettes\n"),
+        ],
+        ids=["no-new-commit", "register-only", "model"],
+    )
+    def test_finish_runs_again_what_a_new_commit_puts_out_of_date(
+        self, hand_repo: Path, tmp_path: Path, edit: str | None, again: str
     ) -> None:
-        """Every stage completed before the stop. A hand edit committed after
-        it makes --finish regenerate again, since the artifacts must match the
-        tree pushed; check and the vignettes, completed, do not run again."""
+        """Every stage completed before the stop. A commit after it makes
+        --finish regenerate and check again, since both read the registers and
+        the artifacts must match the tree pushed; the vignettes run again only
+        when the commit touched something other than the run's registers."""
         env, log, _ = self._r_env(tmp_path)
         proc = self._run(hand_repo, "--yes", env=env)
         assert proc.returncode == 9, proc.stdout + proc.stderr
         assert log.read_text() == "regen\ncheck\nvignettes\n"
-        if edit:
-            wt = hand_repo / ".worktrees" / CONSOLIDATION
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        if edit == "register":
             text = (wt / REGISTER).read_text()
             (wt / REGISTER).write_text(
                 text.replace("the longer one.", "the longer one. Alpha note.")
             )
             git(wt, "commit", "-qam", "Union the FOO notes by hand")
+        elif edit == "model":
+            (wt / "inst" / "modeldb").mkdir(parents=True, exist_ok=True)
+            (wt / "inst" / "modeldb" / "F_2020_f.R").write_text("# F\n")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-qm", "Fix a model by hand")
         done = run(*self._printed_finish(proc.stderr), env=env)
         assert done.returncode == 0, done.stdout + done.stderr
-        again = "regen\n" if edit else ""
         assert log.read_text() == "regen\ncheck\nvignettes\n" + again
+
+    def test_finish_checks_again_after_a_fix_for_the_vignettes(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """Check passed, then the vignettes failed; the fix is a model edit.
+        --finish runs check again on it, not only the vignettes."""
+        env, log, flags = self._r_env(tmp_path, fail="vig")
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 8, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / "inst" / "modeldb").mkdir(parents=True, exist_ok=True)
+        (wt / "inst" / "modeldb" / "F_2020_f.R").write_text("# F, fixed\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "Fix the model the vignette runs")
+        (flags / "fail-vig").unlink()
+        finish = _printed_after(proc.stderr, "and commit, then run")
+        done = run(*finish, "--hand-union-done", "--skip-push", env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert log.read_text() == "regen\ncheck\nvignettes\nregen\ncheck\nvignettes\n"
 
     def test_finish_keeps_the_runs_skips_and_takes_its_own(
         self, hand_repo: Path, tmp_path: Path
