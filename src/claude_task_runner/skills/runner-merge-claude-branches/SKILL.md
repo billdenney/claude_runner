@@ -320,7 +320,8 @@ exists to repair. Repair, then regenerate.
    branches added the same canonical in different words and the merge lost
    it, the first branch's copy is restored and each other copy is printed in
    full and appended to the hand-union report (step 6b), for a hand union.
-   So is a name a branch added to a multi-name heading that the merge kept
+   Any later heading that shares a name with the restored one is such a copy,
+   whatever order it lists the names in. So is a name a branch added to a multi-name heading that the merge kept
    without it.
 
    Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.

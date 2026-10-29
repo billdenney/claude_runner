@@ -22,9 +22,10 @@ Every ``### `` heading counts, a backticked name (``prob_<endpoint>`` in
 backticks, keyed without them) or prose included. When two branches added the same
 canonical in different words and the merge lost it, the first branch's copy is
 restored and each other copy is printed in full, and with ``--report FILE``
-appended to the hand-union report, for a hand union. So is a name a branch
-added to a multi-name heading that survived without it: the block is there,
-so the repair is the heading, by hand.
+appended to the hand-union report, for a hand union. A later heading that
+shares any name with the restored one is such a copy, whatever order it lists
+the names in. So is a name a branch added to a multi-name heading that
+survived without it: the block is there, so the repair is the heading, by hand.
 
 Idempotent: a canonical already present is left alone, so re-running is safe.
 
@@ -79,14 +80,15 @@ def fail(message: str) -> int:
     return 2
 
 
-def blocks(text: str) -> dict[str, tuple[str, str, str]]:
-    """Map every canonical name -> (parent ``## section``, block text, owning name).
+def blocks(text: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
+    """Map every canonical name -> (parent ``## section``, block text, the
+    names its heading declares, in order).
 
     A multi-name header (``### fm_a, fm_b, fm_c``) contributes one entry per
     name so that "is this canonical present?" is answered correctly; the
     owning name is the first, which is what insertion keys on.
     """
-    found: dict[str, tuple[str, str, str]] = {}
+    found: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     section = ""
     lines = text.splitlines(keepends=True)
     i = 0
@@ -113,7 +115,7 @@ def blocks(text: str) -> dict[str, tuple[str, str, str]]:
             # Key every name a multi-name header declares, so presence checks
             # answer correctly for `### fm_a, fm_b, fm_c`. The first name owns
             # the block for insertion purposes.
-            found.setdefault(nm, (section, block, names[0]))
+            found.setdefault(nm, (section, block, tuple(names)))
     return found
 
 
@@ -249,9 +251,11 @@ def main() -> int:
         return fail(merge_set.empty_message(args.pattern, args.branch, args.base))
 
     restored: list[tuple[str, str, str]] = []
-    restored_from: dict[str, tuple[str, str]] = {}
-    """A restored block's owning name -> the branch it came from, and the block."""
-    differing: list[tuple[str, str, str, str]] = []
+    restored_from: dict[str, tuple[str, str, str]] = {}
+    """Every name a restored heading declares -> the restored block's owning
+    name, the branch it came from, and the block. Keyed by every name, so a
+    later copy is matched whatever its heading leads with."""
+    differing: list[tuple[str, str, str, str, str]] = []
     inherited = 0
     deliberate = 0
     lost_names: list[tuple[str, str, str, str]] = []
@@ -262,11 +266,17 @@ def main() -> int:
             continue
         fork_blocks = blocks(merge_set.read_file(repo, member.fork, args.file) or "")
         branch_blocks = blocks(text)
-        for name, (section, block, owner) in branch_blocks.items():
-            if owner in restored_from:
-                first, first_block = restored_from[owner]
+        for name, (section, block, names) in branch_blocks.items():
+            owner = names[0]
+            earlier = next((restored_from[n] for n in names if n in restored_from), None)
+            if earlier is not None:
+                # A copy of a block already restored: its heading shares a name
+                # with the restored one, in any order. Compared once, at its
+                # owner; restoring it too would declare that name twice.
+                kept, first, first_block = earlier
                 if name == owner and block != first_block:
-                    differing.append((owner, ref.replace("origin/", ""), first, block))
+                    branch = ref.replace("origin/", "")
+                    differing.append((kept, branch, first, first_block, block))
                 continue
             if name in base_blocks or name in merged_blocks:
                 continue
@@ -289,11 +299,10 @@ def main() -> int:
                 lost_names.append((name, owner, ref.replace("origin/", ""), block))
                 continue
             restored.append((name, section, block))
-            restored_from[owner] = (ref.replace("origin/", ""), block)
             # Every name the restored heading declares is present now.
-            for other, (_, other_block, other_owner) in branch_blocks.items():
-                if other_owner == owner and other_block == block:
-                    merged_blocks[other] = (section, block, owner)
+            for other in names:
+                restored_from[other] = (owner, ref.replace("origin/", ""), block)
+                merged_blocks[other] = (section, block, names)
 
     if deliberate:
         print(
@@ -315,7 +324,7 @@ def main() -> int:
             f"# {len(lost_names)} multi-name header entry(ies) need a manual union; "
             f"buildModelDb() will fail on these until fixed"
         )
-    for name, ref, first, block in differing:
+    for name, ref, first, _, block in differing:
         print(
             f"# {name}: {ref} added it too, worded differently; the restore takes"
             f" {first}'s copy. Union this one by hand:"
@@ -329,12 +338,12 @@ def main() -> int:
                 [
                     register.Difference(
                         f"{ref}'s copy (the register has {first}'s)",
-                        restored_from[name][1].splitlines(),
+                        first_block.splitlines(),
                         block.splitlines(),
                     )
                 ],
             )
-            for name, ref, first, block in differing
+            for name, ref, first, first_block, block in differing
         ]
         register.append_report(args.report, args.file, hand, RESTORE_INTRO, "In that copy:")
     if lost_names and args.report is not None and not args.check:

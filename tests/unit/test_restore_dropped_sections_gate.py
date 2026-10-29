@@ -367,6 +367,89 @@ def test_a_canonical_two_branches_added_differently_names_the_other_copy(
     )
 
 
+@pytest.mark.parametrize("heading", ["BETA, ALPHA", "BETA", "GAMMA, ALPHA"])
+def test_a_later_copy_whose_heading_leads_with_another_name_reaches_the_report(
+    repo: Path, tmp_path: Path, heading: str
+) -> None:
+    """A second copy of a restored ``### ALPHA, BETA`` block is that block's
+    copy whatever its heading leads with: the names reordered, only some of
+    them, or a new name beside one of them. Its words are printed and reach
+    the hand-union report, and no second block declaring ALPHA or BETA is
+    inserted. Keyed on the first name alone, the second copy was dropped
+    without a word, and with it the Notes line only it carries."""
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "ALPHA, BETA"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", heading], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")
+    second = f"### {heading} (**canonical for {heading}**)\n- **Type:** x\n"
+    worded = second + "- **Notes:** only claude/second says this\n"
+    (repo / REGISTER).write_text((repo / REGISTER).read_text().replace(second, worded))
+    commit(repo, "second wording")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "ALPHA" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    shown = "".join(f"    {line}" for line in worded.splitlines(keepends=True))
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    ALPHA  (## Section A)\n"
+    ) in out, out
+    assert (
+        "# ALPHA: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n" + shown
+    ) in out, out
+    report = tmp_path / "hand-union.md"
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--branch",
+            "consolidation",
+            "--base",
+            "main",
+            "--file",
+            REGISTER,
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    text = (repo / REGISTER).read_text()
+    assert "### ALPHA, BETA (**canonical for ALPHA, BETA**)\n- **Type:** x\n\n" in text
+    assert text.count("ALPHA") == 2, text
+    assert "GAMMA" not in text, text
+    assert report.read_text().endswith(
+        "## ALPHA\n"
+        "\n"
+        "### claude/second's copy (the register has claude/first's)\n"
+        "\n"
+        "In the register:\n"
+        "\n"
+        "````\n"
+        "### ALPHA, BETA (**canonical for ALPHA, BETA**)\n"
+        "- **Type:** x\n"
+        "````\n"
+        "\n"
+        "In that copy:\n"
+        "\n"
+        f"````\n{worded}````\n"
+        "\n"
+    )
+
+
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
     """A restored multi-name heading's other names count as present: none is
     reported as dropped from a heading the restore put back."""
