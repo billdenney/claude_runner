@@ -157,7 +157,9 @@ class FailureClassifierSettings(_StrictModel):
     often a still-blocked task is tried again, so a long wait (e.g. a paper
     awaiting operator re-acquisition, a mount not up yet) re-checks
     periodically instead of being re-picked every tick and starving ready
-    work. Default 15 min."""
+    work. Default 15 min. Must be at least ``[usage].poll_interval_s``: the
+    selector checks the cooldown once a tick, so a shorter one would re-pick
+    the task every tick (see ``Settings``)."""
     sidecar_refile_loop_threshold: int = Field(default=4, ge=1)
     """Consecutive no-progress sidecar re-files (a dispatch that ends
     ``awaiting_sidecar`` without committing anything) after which the
@@ -1094,5 +1096,25 @@ class Settings(_StrictModel):
                 f"{2 * cycle_s:g} s. Each account is read once per cycle, so a single "
                 "failed capture would stop it taking tasks. Raise max_reading_age_s or "
                 "lower poll_interval_s."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_deferral_cooldown_spans_a_tick(self) -> Settings:
+        """Reject a deferral cooldown shorter than one supervisor tick.
+
+        The selector compares a deferred task's ``next_eligible_at`` with the
+        clock once a tick, and nothing wakes the supervisor for it. A shorter
+        cooldown therefore cannot mean what it says: a still-blocked task is
+        re-dispatched, its hook re-run and its slot held, every tick.
+        """
+        cooldown_s = self.failure_classifier.deferral_recheck_cooldown_s
+        poll_s = self.usage.poll_interval_s
+        if cooldown_s < poll_s:
+            raise ValueError(
+                f"[failure_classifier].deferral_recheck_cooldown_s = {cooldown_s:g} s is under "
+                f"one supervisor tick, [usage].poll_interval_s = {poll_s:g} s. Deferred tasks "
+                "are checked once a tick, so a shorter cooldown re-dispatches a still-blocked "
+                "task every tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
             )
         return self

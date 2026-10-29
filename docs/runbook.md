@@ -456,7 +456,8 @@ task that does not run.
      the circuit breaker is not fed. Fix the cause; the supervisor tries
      again once `next_eligible_at` has passed
      (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
-     default), and the task runs.
+     default, and never less than `[usage].poll_interval_s`, since the
+     cooldown is checked once a tick), and the task runs.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.
