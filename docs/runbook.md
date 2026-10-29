@@ -375,10 +375,11 @@ notification (`corrupt-state quarantine: task <id> ...`) and a
 every state file it cannot load into `state/.corrupt/` (ADR-0028), so that
 no pass skips the task forever. A file fails to load when a crash or power
 loss truncated it, when a hand edit broke it, or when it records a value no
-process or date can hold: a `pid` (the task's or a run's) above 2147483647,
-the C `pid_t` maximum, or an integer of more than 4300 digits. The runner
-never writes such a value; only a hand edit or bit rot does. The quarantine
-then decides the task from what it can still read at the head of the file:
+process or date can hold: a `pid` (the task's or a run's) below 1 or above
+2147483647, the C `pid_t` maximum, or an integer of more than 4300 digits.
+The runner never writes such a value; only a hand edit or bit rot does. The
+quarantine then decides the task from what it can still read at the head of
+the file:
 
 - A `completed` task gets a minimal state that keeps `completed`, so its
   finished work is not redone. Its runs and session id are not kept.
@@ -395,9 +396,19 @@ then decides the task from what it can still read at the head of the file:
    task's log, `<queue>/.claude_task_runner/logs/<id>/`, to see what the
    last attempt did.
 2. To keep a task from running again (its work is done, say), stop the
-   supervisor, fix the copy and move it back to
-   `<queue>/.claude_task_runner/state/<id>.yaml`, then start the
-   supervisor. A copy moved back unfixed is quarantined again.
+   supervisor, then look for `<queue>/.claude_task_runner/state/<id>.yaml`.
+   A task left without state can be dispatched on the supervisor's first
+   tick, so a file there is a new attempt's record. Do not move the copy
+   over it: with `[supervisor].adopt_workers` on (the default) that
+   attempt's worker keeps running after the supervisor stops, and its
+   record would be lost. Start the supervisor again and let the attempt
+   finish.
+3. With no such file, fix the copy, set its `status: completed`, move it
+   back to `<queue>/.claude_task_runner/state/<id>.yaml`, and start the
+   supervisor. A `pending` or `failed` copy is dispatched again. A
+   `running` one is settled at startup like any task whose worker is gone,
+   which runs it again unless its log ends in a successful result. A copy
+   moved back unfixed is quarantined again.
 
 ## Weekly throttled, no dispatch resuming
 
