@@ -261,7 +261,12 @@ exists to repair. Repair, then regenerate.
    report and the `--finish --hand-union-done` command, and any later
    failure (check, vignettes) names the report too. Union the wording into
    the register by hand, keeping each source's attribution, commit in the
-   worktree, and run that command, without redoing the merge. `--finish`
+   worktree, and run that command, without redoing the merge. The command
+   names only `--repo` and `--branch-name`: the run records its other inputs
+   (`--base`, `--pattern`, `--extra-ref`, the union and register files, and
+   every ref it merged) in the worktree's git directory, and `--finish` uses
+   them, refusing a conflicting one given on its command line (exit 2) and
+   stopping when a merged ref no longer exists (exit 3). `--finish`
    runs the run's gates again on the branch as the hand edits left it: the
    duplicate check, the revert check (a hand edit that drops base content
    stops it, exit 5) and the contribution verifier. Then it runs the

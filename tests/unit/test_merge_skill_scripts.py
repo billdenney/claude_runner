@@ -583,14 +583,14 @@ class TestMergeBranches:
             push_task_branch(repo, f"claude/{name}", files, f"Register LKST ({name})")
 
     @staticmethod
-    def _loss_stop(repo: Path, files: str, finish_extra: str = "") -> str:
+    def _loss_stop(repo: Path, files: str) -> str:
         wt = repo / ".worktrees" / CONSOLIDATION
         report = git(
             wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md"
         )
         finish = (
             f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION}{finish_extra} --finish"
+            f" --branch-name {CONSOLIDATION} --finish"
         )
         return (
             "\n"
@@ -748,14 +748,111 @@ class TestMergeBranches:
         )
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
 
+    @staticmethod
+    def _stop_with_extra_refs(
+        repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """feature/a2 and feature/b2, outside the pattern, each register LKST
+        under a section of their own and are merged with --extra-ref; a2's
+        model is lost. The run stops (exit 9), and the --finish it prints."""
+        for name, model in (("a2", "A2_2020_x.R"), ("b2", "B2_2021_y.R")):
+            block = (
+                f"\n## Section from {name}\n\n### LKST (**canonical for lkst**)\n\n"
+                f"- **Example models:** `{model}` ({name}).\n"
+            )
+            push_task_branch(
+                repo, f"feature/{name}", {REGISTER: BASE_REGISTER + block}, f"LKST ({name})"
+            )
+        proc = run(
+            "bash",
+            MERGE_BRANCHES,
+            "--repo",
+            repo,
+            "--yes",
+            "--skip-r-regen",
+            "--skip-check",
+            "--skip-vignettes",
+            "--branch-name",
+            CONSOLIDATION,
+            "--exclude-ref",
+            "origin/claude/a",
+            "--exclude-ref",
+            "origin/claude/b",
+            "--extra-ref",
+            "origin/feature/a2",
+            "--extra-ref",
+            "origin/feature/b2",
+        )
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        return proc, shlex.split(proc.stderr.rstrip("\n").splitlines()[-1])
+
+    def test_finish_verifies_with_the_runs_extra_refs(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The printed --finish names no --extra-ref, and still checks the
+        branches the run merged with them: the loss stops it."""
+        _, finish = self._stop_with_extra_refs(repo, monkeypatch, tmp_path)
+        assert "--extra-ref" not in finish
+        done = run(*finish)
+        assert done.returncode == 9, done.stdout + done.stderr
+        assert "    LKST  <-  A2_2020_x.R   (from feature/a2)\n" in done.stdout
+        assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
     @pytest.mark.parametrize(
-        ("comp", "flags", "finish_extra"),
+        ("given", "message"),
         [
-            ("inst/references/compartment-names.md", (), ""),
+            (
+                ["--base", "origin/claude/a"],
+                "--finish uses the run's --base 'origin/main'; --base 'origin/claude/a'"
+                " conflicts with it.",
+            ),
+            (
+                ["--extra-ref", "origin/feature/a2"],
+                "--finish uses the run's --extra-ref values (origin/feature/a2,"
+                " origin/feature/b2); those given conflict with them.",
+            ),
+            (
+                ["--pattern", "origin/feature/*"],
+                "--finish uses the run's --pattern 'origin/claude/*'; --pattern"
+                " 'origin/feature/*' conflicts with it.",
+            ),
+        ],
+        ids=["base", "extra-ref", "pattern"],
+    )
+    def test_finish_refuses_an_input_that_conflicts_with_the_runs(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        given: list[str],
+        message: str,
+    ) -> None:
+        _, finish = self._stop_with_extra_refs(repo, monkeypatch, tmp_path)
+        refused = run(*finish, *given)
+        assert (refused.returncode, refused.stderr) == (2, f"ERROR: {message}\n")
+
+    def test_finish_stops_when_a_merged_ref_is_gone(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A branch the run merged was pruned since: without it the verifier
+        would check a smaller merge set, so --finish names it and stops."""
+        _, finish = self._stop_with_extra_refs(repo, monkeypatch, tmp_path)
+        sha = git(repo, "rev-parse", "origin/feature/a2").strip()
+        git(repo, "update-ref", "-d", "refs/remotes/origin/feature/a2")
+        refused = run(*finish)
+        assert (refused.returncode, refused.stderr) == (
+            3,
+            f"ERROR: --finish: the run merged origin/feature/a2 at {sha[:12]}, and that ref no"
+            f" longer exists; fetch it, or recreate it at {sha}, then run --finish again.\n",
+        )
+
+    @pytest.mark.parametrize(
+        ("comp", "flags"),
+        [
+            ("inst/references/compartment-names.md", ()),
             (
                 "refs/comp,names.md",
                 ("--no-register-files", "--register-file", "refs/comp,names.md"),
-                " --no-register-files --register-file refs/comp\\,names.md",
             ),
         ],
         ids=["default-register", "comma-in-path"],
@@ -766,7 +863,6 @@ class TestMergeBranches:
         monkeypatch: pytest.MonkeyPatch,
         comp: str,
         flags: tuple[str, ...],
-        finish_extra: str,
     ) -> None:
         """Every register's losses are recorded before the stop, which names
         each register's path as it is, a comma in it included."""
@@ -776,7 +872,7 @@ class TestMergeBranches:
             repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes", *flags
         )
         assert proc.returncode == 9, proc.stdout + proc.stderr
-        assert proc.stderr.endswith(self._loss_stop(repo, f"{REGISTER}, {comp}", finish_extra))
+        assert proc.stderr.endswith(self._loss_stop(repo, f"{REGISTER}, {comp}"))
         wt = repo / ".worktrees" / CONSOLIDATION
         report = git(
             wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md"
@@ -872,7 +968,7 @@ class TestMergeBranches:
             "ERROR: the merge reverted register content origin/main has (listed above). Nothing\n"
             f"  was repaired: restore it by hand in {wt} and commit, then run\n"
             f"     bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION} --finish\n"
+            f" --branch-name {CONSOLIDATION} --finish\n"
         )
         assert "==> Regenerating" not in proc.stdout
         assert (wt / REGISTER).read_text() == (
@@ -984,7 +1080,7 @@ class TestMergeBranchesHandUnion:
         assert proc.returncode == 9, proc.stdout + proc.stderr
         finish = (
             f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION} --finish"
+            f" --branch-name {CONSOLIDATION} --finish"
         )
         assert proc.stderr.endswith(
             "\n"
@@ -1062,7 +1158,7 @@ class TestMergeBranchesHandUnion:
             "Fix the failing vignettes (or the underlying model .R files, or the\n"
             "validator's setup) and commit, then run\n"
             f"     bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(hand_repo))}"
-            f" --base origin/main --branch-name {CONSOLIDATION} --finish\n"
+            f" --branch-name {CONSOLIDATION} --finish\n"
             "which runs the validation again before the push.\n"
             "\n"
             "NOTE: a hand union is still pending. The wording the register lacks is in\n"
@@ -1094,8 +1190,12 @@ class TestMergeBranchesHandUnion:
 
     def test_finish_refuses_a_duplicate_left_in_the_register(self, hand_repo: Path) -> None:
         """A hand union that put a second copy back is caught before the push."""
-        wt = consolidate(hand_repo, ["origin/claude/fa", "origin/claude/fb"], CONSOLIDATION)
-        proc = self._run(hand_repo, "--finish", "--no-register-files")
+        stop = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        assert stop.returncode == 9, stop.stdout + stop.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / REGISTER).write_text((wt / REGISTER).read_text() + FOO_A)
+        git(wt, "commit", "-qam", "Put Fa's copy of FOO back by hand")
+        proc = run(*self._printed_finish(stop.stderr))
         assert proc.returncode == 5, proc.stdout + proc.stderr
         assert proc.stderr.endswith(f"ERROR: duplicate canonical headers remain in {REGISTER}.\n")
         assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
@@ -1105,10 +1205,12 @@ class TestMergeBranchesHandUnion:
         self, hand_repo: Path
     ) -> None:
         """A register the base has and the worktree lacks stops the push."""
-        wt = consolidate(hand_repo, ["origin/claude/fa"], CONSOLIDATION)
+        stop = self._run(hand_repo, "--yes", "--skip-r-regen", "--skip-check", "--skip-vignettes")
+        assert stop.returncode == 9, stop.stdout + stop.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
         git(wt, "rm", "-q", REGISTER)
         git(wt, "commit", "-qm", "lose the register")
-        proc = self._run(hand_repo, "--finish", "--no-register-files")
+        proc = run(*self._printed_finish(stop.stderr))
         assert (proc.returncode, proc.stderr.splitlines()[-1]) == (
             5,
             f"ERROR: {REGISTER} is on origin/main but missing from the worktree; restore it"
@@ -1406,11 +1508,12 @@ class TestMergeBranchesHandUnion:
         ],
         ids=["none", "custom"],
     )
-    def test_the_printed_finish_carries_the_runs_registers_and_the_report_accumulates(
+    def test_finish_uses_the_runs_registers_and_the_report_accumulates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registers: tuple[str, ...]
     ) -> None:
         """A custom union file and register: both hand unions are in one report,
-        and the printed --finish, run as printed, finds both files."""
+        and the printed --finish, which names neither, checks both: it reads
+        the run's recorded inputs."""
         union_file = "refs/covariates.md"
         comp = "refs/comp names.md"
         comp_base = "## Compartments\n\n### depot (**dosing compartment**)\n\n- **Role:** state.\n"
@@ -1443,13 +1546,7 @@ class TestMergeBranchesHandUnion:
         wt = repo / ".worktrees" / CONSOLIDATION
         assert proc.returncode == 9, proc.stdout + proc.stderr
         printed = self._printed_finish(proc.stderr)
-        assert printed[printed.index("--branch-name") + 2 :] == [
-            "--union-file",
-            union_file,
-            *registers,
-            "--finish",
-            "--hand-union-done",
-        ]
+        assert printed[printed.index("--branch-name") + 2 :] == ["--finish", "--hand-union-done"]
         report = self._report(wt).read_text()
         assert f"# Hand union needed in {union_file}\n" in report
         assert (f"# Hand union needed in {comp}\n" in report) == (comp in registers)

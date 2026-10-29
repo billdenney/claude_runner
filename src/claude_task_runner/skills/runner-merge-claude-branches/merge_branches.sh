@@ -96,11 +96,14 @@
 #                           or a failed gate) once the fix is committed: run the
 #                           gates again on the worktree's branch, run every R
 #                           step the run did not complete, push, and print the
-#                           PR text. Takes the same --repo, --base,
-#                           --branch-name, --pattern, --extra-ref,
-#                           --union-file, --register-file and
-#                           --no-register-files as the run (every stop prints
-#                           them). It refuses a worktree with uncommitted
+#                           PR text. Takes the run's --repo and
+#                           --branch-name (every stop prints them) and reads
+#                           the run's other inputs -- --base, --pattern,
+#                           --extra-ref, --union-file and the register files
+#                           -- from the worktree, refusing a conflicting one
+#                           given here (exit 2) and stopping when a ref the
+#                           run merged no longer exists (exit 3). It refuses
+#                           a worktree with uncommitted
 #                           changes; prints a pending hand-union report and
 #                           stops (exit 9) unless --hand-union-done is given;
 #                           runs the duplicate check, the revert check and the
@@ -123,14 +126,16 @@
 #   0  success; also a completed --dry-run, no unmerged branches, or the
 #      operator answering no at the prompt
 #   1  an unexpected command failure
-#   2  bad arguments: an unknown flag, a flag missing its value, or a
-#      non-numeric --vignette-jobs / --vignette-timeout
+#   2  bad arguments: an unknown flag, a flag missing its value, a
+#      non-numeric --vignette-jobs / --vignette-timeout, or, for --finish,
+#      an input that conflicts with the one the run recorded
 #   3  pre-flight failure: --repo is not a git working tree, python3 missing,
 #      Rscript missing while an R step is enabled, git fetch failed, --base or
 #      an --extra-ref does not resolve, no branch matched, a survey diff
 #      failed (no merge base, or a shallow clone), no --yes without a
 #      terminal, or the worktree already exists; for --finish, no worktree,
-#      a worktree on another branch, one with uncommitted changes, or no
+#      a worktree on another branch, one with uncommitted changes, no
+#      recorded inputs, a ref the run merged that no longer exists, or no
 #      Rscript while an R step is still pending
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
@@ -166,6 +171,13 @@ HAND_UNION_REPORT=""
 # Which of steps 7-9 the run skipped, and the commit each completed at
 # (stage_get); kept in the worktree's git directory for --finish.
 STAGES_FILE=""
+# The gates' inputs and the refs the run merged (record_inputs), for --finish.
+INPUTS_FILE=""
+MERGED_REFS=()
+BASE_GIVEN=0
+PATTERN_GIVEN=0
+UNION_FILE_GIVEN=0
+REGISTERS_GIVEN=0
 VERIFY_LOSS_FILES=()
 HAND_UNION_DONE=0
 
@@ -176,8 +188,7 @@ PYTHON3="$(command -v python3 || true)"
 
 REPO="${PWD}"
 BASE="origin/main"
-DEFAULT_PATTERN="origin/claude/*"
-PATTERN="$DEFAULT_PATTERN"
+PATTERN="origin/claude/*"
 BRANCH_NAME=""
 DEFAULT_UNION_FILE="inst/references/covariate-columns.md"
 UNION_FILE="$DEFAULT_UNION_FILE"
@@ -276,30 +287,82 @@ check_no_duplicates() {  # gate: no duplicate canonical remains in any register
   done
 }
 
-finish_command() {  # this run's --finish command line, every value shell-quoted
-  local cmd reg ref
+finish_command() {  # the --finish that completes this run: the worktree's identity; --finish reads the rest
+  local cmd
   cmd="bash $(printf '%q' "$SCRIPT_DIR/merge_branches.sh") --repo $(printf '%q' "$REPO")"
-  cmd+=" --base $(printf '%q' "$BASE") --branch-name $(printf '%q' "$BRANCH_NAME")"
-  if [[ "$PATTERN" != "$DEFAULT_PATTERN" ]]; then
-    cmd+=" --pattern $(printf '%q' "$PATTERN")"
-  fi
-  for ref in "${EXTRA_REFS[@]:-}"; do
-    if [[ -n "$ref" ]]; then cmd+=" --extra-ref $(printf '%q' "$ref")"; fi
-  done
-  if [[ "$UNION_FILE" != "$DEFAULT_UNION_FILE" ]]; then
-    cmd+=" --union-file $(printf '%q' "$UNION_FILE")"
-  fi
-  if [[ "${REGISTER_FILES[*]:-}" != "${DEFAULT_REGISTER_FILES[*]}" ]]; then
-    cmd+=" --no-register-files"
-    for reg in "${REGISTER_FILES[@]:-}"; do
-      if [[ -n "$reg" ]]; then cmd+=" --register-file $(printf '%q' "$reg")"; fi
-    done
-  fi
+  cmd+=" --branch-name $(printf '%q' "$BRANCH_NAME")"
   if (( VIGNETTE_JOBS_GIVEN )); then cmd+=" --vignette-jobs $VIGNETTE_JOBS"; fi
   if (( VIGNETTE_TIMEOUT != DEFAULT_VIGNETTE_TIMEOUT )); then
     cmd+=" --vignette-timeout $VIGNETTE_TIMEOUT"
   fi
   echo "$cmd --finish"
+}
+
+record_inputs() {  # the gates' inputs and every ref merged, at the commit merged
+  local item
+  {
+    printf 'base\t%s\n' "$BASE"
+    printf 'pattern\t%s\n' "$PATTERN"
+    printf 'union-file\t%s\n' "$UNION_FILE"
+    for item in "${EXTRA_REFS[@]:-}"; do
+      if [[ -n "$item" ]]; then printf 'extra-ref\t%s\n' "$item"; fi
+    done
+    for item in "${REGISTER_FILES[@]:-}"; do
+      if [[ -n "$item" ]]; then printf 'register-file\t%s\n' "$item"; fi
+    done
+    for item in "${MERGED_REFS[@]}"; do
+      printf 'merged\t%s\t%s\n' "$item" "$(git rev-parse "$item^{commit}")"
+    done
+  } > "$INPUTS_FILE"
+}
+
+same_list() {  # <a> <b>: two newline-separated lists hold the same items
+  [[ "$(printf '%s\n' "$1" | sort)" == "$(printf '%s\n' "$2" | sort)" ]]
+}
+
+read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given here is refused
+  local key value sha base="" pattern="" union="" extras=() registers=() given
+  [[ -s "$INPUTS_FILE" ]] \
+    || die 3 "--finish: $WT_ABS has no recorded inputs: its run stopped before its merges completed. Re-run on a fresh --branch-name."
+  while IFS=$'\t' read -r key value sha; do
+    case "$key" in
+      base) base=$value ;;
+      pattern) pattern=$value ;;
+      union-file) union=$value ;;
+      extra-ref) extras+=("$value") ;;
+      register-file) registers+=("$value") ;;
+      merged)
+        if ! git rev-parse --verify --quiet "$value^{commit}" >/dev/null; then
+          die 3 "--finish: the run merged $value at ${sha:0:12}, and that ref no longer exists; fetch it, or recreate it at $sha, then run --finish again."
+        fi ;;
+    esac
+  done < "$INPUTS_FILE"
+  if (( BASE_GIVEN )) && [[ "$BASE" != "$base" ]]; then
+    die 2 "--finish uses the run's --base '$base'; --base '$BASE' conflicts with it."
+  fi
+  if (( PATTERN_GIVEN )) && [[ "$PATTERN" != "$pattern" ]]; then
+    die 2 "--finish uses the run's --pattern '$pattern'; --pattern '$PATTERN' conflicts with it."
+  fi
+  if (( UNION_FILE_GIVEN )) && [[ "$UNION_FILE" != "$union" ]]; then
+    die 2 "--finish uses the run's --union-file '$union'; --union-file '$UNION_FILE' conflicts with it."
+  fi
+  given="$(printf '%s\n' "${EXTRA_REFS[@]:-}")"
+  if [[ -n "$given" ]] && ! same_list "$given" "$(printf '%s\n' "${extras[@]:-}")"; then
+    die 2 "--finish uses the run's --extra-ref values ($(join_paths "${extras[@]:-}")); those given conflict with them."
+  fi
+  if (( REGISTERS_GIVEN )) \
+    && ! same_list "$(printf '%s\n' "${REGISTER_FILES[@]:-}")" "$(printf '%s\n' "${registers[@]:-}")"; then
+    die 2 "--finish uses the run's register files ($(join_paths "${registers[@]:-}")); those given conflict with them."
+  fi
+  BASE=$base
+  PATTERN=$pattern
+  UNION_FILE=$union
+  EXTRA_REFS=("${extras[@]}")
+  REGISTER_FILES=("${registers[@]}")
+  EXTRA_REF_ARGS=()
+  for value in "${EXTRA_REFS[@]:-}"; do
+    if [[ -n "$value" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$value"); fi
+  done
 }
 
 join_paths() {  # <path>...: one line, ", " between
@@ -741,14 +804,14 @@ finish_r_stages() {  # --finish: every R stage the run did not complete, in orde
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) need_value "$@"; REPO="$2"; shift 2 ;;
-    --base) need_value "$@"; BASE="$2"; shift 2 ;;
-    --pattern) need_value "$@"; PATTERN="$2"; shift 2 ;;
+    --base) need_value "$@"; BASE="$2"; BASE_GIVEN=1; shift 2 ;;
+    --pattern) need_value "$@"; PATTERN="$2"; PATTERN_GIVEN=1; shift 2 ;;
     --extra-ref) need_value "$@"; EXTRA_REFS+=("$2"); shift 2 ;;
     --exclude-ref) need_value "$@"; EXCLUDE_REFS+=("$2"); shift 2 ;;
     --branch-name) need_value "$@"; BRANCH_NAME="$2"; shift 2 ;;
-    --union-file) need_value "$@"; UNION_FILE="$2"; shift 2 ;;
-    --register-file) need_value "$@"; REGISTER_FILES+=("$2"); shift 2 ;;
-    --no-register-files) REGISTER_FILES=(); shift ;;
+    --union-file) need_value "$@"; UNION_FILE="$2"; UNION_FILE_GIVEN=1; shift 2 ;;
+    --register-file) need_value "$@"; REGISTER_FILES+=("$2"); REGISTERS_GIVEN=1; shift 2 ;;
+    --no-register-files) REGISTER_FILES=(); REGISTERS_GIVEN=1; shift ;;
     --accept-verifier-losses) ACCEPT_VERIFIER_LOSSES=1; shift ;;
     --forbid-path)
       need_value "$@"
@@ -808,7 +871,6 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 3 "$REPO is not a git
 
 if (( FINISH )); then
   [[ -n "$PYTHON3" ]] || die 3 "python3 is not on PATH; the duplicate check needs it."
-  git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
   WT_ABS="$REPO/.worktrees/${BRANCH_NAME}"
   [[ -d "$WT_ABS" ]] || die 3 "--finish: no worktree at $WT_ABS; run without --finish first."
   cd "$WT_ABS"
@@ -818,6 +880,9 @@ if (( FINISH )); then
     || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
   HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
   STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
+  INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
+  read_inputs
+  git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
   echo "==> Finishing $BRANCH_NAME in $WT_ABS"
   if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
     {
@@ -1061,7 +1126,8 @@ cd "$WT_ABS"
 # Kept in the worktree's own git directory, so no step can commit it.
 HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
 STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
-rm -f "$HAND_UNION_REPORT" "$STAGES_FILE"
+INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
+rm -f "$HAND_UNION_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
 record_skips
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
@@ -1079,6 +1145,7 @@ for br in "${UNMERGED[@]}"; do
         "$br" >/dev/null 2>&1; then
     SUCCESS=$((SUCCESS+1))
     MERGED_LIST+=("$short")
+    MERGED_REFS+=("$br")
   else
     # modify/delete on a base-deleted path is EXPECTED, not a real conflict:
     # the base dropped the file on purpose and this branch predates that, so it
@@ -1106,6 +1173,7 @@ for br in "${UNMERGED[@]}"; do
       if git commit -q --no-edit >/dev/null 2>&1; then
         SUCCESS=$((SUCCESS+1))
         MERGED_LIST+=("$short")
+        MERGED_REFS+=("$br")
         echo "      modify/delete on base-deleted path(s) -> kept deleted: ${UNRES[*]}"
         continue
       fi
@@ -1132,6 +1200,7 @@ if (( SUCCESS == 0 )); then
   echo "ERROR: no merges succeeded; nothing to push." >&2
   exit 4
 fi
+record_inputs
 
 # ---------------------------------------------------------------------------
 # Resurrected-path guard.
