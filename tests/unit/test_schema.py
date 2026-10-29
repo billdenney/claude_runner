@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from claude_task_runner.process_signals import PID_MAX
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     RunRecord,
@@ -174,8 +175,44 @@ class TestRunRecord:
                 pid=0,
             )
 
+    @pytest.mark.parametrize("pid", [2**31, 10**20], ids=["2**31", "10**20"])
+    def test_pid_field_rejects_a_pid_no_process_can_have(self, pid: int) -> None:
+        """Above the C ``pid_t`` maximum ``os.kill`` raises ``OverflowError``."""
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        with pytest.raises(ValidationError):
+            RunRecord(
+                attempt=1,
+                started_at=t,
+                finished_at=t,
+                stop_reason="end_turn",
+                duration_s=1,
+                pid=pid,
+            )
+
+    def test_pid_field_accepts_pid_max(self) -> None:
+        t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
+        r = RunRecord(
+            attempt=1,
+            started_at=t,
+            finished_at=t,
+            stop_reason="end_turn",
+            duration_s=1,
+            pid=PID_MAX,
+        )
+        assert r.pid == 2**31 - 1
+
 
 class TestTaskState:
+    @pytest.mark.parametrize("pid", [2**31, 10**20], ids=["2**31", "10**20"])
+    def test_pid_field_rejects_a_pid_no_process_can_have(self, pid: int) -> None:
+        """A state YAML recording such a pid must fail to load, so the
+        corrupt-state quarantine takes it before any probe of it."""
+        with pytest.raises(ValidationError):
+            TaskState(task_id="001-foo", status="running", pid=pid)
+
+    def test_pid_field_accepts_pid_max(self) -> None:
+        assert TaskState(task_id="001-foo", pid=PID_MAX).pid == 2**31 - 1
+
     def test_defaults(self) -> None:
         s = TaskState(task_id="001-foo")
         assert s.status == "pending"

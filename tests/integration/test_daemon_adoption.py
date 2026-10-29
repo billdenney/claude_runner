@@ -32,7 +32,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shutil
 import signal
+import tempfile
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -599,3 +601,91 @@ def test_daemon_demotes_task_whose_pid_another_process_has(
     demoted = load_state(state_path_for(qd, "t-reused"))
     assert (demoted.status, demoted.stop_reason) == ("failed", ORPHAN_STOP_REASON)
     assert dispatcher_mod._pid_alive(live_worker_pid)
+
+
+@pytest.mark.parametrize("pid", [2**31, 10**20], ids=["2**31", "10**20"])
+def test_daemon_starts_with_an_out_of_range_task_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int
+) -> None:
+    """No process can have a pid outside the C ``pid_t`` range, and
+    ``os.kill`` raises ``OverflowError`` (not ``OSError``) for one. A
+    ``running`` state YAML recording such a pid must not crash supervisor
+    startup: the corrupt-state quarantine (ADR-0028) takes it, and the
+    task reverts to pending."""
+    qd = _queue(tmp_path)
+    _seed_exited(qd, "t-pid", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70))
+    path = state_path_for(qd, "t-pid")
+    path.write_text(path.read_text().replace(f"pid: {_EXITED_PID}\n", f"pid: {pid}\n"))
+
+    _notifications, events = _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+    assert not path.exists()
+    assert [
+        (p["task_id"], p["preserved_status"]) for k, p in events if k == "corrupt_state_quarantined"
+    ] == [("t-pid", None)]
+
+
+def _far_future_mtime_dir(tmp_path: Path) -> Path:
+    """A directory whose filesystem stores an mtime past year 9999 as given.
+
+    ext4 clamps a far-future mtime to year 2446, so the queue goes on tmpfs
+    (``/dev/shm``), which keeps 64-bit seconds; skipped where neither works.
+    """
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        root = Path(tempfile.mkdtemp(dir=shm, prefix="ctr-mtime-"))
+        probe = root / "probe"
+        probe.write_text("x")
+        os.utime(probe, (253402300800, 253402300800))
+        if probe.stat().st_mtime == 253402300800:
+            probe.unlink()
+            return root
+        shutil.rmtree(root)
+    pytest.skip("no writable filesystem here stores an mtime past year 9999")
+
+
+def test_daemon_starts_with_a_worker_log_mtime_past_year_9999(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup silent-orphan reaper reads each running worker's log
+    mtime as a sign of life. One no datetime can hold (past year 9999,
+    possible on tmpfs) must not crash startup: it is no sign of life, and
+    the task is handled on the others."""
+    root = _far_future_mtime_dir(tmp_path)
+    try:
+        qd = _queue(root)
+        log = _seed_exited(qd, "t-mtime", [_INIT, _ASSISTANT], heartbeat_age=timedelta(seconds=70))
+        os.utime(log, (253402300800, 253402300800))
+        monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+
+        _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+        reloaded = load_state(state_path_for(qd, "t-mtime"))
+        assert (reloaded.status, reloaded.stop_reason) == ("failed", ORPHAN_STOP_REASON)
+    finally:
+        shutil.rmtree(root)
+
+
+def test_daemon_records_an_exited_worker_whose_log_mtime_is_past_year_9999(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exited-worker finalize dates the run by its log's last write. An
+    mtime no datetime can hold dates it at now, like any mtime after now,
+    and the finished run is still recorded rather than left for the
+    demotion as a failed finalize."""
+    root = _far_future_mtime_dir(tmp_path)
+    try:
+        qd = _queue(root)
+        log = _seed_exited(
+            qd, "t-mtime-done", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70)
+        )
+        os.utime(log, (253402300800, 253402300800))
+        monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+
+        _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+        reloaded = load_state(state_path_for(qd, "t-mtime-done"))
+        assert reloaded.status == "completed"
+        assert [run.finished_at for run in reloaded.runs] == [_NOW]
+    finally:
+        shutil.rmtree(root)

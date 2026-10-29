@@ -522,6 +522,60 @@ def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None
     )
 
 
+@pytest.mark.parametrize(
+    "mtime",
+    [
+        pytest.param(253402300800.0, id="year-10000"),
+        pytest.param(1e20, id="past-time_t"),
+    ],
+)
+def test_fs_mtime_no_datetime_can_hold_is_not_activity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, mtime: float
+) -> None:
+    """A file mtime past year 9999 passes the window check (it lies in the
+    future), but no datetime can hold it. It proves nothing: the FS check
+    is skipped with a WARNING and the heartbeat verdict applies, exactly as
+    for an mtime past the window, instead of the reaper raising."""
+    qd = _queue(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    _seed_task_and_state(
+        qd,
+        "t-fs-far-future",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-far-future"))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        results = reap_silent_orphans_tick(
+            qd,
+            {"t-fs-far-future"},
+            settings=_settings(alert=300, kill=0, fs_window=600),
+            clock=FakeClock(_now()),
+            fs_mtime_fn=lambda _path: mtime,
+            worker_probe_fn=worker_gone,
+        )
+
+    assert [r.verdict for r in results] == [HeartbeatVerdict.SILENT]
+    after = load_state(state_path_for(qd, "t-fs-far-future"))
+    assert (after.status, after.last_heartbeat_at) == ("possibly_hung", before.last_heartbeat_at)
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "newest file mtime" in r.getMessage()
+    ]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith(
+        f"silent-orphan reaper: t-fs-far-future: newest file mtime under {work} "
+        f"is out of range (timestamp {mtime!r} is out of range: "
+    ), warnings[0]
+    assert warnings[0].endswith("); skipping FS check"), warnings[0]
+
+
 def test_fs_check_skipped_when_no_working_dir(tmp_path: Path) -> None:
     """Tasks without a working_dir (research/analysis) skip the FS
     check entirely and proceed with the heartbeat verdict."""

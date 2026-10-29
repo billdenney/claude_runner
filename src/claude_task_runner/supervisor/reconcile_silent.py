@@ -189,12 +189,12 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock
+from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
@@ -970,12 +970,27 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
 
 
 def _log_written_at(state: TaskState) -> datetime | None:
-    """When the worker last wrote its stream log, or ``None`` with no log."""
+    """When the worker last wrote its stream log, or ``None`` with no log.
+
+    Also ``None``, with a WARNING, for an mtime no datetime can hold (past
+    year 9999, which tmpfs stores as given): that is no sign of life.
+    """
     if state.log_path is None:
         return None
     try:
-        return datetime.fromtimestamp(os.stat(state.log_path).st_mtime, tz=UTC)
+        mtime = os.stat(state.log_path).st_mtime
     except OSError:
+        return None
+    try:
+        return utc_from_timestamp(mtime)
+    except TimestampOutOfRange as exc:
+        logger.warning(
+            "silent-orphan reaper: %s: worker log %s has an mtime out of range (%s); "
+            "not counting it as a sign of life",
+            state.task_id,
+            state.log_path,
+            exc,
+        )
         return None
 
 
@@ -1355,7 +1370,19 @@ def _maybe_refresh_from_filesystem(
     # FS-confirmed activity. Refresh last_heartbeat_at from the mtime
     # so the next reaper pass measures silence from the most-recent
     # confirmed activity (NOT from the prior stale stream-json event).
-    mtime_dt = datetime.fromtimestamp(latest_mtime, tz=UTC)
+    try:
+        mtime_dt = utc_from_timestamp(latest_mtime)
+    except TimestampOutOfRange as exc:
+        # An mtime no datetime can hold (past year 9999, say) is no
+        # evidence of activity: act on the heartbeat verdict instead.
+        logger.warning(
+            "silent-orphan reaper: %s: newest file mtime under %s is out of range (%s); "
+            "skipping FS check",
+            state.task_id,
+            working_dir,
+            exc,
+        )
+        return False
     refreshed = state.model_copy(update={"last_heartbeat_at": mtime_dt})
 
     outcome = _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck)

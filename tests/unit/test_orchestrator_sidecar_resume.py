@@ -175,8 +175,18 @@ def test_in_flight_task_is_skipped(queue_dir: Path) -> None:
     assert task.id not in {t.id for t in eligible}
 
 
+@pytest.mark.parametrize(
+    "state_text",
+    [
+        pytest.param("not yaml: ][[", id="unparseable-yaml"),
+        pytest.param(
+            "schema_version: 2\ntask_id: t-corrupt-state\nstatus: completed\npid: 2147483648\n",
+            id="pid-above-pid-max",
+        ),
+    ],
+)
 def test_unparseable_state_file_is_skipped_not_dispatched(
-    queue_dir: Path, caplog: pytest.LogCaptureFixture
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, state_text: str
 ) -> None:
     """A state file that can't parse must cause the task to be SKIPPED, not
     silently treated as "not yet dispatched".
@@ -190,7 +200,7 @@ def test_unparseable_state_file_is_skipped_not_dispatched(
     task = _make_task("t-corrupt-state")
     _write_task_yaml(queue_dir, task)
     state_path_for(queue_dir, task.id).parent.mkdir(parents=True, exist_ok=True)
-    state_path_for(queue_dir, task.id).write_text("not yaml: ][[", encoding="utf-8")
+    state_path_for(queue_dir, task.id).write_text(state_text, encoding="utf-8")
     in_flight: dict[str, DispatchSlot] = {}
     with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
         eligible = _eligible_candidates(queue_dir, in_flight, set())

@@ -17,6 +17,11 @@ anything: a refusal logs at ERROR and raises :class:`UnsafeSignalTarget`.
 Liveness probes (signal 0) go through :func:`kill` as well, so a probe of
 pid 1 does not report init as a live worker.
 
+They also refuse a pid or group above :data:`PID_MAX`. No process can have
+one, and ``os.kill``, ``os.killpg`` and ``os.getpgid`` raise
+``OverflowError`` for it, which is not an ``OSError``: a corrupt recorded
+pid would otherwise escape every ``except OSError`` around a probe.
+
 ``tests/unit/test_process_signals.py`` fails if code under ``src`` calls
 ``os.kill`` or ``os.killpg`` anywhere else.
 """
@@ -28,6 +33,13 @@ import os
 import signal
 
 logger = logging.getLogger(__name__)
+
+PID_MAX = 2**31 - 1
+"""The largest value a C ``pid_t`` holds, and so the largest pid or process
+group ``os.kill``, ``os.killpg`` and ``os.getpgid`` accept: above it they
+raise ``OverflowError``. The kernel's own ceiling,
+``/proc/sys/kernel/pid_max``, is lower (at most 2**22); a recorded pid
+between the two is merely a process that does not exist."""
 
 
 class UnsafeSignalTarget(ValueError):
@@ -46,6 +58,8 @@ def _pid_hazard(pid: int) -> str | None:
         return "pid 1 is init, and process group 1 is every process the user owns"
     if pid < 0:
         return "a negative pid is a process group, and -1 is every process the user owns"
+    if pid > PID_MAX:
+        return f"no process has a pid above {PID_MAX}, the largest a C pid_t holds"
     if pid == os.getpid():
         return "it is this process"
     return None
@@ -59,6 +73,8 @@ def _pgid_hazard(pgid: int) -> str | None:
         return "killpg(1) is kill(-1), which signals every process the user owns"
     if pgid < 0:
         return "a process group id is never negative"
+    if pgid > PID_MAX:
+        return f"no process group has an id above {PID_MAX}, the largest a C pid_t holds"
     if pgid == os.getpgrp():
         return "it is this process's own group"
     return None
@@ -93,7 +109,8 @@ def refuse_unsafe_pid(pid: int, action: str) -> None:
 
 
 def kill(pid: int, sig: int) -> None:
-    """``os.kill(pid, sig)``, refusing a pid of 1 or less and this process's own.
+    """``os.kill(pid, sig)``, refusing a pid of 1 or less, above :data:`PID_MAX`,
+    or this process's own.
 
     Raises :class:`UnsafeSignalTarget` without sending anything on a
     refusal; otherwise raises whatever ``os.kill`` raises.
@@ -103,7 +120,8 @@ def kill(pid: int, sig: int) -> None:
 
 
 def killpg(pgid: int, sig: int) -> None:
-    """``os.killpg(pgid, sig)``, refusing a group of 1 or less and this process's own.
+    """``os.killpg(pgid, sig)``, refusing a group of 1 or less, above
+    :data:`PID_MAX`, or this process's own.
 
     Raises :class:`UnsafeSignalTarget` without sending anything on a
     refusal; otherwise raises whatever ``os.killpg`` raises.

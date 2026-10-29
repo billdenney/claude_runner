@@ -364,7 +364,12 @@ def gather() -> Facts:
             saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
             with open(sup_json, encoding="utf-8") as fh:
                 loaded = json.load(fh)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, OverflowError) as exc:
+            # fromtimestamp raises ValueError for a year outside 1..9999,
+            # OverflowError past the platform's time_t, and OSError when
+            # gmtime rejects a value that fits time_t. This script runs
+            # under the system python3 and cannot import the package's
+            # clock.utc_from_timestamp, which turns all three into one error.
             snapshot_error = str(exc)
         else:
             if isinstance(loaded, dict):
