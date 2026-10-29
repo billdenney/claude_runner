@@ -137,6 +137,7 @@ def main(argv: list[str]) -> int:
         default=[],
         help="Additional fully-qualified ref to include (repeatable).",
     )
+    merge_set.add_record_argument(ap)
     args = ap.parse_args(argv)
     try:
         args.file = merge_set.normalise_path(args.file)
@@ -155,7 +156,8 @@ def main(argv: list[str]) -> int:
     if not worktree.is_dir():
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
     branches = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
-    if not branches:
+    record = merge_set.read_record(args.merged_record) if args.merged_record else None
+    if not branches and record is None:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
             " nothing to verify"
@@ -167,7 +169,7 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    found = merge_set.compute(repo, args.branch, args.base, branches)
+    found = merge_set.compute(repo, args.branch, args.base, branches, record)
     for line in found.summary():
         print(f"    (section-verifier) {line}")
     if not found.members:

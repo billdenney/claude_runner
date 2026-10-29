@@ -372,6 +372,7 @@ def main(argv: list[str]) -> int:
         required=True,
         help="repo-relative path to a register file to check (repeatable)",
     )
+    merge_set.add_record_argument(ap)
     args = ap.parse_args(argv)
     try:
         args.file = [merge_set.normalise_path(path) for path in args.file]
@@ -390,7 +391,8 @@ def main(argv: list[str]) -> int:
     if worktree is None:
         return fail(f"no worktree of {repo} has --branch {args.branch!r} checked out")
     refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
-    if not refs:
+    record = merge_set.read_record(args.merged_record) if args.merged_record else None
+    if not refs and record is None:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
             " nothing to verify"
@@ -408,7 +410,7 @@ def main(argv: list[str]) -> int:
     if not targets:
         return 0
 
-    found = merge_set.compute(repo, args.branch, args.base, refs)
+    found = merge_set.compute(repo, args.branch, args.base, refs, record)
     for line in found.summary():
         print(f"    (reverts) {line}")
     if not found.members:

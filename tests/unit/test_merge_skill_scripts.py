@@ -715,6 +715,23 @@ class TestMergeBranches:
         assert f"WARNING: verifier reported missing contributions in {REGISTER}.\n" in done.stdout
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) != ""
 
+    def test_finish_gates_the_commits_the_run_merged_not_the_refs_now(self, repo: Path) -> None:
+        """claude/a2, whose model the merge lost, is force-pushed to unrelated
+        content after the stop. --finish checks the commit the run merged, so
+        the loss still stops it, and the rewritten ref changes nothing."""
+        _, finish = self._stop_on_lost_lkst(repo)
+        merged = git(repo, "rev-parse", "origin/claude/a2").strip()
+        git(repo, "checkout", "-q", "-B", "rewrite", "main")
+        commit(repo, {"inst/other.txt": "unrelated\n"}, "Rewrite claude/a2")
+        git(repo, "push", "-q", "--force", "origin", "rewrite:claude/a2")
+        git(repo, "checkout", "-q", "main")
+        git(repo, "fetch", "-q", "origin")
+        assert git(repo, "rev-parse", "origin/claude/a2").strip() != merged
+        left = run(*finish)
+        assert left.returncode == 9, left.stdout + left.stderr
+        assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in left.stdout
+        assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
     def test_finish_needs_no_flag_once_every_loss_is_reconciled(self, repo: Path) -> None:
         """Filed by hand, claude/a2's model and section satisfy the verifier
         --finish re-runs, so --accept-verifier-losses is not needed."""
@@ -831,19 +848,36 @@ class TestMergeBranches:
         refused = run(*finish, *given)
         assert (refused.returncode, refused.stderr) == (2, f"ERROR: {message}\n")
 
-    def test_finish_stops_when_a_merged_ref_is_gone(
+    def test_finish_checks_a_pruned_ref_at_the_commit_the_run_merged(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A branch the run merged was pruned since: without it the verifier
-        would check a smaller merge set, so --finish names it and stops."""
+        """feature/a2, whose model the merge lost, is pruned after the stop; its
+        merged commit is still in the objects, so --finish checks that commit
+        and the loss still stops it."""
         _, finish = self._stop_with_extra_refs(repo, monkeypatch, tmp_path)
-        sha = git(repo, "rev-parse", "origin/feature/a2").strip()
         git(repo, "update-ref", "-d", "refs/remotes/origin/feature/a2")
+        left = run(*finish)
+        assert left.returncode == 9, left.stdout + left.stderr
+        assert "    LKST  <-  A2_2020_x.R   (from feature/a2)\n" in left.stdout
+
+    def test_finish_stops_when_a_recorded_commit_is_missing(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A merged commit the record names that the objects lack cannot be
+        checked, so --finish names it and stops."""
+        _, finish = self._stop_with_extra_refs(repo, monkeypatch, tmp_path)
+        wt = repo / ".worktrees" / CONSOLIDATION
+        inputs = Path(
+            git(wt, "rev-parse", "--path-format=absolute", "--git-path", "merge-inputs").strip()
+        )
+        merged = git(repo, "rev-parse", "origin/feature/a2").strip()
+        missing = "0" * 40
+        inputs.write_text(inputs.read_text().replace(merged, missing))
         refused = run(*finish)
         assert (refused.returncode, refused.stderr) == (
             3,
-            f"ERROR: --finish: the run merged origin/feature/a2 at {sha[:12]}, and that ref no"
-            f" longer exists; fetch it, or recreate it at {sha}, then run --finish again.\n",
+            f"ERROR: --finish: the run merged origin/feature/a2 at {missing}, which is not in"
+            " this repository's objects; fetch it, then run --finish again.\n",
         )
 
     @pytest.mark.parametrize(
@@ -2385,7 +2419,7 @@ class TestMergeSet:
         assert proc.stdout == f"origin/claude/a {merged} {_sha(repo, 'origin/main')}\n"
         assert proc.stderr == (
             "# merge-set gate: skipped 1 branch(es) that consolidation did not merge (left out"
-            " with --exclude-ref, or pushed after the survey)\n"
+            " with --exclude-ref, or pushed after the survey): origin/claude/b\n"
             "# merge-set gate: origin/claude/a moved on after consolidation merged it; reading"
             f" the merged commit {merged[:12]}, not its tip {tip[:12]}\n"
         )
@@ -2457,7 +2491,7 @@ class TestMergeSetGate:
         assert (worktree / REGISTER).read_text() == _with_models(B_ENTRY, A_ENTRY) + BMI_BLOCK
         assert proc.stderr.startswith(
             "# merge-set gate: skipped 1 branch(es) that consolidation did not merge (left out"
-            " with --exclude-ref, or pushed after the survey)\n"
+            " with --exclude-ref, or pushed after the survey): origin/claude/c\n"
             "# merge-set gate: origin/claude/a moved on after consolidation merged it;"
         )
 
@@ -2477,7 +2511,7 @@ class TestMergeSetGate:
         a_merged = _sha(repo, "consolidation~1^2")  # claude/a was merged first, then claude/b
         gate = (
             "    (placement) merge-set gate: skipped 1 branch(es) that consolidation did not"
-            " merge (left out with --exclude-ref, or pushed after the survey)\n"
+            " merge (left out with --exclude-ref, or pushed after the survey): origin/claude/c\n"
             "    (placement) merge-set gate: origin/claude/a moved on after consolidation merged"
             f" it; reading the merged commit {a_merged[:12]}, not its tip"
             f" {_sha(repo, 'origin/claude/a')[:12]}\n"

@@ -104,8 +104,11 @@
 #                           the run's other inputs -- --base, --pattern,
 #                           --extra-ref, --union-file and the register files
 #                           -- from the worktree, refusing a conflicting one
-#                           given here (exit 2) and stopping when a ref the
-#                           run merged no longer exists (exit 3). It refuses
+#                           given here (exit 2). Its gates read every ref the
+#                           run merged at the commit it merged, so a ref
+#                           rewritten or pruned since changes nothing; a
+#                           recorded commit missing from the objects stops it
+#                           (exit 3). It refuses
 #                           a worktree whose run stopped before its repairs
 #                           completed (exit 3), and one with uncommitted
 #                           changes or untracked files, listing them. It
@@ -148,7 +151,7 @@
 #      terminal, or the worktree already exists; for --finish, no worktree,
 #      a worktree on another branch, one with uncommitted changes or
 #      untracked files, no recorded inputs, a run that stopped before its
-#      repairs completed, a ref the run merged that no longer exists, or no
+#      repairs completed, a merged commit missing from the objects, or no
 #      Rscript while an R step is still pending
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
@@ -187,6 +190,8 @@ STAGES_FILE=""
 # The gates' inputs and the refs the run merged (record_inputs), for --finish.
 INPUTS_FILE=""
 MERGED_REFS=()
+# With --finish, the gates read the merge set the run recorded (--merged-record).
+RECORD_ARGS=()
 BASE_GIVEN=0
 PATTERN_GIVEN=0
 UNION_FILE_GIVEN=0
@@ -357,8 +362,8 @@ read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given 
       extra-ref) extras+=("$value") ;;
       register-file) registers+=("$value") ;;
       merged)
-        if ! git rev-parse --verify --quiet "$value^{commit}" >/dev/null; then
-          die 3 "--finish: the run merged $value at ${sha:0:12}, and that ref no longer exists; fetch it, or recreate it at $sha, then run --finish again."
+        if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+          die 3 "--finish: the run merged $value at $sha, which is not in this repository's objects; fetch it, then run --finish again."
         fi ;;
     esac
   done < "$INPUTS_FILE"
@@ -384,9 +389,15 @@ read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given 
   UNION_FILE=$union
   EXTRA_REFS=("${extras[@]}")
   REGISTER_FILES=("${registers[@]}")
+  # The gates read each merged ref at the commit recorded for it, so a ref
+  # rewritten or pruned since changes nothing; an extra ref gone since is left
+  # out of the candidates the gates list.
+  RECORD_ARGS=(--merged-record "$INPUTS_FILE")
   EXTRA_REF_ARGS=()
   for value in "${EXTRA_REFS[@]:-}"; do
-    if [[ -n "$value" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$value"); fi
+    if [[ -n "$value" ]] && git rev-parse --verify --quiet "$value^{commit}" >/dev/null; then
+      EXTRA_REF_ARGS+=(--extra-ref "$value")
+    fi
   done
 }
 
@@ -461,7 +472,7 @@ verify_contributions() {  # <run|finish>: the contribution verifier on every reg
     verify_rc=0
     "$SCRIPT_DIR/verify_branch_contributions.sh" --repo "$REPO" --branch "$BRANCH_NAME" \
       --base "$BASE" --pattern "$PATTERN" --file "$vf" "${EXTRA_REF_ARGS[@]}" \
-      | tee "$out" || verify_rc=$?
+      ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} | tee "$out" || verify_rc=$?
     if (( verify_rc == 1 && ACCEPT_VERIFIER_LOSSES )); then
       echo "WARNING: verifier reported missing contributions in $vf."
       echo "         --accept-verifier-losses: the run goes on. Reconcile them by hand"
@@ -494,7 +505,7 @@ revert_check() {  # gate: register content the base has that the merge, or a han
   echo "==> Checking the registers for base content the merge reverted"
   "$PYTHON3" "$SCRIPT_DIR/verify_no_base_reverts.py" \
     --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN" \
-    "${EXTRA_REF_ARGS[@]}" "${targets[@]}" || revert_rc=$?
+    "${EXTRA_REF_ARGS[@]}" ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} "${targets[@]}" || revert_rc=$?
   if (( revert_rc == 1 )); then
     {
       echo "ERROR: the merge reverted register content $BASE has (listed above). Nothing"

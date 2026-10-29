@@ -206,7 +206,8 @@ class MergeSet:
         if self.not_merged:
             lines.append(
                 f"merge-set gate: skipped {len(self.not_merged)} branch(es) that {self.branch}"
-                " did not merge (left out with --exclude-ref, or pushed after the survey)"
+                " did not merge (left out with --exclude-ref, or pushed after the survey): "
+                + ", ".join(self.not_merged)
             )
         for member in self.members:
             if member.advanced:
@@ -218,8 +219,58 @@ class MergeSet:
         return lines
 
 
-def compute(repo: Path, branch: str, base: str, refs: Sequence[str]) -> MergeSet:
-    """Split ``refs`` into the members of ``branch``'s merge set and the rest."""
+def read_record(path: str) -> list[tuple[str, str]]:
+    """The ``(ref, merged commit)`` pairs a consolidation run recorded, from the
+    ``merged<TAB>ref<TAB>commit`` lines of its inputs file."""
+    pairs = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        key, _, rest = line.partition("\t")
+        if key == "merged":
+            ref, _, sha = rest.partition("\t")
+            pairs.append((ref, sha))
+    if not pairs:
+        raise GitError(f"{path} records no merged ref")
+    return pairs
+
+
+def _recorded(
+    repo: Path, branch: str, base: str, refs: Sequence[str], record: Sequence[tuple[str, str]]
+) -> MergeSet:
+    """The merge set a run recorded: each ref at the commit it merged, whatever
+    the ref holds now, so a ref rewritten or pruned since changes nothing."""
+    base_sha = git(repo, "rev-parse", f"{base}^{{commit}}").strip()
+    members = []
+    for ref, sha in record:
+        if _run(repo, ["cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0:
+            raise GitError(f"the run merged {ref} at {sha}, which is not in {repo}'s objects")
+        tip = sha
+        if resolves(repo, ref):
+            tip = git(repo, "rev-parse", f"{ref}^{{commit}}").strip()
+        fork = merge_base(repo, base_sha, sha)
+        if fork is None:
+            raise GitError(f"{ref} was merged into {branch} but shares no history with {base}")
+        members.append(Member(ref, tip, sha, fork))
+    names = {ref for ref, _ in record}
+    rest = [ref for ref in refs if ref not in names]
+    tips = git(repo, "rev-parse", *(f"{ref}^{{commit}}" for ref in rest)).split() if rest else []
+    on_base = [ref for ref, tip in zip(rest, tips, strict=True) if is_ancestor(repo, tip, base_sha)]
+    not_merged = [ref for ref in rest if ref not in on_base]
+    return MergeSet(branch, base, tuple(members), tuple(not_merged), tuple(on_base))
+
+
+def compute(
+    repo: Path,
+    branch: str,
+    base: str,
+    refs: Sequence[str],
+    record: Sequence[tuple[str, str]] | None = None,
+) -> MergeSet:
+    """Split ``refs`` into the members of ``branch``'s merge set and the rest.
+
+    With ``record`` (read_record), the members are the refs it names at the
+    commits it names, and ``refs`` only says which other candidates exist."""
+    if record is not None:
+        return _recorded(repo, branch, base, refs, record)
     if not refs:
         return MergeSet(branch, base, (), (), ())
     shas = git(repo, "rev-parse", *(f"{ref}^{{commit}}" for ref in (branch, base, *refs)))
@@ -261,6 +312,16 @@ def touches(repo: Path, member: Member, path: str) -> bool:
     return proc.returncode == 1
 
 
+def add_record_argument(ap: argparse.ArgumentParser) -> None:
+    """--merged-record, which every gate --finish runs takes (see read_record)."""
+    ap.add_argument(
+        "--merged-record",
+        metavar="FILE",
+        help="a consolidation run's inputs file: check the refs it merged, at the commits"
+        " it merged, rather than what the refs hold now",
+    )
+
+
 def fail(message: str) -> int:
     print(f"ERROR: (merge-set) {message}", file=sys.stderr)
     return 2
@@ -284,6 +345,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--quiet", action="store_true", help="do not print what the gate left out, on stderr"
     )
+    add_record_argument(ap)
     args = ap.parse_args(argv)
 
     repo = Path(args.repo)
@@ -295,9 +357,10 @@ def main(argv: list[str]) -> int:
         if not resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     refs = candidate_refs(repo, args.pattern, args.extra_ref)
-    if not refs:
+    record = read_record(args.merged_record) if args.merged_record else None
+    if not refs and record is None:
         return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
-    found = compute(repo, args.branch, args.base, refs)
+    found = compute(repo, args.branch, args.base, refs, record)
     if not args.quiet:
         for line in found.summary():
             print(f"# {line}", file=sys.stderr)

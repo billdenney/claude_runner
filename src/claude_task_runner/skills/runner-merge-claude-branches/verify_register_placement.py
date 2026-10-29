@@ -140,6 +140,7 @@ def main() -> int:
     ap.add_argument("--pattern", default="origin/claude/*")
     ap.add_argument("--extra-ref", action="append", default=[])
     ap.add_argument("--file", required=True)
+    merge_set.add_record_argument(ap)
     args = ap.parse_args()
     try:
         args.file = merge_set.normalise_path(args.file)
@@ -169,7 +170,8 @@ def main() -> int:
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
 
     refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
-    if not refs:
+    record = merge_set.read_record(args.merged_record) if args.merged_record else None
+    if not refs and record is None:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
             " nothing to verify"
@@ -188,7 +190,7 @@ def main() -> int:
     # branches out on purpose, so the pattern also matches branches that are
     # not in this merge; holding the merge responsible for their content would
     # be a false positive.  merge_set.py decides, from ancestry.
-    found = merge_set.compute(repo, args.branch, args.base, refs)
+    found = merge_set.compute(repo, args.branch, args.base, refs, record)
     for line in found.summary():
         print(f"    (placement) {line}")
     if not found.members:

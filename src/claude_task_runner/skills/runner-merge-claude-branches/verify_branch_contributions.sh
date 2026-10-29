@@ -42,6 +42,10 @@
 #   --file <path>           Repo-relative file to verify (default:
 #                           inst/references/covariate-columns.md). Pass ""
 #                           to disable the verifier.
+#   --merged-record <file>  A consolidation run's inputs file (merge_branches.sh
+#                           --finish passes it): check the refs it merged, at
+#                           the commits it merged, rather than what the refs
+#                           hold now.
 #   -h, --help              Show this help.
 #
 # Exit codes:
@@ -67,6 +71,7 @@ BASE="origin/main"
 PATTERN="origin/claude/*"
 FILE="inst/references/covariate-columns.md"
 EXTRA_REFS=()
+MERGED_RECORD=""
 
 die() {
   echo "ERROR: (verifier) $*" >&2
@@ -89,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --pattern) need_value "$@"; PATTERN="$2"; shift 2 ;;
     --extra-ref) need_value "$@"; EXTRA_REFS+=("$2"); shift 2 ;;
     --file) need_value "$@"; FILE="$2"; shift 2 ;;
+    --merged-record) need_value "$@"; MERGED_RECORD="$2"; shift 2 ;;
     -h|--help)
       awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
       exit 0 ;;
@@ -130,8 +136,9 @@ for er in "${EXTRA_REFS[@]:-}"; do
   resolves "$er" || die "--extra-ref '$er' does not resolve to a commit in $REPO"
   CANDIDATES=$((CANDIDATES + 1))
 done
-# Checking no branch at all would report every contribution present.
-(( CANDIDATES > 0 )) \
+# Checking no branch at all would report every contribution present; a record
+# names the branches itself.
+(( CANDIDATES > 0 )) || [[ -n "$MERGED_RECORD" ]] \
   || die "no branch matches --pattern '$PATTERN' and no --extra-ref was given; nothing to verify"
 
 MERGED_FILE="$WT/$FILE"
@@ -149,6 +156,7 @@ delegated_args=(
 for er in "${EXTRA_REFS[@]:-}"; do
   [[ -n "$er" ]] && delegated_args+=( --extra-ref "$er" )
 done
+if [[ -n "$MERGED_RECORD" ]]; then delegated_args+=( --merged-record "$MERGED_RECORD" ); fi
 
 # One "<ref> <merged commit> <fork point>" line per member of the merge set.
 # The delegated verifiers report what the gate left out, so this one is quiet.
