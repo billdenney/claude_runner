@@ -339,6 +339,29 @@ finish_command() {  # the --finish that completes this run: the worktree's ident
   echo "$cmd --finish"
 }
 
+normalise_registers() {  # the union and register paths as git's trees name them (merge_set.normalise_path)
+  local normalised line
+  normalised="$("$PYTHON3" - "$SCRIPT_DIR" "$UNION_FILE" "${REGISTER_FILES[@]:-}" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import merge_set
+
+for path in sys.argv[2:]:
+    try:
+        print(merge_set.normalise_path(path) if path else "")
+    except merge_set.GitError as err:
+        sys.exit(f"ERROR: --union-file/--register-file: {err}")
+PY
+)" || exit 2
+  UNION_FILE=""
+  REGISTER_FILES=()
+  local first=1
+  while IFS= read -r line; do
+    if (( first )); then UNION_FILE=$line; first=0; elif [[ -n "$line" ]]; then REGISTER_FILES+=("$line"); fi
+  done <<< "$normalised"
+}
+
 record_inputs() {  # the gates' inputs and every ref merged, at the commit merged
   local item
   {
@@ -855,12 +878,19 @@ stage_stale() {  # <stage> <commit it completed at>: whether the branch has move
   # models and the artifacts, so commits that changed only the run's
   # registers leave them standing.
   git rev-parse --verify --quiet "$done_at^{commit}" >/dev/null || return 0
+  # To a file, not a process substitution, so a diff that fails stops the run
+  # rather than reading as "nothing changed"; --no-renames, so a vignette
+  # renamed onto a register path counts as the vignette it was.
+  local changed
+  changed="$(git rev-parse --path-format=absolute --git-path vignette-diff)"
+  git diff -z --no-renames --name-only "$done_at" HEAD > "$changed" \
+    || die 5 "cannot tell whether the vignettes are out of date: git diff $done_at HEAD failed."
   while IFS= read -r -d '' path; do
     for register in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
       if [[ -n "$register" && "$path" == "$register" ]]; then continue 2; fi
     done
     return 0
-  done < <(git diff -z --name-only "$done_at" HEAD)
+  done < "$changed"
   return 1
 }
 
@@ -884,9 +914,10 @@ stage_status() {  # <stage>: due, done, run-skip or finish-skip, for --finish no
 }
 
 finish_r_stages() {  # --finish: every R stage the run did not complete, or that is out of date
-  local stage state flags="" due=()
+  local stage state status flags="" due=()
   for stage in regen check vignettes; do
-    if [[ "$(stage_status "$stage")" == due ]]; then
+    status="$(stage_status "$stage")" || exit $?
+    if [[ "$status" == due ]]; then
       due+=("$stage")
       flags+=" $(stage_flag "$stage")"
     fi
@@ -898,7 +929,8 @@ finish_r_stages() {  # --finish: every R stage the run did not complete, or that
   # stages after it out of date.
   for stage in regen check vignettes; do
     state="$(stage_get "$stage")"
-    case "$(stage_status "$stage")" in
+    status="$(stage_status "$stage")" || exit $?
+    case "$status" in
       run-skip | finish-skip) echo "    ($stage: $(stage_skip_note "$stage"))" ;;
       done) echo "    ($stage: completed at ${state:0:12})" ;;
       due)
@@ -991,6 +1023,7 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die 3 "$REPO is not a git
 
 if (( FINISH )); then
   [[ -n "$PYTHON3" ]] || die 3 "python3 is not on PATH; the duplicate check needs it."
+  normalise_registers
   WT_ABS="$REPO/.worktrees/${BRANCH_NAME}"
   [[ -d "$WT_ABS" ]] || die 3 "--finish: no worktree at $WT_ABS; run without --finish first."
   cd "$WT_ABS"
@@ -1187,6 +1220,7 @@ fi
 # The repair steps are all python3 scripts, and the R steps need Rscript.
 # Checked before anything is created, rather than after the merges.
 [[ -n "$PYTHON3" ]] || die 3 "python3 is not on PATH; the union-merge, dedup, restore and verify steps need it."
+normalise_registers
 if (( ! SKIP_R_REGEN || ! SKIP_CHECK || ! SKIP_VIGNETTES )) && ! command -v Rscript >/dev/null 2>&1; then
   die 3 "Rscript is not on PATH. Install R, or pass --skip-r-regen, --skip-check and --skip-vignettes and run those steps elsewhere."
 fi

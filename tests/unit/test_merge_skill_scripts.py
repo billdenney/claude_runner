@@ -1421,6 +1421,45 @@ class TestMergeBranchesHandUnion:
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\ncheck\nvignettes\n" + again
 
+    def test_a_vignette_renamed_onto_a_register_path_is_validated_again(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """Rename detection would name only the register path the vignette
+        became; read without it, the vignette path is a change too."""
+        update_main(hand_repo, {"vignettes/articles/a.Rmd": "a vignette\n"}, "Ship a vignette")
+        env, log, _ = self._r_env(tmp_path)
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        git(wt, "mv", "vignettes/articles/a.Rmd", "inst/references/parameter-names.md")
+        git(wt, "commit", "-qm", "Move the vignette")
+        done = run(*self._printed_finish(proc.stderr), env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert log.read_text() == "regen\ncheck\nvignettes\nregen\ncheck\nvignettes\n"
+
+    def test_a_diff_that_fails_stops_finish(self, hand_repo: Path, tmp_path: Path) -> None:
+        """Whether the vignettes are out of date is read from a diff; when it
+        fails, --finish stops rather than take the vignettes for current."""
+        env, _, _ = self._r_env(tmp_path)
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        (wt / "inst" / "modeldb").mkdir(parents=True, exist_ok=True)
+        (wt / "inst" / "modeldb" / "F_2020_f.R").write_text("# F\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "Fix a model by hand")
+        real = shutil.which("git")
+        assert real is not None
+        fake = (
+            '#!/bin/bash\ncase "$*" in *"diff -z --no-renames"*) exit 128 ;; esac\n'
+            f'exec {shlex.quote(real)} "$@"\n'
+        )
+        failing = {**env, "PATH": f"{_bin_dir(tmp_path, 'gitbin', {'git': fake})}:{env['PATH']}"}
+        done = run(*self._printed_finish(proc.stderr), env=failing)
+        assert done.returncode == 5, done.stdout + done.stderr
+        assert "ERROR: cannot tell whether the vignettes are out of date: git diff" in done.stderr
+        assert git(hand_repo, "ls-remote", "origin", CONSOLIDATION) == ""
+
     def test_finish_checks_again_after_a_fix_for_the_vignettes(
         self, hand_repo: Path, tmp_path: Path
     ) -> None:
