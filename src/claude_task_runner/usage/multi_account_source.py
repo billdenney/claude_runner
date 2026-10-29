@@ -177,7 +177,7 @@ class MultiAccountUsageSource:
         (every account has ``last_capture_at=None``) is deterministic.
         """
         snapshot = self._snapshot_getter()
-        epoch = datetime.fromtimestamp(0, tz=UTC)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
         candidates = []
         for name in self._per_account:
             state = snapshot.accounts.get(name)
