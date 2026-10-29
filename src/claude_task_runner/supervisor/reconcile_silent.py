@@ -189,7 +189,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -970,12 +970,27 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
 
 
 def _log_written_at(state: TaskState) -> datetime | None:
-    """When the worker last wrote its stream log, or ``None`` with no log."""
+    """When the worker last wrote its stream log, or ``None`` with no log.
+
+    Also ``None``, with a WARNING, for an mtime no datetime can hold (past
+    year 9999, which tmpfs stores as given): that is no sign of life.
+    """
     if state.log_path is None:
         return None
     try:
-        return datetime.fromtimestamp(os.stat(state.log_path).st_mtime, tz=UTC)
+        mtime = os.stat(state.log_path).st_mtime
     except OSError:
+        return None
+    try:
+        return utc_from_timestamp(mtime)
+    except TimestampOutOfRange as exc:
+        logger.warning(
+            "silent-orphan reaper: %s: worker log %s has an mtime out of range (%s); "
+            "not counting it as a sign of life",
+            state.task_id,
+            state.log_path,
+            exc,
+        )
         return None
 
 

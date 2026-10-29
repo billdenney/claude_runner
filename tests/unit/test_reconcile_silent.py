@@ -15,8 +15,10 @@ chooses between three outcomes:
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +34,7 @@ from claude_task_runner.queue.store import (
 )
 from claude_task_runner.runner.dispatcher import WorkerProbe
 from claude_task_runner.runner.heartbeat import HeartbeatVerdict
+from claude_task_runner.supervisor import reconcile_silent as rs
 from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON
 from claude_task_runner.supervisor.reconcile_silent import (
     KILL_STOP_REASON,
@@ -488,3 +491,45 @@ def test_mixed_verdicts_in_one_pass(tmp_path: Path, live_worker_pid: int) -> Non
     assert load_state(state_path_for(qd, "t-fresh")).status == "running"
     assert load_state(state_path_for(qd, "t-silent")).status == "possibly_hung"
     assert load_state(state_path_for(qd, "t-kill")).status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# The worker log's mtime as a sign of life
+# ---------------------------------------------------------------------------
+
+
+def test_log_written_at_is_the_log_mtime(tmp_path: Path) -> None:
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_text("{}\n")
+    os.utime(log, (1_790_000_000, 1_790_000_000))
+    state = TaskState(task_id="t-log", status="running", log_path=str(log))
+
+    assert rs._log_written_at(state) == datetime.fromtimestamp(1_790_000_000, tz=UTC)
+
+
+def test_a_log_mtime_no_datetime_can_hold_is_no_sign_of_life(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """tmpfs stores an mtime past year 9999 as given, and turning it into a
+    datetime raised out of the startup reaper. It counts as no sign of
+    life, with a WARNING."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_text("{}\n")
+    real_stat = os.stat
+
+    def _stat(path: object, *args: object, **kwargs: object) -> object:
+        if os.fspath(path) == str(log):  # type: ignore[arg-type]
+            return SimpleNamespace(st_mtime=1e12)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rs.os, "stat", _stat)
+    state = TaskState(task_id="t-log", status="running", log_path=str(log))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        assert rs._log_written_at(state) is None
+
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"silent-orphan reaper: t-log: worker log {log} has an mtime out of range "
+        "(timestamp 1000000000000.0 is out of range: year 33658 is out of range); "
+        "not counting it as a sign of life"
+    ]
