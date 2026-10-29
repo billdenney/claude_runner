@@ -170,7 +170,7 @@ def units(text: str) -> list[Unit]:
             current = Unit(section, line, frozenset())
             found.append(current)
         elif line.startswith("### "):
-            current = Unit(section, line, register.heading_names(line[4:])[0])
+            current = Unit(section, line, frozenset(register.heading_names(line[4:])[0]))
             found.append(current)
         else:
             current.lines.append(line)

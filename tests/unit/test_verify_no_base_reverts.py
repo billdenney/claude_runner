@@ -284,7 +284,7 @@ class TestParsing:
 
     def test_a_multi_name_heading_is_one_name_per_entry(self) -> None:
         assert self.v.register.heading_names("fm_a, fm_b ,fm_c (**canonical (nested) x**)") == (
-            frozenset({"fm_a", "fm_b", "fm_c"}),
+            ("fm_a", "fm_b", "fm_c"),
             "(**canonical (nested) x**)",
         )
 

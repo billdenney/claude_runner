@@ -100,17 +100,17 @@ ANY_HEAD = re.compile(r"^#{2,6}\s")  # any block boundary (## or ###+)
 Key = str | tuple[str, str]
 
 
-def heading_names(text: str) -> tuple[frozenset[str], str]:
-    """The names a ``### `` heading declares, and its description.
+def heading_names(text: str) -> tuple[tuple[str, ...], str]:
+    """The names a ``### `` heading declares, in its order, and its description.
 
-    ``"fm_a, fm_b (**canonical ...**)"`` gives ``({"fm_a", "fm_b"}, "(**canonical ...**)")``.
+    ``"fm_a, fm_b (**canonical ...**)"`` gives ``(("fm_a", "fm_b"), "(**canonical ...**)")``.
     """
     names_part, paren, rest = text.partition("(")
-    names = frozenset(name.strip() for name in names_part.split(",") if name.strip())
-    return names or frozenset({text.strip()}), (paren + rest).strip()
+    names = tuple(dict.fromkeys(name.strip() for name in names_part.split(",") if name.strip()))
+    return names or (text.strip(),), (paren + rest).strip()
 
 
-Head = tuple[int, frozenset[str], str]
+Head = tuple[int, tuple[str, ...], str]
 
 
 def _parse(lines: list[str]) -> tuple[list[Head], list[int]]:
