@@ -258,7 +258,8 @@ def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
 
 def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
     """A lost block under a backticked heading (``### `prob_<endpoint>```) or a
-    prose heading is restored like any other, keyed without its backticks."""
+    prose heading is restored like any other, keyed with its backticks as
+    nlmixr2lib's register parsers read it."""
     added = ["KEEP_ME", "NEW_NAME", "`prob_<endpoint>`", "Why kon is not canonical"]
     make_remote_branch(repo, "adds", "main", added, "adds two")
     make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
@@ -270,7 +271,7 @@ def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
     assert rc == 1, out
     assert (
         "# 2 canonical(s) dropped by the merge and missing from refs.md:\n"
-        "    prob_<endpoint>  (## Section A)\n"
+        "    `prob_<endpoint>`  (## Section A)\n"
         "    Why kon is not canonical  (## Section A)\n"
     ) in out, out
 

@@ -322,7 +322,9 @@ exists to repair. Repair, then regenerate.
    verifier caught it.
 
    Every `### ` heading counts, a backticked one (`` ### `prob_<endpoint>` ``)
-   or prose included. When two
+   or prose included. Like the dedup, the union and the placement check, it
+   reads a heading's names as nlmixr2lib's register parsers do: a backticked
+   name keeps its backticks, so `` ### `prob` `` is not `### prob`. When two
    branches added the same canonical in different words and the merge lost
    it, the first branch's copy is restored and each other copy is printed in
    full and appended to the hand-union report (step 6b), for a hand union.

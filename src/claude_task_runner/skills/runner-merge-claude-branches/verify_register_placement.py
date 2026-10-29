@@ -73,14 +73,13 @@ def _blocks(text: str) -> Iterator[tuple[list[str], register._Block]]:
     ("### QTc, QTcF, QTcI, QTcP, QTcS"), and that list GROWS as new spellings
     are ratified. Keying on the whole heading would read a block that gained
     a name as a different canonical and report every model under it as lost,
-    so each name is indexed separately.
+    so each name is indexed separately, read by ``heading_names`` as the
+    dedup reads it.
     """
     lines = text.split("\n")
     heads, bounds = register._parse(lines)
-    for start, _, _ in heads:
-        heading = lines[start]
-        names = [n.strip() for n in heading[4:].split(" (")[0].split(",") if n.strip()]
-        yield names, register._parse_block(lines[start : register._block_end(start, bounds)])
+    for start, names, _ in heads:
+        yield list(names), register._parse_block(lines[start : register._block_end(start, bounds)])
 
 
 def parse(text: str) -> dict[str, set[str]]:

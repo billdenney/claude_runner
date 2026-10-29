@@ -2037,6 +2037,56 @@ class TestUnionEditsFieldsInPlace:
         )
 
 
+class TestABacktickedHeadingIsNotTheBareName:
+    """nlmixr2lib's register parsers keep a heading's backticks:
+    checkNamingRegisters.R reads ``### `prob` `` as a pseudo entry (a pattern
+    or a note, which registers no canonical) and conventions.R drops the name
+    as no identifier. So ``### `prob` `` and ``### prob`` are two headings,
+    to the dedup, the restore and the placement check alike."""
+
+    BLOCK = "\n### {heading} (**{what}**)\n\n- **Example models:** `{model}` ({what}).\n"
+
+    @pytest.mark.parametrize(
+        ("on_base", "added"),
+        [("prob", "`prob`"), ("`prob`", "prob")],
+        ids=["adds-backticked", "adds-bare"],
+    )
+    def test_each_is_its_own_heading(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_base: str, added: str
+    ) -> None:
+        base = BASE_REGISTER + self.BLOCK.format(
+            heading=on_base, what="on the base", model="Base_2019_b.R"
+        )
+        new_block = self.BLOCK.format(heading=added, what="added", model="Added_2020_a.R")
+        both = base + new_block
+
+        register = tmp_path / "register.md"
+        register.write_text(both)
+        proc = run_helper("dedup_canonical_headers.py", "--check", register)
+        assert (proc.returncode, proc.stderr) == (
+            0,
+            f"# clean (no per-##-section duplicate canonicals): {register}\n",
+        )
+
+        placement = load_helper("verify_register_placement")
+        assert dict(placement.parse(both)) == {
+            "WT": {"Base_2000_x.R"},
+            on_base: {"Base_2019_b.R"},
+            added: {"Added_2020_a.R"},
+        }
+
+        zap = base + "\n### ZAP (**canonical for zap**)\n"
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: base})
+        push_task_branch(repo, "claude/adds", {REGISTER: both}, "Add the added heading")
+        push_task_branch(repo, "claude/zap", {REGISTER: zap}, "Register ZAP")
+        wt = consolidate(repo, ["origin/claude/adds", "origin/claude/zap"], CONSOLIDATION)
+        assert (wt / REGISTER).read_text() == zap, "the fixture lost nothing"
+        proc = run_helper("restore_dropped_sections.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert f"    {added}  (## Body size)\n" in proc.stdout
+        assert (wt / REGISTER).read_text() == zap + new_block
+
+
 class TestUnionFindsAFieldUnderAnyOfItsHeadingsNames:
     """A field is the canonical's, whatever its heading says about it. When
     one branch adds a name to a heading, reorders its names or rewords its

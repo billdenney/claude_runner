@@ -18,9 +18,10 @@ branch added relative to its fork point from the base, and re-inserts any that
 are missing from the merge result -- into the same ``## SECTION`` the branch
 filed them under, creating that section only if it does not already exist.
 
-Every ``### `` heading counts, a backticked name (``prob_<endpoint>`` in
-backticks, keyed without them) or prose included. When two branches added the same
-canonical in different words and the merge lost it, the first branch's copy is
+Every ``### `` heading counts, a backticked name or prose included. A heading's
+names are read by ``heading_names``, as nlmixr2lib's register parsers read them:
+a backticked name keeps its backticks, so ``### `prob` `` is not ``### prob``.
+When two branches added the same canonical in different words and the merge lost it, the first branch's copy is
 restored and each other copy is printed in full, and with ``--report FILE``
 appended to the hand-union report, for a hand union. A later heading that
 shares any name with the restored one is such a copy, whatever order it lists
@@ -66,7 +67,6 @@ NAME_INTRO = (
     "to the register's heading by hand and commit: buildModelDb() fails until then.",
 )
 
-HEADER_RE = re.compile(r"^### (.+?)(?:\s*\(|\s*$)")
 SECTION_RE = re.compile(r"^## +(.*?)\s*$")
 
 
@@ -98,8 +98,8 @@ def blocks(text: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
             section = sec.group(1)
             i += 1
             continue
-        hdr = HEADER_RE.match(lines[i])
-        if not hdr:
+        heading = lines[i][4:].strip() if lines[i].startswith("### ") else ""
+        if not heading:
             i += 1
             continue
         start = i
@@ -108,14 +108,13 @@ def blocks(text: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
             lines[i].startswith("### ") or lines[i].startswith("## ") or lines[i].startswith("# ")
         ):
             i += 1
-        names = [n.strip().strip("`").strip() for n in hdr.group(1).split(",")]
-        names = [n for n in names if n]
+        names = register.heading_names(heading)[0]
         block = "".join(lines[start:i]).rstrip("\n") + "\n"
         for nm in names:
             # Key every name a multi-name header declares, so presence checks
             # answer correctly for `### fm_a, fm_b, fm_c`. The first name owns
             # the block for insertion purposes.
-            found.setdefault(nm, (section, block, tuple(names)))
+            found.setdefault(nm, (section, block, names))
     return found
 
 
