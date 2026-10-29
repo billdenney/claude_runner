@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import signal
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -65,6 +66,30 @@ def _worker_probe_off_host_proc(monkeypatch: pytest.MonkeyPatch) -> None:
     tree, or back to ``/proc`` for processes they start.
     """
     monkeypatch.setattr(dispatcher_mod, "_PROC_ROOT", _NO_PROC)
+
+
+@pytest.fixture
+def raise_in_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> Callable[[int | None], None]:
+    """Arm ``dispatcher._dispatch_loop`` to raise ``RuntimeError("boom")`` from
+    its own iteration, after it has consumed ``lines_before`` lines, or after
+    the last one for ``None``. The real loop runs until then."""
+
+    def arm(lines_before: int | None) -> None:
+        real_loop = dispatcher_mod._dispatch_loop
+
+        def _loop(*, lines: Iterable[str], **kwargs: Any) -> Any:
+            def _failing() -> Iterator[str]:
+                for count, line in enumerate(lines, start=1):
+                    yield line
+                    if count == lines_before:
+                        raise RuntimeError("boom")
+                raise RuntimeError("boom")
+
+            return real_loop(lines=_failing(), **kwargs)
+
+        monkeypatch.setattr(dispatcher_mod, "_dispatch_loop", _loop)
+
+    return arm
 
 
 @pytest.fixture
