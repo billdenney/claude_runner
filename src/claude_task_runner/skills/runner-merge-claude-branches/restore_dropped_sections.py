@@ -271,13 +271,15 @@ def main() -> int:
                 # The base's own canonical, which no branch added, even when a
                 # restored heading declares it too.
                 continue
-            earlier = next((restored_from[n] for n in names if n in restored_from), None)
+            added = [n for n in names if n not in base_blocks]
+            earlier = next((restored_from[n] for n in added if n in restored_from), None)
             if earlier is not None:
                 # A copy of a block already restored: its heading shares a name
-                # with the restored one, in any order. Compared once, at its
-                # owner; restoring it too would declare that name twice.
+                # the base lacks with the restored one, in any order. Compared
+                # once, at the first such name; restoring it too would declare
+                # that name twice.
                 kept, first, first_block = earlier
-                if name == owner and block != first_block:
+                if name == added[0] and block != first_block:
                     branch = ref.replace("origin/", "")
                     differing.append((kept, branch, first, first_block, block))
                 continue

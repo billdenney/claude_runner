@@ -450,6 +450,41 @@ def test_a_later_copy_whose_heading_leads_with_another_name_reaches_the_report(
     )
 
 
+def test_a_later_copy_that_also_declares_a_base_name_is_compared(repo: Path) -> None:
+    """``### baseN, ALPHA`` is a copy of the restored ``### ALPHA`` block though
+    it leads with a name the base has: it is compared and printed at its first
+    name the base lacks, not skipped because its first name is the base's."""
+    write_register(repo, ["KEEP_ME", "NEW_NAME", "baseN"])
+    commit(repo, "main registers baseN")
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "baseN", "ALPHA"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", "baseN, ALPHA"], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
+    text = (repo / REGISTER).read_text()
+    (repo / REGISTER).write_text(text.replace("for baseN**", "for baseN, reworded**"))
+    commit(repo, "reword baseN")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/keeps",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "keeps"):
+        merge(repo, name)
+    assert "ALPHA" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# ALPHA: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n"
+        "    ### baseN, ALPHA (**canonical for baseN, ALPHA**)\n"
+        "    - **Type:** x\n"
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    ALPHA  (## Section A)\n"
+    ) in out, out
+
+
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
     """A restored multi-name heading's other names count as present: none is
     reported as dropped from a heading the restore put back."""
