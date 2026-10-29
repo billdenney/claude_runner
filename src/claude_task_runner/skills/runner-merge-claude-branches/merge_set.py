@@ -42,6 +42,7 @@ matching ``--pattern``, an empty merge set, or a failed git command.
 from __future__ import annotations
 
 import argparse
+import posixpath
 import subprocess
 import sys
 import traceback
@@ -112,25 +113,61 @@ def merge_base(repo: Path, one: str, other: str) -> str | None:
     )
 
 
+def normalise_path(path: str) -> str:
+    """``path`` relative to the repository root, as a tree holds it: ``./``
+    and doubled ``/`` dropped and ``..`` folded in. A GitError when nothing is
+    left, it is absolute or climbs out of the root, it ends in ``/`` (a
+    directory), it starts with ``:``, which git reads as pathspec magic, or
+    it is a Windows path (a backslash, or a drive letter), which no tree
+    holds."""
+    if not path:
+        raise GitError("an empty path names no file")
+    if path.startswith(":"):
+        raise GitError(f"{path!r} starts with ':', which git reads as pathspec magic")
+    if path.endswith("/"):
+        raise GitError(f"{path!r} names a directory, not a file")
+    if "\\" in path:
+        raise GitError(f"{path!r} holds a backslash; a path in git's trees uses '/'")
+    if len(path) > 1 and path[1] == ":" and path[0].isascii() and path[0].isalpha():
+        raise GitError(f"{path!r} starts with a drive letter; give it relative to the repository")
+    norm = posixpath.normpath(path)
+    if path.startswith("/") or norm == ".." or norm.startswith("../"):
+        raise GitError(f"{path!r} is outside the repository")
+    if norm == ".":
+        raise GitError(f"{path!r} names no file")
+    return norm
+
+
 def read_file(repo: Path, commit: str, path: str) -> str | None:
-    """``path`` as of ``commit``, or None when that commit has no such file."""
-    probe = _run(repo, ["cat-file", "-e", f"{commit}:{path}"])
-    if probe.returncode != 0:
-        if not resolves(repo, commit):
-            raise GitError(f"{commit!r} does not resolve to a commit in {repo}")
+    """``path`` as of ``commit``, or None when that commit has no such file; a
+    GitError when the file, or a tree on the way to it, cannot be read."""
+    path = normalise_path(path)
+    if blob_id(repo, commit, path) is None:
         return None
     return git(repo, "cat-file", "blob", f"{commit}:{path}")
 
 
 def blob_id(repo: Path, commit: str, path: str) -> str | None:
     """The id of ``path``'s blob at ``commit``, or None when it has no such file:
-    the same id means the same text, so a reader can parse each once."""
-    proc = _run(repo, ["rev-parse", "--verify", "--quiet", f"{commit}:{path}"])
-    if proc.returncode != 0:
-        if not resolves(repo, commit):
-            raise GitError(f"{commit!r} does not resolve to a commit in {repo}")
-        return None
-    return proc.stdout.strip()
+    the same id means the same text, so a reader can parse each once.
+
+    ``git ls-tree`` lists nothing, and exits 0, for a path the commit's tree
+    does not have (a path through a file included), and exits non-zero when
+    the commit or a tree on the way cannot be read; ``rev-parse`` answers both
+    the same way. A path naming a directory is a GitError too, and so is one
+    normalise_path refuses. ``--full-tree`` reads the path from the root
+    whatever directory ``repo`` is, and ``--literal-pathspecs`` reads it as
+    written."""
+    path = normalise_path(path)
+    listed = git(repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-z", commit, "--", path)
+    for entry in listed.split("\0"):
+        meta, _, name = entry.partition("\t")
+        if name == path:
+            _, kind, oid = meta.split()
+            if kind != "blob":
+                raise GitError(f"{path} at {commit} is a {kind}, not a file")
+            return oid
+    return None
 
 
 def candidate_refs(repo: Path, pattern: str, extra_refs: Sequence[str]) -> list[str]:
@@ -175,7 +212,8 @@ class MergeSet:
         if self.not_merged:
             lines.append(
                 f"merge-set gate: skipped {len(self.not_merged)} branch(es) that {self.branch}"
-                " did not merge (left out with --exclude-ref, or pushed after the survey)"
+                " did not merge (left out with --exclude-ref, or pushed after the survey): "
+                + ", ".join(self.not_merged)
             )
         for member in self.members:
             if member.advanced:
@@ -187,8 +225,58 @@ class MergeSet:
         return lines
 
 
-def compute(repo: Path, branch: str, base: str, refs: Sequence[str]) -> MergeSet:
-    """Split ``refs`` into the members of ``branch``'s merge set and the rest."""
+def read_record(path: str) -> list[tuple[str, str]]:
+    """The ``(ref, merged commit)`` pairs a consolidation run recorded, from the
+    ``merged<TAB>ref<TAB>commit`` lines of its inputs file."""
+    pairs = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        key, _, rest = line.partition("\t")
+        if key == "merged":
+            ref, _, sha = rest.partition("\t")
+            pairs.append((ref, sha))
+    if not pairs:
+        raise GitError(f"{path} records no merged ref")
+    return pairs
+
+
+def _recorded(
+    repo: Path, branch: str, base: str, refs: Sequence[str], record: Sequence[tuple[str, str]]
+) -> MergeSet:
+    """The merge set a run recorded: each ref at the commit it merged, whatever
+    the ref holds now, so a ref rewritten or pruned since changes nothing."""
+    base_sha = git(repo, "rev-parse", f"{base}^{{commit}}").strip()
+    members = []
+    for ref, sha in record:
+        if _run(repo, ["cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0:
+            raise GitError(f"the run merged {ref} at {sha}, which is not in {repo}'s objects")
+        tip = sha
+        if resolves(repo, ref):
+            tip = git(repo, "rev-parse", f"{ref}^{{commit}}").strip()
+        fork = merge_base(repo, base_sha, sha)
+        if fork is None:
+            raise GitError(f"{ref} was merged into {branch} but shares no history with {base}")
+        members.append(Member(ref, tip, sha, fork))
+    names = {ref for ref, _ in record}
+    rest = [ref for ref in refs if ref not in names]
+    tips = git(repo, "rev-parse", *(f"{ref}^{{commit}}" for ref in rest)).split() if rest else []
+    on_base = [ref for ref, tip in zip(rest, tips, strict=True) if is_ancestor(repo, tip, base_sha)]
+    not_merged = [ref for ref in rest if ref not in on_base]
+    return MergeSet(branch, base, tuple(members), tuple(not_merged), tuple(on_base))
+
+
+def compute(
+    repo: Path,
+    branch: str,
+    base: str,
+    refs: Sequence[str],
+    record: Sequence[tuple[str, str]] | None = None,
+) -> MergeSet:
+    """Split ``refs`` into the members of ``branch``'s merge set and the rest.
+
+    With ``record`` (read_record), the members are the refs it names at the
+    commits it names, and ``refs`` only says which other candidates exist."""
+    if record is not None:
+        return _recorded(repo, branch, base, refs, record)
     if not refs:
         return MergeSet(branch, base, (), (), ())
     shas = git(repo, "rev-parse", *(f"{ref}^{{commit}}" for ref in (branch, base, *refs)))
@@ -230,6 +318,16 @@ def touches(repo: Path, member: Member, path: str) -> bool:
     return proc.returncode == 1
 
 
+def add_record_argument(ap: argparse.ArgumentParser) -> None:
+    """--merged-record, which every gate --finish runs takes (see read_record)."""
+    ap.add_argument(
+        "--merged-record",
+        metavar="FILE",
+        help="a consolidation run's inputs file: check the refs it merged, at the commits"
+        " it merged, rather than what the refs hold now",
+    )
+
+
 def fail(message: str) -> int:
     print(f"ERROR: (merge-set) {message}", file=sys.stderr)
     return 2
@@ -253,6 +351,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--quiet", action="store_true", help="do not print what the gate left out, on stderr"
     )
+    add_record_argument(ap)
     args = ap.parse_args(argv)
 
     repo = Path(args.repo)
@@ -264,9 +363,10 @@ def main(argv: list[str]) -> int:
         if not resolves(repo, ref):
             return fail(f"{flag} {ref!r} does not resolve to a commit in {repo}")
     refs = candidate_refs(repo, args.pattern, args.extra_ref)
-    if not refs:
+    record = read_record(args.merged_record) if args.merged_record else None
+    if not refs and record is None:
         return fail(f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given")
-    found = compute(repo, args.branch, args.base, refs)
+    found = compute(repo, args.branch, args.base, refs, record)
     if not args.quiet:
         for line in found.summary():
             print(f"# {line}", file=sys.stderr)

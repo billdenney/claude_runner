@@ -30,10 +30,12 @@ while the filename check passed on all of them:
                              later one won and took the earlier ratification's
                              example models with it.
 
-That is the "two branches register the same canonical" case, which neither the
-union-merger (it rebuilds only Example-models LINES that already share a
-bucket) nor restore_dropped_sections.py (it restores only blocks that vanished
-ENTIRELY) repairs.
+That is the "two branches register the same canonical" case. The union-merger
+folds the dropped copy's Example-models entries back in when both copies stand
+under one ``##`` section (a copy's heading stands for the merge result's heading
+of that canonical), but not across sections and not source aliases, and
+restore_dropped_sections.py restores only blocks that vanished ENTIRELY; this
+check reports what is left.
 
 A model is filed under a canonical when it is an entry of the block's
 ``**Example models:**`` field, inline or in a sub-bullet (``-`` or ``*``), as
@@ -73,14 +75,13 @@ def _blocks(text: str) -> Iterator[tuple[list[str], register._Block]]:
     ("### QTc, QTcF, QTcI, QTcP, QTcS"), and that list GROWS as new spellings
     are ratified. Keying on the whole heading would read a block that gained
     a name as a different canonical and report every model under it as lost,
-    so each name is indexed separately.
+    so each name is indexed separately, read by ``heading_names`` as the
+    dedup reads it.
     """
     lines = text.split("\n")
     heads, bounds = register._parse(lines)
-    for start, _, _ in heads:
-        heading = lines[start]
-        names = [n.strip() for n in heading[4:].split(" (")[0].split(",") if n.strip()]
-        yield names, register._parse_block(lines[start : register._block_end(start, bounds)])
+    for start, names, _ in heads:
+        yield list(names), register._parse_block(lines[start : register._block_end(start, bounds)])
 
 
 def parse(text: str) -> dict[str, set[str]]:
@@ -139,7 +140,12 @@ def main() -> int:
     ap.add_argument("--pattern", default="origin/claude/*")
     ap.add_argument("--extra-ref", action="append", default=[])
     ap.add_argument("--file", required=True)
+    merge_set.add_record_argument(ap)
     args = ap.parse_args()
+    try:
+        args.file = merge_set.normalise_path(args.file)
+    except merge_set.GitError as err:
+        return fail(f"--file: {err}")
 
     repo = Path(args.repo)
     if not repo.is_dir():
@@ -164,7 +170,8 @@ def main() -> int:
         return fail(f"no worktree for --branch {args.branch!r} at {worktree}")
 
     refs = merge_set.candidate_refs(repo, args.pattern, args.extra_ref)
-    if not refs:
+    record = merge_set.read_record(args.merged_record) if args.merged_record else None
+    if not refs and record is None:
         return fail(
             f"no branch matches --pattern {args.pattern!r} and no --extra-ref was given;"
             " nothing to verify"
@@ -183,7 +190,7 @@ def main() -> int:
     # branches out on purpose, so the pattern also matches branches that are
     # not in this merge; holding the merge responsible for their content would
     # be a false positive.  merge_set.py decides, from ancestry.
-    found = merge_set.compute(repo, args.branch, args.base, refs)
+    found = merge_set.compute(repo, args.branch, args.base, refs, record)
     for line in found.summary():
         print(f"    (placement) {line}")
     if not found.members:

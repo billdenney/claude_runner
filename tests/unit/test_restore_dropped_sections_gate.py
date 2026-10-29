@@ -68,7 +68,7 @@ def repo(tmp_path: Path) -> Path:
     return r
 
 
-def run(repo: Path, branch: str, base: str = "main") -> tuple[int, str]:
+def run(repo: Path, branch: str, base: str = "main", file: str = REGISTER) -> tuple[int, str]:
     """Exit code and output of a --check run: 1 means something is missing."""
     out = subprocess.run(
         [
@@ -83,7 +83,7 @@ def run(repo: Path, branch: str, base: str = "main") -> tuple[int, str]:
             "--pattern",
             "origin/claude/*",
             "--file",
-            REGISTER,
+            file,
             "--check",
         ],
         capture_output=True,
@@ -165,6 +165,23 @@ def test_genuine_loss_is_still_reported(repo: Path) -> None:
     rc, out = run(repo, "consolidation")
     assert rc == 1, out
     assert "    REALLY_NEW  (## Section A)\n" in out, out
+    assert run(repo, "consolidation", file=f"./{REGISTER}") == (rc, out)
+
+
+@pytest.mark.parametrize(
+    ("file", "message"),
+    [
+        ("../refs.md", "'../refs.md' is outside the repository"),
+        (":refs.md", "':refs.md' starts with ':', which git reads as pathspec magic"),
+        ("refs.md/", "'refs.md/' names a directory, not a file"),
+    ],
+    ids=["outside", "colon", "trailing-slash"],
+)
+def test_a_file_path_that_names_no_file_is_refused(repo: Path, file: str, message: str) -> None:
+    """Refused before anything is read (exit 2): read as absent, it would make
+    the restore check nothing and pass."""
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    assert run(repo, "consolidation", file=file) == (2, f"ERROR: (restore) --file: {message}\n")
 
 
 def merge(repo: Path, name: str) -> None:
@@ -258,7 +275,8 @@ def test_deliberate_rename_on_the_branch_is_skipped(repo: Path) -> None:
 
 def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
     """A lost block under a backticked heading (``### `prob_<endpoint>```) or a
-    prose heading is restored like any other, keyed without its backticks."""
+    prose heading is restored like any other, keyed with its backticks as
+    nlmixr2lib's register parsers read it."""
     added = ["KEEP_ME", "NEW_NAME", "`prob_<endpoint>`", "Why kon is not canonical"]
     make_remote_branch(repo, "adds", "main", added, "adds two")
     make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
@@ -270,7 +288,7 @@ def test_a_backticked_or_prose_heading_is_restored_too(repo: Path) -> None:
     assert rc == 1, out
     assert (
         "# 2 canonical(s) dropped by the merge and missing from refs.md:\n"
-        "    prob_<endpoint>  (## Section A)\n"
+        "    `prob_<endpoint>`  (## Section A)\n"
         "    Why kon is not canonical  (## Section A)\n"
     ) in out, out
 
@@ -367,6 +385,167 @@ def test_a_canonical_two_branches_added_differently_names_the_other_copy(
     )
 
 
+@pytest.mark.parametrize("heading", ["BETA, ALPHA", "BETA", "GAMMA, ALPHA"])
+def test_a_later_copy_whose_heading_leads_with_another_name_reaches_the_report(
+    repo: Path, tmp_path: Path, heading: str
+) -> None:
+    """A second copy of a restored ``### ALPHA, BETA`` block is that block's
+    copy whatever its heading leads with: the names reordered, only some of
+    them, or a new name beside one of them. Its words are printed and reach
+    the hand-union report, the Notes line only it carries included, and no
+    second block declaring ALPHA or BETA is inserted."""
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "ALPHA, BETA"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", heading], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "refs/remotes/origin/claude/second")
+    second = f"### {heading} (**canonical for {heading}**)\n- **Type:** x\n"
+    worded = second + "- **Notes:** only claude/second says this\n"
+    (repo / REGISTER).write_text((repo / REGISTER).read_text().replace(second, worded))
+    commit(repo, "second wording")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "ALPHA" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    shown = "".join(f"    {line}" for line in worded.splitlines(keepends=True))
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    ALPHA  (## Section A)\n"
+    ) in out, out
+    assert (
+        "# ALPHA: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n" + shown
+    ) in out, out
+    report = tmp_path / "hand-union.md"
+    restored = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo",
+            str(repo),
+            "--branch",
+            "consolidation",
+            "--base",
+            "main",
+            "--file",
+            REGISTER,
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    text = (repo / REGISTER).read_text()
+    assert "### ALPHA, BETA (**canonical for ALPHA, BETA**)\n- **Type:** x\n\n" in text
+    assert text.count("ALPHA") == 2, text
+    assert "GAMMA" not in text, text
+    assert report.read_text().endswith(
+        "## ALPHA\n"
+        "\n"
+        "### claude/second's copy (the register has claude/first's)\n"
+        "\n"
+        "In the register:\n"
+        "\n"
+        "````\n"
+        "### ALPHA, BETA (**canonical for ALPHA, BETA**)\n"
+        "- **Type:** x\n"
+        "````\n"
+        "\n"
+        "In that copy:\n"
+        "\n"
+        f"````\n{worded}````\n"
+        "\n"
+    )
+
+
+def test_a_later_copy_that_also_declares_a_base_name_is_compared(repo: Path) -> None:
+    """``### baseN, ALPHA`` is a copy of the restored ``### ALPHA`` block though
+    it leads with a name the base has: it is compared and printed at its first
+    name the base lacks, not skipped because its first name is the base's."""
+    write_register(repo, ["KEEP_ME", "NEW_NAME", "baseN"])
+    commit(repo, "main registers baseN")
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "baseN", "ALPHA"], "first")
+    make_remote_branch(repo, "second", "main", ["KEEP_ME", "NEW_NAME", "baseN, ALPHA"], "second")
+    git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
+    text = (repo / REGISTER).read_text()
+    (repo / REGISTER).write_text(text.replace("for baseN**", "for baseN, reworded**"))
+    commit(repo, "reword baseN")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/keeps",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "keeps"):
+        merge(repo, name)
+    assert "ALPHA" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert rc == 1, out
+    assert (
+        "# ALPHA: claude/second added it too, worded differently; the restore takes"
+        " claude/first's copy. Union this one by hand:\n"
+        "    ### baseN, ALPHA (**canonical for baseN, ALPHA**)\n"
+        "    - **Type:** x\n"
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    ALPHA  (## Section A)\n"
+    ) in out, out
+
+
+def test_a_reworded_base_canonical_is_never_a_copy(repo: Path) -> None:
+    """A branch that only rewords the base's ``### fm_a`` added nothing, so it
+    is no copy of the restored ``### fm_b, fm_a`` block, which declares fm_a
+    too: the restore says nothing about it."""
+    write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
+    commit(repo, "main registers fm_a")
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "fm_b, fm_a"], "first")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "main")
+    text = (repo / REGISTER).read_text()
+    (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
+    commit(repo, "reword fm_a")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "fm_a" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert (rc, out) == (
+        1,
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    fm_b  (## Section A)\n",
+    )
+
+
+def test_an_unreadable_base_is_an_error_not_an_empty_register(repo: Path) -> None:
+    """A base whose register cannot be read stops the restore with exit 2:
+    read as empty, every name the base has would look added by a branch."""
+    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", "ADDED"], "adds one")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    merge(repo, "adds")
+    blob = git(repo, "rev-parse", f"main:{REGISTER}").strip()
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    rc, out = run(repo, "consolidation")
+    assert rc == 2, out
+    assert f"GitError: git cat-file blob main:{REGISTER} failed" in out, out
+
+
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
     """A restored multi-name heading's other names count as present: none is
     reported as dropped from a heading the restore put back."""
@@ -383,17 +562,30 @@ def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> No
     assert "HEADER-NAME LOST" not in out, out
 
 
+@pytest.mark.parametrize(
+    ("heading", "kept"),
+    [
+        ("fm_a, fm_b", "fm_a (**canonical for fm_a, reworded**)"),
+        ("fm_b, fm_a", "fm_a (**canonical for fm_a, reworded**)"),
+        ("fm_a, fm_b", "fm_z, fm_a (**canonical for fm_a, reworded**)"),
+    ],
+    ids=["after", "before", "survivor-not-first"],
+)
 def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
-    repo: Path, tmp_path: Path
+    repo: Path, tmp_path: Path, heading: str, kept: str
 ) -> None:
     """The block is there under its other name, so the repair is the heading;
-    it is printed and, with --report, added to the hand-union report."""
+    it is printed and, with --report, added to the hand-union report, wherever
+    the branch put the new name in the heading, and the message quotes the
+    merged heading as it stands. Nothing is inserted: a block headed
+    ``### fm_b, fm_a`` beside the surviving ``### fm_a`` would declare fm_a
+    twice."""
     write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
     commit(repo, "main registers fm_a")
-    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", "fm_a, fm_b"], "adds fm_b")
+    make_remote_branch(repo, "adds", "main", ["KEEP_ME", "NEW_NAME", heading], "adds fm_b")
     git(repo, "checkout", "-q", "-b", "_tmp_keeps", "main")
     text = (repo / REGISTER).read_text()
-    (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
+    (repo / REGISTER).write_text(text.replace("### fm_a (**canonical for fm_a**)", f"### {kept}"))
     commit(repo, "reword fm_a")
     git(
         repo,
@@ -405,7 +597,8 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
     git(repo, "checkout", "-q", "-b", "consolidation", "main")
     merge(repo, "adds")
     merge(repo, "keeps")
-    assert "fm_b" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    merged = (repo / REGISTER).read_text()
+    assert "fm_b" not in merged, "fixture did not reproduce the loss"
     report = tmp_path / "hand-union.md"
     out = subprocess.run(
         [
@@ -426,7 +619,12 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
         text=True,
     )
     assert out.returncode == 0, out.stdout + out.stderr
-    assert "# HEADER-NAME LOST" in out.stdout
+    assert (
+        "# HEADER-NAME LOST (repair by hand, not a block insert): 'fm_b' was added to the"
+        f" '### {kept}' header by claude/adds and is missing from the merged header\n"
+    ) in out.stdout
+    assert "# no dropped canonicals in refs.md\n" in out.stdout
+    assert (repo / REGISTER).read_text() == merged
     assert report.read_text().endswith(
         "## fm_a\n"
         "\n"
@@ -435,13 +633,13 @@ def test_a_name_lost_from_a_surviving_heading_goes_to_the_report(
         "In the register:\n"
         "\n"
         "````\n"
-        "### fm_a (**canonical for fm_a, reworded**)\n"
+        f"### {kept}\n"
         "````\n"
         "\n"
         "In that branch's copy:\n"
         "\n"
         "````\n"
-        "### fm_a, fm_b (**canonical for fm_a, fm_b**)\n"
+        f"### {heading} (**canonical for {heading}**)\n"
         "````\n"
         "\n"
     )

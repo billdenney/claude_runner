@@ -11,7 +11,12 @@ checks new headers *survived*, not that they are *unique*, so the
 duplicate slips through to origin/main (8 such pairs were found in
 covariate-columns.md on 2026-07-25).
 
-This closes that gap. Two scopes:
+This closes that gap. A heading registers every name it declares before
+its description (``### fm_a, fm_b (**...**)`` registers two), as
+nlmixr2lib's own register parsers read it, so headings that declare a name
+in common are copies of one entry, whatever else they declare and in
+whatever order: ``### fm_a`` and ``### fm_b, fm_a``, or ``### a, b`` and
+``### b, a``. Two scopes:
 
 * **default (section-scoped)** — a duplicate is only the same ``### NAME``
   appearing more than once *under the same ``##`` section*. Safe for
@@ -68,7 +73,8 @@ Modes:
   --check     report duplicates and exit 1 if any remain (a merge gate);
               exit 0 when clean. Makes no edits.
 Either mode exits 2, before touching any file, when a named file does not
-exist: a gate must not pass on a path it never read.
+exist: a gate must not pass on a path it never read. A crash (a register that
+is not UTF-8, say) exits 2 too, never 1, which --check gives for duplicates.
 
 Usage:
     python3 dedup_canonical_headers.py <file.md> [<file2.md> ...]
@@ -84,23 +90,43 @@ import itertools
 import os
 import re
 import sys
-from collections import defaultdict
+import traceback
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-H3 = re.compile(r"^###\s+(\S+)")
+H3 = re.compile(r"^###\s+(.*\S)")
 SECT2 = re.compile(r"^##\s+(.+?)\s*$")  # depth-2 section header
-ANY_HEAD = re.compile(r"^#{2,6}\s")  # any block boundary (## or ###+)
+# A block runs to the next ## or ### heading, as nlmixr2lib's register parsers
+# read an entry: a #### subsection or a # line inside it is part of it.
+ANY_HEAD = re.compile(r"^#{2,3}\s")
 
 
 Key = str | tuple[str, str]
 
 
-def _parse(lines: list[str]) -> tuple[list[tuple[int, str, str]], list[int]]:
+def heading_names(text: str) -> tuple[tuple[str, ...], str]:
+    """The names a ``### `` heading declares, in its order, and its description.
+
+    ``"fm_a, fm_b (**canonical ...**)"`` gives ``(("fm_a", "fm_b"), "(**canonical ...**)")``.
+    The names end at the first " (", as nlmixr2lib's checkNamingRegisters.R
+    cuts a heading, so a "(" inside a name is part of it, and a backticked
+    name keeps its backticks: ``### `prob` `` is not ``### prob``.
+    """
+    names_part, cut, rest = text.partition(" (")
+    names = tuple(dict.fromkeys(name.strip() for name in names_part.split(",") if name.strip()))
+    return names or (text.strip(),), (f"({rest}".strip() if cut else "")
+
+
+Head = tuple[int, tuple[str, ...], str]
+
+
+def _parse(lines: list[str]) -> tuple[list[Head], list[int]]:
     """Return (heads, bounds) where:
-    heads    = list of (line_idx, name, section) for each ### heading
+    heads    = list of (line_idx, names, section) for each ### heading, with
+               every name it declares (see :func:`heading_names`)
     bounds   = sorted block-boundary indices (## / ### headings + EOF)
     """
-    heads: list[tuple[int, str, str]] = []
+    heads: list[Head] = []
     bounds: set[int] = set()
     cur_sect = ""
     for i, ln in enumerate(lines):
@@ -111,7 +137,7 @@ def _parse(lines: list[str]) -> tuple[list[tuple[int, str, str]], list[int]]:
             bounds.add(i)
         m = H3.match(ln)
         if m:
-            heads.append((i, m.group(1), cur_sect))
+            heads.append((i, heading_names(m.group(1))[0], cur_sect))
     bounds.add(len(lines))
     return heads, sorted(bounds)
 
@@ -125,14 +151,63 @@ def _key(name: str, sect: str, global_unique: bool) -> Key:
     return name if global_unique else (sect, name)
 
 
+@dataclass
+class _Group:
+    """The ``### `` headings that register one canonical more than once."""
+
+    key: Key
+    """The names declared more than once among them, sorted and joined with
+    ", ": alone when ``global_unique``, else with the section."""
+    lines: list[int]
+    """Each heading's line index, in order."""
+    names: set[Key]
+    """The key of every name any of them declares."""
+
+
+def _groups(heads: list[Head], global_unique: bool) -> list[_Group]:
+    """The headings that share a declared name, joined through any name they
+    share, so ``### fm_a`` and ``### fm_b, fm_a`` are one group and so are
+    ``### a, b`` and ``### b, a``; two prose headings that only begin with
+    the same word are not. Groups of two or more, in the order of their
+    first heading."""
+    members: list[list[int]] = []
+    keys_of: list[set[Key]] = []
+    group_of: dict[Key, int] = {}
+    for pos, (_, names, sect) in enumerate(heads):
+        keys = {_key(name, sect, global_unique) for name in names}
+        hits = sorted({group_of[k] for k in keys if k in group_of})
+        if hits:
+            target = hits[0]
+        else:
+            target = len(members)
+            members.append([])
+            keys_of.append(set())
+        for other in hits[1:]:
+            members[target] += members[other]
+            keys_of[target] |= keys_of[other]
+            members[other], keys_of[other] = [], set()
+        members[target].append(pos)
+        keys_of[target] |= keys
+        for k in keys_of[target]:
+            group_of[k] = target
+    out = []
+    for positions, keys in zip(members, keys_of, strict=True):
+        if len(positions) < 2:
+            continue
+        positions.sort()
+        seen = Counter(name for pos in positions for name in heads[pos][1])
+        label = ", ".join(sorted(name for name, count in seen.items() if count > 1))
+        key = _key(label, heads[positions[0]][2], global_unique)
+        out.append(_Group(key, [heads[pos][0] for pos in positions], keys))
+    return out
+
+
 def find_dups(lines: list[str], global_unique: bool = False) -> dict[Key, list[int]]:
-    """Return {key: [line_idx, ...]} for names appearing >1. Key is the
-    bare name when ``global_unique`` else ``(section, name)``."""
+    """Return {key: [line_idx, ...]} for each canonical registered more than
+    once (see :func:`_groups`). Key is the names the headings share, alone
+    when ``global_unique`` else ``(section, names)``."""
     heads, _ = _parse(lines)
-    groups: dict[Key, list[int]] = defaultdict(list)
-    for i, name, sect in heads:
-        groups[_key(name, sect, global_unique)].append(i)
-    return {k: v for k, v in groups.items() if len(v) > 1}
+    return {group.key: group.lines for group in _groups(heads, global_unique)}
 
 
 FIELD = re.compile(r"^- \*\*([^*]+?):\*\*(.*)$")
@@ -662,9 +737,11 @@ def _base_copies(lines: list[str], global_unique: bool) -> dict[Key, set[str]]:
     whitespace normalised."""
     heads, bounds = _parse(lines)
     out: dict[Key, set[str]] = {}
-    for i, name, sect in heads:
+    for i, names, sect in heads:
         block = lines[i : _block_end(i, bounds)]
-        out.setdefault(_key(name, sect, global_unique), {_norm([ln]) for ln in block if ln.strip()})
+        normed = {_norm([ln]) for ln in block if ln.strip()}
+        for name in names:
+            out.setdefault(_key(name, sect, global_unique), normed)
     return out
 
 
@@ -688,22 +765,17 @@ def dedup(
     on the base stays, and the merge reverts none of it."""
     base = _base_copies(prefer, global_unique) if prefer is not None else {}
     heads, bounds = _parse(lines)
-    groups: dict[Key, list[int]] = defaultdict(list)
-    names: dict[Key, str] = {}
-    for i, name, sect in heads:
-        k = _key(name, sect, global_unique)
-        groups[k].append(i)
-        names[k] = name
 
     replace: list[tuple[int, int, list[str]]] = []
     collapsed: list[Collapsed] = []
     hand: list[HandUnion] = []
-    for key, idxs in groups.items():
-        if len(idxs) < 2:
-            continue
-        name = names[key]
+    for group in _groups(heads, global_unique):
+        idxs = group.lines
+        name = group.key if isinstance(group.key, str) else group.key[1]
         spans = [(i, _block_end(i, bounds)) for i in idxs]
-        on_base = base.get(key, set())
+        on_base: set[str] = set()
+        for k in group.names:
+            on_base |= base.get(k, set())
         keep_span = max(
             spans,
             key=lambda b: (
@@ -889,4 +961,9 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Exception:
+        # Exit 1 is --check's "duplicates remain"; a crash must not read as it.
+        traceback.print_exc()
+        raise SystemExit(2) from None

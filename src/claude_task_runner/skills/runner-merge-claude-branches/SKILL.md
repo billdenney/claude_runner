@@ -66,7 +66,12 @@ prints every flag and exit code. Each exit code has one meaning; the ones that
 stop a run partway are 5 (a repair or verification step failed, the verifier
 could not run, or the revert check found base content the merge reverted),
 6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
-before the push; finish with `--finish --hand-union-done`, step 6b).
+before the push, for wording a repair set aside or a loss the verifier
+reported, steps 6b and 7). A run whose repairs completed is completed from
+the same worktree by the `--finish` command its stop prints: it runs the
+gates again on the branch and every R step that is not up to date, then
+pushes (step 6b). A run that stopped before its repairs completed is re-run
+on a fresh `--branch-name`.
 
 ## The merge set
 
@@ -182,7 +187,10 @@ exists to repair. Repair, then regenerate.
      back twice that way, from branches that had been merged.
    - Reads each Example-models field whole with the dedup's parser (label
      line, wrapped lines, sub-bullets), buckets the entries by (covariate
-     header, subsection) and unions them with the base's, keeping the most
+     header, subsection), where a copy's `###` heading that declares one of
+     the merge result's heading's names is that heading (a branch may add a
+     name, reorder them or reword the description while another adds a
+     model), and unions them with the base's, keeping the most
      informative (longest) annotation per filename. Every other annotation
      that sets aside goes to the hand-union report (step 6b), beside the one
      kept.
@@ -225,7 +233,10 @@ exists to repair. Repair, then regenerate.
    (both branched from an older main, so `-X theirs` keeps one copy per
    branch). `verify_section_headers.py` only checks headers *survived*,
    not that they are *unique*, so these slip through (8 such pairs were
-   on origin/main on 2026-07-25). This step collapses each to one entry,
+   on origin/main on 2026-07-25). Headings that declare a name in common
+   are copies of one entry, whatever else they declare and in whatever
+   order (`### fm_a` and `### fm_b, fm_a`), as nlmixr2lib's own register
+   parsers read a heading. This step collapses each to one entry,
    keeping the copy the base has (`--prefer`, the register as `--base` has
    it), else the longest, and carrying into it every model a dropped copy
    lists as an Example-models entry that it lacks (each as written, with
@@ -246,13 +257,45 @@ exists to repair. Repair, then regenerate.
    hand-union report in the worktree's git directory, never into the
    register. The union merge (step 6) and the restore (step 6c) append to
    the same report: an annotation "longest wins" set aside, and a canonical
-   two branches added in different words. Every later step still runs; the
+   two branches added in different words, and so does the verifier (step 7):
+   each contribution it reports missing. Every later step still runs; the
    run then stops before the push (exit 9) and prints the worktree, the
    report and the `--finish --hand-union-done` command, and any later
    failure (check, vignettes) names the report too. Union the wording into
    the register by hand, keeping each source's attribution, commit in the
-   worktree, and run that command: it checks for duplicates again, pushes
-   the branch and prints the PR text, without redoing the merge. Without
+   worktree, and run that command, without redoing the merge. The command
+   names only `--repo`, `--branch-name` and any vignette settings: the run
+   records its other inputs
+   (`--base`, `--pattern`, `--extra-ref`, the union and register files, and
+   every ref it merged) in the worktree's git directory, and `--finish` uses
+   them, refusing a conflicting one given on its command line (exit 2) and
+   reading every merged ref at the commit the run merged, so a ref rewritten
+   or pruned since changes nothing; a recorded commit missing from the
+   objects stops it (exit 3). `--finish`
+   runs the run's gates again on the branch as the hand edits left it: the
+   duplicate check, the revert check (a hand edit that drops base content
+   stops it, exit 5) and the contribution verifier. Then it runs the
+   regeneration and check if the run's never completed or HEAD has moved
+   since they did -- both read the registers, so a hand union counts, and
+   the committed artifacts must match the tree pushed -- and the vignettes
+   if they never completed or a commit since touched a file other than the
+   run's registers (a model or vignette fix does; a hand union alone does
+   not). A step the run skipped stays skipped, and a `--skip-*` given to
+   `--finish` skips a step still due.
+   A pending step with no `Rscript` on PATH stops it (exit 3). Then it
+   pushes the branch and prints the PR text. `--finish` completes any run
+   whose repairs (the union, the dedups, the restore and the NEWS union)
+   completed: one that stopped for a hand union (exit 9), at the revert check
+   or a failed regeneration (exit 5), at check (exit 6), at the push
+   (exit 7) or at the vignettes (exit 8), or was interrupted after its
+   repairs; each of those prints the `--finish` command, bare except at the
+   hand-union stop, so `--finish` itself says when the report needs
+   `--hand-union-done`. A run that stopped before its repairs completed (a
+   repair that crashed, duplicates left after the dedup, a verifier that
+   could not run) is refused (exit 3), since `--finish` redoes no repair:
+   re-run it on a fresh `--branch-name`. `--finish` also refuses a worktree
+   with uncommitted changes or untracked files, listing them, since a step
+   that failed or was interrupted can leave partial output. Without
    `--hand-union-done`, `--finish` prints the report and stops (exit 9)
    while it holds anything. The report lives in the worktree's git
    directory and goes with the worktree; copy it before removing one.
@@ -316,11 +359,14 @@ exists to repair. Repair, then regenerate.
    verifier caught it.
 
    Every `### ` heading counts, a backticked one (`` ### `prob_<endpoint>` ``)
-   or prose included. When two
+   or prose included. Like the dedup, the union and the placement check, it
+   reads a heading's names as nlmixr2lib's register parsers do: a backticked
+   name keeps its backticks, so `` ### `prob` `` is not `### prob`. When two
    branches added the same canonical in different words and the merge lost
    it, the first branch's copy is restored and each other copy is printed in
    full and appended to the hand-union report (step 6b), for a hand union.
-   So is a name a branch added to a multi-name heading that the merge kept
+   Any later heading that shares a name with the restored one is such a copy,
+   whatever order it lists the names in. So is a name a branch added to a multi-name heading that the merge kept
    without it.
 
    Regression tests: `tests/unit/test_restore_dropped_sections_gate.py`.
@@ -407,11 +453,22 @@ exists to repair. Repair, then regenerate.
      *gained* a name is not read as a different canonical with everything
      under it lost.
 
-   The verifier exits 1 when it finds losses, and `merge_branches.sh` turns
-   that into a WARNING to reconcile by hand. It exits 2 when it cannot run at
-   all: a `--base`, `--branch` or `--extra-ref` that does not resolve, no
-   worktree for the branch, a `--pattern` matching nothing, an empty merge
-   set, or no `python3`. Each of those used to pass silently -- a verifier
+   The verifier exits 1 when it finds losses. Each is one no repair could put
+   back (a canonical two branches filed under different `##` sections, a new
+   section header the union does not relocate), and settling it needs
+   judgement, so `merge_branches.sh` appends the verifier's report for every
+   register with losses to the hand-union report, runs every later step, and
+   stops before the push (exit 9) with one message naming the files, the
+   report and the `--finish` command. Reconcile each loss by hand in the
+   worktree and commit, then run `--finish --hand-union-done`: it runs the
+   verifier again, pushes a branch it finds whole, and stops (exit 9) while
+   a loss is left unless `--accept-verifier-losses` is given, which accepts
+   what is left. Passed on the run itself,
+   `--accept-verifier-losses` turns each loss into a WARNING and the run goes
+   on to the push. The verifier exits 2 when it cannot run at all: a `--base`,
+   `--branch` or `--extra-ref` that does not resolve, no worktree for the
+   branch, a `--pattern` matching nothing, an empty merge set, or no
+   `python3`. Each of those used to pass silently -- a verifier
    that checks nothing reports everything present -- and `merge_branches.sh`
    now stops with exit 5 on them. The helpers it calls (`union_merge_lines.py`,
    `restore_dropped_sections.py`, `union_merge_news.py`, the two delegated
@@ -513,8 +570,10 @@ exists to repair. Repair, then regenerate.
     gate. The worker also forces `knitr::opts_chunk$set(error = FALSE)`
     so a chunk error fails the render instead of being written into the
     HTML and reported as success. Continues on failure and
-    writes a JSON-lines report (`.vignette_results.jsonl` in the
-    worktree). The orchestrator script (`merge_branches.sh`) runs this
+    writes a JSON-lines report (`vignette-results.jsonl`, beside the build
+    log `vignette-build.log`, in the worktree's git directory, so neither
+    dirties the tree; the failure message prints both paths). The
+    orchestrator script (`merge_branches.sh`) runs this
     automatically before push; in that script's own step list it is
     step 9 (the `--skip-vignettes` gate).
 
@@ -528,7 +587,7 @@ exists to repair. Repair, then regenerate.
     bug pattern that broke 12 vignettes in the 2026-06-17 merge) in
     one batch.
 
-    **What to do on failure.** The `.vignette_results.jsonl` lists
+    **What to do on failure.** The `vignette-results.jsonl` lists
     every failing vignette with its error message. Common patterns:
 
     - `chol(): decomposition failed` — model has a rank-1 / numerically
@@ -711,9 +770,9 @@ then run again with `--yes` once the operator agrees.
 ### Idempotence
 
 The script aborts cleanly if the target worktree already exists.
-A run that stopped for a hand union (exit 9) is finished with `--finish
---hand-union-done` on the same worktree, which keeps the hand edits; see
-step 6b. Removing the worktree deletes its hand-union report (the run that
+A run that stopped -- for a hand union (exit 9) or at a failed gate -- is
+finished with the `--finish` command its stop message prints, on the same
+worktree, which keeps the hand edits; see step 6b. Removing the worktree deletes its hand-union report (the run that
 finds the worktree says where it is), so copy the report first. To re-run
 from scratch, remove the worktree first:
 
