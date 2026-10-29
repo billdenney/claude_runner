@@ -1364,6 +1364,28 @@ def _is_unmeetable_dependency_reason(reason: str | None) -> bool:
     return reason is not None and reason.startswith(_UNMEETABLE_DEPENDENCY_PREFIX)
 
 
+_warned_timezone_less_retries: set[tuple[Path, datetime]] = set()
+"""``(state file, next_eligible_at)`` pairs already logged by
+:func:`_warn_timezone_less_retry`. The selector reads every state on every
+tick and the hold writes nothing, so each value is logged once per process,
+and again only once it is changed."""
+
+
+def _warn_timezone_less_retry(task_id: str, state_file: Path, retry_at: datetime) -> None:
+    """Log, once per file and value, that ``task_id`` is held for ``retry_at``."""
+    if (state_file, retry_at) in _warned_timezone_less_retries:
+        return
+    _warned_timezone_less_retries.add((state_file, retry_at))
+    logger.error(
+        "holding task %s: %s: next_eligible_at %s has no timezone; write it with an "
+        "offset, e.g. %s if it was meant as UTC",
+        task_id,
+        state_file,
+        retry_at,
+        retry_at.replace(tzinfo=UTC).isoformat(),
+    )
+
+
 def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: Collection[str],
@@ -1384,7 +1406,8 @@ def _eligible_candidates(
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
     # When omitted (older unit tests that exercise non-deferred paths),
-    # a deferred task simply isn't cooldown-gated.
+    # a deferred task simply isn't cooldown-gated and its
+    # ``next_eligible_at`` is not read.
     #
     # ``effort_levels`` is the merged ``[effort_levels]`` table the effort
     # gate checks each task's (model, effort) against. Required, with no
@@ -1582,26 +1605,17 @@ def _skip_category(
                 # with a fresh cooldown. The cooldown is what keeps a
                 # still-blocked task from being re-picked every tick.
                 retry_at = state.next_eligible_at
-                if retry_at is not None and retry_at.utcoffset() is None:
-                    # A hand edit without an offset. Comparing it with the
-                    # aware clock raises TypeError, which would stop the
-                    # whole selector; guessing a zone could release the task
-                    # hours early or late. Hold just this task until fixed.
-                    logger.error(
-                        "holding task %s: %s: next_eligible_at %s has no timezone; "
-                        "write it in UTC with an offset, e.g. %s",
-                        task.id,
-                        sp,
-                        retry_at,
-                        retry_at.replace(tzinfo=UTC).isoformat(),
-                    )
-                    return _SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE
-                if (
-                    now is not None
-                    and state.next_eligible_at is not None
-                    and now < state.next_eligible_at
-                ):
-                    return _SKIP_DEFERRED_COOLDOWN
+                if now is not None and retry_at is not None:
+                    if retry_at.utcoffset() is None:
+                        # A hand edit without an offset. Comparing it with
+                        # the aware clock raises TypeError, which would stop
+                        # the whole selector; guessing a zone could release
+                        # the task hours early or late. Hold just this task
+                        # until fixed.
+                        _warn_timezone_less_retry(task.id, sp, retry_at)
+                        return _SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE
+                    if now < retry_at:
+                        return _SKIP_DEFERRED_COOLDOWN
                 # cooldown elapsed (or unset) → fall through, re-attempt.
             elif state.status != "awaiting_sidecar":
                 # Any other non-dispatchable status (running,

@@ -126,7 +126,7 @@ def test_every_task_yaml_is_eligible_or_counted(queue_dir: Path, tmp_path: Path)
     eligible = _select(queue_dir, skips)
 
     n_yamls = len(list(todo_dir(queue_dir).glob("*.yaml")))
-    assert n_yamls == 24
+    assert n_yamls == 25
     assert len(eligible) + sum(skips.values()) == n_yamls
 
 

@@ -845,6 +845,28 @@ def _missing_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
     )
 
 
+def _retry_without_timezone_notes(holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks held because the retry time in their state file has no
+    timezone: each stays held until the file gives it in UTC with an offset."""
+    rows = [r for r in holds.get("retries_without_timezone") or [] if isinstance(r, dict)]
+    if not rows:
+        return
+    items = [
+        f"{r.get('task_id')}: next_eligible_at {r.get('next_eligible_at')} in {r.get('state_file')}"
+        for r in rows
+    ]
+    n = len(rows)
+    lead = (
+        "1 task is held because its retry time has no timezone"
+        if n == 1
+        else f"{n} tasks are held because their retry times have no timezone"
+    )
+    notes.attention.append(
+        f"{lead} ({_listing(items)}). Rewrite each next_eligible_at in UTC with an offset, "
+        "for example 2026-10-15T12:00:00+00:00; the supervisor does not guess a timezone."
+    )
+
+
 def _unmeetable_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]]]:
     """``queue holds``' ``unmeetable_dependencies``: each task held
     ``depends_on_unmeetable``, with each dependency that cannot finish
@@ -985,6 +1007,7 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
     _retry_notes(facts, holds, notes)
     _missing_dependency_notes(holds, notes)
     _unmeetable_dependency_notes(holds, notes)
+    _retry_without_timezone_notes(holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."

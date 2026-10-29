@@ -893,6 +893,51 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
     ), section
 
 
+def test_tasks_held_for_a_retry_time_without_a_timezone_are_named(
+    queue: Path, bin_dir: Path
+) -> None:
+    """The Tasks line counts them, and an attention note names each task,
+    its offsetless value and the state file to fix, singular and plural."""
+    row = {
+        "task_id": "hand-parked",
+        "state_file": "/q/.claude_task_runner/state/hand-parked.yaml",
+        "next_eligible_at": "2099-01-01T00:00:00",
+    }
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"next_eligible_at_without_timezone": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "retries_without_timezone": [row],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    summary = _summary(queue, bin_dir)
+    assert (
+        "- **Tasks:** 1 has a retry time with no timezone (fix its state file); 0 finished.\n"
+    ) in summary
+    assert (
+        "- 1 task is held because its retry time has no timezone (hand-parked: "
+        "next_eligible_at 2099-01-01T00:00:00 in /q/.claude_task_runner/state/hand-parked.yaml)"
+        ". Rewrite each next_eligible_at in UTC with an offset, for example "
+        "2026-10-15T12:00:00+00:00; the supervisor does not guess a timezone.\n"
+    ) in summary
+
+    other = {**row, "task_id": "also-parked", "state_file": "/q/s/also-parked.yaml"}
+    holds["held"] = {"next_eligible_at_without_timezone": 2}
+    holds["todo_tasks"] = 2
+    holds["retries_without_timezone"] = [row, other]
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    summary = _summary(queue, bin_dir)
+    assert (
+        "- **Tasks:** 2 have retry times with no timezone (fix their state files); 0 finished.\n"
+    ) in summary
+    assert (
+        "- 2 tasks are held because their retry times have no timezone (hand-parked: "
+        "next_eligible_at 2099-01-01T00:00:00 in /q/.claude_task_runner/state/hand-parked.yaml; "
+        "also-parked: next_eligible_at 2099-01-01T00:00:00 in /q/s/also-parked.yaml). "
+    ) in summary
+
+
 def test_nothing_running_although_tasks_can_start(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:
@@ -1859,6 +1904,8 @@ def test_every_held_category_has_plain_words() -> None:
         "completed",
     }
     assert sorted(categories - set(report._HELD_WORDS)) == []
+    # in_flight is counted as running, apart from the held list.
+    assert sorted(categories - {"in_flight"} - set(report._HELD_ORDER)) == []
 
     task = Task.model_validate(
         {

@@ -300,6 +300,14 @@ def list_tasks(
             )
 
 
+def _has_no_offset(value: object) -> bool:
+    """True for a ``next_eligible_at`` (an ISO string, as dumped) with no offset."""
+    try:
+        return datetime.fromisoformat(str(value)).utcoffset() is None
+    except ValueError:
+        return False
+
+
 def _print_deferral(console: Console, state: dict[str, object]) -> None:
     """Print why a ``deferred`` task is parked, for ``queue states`` and ``queue show``.
 
@@ -307,7 +315,9 @@ def _print_deferral(console: Console, state: dict[str, object]) -> None:
     deferral keeps its old ``deferred_reason`` and ``next_eligible_at``,
     so a completed task can still carry both. For a ``deferred`` task,
     prints ``deferred_reason`` and, when it is set, ``next_eligible_at``,
-    the earliest time the supervisor tries the task again. Of the runner's
+    the earliest time the supervisor tries the task again. A
+    ``next_eligible_at`` with no offset is flagged: the supervisor holds the
+    task until it is written in UTC with an offset. Of the runner's
     own deferrals, only a pre-dispatch hook's sets it (ADR-0026). A
     readiness hold (ADR-0030), an effort hold (ADR-0010) and a missing- or
     unmeetable-dependency hold (ADR-0036) do not, because their gate
@@ -329,7 +339,12 @@ def _print_deferral(console: Console, state: dict[str, object]) -> None:
     lines = [f"  deferred_reason: {shown}"]
     next_eligible_at = state.get("next_eligible_at")
     if next_eligible_at is not None:
-        lines.append(f"  next_eligible_at: {next_eligible_at}")
+        flag = (
+            " (no timezone: held until it is written in UTC with an offset)"
+            if _has_no_offset(next_eligible_at)
+            else ""
+        )
+        lines.append(f"  next_eligible_at: {next_eligible_at}{flag}")
     console.print("\n".join(lines), markup=False, highlight=False, emoji=False, soft_wrap=True)
 
 
@@ -455,7 +470,7 @@ def holds(
     selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
     (the warm-up cap while ``warming_up``), ``null`` when there is none.
 
-    Four holds carry their tasks' details. ``parked_workers``: the
+    Five holds carry their tasks' details. ``parked_workers``: the
     ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
     ``worker_still_running``), each with its ``pid``, ``started_at``,
     whether it is still ``running``, its ``duration_cap_s`` (0: none) and
@@ -465,6 +480,10 @@ def holds(
     longer loads when these two are read (removed or rewritten since the
     selection read it) is left out of them and listed under
     ``unread_states`` with the error.
+    ``retries_without_timezone``: the ``next_eligible_at_without_timezone``
+    tasks, each with its ``state_file`` and the ``next_eligible_at`` written
+    there with no offset; each is held until that value is rewritten in
+    UTC with an offset.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
     the ``missing`` ids in its ``depends_on``, in the order it lists them.
     ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
@@ -501,6 +520,9 @@ def holds(
     unread: list[dict[str, str]] = []
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
+    no_timezone = _retries_without_timezone(
+        qd, preview.held.get("next_eligible_at_without_timezone", []), unread
+    )
     missing = sorted(preview.missing_dependencies.items())
     unmeetable = sorted(preview.unmeetable_dependencies.items())
     cycles, cycle_index = _dependency_cycles_json(unmeetable)
@@ -521,6 +543,7 @@ def holds(
         "warming_up": preview.warming_up,
         "parked_workers": parked,
         "retrying": retrying,
+        "retries_without_timezone": no_timezone,
         "missing_dependencies": [{"task_id": t, "missing": ids} for t, ids in missing],
         "unmeetable_dependencies": [
             {
@@ -578,6 +601,14 @@ def holds(
             literal(
                 styled(f"retries at {item['next_eligible_at']}:", "bold"),
                 f" {item['task_id']}: {item['deferred_reason']}",
+            )
+        )
+    for item in no_timezone:
+        console.print(
+            literal(
+                styled("retry time without a timezone:", "bold"),
+                f" {item['task_id']}: next_eligible_at {item['next_eligible_at']} in "
+                f"{item['state_file']}; held until it is written in UTC with an offset",
             )
         )
     for task_id, ids in missing:
@@ -681,6 +712,24 @@ def _retrying(qd: Path, tasks: list[Task], unread: list[dict[str, str]]) -> list
             {
                 "task_id": task.id,
                 "deferred_reason": state.deferred_reason,
+                "next_eligible_at": due.isoformat() if due else None,
+            }
+        )
+    return out
+
+
+def _retries_without_timezone(
+    qd: Path, tasks: list[Task], unread: list[dict[str, str]]
+) -> list[dict[str, object]]:
+    """``tasks`` (held ``next_eligible_at_without_timezone``) with the state
+    file to fix and the offsetless ``next_eligible_at`` written there."""
+    out: list[dict[str, object]] = []
+    for task, state in _held_states(qd, tasks, unread):
+        due = state.next_eligible_at
+        out.append(
+            {
+                "task_id": task.id,
+                "state_file": str(state_file_path(qd, task.id)),
                 "next_eligible_at": due.isoformat() if due else None,
             }
         )

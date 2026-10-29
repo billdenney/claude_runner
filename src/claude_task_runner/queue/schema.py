@@ -410,8 +410,10 @@ class TaskState(_StrictBase):
     """When ``status == "deferred"``, the earliest time the orchestrator
     will re-attempt dispatch (and so re-run the pre-dispatch hook). Until
     then the parked task is skipped, so a still-deferring hook re-checks
-    on a cooldown instead of being re-picked at every tick. ``None`` when
-    not parked / on legacy state YAMLs."""
+    on a cooldown instead of being re-picked at every tick. A value with no
+    offset (a hand edit) is never compared with the clock: the task is
+    held as ``next_eligible_at_without_timezone`` until it is written in
+    UTC with an offset. ``None`` when not parked / on legacy state YAMLs."""
     deferred_reason: str | None = None
     """Last pre-dispatch deferral message (hook stderr) while a task is
     parked in ``deferred`` — operator-visible context for *why* it's

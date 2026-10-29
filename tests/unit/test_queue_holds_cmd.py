@@ -63,6 +63,7 @@ HELD = {
     "failed_circuit_breaker": 1,
     "in_flight": 1,
     "invalid_effort": 1,
+    "next_eligible_at_without_timezone": 1,
     "possibly_hung": 1,
     "readiness_awaiting_sidecar_response": 1,
     "readiness_awaiting_sidecar_response+missing_file": 1,
@@ -144,7 +145,7 @@ def test_every_task_lands_in_one_place(mixed: Path) -> None:
         },
         "held": HELD,
         "completed": 2,
-        "todo_tasks": 24,
+        "todo_tasks": 25,
         "poll_interval_s": 60.0,
         "affinity_ttl_s": 5400.0,
         "queue_cap": None,
@@ -155,6 +156,13 @@ def test_every_task_lands_in_one_place(mixed: Path) -> None:
                 "task_id": "cooldown",
                 "deferred_reason": "pre-dispatch hook deferred (exit 1): waiting",
                 "next_eligible_at": "2027-10-14T12:00:00+00:00",
+            }
+        ],
+        "retries_without_timezone": [
+            {
+                "task_id": "retry-no-timezone",
+                "state_file": str(state_path_for(queue, "retry-no-timezone")),
+                "next_eligible_at": "2026-10-15T12:00:00",
             }
         ],
         "missing_dependencies": [
@@ -315,6 +323,31 @@ def test_text_output_names_each_missing_dependency(queue: Path) -> None:
         "missing dependency: orphan needs 115-gone, [122]-gone (no task file in todo/, not "
         "completed or running)\n"
     )
+
+
+def test_text_output_names_each_retry_time_without_a_timezone(
+    queue: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(queue_cmd_mod, "RealClock", lambda: FakeClock(NOW))
+    add_task(queue, "hand-parked")
+    sp = state_path_for(queue, "hand-parked")
+    sp.write_text(
+        "schema_version: 2\ntask_id: hand-parked\nstatus: deferred\n"
+        "next_eligible_at: 2099-01-01 00:00:00\n",
+        encoding="utf-8",
+    )
+
+    result = invoke_cli(["queue", "holds", "--queue", str(queue)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.replace("\n", " ") == (
+        "eligible: 0 (0 can start now, 0 waiting for the account their session runs on)\n"
+        "held, next_eligible_at_without_timezone: 1\n"
+        "completed: 0\n"
+        "queue-wide cap: none\n"
+        "selection runs every: 60 s\n"
+        "retry time without a timezone: hand-parked: next_eligible_at 2099-01-01T00:00:00 in "
+        f"{sp}; held until it is written in UTC with an offset\n"
+    ).replace("\n", " ")
 
 
 def test_without_supervisor_json_nothing_is_in_flight(queue: Path) -> None:

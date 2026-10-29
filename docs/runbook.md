@@ -460,7 +460,9 @@ task that does not run.
      cooldown is checked once a tick), and the task runs.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
-     has none.
+     has none. Write the time in UTC with an offset
+     (`2026-10-15T12:00:00+00:00`): one with no offset never passes, and the
+     task is held as `next_eligible_at_without_timezone` until it is fixed.
 
 ## Nothing dispatches, but an account has room
 

@@ -410,24 +410,34 @@ def test_deferred_without_next_eligible_at_is_eligible(queue_dir: Path) -> None:
     assert task.id in {t.id for t in eligible}
 
 
+def _hand_park(queue_dir: Path, task_id: str, next_eligible_at: str) -> Path:
+    """A deferred state written by hand, ``next_eligible_at`` spelled as given
+    and unquoted, so YAML's own timestamp resolver reads it."""
+    sp = state_path_for(queue_dir, task_id)
+    sp.write_text(
+        f"schema_version: 2\ntask_id: {task_id}\nstatus: deferred\n"
+        f"deferred_reason: parked by hand\nnext_eligible_at: {next_eligible_at}\n",
+        encoding="utf-8",
+    )
+    return sp
+
+
+def _errors(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+
+
 def test_deferred_with_a_timezone_less_next_eligible_at_holds_only_itself(
     queue_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A ``next_eligible_at`` written by hand without a timezone cannot be
-    compared with the aware clock. That task is held, with an ERROR that names
-    the file and the field; the rest of the queue still dispatches. Comparing it
-    raised TypeError out of the selector, which stopped dispatch for every task
-    on every tick."""
+    """A ``next_eligible_at`` with no offset cannot be compared with the aware
+    clock, and guessing its zone could release the task hours off. That task
+    alone is held, with an ERROR naming the file and the field; every other
+    task is still selected."""
     naive = _make_task("t-deferred-naive")
     ready = _make_task("t-ready")
     _write_task_yaml(queue_dir, naive)
     _write_task_yaml(queue_dir, ready)
-    sp = state_path_for(queue_dir, naive.id)
-    write_state_atomic(_make_deferred_state(naive.id, _NOW + dt.timedelta(days=1)), sp)
-    # The hand edit: an operator parks the task with a date and no offset.
-    payload = yaml.safe_load(sp.read_text(encoding="utf-8"))
-    payload["next_eligible_at"] = "2099-01-01T00:00:00"
-    sp.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    sp = _hand_park(queue_dir, naive.id, "2099-01-01T00:00:00")
 
     skips: Counter[str] = Counter()
     with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
@@ -435,24 +445,121 @@ def test_deferred_with_a_timezone_less_next_eligible_at_holds_only_itself(
 
     assert [t.id for t in eligible] == [ready.id]
     assert skips == Counter({"next_eligible_at_without_timezone": 1})
-    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [
+    assert _errors(caplog) == [
         f"holding task {naive.id}: {sp}: next_eligible_at 2099-01-01 00:00:00 has no "
-        "timezone; write it in UTC with an offset, e.g. 2099-01-01T00:00:00+00:00"
+        "timezone; write it with an offset, e.g. 2099-01-01T00:00:00+00:00 if it was "
+        "meant as UTC"
     ]
 
 
-def test_deferred_with_a_non_utc_offset_is_compared_as_written(queue_dir: Path) -> None:
-    """An aware value in another offset still compares correctly, so it is not
-    held: 13:00+02:00 is 11:00 UTC, before ``_NOW`` (12:00 UTC)."""
+@pytest.mark.parametrize(
+    ("written", "read"),
+    [
+        ("2099-01-01T00:00:00", "2099-01-01 00:00:00"),
+        ("'2099-01-01T00:00:00'", "2099-01-01 00:00:00"),
+        ("2099-01-01", "2099-01-01 00:00:00"),
+        ("2099-01-01 06:30:00", "2099-01-01 06:30:00"),
+        ("2099-01-01T06:30:00.250", "2099-01-01 06:30:00.250000"),
+    ],
+)
+def test_every_offsetless_spelling_is_held(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture, written: str, read: str
+) -> None:
+    """Unquoted, quoted, date-only, space-separated and fractional values
+    without an offset all reach the hold, not the clock comparison."""
+    task = _make_task("t-hand")
+    _write_task_yaml(queue_dir, task)
+    sp = _hand_park(queue_dir, task.id, written)
+    skips: Counter[str] = Counter()
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        assert _eligible_candidates(queue_dir, {}, set(), now=_NOW, skips=skips) == []
+    assert skips == Counter({"next_eligible_at_without_timezone": 1})
+    assert [m.split(": next_eligible_at ")[1].split(" has no")[0] for m in _errors(caplog)] == [
+        read
+    ]
+    assert str(sp) in _errors(caplog)[0]
+
+
+def test_two_offsetless_tasks_are_each_held_and_named(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    first, second = _make_task("t-hand-a"), _make_task("t-hand-b")
+    for task in (first, second):
+        _write_task_yaml(queue_dir, task)
+    sp_a = _hand_park(queue_dir, first.id, "2099-01-01T00:00:00")
+    sp_b = _hand_park(queue_dir, second.id, "2099-02-01T00:00:00")
+    skips: Counter[str] = Counter()
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        assert _eligible_candidates(queue_dir, {}, set(), now=_NOW, skips=skips) == []
+    assert skips == Counter({"next_eligible_at_without_timezone": 2})
+    assert sorted(_errors(caplog)) == [
+        f"holding task {first.id}: {sp_a}: next_eligible_at 2099-01-01 00:00:00 has no "
+        "timezone; write it with an offset, e.g. 2099-01-01T00:00:00+00:00 if it was "
+        "meant as UTC",
+        f"holding task {second.id}: {sp_b}: next_eligible_at 2099-02-01 00:00:00 has no "
+        "timezone; write it with an offset, e.g. 2099-02-01T00:00:00+00:00 if it was "
+        "meant as UTC",
+    ]
+
+
+def test_the_error_is_logged_once_per_value(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The selector runs every tick and the hold writes nothing, so the same
+    value is logged once; a changed value, still offsetless, is logged again."""
+    task = _make_task("t-hand")
+    _write_task_yaml(queue_dir, task)
+    _hand_park(queue_dir, task.id, "2099-01-01T00:00:00")
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        for _tick in range(3):
+            assert _eligible_candidates(queue_dir, {}, set(), now=_NOW) == []
+        assert len(_errors(caplog)) == 1
+        _hand_park(queue_dir, task.id, "2099-03-01T00:00:00")
+        for _tick in range(2):
+            assert _eligible_candidates(queue_dir, {}, set(), now=_NOW) == []
+    assert [m.split(": next_eligible_at ")[1][:10] for m in _errors(caplog)] == [
+        "2099-01-01",
+        "2099-03-01",
+    ]
+
+
+def test_without_a_clock_the_offsetless_value_is_not_read(
+    queue_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A caller that passes no ``now`` does not gate deferred tasks on their
+    cooldown, so it has nothing to compare the value with and holds nothing."""
+    task = _make_task("t-hand")
+    _write_task_yaml(queue_dir, task)
+    _hand_park(queue_dir, task.id, "2099-01-01T00:00:00")
+    with caplog.at_level("ERROR", logger="claude_task_runner.runner.orchestrator"):
+        assert [t.id for t in _eligible_candidates(queue_dir, {}, set())] == [task.id]
+    assert _errors(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("retry_at", "eligible", "skips"),
+    [
+        # 13:00+02:00 is 11:00 UTC, before _NOW (12:00 UTC): released.
+        (dt.datetime(2026, 6, 21, 13, 0, tzinfo=dt.timezone(dt.timedelta(hours=2))), True, {}),
+        # 11:00-02:00 is 13:00 UTC, after _NOW: still cooling down.
+        (
+            dt.datetime(2026, 6, 21, 11, 0, tzinfo=dt.timezone(dt.timedelta(hours=-2))),
+            False,
+            {"deferred_cooldown": 1},
+        ),
+    ],
+)
+def test_deferred_with_a_non_utc_offset_is_compared_as_written(
+    queue_dir: Path, retry_at: dt.datetime, eligible: bool, skips: dict[str, int]
+) -> None:
+    """An aware value in another offset compares as the instant it names."""
     task = _make_task("t-deferred-offset")
     _write_task_yaml(queue_dir, task)
-    plus_two = dt.timezone(dt.timedelta(hours=2))
-    write_state_atomic(
-        _make_deferred_state(task.id, dt.datetime(2026, 6, 21, 13, 0, tzinfo=plus_two)),
-        state_path_for(queue_dir, task.id),
-    )
-    eligible = _eligible_candidates(queue_dir, {}, set(), now=_NOW)
-    assert task.id in {t.id for t in eligible}
+    write_state_atomic(_make_deferred_state(task.id, retry_at), state_path_for(queue_dir, task.id))
+    counted: Counter[str] = Counter()
+    got = _eligible_candidates(queue_dir, {}, set(), now=_NOW, skips=counted)
+    assert [t.id for t in got] == ([task.id] if eligible else [])
+    assert counted == Counter(skips)
 
 
 # --- Dispatch block-list: `block_dispatch: true` selector skip (ADR-0029) --

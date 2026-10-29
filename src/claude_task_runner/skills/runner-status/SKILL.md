@@ -376,7 +376,10 @@ or recent failures), follow the prioritized triage flow below.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,
-         the task can be dispatched again. If a gate holds it then, the
+         the task can be dispatched again. A `next_eligible_at` with no
+         offset never passes: the task is held as
+         `next_eligible_at_without_timezone` until the time is written in
+         UTC with an offset. If a gate holds it then, the
          gate's own reason replaces the hand-written one. List each task
          with its reason and `next_eligible_at`.
 
