@@ -554,15 +554,17 @@ class TestMergeBranches:
         )
 
     def test_losses_the_repairs_cannot_fix_are_a_warning(self, repo: Path, tmp_path: Path) -> None:
-        """Two branches register one canonical under different header text.
+        """Two branches register one canonical under different ``##`` sections.
 
-        -X theirs keeps claude/b2's block. The union-merger buckets by the whole
-        header, so it cannot fold claude/a2's model back in; that is left to the
-        operator, and the run finishes.
+        -X theirs keeps claude/b2's section. The union-merger keeps sections
+        apart, so it cannot fold claude/a2's model back in, and which section
+        is right is a judgement; that is left to the operator, and the run
+        finishes.
         """
         for name, model in (("a2", "A2_2020_x.R"), ("b2", "B2_2021_y.R")):
             text = BASE_REGISTER + (
-                f"\n### LKST (**canonical for lkst, from {name}**)\n\n"
+                f"\n## Section from {name}\n\n"
+                f"### LKST (**canonical for lkst**)\n\n"
                 f"- **Example models:** `{model}` ({name}).\n"
             )
             push_task_branch(repo, f"claude/{name}", {REGISTER: text}, f"Register LKST ({name})")
@@ -2032,6 +2034,49 @@ class TestUnionEditsFieldsInPlace:
             "`N_2020_n.R` (short)\n"
             "````\n"
             "\n"
+        )
+
+
+class TestUnionFindsAFieldUnderAnyOfItsHeadingsNames:
+    """A field is the canonical's, whatever its heading says about it. When
+    one branch adds a name to a heading, reorders its names or rewords its
+    description, and that branch merges last, the merge keeps its heading
+    over a field another branch added a model to; the union must still put
+    that model back under the heading the merge kept."""
+
+    TEXT = "# Covariates\n\n## Fractions\n\n### {heading}\n\n- **Example models:** {models}.\n"
+
+    @pytest.mark.parametrize(
+        ("base_heading", "branch_heading"),
+        [
+            ("fm_a (**fraction a**)", "fm_a, fm_b (**fraction a**)"),
+            ("fm_a, fm_b (**fractions**)", "fm_b, fm_a (**fractions**)"),
+            ("fm_a (**fraction a**)", "fm_a (**fraction a, as the branch words it**)"),
+        ],
+        ids=["extended", "reordered", "reworded"],
+    )
+    def test_a_model_filed_under_the_old_heading_comes_back(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base_heading: str,
+        branch_heading: str,
+    ) -> None:
+        base = self.TEXT.format(heading=base_heading, models="`A_2020_a.R` (a)")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: base})
+        added = self.TEXT.format(heading=base_heading, models="`A_2020_a.R` (a), `Y_2022_y.R` (y)")
+        push_task_branch(repo, "claude/adds", {REGISTER: added}, "Add Y 2022")
+        renamed = self.TEXT.format(
+            heading=branch_heading, models="`A_2020_a.R` (a), `X_2021_x.R` (x)"
+        )
+        push_task_branch(repo, "claude/heads", {REGISTER: renamed}, "Add X 2021")
+        wt = consolidate(repo, ["origin/claude/adds", "origin/claude/heads"], CONSOLIDATION)
+        assert (wt / REGISTER).read_text() == renamed, "the fixture lost nothing"
+        proc = run_helper("union_merge_lines.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stderr
+        assert (wt / REGISTER).read_text() == self.TEXT.format(
+            heading=branch_heading,
+            models="`A_2020_a.R` (a), `X_2021_x.R` (x), `Y_2022_y.R` (y)",
         )
 
 

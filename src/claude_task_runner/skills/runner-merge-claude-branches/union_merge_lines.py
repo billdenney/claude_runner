@@ -25,7 +25,10 @@ This script repairs that loss after the merge:
    (dedup_canonical_headers.py: the whole field, label line, wrapped lines
    and sub-bullets) and buckets the ``(filename, note)`` entries by
    ``(covariate header, subsection header)`` resolved from the most recent
-   ``##``/``###`` markdown headings. An entry's note is what follows its
+   ``##``/``###`` markdown headings, where a copy's ``###`` heading that
+   declares one of the names of a heading in the merge result stands for
+   that heading: a branch may add a name to it, reorder its names or reword
+   its description while another adds a model under it. An entry's note is what follows its
    filename up to the next entry, a ``;`` or the full stop that ends a
    sentence, the same wherever the entry stands: a closing remark belongs to
    the field. Notes are compared by what they say, not by their form.
@@ -81,6 +84,10 @@ SECTION_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 Bucket = tuple[str, str]
 
+Headings = dict[tuple[str, str], str]
+"""``(## section, name) -> the ### heading that declares it`` in the file the
+union edits (see :func:`headings_of`)."""
+
 UNION_INTRO = (
     "Two merged copies of the register annotate each model below differently.",
     "The union kept the longer annotation, or a branch's correction; the other",
@@ -94,11 +101,15 @@ def fail(message: str) -> int:
     return 2
 
 
-def _sections(lines: Sequence[str]) -> list[Bucket]:
+def _sections(lines: Sequence[str], headings: Headings | None = None) -> list[Bucket]:
     """``(cov, sub)`` for each line: the latest ``##`` heading and the latest deeper one.
 
     The bucket key is the pair, so the same subsection name under different
-    covariates is kept distinct.
+    covariates is kept distinct. With ``headings`` (the edited file's), a
+    ``###`` heading that declares one of its names stands for that file's
+    heading: one branch may add a name to a heading, reorder its names or
+    reword its description while another files a model under it, and both
+    fields are the one canonical's.
     """
     cov = ""
     sub = ""
@@ -112,14 +123,42 @@ def _sections(lines: Sequence[str]) -> list[Bucket]:
                 sub = ""
             elif depth >= 3:
                 sub = match.group(2)
+                if depth == 3 and headings:
+                    sub = _resolved(cov, sub, headings)
         found.append((cov, sub))
     return found
 
 
-def _fields(lines: list[str]) -> Iterator[tuple[Bucket, int, register._Field]]:
+def headings_of(text: str) -> Headings:
+    """Each name a ``###`` heading of ``text`` declares, under its ``##``
+    section, mapped to that heading (the first, when two declare it)."""
+    lines = text.split("\n")
+    out: Headings = {}
+    for line, (cov, sub) in zip(lines, _sections(lines), strict=True):
+        match = SECTION_RE.match(line)
+        if match and len(match.group(1)) == 3:
+            for name in register.heading_names(sub)[0]:
+                out.setdefault((cov, name), sub)
+    return out
+
+
+def _resolved(cov: str, heading: str, headings: Headings) -> str:
+    """The edited file's heading under ``cov`` that declares one of
+    ``heading``'s names: ``heading`` itself when it is one of them, the first
+    in sorted order otherwise, and ``heading`` when there is none."""
+    found = {headings[(cov, n)] for n in register.heading_names(heading)[0] if (cov, n) in headings}
+    if heading in found or not found:
+        return heading
+    return min(found)
+
+
+def _fields(
+    lines: list[str], headings: Headings | None = None
+) -> Iterator[tuple[Bucket, int, register._Field]]:
     """Every Example-models field of every ``### `` block in ``lines``, read
-    by the dedup's parser: its bucket, the index of its label line, the field."""
-    buckets = _sections(lines)
+    by the dedup's parser: its bucket (see :func:`_sections`), the index of
+    its label line, the field."""
+    buckets = _sections(lines, headings)
     heads, bounds = register._parse(lines)
     for head, _, _ in heads:
         block = register._parse_block(lines[head : register._block_end(head, bounds)])
@@ -130,20 +169,22 @@ def _fields(lines: list[str]) -> Iterator[tuple[Bucket, int, register._Field]]:
             at += len(found.lines)
 
 
-def _entries(text: str) -> Iterator[tuple[Bucket, str, str, bool]]:
+def _entries(
+    text: str, headings: Headings | None = None
+) -> Iterator[tuple[Bucket, str, str, bool]]:
     """``(bucket, filename, note, listed)`` for every Example-models entry in
     ``text``; ``listed`` when it is in a sub-bullet."""
-    for bucket, _, found in _fields(text.split("\n")):
+    for bucket, _, found in _fields(text.split("\n"), headings):
         examples = register._examples(found)
         for entry in examples.entries:
             yield bucket, entry.model, entry.note, examples.runs[entry.run].bullet
 
 
-def _prose(text: str) -> dict[Bucket, Counter[str]]:
+def _prose(text: str, headings: Headings | None = None) -> dict[Bucket, Counter[str]]:
     """Each bucket's Example-models prose (text that belongs to no entry),
     whitespace normalised, with how often each piece occurs."""
     out: dict[Bucket, Counter[str]] = defaultdict(Counter)
-    for bucket, _, found in _fields(text.split("\n")):
+    for bucket, _, found in _fields(text.split("\n"), headings):
         out[bucket].update(register._norm([p]) for p in register._examples(found).prose)
     return out
 
@@ -216,9 +257,9 @@ def _as_map(found: Found, prose: dict[Bucket, Counter[str]]) -> Entries:
     return entries
 
 
-def entry_map(text: str) -> Entries:
+def entry_map(text: str, headings: Headings | None = None) -> Entries:
     """``(bucket, filename) -> note`` for ``text``, the longest on a repeat."""
-    return _as_map(list(_entries(text)), _prose(text))
+    return _as_map(list(_entries(text, headings)), _prose(text, headings))
 
 
 def _fold(
@@ -243,7 +284,11 @@ def _label(bucket: Bucket, filename: str = "") -> str:
     return " / ".join([part for part in bucket if part] + ([filename] if filename else []))
 
 
-def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]) -> Union:
+def collect_entries(
+    base_text: str,
+    branch_copies: Iterable[tuple[str, Entries]],
+    headings: Headings | None = None,
+) -> Union:
     """Fold the base and then what each branch changed into one :class:`Union`.
 
     ``branch_copies`` yields each branch's copy of the file with the entries
@@ -257,7 +302,10 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
     Across versions, the LONGEST observed note per ``(cov, sub, fname)``
     wins, the base's on a tie; every other note seen is kept for the report
     of what that discards. ``branch_copies`` is consumed one copy at a time,
-    so a large register is never held once per branch.
+    so a large register is never held once per branch. With ``headings``
+    (the edited file's, from :func:`headings_of`), every copy's fields are
+    bucketed under that file's headings; the fork points' entries in
+    ``branch_copies`` must be read with the same ``headings``.
 
     A branch's removals and corrections count only where the base still has
     what the branch inherited; when main changed the entry too, the branch's
@@ -265,17 +313,17 @@ def collect_entries(base_text: str, branch_copies: Iterable[tuple[str, Entries]]
     entry wins; a second that disagrees is noted.
     """
     union = Union()
-    base_found = list(_entries(base_text))
+    base_found = list(_entries(base_text, headings))
     base = _as_map(base_found, {})
     _fold(base_found, union, union.base_order)
     kept_by_branch: set[tuple[Bucket, str]] = set()
     for text, inherited in branch_copies:
-        found = list(_entries(text))
+        found = list(_entries(text, headings))
         _fold(found, union, union.branch_order, inherited)
         mine = _as_map(found, {})
         kept_by_branch.update(k for k in mine if k not in inherited)
         forked = getattr(inherited, "prose", {})
-        for bucket, pieces in _prose(text).items():
+        for bucket, pieces in _prose(text, headings).items():
             added = pieces - forked.get(bucket, Counter())
             if added:
                 union.prose.setdefault(bucket, Counter())
@@ -537,9 +585,10 @@ def emit_merged(current_text: str, union: Union) -> _Emitted:
 
 
 def _branch_copies(
-    repo: Path, members: Iterable[merge_set.Member], file_rel: str
+    repo: Path, members: Iterable[merge_set.Member], file_rel: str, headings: Headings
 ) -> Iterator[tuple[str, Entries]]:
-    """Each member's copy at its merged commit, with the entries at its fork point.
+    """Each member's copy at its merged commit, with the entries at its fork
+    point, bucketed under ``headings``.
 
     A member that deleted the file has no copy. Fork points repeat across
     members, so each one's entries are read once.
@@ -550,7 +599,8 @@ def _branch_copies(
         if text is None:
             continue
         if member.fork not in at_fork:
-            at_fork[member.fork] = entry_map(merge_set.read_file(repo, member.fork, file_rel) or "")
+            fork_text = merge_set.read_file(repo, member.fork, file_rel) or ""
+            at_fork[member.fork] = entry_map(fork_text, headings)
         yield text, at_fork[member.fork]
 
 
@@ -626,15 +676,18 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("# no branches touched the union-file; nothing to reconstruct.\n")
         return 0
 
+    with target.open(encoding="utf-8", newline="") as fh:
+        current_text = fh.read()
+    headings = headings_of(current_text)
     base_text = merge_set.read_file(repo, args.base, args.file) or ""
-    union = collect_entries(base_text, _branch_copies(repo, touching, args.file))
+    union = collect_entries(
+        base_text, _branch_copies(repo, touching, args.file, headings), headings
+    )
     sys.stderr.write(f"# (cov, sub) buckets with entries: {len(union.annotations)}\n")
     sys.stderr.write(
         f"# total filename entries:           {sum(len(v) for v in union.annotations.values())}\n"
     )
 
-    with target.open(encoding="utf-8", newline="") as fh:
-        current_text = fh.read()
     emitted = emit_merged(current_text, union)
     for note in emitted.notes:
         sys.stderr.write(f"{note}\n")

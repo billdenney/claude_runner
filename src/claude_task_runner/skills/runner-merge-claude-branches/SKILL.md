@@ -182,7 +182,10 @@ exists to repair. Repair, then regenerate.
      back twice that way, from branches that had been merged.
    - Reads each Example-models field whole with the dedup's parser (label
      line, wrapped lines, sub-bullets), buckets the entries by (covariate
-     header, subsection) and unions them with the base's, keeping the most
+     header, subsection), where a copy's `###` heading that declares one of
+     the merge result's heading's names is that heading (a branch may add a
+     name, reorder them or reword the description while another adds a
+     model), and unions them with the base's, keeping the most
      informative (longest) annotation per filename. Every other annotation
      that sets aside goes to the hand-union report (step 6b), beside the one
      kept.
