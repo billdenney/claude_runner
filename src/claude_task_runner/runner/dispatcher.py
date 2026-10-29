@@ -1039,10 +1039,13 @@ def _dispatch_loop(
     task: Task,
     started_at: datetime,
     heartbeat_persist_fn: Callable[[datetime], None] | None = None,
+    summary: StreamSummary | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the stream ends or we kill it.
 
-    Returns the StreamSummary and any cap violation observed.
+    Returns the StreamSummary and any cap violation observed. A caller that
+    passes ``summary`` gets it filled in place, so what the loop parsed
+    before it raised (the session id, the usage so far) is still there.
 
     The loop is decoupled from how its events arrive: ``lines`` is any
     iterable of NDJSON lines and ``terminate`` is the side-effect that
@@ -1065,7 +1068,7 @@ def _dispatch_loop(
     is enough since the interval is well below
     ``heartbeat_silence_alert_s``.
     """
-    summary = StreamSummary()
+    summary = summary if summary is not None else StreamSummary()
     cap_violation: caps_mod.CapViolation | None = None
     last_heartbeat: datetime | None = None
     last_persist_at: datetime | None = None
@@ -1314,6 +1317,40 @@ def _terminate(process: subprocess.Popen[str]) -> None:
             pgid,
         )
         raise TerminateFailed(f"task pid {process.pid} survived SIGKILL to PG {pgid}") from exc
+
+
+DISPATCH_LOOP_ERROR_STOP_REASON = "dispatch_loop_error"
+"""``stop_reason`` of a run whose dispatch loop raised, and whose worker was
+then stopped before it wrote its terminal result. The run's ``error`` names
+the exception. It is a failure like any other: it counts toward the circuit
+breaker, and the task is dispatched again."""
+
+
+def _stop_after_loop_error(process: subprocess.Popen[str], task_id: str, exc: Exception) -> bool:
+    """Stop an owned worker whose dispatch loop raised ``exc``; whether it is gone.
+
+    Logs the loop's failure with its traceback, then :func:`_terminate`s the
+    worker. ``False`` when the worker still runs: :func:`_terminate` could
+    not confirm it dead, so the caller must not record the attempt as over.
+    """
+    logger.error(
+        "task %s: dispatch loop raised %s: %s; stopping worker pid=%s",
+        task_id,
+        type(exc).__name__,
+        exc,
+        process.pid,
+        exc_info=exc,
+    )
+    try:
+        _terminate(process)
+    except Exception as stop_exc:
+        logger.error(
+            "task %s: could not stop worker pid=%s after its dispatch loop failed: %s",
+            task_id,
+            process.pid,
+            stop_exc,
+        )
+    return process.poll() is not None
 
 
 def _terminate_by_pid(
@@ -2118,6 +2155,9 @@ def dispatch(
     def _terminate_owned() -> None:
         _terminate(process)
 
+    summary = StreamSummary()
+    cap_violation: caps_mod.CapViolation | None = None
+    loop_error: Exception | None = None
     try:
         summary, cap_violation = _dispatch_loop(
             lines=lines,
@@ -2127,10 +2167,27 @@ def dispatch(
             task=task,
             started_at=started_at,
             heartbeat_persist_fn=heartbeat_persist_fn,
+            summary=summary,
         )
+    except Exception as exc:
+        # Escaping here would leave the worker running unsupervised and its
+        # task "running" with no run recorded. Stop the worker and record
+        # the attempt below, or park a worker that cannot be stopped.
+        loop_error = exc
     finally:
         if alive_monitor is not None:
             alive_monitor.stop()
+
+    if loop_error is not None and not _stop_after_loop_error(process, task.id, loop_error):
+        if persist_state:
+            parked = park_live_worker(
+                new_state, why="after its dispatch loop failed and it could not be stopped"
+            )
+            write_state_atomic(parked, state_path_for(queue_dir, task.id))
+        raise DispatchError(
+            f"task {task.id}: dispatch loop raised {type(loop_error).__name__}: {loop_error}; "
+            f"worker pid={process.pid} could not be stopped and is parked"
+        ) from loop_error
 
     # Drain remaining output and stderr. If the process won't finish
     # within the grace period, SIGKILL its whole group (so any forked
@@ -2200,6 +2257,16 @@ def dispatch(
         account=account,
         pid=process.pid,
     )
+    if loop_error is not None and summary.final_result is None:
+        # Stopped mid-run: the exit code is the stop, not the cause. A
+        # worker that wrote its terminal result before the loop failed
+        # finished its work, and that result stands.
+        run_record = run_record.model_copy(
+            update={
+                "stop_reason": DISPATCH_LOOP_ERROR_STOP_REASON,
+                "error": f"dispatch loop raised {type(loop_error).__name__}: {loop_error}",
+            }
+        )
 
     # Detect open sidecar once and thread it through finalization. The
     # output-evidence gate (ADR-0020) consults it when deciding whether
@@ -2676,7 +2743,7 @@ back to caller without resolution — should be picked up next tick
 via session resume, not classified completed yet), and the runner-
 synthesised ``killed_by_cap`` / ``process_exit_nonzero`` /
 ``no_result`` / ``pre_dispatch_hook_failed`` / ``end_turn_no_output``
-(ADR-0020 evidence gate)."""
+(ADR-0020 evidence gate) / ``dispatch_loop_error``."""
 
 
 def _count_trailing_failures(runs: list[RunRecord]) -> int:

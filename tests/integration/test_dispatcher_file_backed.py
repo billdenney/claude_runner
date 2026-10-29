@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ from claude_task_runner.queue.store import (
     state_path_for,
     write_state_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner.dispatcher import (
     DispatchOutcome,
     dispatch,
@@ -387,3 +389,162 @@ def test_spawn_records_the_workers_boot_and_start_tick(
     assert written and all(
         "worker_boot_id" not in w and "worker_start_ticks" not in w for w in written
     )
+
+
+# ---------------------------------------------------------------------------
+# A dispatch loop that raises (H88): the worker is stopped and the attempt
+# recorded, or parked when the worker cannot be stopped
+# ---------------------------------------------------------------------------
+
+_INIT_LINES = 1
+"""The shim's first line is its ``system/init`` event."""
+
+
+def _loop_raising_after(monkeypatch: pytest.MonkeyPatch, *, lines_before: int | None) -> None:
+    """Make ``_dispatch_loop`` raise ``RuntimeError("boom")`` from its own
+    iteration, after it has consumed ``lines_before`` lines, or after the
+    last one when ``None``: the real loop runs until then."""
+    real_loop = dispatcher_mod._dispatch_loop
+
+    def _loop(*, lines: object, **kwargs: object) -> object:
+        def _failing() -> object:
+            for count, line in enumerate(lines, start=1):  # type: ignore[call-overload]
+                yield line
+                if count == lines_before:
+                    raise RuntimeError("boom")
+            raise RuntimeError("boom")
+
+        return real_loop(lines=_failing(), **kwargs)
+
+    monkeypatch.setattr(dispatcher_mod, "_dispatch_loop", _loop)
+
+
+@pytest.fixture
+def spawned(monkeypatch: pytest.MonkeyPatch) -> object:
+    """Keeps every worker ``dispatch`` spawns, and kills any still running
+    at teardown."""
+    procs: list[subprocess.Popen[str]] = []
+    real_popen = subprocess.Popen
+
+    def _popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        proc = real_popen(*args, **kwargs)  # type: ignore[call-overload]
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(dispatcher_mod.subprocess, "Popen", _popen)
+    yield procs
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_loop_that_raises_mid_run_stops_the_worker_and_records_a_failure(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The loop raises after the init event while the worker still runs. The
+    worker is stopped, and exactly one run is recorded, failed with
+    dispatch_loop_error and the exception, with the session id the loop
+    had already seen."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-loop")
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    _loop_raising_after(monkeypatch, lines_before=_INIT_LINES)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.poll() is not None
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: boom",
+    )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.error, run.pid) == (
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: boom",
+        worker.pid,
+    )
+    assert run.killed_by_cap is None
+    assert reloaded.session_id == "sess-loop"
+    assert (reloaded.pid, reloaded.log_path) == (None, None)
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_terminal_result_written_before_the_loop_raised_stands(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The loop raises only after the worker's terminal result: the worker
+    finished its work, so its result is the run's record and the task is
+    completed, not failed and dispatched again."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-done")
+    _loop_raising_after(monkeypatch, lines_before=None)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "completed",
+        "end_turn",
+        None,
+    )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.error) == ("end_turn", None)
+    assert reloaded.session_id == "sess-done"
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """When the worker cannot be stopped it may still run, so the attempt is
+    not recorded as over: the task is parked possibly_hung with the
+    worker's pid, so it is not dispatched again and its run is recorded
+    once it exits, and dispatch raises."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    _loop_raising_after(monkeypatch, lines_before=_INIT_LINES)
+
+    def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+
+    [worker] = spawned
+    assert worker.poll() is None
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; "
+        f"worker pid={worker.pid} could not be stopped and is parked"
+    )
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
+    assert reloaded.pid == worker.pid
+    assert reloaded.runs == []
