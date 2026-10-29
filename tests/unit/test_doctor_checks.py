@@ -67,6 +67,7 @@ from claude_task_runner.supervisor.persistence import (
 from claude_task_runner.supervisor.pidfile import acquire_global_lock
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 from ._fs_faults import unsearchable
 from ._skill_installs import make
 
@@ -1043,13 +1044,14 @@ def test_check_state_yamls_flags_a_pid_past_the_digit_limit(
     state_dir = queue_dir / ".claude_task_runner" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "huge.yaml").write_text(
-        "schema_version: 2\ntask_id: huge\npid: " + "9" * 4301 + "\n", encoding="utf-8"
+        f"schema_version: 2\ntask_id: huge\npid: {PAST_DIGIT_LIMIT}\n", encoding="utf-8"
     )
     result = check_state_yamls(settings, queue_dir)
-    assert (result.status, result.detail) == (CheckStatus.FAIL, "1 of 1 state YAMLs invalid")
-    assert result.remediation is not None
-    assert result.remediation.startswith(f"huge.yaml: {state_dir / 'huge.yaml'}: invalid YAML: ")
-    assert "Exceeds the limit (4300 digits)" in result.remediation
+    assert (result.status, result.detail, result.remediation) == (
+        CheckStatus.FAIL,
+        "1 of 1 state YAMLs invalid",
+        f"huge.yaml: {state_dir / 'huge.yaml'}: invalid YAML: {digit_limit_error()}",
+    )
 
 
 # ---------------------------------------------------------------------------

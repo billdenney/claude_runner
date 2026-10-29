@@ -1079,15 +1079,24 @@ def test_a_supervisor_json_mtime_no_datetime_can_hold_leaves_the_record_readable
 
     assert (facts.saved_at, facts.saved_at_error) == (None, error)
     assert facts.snapshot_error is None
-    assert isinstance(facts.snapshot, dict)
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
+
+
+def _fromtimestamp_error(timestamp: float) -> str:
+    """What this interpreter's ``fromtimestamp`` says about ``timestamp``.
+    At 2**63 Python 3.11.1 raises OSError (errno 75); 3.11.15 and 3.12 on
+    raise OverflowError."""
+    with pytest.raises((ValueError, OverflowError, OSError)) as raised:
+        datetime.fromtimestamp(timestamp, UTC)
+    return str(raised.value)
 
 
 def test_a_real_supervisor_json_mtime_past_time_t_is_reported_as_unknown(
     far_future_mtime_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On tmpfs an mtime of 2**63 - 1 is stored, its float rounds up past the
-    platform's time_t, and fromtimestamp raises OverflowError. The summary
-    says when the supervisor last saved is unknown, and why."""
+    """On tmpfs an mtime of 2**63 - 1 is stored and its float rounds up to
+    2**63, which fromtimestamp rejects. The summary says when the
+    supervisor last saved is unknown, and why."""
     report = _report_module()
     queue = far_future_mtime_dir / "queue"
     (queue / "todo").mkdir(parents=True)
@@ -1101,9 +1110,9 @@ def test_a_real_supervisor_json_mtime_past_time_t_is_reported_as_unknown(
 
     facts = report.gather()
 
-    error = "timestamp out of range for platform time_t"
+    error = _fromtimestamp_error(path.stat().st_mtime)
     assert (facts.saved_at, facts.saved_at_error) == (None, error)
-    assert isinstance(facts.snapshot, dict)
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
     summary = report.plain_summary(facts)
     assert (
         "- **Supervisor:** its process is running, but when it last saved its state is unknown."
