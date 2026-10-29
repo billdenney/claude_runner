@@ -26,9 +26,10 @@
 #      a canonical two branches added in different words), or the verifier
 #      reported a loss, the run stops first (exit 9): the register keeps one
 #      wording, the others and the losses are in a hand-union report, and
-#      after the hand union is committed --finish --hand-union-done (with
-#      --accept-verifier-losses after a loss) pushes and prints the PR text
-#      from the same worktree. Every later failure names that report too.
+#      after the hand union is committed --finish --hand-union-done pushes
+#      and prints the PR text from the same worktree, once the gates pass
+#      again. Every stop prints that --finish command, and every later
+#      failure names the report too.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -68,11 +69,11 @@
 #   --accept-verifier-losses
 #                           Accept the models, headers or source aliases the
 #                           contribution verifier reports missing from a
-#                           register. With --finish: push although the run
-#                           recorded such losses, once each is reconciled by
-#                           hand or deliberately left. On a run: print a
-#                           WARNING for each instead of recording it and
-#                           stopping before the push.
+#                           register. With --finish: push although the
+#                           verifier, run again on the branch, still reports
+#                           losses; a branch it finds whole needs no flag. On
+#                           a run: print a WARNING for each instead of
+#                           recording it and stopping before the push.
 #   --skip-r-regen          Skip step 7 (buildModelDb / document). Use when
 #                           merging into a repo that doesn't have these.
 #   --skip-check            Skip step 8 (devtools::check). Use for fast
@@ -82,24 +83,33 @@
 #                           the final pre-push run because pkgdown CI's
 #                           sequential vignette build will surface the
 #                           failures one at a time.
+#                           A step the run skipped stays skipped for its
+#                           --finish without the flag; given to --finish, a
+#                           --skip-* skips that step if it is still pending.
 #   --vignette-jobs <N>     Parallel workers for vignette validation
 #                           (default: max(1, ncpus - 2)).
 #   --vignette-timeout <S>  Per-vignette wall-clock ceiling in seconds
 #                           (default: 900). Increase if you have a model
 #                           that legitimately needs >15 minutes.
 #   --skip-push             Don't push the branch (steps 1-9 only).
-#   --finish                Only push the existing worktree's branch and print
-#                           the PR text: the way to complete a run that stopped
-#                           for a hand union (exit 9), or failed a later gate,
-#                           once the fix is committed. Takes the same --repo,
-#                           --base, --branch-name, --union-file,
-#                           --register-file and --no-register-files as the run
-#                           (the stop message prints them); refuses a worktree
-#                           with uncommitted changes, checks again that no
-#                           duplicate canonical remains, and prints a pending
-#                           hand-union report and stops (exit 9) unless
-#                           --hand-union-done is given, and, when the run
-#                           recorded verifier losses, --accept-verifier-losses.
+#   --finish                Complete a run that stopped (a hand union, exit 9,
+#                           or a failed gate) once the fix is committed: run the
+#                           gates again on the worktree's branch, run every R
+#                           step the run did not complete, push, and print the
+#                           PR text. Takes the same --repo, --base,
+#                           --branch-name, --pattern, --extra-ref,
+#                           --union-file, --register-file and
+#                           --no-register-files as the run (every stop prints
+#                           them). It refuses a worktree with uncommitted
+#                           changes; prints a pending hand-union report and
+#                           stops (exit 9) unless --hand-union-done is given;
+#                           runs the duplicate check, the revert check and the
+#                           contribution verifier, stopping (exit 9) while the
+#                           verifier reports a loss unless
+#                           --accept-verifier-losses; then runs the
+#                           regeneration if it never completed or HEAD has
+#                           moved since it did, and check and the vignettes
+#                           if they never completed, each unless skipped.
 #   --hand-union-done       With --finish: the report's wording is unioned into
 #                           the register and committed; push anyway.
 #   --dry-run               Print the survey and exit before creating the worktree.
@@ -120,7 +130,8 @@
 #      an --extra-ref does not resolve, no branch matched, a survey diff
 #      failed (no merge base, or a shallow clone), no --yes without a
 #      terminal, or the worktree already exists; for --finish, no worktree,
-#      a worktree on another branch, or one with uncommitted changes
+#      a worktree on another branch, one with uncommitted changes, or no
+#      Rscript while an R step is still pending
 #   4  nothing merged: two branches add one path with different content (the
 #      survey stops before merging), or every merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
@@ -136,8 +147,8 @@
 #      message names the worktree, the report of what the register lacks, and
 #      the --finish command to run once the hand union is committed. --finish
 #      also exits 9 while that report holds anything and --hand-union-done is
-#      not given, or while the run's verifier losses are not accepted with
-#      --accept-verifier-losses.
+#      not given, or while the verifier it runs still reports a loss and
+#      --accept-verifier-losses is not given.
 set -Eeuo pipefail
 # errtrace (-E): functions and subshells inherit the ERR trap, so a command
 # that fails inside a function is reported and exits 1 like one at the top
@@ -152,7 +163,10 @@ trap 'remind_hand_union $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 HAND_UNION_REPORT=""
-VERIFIER_LOSSES=""
+# Which of steps 7-9 the run skipped, and the commit each completed at
+# (stage_get); kept in the worktree's git directory for --finish.
+STAGES_FILE=""
+VERIFY_LOSS_FILES=()
 HAND_UNION_DONE=0
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
@@ -162,7 +176,8 @@ PYTHON3="$(command -v python3 || true)"
 
 REPO="${PWD}"
 BASE="origin/main"
-PATTERN="origin/claude/*"
+DEFAULT_PATTERN="origin/claude/*"
+PATTERN="$DEFAULT_PATTERN"
 BRANCH_NAME=""
 DEFAULT_UNION_FILE="inst/references/covariate-columns.md"
 UNION_FILE="$DEFAULT_UNION_FILE"
@@ -178,7 +193,9 @@ SKIP_R_REGEN=0
 SKIP_CHECK=0
 SKIP_VIGNETTES=0
 VIGNETTE_JOBS=""
-VIGNETTE_TIMEOUT=900
+DEFAULT_VIGNETTE_TIMEOUT=900
+VIGNETTE_TIMEOUT=$DEFAULT_VIGNETTE_TIMEOUT
+VIGNETTE_JOBS_GIVEN=0
 SKIP_PUSH=0
 ACCEPT_VERIFIER_LOSSES=0
 FINISH=0
@@ -260,9 +277,15 @@ check_no_duplicates() {  # gate: no duplicate canonical remains in any register
 }
 
 finish_command() {  # this run's --finish command line, every value shell-quoted
-  local cmd reg
+  local cmd reg ref
   cmd="bash $(printf '%q' "$SCRIPT_DIR/merge_branches.sh") --repo $(printf '%q' "$REPO")"
   cmd+=" --base $(printf '%q' "$BASE") --branch-name $(printf '%q' "$BRANCH_NAME")"
+  if [[ "$PATTERN" != "$DEFAULT_PATTERN" ]]; then
+    cmd+=" --pattern $(printf '%q' "$PATTERN")"
+  fi
+  for ref in "${EXTRA_REFS[@]:-}"; do
+    if [[ -n "$ref" ]]; then cmd+=" --extra-ref $(printf '%q' "$ref")"; fi
+  done
   if [[ "$UNION_FILE" != "$DEFAULT_UNION_FILE" ]]; then
     cmd+=" --union-file $(printf '%q' "$UNION_FILE")"
   fi
@@ -272,18 +295,66 @@ finish_command() {  # this run's --finish command line, every value shell-quoted
       if [[ -n "$reg" ]]; then cmd+=" --register-file $(printf '%q' "$reg")"; fi
     done
   fi
+  if (( VIGNETTE_JOBS_GIVEN )); then cmd+=" --vignette-jobs $VIGNETTE_JOBS"; fi
+  if (( VIGNETTE_TIMEOUT != DEFAULT_VIGNETTE_TIMEOUT )); then
+    cmd+=" --vignette-timeout $VIGNETTE_TIMEOUT"
+  fi
   echo "$cmd --finish"
 }
 
-finish_flags() {  # what --finish needs: --hand-union-done, and --accept-verifier-losses after losses
-  local flags=" --hand-union-done"
-  if [[ -s "$VERIFIER_LOSSES" ]]; then flags+=" --accept-verifier-losses"; fi
-  echo "$flags"
+finish_line() {  # the --finish command every message prints: --hand-union-done while the report holds anything
+  local line
+  line="$(finish_command)"
+  if [[ -s "$HAND_UNION_REPORT" ]]; then line+=" --hand-union-done"; fi
+  echo "$line"
+}
+
+join_paths() {  # <path>...: one line, ", " between
+  local joined="" path
+  for path in "$@"; do joined+="${joined:+, }$path"; done
+  echo "$joined"
+}
+
+stage_get() {  # <stage>: "pending", "skip", or the commit it completed at
+  local stage=$1 name value
+  if [[ -f "$STAGES_FILE" ]]; then
+    while read -r name value; do
+      if [[ "$name" == "$stage" ]]; then
+        echo "$value"
+        return 0
+      fi
+    done < "$STAGES_FILE"
+  fi
+  echo pending
+}
+
+stage_set() {  # <stage> <value>
+  local stage=$1 value=$2 name old kept=""
+  if [[ -f "$STAGES_FILE" ]]; then
+    while read -r name old; do
+      if [[ "$name" != "$stage" ]]; then kept+="$name $old"$'\n'; fi
+    done < "$STAGES_FILE"
+  fi
+  printf '%s%s %s\n' "$kept" "$stage" "$value" > "$STAGES_FILE"
+}
+
+record_skips() {  # the run's --skip-* flags, so --finish keeps them without being told
+  stage_set regen "$( (( SKIP_R_REGEN )) && echo skip || echo pending )"
+  stage_set check "$( (( SKIP_CHECK )) && echo skip || echo pending )"
+  stage_set vignettes "$( (( SKIP_VIGNETTES )) && echo skip || echo pending )"
+}
+
+register_targets() {  # the union file and every register file the worktree has
+  local rf
+  RESTORE_TARGETS=()
+  if [[ -n "$UNION_FILE" && -f "$UNION_FILE" ]]; then RESTORE_TARGETS+=("$UNION_FILE"); fi
+  for rf in "${REGISTER_FILES[@]:-}"; do
+    if [[ -n "$rf" && -f "$rf" ]]; then RESTORE_TARGETS+=("$rf"); fi
+  done
 }
 
 record_verifier_losses() {  # <register> <verifier output>: into the hand-union report
   local file=$1 out=$2
-  echo "$file" >> "$VERIFIER_LOSSES"
   {
     echo "# Contributions missing from $file"
     echo
@@ -299,24 +370,79 @@ record_verifier_losses() {  # <register> <verifier output>: into the hand-union 
   } >> "$HAND_UNION_REPORT"
 }
 
+verify_contributions() {  # <run|finish>: the contribution verifier on every register
+  local mode=$1 vf verify_rc out
+  out="$(git rev-parse --path-format=absolute --git-path verifier-output.txt)"
+  VERIFY_LOSS_FILES=()
+  echo
+  echo "==> Verifying no per-branch model contributions are missing"
+  for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
+    verify_rc=0
+    "$SCRIPT_DIR/verify_branch_contributions.sh" --repo "$REPO" --branch "$BRANCH_NAME" \
+      --base "$BASE" --pattern "$PATTERN" --file "$vf" "${EXTRA_REF_ARGS[@]}" \
+      | tee "$out" || verify_rc=$?
+    if (( verify_rc == 1 && ACCEPT_VERIFIER_LOSSES )); then
+      echo "WARNING: verifier reported missing contributions in $vf."
+      echo "         --accept-verifier-losses: the run goes on. Reconcile them by hand"
+      echo "         before opening the PR (see the placement report): no repair"
+      echo "         relocates a brand-new section header, or unions two branches'"
+      echo "         entries for one canonical filed under different ## sections."
+    elif (( verify_rc == 1 )); then
+      VERIFY_LOSS_FILES+=("$vf")
+      if [[ "$mode" == run ]]; then
+        record_verifier_losses "$vf" "$out"
+        echo "    (verifier) the contributions missing from $vf are in the hand-union report; the run stops before the push."
+      fi
+    elif (( verify_rc != 0 )); then
+      die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
+    fi
+  done
+}
+
+revert_check() {  # gate: register content the base has that the merge, or a hand edit, lost
+  local rf targets=() revert_rc=0
+  for rf in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+    [[ -n "$rf" ]] || continue
+    [[ " ${targets[*]:-} " == *" $rf "* ]] && continue
+    if [[ -f "$rf" ]] || git cat-file -e "${BASE}:${rf}" 2>/dev/null; then
+      targets+=(--file "$rf")
+    fi
+  done
+  (( ${#targets[@]} )) || return 0
+  echo
+  echo "==> Checking the registers for base content the merge reverted"
+  "$PYTHON3" "$SCRIPT_DIR/verify_no_base_reverts.py" \
+    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN" \
+    "${EXTRA_REF_ARGS[@]}" "${targets[@]}" || revert_rc=$?
+  if (( revert_rc == 1 )); then
+    {
+      echo "ERROR: the merge reverted register content $BASE has (listed above). Nothing"
+      echo "  was repaired: restore it by hand in $WT_ABS and commit, then run"
+      echo "     $(finish_line)"
+    } >&2
+    exit 5
+  elif (( revert_rc != 0 )); then
+    die 5 "verify_no_base_reverts.py could not run (exit $revert_rc)."
+  fi
+}
+
 stop_for_hand_union() {
-  if [[ -s "$VERIFIER_LOSSES" ]]; then
-    local files="" file
-    while IFS= read -r file; do files+="${files:+, }$file"; done < "$VERIFIER_LOSSES"
+  if (( ${#VERIFY_LOSS_FILES[@]} )); then
     {
       echo
       echo "STOP: every step but the push ran, but the verifier reported a model, header"
-      echo "  or source alias a merged branch added missing from $files, and no repair"
-      echo "  put it back. Each is in the hand-union report, with any wording a repair"
-      echo "  set aside:"
+      echo "  or source alias a merged branch added missing from $(join_paths "${VERIFY_LOSS_FILES[@]}"),"
+      echo "  and no repair put it back. Each is in the hand-union report, with any"
+      echo "  wording a repair set aside:"
       echo "    $HAND_UNION_REPORT"
       echo "  (it goes with the worktree, git worktree remove, so copy it to keep it)."
       echo "  1. In the worktree $WT_ABS, reconcile each by hand, union any wording"
       echo "     set aside into the register, keeping each source's attribution, and"
       echo "     commit."
-      echo "  2. Then push the branch and print the PR text; --accept-verifier-losses"
-      echo "     accepts any loss you leave:"
-      echo "     $(finish_command)$(finish_flags)"
+      echo "  2. Then push the branch and print the PR text. --finish runs the checks"
+      echo "     again first, and stops while a loss is left unless you add"
+      echo "     --accept-verifier-losses:"
+      echo "     $(finish_line)"
     } >&2
     exit 9
   fi
@@ -330,7 +456,7 @@ stop_for_hand_union() {
     echo "  1. In the worktree $WT_ABS, union that wording into the register"
     echo "     by hand, keeping each source's attribution, and commit."
     echo "  2. Then push the branch and print the PR text:"
-    echo "     $(finish_command) --hand-union-done"
+    echo "     $(finish_line)"
   } >&2
   exit 9
 }
@@ -442,6 +568,174 @@ EOF
   echo "--merged origin/main lists them). No post-merge advance step needed."
 }
 
+run_regen() {  # step 7: regenerate the registry artifacts and commit them
+  local pre_dirty
+  echo
+  pre_dirty="$(git status --porcelain)"
+  echo "==> Regenerating registry artifacts (Rscript)"
+  if ! Rscript -e '
+    suppressPackageStartupMessages(library(devtools))
+    cat("--- load_all ---\n")
+    load_all(".", quiet = TRUE)
+    if (exists("buildModelDb", where = asNamespace("nlmixr2lib"), inherits = FALSE)) {
+      cat("--- buildModelDb ---\n")
+      nlmixr2lib:::buildModelDb()
+    } else {
+      cat("--- skipping buildModelDb (function not found in nlmixr2lib namespace) ---\n")
+    }
+    cat("--- document ---\n")
+    document()
+    cat("--- done ---\n")
+  ' 2>&1 | tail -10; then
+    {
+      echo "ERROR: the registry regeneration failed (its last output is above)."
+      echo "  Fix it in $WT_ABS and commit, then run"
+      echo "     $(finish_line)"
+      echo "  which runs it again, and every later stage still pending, before the push."
+    } >&2
+    exit 5
+  fi
+
+  # Stage whatever the regen actually WROTE, not a hardcoded artifact list.
+  #
+  # The old list named `inst/modeldb.qs2` -- a path this same script carries on
+  # its forbidden-resurrection list, because nlmixr2lib dropped it in favour of
+  # `inst/modeldb.rds`.  So the staging line asked for a file that cannot exist
+  # and never named the one that does: on the 2026-08-31 consolidation the
+  # regenerated registry would have been left unstaged and the branch pushed
+  # with a registry blob stale against 181 new model files.  A hardcoded list
+  # silently under-stages every time the package renames a derived artifact.
+  #
+  # Every earlier step commits its own work, so the worktree is clean on entry
+  # here and anything dirty now is regen output.  Assert that rather than
+  # assume it: if the tree was already dirty the operator needs to know, since
+  # `git add -A` would sweep unrelated edits into the regen commit.
+  if [[ -n "$pre_dirty" ]]; then
+    echo "    WARN: worktree was already dirty before the regen step; staging"
+    echo "          only known artifact paths to avoid committing unrelated edits:"
+    printf '%s\n' "$pre_dirty" | sed 's/^/            /'
+    git add -A _pkgdown.yml data/ inst/ man/ NAMESPACE 2>/dev/null || true
+  elif ! git diff --quiet; then
+    git add -A
+  fi
+  if ! git diff --staged --quiet; then
+    git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
+    echo "    committed regen artifacts: $(git show --stat --format= --name-only HEAD | tr '\n' ' ')"
+  fi
+  stage_set regen "$(git rev-parse HEAD)"
+}
+
+run_check() {  # step 8: the devtools::check gate
+  echo
+  echo "==> Running devtools::check (this can take ~5-15 min)"
+  if Rscript -e 'devtools::check(error_on = "error", args = "--no-build-vignettes")' 2>&1 | tail -20; then
+    echo "    check passed"
+    stage_set check "$(git rev-parse HEAD)"
+  else
+    {
+      echo "ERROR: devtools::check failed. Fix the failures in $WT_ABS and commit, then run"
+      echo "     $(finish_line)"
+      echo "  which runs check again, and the vignettes if still pending, before the push."
+    } >&2
+    exit 6
+  fi
+}
+
+# Step 9, the parallel vignette validation pre-push gate.
+#
+# Why this exists: devtools::check runs with --no-build-vignettes (the
+# CarlssonPetri segfault is the on-disk reason), so vignette
+# evaluation is NOT covered by step 8. pkgdown's CI runs vignettes
+# sequentially and ABORTS on the first failure, so after a large
+# merge it surfaces broken vignettes one at a time across many cycles
+# — a 14-failure consolidation can take 14 CI iterations to drain.
+# A local parallel pass (callr-isolated, continues-on-failure) finds
+# them all in one shot. This is a HARD GATE: a failed vignette
+# blocks push.
+#
+# The gate is the validator's own exit status (0 only when every vignette
+# rendered, or there were none) plus the per-file results. It used to be the
+# results alone, with the pipeline as a bare `if` condition, so an Rscript
+# that was missing or died before writing a line -- a failed install, a
+# missing package -- left no "ok":false to find and the run went on to push.
+run_vignettes() {  # step 9: every vignette renders
+  echo
+  echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
+  echo "    jobs=$VIGNETTE_JOBS  timeout=${VIGNETTE_TIMEOUT}s/vignette"
+  VIGNETTE_RESULTS="${WT_ABS}/.vignette_results.jsonl"
+  VIGNETTE_LOG="${WT_ABS}/.vignette_build.log"
+  rm -f "$VIGNETTE_RESULTS"  # never judge this run by an earlier run's results
+  local vignette_rc=0
+  Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \
+       --worktree "$WT_ABS" \
+       --jobs "$VIGNETTE_JOBS" \
+       --timeout "$VIGNETTE_TIMEOUT" \
+       --results "$VIGNETTE_RESULTS" 2>&1 | tee "$VIGNETTE_LOG" \
+       | { grep -E '^\[FAIL|^SUMMARY|^FAILURES' || true; } || vignette_rc=$?
+  if (( vignette_rc != 0 )) || grep -q '"ok":false' "$VIGNETTE_RESULTS" 2>/dev/null; then
+    echo
+    if [[ -s "$VIGNETTE_RESULTS" ]]; then
+      echo "ERROR: at least one vignette failed to render (validator exit $vignette_rc). Worktree at" >&2
+    else
+      echo "ERROR: the vignette validator exited $vignette_rc without recording a result. Its last lines:" >&2
+      tail -n 5 "$VIGNETTE_LOG" | sed 's/^/    /' >&2
+      echo "Worktree at" >&2
+    fi
+    echo "  $WT_ABS" >&2
+    echo "Full log:    $VIGNETTE_LOG" >&2
+    echo "Per-file JSONL: $VIGNETTE_RESULTS" >&2
+    echo >&2
+    echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
+    echo "validator's setup) and commit, then run" >&2
+    echo "     $(finish_line)" >&2
+    echo "which runs the validation again before the push." >&2
+    exit 8
+  fi
+  echo "    all vignettes rendered cleanly"
+  stage_set vignettes "$(git rev-parse HEAD)"
+}
+
+stage_flag() {  # <stage>: the flag that skips it
+  case "$1" in
+    regen) echo --skip-r-regen ;;
+    check) echo --skip-check ;;
+    vignettes) echo --skip-vignettes ;;
+  esac
+}
+
+finish_r_stages() {  # --finish: every R stage the run did not complete, in order
+  local stage state skipped head flags="" pending=()
+  head="$(git rev-parse HEAD)"
+  for stage in regen check vignettes; do
+    state="$(stage_get "$stage")"
+    case "$stage" in
+      regen) skipped=$SKIP_R_REGEN ;;
+      check) skipped=$SKIP_CHECK ;;
+      vignettes) skipped=$SKIP_VIGNETTES ;;
+    esac
+    if [[ "$state" == skip ]]; then
+      echo "    ($stage: skipped on the run with $(stage_flag "$stage"))"
+    elif [[ "$state" != pending && ( "$stage" != regen || "$state" == "$head" ) ]]; then
+      echo "    ($stage: completed at ${state:0:12})"
+    elif (( skipped )); then
+      echo "    ($stage: still pending, skipped with $(stage_flag "$stage") on --finish)"
+    else
+      pending+=("$stage")
+      flags+=" $(stage_flag "$stage")"
+    fi
+  done
+  if (( ${#pending[@]} )) && ! command -v Rscript >/dev/null 2>&1; then
+    die 3 "Rscript is not on PATH, and these stages are still pending on $BRANCH_NAME: $(join_paths "${pending[@]}"). Install R and run --finish again, or add$flags to push without them."
+  fi
+  for stage in "${pending[@]:-}"; do
+    case "$stage" in
+      regen) run_regen ;;
+      check) run_check ;;
+      vignettes) run_vignettes ;;
+    esac
+  done
+}
+
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -464,7 +758,7 @@ while [[ $# -gt 0 ]]; do
     --skip-r-regen) SKIP_R_REGEN=1; shift ;;
     --skip-check) SKIP_CHECK=1; shift ;;
     --skip-vignettes) SKIP_VIGNETTES=1; shift ;;
-    --vignette-jobs) need_value "$@"; VIGNETTE_JOBS="$2"; shift 2 ;;
+    --vignette-jobs) need_value "$@"; VIGNETTE_JOBS="$2"; VIGNETTE_JOBS_GIVEN=1; shift 2 ;;
     --vignette-timeout) need_value "$@"; VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
     --finish) FINISH=1; shift ;;
@@ -492,6 +786,13 @@ if (( HAND_UNION_DONE && ! FINISH )); then
   die 2 "--hand-union-done goes with --finish"
 fi
 
+# The same hand-picked refs for every repair and verify step: a step that
+# skips them repairs nothing those branches lost.
+EXTRA_REF_ARGS=()
+for er in "${EXTRA_REFS[@]:-}"; do
+  if [[ -n "$er" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$er"); fi
+done
+
 if [[ -z "$BRANCH_NAME" ]]; then
   BRANCH_NAME="merge-all-claude-branches-$(date -u +%F)"
 fi
@@ -515,35 +816,42 @@ if (( FINISH )); then
   [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
     || die 3 "--finish: $WT_ABS has uncommitted changes; commit the hand union first."
   HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
-  VERIFIER_LOSSES="$(git rev-parse --path-format=absolute --git-path verifier-losses)"
+  STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
   echo "==> Finishing $BRANCH_NAME in $WT_ABS"
-  if { [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); } \
-    || { [[ -s "$VERIFIER_LOSSES" ]] && (( ! ACCEPT_VERIFIER_LOSSES )); }; then
+  if [[ -s "$HAND_UNION_REPORT" ]] && (( ! HAND_UNION_DONE )); then
     {
       cat "$HAND_UNION_REPORT"
       echo
       echo "STOP: the hand-union report above is not empty:"
       echo "    $HAND_UNION_REPORT"
-      if [[ -s "$VERIFIER_LOSSES" ]]; then
-        echo "  It lists contributions the verifier reports missing; reconcile each by hand"
-        echo "  and commit (--accept-verifier-losses accepts any you leave), and union any"
-        echo "  wording a repair set aside. Then run"
-      else
-        echo "  Union its wording into the register in $WT_ABS and commit, then run"
-      fi
-      echo "     $(finish_command)$(finish_flags)"
+      echo "  Union its wording into the register in $WT_ABS, reconcile any contribution"
+      echo "  it lists as missing, and commit, then run"
+      echo "     $(finish_line)"
     } >&2
     exit 9
   fi
   if [[ -s "$HAND_UNION_REPORT" ]]; then
     echo "    hand union confirmed (--hand-union-done); the report stays at $HAND_UNION_REPORT"
   fi
-  if [[ -s "$VERIFIER_LOSSES" ]]; then
-    echo "    verifier losses accepted (--accept-verifier-losses)"
-  fi
+  # The run's gates again, on the branch as the hand edits left it.
   check_no_duplicates
+  register_targets
+  revert_check
+  verify_contributions finish
+  if (( ${#VERIFY_LOSS_FILES[@]} )); then
+    {
+      echo
+      echo "STOP: the verifier still reports a model, header or source alias a merged"
+      echo "  branch added missing from $(join_paths "${VERIFY_LOSS_FILES[@]}") (listed above)."
+      echo "  Reconcile each by hand in $WT_ABS and commit, then run --finish again; to"
+      echo "  push with what is left, accept it:"
+      echo "     $(finish_line) --accept-verifier-losses"
+    } >&2
+    exit 9
+  fi
   SUCCESS=$(git log --first-parent --format=%s "$BASE..HEAD" \
     | grep -c "^Merge branch '.*' into ${BRANCH_NAME}\$" || true)
+  finish_r_stages
   push_and_report
   exit 0
 fi
@@ -604,12 +912,6 @@ for er in "${EXTRA_REFS[@]:-}"; do
   if (( ! in_pattern )); then
     ALL_MATCHES+=("$er")
   fi
-done
-# The same hand-picked refs for every repair and verify step: a step that
-# skips them repairs nothing those branches lost.
-EXTRA_REF_ARGS=()
-for er in "${EXTRA_REFS[@]:-}"; do
-  if [[ -n "$er" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$er"); fi
 done
 
 UNMERGED=()
@@ -757,8 +1059,9 @@ git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 cd "$WT_ABS"
 # Kept in the worktree's own git directory, so no step can commit it.
 HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
-VERIFIER_LOSSES="$(git rev-parse --path-format=absolute --git-path verifier-losses)"
-rm -f "$HAND_UNION_REPORT" "$VERIFIER_LOSSES"
+STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
+rm -f "$HAND_UNION_REPORT" "$STAGES_FILE"
+record_skips
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
 echo "    binaries regenerated and covariate-columns.md union-merged after)"
@@ -977,11 +1280,7 @@ done
 # so lacking it) touches the same region. verify_branch_contributions.sh below
 # REPORTS that loss but does not repair it, so this was a manual step on every
 # large merge -- 21 blocks on 2026-08-20 alone.
-RESTORE_TARGETS=()
-[[ -n "$UNION_FILE" && -f "$UNION_FILE" ]] && RESTORE_TARGETS+=("$UNION_FILE")
-for rf in "${REGISTER_FILES[@]:-}"; do
-  [[ -n "$rf" && -f "$rf" ]] && RESTORE_TARGETS+=("$rf")
-done
+register_targets
 if (( ${#RESTORE_TARGETS[@]} )); then
   echo
   echo "==> Restoring canonical blocks dropped by the merge"
@@ -1028,34 +1327,7 @@ fi
 # --accept-verifier-losses; given on the run itself, that flag turns each
 # verdict into a WARNING instead. Any other non-zero exit means the verifier
 # could not run at all, and carrying on would ship an unverified merge.
-echo
-echo "==> Verifying no per-branch model contributions are missing"
-VERIFY_OUT="$(git rev-parse --path-format=absolute --git-path verifier-output.txt)"
-for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
-  verify_args=(
-    --repo "$REPO"
-    --branch "$BRANCH_NAME"
-    --base "$BASE"
-    --pattern "$PATTERN"
-    --file "$vf"
-    "${EXTRA_REF_ARGS[@]}"
-  )
-  verify_rc=0
-  "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}" | tee "$VERIFY_OUT" \
-    || verify_rc=$?
-  if (( verify_rc == 1 && ! ACCEPT_VERIFIER_LOSSES )); then
-    record_verifier_losses "$vf" "$VERIFY_OUT"
-    echo "    (verifier) the contributions missing from $vf are in the hand-union report; the run stops before the push."
-  elif (( verify_rc == 1 )); then
-    echo "WARNING: verifier reported missing contributions in $vf."
-    echo "         --accept-verifier-losses: the run goes on. Reconcile them by hand"
-    echo "         before opening the PR (see the placement report): no repair"
-    echo "         relocates a brand-new section header, or unions two branches'"
-    echo "         entries for one canonical filed under different ## sections."
-  elif (( verify_rc != 0 )); then
-    die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
-  fi
-done
+verify_contributions run
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
 # every branch edits the same lines and -X theirs takes the last branch's whole
@@ -1088,149 +1360,13 @@ fi
 # CONMED_RTV_CC block cut CONMED_RTV_AUC_12H's notes in half. Report every line
 # the base has that the merge lost and no merged branch's own diff removed, and
 # stop: which copy of a block is right needs judgement, so nothing is repaired.
-REVERT_TARGETS=()
-for rf in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
-  [[ -n "$rf" ]] || continue
-  [[ " ${REVERT_TARGETS[*]:-} " == *" $rf "* ]] && continue
-  if [[ -f "$rf" ]] || git cat-file -e "${BASE}:${rf}" 2>/dev/null; then
-    REVERT_TARGETS+=(--file "$rf")
-  fi
-done
-if (( ${#REVERT_TARGETS[@]} )); then
-  echo
-  echo "==> Checking the registers for base content the merge reverted"
-  revert_rc=0
-  "$PYTHON3" "$SCRIPT_DIR/verify_no_base_reverts.py" \
-    --repo "$REPO" --branch "$BRANCH_NAME" --base "$BASE" --pattern "$PATTERN" \
-    "${EXTRA_REF_ARGS[@]}" "${REVERT_TARGETS[@]}" || revert_rc=$?
-  if (( revert_rc == 1 )); then
-    die 5 "the merge reverted register content $BASE has (listed above). Nothing was repaired: restore it by hand in $WT_ABS, commit, and re-run verify_no_base_reverts.py until it passes before regenerating and pushing."
-  elif (( revert_rc != 0 )); then
-    die 5 "verify_no_base_reverts.py could not run (exit $revert_rc)."
-  fi
-fi
+revert_check
 
-# R-side registry regeneration.
-if (( ! SKIP_R_REGEN )); then
-  echo
-  PRE_REGEN_DIRTY="$(git status --porcelain)"
-  echo "==> Regenerating registry artifacts (Rscript)"
-  if ! Rscript -e '
-    suppressPackageStartupMessages(library(devtools))
-    cat("--- load_all ---\n")
-    load_all(".", quiet = TRUE)
-    if (exists("buildModelDb", where = asNamespace("nlmixr2lib"), inherits = FALSE)) {
-      cat("--- buildModelDb ---\n")
-      nlmixr2lib:::buildModelDb()
-    } else {
-      cat("--- skipping buildModelDb (function not found in nlmixr2lib namespace) ---\n")
-    }
-    cat("--- document ---\n")
-    document()
-    cat("--- done ---\n")
-  ' 2>&1 | tail -10; then
-    die 5 "the registry regeneration failed (its last output is above). The worktree is left at $WT_ABS"
-  fi
-
-  # Stage whatever the regen actually WROTE, not a hardcoded artifact list.
-  #
-  # The old list named `inst/modeldb.qs2` -- a path this same script carries on
-  # its forbidden-resurrection list, because nlmixr2lib dropped it in favour of
-  # `inst/modeldb.rds`.  So the staging line asked for a file that cannot exist
-  # and never named the one that does: on the 2026-08-31 consolidation the
-  # regenerated registry would have been left unstaged and the branch pushed
-  # with a registry blob stale against 181 new model files.  A hardcoded list
-  # silently under-stages every time the package renames a derived artifact.
-  #
-  # Every earlier step commits its own work, so the worktree is clean on entry
-  # here and anything dirty now is regen output.  Assert that rather than
-  # assume it: if the tree was already dirty the operator needs to know, since
-  # `git add -A` would sweep unrelated edits into the regen commit.
-  if [[ -n "$PRE_REGEN_DIRTY" ]]; then
-    echo "    WARN: worktree was already dirty before the regen step; staging"
-    echo "          only known artifact paths to avoid committing unrelated edits:"
-    printf '%s\n' "$PRE_REGEN_DIRTY" | sed 's/^/            /'
-    git add -A _pkgdown.yml data/ inst/ man/ NAMESPACE 2>/dev/null || true
-  elif ! git diff --quiet; then
-    git add -A
-  fi
-  if ! git diff --staged --quiet; then
-    git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
-    echo "    committed regen artifacts: $(git show --stat --format= --name-only HEAD | tr '\n' ' ')"
-  fi
-fi
-
-# devtools::check pre-push gate.
-if (( ! SKIP_CHECK )); then
-  echo
-  echo "==> Running devtools::check (this can take ~5-15 min)"
-  if Rscript -e 'devtools::check(error_on = "error", args = "--no-build-vignettes")' 2>&1 | tail -20; then
-    echo "    check passed"
-  else
-    echo "ERROR: devtools::check failed. The worktree is left in place at" >&2
-    echo "  $WT_ABS" >&2
-    echo "Fix the failures and re-run check; when it is green, commit, then push" >&2
-    echo "and print the PR text with" >&2
-    echo "  $(finish_command)" >&2
-    exit 6
-  fi
-fi
-
-# Parallel vignette validation pre-push gate.
-#
-# Why this exists: devtools::check runs with --no-build-vignettes (the
-# CarlssonPetri segfault is the on-disk reason), so vignette
-# evaluation is NOT covered by step 8. pkgdown's CI runs vignettes
-# sequentially and ABORTS on the first failure, so after a large
-# merge it surfaces broken vignettes one at a time across many cycles
-# — a 14-failure consolidation can take 14 CI iterations to drain.
-# A local parallel pass (callr-isolated, continues-on-failure) finds
-# them all in one shot. This is a HARD GATE: a failed vignette
-# blocks push.
-#
-# The gate is the validator's own exit status (0 only when every vignette
-# rendered, or there were none) plus the per-file results. It used to be the
-# results alone, with the pipeline as a bare `if` condition, so an Rscript
-# that was missing or died before writing a line -- a failed install, a
-# missing package -- left no "ok":false to find and the run went on to push.
-if (( ! SKIP_VIGNETTES )); then
-  echo
-  echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
-  echo "    jobs=$VIGNETTE_JOBS  timeout=${VIGNETTE_TIMEOUT}s/vignette"
-  VIGNETTE_RESULTS="${WT_ABS}/.vignette_results.jsonl"
-  VIGNETTE_LOG="${WT_ABS}/.vignette_build.log"
-  rm -f "$VIGNETTE_RESULTS"  # never judge this run by an earlier run's results
-  vignette_rc=0
-  Rscript "$SCRIPT_DIR/verify_vignettes_parallel.R" \
-       --worktree "$WT_ABS" \
-       --jobs "$VIGNETTE_JOBS" \
-       --timeout "$VIGNETTE_TIMEOUT" \
-       --results "$VIGNETTE_RESULTS" 2>&1 | tee "$VIGNETTE_LOG" \
-       | { grep -E '^\[FAIL|^SUMMARY|^FAILURES' || true; } || vignette_rc=$?
-  if (( vignette_rc != 0 )) || grep -q '"ok":false' "$VIGNETTE_RESULTS" 2>/dev/null; then
-    echo
-    if [[ -s "$VIGNETTE_RESULTS" ]]; then
-      echo "ERROR: at least one vignette failed to render (validator exit $vignette_rc). Worktree at" >&2
-    else
-      echo "ERROR: the vignette validator exited $vignette_rc without recording a result. Its last lines:" >&2
-      tail -n 5 "$VIGNETTE_LOG" | sed 's/^/    /' >&2
-      echo "Worktree at" >&2
-    fi
-    echo "  $WT_ABS" >&2
-    echo "Full log:    $VIGNETTE_LOG" >&2
-    echo "Per-file JSONL: $VIGNETTE_RESULTS" >&2
-    echo >&2
-    echo "Fix the failing vignettes (or the underlying model .R files, or the" >&2
-    echo "validator's setup) and re-run validation:" >&2
-    echo "  Rscript $SCRIPT_DIR/verify_vignettes_parallel.R \\" >&2
-    echo "    --worktree $WT_ABS \\" >&2
-    echo "    --jobs $VIGNETTE_JOBS" >&2
-    echo "When it is green, commit, then push and print the PR text with" >&2
-    echo "  $(finish_command)" >&2
-    exit 8
-  fi
-  echo "    all vignettes rendered cleanly"
-fi
+# Steps 7-9, each unless skipped; each records the commit it completed at, so
+# --finish runs whichever the run did not complete.
+if (( ! SKIP_R_REGEN )); then run_regen; fi
+if (( ! SKIP_CHECK )); then run_check; fi
+if (( ! SKIP_VIGNETTES )); then run_vignettes; fi
 
 # Push, and print the PR text; stops first when a hand union is pending, which
 # includes a loss the verifier reported.

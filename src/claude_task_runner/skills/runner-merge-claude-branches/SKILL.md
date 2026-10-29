@@ -67,8 +67,9 @@ stop a run partway are 5 (a repair or verification step failed, the verifier
 could not run, or the revert check found base content the merge reverted),
 6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
 before the push, for wording a repair set aside or a loss the verifier
-reported; finish with `--finish --hand-union-done`, plus
-`--accept-verifier-losses` after a loss, steps 6b and 7).
+reported, steps 6b and 7). Every stop prints the `--finish` command that
+completes the run from the same worktree: it runs the gates again on the
+branch and every R step the run did not complete, then pushes (step 6b).
 
 ## The merge set
 
@@ -260,8 +261,18 @@ exists to repair. Repair, then regenerate.
    report and the `--finish --hand-union-done` command, and any later
    failure (check, vignettes) names the report too. Union the wording into
    the register by hand, keeping each source's attribution, commit in the
-   worktree, and run that command: it checks for duplicates again, pushes
-   the branch and prints the PR text, without redoing the merge. Without
+   worktree, and run that command, without redoing the merge. `--finish`
+   runs the run's gates again on the branch as the hand edits left it: the
+   duplicate check, the revert check (a hand edit that drops base content
+   stops it, exit 5) and the contribution verifier. Then it runs the
+   regeneration if the run's never completed or HEAD has moved since it did,
+   since the committed artifacts must match the tree pushed, and check and
+   the vignettes if they never completed; a step the run skipped stays
+   skipped, and a `--skip-*` given to `--finish` skips a step still pending.
+   A pending step with no `Rscript` on PATH stops it (exit 3). Then it
+   pushes the branch and prints the PR text. Every stop that leaves work
+   for `--finish` -- the revert check, a failed regeneration (exit 5),
+   check (exit 6) or vignette run (exit 8) -- prints the same command. Without
    `--hand-union-done`, `--finish` prints the report and stops (exit 9)
    while it holds anything. The report lives in the worktree's git
    directory and goes with the worktree; copy it before removing one.
@@ -426,9 +437,10 @@ exists to repair. Repair, then regenerate.
    register with losses to the hand-union report, runs every later step, and
    stops before the push (exit 9) with one message naming the files, the
    report and the `--finish` command. Reconcile each loss by hand in the
-   worktree and commit; `--finish --hand-union-done --accept-verifier-losses`
-   then pushes, and `--finish` without `--accept-verifier-losses` refuses
-   (exit 9) while the run's losses are recorded. Passed on the run itself,
+   worktree and commit, then run `--finish --hand-union-done`: it runs the
+   verifier again, pushes a branch it finds whole, and stops (exit 9) while
+   a loss is left unless `--accept-verifier-losses` is given, which accepts
+   what is left. Passed on the run itself,
    `--accept-verifier-losses` turns each loss into a WARNING and the run goes
    on to the push. The verifier exits 2 when it cannot run at all: a `--base`,
    `--branch` or `--extra-ref` that does not resolve, no worktree for the
