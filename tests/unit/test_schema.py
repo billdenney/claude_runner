@@ -7,7 +7,7 @@ import pkgutil
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pydantic.fields import FieldInfo
 
 import claude_task_runner
@@ -411,6 +411,20 @@ def _pid_fields() -> list[tuple[type[BaseModel], str, FieldInfo]]:
     return found
 
 
+def _not_bounded_to_a_pid_t(
+    fields: list[tuple[type[BaseModel], str, FieldInfo]],
+) -> dict[str, tuple[int | None, int | None]]:
+    """``Model.field`` → its ``(ge, le)`` for each field whose bounds are not
+    ``(1, PID_T_MAX)``; ``None`` for a bound it lacks."""
+    found = {}
+    for model, name, field in fields:
+        bounds = {type(m).__name__: m for m in field.metadata}
+        pair = (getattr(bounds.get("Ge"), "ge", None), getattr(bounds.get("Le"), "le", None))
+        if pair != (1, PID_T_MAX):
+            found[f"{model.__name__}.{name}"] = pair
+    return found
+
+
 def test_every_pid_field_is_bounded_to_a_pid_t() -> None:
     """A recorded pid outside 1..PID_T_MAX must fail to load: ``os.kill``
     raises OverflowError above it, and the quarantine takes the file
@@ -419,6 +433,18 @@ def test_every_pid_field_is_bounded_to_a_pid_t() -> None:
     assert {("RunRecord", "pid"), ("TaskState", "pid")} <= {
         (model.__name__, name) for model, name, _ in fields
     }
-    for model, name, field in fields:
-        bounds = {type(m).__name__: m for m in field.metadata}
-        assert (bounds["Ge"].ge, bounds["Le"].le) == (1, PID_T_MAX), (model.__name__, name)
+    assert _not_bounded_to_a_pid_t(fields) == {}
+
+
+def test_a_pid_field_without_the_bounds_is_named_with_the_ones_it_has() -> None:
+    class Probe(BaseModel):
+        pid: int | None = None
+        worker_pid: int | None = Field(default=None, ge=0)
+        bounded_pid: int = Field(default=1, ge=1, le=PID_T_MAX)
+
+    fields = [(Probe, name, field) for name, field in Probe.model_fields.items()]
+
+    assert _not_bounded_to_a_pid_t(fields) == {
+        "Probe.pid": (None, None),
+        "Probe.worker_pid": (0, None),
+    }
