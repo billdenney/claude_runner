@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+from pydantic.fields import FieldInfo
 
+import claude_task_runner
 from claude_task_runner.process_signals import PID_T_MAX
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
@@ -388,3 +392,33 @@ class TestSidecar:
                 context="c",
                 questions=[self._question()],
             )
+
+
+def _pid_fields() -> list[tuple[type[BaseModel], str, FieldInfo]]:
+    """Every pydantic field named ``pid`` or ``*_pid`` in the package's models."""
+    found = []
+    for info in pkgutil.walk_packages(claude_task_runner.__path__, "claude_task_runner."):
+        module = importlib.import_module(info.name)
+        for obj in vars(module).values():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, BaseModel)
+                and obj.__module__ == module.__name__
+            ):
+                for name, field in obj.model_fields.items():
+                    if name == "pid" or name.endswith("_pid"):
+                        found.append((obj, name, field))
+    return found
+
+
+def test_every_pid_field_is_bounded_to_a_pid_t() -> None:
+    """A recorded pid outside 1..PID_T_MAX must fail to load: ``os.kill``
+    raises OverflowError above it, and the quarantine takes the file
+    instead of a probe of it raising."""
+    fields = _pid_fields()
+    assert {("RunRecord", "pid"), ("TaskState", "pid")} <= {
+        (model.__name__, name) for model, name, _ in fields
+    }
+    for model, name, field in fields:
+        bounds = {type(m).__name__: m for m in field.metadata}
+        assert (bounds["Ge"].ge, bounds["Le"].le) == (1, PID_T_MAX), (model.__name__, name)

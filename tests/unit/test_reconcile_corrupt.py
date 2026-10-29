@@ -183,11 +183,13 @@ def test_a_pid_no_process_can_have_is_quarantined(tmp_path: Path, pid: int) -> N
     p = state_path_for(qd, "t-pid")
     write_state_atomic(TaskState(task_id="t-pid", status="running", pid=4242), p)
     p.write_text(p.read_text().replace("pid: 4242\n", f"pid: {pid}\n"), encoding="utf-8")
+    original = p.read_bytes()
 
     results = quarantine_corrupt_state_files(qd, now=_NOW)
 
     assert [(r.task_id, r.preserved_status) for r in results] == [("t-pid", None)]
     assert not p.exists()
+    assert Path(results[0].quarantined_path).read_bytes() == original
 
 
 def test_a_completed_state_with_such_a_run_pid_keeps_completed(tmp_path: Path) -> None:
@@ -200,8 +202,10 @@ def test_a_completed_state_with_such_a_run_pid_keeps_completed(tmp_path: Path) -
     )
     write_state_atomic(TaskState(task_id="t-run-pid", status="completed", runs=[run]), p)
     p.write_text(p.read_text().replace("pid: 4242\n", f"pid: {10**20}\n"), encoding="utf-8")
+    original = p.read_bytes()
 
     results = quarantine_corrupt_state_files(qd, now=_NOW)
 
     assert [(r.task_id, r.preserved_status) for r in results] == [("t-run-pid", "completed")]
     assert load_state(p).status == "completed"
+    assert Path(results[0].quarantined_path).read_bytes() == original

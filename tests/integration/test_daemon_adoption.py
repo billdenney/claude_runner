@@ -612,13 +612,14 @@ def test_daemon_starts_with_an_out_of_range_task_pid(
     _seed_exited(qd, "t-pid", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70))
     path = state_path_for(qd, "t-pid")
     path.write_text(path.read_text().replace(f"pid: {_EXITED_PID}\n", f"pid: {pid}\n"))
+    original = path.read_bytes()
 
     _notifications, events = _run_daemon(qd, _settings(adopt=True), monkeypatch)
 
     assert not path.exists()
-    assert [
-        (p["task_id"], p["preserved_status"]) for k, p in events if k == "corrupt_state_quarantined"
-    ] == [("t-pid", None)]
+    quarantined = [p for k, p in events if k == "corrupt_state_quarantined"]
+    assert [(p["task_id"], p["preserved_status"]) for p in quarantined] == [("t-pid", None)]
+    assert Path(str(quarantined[0]["quarantined_path"])).read_bytes() == original
 
 
 def test_daemon_starts_with_a_worker_log_mtime_past_year_9999(
