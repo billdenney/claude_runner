@@ -536,7 +536,7 @@ def test_fs_mtime_no_datetime_can_hold_is_not_activity(
     """A file mtime past year 9999 passes the window check (it lies in the
     future), but no datetime can hold it. It proves nothing: the FS check
     is skipped with a WARNING and the heartbeat verdict applies, exactly as
-    for an mtime past the window, instead of the reaper raising."""
+    for an mtime past the window."""
     qd = _queue(tmp_path)
     work = tmp_path / "work"
     work.mkdir()

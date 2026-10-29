@@ -145,7 +145,7 @@ class RunRecord(_StrictBase):
 
     ``None`` on legacy run records that predate this field, on
     pre-dispatch-hook failures (no subprocess was spawned), and on the
-    adopted path's resume of an already-finalized worker. At most
+    adopted path's resume of an already-finalized worker. Between 1 and
     :data:`~claude_task_runner.process_signals.PID_T_MAX`, as for
     :attr:`TaskState.pid`."""
     account: str | None = None
@@ -361,11 +361,12 @@ class TaskState(_StrictBase):
     that have not yet been dispatched, and on tasks whose most recent
     dispatch has finalized normally.
 
-    At most :data:`~claude_task_runner.process_signals.PID_T_MAX`, the
-    largest C ``pid_t``. No process can have a larger pid, and
-    ``os.kill`` raises ``OverflowError`` for one, so a state YAML recording
-    one fails to load and the corrupt-state quarantine (ADR-0028) takes it
-    instead of a probe of it crashing supervisor startup."""
+    Between 1 and :data:`~claude_task_runner.process_signals.PID_T_MAX`,
+    the largest C ``pid_t``. ``os.kill`` takes 0 and negative pids for
+    process groups and raises ``OverflowError`` above the maximum, so a
+    state YAML recording a pid outside that range fails to load, and the
+    corrupt-state quarantine (ADR-0028) takes it at startup, before any
+    pass probes the pid."""
     log_path: str | None = None
     """Absolute path to the current attempt's stream-json log file, when
     the dispatcher runs in file-backed mode (``[supervisor].adopt_workers``).

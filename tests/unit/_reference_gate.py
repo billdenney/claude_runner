@@ -1,9 +1,11 @@
 """Count where source code refers to a function, for the gates that confine it.
 
 Shared by ``test_expanduser_gate`` (``expanduser`` only in
-``config/paths.py``) and ``test_cli_settings_gate`` (the CLI loads the queue
-TOML only through ``load_settings_or_exit``). Each gate keeps known-answer
-tests of the scanner: one that finds nothing would pass everything.
+``config/paths.py``), ``test_cli_settings_gate`` (the CLI loads the queue
+TOML only through ``load_settings_or_exit``) and ``test_fromtimestamp_gate``
+(``fromtimestamp`` only in ``clock.utc_from_timestamp``). Each gate keeps
+known-answer tests of the scanner: one that finds nothing would pass
+everything.
 """
 
 from __future__ import annotations

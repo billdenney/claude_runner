@@ -103,7 +103,7 @@ OUT_OF_RANGE = [pytest.param(2**31, id="2**31"), pytest.param(10**20, id="10**20
 
 
 @pytest.mark.parametrize("pid", OUT_OF_RANGE)
-def test_kill_refuses_a_pid_above_pid_max(
+def test_kill_refuses_a_pid_above_pid_t_max(
     sent: Recorder, caplog: pytest.LogCaptureFixture, pid: int
 ) -> None:
     message = (
@@ -118,7 +118,7 @@ def test_kill_refuses_a_pid_above_pid_max(
 
 
 @pytest.mark.parametrize("pgid", OUT_OF_RANGE)
-def test_killpg_refuses_a_group_above_pid_max(
+def test_killpg_refuses_a_group_above_pid_t_max(
     sent: Recorder, caplog: pytest.LogCaptureFixture, pgid: int
 ) -> None:
     message = (
@@ -133,7 +133,7 @@ def test_killpg_refuses_a_group_above_pid_max(
 
 
 @pytest.mark.parametrize("pid", OUT_OF_RANGE)
-def test_signal_group_of_refuses_a_pid_above_pid_max_before_asking_its_group(
+def test_signal_group_of_refuses_a_pid_above_pid_t_max_before_asking_its_group(
     sent: Recorder, pid: int
 ) -> None:
     with pytest.raises(UnsafeSignalTarget):
@@ -141,7 +141,7 @@ def test_signal_group_of_refuses_a_pid_above_pid_max_before_asking_its_group(
     assert sent.calls == []
 
 
-def test_pid_max_itself_reaches_os_kill(sent: Recorder) -> None:
+def test_pid_t_max_itself_reaches_os_kill(sent: Recorder) -> None:
     """The bound is the C ``pid_t`` maximum: one below the first value
     ``os.kill`` cannot take is still sent, and the kernel answers ESRCH."""
     process_signals.kill(PID_T_MAX, signal.SIGTERM)
@@ -152,7 +152,7 @@ def test_pid_max_itself_reaches_os_kill(sent: Recorder) -> None:
     ]
 
 
-def test_pid_max_is_the_largest_pid_os_kill_accepts() -> None:
+def test_pid_t_max_is_the_largest_pid_os_kill_accepts() -> None:
     """Known answer against the real ``os.kill``: :data:`PID_T_MAX` gets an
     answer from the kernel, one more overflows before any syscall."""
     with pytest.raises(ProcessLookupError):
@@ -320,7 +320,7 @@ def test_pid_alive_reports_a_pid_of_one_or_less_dead(sent: Recorder, pid: int) -
 
 
 @pytest.mark.parametrize("pid", OUT_OF_RANGE)
-def test_pid_alive_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) -> None:
+def test_pid_alive_reports_a_pid_above_pid_t_max_dead(sent: Recorder, pid: int) -> None:
     """A pid above PID_T_MAX is refused before ``os.kill``, which would raise
     ``OverflowError`` (not an ``OSError``) for it, and reported dead."""
     assert dispatcher_mod._pid_alive(pid) is False
@@ -328,7 +328,7 @@ def test_pid_alive_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) ->
 
 
 @pytest.mark.parametrize("pid", OUT_OF_RANGE)
-def test_probe_worker_reports_a_pid_above_pid_max_dead(sent: Recorder, pid: int) -> None:
+def test_probe_worker_reports_a_pid_above_pid_t_max_dead(sent: Recorder, pid: int) -> None:
     assert (
         dispatcher_mod.probe_worker(pid, log_path=None, started_at=None)
         is dispatcher_mod.WorkerProbe.DEAD

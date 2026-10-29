@@ -193,7 +193,7 @@ class TestRunRecord:
                 pid=pid,
             )
 
-    def test_pid_field_accepts_pid_max(self) -> None:
+    def test_pid_field_accepts_pid_t_max(self) -> None:
         t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
         r = RunRecord(
             attempt=1,
@@ -214,7 +214,7 @@ class TestTaskState:
         with pytest.raises(ValidationError):
             TaskState(task_id="001-foo", status="running", pid=pid)
 
-    def test_pid_field_accepts_pid_max(self) -> None:
+    def test_pid_field_accepts_pid_t_max(self) -> None:
         assert TaskState(task_id="001-foo", pid=PID_T_MAX).pid == 2**31 - 1
 
     def test_defaults(self) -> None:

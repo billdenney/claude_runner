@@ -268,10 +268,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     except QueueSchemaError:
         raise
     except ValueError as exc:
-        # The int resolver raises a bare ValueError for an integer longer
-        # than the interpreter's digit limit (4300 by default), such as a
-        # corrupt pid; QueueSchemaError is itself a ValueError, hence the
-        # re-raise above.
+        # PyYAML's construct_yaml_int raises a bare ValueError for an
+        # integer longer than the interpreter's digit limit (4300 by
+        # default), such as a corrupt pid; QueueSchemaError is itself a
+        # ValueError, hence the re-raise above.
         raise QueueSchemaError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise QueueSchemaError(f"{path}: top-level YAML must be a mapping")
