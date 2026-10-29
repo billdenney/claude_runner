@@ -11,8 +11,10 @@
 #   5. Register repairs: union-merge of covariate-columns.md (recovers the
 #      annotations -X theirs would have lost), dedup of duplicate canonical
 #      headers, restore of dropped canonical blocks, then the contribution
-#      verifier. Every repair and verify step reads only the merge set: the
-#      branches this run merged, each at the commit it merged (merge_set.py).
+#      verifier, whose reported losses stop the run (exit 5) unless
+#      --accept-verifier-losses. Every repair and verify step reads only the
+#      merge set: the branches this run merged, each at the commit it merged
+#      (merge_set.py).
 #   6. Union-merge of NEWS.md, then the revert check: register content the
 #      base has that the merge lost and no merged branch removed stops the
 #      run (verify_no_base_reverts.py)
@@ -62,6 +64,13 @@
 #                           inst/references/parameter-names.md.
 #   --no-register-files     Clear the register list, defaults included; a
 #                           later --register-file adds to the emptied list.
+#   --accept-verifier-losses
+#                           Carry on when the contribution verifier reports a
+#                           model, header or source alias missing from a
+#                           register: print a WARNING instead of stopping with
+#                           exit 5. Pass it once every reported loss is
+#                           understood, and reconcile them by hand before
+#                           opening the PR.
 #   --skip-r-regen          Skip step 7 (buildModelDb / document). Use when
 #                           merging into a repo that doesn't have these.
 #   --skip-check            Skip step 8 (devtools::check). Use for fast
@@ -114,8 +123,10 @@
 #   5  a repair or verification step failed: a union-merge, dedup or restore
 #      script crashed, duplicate canonical headers survived dedup (or a
 #      register on --base is missing from the worktree at --finish), the
-#      verifier could not run, the revert check found base content the merge
-#      reverted (or could not run), or the R registry regeneration failed
+#      verifier reported missing contributions (without
+#      --accept-verifier-losses) or could not run, the revert check found
+#      base content the merge reverted (or could not run), or the R registry
+#      regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
@@ -166,6 +177,7 @@ SKIP_VIGNETTES=0
 VIGNETTE_JOBS=""
 VIGNETTE_TIMEOUT=900
 SKIP_PUSH=0
+ACCEPT_VERIFIER_LOSSES=0
 FINISH=0
 DRY_RUN=0
 ASSUME_YES=0
@@ -385,6 +397,7 @@ while [[ $# -gt 0 ]]; do
     --union-file) need_value "$@"; UNION_FILE="$2"; shift 2 ;;
     --register-file) need_value "$@"; REGISTER_FILES+=("$2"); shift 2 ;;
     --no-register-files) REGISTER_FILES=(); shift ;;
+    --accept-verifier-losses) ACCEPT_VERIFIER_LOSSES=1; shift ;;
     --forbid-path)
       need_value "$@"
       if [[ -z "$2" ]]; then FORBID_PATHS=(); else
@@ -943,15 +956,17 @@ if (( ${#RESTORE_TARGETS[@]} )); then
   done
 fi
 
-# Verify no per-branch contributions were lost. The verifier may
-# legitimately report losses (exit 1; e.g. a brand-new section header the
-# union-merger does not relocate; see SAPS_II in the 2026-05-20
-# consolidation), so that verdict is surfaced as a WARNING for the operator
-# to reconcile by hand before opening the PR, rather than killing the
-# pipeline outright. Any other non-zero exit means the verifier could not
-# run at all, and carrying on would ship an unverified merge.
+# Verify no per-branch contributions were lost. A loss the verifier reports
+# (exit 1) is one no repair could put back -- a canonical two branches filed
+# under different ## sections, a brand-new section header the union-merger does
+# not relocate (SAPS_II in the 2026-05-20 consolidation) -- and settling it
+# needs judgement, so every register is checked and then the run stops (exit 5),
+# unless --accept-verifier-losses turns each verdict into a WARNING to reconcile
+# by hand before opening the PR. Any other non-zero exit means the verifier
+# could not run at all, and carrying on would ship an unverified merge.
 echo
 echo "==> Verifying no per-branch model contributions are missing"
+VERIFY_LOSSES=()
 for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
   verify_args=(
     --repo "$REPO"
@@ -963,7 +978,9 @@ for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
   )
   verify_rc=0
   "$SCRIPT_DIR/verify_branch_contributions.sh" "${verify_args[@]}" || verify_rc=$?
-  if (( verify_rc == 1 )); then
+  if (( verify_rc == 1 && ! ACCEPT_VERIFIER_LOSSES )); then
+    VERIFY_LOSSES+=("$vf")
+  elif (( verify_rc == 1 )); then
     echo "WARNING: verifier reported missing contributions in $vf."
     echo "         Reconcile by hand before opening the PR (the union-merger does"
     echo "         not relocate brand-new section headers, and neither it nor"
@@ -973,6 +990,20 @@ for vf in "${RESTORE_TARGETS[@]:-$UNION_FILE}"; do
     die 5 "verify_branch_contributions.sh could not run on $vf (exit $verify_rc)."
   fi
 done
+if (( ${#VERIFY_LOSSES[@]} )); then
+  {
+    echo "ERROR: the verifier reported missing contributions in ${VERIFY_LOSSES[*]} (listed above):"
+    echo "  a model, header or source alias a merged branch added that no repair put back."
+    echo "  Reconcile each by hand before opening the PR; the placement report names the"
+    echo "  canonical and the model. The run stopped before the NEWS union, the revert"
+    echo "  check, the regeneration and the gates. To run them, remove the worktree and"
+    echo "  its branch:"
+    echo "    git -C $REPO worktree remove --force $WT_REL"
+    echo "    git -C $REPO branch -D $BRANCH_NAME"
+    echo "  and re-run the same command with --accept-verifier-losses."
+  } >&2
+  exit 5
+fi
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
 # every branch edits the same lines and -X theirs takes the last branch's whole

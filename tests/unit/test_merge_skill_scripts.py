@@ -553,13 +553,18 @@ class TestMergeBranches:
             f"ERROR: verify_branch_contributions.sh could not run on {REGISTER} (exit 2).\n"
         )
 
-    def test_losses_the_repairs_cannot_fix_are_a_warning(self, repo: Path, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("accept", [False, True], ids=["stops", "accepted"])
+    def test_a_loss_the_repairs_cannot_fix_stops_the_run_unless_accepted(
+        self, repo: Path, tmp_path: Path, accept: bool
+    ) -> None:
         """Two branches register one canonical under different ``##`` sections.
 
         -X theirs keeps claude/b2's section. The union-merger keeps sections
         apart, so it cannot fold claude/a2's model back in, and which section
-        is right is a judgement; that is left to the operator, and the run
-        finishes.
+        is right is a judgement. The verifier reports the loss and the run
+        stops with exit 5, before the steps after it, unless the operator
+        passed --accept-verifier-losses: then the loss is a warning and the
+        run finishes.
         """
         for name, model in (("a2", "A2_2020_x.R"), ("b2", "B2_2021_y.R")):
             text = BASE_REGISTER + (
@@ -576,10 +581,30 @@ class TestMergeBranches:
             "origin/claude/a",
             "--exclude-ref",
             "origin/claude/b",
+            *(["--accept-verifier-losses"] if accept else []),
         )
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert f"WARNING: verifier reported missing contributions in {REGISTER}.\n" in proc.stdout
         assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in proc.stdout
+        warning = f"WARNING: verifier reported missing contributions in {REGISTER}.\n"
+        later = "==> Checking the registers for base content the merge reverted\n"
+        if accept:
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert warning in proc.stdout
+            assert later in proc.stdout
+            return
+        assert proc.returncode == 5, proc.stdout + proc.stderr
+        assert warning not in proc.stdout
+        assert later not in proc.stdout
+        assert proc.stderr.endswith(
+            f"ERROR: the verifier reported missing contributions in {REGISTER} (listed above):\n"
+            "  a model, header or source alias a merged branch added that no repair put back.\n"
+            "  Reconcile each by hand before opening the PR; the placement report names the\n"
+            "  canonical and the model. The run stopped before the NEWS union, the revert\n"
+            "  check, the regeneration and the gates. To run them, remove the worktree and\n"
+            "  its branch:\n"
+            f"    git -C {repo} worktree remove --force .worktrees/{CONSOLIDATION}\n"
+            f"    git -C {repo} branch -D {CONSOLIDATION}\n"
+            "  and re-run the same command with --accept-verifier-losses.\n"
+        )
 
     def test_a_branch_left_out_leaves_no_trace_in_the_register(
         self, repo: Path, tmp_path: Path
