@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import IO
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock
+from claude_task_runner.clock import Clock, utc_from_timestamp
 from claude_task_runner.config.linux_user import current_username as _resolve_self_user
 from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
@@ -936,8 +936,8 @@ def _boot_time() -> datetime | None:
         name, _, value = line.partition(" ")
         if name == "btime":
             try:
-                return datetime.fromtimestamp(int(value), tz=UTC)
-            except (ValueError, OverflowError, OSError):
+                return utc_from_timestamp(int(value))
+            except ValueError:  # int() refusing the text, or TimestampOutOfRange
                 return None
     return None
 

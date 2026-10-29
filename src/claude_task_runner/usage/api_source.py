@@ -53,11 +53,11 @@ import logging
 import math
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from claude_task_runner.clock import Clock
+from claude_task_runner.clock import Clock, utc_from_timestamp
 from claude_task_runner.config.paths import ConfigDirError, expand_config_dir
 from claude_task_runner.usage.drift import (
     UsageApiAuthExpired,
@@ -386,12 +386,10 @@ def _window_from_headers(*, window: str, utilization: str, reset: str) -> Window
             f"{util_header} value {utilization!r} is {util_pct}%, outside [0, 100]"
         )
     try:
-        resets_at = datetime.fromtimestamp(int(reset), tz=UTC)
-    except (TypeError, ValueError, OverflowError, OSError) as exc:
-        # fromtimestamp raises ValueError for a year outside 1..9999,
-        # OverflowError past the platform's time_t, and OSError when the
-        # C library's gmtime rejects a value that fits time_t (errno 75
-        # at 2**63 - 1 on Linux).
+        resets_at = utc_from_timestamp(int(reset))
+    except (TypeError, ValueError) as exc:
+        # int() refuses a non-integer header; utc_from_timestamp raises
+        # TimestampOutOfRange, a ValueError, for one no datetime can hold.
         raise UsageApiHeaderMissing(
             f"unparseable {reset_header} header value {reset!r}: {exc}"
         ) from exc

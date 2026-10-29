@@ -194,7 +194,7 @@ from pathlib import Path
 from typing import Literal
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock
+from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
@@ -1355,7 +1355,19 @@ def _maybe_refresh_from_filesystem(
     # FS-confirmed activity. Refresh last_heartbeat_at from the mtime
     # so the next reaper pass measures silence from the most-recent
     # confirmed activity (NOT from the prior stale stream-json event).
-    mtime_dt = datetime.fromtimestamp(latest_mtime, tz=UTC)
+    try:
+        mtime_dt = utc_from_timestamp(latest_mtime)
+    except TimestampOutOfRange as exc:
+        # An mtime no datetime can hold (past year 9999, say) is no
+        # evidence of activity: act on the heartbeat verdict instead.
+        logger.warning(
+            "silent-orphan reaper: %s: newest file mtime under %s is out of range (%s); "
+            "skipping FS check",
+            state.task_id,
+            working_dir,
+            exc,
+        )
+        return False
     refreshed = state.model_copy(update={"last_heartbeat_at": mtime_dt})
 
     outcome = _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck)
