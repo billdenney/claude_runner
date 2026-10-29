@@ -103,11 +103,13 @@ def capture(
     captures_dir: Path,
     claude_executable: str = "claude",
     claude_config_dir: str = "",
-) -> tuple[bytes, Path]:
+) -> tuple[bytes, Path | None]:
     """Spawn ``claude``, send ``/usage``, and return the raw PTY bytes.
 
     The raw bytes are also persisted to ``captures_dir/<ISO>.cap`` for
-    forensics. Returns ``(raw_bytes, capture_path)``.
+    forensics. Returns ``(raw_bytes, capture_path)``; ``capture_path`` is
+    ``None`` when the ``.cap`` could not be written, which is logged as a
+    warning and does not cost the reading.
 
     Parameters
     ----------
@@ -127,7 +129,8 @@ def capture(
     Raises
     ------
     UsageCaptureSpawnError
-        If the ``claude`` binary cannot be located or launched.
+        If the ``claude`` binary cannot be located or launched, or
+        ``captures_dir`` cannot be created.
     UsageCaptureTimeout
         If the trust prompt or both ``Resets`` lines do not appear within
         their configured timeouts.
@@ -135,7 +138,12 @@ def capture(
     if shutil.which(claude_executable) is None:
         raise UsageCaptureSpawnError(f"binary not found in PATH: {claude_executable}")
 
-    captures_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        captures_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise UsageCaptureSpawnError(
+            f"cannot create the usage captures directory {captures_dir}: {exc}"
+        ) from exc
     capture_path = captures_dir / _format_filename(clock.now())
 
     spawn_env = _build_spawn_env(claude_config_dir)
@@ -152,12 +160,17 @@ def capture(
     child: pexpect.spawn[bytes] | None = None
     try:
         # encoding=None -> raw bytes mode. We strip ANSI in the parser.
-        child = pexpect.spawn(
-            claude_executable,
-            timeout=settings.capture_trust_timeout_s,
-            encoding=None,
-            env=spawn_env,
-        )
+        # pexpect raises OSError when no pty can be opened and
+        # ExceptionPexpect when the binary cannot be executed.
+        try:
+            child = pexpect.spawn(
+                claude_executable,
+                timeout=settings.capture_trust_timeout_s,
+                encoding=None,
+                env=spawn_env,
+            )
+        except (OSError, pexpect.ExceptionPexpect) as exc:
+            raise UsageCaptureSpawnError(f"cannot start {claude_executable}: {exc}") from exc
         child.logfile_read = log_buf
 
         # Phase 1: race onboarding prompts against the TUI-ready marker.
@@ -290,7 +303,12 @@ def capture(
                 child.terminate(force=True)
 
     raw_full = log_buf.getvalue()
-    capture_path.write_bytes(raw_full)
+    written_path: Path | None = capture_path
+    try:
+        capture_path.write_bytes(raw_full)
+    except OSError as exc:
+        written_path = None
+        logger.warning("usage capture: cannot write the forensics file %s: %s", capture_path, exc)
     _rotate_captures(captures_dir, settings.capture_rotation_count)
 
     # Pick the best snapshot for the parser. We have up to three
@@ -328,7 +346,7 @@ def capture(
         ]
     except UnboundLocalError:
         # Phase 2 didn't reach the snapshot point; return the full stream.
-        return raw_full, capture_path
+        return raw_full, written_path
 
     best = (-1, candidates[-1][1])  # (n_blocks, raw) — start with full
     for label, candidate in candidates:
@@ -350,10 +368,10 @@ def capture(
         n = len(blocks)
         if n >= 2:
             # Earliest snapshot with at least 2 blocks wins — return now.
-            return candidate, capture_path
+            return candidate, written_path
         if n > best[0]:
             best = (n, candidate)
-    return best[1], capture_path
+    return best[1], written_path
 
 
 def _sleep_ms(milliseconds: int) -> None:
