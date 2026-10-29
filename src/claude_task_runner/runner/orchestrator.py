@@ -1784,7 +1784,12 @@ class SelectionPreview:
     """The tasks it would admit, in dispatch order."""
     eligible_statuses: dict[str, str]
     """Each admitted task's state status, ``new`` when it has no state file
-    yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    yet: an ``awaiting_sidecar`` task here has had every question answered.
+    A task in ``unread_states`` has none."""
+    unread_states: dict[str, str]
+    """Admitted tasks whose state no longer loads when the preview reads
+    its status (rewritten or removed since the selector read it), each with
+    the error. The next tick's selector skips such a state."""
     routes: dict[str, str | None]
     """For each admitted task, the account a tick would dispatch it through
     now (:func:`_route`, session affinity and its TTL included), or ``None``
@@ -1868,22 +1873,18 @@ def preview_selection(
     accounts_by_name = {a.name: a for a in resolution.accounts}
     broken = {b.name: b.error for b in resolution.broken}
     statuses: dict[str, str] = {}
+    unread: dict[str, str] = {}
     routes: dict[str, str | None] = {}
     affinity_held: list[str] = []
     for task in eligible:
         sp = state_file_path(queue_dir, task.id)
-        # The selector parsed this state a moment ago. One rewritten since
-        # (a hand edit) is shown as unreadable, as the next tick's selector
-        # skips it, rather than failing the whole preview.
+        # The selector parsed this state a moment ago; one rewritten since
+        # (a hand edit) is reported with its error rather than failing the
+        # whole preview.
         try:
             statuses[task.id] = load_state(sp).status if sp.exists() else "new"
         except (QueueIOError, QueueSchemaError) as exc:
-            logger.warning(
-                "preview: the state of task %s became unreadable after the selector read it: %s",
-                task.id,
-                exc,
-            )
-            statuses[task.id] = "unreadable"
+            unread[task.id] = str(exc)
         choice = _route(
             task,
             queue_dir=queue_dir,
@@ -1910,6 +1911,7 @@ def preview_selection(
     return SelectionPreview(
         eligible=eligible,
         eligible_statuses=statuses,
+        unread_states=unread,
         routes=routes,
         affinity_held=affinity_held,
         skips=skips,

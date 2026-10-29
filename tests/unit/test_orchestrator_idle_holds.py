@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import sys
 import threading
 from collections import Counter
 from collections.abc import Iterator
@@ -35,6 +34,7 @@ from claude_task_runner.config.schema import (
 from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
     QueueSchemaError,
+    load_state,
     queue_runtime_dir,
     state_path_for,
     task_path_for,
@@ -643,36 +643,33 @@ def test_supervisor_logs_a_drained_queue_once(
     ]
 
 
-def test_preview_shows_a_state_unreadable_since_the_selector_read_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_preview_reports_a_state_unreadable_since_the_selector_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The preview reloads each eligible task's state for its status. One
-    rewritten unreadable between the selector's read and that reload is
-    shown as unreadable, with a WARNING, rather than failing the preview."""
+    rewritten unreadable after the selector read it has no status: the
+    task stays eligible and its error is reported, rather than failing
+    the preview."""
     qd = tmp_path / "q"
     qd.mkdir()
     queue_runtime_dir(qd)
-    write_task_atomic(Task(id="t1", title="t", prompt="p"), task_path_for(qd, "t1"))
-    write_state_atomic(TaskState(task_id="t1", status="failed"), state_path_for(qd, "t1"))
-    real_load_state = orchestrator_mod.load_state
+    for task_id in ("t1", "t2"):
+        write_task_atomic(Task(id=task_id, title="t", prompt="p"), task_path_for(qd, task_id))
+    torn = state_path_for(qd, "t1")
+    write_state_atomic(TaskState(task_id="t1", status="failed"), torn)
+    real_select = orchestrator_mod._eligible_candidates
 
-    def _unreadable_on_reread(path: Path) -> TaskState:
-        # The selector reads the state through its helpers; the preview's
-        # own reload is the one call made from preview_selection itself.
-        if sys._getframe(1).f_code.co_name == "preview_selection":
-            raise QueueSchemaError(f"{path}: invalid YAML: hand-edited")
-        return real_load_state(path)
+    def _select_then_tear(*args: Any, **kwargs: Any) -> list[Task]:
+        eligible = real_select(*args, **kwargs)
+        torn.write_text("{not: [yaml", encoding="utf-8")
+        return eligible
 
-    monkeypatch.setattr(orchestrator_mod, "load_state", _unreadable_on_reread)
+    monkeypatch.setattr(orchestrator_mod, "_eligible_candidates", _select_then_tear)
 
-    with caplog.at_level(logging.WARNING, logger="claude_task_runner.runner.orchestrator"):
-        preview = orchestrator_mod.preview_selection(
-            qd, load_settings(None), snapshot=None, now=NOW
-        )
+    preview = orchestrator_mod.preview_selection(qd, load_settings(None), snapshot=None, now=NOW)
 
-    assert [t.id for t in preview.eligible] == ["t1"]
-    assert preview.eligible_statuses == {"t1": "unreadable"}
-    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
-        "preview: the state of task t1 became unreadable after the selector read it: "
-        f"{state_path_for(qd, 't1')}: invalid YAML: hand-edited"
-    ]
+    with pytest.raises(QueueSchemaError) as unread:
+        load_state(torn)
+    assert sorted(t.id for t in preview.eligible) == ["t1", "t2"]
+    assert preview.eligible_statuses == {"t2": "new"}
+    assert preview.unread_states == {"t1": str(unread.value)}
