@@ -1404,7 +1404,8 @@ class TestVerifyBranchContributions:
         footer = (
             "\n"
             f"    Worktree left at: {worktree}\n"
-            "    Either re-run the union-merger, or hand-merge the missing entries.\n"
+            "    File each missing entry by hand, under the canonical and section the branch\n"
+            "    gave it, and commit.\n"
         )
         assert proc.stdout == filename_report + SECTION_REPORT + PLACEMENT_REPORT + footer
 

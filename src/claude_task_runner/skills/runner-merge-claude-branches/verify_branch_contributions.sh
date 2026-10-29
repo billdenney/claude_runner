@@ -225,5 +225,6 @@ if (( PLACEMENT_RC )); then
 fi
 echo
 echo "    Worktree left at: $WT"
-echo "    Either re-run the union-merger, or hand-merge the missing entries."
+echo "    File each missing entry by hand, under the canonical and section the branch"
+echo "    gave it, and commit."
 exit 1

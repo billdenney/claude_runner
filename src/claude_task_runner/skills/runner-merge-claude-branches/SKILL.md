@@ -745,9 +745,9 @@ then run again with `--yes` once the operator agrees.
 ### Idempotence
 
 The script aborts cleanly if the target worktree already exists.
-A run that stopped for a hand union (exit 9) is finished with `--finish
---hand-union-done` on the same worktree, which keeps the hand edits; see
-step 6b. Removing the worktree deletes its hand-union report (the run that
+A run that stopped -- for a hand union (exit 9) or at a failed gate -- is
+finished with the `--finish` command its stop message prints, on the same
+worktree, which keeps the hand edits; see step 6b. Removing the worktree deletes its hand-union report (the run that
 finds the worktree says where it is), so copy the report first. To re-run
 from scratch, remove the worktree first:
 
