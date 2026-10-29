@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    QueueIOError,
+    QueueSchemaError,
     iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
@@ -1870,8 +1872,18 @@ def preview_selection(
     affinity_held: list[str] = []
     for task in eligible:
         sp = state_file_path(queue_dir, task.id)
-        # The selector loaded this state a moment ago, so it parses.
-        statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        # The selector parsed this state a moment ago. One rewritten since
+        # (a hand edit) is shown as unreadable, as the next tick's selector
+        # skips it, rather than failing the whole preview.
+        try:
+            statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        except (QueueIOError, QueueSchemaError) as exc:
+            logger.warning(
+                "preview: the state of task %s became unreadable after the selector read it: %s",
+                task.id,
+                exc,
+            )
+            statuses[task.id] = "unreadable"
         choice = _route(
             task,
             queue_dir=queue_dir,
