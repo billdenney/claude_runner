@@ -124,8 +124,15 @@
 #      wording the register lacks, and the --finish command to run once the
 #      hand union is committed. --finish without --hand-union-done also
 #      exits 9 while that report holds anything.
-set -euo pipefail
-trap 'echo "ERROR: unexpected failure (exit $?) at line $LINENO" >&2; exit 1' ERR
+set -Eeuo pipefail
+# errtrace (-E): functions and subshells inherit the ERR trap, so a command
+# that fails inside a function is reported and exits 1 like one at the top
+# level, instead of ending the run with its own status and no message. In a
+# subshell (a command substitution, a pipeline stage) the trap exits with the
+# failing status and leaves the message to the shell that started it, so a
+# failure is reported once, with that status. A command substitution therefore
+# stops at its first failing command, not only its last.
+trap 'err_rc=$?; (( BASH_SUBSHELL == 0 )) || exit "$err_rc"; echo "ERROR: unexpected failure (exit $err_rc) at line $LINENO" >&2; exit 1' ERR
 trap 'remind_hand_union $?' EXIT
 # An interrupt or a kill exits with its own status, so the EXIT trap names a
 # pending report then too, rather than seeing the status of the last command.

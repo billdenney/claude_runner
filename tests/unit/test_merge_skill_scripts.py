@@ -498,6 +498,34 @@ class TestMergeBranches:
         )
         assert "\nMerge 2 claude/* branches (2 new models)\n" in proc.stdout
 
+    @pytest.mark.parametrize(
+        ("fails", "at"),
+        [
+            ("*dedup-base-copy.md*", 'base_copy="$(git rev-parse'),
+            ('"log -1 --format=%s "*', "subj=$(git log -1"),
+        ],
+        ids=["in-a-function", "in-a-command-substitution"],
+    )
+    def test_an_unexpected_failure_exits_1_and_says_where_once(
+        self, repo: Path, tmp_path: Path, fails: str, at: str
+    ) -> None:
+        """A git command that fails inside a function (run_dedup) exits 1 with
+        the unexpected-failure message, as the header documents, not with
+        git's own 128 and no message. One that fails in a command substitution
+        is reported once, by the shell that ran it, with git's status."""
+        real = shutil.which("git")
+        assert real is not None
+        fake = (
+            f'#!/bin/bash\ncase "$*" in {fails}) exit 128 ;; esac\nexec {shlex.quote(real)} "$@"\n'
+        )
+        env = _env_with_first(_bin_dir(tmp_path, "bin", {"git": fake}))
+        proc = self._full_run(repo, env, "--skip-vignettes")
+        lines = MERGE_BRANCHES.read_text().splitlines()
+        line = next(number for number, text in enumerate(lines, 1) if at in text)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert proc.stderr.count("unexpected failure") == 1, proc.stderr
+        assert f"ERROR: unexpected failure (exit 128) at line {line}\n" in proc.stderr
+
     def test_a_validator_that_dies_before_any_result_fails_the_gate(
         self, repo: Path, tmp_path: Path
     ) -> None:
