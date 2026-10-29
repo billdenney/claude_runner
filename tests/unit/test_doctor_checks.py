@@ -1036,6 +1036,22 @@ def test_check_state_yamls_invalid_file(settings: Settings, queue_dir: Path) -> 
     assert result.status == CheckStatus.FAIL
 
 
+def test_check_state_yamls_flags_a_pid_past_the_digit_limit(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """The check reports the file instead of dying on its ValueError."""
+    state_dir = queue_dir / ".claude_task_runner" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "huge.yaml").write_text(
+        "schema_version: 2\ntask_id: huge\npid: " + "9" * 4301 + "\n", encoding="utf-8"
+    )
+    result = check_state_yamls(settings, queue_dir)
+    assert (result.status, result.detail) == (CheckStatus.FAIL, "1 of 1 state YAMLs invalid")
+    assert result.remediation is not None
+    assert result.remediation.startswith(f"huge.yaml: {state_dir / 'huge.yaml'}: invalid YAML: ")
+    assert "Exceeds the limit (4300 digits)" in result.remediation
+
+
 # ---------------------------------------------------------------------------
 # check_orphaned_sessions (ADR-0024)
 # ---------------------------------------------------------------------------

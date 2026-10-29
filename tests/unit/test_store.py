@@ -248,6 +248,21 @@ class TestAtomicity:
         assert leftovers == []
 
 
+class TestHugeIntegerInState:
+    @pytest.fixture(autouse=True)
+    def _each_loader(self, yaml_backend: str) -> None:
+        """Both loaders must turn it into a QueueSchemaError."""
+
+    def test_a_pid_past_the_digit_limit_is_a_schema_error(self, queue_dir: Path) -> None:
+        """PyYAML's int resolver raises a bare ValueError for an integer past the
+        interpreter's 4300-digit limit. Callers catch only QueueIOError and
+        QueueSchemaError, so it must arrive as a QueueSchemaError."""
+        path = state_path_for(queue_dir, "001")
+        path.write_text("schema_version: 2\ntask_id: '001'\npid: " + "9" * 4301 + "\n")
+        with pytest.raises(QueueSchemaError, match="invalid YAML: Exceeds the limit"):
+            load_state(path)
+
+
 class TestSchemaVersionGuard:
     @pytest.fixture(autouse=True)
     def _each_loader(self, yaml_backend: str) -> None:
@@ -292,8 +307,17 @@ class TestErrorHandling:
             (b"id: a\n---\nid: b\n", "invalid YAML: expected a single document"),
             (b"id: caf\xe9\n", "invalid YAML"),
             (b"id: x\x00y\n", "invalid YAML"),
+            (b"id: x\nmax_tokens_override: " + b"9" * 4301 + b"\n", "invalid YAML: Exceeds"),
         ],
-        ids=["empty", "comment-only", "scalar", "two-documents", "not-utf8", "nul-byte"],
+        ids=[
+            "empty",
+            "comment-only",
+            "scalar",
+            "two-documents",
+            "not-utf8",
+            "nul-byte",
+            "int-past-digit-limit",
+        ],
     )
     def test_degenerate_input_is_a_schema_error(
         self, queue_dir: Path, content: bytes, message: str
