@@ -114,6 +114,10 @@ _HELD_WORDS: dict[str, tuple[str, str]] = {
         "wait for a task that cannot finish",
     ),
     "deferred_cooldown": ("waits for a retry time", "wait for a retry time"),
+    "next_eligible_at_without_timezone": (
+        "has a retry time with no timezone (fix its state file)",
+        "have retry times with no timezone (fix their state files)",
+    ),
     "invalid_effort": (
         "is set to a model or effort the queue does not allow",
         "are set to a model or effort the queue does not allow",
@@ -155,6 +159,7 @@ _HELD_ORDER = (
     "depends_on_missing",
     "depends_on_unmeetable",
     "deferred_cooldown",
+    "next_eligible_at_without_timezone",
     "block_dispatch",
     "weekly_paused",
     "invalid_effort",
