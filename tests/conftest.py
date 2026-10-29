@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import signal
+import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -66,6 +69,30 @@ def _worker_probe_off_host_proc(monkeypatch: pytest.MonkeyPatch) -> None:
     tree, or back to ``/proc`` for processes they start.
     """
     monkeypatch.setattr(dispatcher_mod, "_PROC_ROOT", _NO_PROC)
+
+
+@pytest.fixture
+def far_future_mtime_dir() -> Iterator[Path]:
+    """A fresh directory whose filesystem stores an mtime past year 9999 as given.
+
+    ext4 clamps such an mtime to year 2446, so the directory is on tmpfs
+    (``/dev/shm``), which keeps 64-bit seconds. It is removed at teardown,
+    and the test is skipped where no writable tmpfs keeps the mtime.
+    """
+    shm = Path("/dev/shm")
+    if not (shm.is_dir() and os.access(shm, os.W_OK)):
+        pytest.skip("no writable /dev/shm")
+    root = Path(tempfile.mkdtemp(dir=shm, prefix="ctr-mtime-"))
+    try:
+        probe = root / "probe"
+        probe.write_text("x")
+        os.utime(probe, (253402300800, 253402300800))
+        if probe.stat().st_mtime != 253402300800:
+            pytest.skip("this /dev/shm does not keep an mtime past year 9999")
+        probe.unlink()
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture

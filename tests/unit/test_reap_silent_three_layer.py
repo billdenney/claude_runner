@@ -576,6 +576,68 @@ def test_fs_mtime_no_datetime_can_hold_is_not_activity(
     assert warnings[0].endswith("); skipping FS check"), warnings[0]
 
 
+def _mixed_tree(root: Path, recent_at: datetime) -> tuple[Path, Path]:
+    """``root/work`` holding a file written at ``recent_at`` and a stray file
+    whose mtime is past year 9999 (``root`` is on tmpfs, which keeps it)."""
+    work = root / "work"
+    work.mkdir()
+    recent = work / "recent_output.txt"
+    recent.write_text("x")
+    os.utime(recent, (recent_at.timestamp(), recent_at.timestamp()))
+    stray = work / "stray.bin"
+    stray.write_text("x")
+    os.utime(stray, (253402300800, 253402300800))
+    return work, stray
+
+
+def test_the_walk_leaves_out_an_mtime_no_datetime_can_hold(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The newest usable mtime wins, not the stray's: as the maximum it
+    would hide every other file. One WARNING names the count and a path."""
+    recent_at = _now() - timedelta(seconds=60)
+    work, stray = _mixed_tree(far_future_mtime_dir, recent_at)
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        assert _latest_mtime_in_tree(work) == recent_at.timestamp()
+
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"silent-orphan reaper: left out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {stray}"
+    ]
+
+
+def test_a_stray_far_future_file_does_not_hide_recent_activity(far_future_mtime_dir: Path) -> None:
+    """End to end with the real walk: a file written a minute ago keeps the
+    silent task HEALTHY, with its heartbeat refreshed to that write, even
+    beside a file whose mtime is past year 9999."""
+    qd = _queue(far_future_mtime_dir)
+    recent_at = _now() - timedelta(seconds=60)
+    work, _stray = _mixed_tree(far_future_mtime_dir, recent_at)
+    _seed_task_and_state(
+        qd,
+        "t-fs-mixed",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-mixed"))
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-fs-mixed"},
+        settings=_settings(alert=300, kill=0, fs_window=600),
+        clock=FakeClock(_now()),
+    )
+
+    assert results == []
+    assert load_state(state_path_for(qd, "t-fs-mixed")) == before.model_copy(
+        update={"last_heartbeat_at": recent_at}
+    )
+
+
 def test_fs_check_skipped_when_no_working_dir(tmp_path: Path) -> None:
     """Tasks without a working_dir (research/analysis) skip the FS
     check entirely and proceed with the heartbeat verdict."""

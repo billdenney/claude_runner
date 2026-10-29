@@ -390,6 +390,10 @@ def _latest_mtime_in_tree(
     Failures (permission errors, lost symlink targets, races against
     file deletion) are swallowed silently — the caller should treat
     ``None`` as "no observable activity" and proceed accordingly.
+
+    An entry whose mtime :func:`_usable_mtime` rejects is left out, with
+    one WARNING per walk: as the maximum it would hide every other file's
+    activity.
     """
     try:
         if not root.exists() or not root.is_dir():
@@ -398,6 +402,7 @@ def _latest_mtime_in_tree(
         return None
 
     latest: float | None = None
+    unusable: list[str] = []
 
     def _walk(current: Path, depth: int) -> None:
         nonlocal latest
@@ -417,13 +422,32 @@ def _latest_mtime_in_tree(
             except OSError:
                 continue
             mtime = stat.st_mtime
-            if latest is None or mtime > latest:
+            if not _usable_mtime(mtime):
+                unusable.append(entry.path)
+            elif latest is None or mtime > latest:
                 latest = mtime
             if entry.is_dir(follow_symlinks=False):
                 _walk(Path(entry.path), depth + 1)
 
     _walk(root, depth=0)
+    if unusable:
+        logger.warning(
+            "silent-orphan reaper: left out %d file(s) under %s whose mtime no "
+            "datetime can hold, e.g. %s",
+            len(unusable),
+            root,
+            unusable[0],
+        )
     return latest
+
+
+def _usable_mtime(mtime: float) -> bool:
+    """Whether ``mtime`` can date a sign of life: a datetime can hold it."""
+    try:
+        utc_from_timestamp(mtime)
+    except TimestampOutOfRange:
+        return False
+    return True
 
 
 _BASH_POLL_ANTIPATTERN_RE = re.compile(
