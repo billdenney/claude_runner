@@ -2315,6 +2315,35 @@ class TestABlockRunsToTheNextSectionOrEntry:
         union = u.collect_entries(base, [(branch, u.entry_map(base, headings))], headings)
         assert u.emit_merged(base, union).text == branch
 
+    def test_the_union_keeps_each_blocks_subsection_its_own(self) -> None:
+        """Two entries, each with a ``#### Detail``: a model a branch adds to one
+        is filed there once, and the other's field is left as it is."""
+        u = load_helper("union_merge_lines")
+        block = "### {name} (**c**)\n\n#### Detail\n\nText.\n\n- **Example models:** {models}.\n\n"
+        base = "## S\n\n" + block.format(name="ONE", models="`A.R` (a)")
+        base += block.format(name="TWO", models="`B.R` (b)")
+        branch = base.replace("`A.R` (a).", "`A.R` (a), `N.R` (n).")
+        headings = u.headings_of(base)
+        union = u.collect_entries(base, [(branch, u.entry_map(base, headings))], headings)
+        assert u.emit_merged(base, union).text == branch
+
+    def test_the_restore_inserts_after_a_hash_line_in_the_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``# `` line in a section belongs to the entry above it, so a block
+        restored into that section goes after it, at the section's end."""
+        base = BASE_REGISTER + "\n# A note on WT\n\nStill WT's.\n"
+        new_block = self.DEEP.format(models="`D_2020_d.R` (d)")
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: base})
+        push_task_branch(repo, "claude/adds", {REGISTER: base + "\n" + new_block}, "Add D")
+        zap = base + "\n### ZAP (**canonical for zap**)\n"
+        push_task_branch(repo, "claude/zap", {REGISTER: zap}, "Register ZAP")
+        wt = consolidate(repo, ["origin/claude/adds", "origin/claude/zap"], CONSOLIDATION)
+        assert (wt / REGISTER).read_text() == zap, "the fixture lost nothing"
+        proc = run_helper("restore_dropped_sections.py", *_verifier_args(repo))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (wt / REGISTER).read_text() == zap + "\n" + new_block
+
     def test_the_restore_puts_the_whole_block_back(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
