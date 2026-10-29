@@ -1437,8 +1437,8 @@ class TestMergeBranchesHandUnion:
         )
         assert done.returncode == 0, done.stdout + done.stderr
         assert log.read_text() == "regen\nregen\n"
-        assert "    (check: still pending, skipped with --skip-check on --finish)\n" in done.stdout
-        assert "    (vignettes: skipped on the run with --skip-vignettes)\n" in done.stdout
+        assert "    (check: skipped with --skip-check on --finish)\n" in done.stdout
+        assert "    (vignettes: skipped with --skip-vignettes on the run)\n" in done.stdout
 
     def test_finish_refuses_a_pending_stage_without_rscript(
         self, hand_repo: Path, tmp_path: Path
@@ -1564,6 +1564,39 @@ class TestMergeBranchesHandUnion:
         for line in lines:
             assert f"\n{line}\n" in done.stdout, line
         assert "already run; passed pre-push" not in done.stdout
+
+    def test_the_pr_text_does_not_claim_a_step_skipped_on_a_changed_tree(
+        self, hand_repo: Path, tmp_path: Path
+    ) -> None:
+        """Every step ran, then a model fix was committed and --finish skipped
+        the regeneration and check. The PR text and --finish's lines say both
+        were skipped and their last run is out of date; the vignettes, run
+        again, passed."""
+        env, log, _ = self._r_env(tmp_path)
+        proc = self._run(hand_repo, "--yes", env=env)
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        wt = hand_repo / ".worktrees" / CONSOLIDATION
+        ran_at = git(wt, "rev-parse", "HEAD").strip()[:12]
+        (wt / "inst" / "modeldb").mkdir(parents=True, exist_ok=True)
+        (wt / "inst" / "modeldb" / "F_2020_f.R").write_text("# F, fixed\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "Fix a model by hand")
+        done = run(*self._printed_finish(proc.stderr), "--skip-r-regen", "--skip-check", env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert log.read_text() == "regen\ncheck\nvignettes\nvignettes\n"
+        stale = f"the last run, at {ran_at}, is out of date"
+        check = '`devtools::check(error_on = "error", args = "--no-build-vignettes")`'
+        for line in (
+            f"    (regen: skipped with --skip-r-regen on --finish; {stale})",
+            f"    (check: skipped with --skip-check on --finish; {stale})",
+            f"The registry regeneration was skipped with --skip-r-regen on --finish; {stale};"
+            " run it before merging:",
+            f"- [ ] {check} (skipped with --skip-check on --finish; {stale}; run it before"
+            " merging)",
+            "- [x] Every vignette under `vignettes/articles/` rendered before the push",
+        ):
+            assert f"\n{line}\n" in done.stdout, line
+        assert "still pending" not in done.stdout
 
     def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")

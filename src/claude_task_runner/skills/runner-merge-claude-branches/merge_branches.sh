@@ -810,17 +810,21 @@ run_vignettes() {  # step 9: every vignette renders
   stage_set vignettes "$(git rev-parse HEAD)"
 }
 
-stage_ran() {  # <stage>: whether it completed, rather than was skipped
+stage_ran() {  # <stage>: whether it completed and still holds at HEAD
   local state
   state="$(stage_get "$1")"
-  [[ "$state" != skip && "$state" != pending ]]
+  [[ "$state" != skip && "$state" != pending ]] && ! stage_stale "$1" "$state"
 }
 
-stage_skip_note() {  # <stage>: how it was skipped, for the PR text
-  if [[ "$(stage_get "$1")" == skip ]]; then
+stage_skip_note() {  # <stage>: how a stage that does not hold at HEAD was skipped
+  local state
+  state="$(stage_get "$1")"
+  if [[ "$state" == skip ]]; then
     echo "skipped with $(stage_flag "$1") on the run"
-  else
+  elif [[ "$state" == pending ]]; then
     echo "skipped with $(stage_flag "$1") on --finish"
+  else
+    echo "skipped with $(stage_flag "$1") on --finish; the last run, at ${state:0:12}, is out of date"
   fi
 }
 
@@ -884,8 +888,7 @@ finish_r_stages() {  # --finish: every R stage the run did not complete, or that
   for stage in regen check vignettes; do
     state="$(stage_get "$stage")"
     case "$(stage_status "$stage")" in
-      run-skip) echo "    ($stage: skipped on the run with $(stage_flag "$stage"))" ;;
-      finish-skip) echo "    ($stage: still pending, skipped with $(stage_flag "$stage") on --finish)" ;;
+      run-skip | finish-skip) echo "    ($stage: $(stage_skip_note "$stage"))" ;;
       done) echo "    ($stage: completed at ${state:0:12})" ;;
       due)
         case "$stage" in
