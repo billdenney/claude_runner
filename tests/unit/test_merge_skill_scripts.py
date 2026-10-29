@@ -1261,6 +1261,30 @@ class TestRegisterPlacement:
         )
         assert "(canonical, model)" not in proc.stdout
 
+    def test_a_source_alias_is_kept_only_as_whole_words(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A merged bullet that holds the branch's bullet only inside a longer
+        number ("120" in "1200") says something else, so the branch's bullet
+        is reported as lost."""
+        models = "(base model), `S_2020_s.R` (s)."
+        bullet = "  - `CRCL` -- `S_2020_s.R`, capped at 120.\n"
+        with_alias = BASE_REGISTER.replace(
+            "- **Example models:**", f"- **Source aliases:**\n{bullet}- **Example models:**"
+        ).replace("(base model).", models)
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER})
+        push_task_branch(repo, "claude/s", {REGISTER: with_alias}, "Add S 2020 model")
+        wt = consolidate(repo, ["origin/claude/s"], CONSOLIDATION)
+        (wt / REGISTER).write_text(with_alias.replace("at 120.", "at 1200."))
+        proc = run_helper("verify_register_placement.py", *_verifier_args(repo))
+        assert proc.returncode == 1, proc.stdout
+        assert proc.stdout.endswith(
+            "\n"
+            "ERROR: (placement) 1 source-alias bullet(s) a branch added are NOT under that"
+            f" canonical in {REGISTER}:\n"
+            "    WT  <-  `CRCL` -- `S_2020_s.R`, capped at 120.   (from claude/s)\n"
+        )
+
 
 # The helpers that read the consolidation worktree, and the prefix of their errors.
 WORKTREE_HELPERS = {
@@ -1908,6 +1932,19 @@ class TestUnionEditsFieldsInPlace:
         assert emitted.text == self.HEAD + base
         assert [(d.what, d.dropped) for h in emitted.hand for d in h.differences] == [
             ("Example models entry for N.R", ["`N.R` (n)"])
+        ]
+
+    def test_a_note_held_only_inside_a_longer_word_is_reported(self) -> None:
+        """Two branches annotate N differently. The longer note holds the
+        shorter one only inside a longer number ("120" in "1200"), so the
+        shorter says something the kept one does not and goes to the report."""
+        base = "- **Example models:** `A.R` (a).\n"
+        longer = base.replace("(a).", "(a), `N.R` (CrCL capped at 1200).")
+        shorter = base.replace("(a).", "(a), `N.R` (CrCL capped at 120).")
+        emitted = self._thrice(base, [longer, shorter], shorter)
+        assert emitted.text == self.HEAD + longer
+        assert [(d.what, d.dropped) for h in emitted.hand for d in h.differences] == [
+            ("Example models entry for N.R", ["`N.R` (CrCL capped at 120)"])
         ]
 
     def test_a_corrected_note_in_a_wrapped_field_keeps_the_line_breaks(self) -> None:
@@ -2924,6 +2961,31 @@ class TestDedupKeepsEveryModelAndWord:
         proc, _, report = self._dedup(tmp_path, _pair(kept, dropped))
         assert proc.returncode == 0
         assert "In a dropped copy:\n\n````\nNo\n````\n" in report
+
+    @pytest.mark.parametrize(
+        ("kept", "dropped", "reported"),
+        [
+            (
+                "- **Example models:** `A_2020_a.R` (CrCL capped at 1200).\n",
+                "- **Example models:** `A_2020_a.R` (CrCL capped at 120).\n",
+                "`A_2020_a.R` (CrCL capped at 120)",
+            ),
+            (
+                "- **Source aliases:**\n  Weights capped at 1200 kg.\n",
+                "- **Source aliases:**\n  Weights capped at 120\n",
+                "  Weights capped at 120",
+            ),
+        ],
+        ids=["entry-note", "source-alias-text"],
+    )
+    def test_a_note_or_alias_text_is_kept_only_as_whole_words(
+        self, tmp_path: Path, kept: str, dropped: str, reported: str
+    ) -> None:
+        """ "120" is not kept by "1200": a dropped copy's entry notes and
+        source-alias text compare on word boundaries, as its prose does."""
+        proc, _, report = self._dedup(tmp_path, _pair(kept, dropped))
+        assert proc.returncode == 0
+        assert f"In a dropped copy:\n\n````\n{reported}\n````\n" in report
 
     @pytest.mark.parametrize(
         ("kept", "result"),
