@@ -485,6 +485,37 @@ def test_a_later_copy_that_also_declares_a_base_name_is_compared(repo: Path) -> 
     ) in out, out
 
 
+def test_a_reworded_base_canonical_is_never_a_copy(repo: Path) -> None:
+    """A branch that only rewords the base's ``### fm_a`` added nothing, so it
+    is no copy of the restored ``### fm_b, fm_a`` block, which declares fm_a
+    too: the restore says nothing about it."""
+    write_register(repo, ["KEEP_ME", "NEW_NAME", "fm_a"])
+    commit(repo, "main registers fm_a")
+    make_remote_branch(repo, "first", "main", ["KEEP_ME", "NEW_NAME", "fm_b, fm_a"], "first")
+    git(repo, "checkout", "-q", "-b", "_tmp_second", "main")
+    text = (repo / REGISTER).read_text()
+    (repo / REGISTER).write_text(text.replace("for fm_a**", "for fm_a, reworded**"))
+    commit(repo, "reword fm_a")
+    git(
+        repo,
+        "update-ref",
+        "refs/remotes/origin/claude/second",
+        git(repo, "rev-parse", "HEAD").strip(),
+    )
+    git(repo, "checkout", "-q", "main")
+    make_remote_branch(repo, "clobbers", "main", ["KEEP_ME", "NEW_NAME", "UNRELATED"], "other")
+    git(repo, "checkout", "-q", "-b", "consolidation", "main")
+    for name in ("first", "second", "clobbers"):
+        merge(repo, name)
+    assert "fm_a" not in (repo / REGISTER).read_text(), "fixture did not reproduce the loss"
+    rc, out = run(repo, "consolidation")
+    assert (rc, out) == (
+        1,
+        "# 1 canonical(s) dropped by the merge and missing from refs.md:\n"
+        "    fm_b  (## Section A)\n",
+    )
+
+
 def test_a_restored_multi_name_heading_loses_none_of_its_names(repo: Path) -> None:
     """A restored multi-name heading's other names count as present: none is
     reported as dropped from a heading the restore put back."""

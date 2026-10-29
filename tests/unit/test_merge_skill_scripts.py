@@ -2121,6 +2121,33 @@ class TestUnionFindsAFieldUnderAnyOfItsHeadingsNames:
 
     TEXT = "# Covariates\n\n## Fractions\n\n### {heading}\n\n- **Example models:** {models}.\n"
 
+    RESULT = "## F\n\n### fm_a (**a**)\n\n- **Example models:** `A.R`.\n\n### fm_b (**b**)\n"
+
+    @pytest.mark.parametrize("heading", ["fm_a, fm_b (**ab**)", "fm_b, fm_a (**ab**)"])
+    def test_a_heading_spanning_two_result_headings_takes_the_first_sorted(
+        self, heading: str
+    ) -> None:
+        """A copy's heading that declares the names of two headings in the merge
+        result stands for the one that sorts first, whatever order it lists
+        them in, so every copy lands in the same bucket."""
+        u = load_helper("union_merge_lines")
+        branch = f"## F\n\n### {heading}\n\n- **Example models:** `A.R`, `N.R`.\n"
+        buckets = {bucket for bucket, *_ in u._entries(branch, u.headings_of(self.RESULT))}
+        assert buckets == {("F", "fm_a (**a**)")}
+
+    def test_a_heading_resolves_within_its_own_section(self) -> None:
+        """Two sections may each register a name: a copy's reworded heading
+        under ``## G`` stands for G's heading, not F's, so its model is filed
+        under G."""
+        u = load_helper("union_merge_lines")
+        f_block = "## F\n\n### fm_a (**a**)\n\n- **Example models:** `A.R`.\n"
+        g_block = "\n## G\n\n### fm_a (**g**)\n\n- **Example models:** `G.R`{more}.\n"
+        base = f_block + g_block.format(more="")
+        branch = f_block + g_block.format(more=", `N.R`").replace("(**g**)", "(**g, reworded**)")
+        headings = u.headings_of(base)
+        union = u.collect_entries(base, [(branch, u.entry_map(base, headings))], headings)
+        assert u.emit_merged(base, union).text == f_block + g_block.format(more=", `N.R`")
+
     @pytest.mark.parametrize(
         ("base_heading", "branch_heading"),
         [
@@ -2476,6 +2503,30 @@ class TestDedupCanonicalHeaders:
             " differ in heading; left as they are, merge them by hand\n"
         )
         assert register.read_text() == self.MULTI_NAME
+
+    def test_a_heading_that_shares_a_name_with_two_groups_joins_them(self) -> None:
+        """``### x`` and ``### y`` share nothing, and ``### x, y`` shares a name
+        with each: the three register one canonical, so they are one group."""
+        dd = load_helper("dedup_canonical_headers")
+        text = "## S\n\n### x (**1**)\n\n### y (**2**)\n\n### x, y (**3**)\n"
+        assert dd.find_dups(text.split("\n")) == {("S", "x, y"): [2, 4, 6]}
+
+    def test_global_scope_joins_headings_across_sections(self, tmp_path: Path) -> None:
+        """With --global a name is one canonical file-wide, whichever heading
+        and section declares it; per section, the two are apart."""
+        register = tmp_path / "covariate-columns.md"
+        register.write_text("## S\n\n### a (**x**)\n\n## T\n\n### b, a (**x**)\n")
+        proc = run_helper("dedup_canonical_headers.py", "--global", "--check", register)
+        assert (proc.returncode, proc.stdout) == (1, "")
+        assert proc.stderr == (
+            f"# DUPLICATE canonical headers (whole-file) in {register}: 1\n"
+            "#   a x2 (lines [3, 7])\n"
+        )
+        proc = run_helper("dedup_canonical_headers.py", "--check", register)
+        assert (proc.returncode, proc.stderr) == (
+            0,
+            f"# clean (no per-##-section duplicate canonicals): {register}\n",
+        )
 
     @pytest.mark.parametrize("check", [True, False], ids=["--check", "fix"])
     def test_a_missing_file_is_an_error_and_nothing_is_edited(
