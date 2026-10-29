@@ -1502,6 +1502,35 @@ class TestMergeBranchesHandUnion:
         assert git(wt, "show", "HEAD:data/modeldb.rda") == "new"
         assert git(wt, "status", "--porcelain") == ""
 
+    @pytest.mark.parametrize("ran", [True, False], ids=["ran", "skipped"])
+    def test_the_pr_text_says_which_r_steps_ran(
+        self, hand_repo: Path, tmp_path: Path, ran: bool
+    ) -> None:
+        env, _, _ = self._r_env(tmp_path)
+        skips = [] if ran else ["--skip-r-regen", "--skip-check", "--skip-vignettes"]
+        proc = self._run(hand_repo, "--yes", *skips, env=env)
+        assert proc.returncode == 9, proc.stdout + proc.stderr
+        done = run(*self._printed_finish(proc.stderr), env=env)
+        assert done.returncode == 0, done.stdout + done.stderr
+        check = '`devtools::check(error_on = "error", args = "--no-build-vignettes")`'
+        if ran:
+            lines = [
+                "After the merges, the registry regeneration ran:",
+                f"- [x] {check} passed before the push",
+                "- [x] Every vignette under `vignettes/articles/` rendered before the push",
+            ]
+        else:
+            lines = [
+                "The registry regeneration was skipped with --skip-r-regen on the run; run it"
+                " before merging:",
+                f"- [ ] {check} (skipped with --skip-check on the run; run it before merging)",
+                "- [ ] Every vignette under `vignettes/articles/` renders (skipped with"
+                " --skip-vignettes on the run; run verify_vignettes_parallel.R before merging)",
+            ]
+        for line in lines:
+            assert f"\n{line}\n" in done.stdout, line
+        assert "already run; passed pre-push" not in done.stdout
+
     def test_hand_union_done_goes_with_finish(self, hand_repo: Path) -> None:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")
         assert (proc.returncode, proc.stderr) == (

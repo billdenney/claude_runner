@@ -89,9 +89,6 @@
 #                           the final pre-push run because pkgdown CI's
 #                           sequential vignette build will surface the
 #                           failures one at a time.
-#                           A step the run skipped stays skipped for its
-#                           --finish without the flag; given to --finish, a
-#                           --skip-* skips that step if it is still pending.
 #   --vignette-jobs <N>     Parallel workers for vignette validation
 #                           (default: max(1, ncpus - 2)).
 #   --vignette-timeout <S>  Per-vignette wall-clock ceiling in seconds
@@ -122,9 +119,14 @@
 #                           completed or HEAD has moved since they did, and
 #                           the vignettes if they never completed or a commit
 #                           since touched a file other than the run's
-#                           registers.
-#   --hand-union-done       With --finish: the report's wording is unioned into
-#                           the register and committed; push anyway.
+#                           registers. A step the run skipped stays skipped
+#                           without the flag being given again; a --skip-*
+#                           given to --finish skips that step if it is due.
+#   --hand-union-done       With --finish: the hand-union report has been
+#                           worked through -- its wording unioned into the
+#                           register and committed, any contribution it lists
+#                           as missing reconciled -- so --finish goes on to
+#                           its gates rather than stopping at the report.
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
 #                           Required when stdin is not a terminal, as in an
@@ -584,6 +586,23 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
   echo
   echo "Suggested PR body:"
   echo
+  local regen_text check_line vignette_line
+  local check_cmd='`devtools::check(error_on = "error", args = "--no-build-vignettes")`'
+  if stage_ran regen; then
+    regen_text="After the merges, the registry regeneration ran:"
+  else
+    regen_text="The registry regeneration was $(stage_skip_note regen); run it before merging:"
+  fi
+  if stage_ran check; then
+    check_line="- [x] $check_cmd passed before the push"
+  else
+    check_line="- [ ] $check_cmd ($(stage_skip_note check); run it before merging)"
+  fi
+  if stage_ran vignettes; then
+    vignette_line="- [x] Every vignette under \`vignettes/articles/\` rendered before the push"
+  else
+    vignette_line="- [ ] Every vignette under \`vignettes/articles/\` renders ($(stage_skip_note vignettes); run verify_vignettes_parallel.R before merging)"
+  fi
   cat <<EOF
 ## Summary
 
@@ -599,7 +618,7 @@ branch.
 
 ### Mechanical regeneration commit
 
-After the merges, ran:
+$regen_text
 
 \`\`\`sh
 Rscript -e 'devtools::load_all("."); nlmixr2lib:::buildModelDb(); devtools::document()'
@@ -630,7 +649,8 @@ source branches can then be deleted at the operator's discretion
 
 ## Test plan
 
-- [ ] \`devtools::check(error_on = "error", args = "--no-build-vignettes")\` (already run; passed pre-push)
+$check_line
+$vignette_line
 - [ ] \`nlmixr2lib::modellib()\` lists all newly-added models
 - [ ] Spot-check one of the new models: \`nlmixr2lib::readModelDb(name = "<one>")\` returns a function
 - [ ] Rendered pkgdown navbar shows the new vignettes under the right section
@@ -678,20 +698,15 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
     exit 5
   fi
 
-  # Stage whatever the regen actually WROTE, not a hardcoded artifact list.
-  #
-  # The old list named `inst/modeldb.qs2` -- a path this same script carries on
-  # its forbidden-resurrection list, because nlmixr2lib dropped it in favour of
-  # `inst/modeldb.rds`.  So the staging line asked for a file that cannot exist
-  # and never named the one that does: on the 2026-08-31 consolidation the
-  # regenerated registry would have been left unstaged and the branch pushed
-  # with a registry blob stale against 181 new model files.  A hardcoded list
-  # silently under-stages every time the package renames a derived artifact.
+  # Stage whatever the regen actually wrote, not a fixed artifact list: the
+  # package renames its derived artifacts (inst/modeldb.qs2 became
+  # inst/modeldb.rds), and a fixed list would leave a renamed one unstaged.
   #
   # Every earlier step commits its own work, so the worktree is clean on entry
   # here and anything dirty now is regen output.  Assert that rather than
   # assume it: if the tree was already dirty the operator needs to know, since
-  # `git add -A` would sweep unrelated edits into the regen commit.
+  # `git add -A` would sweep unrelated edits into the regen commit, so only
+  # the artifact paths that exist are staged.
   if [[ -n "$pre_dirty" ]]; then
     echo "    WARN: worktree was already dirty before the regen step; staging"
     echo "          only known artifact paths to avoid committing unrelated edits:"
@@ -742,10 +757,9 @@ run_check() {  # step 8: the devtools::check gate
 # blocks push.
 #
 # The gate is the validator's own exit status (0 only when every vignette
-# rendered, or there were none) plus the per-file results. It used to be the
-# results alone, with the pipeline as a bare `if` condition, so an Rscript
-# that was missing or died before writing a line -- a failed install, a
-# missing package -- left no "ok":false to find and the run went on to push.
+# rendered, or there were none) plus the per-file results: an Rscript that is
+# missing or dies before writing a line -- a failed install, a missing package
+# -- leaves no "ok":false to find, so the results alone cannot pass it.
 run_vignettes() {  # step 9: every vignette renders
   echo
   echo "==> Parallel vignette validation (every Rmd under vignettes/articles/)"
@@ -783,6 +797,20 @@ run_vignettes() {  # step 9: every vignette renders
   fi
   echo "    all vignettes rendered cleanly"
   stage_set vignettes "$(git rev-parse HEAD)"
+}
+
+stage_ran() {  # <stage>: whether it completed, rather than was skipped
+  local state
+  state="$(stage_get "$1")"
+  [[ "$state" != skip && "$state" != pending ]]
+}
+
+stage_skip_note() {  # <stage>: how it was skipped, for the PR text
+  if [[ "$(stage_get "$1")" == skip ]]; then
+    echo "skipped with $(stage_flag "$1") on the run"
+  else
+    echo "skipped with $(stage_flag "$1") on --finish"
+  fi
 }
 
 stage_flag() {  # <stage>: the flag that skips it
