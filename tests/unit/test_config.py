@@ -465,3 +465,48 @@ class TestMaxReadingAge:
     def test_must_be_positive(self, tmp_path: Path, age: float) -> None:
         with pytest.raises(ConfigError, match="max_reading_age_s"):
             load_settings(self._toml(tmp_path, age=age, poll=60, accounts=1))
+
+
+class TestDeferralCooldownSpansATick:
+    """``[failure_classifier].deferral_recheck_cooldown_s`` must be at least one tick.
+
+    The selector checks a deferred task's ``next_eligible_at`` once a tick
+    and nothing wakes the supervisor for it, so a shorter cooldown (``0``
+    included) re-dispatches a still-blocked task every tick.
+    """
+
+    def _toml(self, tmp_path: Path, *, cooldown: float, poll: float = 60) -> Path:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(
+            f"[usage]\npoll_interval_s = {poll}\nmax_reading_age_s = {2 * poll}\n"
+            f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {cooldown}\n"
+        )
+        return toml
+
+    def test_default_is_900_seconds(self) -> None:
+        assert load_settings(None).failure_classifier.deferral_recheck_cooldown_s == 900
+
+    def test_exactly_one_tick_loads(self, tmp_path: Path) -> None:
+        settings = load_settings(self._toml(tmp_path, cooldown=60))
+        assert settings.failure_classifier.deferral_recheck_cooldown_s == 60
+
+    def test_under_one_tick_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(self._toml(tmp_path, cooldown=59.5))
+        assert (
+            "[failure_classifier].deferral_recheck_cooldown_s = 59.5 s is under one "
+            "supervisor tick, [usage].poll_interval_s = 60 s. Deferred tasks are checked "
+            "once a tick, so a shorter cooldown re-dispatches a still-blocked task every "
+            "tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+        ) in str(excinfo.value)
+
+    def test_zero_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 0 s is under one"):
+            load_settings(self._toml(tmp_path, cooldown=0))
+
+    def test_default_rejects_a_poll_longer_than_it(self, tmp_path: Path) -> None:
+        """The 900 s default needs polls of 900 s or less."""
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[usage]\npoll_interval_s = 901\nmax_reading_age_s = 1802\n")
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under one"):
+            load_settings(toml)

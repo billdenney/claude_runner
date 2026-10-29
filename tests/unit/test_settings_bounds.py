@@ -88,7 +88,9 @@ BOUNDED_BY_ANOTHER_SETTING = {
         "[usage].max_reading_age_s must span two capture cycles of "
         "len(accounts) x poll_interval_s and is itself at most ten years, so a "
         "poll interval over five years is rejected by that rule, not by its own "
-        "bound. One more than the ceiling still fails on the field's own bound."
+        "bound. One more than the ceiling still fails on the field's own bound. "
+        "[failure_classifier].deferral_recheck_cooldown_s must also be at least "
+        "one poll interval, so a long poll needs a cooldown as long."
     ),
 }
 """Duration settings whose ceiling alone cannot load, and why."""
@@ -128,14 +130,22 @@ class TestEveryDurationIsAtMostTenYears:
 
     def test_poll_interval_is_bounded_by_the_reading_age(self, tmp_path: Path) -> None:
         """Ten years alone fails the two-cycle rule; five years, with the
-        reading age at its own ceiling, is the largest that loads."""
+        reading age at its own ceiling and a cooldown of at least one poll,
+        is the largest that loads."""
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(toml_setting("usage.poll_interval_s", str(MAX_DURATION_S)))
         with pytest.raises(ConfigError, match="under two capture cycles"):
             load_settings(toml)
-        toml.write_text(
+        five_years = (
             f"[usage]\npoll_interval_s = {MAX_DURATION_S // 2}\n"
             f"max_reading_age_s = {MAX_DURATION_S}\n"
+        )
+        toml.write_text(five_years)
+        with pytest.raises(ConfigError, match="under one supervisor tick"):
+            load_settings(toml)
+        toml.write_text(
+            five_years
+            + f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {MAX_DURATION_S // 2}\n"
         )
         assert load_settings(toml).usage.poll_interval_s == MAX_DURATION_S // 2
 
