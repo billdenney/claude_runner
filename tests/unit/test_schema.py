@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
+from pydantic.fields import FieldInfo
 
-from claude_task_runner.process_signals import PID_MAX
+import claude_task_runner
+from claude_task_runner.process_signals import PID_T_MAX
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     RunRecord,
@@ -189,7 +193,7 @@ class TestRunRecord:
                 pid=pid,
             )
 
-    def test_pid_field_accepts_pid_max(self) -> None:
+    def test_pid_field_accepts_pid_t_max(self) -> None:
         t = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)
         r = RunRecord(
             attempt=1,
@@ -197,7 +201,7 @@ class TestRunRecord:
             finished_at=t,
             stop_reason="end_turn",
             duration_s=1,
-            pid=PID_MAX,
+            pid=PID_T_MAX,
         )
         assert r.pid == 2**31 - 1
 
@@ -210,8 +214,8 @@ class TestTaskState:
         with pytest.raises(ValidationError):
             TaskState(task_id="001-foo", status="running", pid=pid)
 
-    def test_pid_field_accepts_pid_max(self) -> None:
-        assert TaskState(task_id="001-foo", pid=PID_MAX).pid == 2**31 - 1
+    def test_pid_field_accepts_pid_t_max(self) -> None:
+        assert TaskState(task_id="001-foo", pid=PID_T_MAX).pid == 2**31 - 1
 
     def test_defaults(self) -> None:
         s = TaskState(task_id="001-foo")
@@ -388,3 +392,59 @@ class TestSidecar:
                 context="c",
                 questions=[self._question()],
             )
+
+
+def _pid_fields() -> list[tuple[type[BaseModel], str, FieldInfo]]:
+    """Every pydantic field named ``pid`` or ``*_pid`` in the package's models."""
+    found = []
+    for info in pkgutil.walk_packages(claude_task_runner.__path__, "claude_task_runner."):
+        module = importlib.import_module(info.name)
+        for obj in vars(module).values():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, BaseModel)
+                and obj.__module__ == module.__name__
+            ):
+                for name, field in obj.model_fields.items():
+                    if name == "pid" or name.endswith("_pid"):
+                        found.append((obj, name, field))
+    return found
+
+
+def _not_bounded_to_a_pid_t(
+    fields: list[tuple[type[BaseModel], str, FieldInfo]],
+) -> dict[str, tuple[int | None, int | None]]:
+    """``Model.field`` → its ``(ge, le)`` for each field whose bounds are not
+    ``(1, PID_T_MAX)``; ``None`` for a bound it lacks."""
+    found = {}
+    for model, name, field in fields:
+        bounds = {type(m).__name__: m for m in field.metadata}
+        pair = (getattr(bounds.get("Ge"), "ge", None), getattr(bounds.get("Le"), "le", None))
+        if pair != (1, PID_T_MAX):
+            found[f"{model.__name__}.{name}"] = pair
+    return found
+
+
+def test_every_pid_field_is_bounded_to_a_pid_t() -> None:
+    """A recorded pid outside 1..PID_T_MAX must fail to load: ``os.kill``
+    raises OverflowError above it, and the quarantine takes the file
+    instead of a probe of it raising."""
+    fields = _pid_fields()
+    assert {("RunRecord", "pid"), ("TaskState", "pid")} <= {
+        (model.__name__, name) for model, name, _ in fields
+    }
+    assert _not_bounded_to_a_pid_t(fields) == {}
+
+
+def test_a_pid_field_without_the_bounds_is_named_with_the_ones_it_has() -> None:
+    class Probe(BaseModel):
+        pid: int | None = None
+        worker_pid: int | None = Field(default=None, ge=0)
+        bounded_pid: int = Field(default=1, ge=1, le=PID_T_MAX)
+
+    fields = [(Probe, name, field) for name, field in Probe.model_fields.items()]
+
+    assert _not_bounded_to_a_pid_t(fields) == {
+        "Probe.pid": (None, None),
+        "Probe.worker_pid": (0, None),
+    }

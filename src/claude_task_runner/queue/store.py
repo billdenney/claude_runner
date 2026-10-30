@@ -35,6 +35,7 @@ from yaml.composer import ComposerError
 from yaml.nodes import Node
 from yaml.resolver import BaseResolver
 
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import (
     CURRENT_SCHEMA_VERSION,
     Task,
@@ -265,6 +266,14 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         raise QueueIOError(f"failed to read {path}: {exc}") from exc
     except yaml.YAMLError as exc:
         raise QueueSchemaError(f"{path}: invalid YAML: {exc}") from exc
+    except QueueSchemaError:
+        raise
+    except ValueError as exc:
+        # PyYAML's construct_yaml_int raises a bare ValueError for an
+        # integer longer than the interpreter's digit limit (4300 by
+        # default), such as a corrupt pid; QueueSchemaError is itself a
+        # ValueError, hence the re-raise above.
+        raise QueueSchemaError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise QueueSchemaError(f"{path}: top-level YAML must be a mapping")
     return data
@@ -292,31 +301,21 @@ _RETIRED_TASK_KEYS: dict[str, str] = {
 why it went. ``Task`` forbids unknown keys, so without this a file written
 before a key was retired would stop loading and its task would never run."""
 
-_warned_retired_task_keys: set[tuple[Path, str]] = set()
-"""``(file, key)`` pairs already warned about. The orchestrator reloads every
-task YAML on every tick, so each pair is warned about once per process."""
-
 
 def _drop_retired_task_keys(payload: dict[str, Any], path: Path) -> None:
-    """Remove retired keys from ``payload``, warning once per file and key."""
+    """Remove retired keys from ``payload``, warning once per file and key: the
+    orchestrator reloads every task YAML on every tick."""
     for key, reason in _RETIRED_TASK_KEYS.items():
         if key not in payload:
             continue
         del payload[key]
-        if (path, key) not in _warned_retired_task_keys:
-            _warned_retired_task_keys.add((path, key))
+        if first_time("retired_task_key", path, key):
             logger.warning(
                 "%s: ignoring the retired key %r (%s); delete it from the file",
                 path,
                 key,
                 reason,
             )
-
-
-_warned_retired_efforts: set[tuple[Path, str]] = set()
-"""``(file, spelling)`` pairs already warned about by
-:func:`_rename_retired_effort`, once per process for the same reason as
-:data:`_warned_retired_task_keys`."""
 
 
 def _rename_retired_effort(payload: dict[str, Any], path: Path) -> None:
@@ -333,8 +332,7 @@ def _rename_retired_effort(payload: dict[str, Any], path: Path) -> None:
         return
     renamed = RETIRED_EFFORT_LEVELS[effort]
     payload["effort"] = renamed
-    if (path, effort) not in _warned_retired_efforts:
-        _warned_retired_efforts.add((path, effort))
+    if first_time("retired_effort", path, effort):
         logger.warning(
             "%s: reading effort %r as %r, the claude CLI's name; update the file",
             path,

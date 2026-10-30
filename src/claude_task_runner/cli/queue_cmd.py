@@ -448,12 +448,14 @@ def holds(
     ``depends_on_unmeetable`` names one that exists but cannot complete:
     the task itself, a task in a dependency cycle with it, or a
     ``failed_circuit_breaker`` task.
-    Of the eligible, ``can_start_now`` have an account that takes them now, and
-    ``waiting_for_their_account`` are held to the account their session
-    runs on, which cannot take them, until ``affinity_ttl_s`` of idleness
-    lets another. ``poll_interval_s`` is how often the supervisor runs this
-    selection, and ``queue_cap`` the queue-wide cap on tasks in flight now
-    (the warm-up cap while ``warming_up``), ``null`` when there is none.
+    ``by_status`` counts the eligible by their state's status (``new`` with
+    no state yet). Of the eligible, ``can_start_now`` have an account that
+    takes them now, and ``waiting_for_their_account`` are held to the
+    account their session runs on, which cannot take them, until
+    ``affinity_ttl_s`` of idleness lets another. ``poll_interval_s`` is how
+    often the supervisor runs this selection, and ``queue_cap`` the
+    queue-wide cap on tasks in flight now (the warm-up cap while
+    ``warming_up``), ``null`` when there is none.
 
     Four holds carry their tasks' details. ``parked_workers``: the
     ``possibly_hung`` tasks parked while a worker ran unwatched (stop reason
@@ -464,7 +466,9 @@ def holds(
     ``deferred_reason`` and ``next_eligible_at``. A task whose state no
     longer loads when these two are read (removed or rewritten since the
     selection read it) is left out of them and listed under
-    ``unread_states`` with the error.
+    ``unread_states`` with the error. So is an eligible task whose state no
+    longer loads when its status is read: it stays eligible, in no
+    ``by_status`` count.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
     the ``missing`` ids in its ``depends_on``, in the order it lists them.
     ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
@@ -498,7 +502,7 @@ def holds(
     for status in preview.eligible_statuses.values():
         by_status[status] = by_status.get(status, 0) + 1
     can_start_now = sum(1 for account in preview.routes.values() if account is not None)
-    unread: list[dict[str, str]] = []
+    unread = [{"task_id": t, "error": error} for t, error in preview.unread_states.items()]
     parked = _parked_workers(qd, settings, preview.held.get("possibly_hung", []), now, unread)
     retrying = _retrying(qd, preview.held.get("deferred_cooldown", []), unread)
     missing = sorted(preview.missing_dependencies.items())
@@ -552,7 +556,8 @@ def holds(
     )
     for task in preview.eligible:
         route = preview.routes[task.id] or "no account now"
-        console.print(literal(f"  {task.id} ({preview.eligible_statuses[task.id]}; {route})"))
+        status = preview.eligible_statuses.get(task.id, "state not read")
+        console.print(literal(f"  {task.id} ({status}; {route})"))
     for category, n in held.items():
         console.print(literal(styled(f"held, {category}:", "bold"), f" {n}"))
     console.print(literal(styled("completed:", "bold"), f" {payload['completed']}"))
@@ -1274,7 +1279,9 @@ def force_dispatch(
     ``--allow-live-worker`` is not given, if the queue's ``[effort_levels]`` rejects its
     (model, effort) pair, if one of its ``requires`` elements is unmet
     (ADR-0030), or if the pre-dispatch hook fails during the synchronous
-    path.
+    path. The synchronous path also exits non-zero when the dispatch loop
+    fails and the worker cannot be stopped: the task is then parked
+    ``possibly_hung`` with that worker on record.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -1435,7 +1442,9 @@ def force_dispatch(
             claude_executable=settings.claude.executable,
             allow_live_worker=allow_live_worker,
         )
-    except fd_mod.ForceDispatchError as exc:
+    except (fd_mod.ForceDispatchError, dispatcher_mod.DispatchError) as exc:
+        # DispatchError: the dispatch loop failed and the worker could not be
+        # stopped, so the task is parked with it on record.
         msg = str(exc)
         if json:
             print(_json.dumps({"ok": False, "error": msg}))

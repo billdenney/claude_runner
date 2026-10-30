@@ -301,8 +301,13 @@ N hours old.
    an API call. Kill it: `kill <pid>`.
 3. The runner will mark the task `failed` (environmental); on next tick
    the supervisor will dispatch via `--resume <session_id>` automatically.
-4. If hangs are common, reduce `task_caps.heartbeat_silence_kill_s` from
-   default 0 (off) to e.g. 600 to auto-kill silent tasks.
+4. If hangs are common, set `task_caps.heartbeat_silence_kill_s` (default
+   0, off) to e.g. 600. The dispatcher then stops a worker that writes no
+   stream output for that long, checking every 10 s (ADR-0037). A long
+   tool call is not silence: claude writes a `tool_progress` line every
+   30 s while one runs. Whatever this is set to, a worker that writes
+   nothing at all is stopped at its duration cap
+   (`task_caps.max_duration_s_per_task`, 4 h by default).
 
 ## After a restart, a task is `failed` or `possibly_hung` while its worker still runs
 
@@ -324,8 +329,10 @@ worker when `[supervisor].adopt_workers` is off, and a worker no state
 records (found by its stream log) are parked as `worker_still_running`
 instead: a `failed` task would be dispatched again, and two workers in one
 worktree corrupt its branch. The same park happens when a dispatchable
-task turns out to have a worker still running. The supervisor reports each
-park (a `warning` notification and a `live_worker_parked` event).
+task turns out to have a worker still running, and when a worker cannot be
+stopped after its dispatch loop failed (see "A run failed with
+`dispatch_loop_error`"). The supervisor reports each park (a `warning`
+notification and a `live_worker_parked` event).
 
 While a `worker_still_running` worker runs it holds a slot of the account
 it runs on (`account list` counts it), and nothing dispatches its task. It
@@ -362,6 +369,95 @@ status.
    `failed` (`status: failed` in
    `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
    stopped) and the supervisor resumes its session.
+
+## A task's state file was quarantined at startup
+
+**Symptom:** the supervisor's log says
+`quarantined N corrupt state file(s) on startup: [...]`, with a `warning`
+notification (`corrupt-state quarantine: task <id> ...`) and a
+`corrupt_state_quarantined` event per task. The task's state file is now
+`<queue>/.claude_task_runner/state/.corrupt/<id>.<timestamp>.yaml`.
+
+**Cause:** at startup, before any other recovery pass, the supervisor moves
+every state file it cannot load into `state/.corrupt/` (ADR-0028), so that
+no pass skips the task forever. A file fails to load when a crash or power
+loss truncated it, when a hand edit broke it, or when it records a value no
+process or date can hold: a `pid` (the task's or a run's) below 1 or above
+2147483647, the C `pid_t` maximum, or an integer of more than 4300 digits.
+The runner never writes such a value; only a hand edit or bit rot does. The
+quarantine then decides the task from what it can still read at the head of
+the file:
+
+- A `completed` task gets a minimal state that keeps `completed`, so its
+  finished work is not redone. Its runs and session id are not kept.
+- A task whose worker still runs (the recorded worker, or a process writing
+  the task's stream log) is parked `possibly_hung` with that worker on
+  record (see the section above), so no second worker starts.
+- Any other task has no state, reverts to pending and runs again from the
+  start, even if its last worker had finished: the quarantined file's
+  record of that run is not read.
+
+**Steps:**
+1. The quarantined copy keeps the original bytes:
+   `ls <queue>/.claude_task_runner/state/.corrupt/`. Compare it with the
+   task's log, `<queue>/.claude_task_runner/logs/<id>/`, to see what the
+   last attempt did.
+2. To keep a task from running again (its work is done, say), stop the
+   supervisor, then look for `<queue>/.claude_task_runner/state/<id>.yaml`.
+   A task left without state can be dispatched on the supervisor's first
+   tick, so a file there is a new attempt's record. Do not move the copy
+   over it: with `[supervisor].adopt_workers` on (the default) that
+   attempt's worker keeps running after the supervisor stops, and its
+   record would be lost. Start the supervisor again and let the attempt
+   finish.
+3. With no such file, fix the copy, set its `status: completed`, move it
+   back to `<queue>/.claude_task_runner/state/<id>.yaml`, and start the
+   supervisor. A `pending` or `failed` copy is dispatched again. A
+   `running` one is settled at startup like any task whose worker is gone,
+   which runs it again unless its log ends in a successful result. A copy
+   moved back unfixed is quarantined again.
+
+## A run failed with `dispatch_loop_error`
+
+**Symptom:** a run in `claude-task-runner queue show <id>` has stop reason
+`dispatch_loop_error` and the error `dispatch loop raised <Exception>:
+<message>`. The supervisor log has an ERROR with a traceback, `task <id>:
+dispatch loop raised ...; stopping worker pid=<pid>`.
+
+**Cause:** the supervisor's loop that watches a worker raised: a bug in the
+runner, a clock step, a cap kill that could not confirm the worker died, or
+a monitor thread that could not start. Rather than leave the worker running
+unwatched, the supervisor stopped it and recorded the run as failed. The
+failure counts toward the circuit breaker, and the task is dispatched
+again. A worker that had already written its terminal result, or had
+exited on its own, keeps its own record instead, and one whose cap kill
+raised is recorded as killed by that cap.
+
+A worker the supervisor cannot stop may still be running, so no run is
+recorded: the task is parked `possibly_hung` with stop reason
+`worker_still_running`, as in the section above. The log says why the stop
+failed: `could not stop worker pid=<pid> after its dispatch loop failed`
+when the kill itself failed, or, for an adopted worker that outlived its
+SIGKILL, `subprocess leak: adopted worker pid=<pid> did not exit ...`.
+`queue force-dispatch` with no supervisor running prints `force-dispatch
+failed: ... could not be stopped and is parked` and exits 2.
+
+**Steps:**
+1. Read the traceback in the supervisor log, and report it: the loop is not
+   meant to raise.
+2. If several tasks fail this way in a row, stop the supervisor
+   (`systemctl --user stop claude-task-runner`) until the cause is fixed.
+   Each failure counts toward its task's circuit breaker, and a fault in
+   the loop fails every task it watches. Afterwards, set a task the breaker
+   stopped back to `status: pending` in
+   `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
+   stopped: no `queue` command resets a circuit breaker.
+3. For a parked worker, follow steps 1 and 2 of "After a restart, a task is
+   `failed` or `possibly_hung` while its worker still runs". A pipe-backed
+   worker (`[supervisor].adopt_workers` off, or `queue force-dispatch` with
+   no supervisor running) has a pipe as its stdout, not its log, so
+   `readlink /proc/<pid>/fd/1` prints `pipe:[...]`; `ps -o args= -p <pid>`
+   shows whether the pid is still a `claude` worker.
 
 ## Weekly throttled, no dispatch resuming
 

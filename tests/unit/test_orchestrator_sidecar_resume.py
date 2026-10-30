@@ -46,7 +46,6 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import orchestrator as orchestrator_mod
 from claude_task_runner.runner import readiness
 from claude_task_runner.runner.in_flight import DispatchSlot
-from claude_task_runner.runner.orchestrator import _dispatch_blocked_task_ids
 
 from ._sidecar_files import write_request
 
@@ -461,8 +460,7 @@ def test_deferred_with_a_non_utc_offset_is_compared_as_written(queue_dir: Path) 
 # (e.g. a paper awaiting a supplement) with `block_dispatch: true` in a
 # queue-relative JSONL (the `needs_acquisition.jsonl` convention). The
 # selector reads it and skips those tasks WITHOUT spending a
-# dispatch+defer cycle each cooldown. The reader is fail-safe: a missing
-# file / malformed line / non-matching row means "not blocked".
+# dispatch+defer cycle each cooldown. test_block_list.py covers the reader.
 
 
 def _write_block_file(queue_dir: Path, name: str, lines: list[str]) -> str:
@@ -470,39 +468,18 @@ def _write_block_file(queue_dir: Path, name: str, lines: list[str]) -> str:
     return name
 
 
-def test_dispatch_blocked_task_ids_off_when_unset(queue_dir: Path) -> None:
-    """No configured block file → feature off → empty set (even if a file
-    with that content would exist elsewhere)."""
-    assert _dispatch_blocked_task_ids(queue_dir, None) == set()
-    assert _dispatch_blocked_task_ids(queue_dir, "") == set()
+def test_eligible_candidates_survives_a_block_file_that_is_not_utf8(queue_dir: Path) -> None:
+    """The selector reads the block file on every tick; bytes that are not
+    UTF-8 in it must not stop it."""
+    task = _make_task("t-pending")
+    _write_task_yaml(queue_dir, task)
+    (queue_dir / "needs_acquisition.jsonl").write_bytes(b"\xff{}\n")
 
-
-def test_dispatch_blocked_task_ids_missing_file_is_empty(queue_dir: Path) -> None:
-    """Configured but absent file → empty set (fail-safe, not an error)."""
-    assert _dispatch_blocked_task_ids(queue_dir, "needs_acquisition.jsonl") == set()
-
-
-def test_dispatch_blocked_task_ids_reads_only_flagged_task_rows(queue_dir: Path) -> None:
-    """Mixed-content JSONL: only object rows with ``block_dispatch: true``
-    AND a non-empty string ``task`` contribute. Everything else — an
-    explicit ``false``, an index row, a ``target_path`` re-acquisition
-    row, a flagged row missing ``task``, a malformed line, a blank line —
-    is ignored."""
-    name = _write_block_file(
-        queue_dir,
-        "needs_acquisition.jsonl",
-        [
-            '{"task": "211-goulooze", "block_dispatch": true, "needed": "suppl"}',
-            '{"task": "400-metrum", "block_dispatch": true}',
-            '{"task": "999-cleared", "block_dispatch": false}',
-            '{"title": "some paper", "status": "INDEX_NEEDS_ACQUISITION"}',
-            '{"target_path": "papers/PMID_X/PMID_X.pdf"}',
-            '{"block_dispatch": true}',
-            "not valid json at all",
-            "",
-        ],
+    candidates = _eligible_candidates(
+        queue_dir, {}, set(), now=_NOW, block_file="needs_acquisition.jsonl"
     )
-    assert _dispatch_blocked_task_ids(queue_dir, name) == {"211-goulooze", "400-metrum"}
+
+    assert [t.id for t in candidates] == ["t-pending"]
 
 
 def test_eligible_candidates_skips_blocked_pending_task(queue_dir: Path) -> None:

@@ -1055,12 +1055,12 @@ def test_unreadable_supervisor_json(
         pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
     ],
 )
-def test_a_supervisor_json_mtime_no_datetime_can_hold_is_reported(
+def test_a_supervisor_json_mtime_no_datetime_can_hold_leaves_the_record_readable(
     queue: Path, monkeypatch: pytest.MonkeyPatch, mtime: float, error: str
 ) -> None:
     """The record's save time comes from its mtime. One no datetime can hold
-    (``ValueError`` or ``OverflowError`` from ``fromtimestamp``) is reported
-    as the record being unreadable, not raised out of the report."""
+    (``ValueError`` or ``OverflowError`` from ``fromtimestamp``) makes the
+    save time unknown, with the error, while the record itself still loads."""
     report = _report_module()
     path = persist_mod.supervisor_state_path(queue)
     _supervisor_json(queue, {})
@@ -1077,7 +1077,52 @@ def test_a_supervisor_json_mtime_no_datetime_can_hold_is_reported(
 
     facts = report.gather()
 
-    assert facts.snapshot_error == error
+    assert (facts.saved_at, facts.saved_at_error) == (None, error)
+    assert facts.snapshot_error is None
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
+
+
+def _fromtimestamp_error(timestamp: float) -> str:
+    """What this interpreter's ``fromtimestamp`` says about ``timestamp``.
+    At 2**63 Python 3.11.1 raises OSError (errno 75); 3.11.15 and 3.12 on
+    raise OverflowError."""
+    with pytest.raises((ValueError, OverflowError, OSError)) as raised:
+        datetime.fromtimestamp(timestamp, UTC)
+    return str(raised.value)
+
+
+def test_a_real_supervisor_json_mtime_past_time_t_is_reported_as_unknown(
+    far_future_mtime_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On tmpfs an mtime of 2**63 - 1 is stored and its float rounds up to
+    2**63, which fromtimestamp rejects. The summary says when the
+    supervisor last saved is unknown, and why."""
+    report = _report_module()
+    queue = far_future_mtime_dir / "queue"
+    (queue / "todo").mkdir(parents=True)
+    queue_runtime_dir(queue)
+    _supervisor_json(queue, {})
+    path = persist_mod.supervisor_state_path(queue)
+    os.utime(path, (2**63 - 1, 2**63 - 1))
+    monkeypatch.setenv("RS_QUEUE", str(queue))
+    monkeypatch.setenv("RS_NOW", _report_now().isoformat())
+    monkeypatch.setenv("RS_PID_STATE", "alive")
+
+    facts = report.gather()
+
+    error = _fromtimestamp_error(path.stat().st_mtime)
+    assert (facts.saved_at, facts.saved_at_error) == (None, error)
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
+    summary = report.plain_summary(facts)
+    assert (
+        "- **Supervisor:** its process is running, but when it last saved its state is unknown."
+        in summary
+    )
+    assert (
+        f"- The modification time of the supervisor's record ({path}) cannot be read ({error}), "
+        "so when it last saved its state is unknown. A running supervisor rewrites it at every "
+        "check; if this lasts, look at the file.\n"
+    ) in summary
 
 
 def test_supervisor_json_details_count_the_in_flight_records(

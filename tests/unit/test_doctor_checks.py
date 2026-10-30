@@ -67,6 +67,7 @@ from claude_task_runner.supervisor.persistence import (
 from claude_task_runner.supervisor.pidfile import acquire_global_lock
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 from ._fs_faults import unsearchable
 from ._skill_installs import make
 
@@ -493,6 +494,63 @@ def test_check_dispatch_pct_legacy_per_account_with_throttle_fails(
     result = check_dispatch_pct_legacy(s, queue_dir)
     assert result.status == CheckStatus.FAIL
     assert str(cfg_dir / "runner-account.toml") in result.remediation
+
+
+def test_check_dispatch_pct_legacy_passes_over_a_toml_that_does_not_load(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """tomllib raises a bare ValueError for an integer past the digit limit.
+    check_account_policies reports that file; this check passes over it."""
+    from claude_task_runner.doctor.checks import check_account_policies, check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "personal"
+    cfg_dir.mkdir()
+    path = cfg_dir / "runner-account.toml"
+    path.write_text(f"[concurrency]\nmax_concurrency = {PAST_DIGIT_LIMIT}\n", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="personal", config_dir=str(cfg_dir))])
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+    policies = check_account_policies(s)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 0 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
+    )
+    assert (policies.status, policies.remediation) == (
+        CheckStatus.FAIL,
+        f"personal: Invalid TOML in {path}: {digit_limit_error()}",
+    )
+
+
+def test_check_dispatch_pct_legacy_counts_only_the_tomls_it_read(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """Of two account files, one loads and one does not: the detail counts
+    the one it read and says it left the other out."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    good = tmp_path / "personal"
+    good.mkdir()
+    (good / "runner-account.toml").write_text("[concurrency]\nmax_concurrency = 2\n")
+    bad = tmp_path / "work"
+    bad.mkdir()
+    (bad / "runner-account.toml").write_text("[concurrency\n")
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(name="personal", config_dir=str(good)),
+            AccountSettings(name="work", config_dir=str(bad)),
+        ],
+    )
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 1 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
+    )
 
 
 def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
@@ -1034,6 +1092,23 @@ def test_check_state_yamls_invalid_file(settings: Settings, queue_dir: Path) -> 
     (state_dir / "bad.yaml").write_text("not yaml: ][", encoding="utf-8")
     result = check_state_yamls(settings, queue_dir)
     assert result.status == CheckStatus.FAIL
+
+
+def test_check_state_yamls_flags_a_pid_past_the_digit_limit(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """The check reports the file instead of dying on its ValueError."""
+    state_dir = queue_dir / ".claude_task_runner" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "huge.yaml").write_text(
+        f"schema_version: 2\ntask_id: huge\npid: {PAST_DIGIT_LIMIT}\n", encoding="utf-8"
+    )
+    result = check_state_yamls(settings, queue_dir)
+    assert (result.status, result.detail, result.remediation) == (
+        CheckStatus.FAIL,
+        "1 of 1 state YAMLs invalid",
+        f"huge.yaml: {state_dir / 'huge.yaml'}: invalid YAML: {digit_limit_error()}",
+    )
 
 
 # ---------------------------------------------------------------------------

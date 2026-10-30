@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from claude_task_runner.usage.whoami import (
     IdentitySnapshot,
     credentials_path,
@@ -13,6 +15,8 @@ from claude_task_runner.usage.whoami import (
     from_credentials_only,
     read_credentials,
 )
+
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 
 
 def _write_creds(
@@ -45,9 +49,16 @@ class TestCredentialsPath:
         assert credentials_path("~/.foo") == Path.home() / ".foo" / ".credentials.json"
 
 
+_LOGGER = "claude_task_runner.usage.whoami"
+
+
 class TestReadCredentials:
-    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
-        assert read_credentials(str(tmp_path)) == {}
+    def test_missing_file_returns_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            assert read_credentials(str(tmp_path)) == {}
+        assert caplog.records == []
 
     def test_full_payload(self, tmp_path: Path) -> None:
         _write_creds(
@@ -61,9 +72,56 @@ class TestReadCredentials:
         assert out["rate_limit_tier"] == "default_claude_max_5x"
         assert out["scopes"] == ("user:profile", "user:inference")
 
-    def test_invalid_json_returns_empty(self, tmp_path: Path) -> None:
-        (tmp_path / ".credentials.json").write_text("{not json")
-        assert read_credentials(str(tmp_path)) == {}
+    def test_invalid_json_returns_empty_with_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / ".credentials.json"
+        path.write_text("{not json")
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            assert read_credentials(str(tmp_path)) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"could not read {path}: Expecting property name enclosed in double quotes: "
+            "line 1 column 2 (char 1); reporting no credentials"
+        ]
+
+    @pytest.mark.parametrize(
+        ("content", "error"),
+        [
+            pytest.param(
+                f'{{"claudeAiOauth": {{"n": {PAST_DIGIT_LIMIT}}}}}'.encode(),
+                digit_limit_error(),
+                id="int-past-digit-limit",
+            ),
+            pytest.param(
+                b"\xff{}",
+                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+                id="not-utf8",
+            ),
+        ],
+    )
+    def test_json_that_raises_a_bare_value_error_returns_empty(
+        self, tmp_path: Path, content: bytes, error: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError."""
+        path = tmp_path / ".credentials.json"
+        path.write_bytes(content)
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            assert read_credentials(str(tmp_path)) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"could not read {path}: {error}; reporting no credentials"
+        ]
+
+    @pytest.mark.parametrize("content", ["[]", "null", '"text"'])
+    def test_json_that_is_not_an_object_returns_empty(
+        self, tmp_path: Path, content: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / ".credentials.json"
+        path.write_text(content)
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            assert read_credentials(str(tmp_path)) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"{path} is not a JSON object; reporting no credentials"
+        ]
 
     def test_missing_oauth_section_returns_empty(self, tmp_path: Path) -> None:
         (tmp_path / ".credentials.json").write_text('{"otherKey": {}}')

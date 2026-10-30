@@ -39,7 +39,6 @@ machine. The orchestrator returns the updated snapshot (with refreshed
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import threading
 from collections import Counter
@@ -52,6 +51,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    QueueIOError,
+    QueueSchemaError,
     iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
@@ -65,6 +66,7 @@ from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import effort_levels as effort_levels_mod
 from claude_task_runner.runner import readiness as readiness_mod
+from claude_task_runner.runner.block_list import blocked_task_ids
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
@@ -1005,56 +1007,6 @@ def _clear_session_for_fresh_dispatch(queue_dir: Path, task_id: str) -> None:
         pass
 
 
-def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[str]:
-    """Return task ids an operator has flagged ``block_dispatch: true`` (ADR-0029).
-
-    ``block_file`` is the queue-relative path from
-    ``[dispatch].dispatch_block_file``; ``None`` / empty means the
-    feature is off, so this returns an empty set. The file is JSONL:
-    each line is parsed independently and contributes a task id only
-    when it is a JSON object with ``block_dispatch is True`` and a
-    non-empty string ``task``. Every other line — an index row, a
-    ``target_path`` re-acquisition row, a blank line, or malformed
-    JSON — is skipped, so a mixed-content block-list (the
-    ``needs_acquisition.jsonl`` convention carries all three kinds) is
-    read without acting on rows this selector shouldn't.
-
-    Fail-safe by construction: an unreadable file or an unparseable
-    line yields NO blocked id, so the affected task simply dispatches
-    and the pre-dispatch hook re-checks the block. A block-list problem
-    therefore *under*-blocks (a wasted defer at worst) rather than
-    *over*-blocking (stranding a runnable task) — the safe direction.
-    """
-    if not block_file:
-        return set()
-    path = queue_dir / block_file
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return set()
-    except OSError as exc:
-        logger.debug("dispatch block-list %s unreadable (%s); treating as empty", path, exc)
-        return set()
-
-    blocked: set[str] = set()
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except ValueError:
-            # A non-JSON / partially-written line is not a block entry;
-            # skip it (debug, not warning — the block file is expected
-            # to carry rows this reader deliberately ignores).
-            continue
-        if isinstance(entry, dict) and entry.get("block_dispatch") is True:
-            tid = entry.get("task")
-            if isinstance(tid, str) and tid:
-                blocked.add(tid)
-    return blocked
-
-
 def _is_parked_with(state: TaskState | None, reason: str) -> bool:
     """True iff ``state`` is already parked as ``deferred`` with exactly ``reason``."""
     return state is not None and state.status == "deferred" and state.deferred_reason == reason
@@ -1426,7 +1378,7 @@ def _eligible_candidates(
     # Operator-maintained dispatch block-list (ADR-0029, Part 2): task
     # ids flagged `block_dispatch: true`. Read once per call. Off (empty)
     # unless the queue set `[dispatch].dispatch_block_file`.
-    blocked_ids = _dispatch_blocked_task_ids(queue_dir, block_file)
+    blocked_ids = blocked_task_ids(queue_dir, block_file)
     if blocked_ids:
         logger.debug("dispatch block-list active: %d task(s) parked", len(blocked_ids))
 
@@ -1782,7 +1734,13 @@ class SelectionPreview:
     """The tasks it would admit, in dispatch order."""
     eligible_statuses: dict[str, str]
     """Each admitted task's state status, ``new`` when it has no state file
-    yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    yet: an ``awaiting_sidecar`` task here has had every question answered.
+    A task in ``unread_states`` has none."""
+    unread_states: dict[str, str]
+    """Admitted tasks whose state no longer loads when the preview reads
+    its status (a hand edit since the selector read it, say), each with the
+    error. A state removed since makes the task ``new`` instead. The next
+    tick's selector skips a state that does not load."""
     routes: dict[str, str | None]
     """For each admitted task, the account a tick would dispatch it through
     now (:func:`_route`, session affinity and its TTL included), or ``None``
@@ -1866,12 +1824,18 @@ def preview_selection(
     accounts_by_name = {a.name: a for a in resolution.accounts}
     broken = {b.name: b.error for b in resolution.broken}
     statuses: dict[str, str] = {}
+    unread: dict[str, str] = {}
     routes: dict[str, str | None] = {}
     affinity_held: list[str] = []
     for task in eligible:
         sp = state_file_path(queue_dir, task.id)
-        # The selector loaded this state a moment ago, so it parses.
-        statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        # The selector parsed this state a moment ago; one rewritten since
+        # (a hand edit) is reported with its error rather than failing the
+        # whole preview.
+        try:
+            statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        except (QueueIOError, QueueSchemaError) as exc:
+            unread[task.id] = str(exc)
         choice = _route(
             task,
             queue_dir=queue_dir,
@@ -1898,6 +1862,7 @@ def preview_selection(
     return SelectionPreview(
         eligible=eligible,
         eligible_statuses=statuses,
+        unread_states=unread,
         routes=routes,
         affinity_held=affinity_held,
         skips=skips,
@@ -2032,6 +1997,7 @@ def _dispatch_one_safely(
                 getattr(getattr(settings, "supervisor", None), "adopt_workers", False)
             ),
             spawn_gate=spawn_gate,
+            on_park=on_park,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

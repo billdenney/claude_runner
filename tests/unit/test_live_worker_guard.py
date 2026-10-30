@@ -304,6 +304,30 @@ def test_backstop_dispatches_when_no_worker_runs(queue_dir: Path, live_worker: P
     dispatch.assert_called_once()
 
 
+def test_dispatch_gets_the_park_callback(queue_dir: Path) -> None:
+    """dispatch() parks a worker it cannot stop after its loop failed, and
+    reports that park through the same callback as the backstop's."""
+
+    def _on_park(_state: TaskState, _why: str) -> None:
+        raise AssertionError("not called here")
+
+    with patch(
+        "claude_task_runner.runner.orchestrator.dispatcher_mod.dispatch", return_value=None
+    ) as dispatch:
+        orch_mod._dispatch_one_safely(
+            Task(id=_TASK, title="t", prompt="p"),
+            queue_dir,
+            _settings(),
+            FakeClock(_NOW),
+            "claude",
+            "",
+            None,
+            "default",
+            on_park=_on_park,
+        )
+    assert dispatch.call_args.kwargs["on_park"] is _on_park
+
+
 # ---------------------------------------------------------------------------
 # Producers: startup reconciliation and the corrupt-state quarantine
 # ---------------------------------------------------------------------------

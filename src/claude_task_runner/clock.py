@@ -3,9 +3,10 @@
 Direct calls to `datetime.now()`, `datetime.utcnow()`, or `time.monotonic()`
 outside of this module are flagged in code review. See ADR-0009.
 
-A POSIX timestamp becomes a `datetime` only through :func:`utc_from_timestamp`;
-`tests/unit/test_fromtimestamp_gate.py` fails on any other `fromtimestamp`
-call in the package.
+A POSIX timestamp becomes a `datetime` only through :func:`utc_from_timestamp`.
+`tests/unit/test_fromtimestamp_gate.py` fails on any other `fromtimestamp` in
+the package except its exact allowlist: the runner-status report, a script
+that runs under the system python3 and cannot import this module.
 """
 
 from __future__ import annotations

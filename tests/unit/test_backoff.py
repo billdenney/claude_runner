@@ -27,6 +27,8 @@ from claude_task_runner.cron.backoff import (
 )
 from claude_task_runner.queue.schema import CURRENT_SCHEMA_VERSION
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 
 def _settings(
     *,
@@ -313,6 +315,31 @@ class TestPersistence:
         path.write_text("{not json")
         with pytest.raises(WatchdogStateError, match="invalid JSON"):
             load_state(path)
+
+    @pytest.mark.parametrize(
+        ("content", "error"),
+        [
+            pytest.param(
+                f'{{"schema_version": {PAST_DIGIT_LIMIT}}}'.encode(),
+                digit_limit_error(),
+                id="int-past-digit-limit",
+            ),
+            pytest.param(
+                b"\xff{}",
+                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+                id="not-utf8",
+            ),
+        ],
+    )
+    def test_a_bare_value_error_from_json_is_invalid_json(
+        self, tmp_path: Path, content: bytes, error: str
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError."""
+        path = tmp_path / WATCHDOG_STATE_FILENAME
+        path.write_bytes(content)
+        with pytest.raises(WatchdogStateError) as raised:
+            load_state(path)
+        assert str(raised.value) == f"{path}: invalid JSON: {error}"
 
     def test_unknown_schema_version_raises(self, tmp_path: Path) -> None:
         path = tmp_path / WATCHDOG_STATE_FILENAME

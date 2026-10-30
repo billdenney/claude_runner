@@ -161,7 +161,9 @@ def load_state(path: Path) -> WatchdogState:
             payload = json.load(fh)
     except OSError as exc:
         raise WatchdogStateError(f"failed to read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # JSONDecodeError, and the bare ValueErrors json raises for bytes that
+        # are not UTF-8 and for an integer past the interpreter's digit limit.
         raise WatchdogStateError(f"{path}: invalid JSON: {exc}") from exc
 
     if not isinstance(payload, dict):
