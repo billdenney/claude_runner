@@ -37,6 +37,7 @@ from claude_task_runner.config.schema import (
     ResolvedAccount,
     Settings,
 )
+from claude_task_runner.once import first_time
 from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
 
 logger = logging.getLogger(__name__)
@@ -283,12 +284,6 @@ def _reject_retired_keys(payload: dict[str, Any], source: str) -> None:
         )
 
 
-_warned_retired_effort_sources: set[str] = set()
-"""Queue TOMLs already warned about for a retired effort spelling. The
-supervisor re-reads its TOML on every SIGHUP, so each file is warned about
-once per process."""
-
-
 def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
     """Rename retired spellings in ``payload``'s ``[effort_levels]`` in place.
 
@@ -316,8 +311,7 @@ def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
         ]
         table[model] = list(dict.fromkeys(renamed))
         renamed_models.append(model)
-    if renamed_models and source not in _warned_retired_effort_sources:
-        _warned_retired_effort_sources.add(source)
+    if renamed_models and first_time(("retired_effort_levels", source)):
         spellings = ", ".join(f"{old!r} as {new!r}" for old, new in RETIRED_EFFORT_LEVELS.items())
         logger.warning(
             "%s: reading [effort_levels] %s, the claude CLI's name, for %s; "
@@ -378,9 +372,7 @@ def _load_settings(per_queue_toml: Path | None) -> Settings:
 
     if per_queue_toml is not None:
         try:
-            override = tomllib.loads(_read_regular_file(per_queue_toml).decode("utf-8"))
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-            raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
+            data = _read_regular_file(per_queue_toml)
         except OSError as exc:
             raise _queue_toml_read_error(per_queue_toml, exc) from exc
         except _NotARegularFile as exc:
@@ -390,6 +382,12 @@ def _load_settings(per_queue_toml: Path | None) -> Settings:
         except ValueError as exc:
             # A NUL byte in the path: no file can have that name.
             raise ConfigError(f"Cannot read {per_queue_toml}: {exc}") from exc
+        try:
+            override = tomllib.loads(data.decode("utf-8"))
+        except ValueError as exc:
+            # TOMLDecodeError, UnicodeDecodeError, and the bare ValueError
+            # tomllib raises for an integer past the interpreter's digit limit.
+            raise ConfigError(f"Invalid TOML in {per_queue_toml}: {exc}") from exc
         _reject_legacy_throttle(override, str(per_queue_toml))
         _reject_retired_keys(override, str(per_queue_toml))
         _rename_retired_effort_levels(override, str(per_queue_toml))
@@ -483,7 +481,9 @@ def load_account_policy(config_dir: str) -> AccountPolicy:
         )
     try:
         payload = tomllib.loads(data.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
+        # TOMLDecodeError, UnicodeDecodeError, and the bare ValueError
+        # tomllib raises for an integer past the interpreter's digit limit.
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
     except RecursionError as exc:
         raise ConfigError(f"{path} is nested too deeply to load") from exc

@@ -206,6 +206,9 @@ class Facts:
     psline: str
     started_at: datetime | None
     saved_at: datetime | None
+    saved_at_error: str | None
+    """Why ``supervisor.json``'s modification time could not be read, when
+    the file exists but ``saved_at`` is ``None``."""
     snapshot: dict[str, Any] | None
     snapshot_error: str | None
     config_unknown: str
@@ -364,23 +367,29 @@ def gather() -> Facts:
     snapshot: dict[str, Any] | None = None
     snapshot_error: str | None = None
     saved_at: datetime | None = None
+    saved_at_error: str | None = None
     if sup_json.exists():
         try:
-            saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
             with open(sup_json, encoding="utf-8") as fh:
                 loaded = json.load(fh)
-        except (OSError, ValueError, OverflowError) as exc:
-            # fromtimestamp raises ValueError for a year outside 1..9999,
-            # OverflowError past the platform's time_t, and OSError when
-            # gmtime rejects a value that fits time_t. This script runs
-            # under the system python3 and cannot import the package's
-            # clock.utc_from_timestamp, which turns all three into one error.
+        except (OSError, ValueError) as exc:
             snapshot_error = str(exc)
         else:
             if isinstance(loaded, dict):
                 snapshot = loaded
             else:
                 snapshot_error = f"it holds a JSON {type(loaded).__name__}, not an object"
+        # The save time is read on its own, so a modification time no date
+        # can hold leaves the record itself readable.
+        try:
+            saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
+        except (OSError, ValueError, OverflowError) as exc:
+            # fromtimestamp raises ValueError for a year outside 1..9999,
+            # OverflowError past the platform's time_t, and OSError when
+            # gmtime rejects a value that fits time_t. This script runs
+            # under the system python3 and cannot import the package's
+            # clock.utc_from_timestamp, which turns all three into one error.
+            saved_at_error = str(exc)
 
     log_path = runtime / "supervisor.log"
     candidates = [
@@ -404,6 +413,7 @@ def gather() -> Facts:
         psline=_env("RS_PSLINE"),
         started_at=started_at,
         saved_at=saved_at,
+        saved_at_error=saved_at_error,
         snapshot=snapshot,
         snapshot_error=snapshot_error,
         config_unknown=_env("RS_CONFIG_UNKNOWN"),
@@ -631,6 +641,14 @@ def _supervisor_line(facts: Facts, notes: Notes) -> tuple[str, bool]:
             f"{facts.queue}`; a watchdog, if installed, restarts it within a few minutes."
         )
         return "not running.", False
+    if facts.saved_at is None and facts.saved_at_error is not None:
+        notes.attention.append(
+            f"The modification time of the supervisor's record "
+            f"({facts.runtime / 'supervisor.json'}) cannot be read ({facts.saved_at_error}), "
+            "so when it last saved its state is unknown. A running supervisor rewrites it at "
+            "every check; if this lasts, look at the file."
+        )
+        return "its process is running, but when it last saved its state is unknown.", False
     if facts.saved_at is None:
         notes.attention.append(
             "The supervisor has not saved its state yet; it normally does within a minute of "

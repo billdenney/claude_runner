@@ -11,6 +11,8 @@ import pytest
 
 from claude_task_runner.claude_init import ensure_initialized
 
+from ._digit_limit import PAST_DIGIT_LIMIT
+
 
 def _write_claude_json(config_dir: Path, payload: dict[str, object]) -> Path:
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -124,6 +126,26 @@ class TestEnsureInitializedNoOps:
 
         assert changed is False
         assert (cfg / ".claude.json").read_text() == "{not-json"
+
+    @pytest.mark.parametrize(
+        "content",
+        [f'{{"n": {PAST_DIGIT_LIMIT}}}'.encode(), b"\xff{}"],
+        ids=["int-past-digit-limit", "not-utf8"],
+    )
+    def test_json_that_raises_a_bare_value_error_is_noop(
+        self, tmp_path: Path, content: bytes
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError."""
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / ".claude.json").write_bytes(content)
+        trust = tmp_path / "workspace"
+        trust.mkdir()
+
+        changed = ensure_initialized(cfg, trust)
+
+        assert changed is False
+        assert (cfg / ".claude.json").read_bytes() == content
 
     def test_non_dict_root_is_noop(self, tmp_path: Path) -> None:
         cfg = tmp_path / "cfg"

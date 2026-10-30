@@ -250,7 +250,9 @@ def _read_oauth_token(config_dir: str) -> str:
             f"OAuth credentials file not found: {creds_path}. "
             f"Run `CLAUDE_CONFIG_DIR={creds_path.parent} claude /login` first."
         ) from None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: JSONDecodeError, bytes that are not UTF-8, and the bare
+        # one json raises for an integer past the interpreter's digit limit.
         raise CredentialsNotFound(f"could not read {creds_path}: {exc}") from exc
 
     for path in _CREDENTIAL_KEY_PATHS:

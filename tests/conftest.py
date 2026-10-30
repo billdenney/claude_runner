@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import signal
+import sys
+import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,6 +27,12 @@ pytest_plugins = ["pytester", "signal_gate"]
 
 # The signals supervisor.daemon.start_daemon installs handlers for.
 _DAEMON_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
+
+# tests/unit/_digit_limit.py builds an integer one digit past the limit on
+# int() of a string. PYTHONINTMAXSTRDIGITS=0 turns that limit off; the tests
+# then run with the default one.
+if sys.get_int_max_str_digits() == 0:
+    sys.set_int_max_str_digits(sys.int_info.default_max_str_digits)
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +77,48 @@ def _worker_probe_off_host_proc(monkeypatch: pytest.MonkeyPatch) -> None:
     tree, or back to ``/proc`` for processes they start.
     """
     monkeypatch.setattr(dispatcher_mod, "_PROC_ROOT", _NO_PROC)
+
+
+@pytest.fixture
+def far_future_mtime_dir() -> Iterator[Path]:
+    """A fresh directory whose filesystem stores an mtime past year 9999 as given.
+
+    ext4 clamps such an mtime to year 2446, so the directory is on tmpfs
+    (``/dev/shm``), which keeps 64-bit seconds. It is removed at teardown,
+    and the test is skipped where no writable tmpfs keeps the mtime.
+    """
+    shm = Path("/dev/shm")
+    if not (shm.is_dir() and os.access(shm, os.W_OK)):
+        pytest.skip("no writable /dev/shm")
+    root = Path(tempfile.mkdtemp(dir=shm, prefix="ctr-mtime-"))
+    try:
+        probe = root / "probe"
+        probe.write_text("x")
+        os.utime(probe, (253402300800, 253402300800))
+        if probe.stat().st_mtime != 253402300800:
+            pytest.skip("this /dev/shm does not keep an mtime past year 9999")
+        probe.unlink()
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def stub_mtime(monkeypatch: pytest.MonkeyPatch) -> Callable[[Path, float], None]:
+    """Arm ``os.stat`` to report ``mtime`` for one path, for an mtime no
+    filesystem stores (past ``time_t``, say) or where tmpfs is missing.
+    Every other path is stat'ed as usual."""
+    real_stat = os.stat
+
+    def _arm(path: Path, mtime: float) -> None:
+        def _stat(target: Any, *args: Any, **kwargs: Any) -> Any:
+            if os.fspath(target) == os.fspath(path):
+                return SimpleNamespace(st_mtime=mtime)
+            return real_stat(target, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", _stat)
+
+    return _arm
 
 
 @pytest.fixture

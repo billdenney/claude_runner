@@ -29,6 +29,8 @@ from claude_task_runner.queue.store import (
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 
 @pytest.fixture
 def queue_dir(tmp_path: Path) -> Path:
@@ -138,6 +140,20 @@ class TestRequestIO:
         bad.write_text("not json {")
         reqs = fd_mod.list_requests(queue_dir)
         assert [r.task_id for r in reqs] == ["good"]
+
+    def test_list_requests_skips_one_with_an_integer_past_the_digit_limit(
+        self, queue_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """json raises a bare ValueError for it, not JSONDecodeError."""
+        fd_mod.write_request(queue_dir, "good")
+        bad = fd_mod.force_dispatch_dir(queue_dir) / "bad.req"
+        bad.write_text(f'{{"task_id": "bad", "n": {PAST_DIGIT_LIMIT}}}', encoding="utf-8")
+        with caplog.at_level("WARNING", logger="claude_task_runner.runner.force_dispatch"):
+            reqs = fd_mod.list_requests(queue_dir)
+        assert [r.task_id for r in reqs] == ["good"]
+        assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+            f"force-dispatch: cannot parse request {bad}: {digit_limit_error()}"
+        ]
 
     def test_consume_request_is_idempotent(self, queue_dir: Path) -> None:
         fd_mod.write_request(queue_dir, "t1")

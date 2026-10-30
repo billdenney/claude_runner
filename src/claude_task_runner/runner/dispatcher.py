@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import IO
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
+from claude_task_runner.clock import Clock, utc_from_timestamp
 from claude_task_runner.config.linux_user import current_username as _resolve_self_user
 from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
@@ -68,6 +68,7 @@ from claude_task_runner.config.schema import (
     HookSettings,
     TaskCapsSettings,
 )
+from claude_task_runner.file_mtime import file_mtime_utc
 from claude_task_runner.queue.schema import (
     RunRecord,
     Task,
@@ -536,11 +537,12 @@ def _pid_alive(pid: int) -> bool:
     treated as alive so the adopt monitor doesn't finalize a worker
     prematurely on a transient probe failure (ADR-0025).
 
-    A pid no worker can have, 1 or less or this process's own, is refused
-    by :mod:`claude_task_runner.process_signals` and reported dead: probing
+    A pid no worker can have, 1 or less, this process's own, or above
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, is refused by
+    :mod:`claude_task_runner.process_signals` and reported dead: probing
     pid 1 fails with EPERM, which would otherwise read as a live worker
     and lead the reapers to signal its process group, every process the
-    user owns.
+    user owns, and ``os.kill`` raises ``OverflowError`` above ``PID_T_MAX``.
     """
     try:
         process_signals.kill(pid, 0)
@@ -2600,9 +2602,8 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
     can't be stat'ed, and for an mtime no datetime can hold (past year
     9999, which tmpfs stores as given), as for any mtime after ``now``.
     """
-    try:
-        mtime = utc_from_timestamp(log_path.stat().st_mtime)
-    except (OSError, TimestampOutOfRange):
+    mtime = file_mtime_utc(log_path, consequence="dating the run that wrote it at now")
+    if mtime is None:
         return now
     return max(started_at, min(mtime, now))
 

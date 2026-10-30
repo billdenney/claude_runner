@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    QueueIOError,
+    QueueSchemaError,
     iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
@@ -1029,10 +1031,13 @@ def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[s
         return set()
     path = queue_dir / block_file
     try:
-        text = path.read_text(encoding="utf-8")
+        # A line that is not UTF-8 decodes with replacement characters and is
+        # skipped below as malformed; the other lines still count.
+        text = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return set()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: a NUL byte in the configured path, which no file has.
         logger.debug("dispatch block-list %s unreadable (%s); treating as empty", path, exc)
         return set()
 
@@ -1782,7 +1787,13 @@ class SelectionPreview:
     """The tasks it would admit, in dispatch order."""
     eligible_statuses: dict[str, str]
     """Each admitted task's state status, ``new`` when it has no state file
-    yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    yet: an ``awaiting_sidecar`` task here has had every question answered.
+    A task in ``unread_states`` has none."""
+    unread_states: dict[str, str]
+    """Admitted tasks whose state no longer loads when the preview reads
+    its status (a hand edit since the selector read it, say), each with the
+    error. A state removed since makes the task ``new`` instead. The next
+    tick's selector skips a state that does not load."""
     routes: dict[str, str | None]
     """For each admitted task, the account a tick would dispatch it through
     now (:func:`_route`, session affinity and its TTL included), or ``None``
@@ -1866,12 +1877,18 @@ def preview_selection(
     accounts_by_name = {a.name: a for a in resolution.accounts}
     broken = {b.name: b.error for b in resolution.broken}
     statuses: dict[str, str] = {}
+    unread: dict[str, str] = {}
     routes: dict[str, str | None] = {}
     affinity_held: list[str] = []
     for task in eligible:
         sp = state_file_path(queue_dir, task.id)
-        # The selector loaded this state a moment ago, so it parses.
-        statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        # The selector parsed this state a moment ago; one rewritten since
+        # (a hand edit) is reported with its error rather than failing the
+        # whole preview.
+        try:
+            statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        except (QueueIOError, QueueSchemaError) as exc:
+            unread[task.id] = str(exc)
         choice = _route(
             task,
             queue_dir=queue_dir,
@@ -1898,6 +1915,7 @@ def preview_selection(
     return SelectionPreview(
         eligible=eligible,
         eligible_statuses=statuses,
+        unread_states=unread,
         routes=routes,
         affinity_held=affinity_held,
         skips=skips,

@@ -16,9 +16,9 @@ chooses between three outcomes:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -508,28 +508,22 @@ def test_log_written_at_is_the_log_mtime(tmp_path: Path) -> None:
 
 
 def test_a_log_mtime_no_datetime_can_hold_is_no_sign_of_life(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    stub_mtime: Callable[[Path, float], None],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """tmpfs stores an mtime past year 9999 as given, and turning it into a
-    datetime raised out of the startup reaper. It counts as no sign of
-    life, with a WARNING."""
+    """tmpfs stores an mtime past year 9999 as given. No datetime can hold
+    it, so it counts as no sign of life. The reaper reads the log on every
+    pass, and only the first read warns."""
     log = tmp_path / "attempt-1.stream.jsonl"
-    log.write_text("{}\n")
-    real_stat = os.stat
-
-    def _stat(path: object, *args: object, **kwargs: object) -> object:
-        if os.fspath(path) == str(log):  # type: ignore[arg-type]
-            return SimpleNamespace(st_mtime=1e12)
-        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(rs.os, "stat", _stat)
+    stub_mtime(log, 1e12)
     state = TaskState(task_id="t-log", status="running", log_path=str(log))
 
-    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
-        assert rs._log_written_at(state) is None
+    with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
+        assert [rs._log_written_at(state), rs._log_written_at(state)] == [None, None]
 
     assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
-        f"silent-orphan reaper: t-log: worker log {log} has an mtime out of range "
-        "(timestamp 1000000000000.0 is out of range: year 33658 is out of range); "
-        "not counting it as a sign of life"
+        f"{log} has an mtime no datetime can hold (timestamp 1000000000000.0 is out of range: "
+        "year 33658 is out of range); the silent-orphan reaper does not count it as a sign "
+        "of life for t-log"
     ]

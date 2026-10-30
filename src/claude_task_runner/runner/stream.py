@@ -277,7 +277,9 @@ def parse_line(line: str | bytes) -> dict[str, Any] | None:
         return None
     try:
         obj = json.loads(line)
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError, or the bare ValueError json raises for an integer
+        # past the interpreter's digit limit.
         return None
     return obj if isinstance(obj, dict) else None
 

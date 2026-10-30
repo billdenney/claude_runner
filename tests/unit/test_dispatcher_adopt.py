@@ -35,7 +35,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -422,10 +421,10 @@ def _set_mtime(path: Path, when: datetime) -> None:
 
 
 def test_finalize_exited_success_result_completes(queue_dir: Path) -> None:
-    """The 2026-09-26 restart incident: the worker finished in the restart
-    gap and its log ends in a success result. It is recorded as completed
-    with one RunRecord, the session id from the log and the account passed
-    in. ``finished_at`` is the log's last write, not the restart."""
+    """The worker finished in the restart gap and its log ends in a success
+    result. It is recorded as completed with one RunRecord, the session id
+    from the log and the account passed in. ``finished_at`` is the log's
+    last write, not the restart."""
     task = Task(id="020-exited-ok", title="t", prompt="p", working_dir=None)
     log = _attempt_log(queue_dir, task.id)
     _write_log(log, [_init_line("sess-exited"), _assistant_line(), _result_line("end_turn")])
@@ -717,18 +716,34 @@ def test_log_finished_at_clamps_to_the_attempt(
     assert got == expected
 
 
-@pytest.mark.parametrize("timestamp", [253402300800.0, 1e20], ids=["year-10000", "past-time_t"])
-def test_log_finished_at_dates_an_out_of_range_mtime_now(timestamp: float) -> None:
+@pytest.mark.parametrize(
+    ("timestamp", "reason"),
+    [
+        pytest.param(253402300800.0, "year 10000 is out of range", id="year-10000"),
+        pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
+    ],
+)
+def test_log_finished_at_dates_an_out_of_range_mtime_now(
+    tmp_path: Path,
+    stub_mtime: Callable[[Path, float], None],
+    caplog: pytest.LogCaptureFixture,
+    timestamp: float,
+    reason: str,
+) -> None:
     """tmpfs stores an mtime past year 9999 as given. No datetime can hold
-    it, so the finish is dated now, as any mtime after now is."""
+    it, so the finish is dated now, as any mtime after now is, with a
+    WARNING."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    stub_mtime(log, timestamp)
 
-    class _Log:
-        def stat(self) -> SimpleNamespace:
-            return SimpleNamespace(st_mtime=timestamp)
-
-    got = dispatcher_mod._log_finished_at(_Log(), started_at=_STARTED, now=_RESTART)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
+        got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
 
     assert got == _RESTART
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"{log} has an mtime no datetime can hold (timestamp {timestamp!r} is out of range: "
+        f"{reason}); dating the run that wrote it at now"
+    ]
 
 
 # ---------------------------------------------------------------------------

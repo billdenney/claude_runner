@@ -69,11 +69,6 @@ def global_lock_path() -> Path:
     return global_lock_dir() / GLOBAL_LOCK_FILENAME
 
 
-_PID_T_MAX = 2**31 - 1
-"""The largest PID ``os.kill`` accepts: ``pid_t`` is a signed 32-bit int.
-It raises ``OverflowError`` for anything larger."""
-
-
 class PidFileUnreadable(Exception):
     """A PID file exists but does not hold a PID."""
 
@@ -108,7 +103,7 @@ def read_pid_file(path: Path) -> int | None:
     # more than 4300 digits with a ValueError.
     if digits.isdigit() and len(digits) <= 10:
         pid = int(digits)
-        if 0 < pid <= _PID_T_MAX:
+        if 0 < pid <= process_signals.PID_T_MAX:
             return pid
     shown = digits[:40].decode("ascii", errors="backslashreplace")
     raise PidFileUnreadable(f"PID file {path} holds {shown!r}, not a PID")
@@ -129,11 +124,12 @@ def read_existing_pid(path: Path) -> int | None:
 def is_pid_alive(pid: int) -> bool:
     """Cheap liveness check via a signal-0 probe.
 
-    A pid no supervisor can have, 1 or less or the caller's own, is
-    refused by :mod:`claude_task_runner.process_signals`, logged at ERROR
-    and reported dead. Probing pid 1 fails with EPERM, so a PID file
-    holding ``1`` used to read as a live supervisor, and ``supervisor
-    stop`` would then signal init.
+    A pid no supervisor can have, 1 or less, the caller's own, or above
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, is refused by
+    :mod:`claude_task_runner.process_signals`, logged at ERROR and reported
+    dead. Probing pid 1 fails with EPERM, which would read a PID file
+    holding ``1`` as a live supervisor that ``supervisor stop`` then
+    signals.
     """
     try:
         process_signals.kill(pid, 0)
