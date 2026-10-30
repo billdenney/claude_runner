@@ -265,8 +265,15 @@ def build_argv(
 
 
 def _read_lines(stream: Iterable[str]) -> Iterable[str]:
-    """Trivial pass-through; isolated for monkey-patching in tests."""
-    yield from stream
+    """Trivial pass-through; isolated for monkey-patching in tests.
+
+    A ``for`` loop, not ``yield from``: closing this generator, as a raise
+    in the dispatch loop's body does, would otherwise close ``stream`` too,
+    which is the worker's stdout, and the drain after the loop would lose
+    the lines already read ahead into its buffer.
+    """
+    for line in stream:  # noqa: UP028 - yield from would close stream with this generator
+        yield line
 
 
 # Poll cadence for the file tailer's no-data wait. Small enough that a
@@ -1460,7 +1467,9 @@ def _read_rest(stream: IO[str], into: list[str]) -> None:
             for line in stream:
                 into.append(line)
     except (OSError, ValueError) as exc:
-        logger.warning("could not read the rest of a stopped worker's pipe: %s", exc)
+        # ValueError: the stream was already closed, so whatever it had read
+        # ahead, a terminal result perhaps, is lost.
+        logger.error("could not read the rest of a stopped worker's pipe: %s", exc)
 
 
 def _drain_pipes(

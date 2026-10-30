@@ -579,6 +579,46 @@ def test_a_terminal_result_read_ahead_of_the_loop_error_stands(
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_terminal_result_read_ahead_of_a_raise_in_the_loop_body_stands(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The loop's own body raises (here the cap check, on the second event),
+    which closes the chain of generators feeding it. That must not close
+    the worker's stdout: the result read ahead with that event is still
+    there for the drain, and the run completes."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-body")
+    monkeypatch.setenv("SHIM_SINGLE_WRITE", "1")
+    real_evaluate = dispatcher_mod.caps_mod.evaluate_caps
+    calls: list[int] = []
+
+    def _raises_on_the_second_event(**kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return real_evaluate(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dispatcher_mod.caps_mod, "evaluate_caps", _raises_on_the_second_event)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error, reloaded.session_id) == (
+        "completed",
+        "end_turn",
+        None,
+        "sess-body",
+    )
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
 def test_a_line_that_is_not_utf8_is_a_malformed_line(
     queue_dir: Path,
     task: Task,
