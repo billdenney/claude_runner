@@ -301,8 +301,13 @@ N hours old.
    an API call. Kill it: `kill <pid>`.
 3. The runner will mark the task `failed` (environmental); on next tick
    the supervisor will dispatch via `--resume <session_id>` automatically.
-4. If hangs are common, reduce `task_caps.heartbeat_silence_kill_s` from
-   default 0 (off) to e.g. 600 to auto-kill silent tasks.
+4. If hangs are common, set `task_caps.heartbeat_silence_kill_s` (default
+   0, off) to e.g. 600. The dispatcher then stops a worker that writes no
+   stream output for that long, checking every 10 s (ADR-0037). A long
+   tool call is not silence: claude writes a `tool_progress` line every
+   30 s while one runs. Whatever this is set to, a worker that writes
+   nothing at all is stopped at its duration cap
+   (`task_caps.max_duration_s_per_task`, 4 h by default).
 
 ## After a restart, a task is `failed` or `possibly_hung` while its worker still runs
 
