@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -464,6 +465,44 @@ def test_a_loop_that_raises_mid_run_stops_the_worker_and_records_a_failure(
     assert run.killed_by_cap is None
     assert reloaded.session_id == "sess-loop"
     assert (reloaded.pid, reloaded.log_path) == (None, None)
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_loop_that_raises_before_the_first_line_records_an_empty_failure(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+    adopt: bool,
+) -> None:
+    """The loop raises before it reads a line, and the worker has written
+    none. The worker is stopped, and the run fails with dispatch_loop_error
+    and nothing a stream event would have given: no session id, no usage."""
+    monkeypatch.setenv("SHIM_SLEEP_BEFORE_S", "30")
+    raise_in_dispatch_loop(0)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.returncode == -signal.SIGTERM
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: boom",
+    )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.usage.total_tokens, run.skipped_stream_lines) == (
+        "dispatch_loop_error",
+        0,
+        0,
+    )
+    assert reloaded.session_id is None
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])

@@ -1114,6 +1114,31 @@ def test_adopt_loop_raising_mid_run_stops_the_worker_and_records_a_failure(
     assert (reloaded.pid, reloaded.log_path) == (None, None)
 
 
+def test_adopt_loop_raising_before_the_first_line_stops_the_worker(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """The loop raises before it reads a line. The worker is stopped and the
+    run is recorded from its log, re-read after the stop: failed with
+    dispatch_loop_error, with the session id the log holds."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+    raise_in_dispatch_loop(0)
+
+    outcome = _adopt(queue_dir, task, state)
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: boom",
+    )
+    assert reloaded.session_id == "sess-adopt"
+
+
 def test_adopt_terminal_result_written_before_the_loop_raised_stands(
     queue_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

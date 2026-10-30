@@ -15,6 +15,7 @@ Env vars:
 * ``SHIM_IS_ERROR`` (default ``false``)
 * ``SHIM_COST_USD`` (default ``0.05``)
 * ``SHIM_DURATION_MS`` (default ``500``)
+* ``SHIM_SLEEP_BEFORE_S`` (default ``0``) — sleep before the first event
 * ``SHIM_SLEEP_BETWEEN_S`` (default ``0``) — sleep between events
 * ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
    with this message on stderr (e.g. a ``--resume`` of an unknown session)
@@ -55,9 +56,12 @@ def main() -> int:
     is_error = os.environ.get("SHIM_IS_ERROR", "false").lower() == "true"
     cost_usd = float(os.environ.get("SHIM_COST_USD", "0.05"))
     duration_ms = int(os.environ.get("SHIM_DURATION_MS", "500"))
+    sleep_before = float(os.environ.get("SHIM_SLEEP_BEFORE_S", "0"))
     sleep_between = float(os.environ.get("SHIM_SLEEP_BETWEEN_S", "0"))
     num_msgs = int(os.environ.get("SHIM_NUM_ASSISTANT_MSGS", "2"))
 
+    if sleep_before:
+        time.sleep(sleep_before)
     emit({"type": "system", "subtype": "init", "session_id": session_id})
     if sleep_between:
         time.sleep(sleep_between)
