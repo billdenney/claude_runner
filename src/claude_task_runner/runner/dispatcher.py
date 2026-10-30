@@ -1442,6 +1442,58 @@ def _parked_after_loop_error(task_id: str, pid: int, loop_error: Exception) -> D
     )
 
 
+def _read_rest(stream: IO[str], into: list[str]) -> None:
+    """Append what is left on ``stream`` to ``into`` a line at a time, so a
+    reader given up on keeps what it read, then close it."""
+    try:
+        with stream:
+            for line in stream:
+                into.append(line)
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read the rest of a stopped worker's pipe: %s", exc)
+
+
+def _drain_pipes(
+    process: subprocess.Popen[str], *, task_id: str, timeout_s: float
+) -> tuple[str, str]:
+    """What is left on a stopped worker's stdout and stderr pipes.
+
+    Read through the file objects, so lines the dispatch loop's iterator had
+    read ahead, and not yet yielded, are kept: ``communicate`` reads the
+    descriptors and would drop them. Each pipe is read on its own thread. A
+    pipe still open after ``timeout_s``, held by a process the stop did not
+    end, is left to its thread, and the text read from it so far is
+    returned. Nothing is signalled: the worker is reaped, so its pid is no
+    longer provably its own.
+    """
+    out: list[str] = []
+    err: list[str] = []
+    readers = [
+        threading.Thread(
+            target=_read_rest,
+            args=(stream, into),
+            name=f"drain-{task_id}",
+            daemon=True,
+        )
+        for stream, into in ((process.stdout, out), (process.stderr, err))
+        if stream is not None
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout_s
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        logger.warning(
+            "task %s: worker pid=%s's output is still open %.0fs after it stopped; "
+            "recording its run from what was read",
+            task_id,
+            process.pid,
+            timeout_s,
+        )
+    return "".join(out), "".join(err)
+
+
 def _terminate_by_pid(
     pid: int,
     *,
@@ -2093,6 +2145,10 @@ def dispatch(
             stdout=stdout_sink,
             stderr=stderr_sink,
             text=True,
+            # As the file tailer reads: a line that is not UTF-8 is a
+            # malformed line, not an exception in the dispatch loop.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             cwd=str(task.working_dir) if task.working_dir else None,
             env=spawn_env,
@@ -2323,11 +2379,18 @@ def dispatch(
         summary = _reparse_stdout_file(stdout_log_path)
         stderr_tail = _read_stderr_tail(stderr_log_path)
     else:
-        try:
-            stdout_remainder, stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            _signal_group(process, signal.SIGKILL)
-            stdout_remainder, stderr = process.communicate()
+        if loop_error is None:
+            try:
+                stdout_remainder, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                _signal_group(process, signal.SIGKILL)
+                stdout_remainder, stderr = process.communicate()
+        else:
+            # The loop stopped reading mid-stream, so lines its iterator read
+            # ahead are in process.stdout's buffer, where communicate() does
+            # not look; and the worker is reaped, so nothing is signalled by
+            # its pid.
+            stdout_remainder, stderr = _drain_pipes(process, task_id=task.id, timeout_s=10)
 
         # Re-parse any remainder lines. parse_lines updates `summary`
         # (cumulative usage, session id, final result) as a side effect;

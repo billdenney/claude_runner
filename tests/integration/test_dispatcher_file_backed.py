@@ -536,6 +536,63 @@ def test_a_terminal_result_written_before_the_loop_raised_stands(
     assert reloaded.session_id == "sess-done"
 
 
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_terminal_result_read_ahead_of_the_loop_error_stands(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+    adopt: bool,
+) -> None:
+    """The worker writes every event in one write, so the read that gives
+    the loop the event it raises after also takes the terminal result. The
+    result still counts, from the pipe's buffer or the re-read log, and the
+    run completes."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-ahead")
+    monkeypatch.setenv("SHIM_SINGLE_WRITE", "1")
+    raise_in_dispatch_loop(_INIT_LINES + 2)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error, reloaded.session_id) == (
+        "completed",
+        "end_turn",
+        None,
+        "sess-ahead",
+    )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.error) == ("end_turn", None)
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_line_that_is_not_utf8_is_a_malformed_line(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    adopt: bool,
+) -> None:
+    """Bytes that are not UTF-8 decode with replacement characters on both
+    paths, so their line is skipped as malformed, not an exception in the
+    dispatch loop, and the run completes."""
+    monkeypatch.setenv("SHIM_INVALID_UTF8_LINE", "1")
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason) == ("completed", "end_turn")
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.skipped_stream_lines) == ("end_turn", 1)
+
+
 def test_a_worker_that_exited_on_its_own_keeps_its_own_record(
     queue_dir: Path,
     task: Task,

@@ -22,6 +22,11 @@ Env vars:
 * ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
    with this message on stderr (e.g. a ``--resume`` of an unknown session)
 * ``SHIM_NUM_ASSISTANT_MSGS`` (default ``2``)
+* ``SHIM_SINGLE_WRITE`` (default ``""``) — when ``1`` / ``true``, hold
+   every event back and write them all at once at the end, so a reader
+   gets them in one read
+* ``SHIM_INVALID_UTF8_LINE`` (default ``""``) — when ``1`` / ``true``,
+   write a line of bytes that are not UTF-8 after the init event
 * ``SHIM_IGNORE_SIGTERM`` (default ``""``) — when ``1`` / ``true``,
    install ``signal.SIG_IGN`` for ``SIGTERM`` before emitting events.
    Used by the cap-kill PG-wide-SIGKILL integration test to exercise
@@ -37,13 +42,24 @@ import sys
 import time
 
 
-def emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
+def emit(obj: dict, held: list[str] | None) -> None:
+    """Write ``obj`` as one stream-json line, or keep it in ``held`` for the
+    single write at the end."""
+    line = json.dumps(obj) + "\n"
+    if held is not None:
+        held.append(line)
+        return
+    sys.stdout.write(line)
     sys.stdout.flush()
 
 
+def flag(name: str) -> bool:
+    """Whether the environment variable ``name`` is ``1`` or ``true``."""
+    return os.environ.get(name, "").lower() in ("1", "true")
+
+
 def main() -> int:
-    if os.environ.get("SHIM_IGNORE_SIGTERM", "").lower() in ("1", "true"):
+    if flag("SHIM_IGNORE_SIGTERM"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     fail_fast = os.environ.get("SHIM_FAIL_FAST", "")
@@ -63,9 +79,14 @@ def main() -> int:
     sleep_before_result = float(os.environ.get("SHIM_SLEEP_BEFORE_RESULT_S", "0"))
     num_msgs = int(os.environ.get("SHIM_NUM_ASSISTANT_MSGS", "2"))
 
+    held: list[str] | None = [] if flag("SHIM_SINGLE_WRITE") else None
+
     if sleep_before:
         time.sleep(sleep_before)
-    emit({"type": "system", "subtype": "init", "session_id": session_id})
+    emit({"type": "system", "subtype": "init", "session_id": session_id}, held)
+    if flag("SHIM_INVALID_UTF8_LINE"):
+        sys.stdout.buffer.write(b"\xff\xfe not utf-8\n")
+        sys.stdout.buffer.flush()
     if sleep_between:
         time.sleep(sleep_between)
 
@@ -86,7 +107,8 @@ def main() -> int:
                         "output_tokens": per_msg_output,
                     },
                 },
-            }
+            },
+            held,
         )
         if sleep_between:
             time.sleep(sleep_between)
@@ -105,8 +127,12 @@ def main() -> int:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
             },
-        }
+        },
+        held,
     )
+    if held is not None:
+        sys.stdout.write("".join(held))
+        sys.stdout.flush()
     return 1 if is_error else 0
 
 

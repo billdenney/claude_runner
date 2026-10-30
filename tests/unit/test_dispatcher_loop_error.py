@@ -1,9 +1,13 @@
 """What ``dispatch()`` and ``adopt_worker()`` do with a worker once their
-dispatch loop raised: :func:`dispatcher._stop_after_loop_error`."""
+dispatch loop raised: :func:`dispatcher._stop_after_loop_error`, and on the
+pipe path :func:`dispatcher._drain_pipes`."""
 
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,4 +86,31 @@ def test_a_stop_that_raises_is_logged_and_liveness_decides(
         "task t1: dispatch loop raised RuntimeError: boom; stopping worker pid=4242",
         "task t1: could not stop worker pid=4242 after its dispatch loop failed: "
         "task pid 4242 survived SIGKILL",
+    ]
+
+
+def test_drain_keeps_read_ahead_lines_and_gives_up_on_a_held_pipe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reading the first line through the iterator reads the second ahead;
+    the drain still returns it. Another process keeps the pipe open, so the
+    drain returns after its timeout with what it read."""
+    read_fd, write_fd = os.pipe()
+    straggler = subprocess.Popen(["sleep", "30"], stdout=write_fd)
+    os.write(write_fd, b"first\nsecond\n")
+    os.close(write_fd)
+    stdout = open(read_fd, encoding="utf-8", errors="replace")  # noqa: SIM115 - the drain closes it
+    worker = SimpleNamespace(pid=4242, stdout=stdout, stderr=None)
+    try:
+        first = next(iter(stdout))
+        with caplog.at_level(logging.WARNING, logger=dispatcher_mod.logger.name):
+            out, err = dispatcher_mod._drain_pipes(worker, task_id="t1", timeout_s=1)  # type: ignore[arg-type]
+    finally:
+        straggler.kill()
+        straggler.wait(timeout=10)
+
+    assert (first, out, err) == ("first\n", "second\n", "")
+    assert _messages(caplog) == [
+        "task t1: worker pid=4242's output is still open 1s after it stopped; "
+        "recording its run from what was read"
     ]
