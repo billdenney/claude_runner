@@ -8,12 +8,21 @@ raises a bare ``UnicodeDecodeError`` for bytes that are not UTF-8. A
 handler for ``JSONDecodeError`` or ``TOMLDecodeError`` alone lets both
 through. So this test fails on a reference to a parse function that no
 ``try`` in its own function covers with a handler for ``ValueError``,
-``Exception`` or ``BaseException``, or a bare ``except``. :data:`ALLOWED`
-names a scope that may make such references, how many, and why.
+``Exception`` or ``BaseException``, or a bare ``except``, that does more
+than re-raise or pass (:func:`_reference_gate.references_by_scope`).
+:data:`ALLOWED` names a scope that may make such references, how many, and
+why.
+
+It cannot see a parse it has no name for: ``getattr(json, "loads")``, a
+decoder made elsewhere and passed in, a module reached through an
+attribute (``self.json.loads``), or the Python the skills' shell scripts
+embed. Nor does it see the read before a parse: a text read that decodes
+UTF-8 raises the same ``UnicodeDecodeError`` before json is called.
 """
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from collections import Counter
 from pathlib import Path
@@ -27,11 +36,21 @@ PACKAGE = REPO_ROOT / "src" / "claude_task_runner"
 LOADER = Path("config/loader.py")
 
 PARSERS: dict[str, tuple[str, ...]] = {
-    "json": ("load", "loads"),
+    "json": ("load", "loads", "JSONDecoder"),
     "tomllib": ("load", "loads"),
-    "yaml": ("load", "load_all", "safe_load", "safe_load_all", "full_load"),
+    "yaml": (
+        "load",
+        "load_all",
+        "safe_load",
+        "safe_load_all",
+        "full_load",
+        "full_load_all",
+        "unsafe_load",
+        "unsafe_load_all",
+    ),
 }
-"""Each parsing module, and its functions that parse."""
+"""Each parsing module, and its names that parse: functions, and
+``JSONDecoder``, whose ``decode`` and ``raw_decode`` do."""
 
 GUARDS = frozenset({"ValueError", "Exception", "BaseException"})
 """Exception names whose handler catches the bare ``ValueError``."""
@@ -50,12 +69,21 @@ with that caller named in the reason."""
 
 def unguarded(source: str) -> Counter[str]:
     """How often each scope in ``source`` refers to a parse function outside
-    a ``try`` that catches ``ValueError``."""
+    a ``try`` that catches ``ValueError``. ``from json import *`` (or of
+    another parsing module) counts at the top level: it binds every parse
+    function under a name this cannot follow."""
     counts: Counter[str] = Counter()
     for module, names in PARSERS.items():
         for name in names:
             counts += references_by_scope(source, name, module=module, unless_caught=GUARDS)
-    return counts
+    counts["<module>"] += sum(
+        1
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom)
+        and node.module in PARSERS
+        and any(alias.name == "*" for alias in node.names)
+    )
+    return +counts
 
 
 def unexpected(
@@ -187,6 +215,77 @@ def test_every_spelling_of_a_parse_counts_in_its_scope() -> None:
         """
     )
     assert unguarded(source) == Counter({"spellings": 5, "<module>": 1, "Holder.method": 1})
+
+
+def test_the_other_parsing_names_count() -> None:
+    """PyYAML's full and unsafe loaders and a ``JSONDecoder``, whose
+    ``decode`` and ``raw_decode`` parse, count in their scope; ``from json
+    import *`` counts at the top level."""
+    source = textwrap.dedent(
+        """
+        import json
+        import yaml
+        from json import *
+
+        def others(text):
+            yaml.full_load_all(text)
+            yaml.unsafe_load(text)
+            yaml.unsafe_load_all(text)
+            return json.JSONDecoder().raw_decode(text)
+        """
+    )
+    assert unguarded(source) == Counter({"others": 4, "<module>": 1})
+
+
+def test_a_handler_that_only_re_raises_or_passes_does_not_cover() -> None:
+    """The error then escapes, or vanishes without a word. A handler that
+    raises another error from it covers."""
+    source = textwrap.dedent(
+        """
+        import json
+
+        def reraises(text):
+            try:
+                return json.loads(text)
+            except ValueError:
+                raise
+
+        def passes(text):
+            try:
+                return json.loads(text)
+            except ValueError:
+                pass
+
+        def converts(text):
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise RuntimeError(text) from exc
+        """
+    )
+    assert unguarded(source) == Counter({"reraises": 1, "passes": 1})
+
+
+def test_a_parse_that_can_run_after_the_try_is_not_covered() -> None:
+    """A generator expression runs as it is consumed, and a parse function
+    passed on uncalled runs when its holder calls it, either of which can
+    be after the ``try``. A list comprehension runs at once."""
+    source = textwrap.dedent(
+        """
+        import json
+
+        def lazy(lines):
+            try:
+                parsed = (json.loads(line) for line in lines)
+                mapped = map(json.loads, lines)
+                parse = json.loads
+                now = [json.loads(line) for line in lines]
+            except ValueError:
+                return None
+            return parsed, mapped, parse, now
+        """
+    )
+    assert unguarded(source) == Counter({"lazy": 3})
 
 
 def test_only_the_body_of_a_try_is_covered() -> None:

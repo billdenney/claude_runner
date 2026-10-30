@@ -18,9 +18,23 @@ from collections.abc import Collection
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
+def _does_nothing(handler: ast.ExceptHandler) -> bool:
+    """Whether ``handler`` only re-raises (a bare ``raise``) or passes: the
+    error then escapes, or vanishes without a word."""
+    return all(
+        isinstance(stmt, ast.Pass)
+        or (isinstance(stmt, ast.Raise) and stmt.exc is None)
+        or (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+        for stmt in handler.body
+    )
+
+
 def _catches(node: ast.Try | ast.TryStar, names: Collection[str]) -> bool:
-    """Whether a handler of ``node`` is a bare ``except`` or names one of ``names``."""
+    """Whether a handler of ``node`` that does something is a bare ``except``
+    or names one of ``names``."""
     for handler in node.handlers:
+        if _does_nothing(handler):
+            continue
         if handler.type is None:
             return True
         types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
@@ -51,11 +65,14 @@ def references_by_scope(
     module as alias``, and the bare names that ``from module import name``
     binds.
 
-    With ``unless_caught`` (exception names), a reference in the body of a
+    With ``unless_caught`` (exception names), a call in the body of a
     ``try`` does not count when one of its handlers names one of them or is
-    a bare ``except``. Only the body is covered, not the handlers, ``else``
-    or ``finally``; and a ``try`` covers nothing in a function, class or
-    lambda defined in its body, each of which is checked on its own.
+    a bare ``except``, and does more than re-raise or pass. Only a call is
+    covered: a reference passed on uncalled (``map(json.loads, ...)``, ``f =
+    json.loads``) may run after the ``try``. So may anything in a function,
+    class, lambda or generator expression defined in the body, each of which
+    is checked on its own. The handlers, ``else`` and ``finally`` are not
+    covered.
     """
     tree = ast.parse(source)
     receivers = {
@@ -83,7 +100,7 @@ def references_by_scope(
                 if isinstance(child, _SCOPES):
                     visit(child, f"{scope}.{child.name}" if scope else child.name, False)
                     continue
-                if isinstance(child, ast.Lambda):
+                if isinstance(child, ast.Lambda | ast.GeneratorExp):
                     visit(child, scope, False)
                     continue
                 covered = caught or (
@@ -92,7 +109,8 @@ def references_by_scope(
                     and isinstance(node, ast.Try | ast.TryStar)
                     and _catches(node, unless_caught)
                 )
-                if not covered and (
+                called = isinstance(node, ast.Call) and field == "func"
+                if not (covered and called) and (
                     (
                         isinstance(child, ast.Attribute)
                         and child.attr == name
