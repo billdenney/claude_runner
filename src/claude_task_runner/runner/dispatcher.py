@@ -1441,12 +1441,14 @@ _LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
 """The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
 
 
-def _parked_after_loop_error(task_id: str, pid: int, loop_error: Exception) -> DispatchError:
-    """The error a dispatch raises, from ``loop_error``, once it parked a
-    worker it could not stop."""
+def _unstopped_after_loop_error(
+    task_id: str, pid: int, loop_error: Exception, *, outcome: str
+) -> DispatchError:
+    """The error a dispatch raises, from ``loop_error``, when it could not
+    stop its worker; ``outcome`` says what became of the task."""
     return DispatchError(
         f"task {task_id}: {_loop_error_text(loop_error)}; "
-        f"worker pid={pid} could not be stopped and is parked"
+        f"worker pid={pid} could not be stopped and {outcome}"
     )
 
 
@@ -2350,12 +2352,16 @@ def dispatch(
             gone=lambda: process.poll() is not None,
         )
         if after is _AfterLoopError.RUNNING:
+            outcome = "is not parked: this dispatch keeps no state"
             if persist_state:
                 parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
                 write_state_atomic(parked, state_path_for(queue_dir, task.id))
                 if on_park is not None:
                     on_park(parked, _LOOP_ERROR_PARK)
-            raise _parked_after_loop_error(task.id, process.pid, loop_error) from loop_error
+                outcome = "is parked"
+            raise _unstopped_after_loop_error(
+                task.id, process.pid, loop_error, outcome=outcome
+            ) from loop_error
         if after is _AfterLoopError.STOPPED:
             stopped_for = loop_error
 
@@ -2635,9 +2641,15 @@ def adopt_worker(
         if after is _AfterLoopError.RUNNING:
             parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
             written = _write_unless_finalized(parked, state_path, worker_pid=pid)
-            if written is parked and on_park is not None:
-                on_park(parked, _LOOP_ERROR_PARK)
-            raise _parked_after_loop_error(task.id, pid, loop_error) from loop_error
+            if written is not parked:
+                outcome = f"another writer had already recorded its task as {written.status}"
+            else:
+                if on_park is not None:
+                    on_park(parked, _LOOP_ERROR_PARK)
+                outcome = "is parked"
+            raise _unstopped_after_loop_error(
+                task.id, pid, loop_error, outcome=outcome
+            ) from loop_error
         if after is _AfterLoopError.STOPPED:
             stopped_for = loop_error
 

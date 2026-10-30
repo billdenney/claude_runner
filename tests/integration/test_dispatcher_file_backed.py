@@ -712,6 +712,93 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
 
 
+def _dispatch_in_memory(
+    queue_dir: Path,
+    task: Task,
+    plan: SpawnPlan,
+    *,
+    on_park: Callable[[TaskState, str], None] | None = None,
+) -> object:
+    """``dispatch`` with ``persist_state=False``, which also means the pipe path."""
+    return dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=_caps(),
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        persist_state=False,
+        on_park=on_park,
+    )
+
+
+def test_a_loop_that_raises_in_memory_returns_its_failed_run(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """With ``persist_state=False`` no state file is written. The worker is
+    still stopped, and the outcome carries the dispatch_loop_error run."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-memory")
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    raise_in_dispatch_loop(_INIT_LINES)
+
+    outcome = _dispatch_in_memory(queue_dir, task, fresh_plan)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.returncode == -signal.SIGTERM
+    assert not state_path_for(queue_dir, task.id).exists()
+    assert (
+        outcome.new_state.status,
+        outcome.new_state.stop_reason,
+        outcome.new_state.error,
+        outcome.new_state.session_id,
+    ) == ("failed", "dispatch_loop_error", "dispatch loop raised RuntimeError: boom", "sess-memory")
+    assert outcome.run_record.stop_reason == "dispatch_loop_error"
+
+
+def test_a_worker_that_cannot_be_stopped_in_memory_is_not_parked(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """With ``persist_state=False`` there is no state to park: nothing is
+    written or reported, and dispatch raises, saying so."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    raise_in_dispatch_loop(_INIT_LINES)
+
+    def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _dispatch_in_memory(
+            queue_dir, task, fresh_plan, on_park=lambda state, why: parks.append((state, why))
+        )
+
+    [worker] = spawned
+    assert worker.poll() is None
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={worker.pid} "
+        "could not be stopped and is not parked: this dispatch keeps no state"
+    )
+    assert not state_path_for(queue_dir, task.id).exists()
+    assert parks == []
+
+
 _TOKEN_CAP = 5
 """Below the 7 tokens of the shim's first assistant event, so its cap kill
 fires there, while the worker sleeps before its result."""

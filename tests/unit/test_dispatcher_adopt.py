@@ -1231,6 +1231,40 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
 
 
+def test_adopt_park_stands_down_for_a_record_another_writer_made(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """While the stop fails, a reaper records the task. Its record wins: the
+    park is not written or reported, and adopt_worker raises, saying so."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch, survives=True)
+    reaped = state.model_copy(
+        update={"status": "failed", "stop_reason": "killed_by_silent_reaper", "pid": None}
+    )
+    state_path = state_path_for(queue_dir, task.id)
+
+    def _signal_while_a_reaper_writes(pid: int, sig: int) -> None:
+        write_state_atomic(reaped, state_path)
+        worker.signals.append((pid, sig))
+
+    monkeypatch.setattr(dispatcher_mod, "_signal_group_by_pid", _signal_while_a_reaper_writes)
+    raise_in_dispatch_loop(1)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _adopt(queue_dir, task, state, on_park=lambda parked, why: parks.append((parked, why)))
+
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={_PID} "
+        "could not be stopped and another writer had already recorded its task as failed"
+    )
+    assert worker.signals == [(_PID, signal.SIGTERM), (_PID, signal.SIGKILL)]
+    assert load_state(state_path) == reaped
+    assert parks == []
+
+
 def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
     queue_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
