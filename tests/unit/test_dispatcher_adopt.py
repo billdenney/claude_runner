@@ -61,6 +61,7 @@ from claude_task_runner.runner.dispatcher import (
     DispatchOutcome,
     adopt_worker,
     finalize_exited_worker,
+    park_live_worker,
 )
 
 from ._git_world import git, isolate_git
@@ -1400,6 +1401,57 @@ def test_adopt_records_the_session_while_the_worker_runs(
     )
 
     assert ("running", "sess-adopt", "work") in writes
+
+
+def test_adopt_leaves_a_park_made_while_the_worker_runs(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reaper parks the adopted task while its worker still runs. The
+    monitor's next heartbeat stands down instead of writing the task back
+    to running, and the run's record replaces the park when it ends."""
+    task, state = _seed_adopted(queue_dir, [_init_line()])
+    log = _attempt_log(queue_dir, task.id)
+    path = state_path_for(queue_dir, task.id)
+    worker = _AdoptedWorker(monkeypatch)
+    clock = FakeClock(_RESTART)
+    real_write = dispatcher_mod.write_state_atomic
+    writes: list[str] = []
+
+    def _spy(written: TaskState, at: Path) -> None:
+        writes.append(written.status)
+        real_write(written, at)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+    polls: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        polls.append(seconds)
+        if len(polls) == 1:
+            # The reaper, between two of the monitor's writes.
+            writes.append("possibly_hung")
+            real_write(park_live_worker(load_state(path), why="but showed no sign of life"), path)
+            # Past heartbeat_persist_interval_s, so the next event's is written, or tried.
+            clock.advance(60.0)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(_assistant_line() + "\n" + _result_line() + "\n")
+        elif len(polls) == 3:
+            worker.alive = False
+
+    outcome = adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        clock=clock,
+        settings_caps=_caps(),
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        sleep_fn=_sleep,
+    )
+
+    parked_at = writes.index("possibly_hung")
+    assert writes[parked_at + 1 :] == ["completed"]
+    assert load_state(path) == outcome.new_state
+    assert outcome.new_state.status == "completed"
 
 
 def test_adopt_loop_error_never_signals_a_pid_another_process_holds(

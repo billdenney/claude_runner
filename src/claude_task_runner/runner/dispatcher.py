@@ -71,6 +71,7 @@ from claude_task_runner.config.schema import (
     TaskCapsSettings,
 )
 from claude_task_runner.file_mtime import file_mtime_utc
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import (
     RunRecord,
     Task,
@@ -2443,7 +2444,9 @@ def dispatch(
     #
     # The state lock serializes the read-modify-write so neither writer
     # clobbers the other's field. Both update ``new_state`` (the local
-    # source of truth) and atomic-write the YAML.
+    # source of truth) and atomic-write the YAML, but only while the YAML
+    # still says ``running``: once a reaper has moved the task off it,
+    # they stand down rather than write it back (``_write_running``).
     #
     # Only persist when ``persist_state`` is True — the dispatch
     # function's normal path. When the caller has opted into in-memory
@@ -2458,14 +2461,12 @@ def dispatch(
         def _persist_heartbeat(when: datetime) -> None:
             nonlocal new_state
             with state_lock:
-                new_state = new_state.model_copy(update={"last_heartbeat_at": when})
-                write_state_atomic(new_state, state_path)
+                new_state = _write_running(new_state, state_path, {"last_heartbeat_at": when})
 
         def _persist_alive(when: datetime) -> None:
             nonlocal new_state
             with state_lock:
-                new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
-                write_state_atomic(new_state, state_path)
+                new_state = _write_running(new_state, state_path, {"dispatcher_alive_at": when})
 
         def _persist_session(session_id: str) -> None:
             nonlocal new_state
@@ -2474,10 +2475,9 @@ def dispatch(
                     return  # a resumed session, already on record
                 # A new session is hosted on the account it runs on
                 # (ADR-0024), as _finalize_state records it at the end.
-                new_state = new_state.model_copy(
-                    update={"session_id": session_id, "session_account": account}
+                new_state = _write_running(
+                    new_state, state_path, {"session_id": session_id, "session_account": account}
                 )
-                write_state_atomic(new_state, state_path)
 
         heartbeat_persist_fn = _persist_heartbeat
         session_persist_fn: Callable[[str], None] | None = _persist_session
@@ -2721,7 +2721,9 @@ def adopt_worker(
       (:func:`_terminate_by_pid` → ``killpg``);
     * the heartbeat + ``dispatcher_alive_at`` are refreshed on the state
       YAML while tailing, so the per-tick reaper sees HEALTHY and never
-      demotes the adopted task out from under us.
+      demotes the adopted task out from under us. Should a reaper move the
+      task off ``running`` all the same, the refreshes stop rather than
+      write it back (:func:`_write_running`).
 
     On completion (the pid is gone) the outcome is **inferred** from the
     terminal stream-json ``result`` event captured in the
@@ -2790,7 +2792,9 @@ def adopt_worker(
 
     # Shared running-state writer (heartbeat + dispatcher-alive) — same
     # lock discipline as dispatch()'s monitor so the two fields don't
-    # clobber each other. ``new_state`` is the local source of truth.
+    # clobber each other. ``new_state`` is the local source of truth, and
+    # it is written only while the YAML still says ``running``
+    # (``_write_running``).
     new_state = state
     state_lock = threading.Lock()
     state_path = state_path_for(queue_dir, task.id)
@@ -2798,24 +2802,21 @@ def adopt_worker(
     def _persist_heartbeat(when: datetime) -> None:
         nonlocal new_state
         with state_lock:
-            new_state = new_state.model_copy(update={"last_heartbeat_at": when})
-            write_state_atomic(new_state, state_path)
+            new_state = _write_running(new_state, state_path, {"last_heartbeat_at": when})
 
     def _persist_alive(when: datetime) -> None:
         nonlocal new_state
         with state_lock:
-            new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
-            write_state_atomic(new_state, state_path)
+            new_state = _write_running(new_state, state_path, {"dispatcher_alive_at": when})
 
     def _persist_session(session_id: str) -> None:
         nonlocal new_state
         with state_lock:
             if session_id == new_state.session_id:
                 return  # recorded by the supervisor that started the worker
-            new_state = new_state.model_copy(
-                update={"session_id": session_id, "session_account": account}
+            new_state = _write_running(
+                new_state, state_path, {"session_id": session_id, "session_account": account}
             )
-            write_state_atomic(new_state, state_path)
 
     alive_monitor = _DispatcherAliveMonitor(
         persist_fn=_persist_alive,
@@ -3001,28 +3002,52 @@ def _write_unless_finalized(
     ``running`` between a verdict and this write, and its record wins.
     The write goes ahead while the task is still ``running`` or parked on
     this same worker (:func:`is_parked_live_worker`, ``worker_pid``), and
-    when the recheck cannot load the file.
+    when the recheck cannot load the file. With ``worker_pid`` None it goes
+    ahead only while the task is ``running``, so a write of the running
+    state never turns a park back into a run (:func:`_write_running`). A
+    stand-down is logged once per attempt and status, since the
+    running-state writes repeat.
     """
     try:
         current = load_state(state_path)
     except Exception as exc:
         logger.warning(
-            "adopt_worker: recheck-load of %s failed (%s); persisting anyway", state_path, exc
+            "task %s: recheck-load of %s failed (%s); persisting anyway",
+            state.task_id,
+            state_path,
+            exc,
         )
         write_state_atomic(state, state_path)
         return state, True
     if current.status == "running" or (
-        is_parked_live_worker(current) and current.pid == worker_pid
+        worker_pid is not None and is_parked_live_worker(current) and current.pid == worker_pid
     ):
         write_state_atomic(state, state_path)
         return state, True
-    logger.info(
-        "adopt_worker: task %s status changed to %s; "
-        "standing down so the concurrent writer's record wins",
-        state.task_id,
-        current.status,
-    )
+    if first_time("write_unless_finalized", state.task_id, state.attempts, current.status):
+        logger.info(
+            "task %s: status changed to %s; standing down so the concurrent writer's record wins",
+            state.task_id,
+            current.status,
+        )
     return current, False
+
+
+def _write_running(state: TaskState, state_path: Path, update: dict[str, object]) -> TaskState:
+    """Write a monitor's ``update`` into its task's running ``state``; return
+    the state it now holds.
+
+    The heartbeat, the monitor's tick and the session are written while the
+    worker runs, from a copy of the state the dispatch started with, which
+    says ``running``. Once another writer, such as a reaper marking the task
+    ``possibly_hung``, has moved it off ``running``, writing that copy would
+    put the task back, so the write stands down and ``state`` comes back
+    unchanged (:func:`_write_unless_finalized`, with no worker pid). The
+    run's finalize then decides between that record and its own.
+    """
+    updated = state.model_copy(update=update)
+    _on_disk, wrote = _write_unless_finalized(updated, state_path, worker_pid=None)
+    return updated if wrote else state
 
 
 def _finalize_adopted(

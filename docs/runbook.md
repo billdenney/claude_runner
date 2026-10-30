@@ -293,6 +293,13 @@ supervisor again.
 **Symptom:** A task's state shows `possibly_hung` and last_heartbeat is
 N hours old.
 
+A supervisor may still be monitoring the worker of a task the per-tick
+reaper parked as `worker_still_running` (its monitor fell silent long
+enough for the reaper to judge it so). The task then stays parked until
+the worker exits, and its run is recorded as usual: the monitor does not
+write it back to `running`. Step 1 shows whether the worker is still
+making progress.
+
 **Steps:**
 1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl` —
    does it show partial progress, or is it truly silent?

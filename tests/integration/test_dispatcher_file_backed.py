@@ -48,6 +48,7 @@ from claude_task_runner.runner.dispatcher import (
     DispatchOutcome,
     dispatch,
     finalize_exited_worker,
+    park_live_worker,
 )
 from claude_task_runner.runner.session import ResumeStrategy, SpawnPlan
 
@@ -585,6 +586,54 @@ def test_the_running_state_names_the_session_before_the_run_ends(
 
     assert ("running", "sess-early", "personal") in writes
     assert writes[-1] == ("completed", "sess-early", "personal")
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_park_made_while_the_worker_runs_is_not_written_back(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    adopt: bool,
+) -> None:
+    """A reaper parks the task once its session is on record, while the
+    worker still runs. The heartbeats of the events after that stand down
+    instead of writing the task back to running, and the run's own record
+    replaces the park when it ends."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-parked")
+    monkeypatch.setenv("SHIM_NUM_ASSISTANT_MSGS", "3")
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "0.05")
+    real_write = dispatcher_mod.write_state_atomic
+    writes: list[str] = []
+
+    def _spy(state: TaskState, path: Path) -> None:
+        writes.append(state.status)
+        real_write(state, path)
+        if state.session_id == "sess-parked" and "possibly_hung" not in writes:
+            # The reaper, between two of the dispatcher's writes.
+            writes.append("possibly_hung")
+            real_write(park_live_worker(state, why="but showed no sign of life"), path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+
+    outcome = dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=fresh_plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        # Every event's heartbeat is written, or tried.
+        settings_caps=_caps().model_copy(update={"heartbeat_persist_interval_s": 0.001}),
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+    )
+    assert isinstance(outcome, DispatchOutcome)
+
+    parked_at = writes.index("possibly_hung")
+    assert writes[parked_at + 1 :] == ["completed"]
+    assert load_state(state_path_for(queue_dir, task.id)).status == "completed"
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
