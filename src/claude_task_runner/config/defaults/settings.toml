@@ -217,6 +217,10 @@ sidecar_refile_loop_threshold = 4
 # Per-task safety caps
 # ---------------------------------------------------------------------------
 [task_caps]
+# heartbeat_silence_alert_s must be at least twice dispatcher_alive_write_interval_s
+# (30 s by default), and stuck_sleep_loop_kill_threshold_s, and
+# heartbeat_silence_kill_s when on, at least twice heartbeat_persist_interval_s;
+# the loader rejects less.
 max_tokens_per_task              = 0     # 0 = unlimited
 max_duration_s_per_task          = 14400 # 4h per attempt; 0 = unlimited
 heartbeat_silence_alert_s        = 300   # mark possibly_hung after N s of silence

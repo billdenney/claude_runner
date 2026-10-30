@@ -56,7 +56,12 @@ introduces a new on-disk file MUST update this document in the same PR.
    heartbeat does not count `tool_progress`, so it stands still through a
    long tool call; the silent-orphan reaper and startup adoption also count
    the monitor's `dispatcher_alive_at` and the worker's writes to its stream
-   log (`supervisor.reconcile_silent.liveness_verdict`).
+   log (`supervisor.reconcile_silent.liveness_verdict`). The loader
+   rejects an alert window under two monitor ticks
+   (`dispatcher_alive_write_interval_s`), and a kill threshold under two
+   heartbeat writes (`heartbeat_persist_interval_s`): the reaper measures
+   each against a timestamp written once an interval, which a working task
+   keeps under two intervals old.
 6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**

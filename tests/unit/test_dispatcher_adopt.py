@@ -92,7 +92,7 @@ def _caps(
         heartbeat_silence_kill_s=kill,
         # Large interval so the alive monitor's background loop never
         # fires a second persist during the short test.
-        dispatcher_alive_write_interval_s=600.0,
+        dispatcher_alive_write_interval_s=300.0,
     )
 
 

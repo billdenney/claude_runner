@@ -192,6 +192,10 @@ class TaskCapsSettings(_StrictModel):
     the *active*-case freshness signal; keeping it well below
     ``heartbeat_silence_alert_s`` still gives the reaper a recent
     timestamp for tasks that are actively emitting events.
+
+    Must be at most half of ``stuck_sleep_loop_kill_threshold_s``, and of
+    ``heartbeat_silence_kill_s`` when that is on
+    (:data:`REAPER_THRESHOLD_FLOORS`).
     """
 
     dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0, le=MAX_DURATION_S)
@@ -211,6 +215,9 @@ class TaskCapsSettings(_StrictModel):
     * Dead monitor — both stale. The reaper falls through to the
       filesystem activity verification step (see
       ``zombie_verify_fs_activity_window_s``).
+
+    Must be at most half of ``heartbeat_silence_alert_s``
+    (:data:`REAPER_THRESHOLD_FLOORS`).
     """
 
     zombie_verify_fs_activity_window_s: float = Field(gt=0, default=600.0, le=MAX_DURATION_S)
@@ -291,6 +298,60 @@ class TaskCapsSettings(_StrictModel):
     per-tick cost zero for healthy tasks. Set to ``false`` to revert to
     the duration-cap-only behaviour.
     """
+
+    @model_validator(mode="after")
+    def _validate_thresholds_span_two_writes(self) -> TaskCapsSettings:
+        """Reject a threshold under two of the write intervals it is measured
+        against (:data:`REAPER_THRESHOLD_FLOORS`).
+
+        The reaper compares each threshold with the age of a timestamp the
+        dispatcher writes at most once an interval. The monitor's tick stays
+        under two intervals old through one late write, and the agent's
+        persisted heartbeat stays under two intervals old while the agent
+        emits an event at least once an interval. A shorter threshold would
+        read such a task as silent. A ``heartbeat_silence_kill_s`` of 0 is
+        off and not checked.
+        """
+        for threshold, interval, why in REAPER_THRESHOLD_FLOORS:
+            value = getattr(self, threshold)
+            interval_s = getattr(self, interval)
+            if 0 < value < 2 * interval_s:
+                raise ValueError(
+                    f"[task_caps].{threshold} = {value:g} s is under two write intervals: "
+                    f"[task_caps].{interval} {interval_s:g} s x 2 = {2 * interval_s:g} s. "
+                    f"{why} Raise {threshold} or lower {interval}."
+                )
+        return self
+
+
+REAPER_THRESHOLD_FLOORS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        "heartbeat_silence_alert_s",
+        "dispatcher_alive_write_interval_s",
+        "The reaper counts a task as alive while its monitor's tick, written once an "
+        "interval, is within heartbeat_silence_alert_s, so a shorter window reads a "
+        "running task as silent when one tick is late.",
+    ),
+    (
+        "heartbeat_silence_kill_s",
+        "heartbeat_persist_interval_s",
+        "The reaper measures the agent's silence from its persisted heartbeat, written at "
+        "most once an interval, which an agent emitting an event each interval keeps under "
+        "two intervals old, so a shorter threshold can kill such an agent.",
+    ),
+    (
+        "stuck_sleep_loop_kill_threshold_s",
+        "heartbeat_persist_interval_s",
+        "The stuck-sleep-loop scan starts once the agent's persisted heartbeat, written at "
+        "most once an interval, is that old; an agent emitting an event each interval keeps "
+        "it under two intervals old, so a shorter threshold scans such an agent's process "
+        "tree, and can kill it.",
+    ),
+)
+"""``(threshold, interval, why)`` for each ``[task_caps]`` threshold the reaper
+measures against a timestamp the dispatcher writes once an interval. Each
+must be at least twice its interval, as ``[usage].max_reading_age_s`` must
+span two capture cycles; ``why`` says what a shorter one does."""
 
 
 class WatchdogSettings(_StrictModel):

@@ -291,7 +291,7 @@ def test_adoption_monitor_does_not_signal_a_pid_that_changed_hands(
             max_duration_s_per_task=300.0,
             heartbeat_silence_alert_s=600,
             heartbeat_silence_kill_s=0,
-            dispatcher_alive_write_interval_s=600.0,
+            dispatcher_alive_write_interval_s=300.0,
         ),
         settings_dispatch=settings.dispatch,
         settings_hooks=settings.hooks,
