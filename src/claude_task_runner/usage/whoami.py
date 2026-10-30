@@ -99,8 +99,8 @@ def read_credentials(claude_config_dir: str = "") -> dict[str, str | tuple[str, 
     Returns a dict with at most ``subscription_type``, ``rate_limit_tier``,
     and ``scopes``. Missing fields are absent rather than empty so the
     caller can detect a totally-missing credentials file. A file that
-    cannot be read (a parent that denies access) or is not JSON reads as
-    missing too, with a WARNING.
+    cannot be read (a parent that denies access), or is not a JSON object,
+    reads as missing too, with a WARNING.
     """
     path = credentials_path(claude_config_dir)
     try:
@@ -113,6 +113,9 @@ def read_credentials(claude_config_dir: str = "") -> dict[str, str | tuple[str, 
         # bare one json raises for an integer past the interpreter's digit
         # limit.
         logger.warning("could not read %s: %s; reporting no credentials", path, exc)
+        return {}
+    if not isinstance(payload, dict):
+        logger.warning("%s is not a JSON object; reporting no credentials", path)
         return {}
     oauth = payload.get("claudeAiOauth")
     if not isinstance(oauth, dict):

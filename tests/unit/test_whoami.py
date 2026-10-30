@@ -111,6 +111,18 @@ class TestReadCredentials:
             f"could not read {path}: {error}; reporting no credentials"
         ]
 
+    @pytest.mark.parametrize("content", ["[]", "null", '"text"'])
+    def test_json_that_is_not_an_object_returns_empty(
+        self, tmp_path: Path, content: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / ".credentials.json"
+        path.write_text(content)
+        with caplog.at_level("WARNING", logger=_LOGGER):
+            assert read_credentials(str(tmp_path)) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"{path} is not a JSON object; reporting no credentials"
+        ]
+
     def test_missing_oauth_section_returns_empty(self, tmp_path: Path) -> None:
         (tmp_path / ".credentials.json").write_text('{"otherKey": {}}')
         assert read_credentials(str(tmp_path)) == {}
