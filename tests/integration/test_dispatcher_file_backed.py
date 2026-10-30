@@ -456,7 +456,7 @@ def test_a_loop_that_raises_mid_run_stops_the_worker_and_records_a_failure(
     assert isinstance(outcome, DispatchOutcome)
 
     [worker] = spawned
-    assert worker.poll() is not None
+    assert worker.returncode == -signal.SIGTERM
     reloaded = load_state(state_path_for(queue_dir, task.id))
     assert reloaded == outcome.new_state
     assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
@@ -684,7 +684,10 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
     raise_in_dispatch_loop(_INIT_LINES)
 
+    stops: list[int] = []
+
     def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        stops.append(process.pid)
         raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
 
     monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
@@ -700,7 +703,7 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
         )
 
     [worker] = spawned
-    assert worker.poll() is None
+    assert (stops, worker.poll()) == ([worker.pid], None)
     assert str(exc_info.value) == (
         f"task {task.id}: dispatch loop raised RuntimeError: boom; "
         f"worker pid={worker.pid} could not be stopped and is parked"
@@ -708,6 +711,10 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     reloaded = load_state(state_path_for(queue_dir, task.id))
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == worker.pid
+    # The parked-worker pass probes the worker by its log and records its run
+    # from it, so a file-backed park keeps the log; a pipe-backed one has none.
+    log = queue_dir / ".claude_task_runner" / "logs" / task.id / "attempt-1.stream.jsonl"
+    assert reloaded.log_path == (str(log) if adopt else None)
     assert reloaded.runs == []
     assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
 
