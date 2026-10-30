@@ -498,13 +498,43 @@ def test_mixed_verdicts_in_one_pass(tmp_path: Path, live_worker_pid: int) -> Non
 # ---------------------------------------------------------------------------
 
 
+_LOG_NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+
+
 def test_log_written_at_is_the_log_mtime(tmp_path: Path) -> None:
     log = tmp_path / "attempt-1.stream.jsonl"
     log.write_text("{}\n")
     os.utime(log, (1_790_000_000, 1_790_000_000))
     state = TaskState(task_id="t-log", status="running", log_path=str(log))
 
-    assert rs._log_written_at(state) == datetime.fromtimestamp(1_790_000_000, tz=UTC)
+    assert rs._log_written_at(state, _LOG_NOW) == datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC)
+
+
+def test_a_log_mtime_dated_after_now_is_no_sign_of_life(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A log dated after now (a bogus touch, a clock step) would keep a hung
+    worker looking alive until that date. A minute ahead still counts: the
+    log may be written while a reaper pass runs. Only the first read warns."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_text("{}\n")
+    state = TaskState(task_id="t-log", status="running", log_path=str(log))
+    in_a_minute = _LOG_NOW + timedelta(seconds=60)
+    os.utime(log, (in_a_minute.timestamp(), in_a_minute.timestamp()))
+    assert rs._log_written_at(state, _LOG_NOW) == in_a_minute
+
+    in_2100 = datetime(2100, 1, 1, tzinfo=UTC)
+    os.utime(log, (in_2100.timestamp(), in_2100.timestamp()))
+    with caplog.at_level("WARNING", logger=rs.logger.name):
+        assert [rs._log_written_at(state, _LOG_NOW), rs._log_written_at(state, _LOG_NOW)] == [
+            None,
+            None,
+        ]
+
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"{log} is dated 2100-01-01T00:00:00+00:00, after now (2026-10-30T12:00:00+00:00); "
+        "the silent-orphan reaper does not count it as a sign of life for t-log"
+    ]
 
 
 def test_a_log_mtime_no_datetime_can_hold_is_no_sign_of_life(
@@ -520,7 +550,10 @@ def test_a_log_mtime_no_datetime_can_hold_is_no_sign_of_life(
     state = TaskState(task_id="t-log", status="running", log_path=str(log))
 
     with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
-        assert [rs._log_written_at(state), rs._log_written_at(state)] == [None, None]
+        assert [rs._log_written_at(state, _LOG_NOW), rs._log_written_at(state, _LOG_NOW)] == [
+            None,
+            None,
+        ]
 
     assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
         f"{log} has an mtime no datetime can hold (timestamp 1000000000000.0 is out of range: "
