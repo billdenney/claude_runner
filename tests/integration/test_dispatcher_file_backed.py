@@ -22,8 +22,10 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -578,6 +580,21 @@ def test_a_terminal_result_read_ahead_of_the_loop_error_stands(
     assert (run.stop_reason, run.error) == ("end_turn", None)
 
 
+def _raise_from_the_loop_body_on_the_second_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the loop's cap check raise on the second event, from the loop's
+    own body rather than from its line source."""
+    real_evaluate = dispatcher_mod.caps_mod.evaluate_caps
+    calls: list[int] = []
+
+    def _raises_on_the_second_event(**kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return real_evaluate(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dispatcher_mod.caps_mod, "evaluate_caps", _raises_on_the_second_event)
+
+
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
 def test_a_terminal_result_read_ahead_of_a_raise_in_the_loop_body_stands(
     queue_dir: Path,
@@ -594,16 +611,7 @@ def test_a_terminal_result_read_ahead_of_a_raise_in_the_loop_body_stands(
     there for the drain, and the run completes."""
     monkeypatch.setenv("SHIM_SESSION_ID", "sess-body")
     monkeypatch.setenv("SHIM_SINGLE_WRITE", "1")
-    real_evaluate = dispatcher_mod.caps_mod.evaluate_caps
-    calls: list[int] = []
-
-    def _raises_on_the_second_event(**kwargs: object) -> object:
-        calls.append(1)
-        if len(calls) == 2:
-            raise RuntimeError("boom")
-        return real_evaluate(**kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(dispatcher_mod.caps_mod, "evaluate_caps", _raises_on_the_second_event)
+    _raise_from_the_loop_body_on_the_second_event(monkeypatch)
 
     outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
     assert isinstance(outcome, DispatchOutcome)
@@ -616,6 +624,101 @@ def test_a_terminal_result_read_ahead_of_a_raise_in_the_loop_body_stands(
         None,
         "sess-body",
     )
+
+
+def test_a_result_line_holding_a_line_separator_is_one_line(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+) -> None:
+    """The result's text holds U+2028, which JSON may carry unescaped. The
+    line it is on, read ahead and drained after the loop raised, is still one
+    line, so the result counts."""
+    monkeypatch.setenv("SHIM_SINGLE_WRITE", "1")
+    monkeypatch.setenv("SHIM_RESULT_TEXT", "done\u2028really")
+    _raise_from_the_loop_body_on_the_second_event(monkeypatch)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=False)
+    assert isinstance(outcome, DispatchOutcome)
+
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason) == ("completed", "end_turn")
+
+
+def test_no_thread_to_drain_the_pipes_still_records_the_run(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After a loop error on the pipe path, no thread can start to drain the
+    pipes. The run is still recorded, from what the loop read, so the task
+    is not left running with a dead pid."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    raise_in_dispatch_loop(_INIT_LINES)
+    real_thread = threading.Thread
+
+    class _NoDrainThreads(real_thread):
+        def start(self) -> None:
+            if self.name.startswith("drain-"):
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    monkeypatch.setattr(dispatcher_mod.threading, "Thread", _NoDrainThreads)
+
+    with caplog.at_level("ERROR", logger=dispatcher_mod.logger.name):
+        outcome = _dispatch(queue_dir, task, fresh_plan, adopt=False)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason, reloaded.pid) == (
+        "failed",
+        "dispatch_loop_error",
+        None,
+    )
+    no_thread = (
+        f"task {task.id}: no thread could read the rest of worker pid={worker.pid}'s output "
+        "(can't start new thread); recording its run without it"
+    )
+    assert [r.getMessage() for r in caplog.records].count(no_thread) == 2
+
+
+def test_a_cap_kill_on_the_pipe_path_drains_without_signalling(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+) -> None:
+    """The cap kill's wait reaps the worker, so what is left on its pipes is
+    drained without communicate(), whose timeout path would signal by the
+    reaped pid and then wait on any process holding a pipe."""
+    monkeypatch.setenv("SHIM_SLEEP_BEFORE_RESULT_S", "30")
+    drains: list[int] = []
+    real_drain = dispatcher_mod._drain_pipes
+
+    def _drain(process: subprocess.Popen[str], **kwargs: Any) -> tuple[str, str]:
+        drains.append(process.pid)
+        return real_drain(process, **kwargs)
+
+    monkeypatch.setattr(dispatcher_mod, "_drain_pipes", _drain)
+
+    outcome = _dispatch_capped(queue_dir, task, fresh_plan, adopt=False)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert (drains, worker.returncode) == ([worker.pid], -signal.SIGTERM)
+    [run] = load_state(state_path_for(queue_dir, task.id)).runs
+    assert (run.stop_reason, run.killed_by_cap) == ("killed_by_cap", "tokens")
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])

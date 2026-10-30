@@ -320,6 +320,21 @@ def test_signal_group_swallows_process_lookup_error(
     assert caplog.records == []
 
 
+def test_signal_group_sends_nothing_once_popen_has_reaped_the_worker() -> None:
+    """A reaped worker's pid may be another process's by now: nothing is
+    looked up or sent."""
+    process = _FakeProcess(pid=3500, returncode=-15)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid") as getpgid,
+        mock.patch.object(dispatcher_mod.os, "killpg") as killpg,
+    ):
+        _signal_group(process, signal.SIGKILL)  # type: ignore[arg-type]
+
+    getpgid.assert_not_called()
+    killpg.assert_not_called()
+
+
 def test_signal_group_logs_other_oserror(caplog: pytest.LogCaptureFixture) -> None:
     """A non-vanished ``OSError`` (e.g. EPERM) on signal-send is logged at
     ERROR with the pid, never silently swallowed."""

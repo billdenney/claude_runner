@@ -1232,7 +1232,13 @@ def _signal_group_by_pid(pid: int, sig: int) -> None:
 
 
 def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
-    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`)."""
+    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`).
+
+    Nothing, once ``Popen`` has reaped ``process``: its pid may be another
+    process's by now.
+    """
+    if process.returncode is not None:
+        return
     _signal_group_by_pid(process.pid, sig)
 
 
@@ -1475,30 +1481,39 @@ def _read_rest(stream: IO[str], into: list[str]) -> None:
 def _drain_pipes(
     process: subprocess.Popen[str], *, task_id: str, timeout_s: float
 ) -> tuple[str, str]:
-    """What is left on a stopped worker's stdout and stderr pipes.
+    """What is left on a reaped worker's stdout and stderr pipes.
 
     Read through the file objects, so lines the dispatch loop's iterator had
     read ahead, and not yet yielded, are kept: ``communicate`` reads the
     descriptors and would drop them. Each pipe is read on its own thread. A
     pipe still open after ``timeout_s``, held by a process the stop did not
     end, is left to its thread, and the text read from it so far is
-    returned. Nothing is signalled: the worker is reaped, so its pid is no
-    longer provably its own.
+    returned; that thread and the pipe's descriptor stay until the holder
+    exits, then end. A pipe with no thread to read it ("can't start new
+    thread") is left unread. Nothing is signalled: the worker is reaped, so
+    its pid is no longer provably its own.
     """
     out: list[str] = []
     err: list[str] = []
-    readers = [
-        threading.Thread(
-            target=_read_rest,
-            args=(stream, into),
-            name=f"drain-{task_id}",
-            daemon=True,
+    readers: list[threading.Thread] = []
+    for stream, into in ((process.stdout, out), (process.stderr, err)):
+        if stream is None:
+            continue
+        reader = threading.Thread(
+            target=_read_rest, args=(stream, into), name=f"drain-{task_id}", daemon=True
         )
-        for stream, into in ((process.stdout, out), (process.stderr, err))
-        if stream is not None
-    ]
-    for reader in readers:
-        reader.start()
+        try:
+            reader.start()
+        except RuntimeError as exc:
+            logger.error(
+                "task %s: no thread could read the rest of worker pid=%s's output (%s); "
+                "recording its run without it",
+                task_id,
+                process.pid,
+                exc,
+            )
+            continue
+        readers.append(reader)
     deadline = time.monotonic() + timeout_s
     for reader in readers:
         reader.join(max(0.0, deadline - time.monotonic()))
@@ -2418,7 +2433,7 @@ def dispatch(
         summary = _reparse_stdout_file(stdout_log_path)
         stderr_tail = _read_stderr_tail(stderr_log_path)
     else:
-        if loop_error is None:
+        if loop_error is None and process.returncode is None:
             try:
                 stdout_remainder, stderr = process.communicate(timeout=10)
             except subprocess.TimeoutExpired:
@@ -2427,8 +2442,10 @@ def dispatch(
         else:
             # The loop stopped reading mid-stream, so lines its iterator read
             # ahead are in process.stdout's buffer, where communicate() does
-            # not look; and the worker is reaped, so nothing is signalled by
-            # its pid.
+            # not look. And a loop error's stop, or a cap kill's wait, has
+            # reaped the worker: communicate()'s timeout path would signal
+            # nothing by its pid and then wait on a process still holding a
+            # pipe for as long as it runs.
             stdout_remainder, stderr = _drain_pipes(process, task_id=task.id, timeout_s=10)
 
         # Re-parse any remainder lines. parse_lines updates `summary`
@@ -2440,7 +2457,9 @@ def dispatch(
         # overwritten by `_finalize_state`. Remainder parsing is
         # stats-only.
         if stdout_remainder:
-            for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
+            # Split at newlines only: splitlines() also splits at U+2028 and
+            # the other line separators a JSON string may hold unescaped.
+            for _ in parse_lines(stdout_remainder.split("\n"), summary=summary):
                 pass
         stderr_tail = (stderr or "")[-500:] if stderr else ""
 

@@ -14,6 +14,8 @@ Env vars:
 * ``SHIM_STOP_REASON`` (default ``end_turn``)
 * ``SHIM_IS_ERROR`` (default ``false``)
 * ``SHIM_COST_USD`` (default ``0.05``)
+* ``SHIM_RESULT_TEXT`` (default unset) — the result event's ``result``
+   text, written as is, not as ``\\u`` escapes
 * ``SHIM_DURATION_MS`` (default ``500``)
 * ``SHIM_SLEEP_BEFORE_S`` (default ``0``) — sleep before the first event
 * ``SHIM_SLEEP_BETWEEN_S`` (default ``0``) — sleep between events
@@ -45,7 +47,7 @@ import time
 def emit(obj: dict, held: list[str] | None) -> None:
     """Write ``obj`` as one stream-json line, or keep it in ``held`` for the
     single write at the end."""
-    line = json.dumps(obj) + "\n"
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
     if held is not None:
         held.append(line)
         return
@@ -115,21 +117,21 @@ def main() -> int:
 
     if sleep_before_result:
         time.sleep(sleep_before_result)
-    emit(
-        {
-            "type": "result",
-            "subtype": "error" if is_error else "success",
-            "stop_reason": stop_reason,
-            "is_error": is_error,
-            "total_cost_usd": cost_usd,
-            "duration_ms": duration_ms,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-            },
+    result = {
+        "type": "result",
+        "subtype": "error" if is_error else "success",
+        "stop_reason": stop_reason,
+        "is_error": is_error,
+        "total_cost_usd": cost_usd,
+        "duration_ms": duration_ms,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
-        held,
-    )
+    }
+    if "SHIM_RESULT_TEXT" in os.environ:
+        result["result"] = os.environ["SHIM_RESULT_TEXT"]
+    emit(result, held)
     if held is not None:
         sys.stdout.write("".join(held))
         sys.stdout.flush()
