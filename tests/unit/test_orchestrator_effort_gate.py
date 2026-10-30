@@ -121,6 +121,14 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
+def _infos(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == ORCHESTRATOR_LOGGER and r.levelno == logging.INFO
+    ]
+
+
 def _raise_oserror(msg: str) -> Callable[..., None]:
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError(msg)
@@ -226,6 +234,57 @@ class TestPark:
             "invalid effort: effort 'max' not in accepted set for model "
             "'claude-newmodel-99': ['low']"
         )
+
+    @pytest.mark.parametrize(
+        ("old_reason", "retry_at"),
+        [
+            pytest.param(
+                "pre-dispatch hook deferred (exit 1): waiting",
+                _NOW - dt.timedelta(minutes=1),
+                id="hook-deferral-past-its-cooldown",
+            ),
+            pytest.param("parked by hand: ask Ann first", None, id="hand-reason-without-a-time"),
+        ],
+    )
+    def test_a_replaced_reason_is_logged_once(
+        self,
+        queue_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+        old_reason: str,
+        retry_at: dt.datetime | None,
+    ) -> None:
+        """A reason that no longer holds its task is replaced by the gate's
+        own, and the one replaced is logged at INFO so it is not lost."""
+        _write_task(queue_dir, "t-bad", model="claude-sonnet-4-6", effort="max")
+        _write_state(
+            queue_dir,
+            TaskState(
+                task_id="t-bad",
+                status="deferred",
+                deferred_reason=old_reason,
+                next_eligible_at=retry_at,
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger=ORCHESTRATOR_LOGGER):
+            for _ in range(3):
+                assert _candidate_ids(queue_dir) == set()
+
+        state = _state(queue_dir, "t-bad")
+        assert (state.deferred_reason, state.next_eligible_at) == (SONNET_MAX_REASON, None)
+        assert [m for m in _infos(caplog) if "replaces" in m] == [
+            f"task t-bad: parked: {SONNET_MAX_REASON} (replaces deferred_reason: {old_reason})"
+        ]
+
+    def test_parking_a_task_with_no_reason_logs_no_replacement(
+        self, queue_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _write_task(queue_dir, "t-bad", model="claude-sonnet-4-6", effort="max")
+        _write_state(queue_dir, TaskState(task_id="t-bad", status="pending"))
+        with caplog.at_level(logging.INFO, logger=ORCHESTRATOR_LOGGER):
+            _candidate_ids(queue_dir)
+        assert _state(queue_dir, "t-bad").deferred_reason == SONNET_MAX_REASON
+        assert [m for m in _infos(caplog) if "replaces" in m] == []
 
 
 # ---------------------------------------------------------------------------

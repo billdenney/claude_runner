@@ -153,5 +153,24 @@ publicised the behaviour.
    per tick), never touches `attempts` / `runs`, and clears itself back to
    `pending` once the requirement is satisfied. The `readiness hold:` marker
    scopes that self-healing: an operator's manual park and the pre-dispatch
-   hook's exit-1 deferral carry different reasons and are never cleared or
-   overwritten by this gate.
+   hook's exit-1 deferral carry different reasons and are never cleared by
+   this gate. They can be replaced by it; see the amendment of 2026-10-30.
+
+## Amendment (2026-10-30) — a park replaces a reason that no longer holds
+
+The amendment above said this gate never overwrites an operator's manual
+park or the pre-dispatch hook's exit-1 deferral. It does, and the same holds
+for the effort gate (ADR-0010) and the dependency holds (ADR-0036), which
+share the park. A `deferred` state is held by its own reason only while its
+`next_eligible_at` is in the future. Once that has passed, or when the
+reason was written by hand without one, the task reaches the gates like any
+other, and a gate that holds it records its own reason in place of the old
+one and clears `next_eligible_at`.
+
+That behaviour is kept: the old reason no longer holds the task, and the
+gate's reason is what does. Un-parking is still scoped by each gate's
+prefix, so no gate ever clears a reason it did not write. What changes is
+that the replacement is no longer silent: the park logs the reason it
+replaces at INFO, `task <id>: parked: <new reason> (replaces
+deferred_reason: <old reason>)`, once per transition, so the operator's note
+or the hook's stderr survives in the supervisor log.
