@@ -7,16 +7,15 @@ shelled-out ``git`` / ``Rscript``) are reaped too. The subprocess is
 spawned with ``start_new_session=True`` precisely so the group exists
 to be signalled.
 
-The 2026-06-13 ``frompeople-903-farrell_2013`` zombie post-mortem
-strengthened the contract further: ``_terminate`` now VERIFIES the
-parent actually exited via a post-SIGKILL ``process.wait`` and RAISES
-:class:`TerminateFailed` when the kill can't be confirmed (signal-send
-OSError on SIGKILL, or parent surviving SIGKILL). A raised
-``TerminateFailed`` propagates out of the dispatch loop so the
-dispatcher does not finalize the slot to ``failed`` and clear the pid
-— the on-disk state stays ``"running"`` for the per-tick silent-orphan
-reaper to pick up. Letting the dispatcher pretend the kill succeeded
-is the bug that lost 30+ hours of slot capacity in the live incident.
+``_terminate`` also verifies that the parent exited, with a post-SIGKILL
+``process.wait``, and raises :class:`TerminateFailed` when the kill can't
+be confirmed (an OSError sending SIGKILL, or a parent that survives it).
+A raised ``TerminateFailed`` ends the dispatch loop, and ``dispatch()``
+records no run while the worker may still be running: it tries the stop
+once more and parks the task with the worker's pid when that fails too
+(``test_dispatcher_file_backed.py``). A still-running worker recorded as
+finished frees its slot, which lost 30+ hours of slot capacity in the
+2026-06-13 ``frompeople-903-farrell_2013`` post-mortem.
 
 These tests cover both the mocked unit paths (one ``_terminate``
 invocation, patched ``os.killpg`` / ``os.getpgid``) and integration
@@ -65,8 +64,10 @@ class _FakeProcess:
         *,
         pid: int = 4242,
         wait_outcomes: list[int | type[BaseException]] | None = None,
+        returncode: int | None = None,
     ) -> None:
         self.pid = pid
+        self.returncode = returncode
         self._outcomes = list(wait_outcomes or [0])
         self.wait_calls: list[float | None] = []
 
@@ -136,6 +137,23 @@ def test_terminate_returns_silently_when_parent_already_gone() -> None:
     ):
         _terminate(process)  # type: ignore[arg-type]
 
+    killpg.assert_not_called()
+    assert process.wait_calls == []
+
+
+def test_terminate_sends_nothing_once_popen_has_reaped_the_worker() -> None:
+    """A worker ``Popen`` has reaped (the file tailer's ``poll`` does as it
+    exits) may have had its pid given to another process: nothing is looked
+    up, signalled or waited on."""
+    process = _FakeProcess(pid=3050, returncode=0)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid") as getpgid,
+        mock.patch.object(dispatcher_mod.os, "killpg") as killpg,
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    getpgid.assert_not_called()
     killpg.assert_not_called()
     assert process.wait_calls == []
 
@@ -213,11 +231,11 @@ def test_terminate_raises_terminate_failed_on_sigkill_oserror(
 
     assert "SIGKILL to PG 5100" in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, PermissionError)
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors, "expected an ERROR log for the SIGKILL EPERM"
-    msg = errors[0].getMessage()
-    assert "SIGKILL to PG 5100" in msg
-    assert "silent reaper" in msg
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [
+        "SIGKILL to PG 5100 (task pid 5100) failed: operation not permitted — subprocess "
+        "may survive; its run is not recorded while it may still be running"
+    ]
 
 
 def test_terminate_returns_silently_when_group_vanished_on_sigkill() -> None:
@@ -273,9 +291,11 @@ def test_terminate_raises_terminate_failed_when_parent_survives_sigkill(
         mock.call(6100, signal.SIGKILL),
     ]
     assert process.wait_calls == [5, 2]
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors, "expected an ERROR log for the survived-SIGKILL case"
-    assert "TASK_UNINTERRUPTIBLE" in errors[0].getMessage()
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [
+        "task pid 6100 survived SIGKILL to PG 6100 — kernel-level issue "
+        "(TASK_UNINTERRUPTIBLE?); its run is not recorded while it may still be running"
+    ]
 
 
 # --- _signal_group passthrough tests (unchanged contract) -----------------

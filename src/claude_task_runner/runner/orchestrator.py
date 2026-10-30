@@ -2050,6 +2050,7 @@ def _dispatch_one_safely(
                 getattr(getattr(settings, "supervisor", None), "adopt_workers", False)
             ),
             spawn_gate=spawn_gate,
+            on_park=on_park,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

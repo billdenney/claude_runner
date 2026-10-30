@@ -352,6 +352,7 @@ def test_terminate_refuses_a_worker_in_its_own_group(sent: Recorder) -> None:
     sent.pgid = os.getpgrp()
     process = MagicMock(spec=subprocess.Popen)
     process.pid = 4242
+    process.returncode = None
     with pytest.raises(dispatcher_mod.TerminateFailed) as exc_info:
         dispatcher_mod._terminate(process)
     assert str(exc_info.value) == (

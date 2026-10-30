@@ -18,10 +18,13 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import Task
-from claude_task_runner.runner.dispatcher import _dispatch_loop
+from claude_task_runner.runner.caps import CapViolation
+from claude_task_runner.runner.dispatcher import TerminateFailed, _CapKill, _dispatch_loop
 
 
 def _caps(*, max_tokens: int = 0, max_duration: float = 0.0, kill: float = 0.0) -> TaskCapsSettings:
@@ -165,3 +168,61 @@ def test_heartbeat_persist_fn_invoked() -> None:
     # First event always persists (no prior timestamp to rate-limit on).
     assert len(persists) == 1
     assert persists[0] == clock.now()
+
+
+class _SteppingClock(FakeClock):
+    """Moves ``step_s`` after every reading, so within one event the loop
+    sees the silence since that event's heartbeat grow."""
+
+    def __init__(self, start: datetime, *, step_s: float) -> None:
+        super().__init__(start)
+        self._step_s = step_s
+
+    def now(self) -> datetime:
+        current = super().now()
+        self.advance(self._step_s)
+        return current
+
+
+def _kill_fails() -> None:
+    raise TerminateFailed("task pid 4242 survived SIGKILL")
+
+
+def test_a_cap_kill_that_raises_leaves_its_cap_with_the_caller() -> None:
+    """The kill raises out of the loop, and ``cap_kill`` still holds the cap
+    it was for, so the caller can record the run as killed by it."""
+    clock = FakeClock(datetime(2026, 6, 13, 12, 0, tzinfo=UTC))
+    cap_kill = _CapKill()
+
+    with pytest.raises(TerminateFailed):
+        _dispatch_loop(
+            lines=[_init(), _assistant(1_000_000, 0), _assistant(1_000_000, 0), _result()],
+            terminate=_kill_fails,
+            settings_caps=_caps(max_tokens=1_500_000),
+            clock=clock,
+            task=_task(),
+            started_at=clock.now(),
+            cap_kill=cap_kill,
+        )
+
+    assert cap_kill.violation == CapViolation(which="tokens", observed=2_000_000, cap=1_500_000)
+
+
+def test_a_silence_kill_that_raises_leaves_its_cap_with_the_caller() -> None:
+    """The heartbeat silence kill records its duration cap before the kill
+    too."""
+    start = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+    cap_kill = _CapKill()
+
+    with pytest.raises(TerminateFailed):
+        _dispatch_loop(
+            lines=[_init(), _result()],
+            terminate=_kill_fails,
+            settings_caps=_caps(kill=900.0),
+            clock=_SteppingClock(start, step_s=1000.0),
+            task=_task(),
+            started_at=start,
+            cap_kill=cap_kill,
+        )
+
+    assert cap_kill.violation == CapViolation(which="duration", observed=2000.0, cap=900.0)

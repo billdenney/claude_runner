@@ -53,6 +53,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON, ORPHAN_STOP_REASON
@@ -135,6 +136,35 @@ def _run_daemon(
         max_ticks=0,
     )
     return notifications, events
+
+
+def test_daemon_hands_startup_adoption_the_park_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adopted worker's monitor that parks its worker reports the park to
+    the tracker the ticks drain and report, as every other park is."""
+    qd = _queue(tmp_path)
+    trackers: list[adoption_mod.ParkedWorkerTracker] = []
+
+    class _Tracker(adoption_mod.ParkedWorkerTracker):
+        def __init__(self) -> None:
+            super().__init__()
+            trackers.append(self)
+
+    calls: list[dict[str, object]] = []
+
+    def _adopt(*_args: object, **kwargs: object) -> list[object]:
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(adoption_mod, "ParkedWorkerTracker", _Tracker)
+    monkeypatch.setattr(adoption_mod, "adopt_running_workers", _adopt)
+
+    _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+    [tracker] = trackers
+    [kwargs] = calls
+    assert kwargs["on_park"] == tracker.note_park
 
 
 def test_daemon_adopts_healthy_worker_and_shields_from_demotion(

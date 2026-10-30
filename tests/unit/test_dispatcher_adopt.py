@@ -35,6 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1084,16 +1085,24 @@ def _seed_adopted(queue_dir: Path, lines: list[str]) -> tuple[Task, TaskState]:
     return task, _seed_running(queue_dir, task, log_path=log, started_at=_STARTED)
 
 
-def _adopt(queue_dir: Path, task: Task, state: TaskState) -> DispatchOutcome:
+def _adopt(
+    queue_dir: Path,
+    task: Task,
+    state: TaskState,
+    *,
+    caps: TaskCapsSettings | None = None,
+    on_park: Callable[[TaskState, str], None] | None = None,
+) -> DispatchOutcome:
     return adopt_worker(
         task=task,
         state=state,
         queue_dir=queue_dir,
         clock=FakeClock(_RESTART),
-        settings_caps=_caps(),
+        settings_caps=caps if caps is not None else _caps(),
         settings_dispatch=_SETTINGS.dispatch,
         settings_hooks=_SETTINGS.hooks,
         sleep_fn=lambda _s: None,
+        on_park=on_park,
     )
 
 
@@ -1127,6 +1136,57 @@ def test_adopt_loop_raising_mid_run_stops_the_worker_and_records_a_failure(
     )
     assert reloaded.session_id == "sess-adopt"
     assert (reloaded.pid, reloaded.log_path) == (None, None)
+
+
+def test_adopt_loop_raising_before_the_first_line_stops_the_worker(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """The loop raises before it reads a line. The worker is stopped and the
+    run is recorded from its log, re-read after the stop: failed with
+    dispatch_loop_error, with the session id the log holds."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+    raise_in_dispatch_loop(0)
+
+    outcome = _adopt(queue_dir, task, state)
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: boom",
+    )
+    assert reloaded.session_id == "sess-adopt"
+
+
+def test_adopt_monitor_thread_that_cannot_start_stops_the_worker(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher-alive monitor's thread cannot start. The adopted worker
+    is stopped, and its run fails with dispatch_loop_error naming the
+    error."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+
+    def _cannot_start(_monitor: object) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(dispatcher_mod._DispatcherAliveMonitor, "start", _cannot_start)
+
+    outcome = _adopt(queue_dir, task, state)
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: can't start new thread",
+    )
 
 
 def test_adopt_terminal_result_written_before_the_loop_raised_stands(
@@ -1164,13 +1224,15 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
 ) -> None:
     """The worker survives SIGTERM and SIGKILL, so it may still run: the
     attempt is not recorded as over. The task is parked possibly_hung with
-    the worker's pid, and adopt_worker raises."""
+    the worker's pid, the park goes to ``on_park``, and adopt_worker
+    raises."""
     task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
     worker = _AdoptedWorker(monkeypatch, survives=True)
     raise_in_dispatch_loop(1)
+    parks: list[tuple[TaskState, str]] = []
 
     with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
-        _adopt(queue_dir, task, state)
+        _adopt(queue_dir, task, state, on_park=lambda parked, why: parks.append((parked, why)))
 
     assert str(exc_info.value) == (
         f"task {task.id}: dispatch loop raised RuntimeError: boom; "
@@ -1181,6 +1243,75 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == _PID
     assert reloaded.runs == []
+    assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
+
+
+def test_adopt_park_stands_down_for_a_record_another_writer_made(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """While the stop fails, a reaper records the task. Its record wins: the
+    park is not written or reported, and adopt_worker raises, saying so."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch, survives=True)
+    reaped = state.model_copy(
+        update={"status": "failed", "stop_reason": "killed_by_silent_reaper", "pid": None}
+    )
+    state_path = state_path_for(queue_dir, task.id)
+
+    def _signal_while_a_reaper_writes(pid: int, sig: int) -> None:
+        write_state_atomic(reaped, state_path)
+        worker.signals.append((pid, sig))
+
+    monkeypatch.setattr(dispatcher_mod, "_signal_group_by_pid", _signal_while_a_reaper_writes)
+    raise_in_dispatch_loop(1)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _adopt(queue_dir, task, state, on_park=lambda parked, why: parks.append((parked, why)))
+
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={_PID} "
+        "could not be stopped and another writer had already recorded its task as failed"
+    )
+    assert worker.signals == [(_PID, signal.SIGTERM), (_PID, signal.SIGKILL)]
+    assert load_state(state_path) == reaped
+    assert parks == []
+
+
+def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loop's cap kill raises, which ends the loop. The stop after it
+    ends the worker, and the run is killed by the cap it exceeded, not a
+    dispatch_loop_error naming the failed kill."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+    real_kill = dispatcher_mod._terminate_by_pid
+    calls: list[int] = []
+
+    def _fails_once(pid: int, **kwargs: Any) -> None:
+        calls.append(pid)
+        if len(calls) == 1:
+            raise RuntimeError("signal failed")
+        real_kill(pid, **kwargs)
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate_by_pid", _fails_once)
+
+    outcome = _adopt(
+        queue_dir, task, state, caps=_caps().model_copy(update={"max_tokens_per_task": 50})
+    )
+
+    assert (calls, worker.signals) == ([_PID, _PID], [(_PID, signal.SIGTERM)])
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap, run.error) == (
+        "killed_by_cap",
+        "tokens",
+        "tokens cap exceeded: 100 > 50",
+    )
 
 
 def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
@@ -1189,8 +1320,9 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     raise_in_dispatch_loop: Callable[[int | None], None],
 ) -> None:
     """The recorded pid comes from a state file. When the identity check says
-    it now belongs to another process, the worker is gone: nothing is
-    signalled, and the run is recorded as a dispatch_loop_error failure."""
+    it now belongs to another process, the worker has exited on its own:
+    nothing is signalled, and the run is its own, a crash with no terminal
+    result, not a dispatch_loop_error."""
     task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
     answers = [dispatcher_mod.WorkerProbe.ALIVE]
 
@@ -1207,7 +1339,12 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     outcome = _adopt(queue_dir, task, state)
 
     assert signals == []
-    assert (outcome.new_state.status, outcome.run_record.stop_reason) == (
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
         "failed",
-        "dispatch_loop_error",
+        "process_exit_nonzero",
+        "claude exited with code -1 and no result event",
     )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.pid) == ("process_exit_nonzero", _PID)

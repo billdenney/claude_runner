@@ -1279,7 +1279,9 @@ def force_dispatch(
     ``--allow-live-worker`` is not given, if the queue's ``[effort_levels]`` rejects its
     (model, effort) pair, if one of its ``requires`` elements is unmet
     (ADR-0030), or if the pre-dispatch hook fails during the synchronous
-    path.
+    path. The synchronous path also exits non-zero when the dispatch loop
+    fails and the worker cannot be stopped: the task is then parked
+    ``possibly_hung`` with that worker on record.
     """
     console = Console()
     qd = require_queue_option(queue_dir, console, json=json)
@@ -1440,7 +1442,9 @@ def force_dispatch(
             claude_executable=settings.claude.executable,
             allow_live_worker=allow_live_worker,
         )
-    except fd_mod.ForceDispatchError as exc:
+    except (fd_mod.ForceDispatchError, dispatcher_mod.DispatchError) as exc:
+        # DispatchError: the dispatch loop failed and the worker could not be
+        # stopped, so the task is parked with it on record.
         msg = str(exc)
         if json:
             print(_json.dumps({"ok": False, "error": msg}))
