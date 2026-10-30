@@ -331,3 +331,52 @@ def test_a_silence_kill_that_raises_leaves_its_cap_with_the_caller() -> None:
         )
 
     assert cap_kill.violation == CapViolation(which="duration", observed=1000.0, cap=900.0)
+
+
+def test_the_session_is_recorded_once_when_claude_reports_it() -> None:
+    """The init event's session id goes to session_persist_fn at once, and
+    the events after it do not send it again."""
+    clock = FakeClock(_START)
+    recorded: list[str] = []
+
+    _dispatch_loop(
+        lines=[_init(), _assistant(), _assistant(), _result()],
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        session_persist_fn=recorded.append,
+    )
+
+    assert recorded == ["sess-loop"]
+
+
+def test_a_session_that_cannot_be_recorded_is_logged_and_the_loop_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock(_START)
+
+    def _fails(_session_id: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.runner.dispatcher"):
+        summary, violation = _dispatch_loop(
+            lines=[_init(), _assistant(), _result()],
+            terminate=lambda: None,
+            settings_caps=_caps(),
+            clock=clock,
+            task=_task(),
+            started_at=_START,
+            session_persist_fn=_fails,
+        )
+
+    assert (summary.session_id, summary.final_result is not None, violation) == (
+        "sess-loop",
+        True,
+        None,
+    )
+    assert [r.getMessage() for r in caplog.records] == [
+        "task t-loop: could not record session sess-loop in its running state "
+        "([Errno 28] No space left on device); the run records it when it ends"
+    ]

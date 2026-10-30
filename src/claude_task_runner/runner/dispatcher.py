@@ -1126,6 +1126,7 @@ def _dispatch_loop(
     heartbeat_persist_fn: Callable[[datetime], None] | None = None,
     summary: StreamSummary | None = None,
     cap_kill: _CapKill | None = None,
+    session_persist_fn: Callable[[str], None] | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the stream ends or we kill it.
 
@@ -1161,6 +1162,12 @@ def _dispatch_loop(
     second) from thrashing the filesystem — one write per interval
     is enough since the interval is well below
     ``heartbeat_silence_alert_s``.
+
+    ``session_persist_fn``, when supplied, is invoked with each session id
+    claude reports that it was not yet invoked with (in practice, once, at
+    the init event), so the running state names the session before the
+    run ends: a re-dispatch after a supervisor that died mid-run resumes it.
+    A failure is logged, and the run records the session when it ends.
     """
     summary = summary if summary is not None else StreamSummary()
     cap_kill = cap_kill if cap_kill is not None else _CapKill()
@@ -1172,6 +1179,7 @@ def _dispatch_loop(
     # measures. A tool_progress line counts, so a long tool call is not
     # silence; the stuck-sleep-loop reaper deals with a stuck one.
     last_line_at = clock.now()
+    recorded_session_id: str | None = None
 
     def _lines_until_a_time_cap() -> Iterator[str]:
         nonlocal last_line_at
@@ -1258,6 +1266,23 @@ def _dispatch_loop(
                     heartbeat_persist_failures,
                 )
             last_persist_at = last_heartbeat
+
+        if (
+            session_persist_fn is not None
+            and summary.session_id is not None
+            and summary.session_id != recorded_session_id
+        ):
+            recorded_session_id = summary.session_id
+            try:
+                session_persist_fn(summary.session_id)
+            except Exception as exc:
+                logger.warning(
+                    "task %s: could not record session %s in its running state (%s); "
+                    "the run records it when it ends",
+                    task.id,
+                    summary.session_id,
+                    exc,
+                )
 
         # After each event, check caps. An event is no silence, so the
         # silence kill waits for a tick.
@@ -2098,6 +2123,9 @@ def dispatch(
     Side effects (when ``persist_state=True``, the default):
 
     * Writes pre-run state with ``status="running"``.
+    * Writes the session id and its host account into the running state
+      as soon as claude reports a new one, so a re-dispatch after a
+      supervisor that died mid-run resumes the session.
     * Writes post-run state with appended :class:`RunRecord`, updated
       ``status``, and refreshed ``session_id``.
     * When the worker cannot be started (no ``claude`` binary,
@@ -2439,7 +2467,20 @@ def dispatch(
                 new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
                 write_state_atomic(new_state, state_path)
 
+        def _persist_session(session_id: str) -> None:
+            nonlocal new_state
+            with state_lock:
+                if session_id == new_state.session_id:
+                    return  # a resumed session, already on record
+                # A new session is hosted on the account it runs on
+                # (ADR-0024), as _finalize_state records it at the end.
+                new_state = new_state.model_copy(
+                    update={"session_id": session_id, "session_account": account}
+                )
+                write_state_atomic(new_state, state_path)
+
         heartbeat_persist_fn = _persist_heartbeat
+        session_persist_fn: Callable[[str], None] | None = _persist_session
         alive_monitor = _DispatcherAliveMonitor(
             persist_fn=_persist_alive,
             clock=clock,
@@ -2448,6 +2489,7 @@ def dispatch(
         )
     else:
         heartbeat_persist_fn = None
+        session_persist_fn = None
         alive_monitor = None
 
     # Build the line source + terminate callback for the loop. Both
@@ -2485,6 +2527,7 @@ def dispatch(
             heartbeat_persist_fn=heartbeat_persist_fn,
             summary=summary,
             cap_kill=cap_kill,
+            session_persist_fn=session_persist_fn,
         )
     except Exception as exc:
         # Escaping here would leave the worker running unsupervised and its
@@ -2764,6 +2807,16 @@ def adopt_worker(
             new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
             write_state_atomic(new_state, state_path)
 
+    def _persist_session(session_id: str) -> None:
+        nonlocal new_state
+        with state_lock:
+            if session_id == new_state.session_id:
+                return  # recorded by the supervisor that started the worker
+            new_state = new_state.model_copy(
+                update={"session_id": session_id, "session_account": account}
+            )
+            write_state_atomic(new_state, state_path)
+
     alive_monitor = _DispatcherAliveMonitor(
         persist_fn=_persist_alive,
         clock=clock,
@@ -2792,6 +2845,7 @@ def adopt_worker(
             started_at=started_at,
             heartbeat_persist_fn=_persist_heartbeat,
             cap_kill=cap_kill,
+            session_persist_fn=_persist_session,
         )
     except Exception as exc:
         # As in dispatch(): escaping here would leave the worker unwatched

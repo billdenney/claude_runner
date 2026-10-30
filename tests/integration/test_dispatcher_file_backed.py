@@ -548,6 +548,46 @@ def test_a_terminal_result_written_before_the_loop_raised_stands(
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_the_running_state_names_the_session_before_the_run_ends(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    adopt: bool,
+) -> None:
+    """A supervisor that dies mid-run leaves the state running; the next
+    dispatch resumes the session only if the state names it. So the
+    session id and its host account are written while the worker runs."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-early")
+    real_write = dispatcher_mod.write_state_atomic
+    writes: list[tuple[str, str | None, str | None]] = []
+
+    def _spy(state: TaskState, path: Path) -> None:
+        writes.append((state.status, state.session_id, state.session_account))
+        real_write(state, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+
+    outcome = dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=fresh_plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=_caps(),
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+        account="personal",
+    )
+    assert isinstance(outcome, DispatchOutcome)
+
+    assert ("running", "sess-early", "personal") in writes
+    assert writes[-1] == ("completed", "sess-early", "personal")
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
 def test_a_terminal_result_read_ahead_of_the_loop_error_stands(
     queue_dir: Path,
     task: Task,

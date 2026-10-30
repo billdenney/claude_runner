@@ -36,8 +36,9 @@ a present ``session_id`` and a still-existing
 The end-to-end recovery:
 
 1. Supervisor dies. ``TaskState.status == "running"`` on disk.
-   ``TaskState.session_id`` was already written by the dispatcher
-   when claude reported the session on its first stream-json event.
+   ``TaskState.session_id`` was already written, with the account that
+   hosts it, when claude reported the session in its init event: the
+   dispatch loop records it at once (``session_persist_fn``).
 2. New supervisor starts. :func:`reconcile_orphans` runs early.
 3. Orphan's status is demoted to ``"failed"``,
    ``stop_reason="orphaned_by_supervisor_restart"``.
@@ -56,8 +57,8 @@ The end-to-end recovery:
 
 Edge cases:
 
-* ``session_id`` never recorded (claude crashed before first stream-
-  json event): ``plan_next_spawn`` falls back to FRESH.
+* ``session_id`` never recorded (claude crashed before its init event,
+  or the write failed): ``plan_next_spawn`` falls back to FRESH.
 * JSONL missing (Claude Code's projects dir was cleaned up):
   ``plan_next_spawn`` falls back to FRESH.
 * The previous supervisor was actually still alive when this one

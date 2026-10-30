@@ -1369,6 +1369,39 @@ def test_adopt_worker_that_writes_nothing_more_is_stopped_at_its_duration_cap(
     )
 
 
+def test_adopt_records_the_session_while_the_worker_runs(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state left by a supervisor that did not record the session gets it
+    from the log's init event, with the account the worker runs on, before
+    the run ends."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    assert state.session_id is None
+    _AdoptedWorker(monkeypatch, alive=False)
+    real_write = dispatcher_mod.write_state_atomic
+    writes: list[tuple[str, str | None, str | None]] = []
+
+    def _spy(written: TaskState, path: Path) -> None:
+        writes.append((written.status, written.session_id, written.session_account))
+        real_write(written, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+
+    adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        clock=FakeClock(_RESTART),
+        settings_caps=_caps(),
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        account="work",
+        sleep_fn=lambda _s: None,
+    )
+
+    assert ("running", "sess-adopt", "work") in writes
+
+
 def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     queue_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
