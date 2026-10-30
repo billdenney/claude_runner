@@ -496,6 +496,32 @@ def test_check_dispatch_pct_legacy_per_account_with_throttle_fails(
     assert str(cfg_dir / "runner-account.toml") in result.remediation
 
 
+def test_check_dispatch_pct_legacy_passes_over_a_toml_that_does_not_load(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """tomllib raises a bare ValueError for an integer past the digit limit.
+    check_account_policies reports that file; this check passes over it."""
+    from claude_task_runner.doctor.checks import check_account_policies, check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "personal"
+    cfg_dir.mkdir()
+    path = cfg_dir / "runner-account.toml"
+    path.write_text(f"[concurrency]\nmax_concurrency = {PAST_DIGIT_LIMIT}\n", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="personal", config_dir=str(cfg_dir))])
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+    policies = check_account_policies(s)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 1 TOML(s)",
+    )
+    assert (policies.status, policies.remediation) == (
+        CheckStatus.FAIL,
+        f"personal: Invalid TOML in {path}: {digit_limit_error()}",
+    )
+
+
 def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
     settings: Settings, queue_dir: Path
 ) -> None:

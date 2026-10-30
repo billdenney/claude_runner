@@ -101,8 +101,10 @@ def read_credentials(claude_config_dir: str = "") -> dict[str, str | tuple[str, 
     try:
         with path.open("rb") as fh:
             payload = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        # Missing, a parent that denies access, or not JSON.
+    except (OSError, ValueError):
+        # Missing, a parent that denies access, or not JSON: a ValueError is
+        # JSONDecodeError, bytes that are not UTF-8, or the bare one json
+        # raises for an integer past the interpreter's digit limit.
         return {}
     oauth = payload.get("claudeAiOauth")
     if not isinstance(oauth, dict):

@@ -82,7 +82,10 @@ def ensure_initialized(
 
     try:
         data = json.loads(config_file.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: JSONDecodeError, bytes the default encoding cannot
+        # decode, and the bare one json raises for an integer past the
+        # interpreter's digit limit.
         logger.debug("ensure_initialized: cannot parse %s: %s", config_file, exc)
         return False
     if not isinstance(data, dict):

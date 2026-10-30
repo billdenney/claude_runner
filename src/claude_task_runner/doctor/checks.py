@@ -411,9 +411,11 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
         try:
             with path.open("rb") as fh:
                 payload = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
-            # check_account_policies reports a file that does not load;
-            # only the legacy throttle key matters here.
+        except (OSError, ValueError):
+            # check_account_policies reports a file that does not load: the
+            # ValueError is TOMLDecodeError, UnicodeDecodeError, or the bare
+            # one tomllib raises for an integer past the digit limit. Only
+            # the legacy throttle key matters here.
             continue
         if "throttle" in payload:
             offenders.append(str(path))

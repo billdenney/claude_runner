@@ -24,6 +24,7 @@ from claude_task_runner.queue.sidecar import (
 )
 from claude_task_runner.queue.store import queue_runtime_dir
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 from ._sidecar_files import write_request
 
 
@@ -199,6 +200,17 @@ class TestAnswer:
         )
         assert result.exit_code != 0
         assert "invalid JSON" in (result.stdout + result.stderr)
+
+    def test_an_integer_past_the_digit_limit_is_invalid_json(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """json raises a bare ValueError for it, not JSONDecodeError."""
+        _seed_request(queue_dir, task_id="001", sequence=1)
+        answers = f'[{{"id": "q1", "value": {PAST_DIGIT_LIMIT}}}]'
+        result = runner.invoke(
+            app, ["answer", "001", "1", "--queue", str(queue_dir), "--answers", answers]
+        )
+        assert (result.exit_code, result.stderr) == (2, f"invalid JSON: {digit_limit_error()}\n")
 
     def test_must_supply_one_answers_source(self, runner: CliRunner, queue_dir: Path) -> None:
         _seed_request(queue_dir, task_id="001", sequence=1)

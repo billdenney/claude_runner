@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from claude_task_runner.usage.whoami import (
     IdentitySnapshot,
     credentials_path,
@@ -13,6 +15,8 @@ from claude_task_runner.usage.whoami import (
     from_credentials_only,
     read_credentials,
 )
+
+from ._digit_limit import PAST_DIGIT_LIMIT
 
 
 def _write_creds(
@@ -63,6 +67,18 @@ class TestReadCredentials:
 
     def test_invalid_json_returns_empty(self, tmp_path: Path) -> None:
         (tmp_path / ".credentials.json").write_text("{not json")
+        assert read_credentials(str(tmp_path)) == {}
+
+    @pytest.mark.parametrize(
+        "content",
+        [f'{{"claudeAiOauth": {{"n": {PAST_DIGIT_LIMIT}}}}}'.encode(), b"\xff{}"],
+        ids=["int-past-digit-limit", "not-utf8"],
+    )
+    def test_json_that_raises_a_bare_value_error_returns_empty(
+        self, tmp_path: Path, content: bytes
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError."""
+        (tmp_path / ".credentials.json").write_bytes(content)
         assert read_credentials(str(tmp_path)) == {}
 
     def test_missing_oauth_section_returns_empty(self, tmp_path: Path) -> None:

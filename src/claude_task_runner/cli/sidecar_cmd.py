@@ -292,7 +292,9 @@ def answer_sidecar(
 
     try:
         raw = _json.loads(text)
-    except _json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # JSONDecodeError, and the bare ValueError json raises for an integer
+        # past the interpreter's digit limit.
         sys.stderr.write(f"invalid JSON: {exc}\n")
         raise typer.Exit(code=2) from exc
 

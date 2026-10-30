@@ -59,6 +59,8 @@ from claude_task_runner.usage.source import (
     FakeUsageSource,
 )
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 # ---------------------------------------------------------------------------
 # _headers_to_reading — pure parsing path. All these tests are
 # deterministic and free of I/O.
@@ -295,6 +297,17 @@ def test_read_oauth_token_invalid_json_raises(tmp_path: Path) -> None:
     (config_dir / ".credentials.json").write_text("not json {", encoding="utf-8")
     with pytest.raises(CredentialsNotFound):
         _read_oauth_token(str(config_dir))
+
+
+def test_read_oauth_token_integer_past_the_digit_limit_raises(tmp_path: Path) -> None:
+    """json raises a bare ValueError for it, not JSONDecodeError."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    creds = config_dir / ".credentials.json"
+    creds.write_text(f'{{"claudeAiOauth": {{"expiresAt": {PAST_DIGIT_LIMIT}}}}}', encoding="utf-8")
+    with pytest.raises(CredentialsNotFound) as raised:
+        _read_oauth_token(str(config_dir))
+    assert str(raised.value) == f"could not read {creds}: {digit_limit_error()}"
 
 
 def test_read_oauth_token_no_matching_key_raises(tmp_path: Path) -> None:

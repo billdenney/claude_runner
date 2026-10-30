@@ -2,21 +2,40 @@
 
 Shared by ``test_expanduser_gate`` (``expanduser`` only in
 ``config/paths.py``), ``test_cli_settings_gate`` (the CLI loads the queue
-TOML only through ``load_settings_or_exit``) and ``test_fromtimestamp_gate``
-(``fromtimestamp`` only in ``clock.utc_from_timestamp``). Each gate keeps
-known-answer tests of the scanner: one that finds nothing would pass
-everything.
+TOML only through ``load_settings_or_exit``), ``test_fromtimestamp_gate``
+(``fromtimestamp`` only in ``clock.utc_from_timestamp``) and
+``test_parse_error_gate`` (every JSON, TOML and YAML parse catches
+``ValueError``). Each gate keeps known-answer tests of the scanner: one that
+finds nothing would pass everything.
 """
 
 from __future__ import annotations
 
 import ast
 from collections import Counter
+from collections.abc import Collection
 
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
-def references_by_scope(source: str, name: str) -> Counter[str]:
+def _catches(node: ast.Try | ast.TryStar, names: Collection[str]) -> bool:
+    """Whether a handler of ``node`` is a bare ``except`` or names one of ``names``."""
+    for handler in node.handlers:
+        if handler.type is None:
+            return True
+        types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+        if any(isinstance(t, ast.Name) and t.id in names for t in types):
+            return True
+    return False
+
+
+def references_by_scope(
+    source: str,
+    name: str,
+    *,
+    module: str | None = None,
+    unless_caught: Collection[str] = (),
+) -> Counter[str]:
     """How often each scope in ``source`` refers to the function ``name``.
 
     A reference is any attribute ``<expr>.name``, called or not, so
@@ -26,29 +45,67 @@ def references_by_scope(source: str, name: str) -> Counter[str]:
     itself does not count. The key is the qualified name of
     the innermost enclosing function or class (``Class.method``,
     ``outer.inner``), ``<module>`` at the top level.
+
+    With ``module``, only references through that module count:
+    ``module.name`` after ``import module``, ``alias.name`` after ``import
+    module as alias``, and the bare names that ``from module import name``
+    binds.
+
+    With ``unless_caught`` (exception names), a reference in the body of a
+    ``try`` does not count when one of its handlers names one of them or is
+    a bare ``except``. Only the body is covered, not the handlers, ``else``
+    or ``finally``; and a ``try`` covers nothing in a function, class or
+    lambda defined in its body, each of which is checked on its own.
     """
     tree = ast.parse(source)
+    receivers = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == module
+    }
     aliases = {
         alias.asname or alias.name
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
+        and (module is None or (node.module == module and node.level == 0))
         for alias in node.names
         if alias.name == name
     }
     counts: Counter[str] = Counter()
 
-    def visit(node: ast.AST, scope: str | None) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, _SCOPES):
-                visit(child, f"{scope}.{child.name}" if scope else child.name)
-                continue
-            if (isinstance(child, ast.Attribute) and child.attr == name) or (
-                isinstance(child, ast.Name)
-                and isinstance(child.ctx, ast.Load)
-                and child.id in aliases
-            ):
-                counts[scope or "<module>"] += 1
-            visit(child, scope)
+    def visit(node: ast.AST, scope: str | None, caught: bool) -> None:
+        for field, value in ast.iter_fields(node):
+            for child in value if isinstance(value, list) else [value]:
+                if not isinstance(child, ast.AST):
+                    continue
+                if isinstance(child, _SCOPES):
+                    visit(child, f"{scope}.{child.name}" if scope else child.name, False)
+                    continue
+                if isinstance(child, ast.Lambda):
+                    visit(child, scope, False)
+                    continue
+                covered = caught or (
+                    bool(unless_caught)
+                    and field == "body"
+                    and isinstance(node, ast.Try | ast.TryStar)
+                    and _catches(node, unless_caught)
+                )
+                if not covered and (
+                    (
+                        isinstance(child, ast.Attribute)
+                        and child.attr == name
+                        and (module is None or ast.unparse(child.value) in receivers)
+                    )
+                    or (
+                        isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                        and child.id in aliases
+                    )
+                ):
+                    counts[scope or "<module>"] += 1
+                visit(child, scope, covered)
 
-    visit(tree, None)
+    visit(tree, None, False)
     return counts
