@@ -26,6 +26,7 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
 
@@ -937,6 +938,33 @@ class TestForceDispatchCLI:
             result = runner_cli.invoke(app, ["force-dispatch", "t1", "--queue", str(queue_dir)])
         assert result.exit_code == 2
         assert "force-dispatch failed" in result.stdout
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["human", "json"])
+    def test_a_worker_the_dispatch_could_not_stop_is_reported(
+        self, queue_dir: Path, runner_cli: CliRunner, as_json: bool
+    ) -> None:
+        """dispatch() raises DispatchError when its loop failed and it could
+        not stop the worker, having parked the task. That is reported as the
+        refusals are, exit 2, not as a traceback."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        message = (
+            "task t1: dispatch loop raised RuntimeError: boom; worker pid=4242 "
+            "could not be stopped and is parked"
+        )
+        with patch(
+            "claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously",
+            side_effect=dispatcher_mod.DispatchError(message),
+        ):
+            result = runner_cli.invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), *(["--json"] * as_json)]
+            )
+        assert result.exit_code == 2
+        if as_json:
+            assert json.loads(result.stdout) == {"ok": False, "error": message}
+        else:
+            assert " ".join(result.stdout.split()) == f"force-dispatch failed: {message}"
 
     def test_supervised_picked_up_human_output(
         self, queue_dir: Path, runner_cli: CliRunner
