@@ -19,11 +19,17 @@ _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
 def _does_nothing(handler: ast.ExceptHandler) -> bool:
-    """Whether ``handler`` only re-raises (a bare ``raise``) or passes: the
-    error then escapes, or vanishes without a word."""
+    """Whether ``handler`` only re-raises what it caught (``raise``, or
+    ``raise exc`` of its own name) or passes: the error then escapes, or
+    vanishes without a word."""
     return all(
         isinstance(stmt, ast.Pass)
-        or (isinstance(stmt, ast.Raise) and stmt.exc is None)
+        or (
+            isinstance(stmt, ast.Raise)
+            and (
+                stmt.exc is None or (isinstance(stmt.exc, ast.Name) and stmt.exc.id == handler.name)
+            )
+        )
         or (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
         for stmt in handler.body
     )

@@ -23,15 +23,20 @@ _seen: dict[Hashable, None] = {}
 _lock = threading.Lock()
 
 
-def first_time(key: Hashable) -> bool:
-    """``True`` the first time this process asks about ``key``, ``False`` after.
+def first_time(name: str, *parts: Hashable) -> bool:
+    """``True`` the first time this process asks about ``(name, *parts)``,
+    ``False`` after, until the record forgets it.
 
-    Once per process: a warning keyed on a file's state stays quiet when that
-    state goes away and comes back. Start the key with a name for the
-    warning, such as ``("retired_task_key", path, key)``, so that two
-    warnings about the same thing do not silence each other. Safe to call
-    from several threads.
+    ``name`` names the warning, so that two warnings about the same thing do
+    not silence each other; ``parts`` say what it is about, such as
+    ``first_time("retired_task_key", path, key)``. Once per process: a
+    warning keyed on a file's state stays quiet when that state goes away
+    and comes back. The record keeps the :data:`MAX_KEYS` keys added last
+    and forgets the oldest first, however recently it was asked about, so
+    more keys than that, asked about in turn, give ``True`` every time.
+    Safe to call from several threads.
     """
+    key = (name, *parts)
     with _lock:
         if key in _seen:
             return False

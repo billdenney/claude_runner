@@ -440,7 +440,7 @@ def _latest_mtime_in_tree(
             mtime = stat.st_mtime
             problem = _mtime_problem(mtime, now)
             if problem is not None:
-                if first_time(("reaper_walk", entry.path, mtime)):
+                if first_time("reaper_walk", entry.path, mtime):
                     unreported[problem] += 1
                     examples.setdefault(problem, entry.path)
             elif latest is None or mtime > latest:
@@ -1037,7 +1037,7 @@ def _log_written_at(state: TaskState, now: datetime) -> datetime | None:
     written_at = file_mtime_utc(state.log_path, consequence=consequence)
     if written_at is None or written_at - now <= _FUTURE_MTIME_SLACK:
         return written_at
-    if first_time(("future_log_mtime", state.log_path, written_at)):
+    if first_time("future_log_mtime", state.log_path, written_at):
         logger.warning(
             "%s is dated %s, after now (%s); %s",
             state.log_path,

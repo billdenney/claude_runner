@@ -37,7 +37,7 @@ def file_mtime_utc(path: str | os.PathLike[str], *, consequence: str) -> datetim
     try:
         return utc_from_timestamp(mtime)
     except TimestampOutOfRange as exc:
-        if first_time(("file_mtime_utc", consequence, os.fspath(path), mtime)):
+        if first_time("file_mtime_utc", consequence, os.fspath(path), mtime):
             logger.warning(
                 "%s has an mtime no datetime can hold (%s); %s", os.fspath(path), exc, consequence
             )

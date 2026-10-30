@@ -286,8 +286,9 @@ def answer_sidecar(
     else:
         assert answers_file is not None
         try:
-            # Bytes, which json decodes as UTF-8 itself, so a file that is
-            # not UTF-8 is invalid JSON below.
+            # Bytes: json works out UTF-8, UTF-16 or UTF-32 (with or without
+            # a byte-order mark) and decodes them itself, so bytes in none of
+            # them fail below, as invalid JSON.
             text = answers_file.read_bytes()
         except OSError as exc:
             sys.stderr.write(f"failed to read {answers_file}: {exc}\n")

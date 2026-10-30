@@ -523,6 +523,36 @@ def test_check_dispatch_pct_legacy_passes_over_a_toml_that_does_not_load(
     )
 
 
+def test_check_dispatch_pct_legacy_counts_only_the_tomls_it_read(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """Of two account files, one loads and one does not: the detail counts
+    the one it read and says it left the other out."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    good = tmp_path / "personal"
+    good.mkdir()
+    (good / "runner-account.toml").write_text("[concurrency]\nmax_concurrency = 2\n")
+    bad = tmp_path / "work"
+    bad.mkdir()
+    (bad / "runner-account.toml").write_text("[concurrency\n")
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(name="personal", config_dir=str(good)),
+            AccountSettings(name="work", config_dir=str(bad)),
+        ],
+    )
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 1 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
+    )
+
+
 def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
     settings: Settings, queue_dir: Path
 ) -> None:
