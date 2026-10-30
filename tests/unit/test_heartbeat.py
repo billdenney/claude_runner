@@ -100,10 +100,8 @@ class TestEvaluate:
             )
 
     def test_baseline_picks_max(self) -> None:
-        # If last_heartbeat is in the past relative to started_at (a
-        # non-real-world quirk), evaluate() uses last_heartbeat as
-        # baseline (whichever lets us measure silence from the most
-        # recent confirmed liveness).
+        """A heartbeat after the start is the baseline: silence runs from the
+        most recent confirmed liveness."""
         s = _settings(alert=300)
         started = self._now()
         last_hb = self._now() + timedelta(seconds=400)
@@ -114,8 +112,21 @@ class TestEvaluate:
             started_at=started,
             now=now,
         )
-        # silence = 600 - 400 = 200 -> healthy
-        assert status.verdict is HeartbeatVerdict.HEALTHY
+        assert (status.verdict, status.silence_s) == (HeartbeatVerdict.HEALTHY, 200.0)
+
+    def test_a_heartbeat_from_before_the_start_is_not_the_baseline(self) -> None:
+        """A heartbeat older than the start belongs to an earlier attempt.
+        Measured from it, the silence would take in the gap between the
+        attempts, and a run that has just started would be killed."""
+        s = _settings(alert=300, kill=900)
+        started = self._now()
+        status = evaluate(
+            settings=s,
+            last_heartbeat_at=started - timedelta(hours=2),
+            started_at=started,
+            now=started + timedelta(seconds=60),
+        )
+        assert (status.verdict, status.silence_s) == (HeartbeatVerdict.HEALTHY, 60.0)
 
 
 _STARTED_AT = datetime(2026, 5, 3, 18, 0, tzinfo=UTC)

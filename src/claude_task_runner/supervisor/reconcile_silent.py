@@ -93,15 +93,13 @@ Heartbeat baseline correction
 -----------------------------
 ``last_heartbeat_at`` may be from a PRIOR (finished) run — it sits
 before ``last_started_at`` until the dispatcher's first per-event
-persist lands. Naively passing that into
-:func:`runner.heartbeat.evaluate` would inflate the silence window
-(``now - last_heartbeat_at`` includes the entire current run plus
-all the time between the prior run and this one). This module guards
-against that by treating any ``last_heartbeat_at`` older than
-``last_started_at`` as if no heartbeat had landed yet — the evaluator
-then falls back to ``last_started_at`` as the baseline, which is the
-correct conservative answer for "what's the most recent confirmed
-liveness signal."
+persist lands. Measured from it, the silence window would include the
+entire current run plus all the time between the prior run and this
+one. :func:`runner.heartbeat.evaluate` therefore measures from the later
+of ``last_heartbeat_at`` and ``started_at``, and this module also reads
+any ``last_heartbeat_at`` older than ``last_started_at`` as if no
+heartbeat had landed yet, so ``last_started_at`` is the baseline: the
+most recent confirmed liveness signal.
 
 The same correction is applied to ``dispatcher_alive_at`` for the same
 reason.

@@ -76,7 +76,7 @@ def evaluate(
     if last_heartbeat_at is not None and last_heartbeat_at > now:
         raise ValueError("last_heartbeat_at cannot be in the future")
 
-    baseline = last_heartbeat_at if last_heartbeat_at is not None else started_at
+    baseline = started_at if last_heartbeat_at is None else max(last_heartbeat_at, started_at)
     silence = (now - baseline).total_seconds()
 
     kill_threshold = settings.heartbeat_silence_kill_s
