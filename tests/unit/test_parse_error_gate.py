@@ -14,10 +14,11 @@ than re-raise or pass (:func:`_reference_gate.references_by_scope`).
 why.
 
 It cannot see a parse it has no name for: ``getattr(json, "loads")``, a
-decoder made elsewhere and passed in, a module reached through an
-attribute (``self.json.loads``), or the Python the skills' shell scripts
-embed. Nor does it see the read before a parse: a text read that decodes
-UTF-8 raises the same ``UnicodeDecodeError`` before json is called.
+decoder made elsewhere and passed in, ``json.decoder.JSONDecoder`` reached
+through the submodule, a module reached through an attribute
+(``self.json.loads``), or the Python the skills' shell scripts embed. Nor
+does it see the read before a parse: a text read that decodes UTF-8 raises
+the same ``UnicodeDecodeError`` before json is called.
 """
 
 from __future__ import annotations
@@ -69,17 +70,22 @@ with that caller named in the reason."""
 
 def unguarded(source: str) -> Counter[str]:
     """How often each scope in ``source`` refers to a parse function outside
-    a ``try`` that catches ``ValueError``. ``from json import *`` (or of
-    another parsing module) counts at the top level: it binds every parse
-    function under a name this cannot follow."""
+    a ``try`` that catches ``ValueError``.
+
+    A ``*_load_all`` counts wherever it is: it returns a generator that
+    parses as it is consumed, which may be after the ``try``. ``from json
+    import *`` (or of another parsing module) counts at the top level: it
+    binds every parse function under a name this cannot follow."""
     counts: Counter[str] = Counter()
     for module, names in PARSERS.items():
         for name in names:
-            counts += references_by_scope(source, name, module=module, unless_caught=GUARDS)
+            caught = () if name.endswith("_all") else GUARDS
+            counts += references_by_scope(source, name, module=module, unless_caught=caught)
     counts["<module>"] += sum(
         1
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.ImportFrom)
+        and node.level == 0
         and node.module in PARSERS
         and any(alias.name == "*" for alias in node.names)
     )
@@ -219,13 +225,11 @@ def test_every_spelling_of_a_parse_counts_in_its_scope() -> None:
 
 def test_the_other_parsing_names_count() -> None:
     """PyYAML's full and unsafe loaders and a ``JSONDecoder``, whose
-    ``decode`` and ``raw_decode`` parse, count in their scope; ``from json
-    import *`` counts at the top level."""
+    ``decode`` and ``raw_decode`` parse, count in their scope."""
     source = textwrap.dedent(
         """
         import json
         import yaml
-        from json import *
 
         def others(text):
             yaml.full_load_all(text)
@@ -234,12 +238,45 @@ def test_the_other_parsing_names_count() -> None:
             return json.JSONDecoder().raw_decode(text)
         """
     )
-    assert unguarded(source) == Counter({"others": 4, "<module>": 1})
+    assert unguarded(source) == Counter({"others": 4})
+
+
+def test_a_star_import_of_a_parsing_module_counts() -> None:
+    """Of each parsing module, at the top level; a relative import of a
+    module of the same name is another module."""
+    source = textwrap.dedent(
+        """
+        from json import *
+        from tomllib import *
+        from yaml import *
+        from .json import *
+        """
+    )
+    assert unguarded(source) == Counter({"<module>": 3})
+
+
+def test_a_load_all_counts_inside_the_try_too() -> None:
+    """It returns a generator that parses as it is consumed, which may be
+    after the ``try``."""
+    source = textwrap.dedent(
+        """
+        import yaml
+
+        def lazy(text):
+            try:
+                documents = yaml.safe_load_all(text)
+            except ValueError:
+                return []
+            return list(documents)
+        """
+    )
+    assert unguarded(source) == Counter({"lazy": 1})
 
 
 def test_a_handler_that_only_re_raises_or_passes_does_not_cover() -> None:
-    """The error then escapes, or vanishes without a word. A handler that
-    raises another error from it covers."""
+    """The error then escapes, or vanishes without a word: a bare ``raise``,
+    ``raise exc`` of what it caught, ``pass`` or only a string. A handler
+    that raises another error from it covers."""
     source = textwrap.dedent(
         """
         import json
@@ -250,11 +287,23 @@ def test_a_handler_that_only_re_raises_or_passes_does_not_cover() -> None:
             except ValueError:
                 raise
 
+        def reraises_by_name(text):
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise exc
+
         def passes(text):
             try:
                 return json.loads(text)
             except ValueError:
                 pass
+
+        def only_a_string(text):
+            try:
+                return json.loads(text)
+            except ValueError:
+                "nothing to do"
 
         def converts(text):
             try:
@@ -263,7 +312,9 @@ def test_a_handler_that_only_re_raises_or_passes_does_not_cover() -> None:
                 raise RuntimeError(text) from exc
         """
     )
-    assert unguarded(source) == Counter({"reraises": 1, "passes": 1})
+    assert unguarded(source) == Counter(
+        {"reraises": 1, "reraises_by_name": 1, "passes": 1, "only_a_string": 1}
+    )
 
 
 def test_a_parse_that_can_run_after_the_try_is_not_covered() -> None:
