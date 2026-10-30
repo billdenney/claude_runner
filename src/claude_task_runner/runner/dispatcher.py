@@ -1437,6 +1437,10 @@ def _name_loop_error(
     )
 
 
+_LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
+"""The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
+
+
 def _parked_after_loop_error(task_id: str, pid: int, loop_error: Exception) -> DispatchError:
     """The error a dispatch raises, from ``loop_error``, once it parked a
     worker it could not stop."""
@@ -1943,6 +1947,7 @@ def dispatch(
     persist_state: bool = True,
     adopt_workers: bool = False,
     spawn_gate: SpawnGate | None = None,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
 
@@ -1977,6 +1982,10 @@ def dispatch(
     the worker's pid is on record, so a stopping supervisor waits for
     that, and after the supervisor has closed it a daemon thread starts
     no worker. ``None`` (callers outside the supervisor) skips it.
+
+    ``on_park`` receives the park of a worker this dispatch could not stop
+    after its loop failed, with its ``why``, so the supervisor reports it as
+    it reports its other parks.
     """
     # A worker that cannot be started parks the task (_defer_unstartable):
     # the checks run before the ``running`` write below, and a process that
@@ -2342,10 +2351,10 @@ def dispatch(
         )
         if after is _AfterLoopError.RUNNING:
             if persist_state:
-                parked = park_live_worker(
-                    new_state, why="after its dispatch loop failed and it could not be stopped"
-                )
+                parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
                 write_state_atomic(parked, state_path_for(queue_dir, task.id))
+                if on_park is not None:
+                    on_park(parked, _LOOP_ERROR_PARK)
             raise _parked_after_loop_error(task.id, process.pid, loop_error) from loop_error
         if after is _AfterLoopError.STOPPED:
             stopped_for = loop_error
@@ -2481,6 +2490,7 @@ def adopt_worker(
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> DispatchOutcome:
     """Monitor a worker this supervisor did NOT spawn, to completion.
 
@@ -2515,6 +2525,10 @@ def adopt_worker(
     defaulted: the finalize applies the owned path's gates with them (see
     :func:`_finalize_adopted`), and a caller that leaves one out must fail
     rather than silently skip a gate.
+
+    ``on_park`` receives the park of a worker this monitor could not stop
+    after its loop failed, with its ``why``, so the supervisor reports it
+    as it reports its other parks.
     """
     started_at = state.last_started_at if state.last_started_at is not None else clock.now()
     log_path = Path(state.log_path) if state.log_path is not None else None
@@ -2619,13 +2633,10 @@ def adopt_worker(
             task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
         )
         if after is _AfterLoopError.RUNNING:
-            _write_unless_finalized(
-                park_live_worker(
-                    new_state, why="after its dispatch loop failed and it could not be stopped"
-                ),
-                state_path,
-                worker_pid=pid,
-            )
+            parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
+            written = _write_unless_finalized(parked, state_path, worker_pid=pid)
+            if written is parked and on_park is not None:
+                on_park(parked, _LOOP_ERROR_PARK)
             raise _parked_after_loop_error(task.id, pid, loop_error) from loop_error
         if after is _AfterLoopError.STOPPED:
             stopped_for = loop_error

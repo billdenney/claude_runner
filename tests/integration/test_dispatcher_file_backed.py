@@ -102,7 +102,14 @@ def reset_shim_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key)
 
 
-def _dispatch(queue_dir: Path, task: Task, plan: SpawnPlan, *, adopt: bool) -> object:
+def _dispatch(
+    queue_dir: Path,
+    task: Task,
+    plan: SpawnPlan,
+    *,
+    adopt: bool,
+    on_park: Callable[[TaskState, str], None] | None = None,
+) -> object:
     return dispatch(
         task=task,
         state=TaskState(task_id=task.id),
@@ -113,6 +120,7 @@ def _dispatch(queue_dir: Path, task: Task, plan: SpawnPlan, *, adopt: bool) -> o
         settings_hooks=_hooks(),
         claude_executable=str(SHIM_PATH),
         adopt_workers=adopt,
+        on_park=on_park,
     )
 
 
@@ -671,7 +679,8 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     """When the worker cannot be stopped it may still run, so the attempt is
     not recorded as over: the task is parked possibly_hung with the
     worker's pid, so it is not dispatched again and its run is recorded
-    once it exits, and dispatch raises."""
+    once it exits, and dispatch raises. The park goes to ``on_park``, to be
+    reported as the supervisor's other parks are."""
     monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
     raise_in_dispatch_loop(_INIT_LINES)
 
@@ -679,9 +688,16 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
         raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
 
     monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+    parks: list[tuple[TaskState, str]] = []
 
     with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
-        _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+        _dispatch(
+            queue_dir,
+            task,
+            fresh_plan,
+            adopt=adopt,
+            on_park=lambda state, why: parks.append((state, why)),
+        )
 
     [worker] = spawned
     assert worker.poll() is None
@@ -693,6 +709,7 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == worker.pid
     assert reloaded.runs == []
+    assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
 
 
 _TOKEN_CAP = 5

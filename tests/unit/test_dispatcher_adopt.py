@@ -1071,7 +1071,12 @@ def _seed_adopted(queue_dir: Path, lines: list[str]) -> tuple[Task, TaskState]:
 
 
 def _adopt(
-    queue_dir: Path, task: Task, state: TaskState, *, caps: TaskCapsSettings | None = None
+    queue_dir: Path,
+    task: Task,
+    state: TaskState,
+    *,
+    caps: TaskCapsSettings | None = None,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> DispatchOutcome:
     return adopt_worker(
         task=task,
@@ -1082,6 +1087,7 @@ def _adopt(
         settings_dispatch=_SETTINGS.dispatch,
         settings_hooks=_SETTINGS.hooks,
         sleep_fn=lambda _s: None,
+        on_park=on_park,
     )
 
 
@@ -1203,13 +1209,15 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
 ) -> None:
     """The worker survives SIGTERM and SIGKILL, so it may still run: the
     attempt is not recorded as over. The task is parked possibly_hung with
-    the worker's pid, and adopt_worker raises."""
+    the worker's pid, the park goes to ``on_park``, and adopt_worker
+    raises."""
     task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
     worker = _AdoptedWorker(monkeypatch, survives=True)
     raise_in_dispatch_loop(1)
+    parks: list[tuple[TaskState, str]] = []
 
     with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
-        _adopt(queue_dir, task, state)
+        _adopt(queue_dir, task, state, on_park=lambda parked, why: parks.append((parked, why)))
 
     assert str(exc_info.value) == (
         f"task {task.id}: dispatch loop raised RuntimeError: boom; "
@@ -1220,6 +1228,7 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == _PID
     assert reloaded.runs == []
+    assert parks == [(reloaded, "after its dispatch loop failed and it could not be stopped")]
 
 
 def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
