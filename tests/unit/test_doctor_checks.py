@@ -27,8 +27,10 @@ from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES, SkillState
 from claude_task_runner.cli.install_skills_cmd import app as install_skills_app
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import AccountSettings, Settings
+from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.cron.registry import queues_registry_path, register_queue
 from claude_task_runner.doctor.checks import (
+    CheckResult,
     CheckStatus,
     _current_username,
     _extract_paths,
@@ -1291,18 +1293,119 @@ def test_check_skills_installed_reports_broken_and_unchecked_together(
 # ---------------------------------------------------------------------------
 
 
-def test_check_watchdog_systemd_present(
-    settings: Settings, tmp_path: Path, queue_dir: Path
-) -> None:
-    fake_unit = tmp_path / "claude-task-runner.service"
-    fake_unit.write_text("[Unit]\n", encoding="utf-8")
+def _systemd_unit(
+    tmp_path: Path, settings: Settings, queue_dir: Path, *, exe: Path | None = None
+) -> tuple[Path, Path]:
+    """A unit as ``install`` writes it for ``queue_dir`` and ``settings``,
+    starting an executable stand-in for ``claude-task-runner``."""
+    if exe is None:
+        exe = tmp_path / "bin" / "claude-task-runner"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_text("#!/bin/sh\n", encoding="utf-8")
+        exe.chmod(0o755)
+    unit = tmp_path / "claude-task-runner.service"
+    unit.write_text(
+        systemd_mod.build_unit_text(
+            supervisor_command=f"{exe} supervisor start --queue {queue_dir}",
+            queue_dir=queue_dir,
+            watchdog=settings.watchdog,
+            task_caps=settings.task_caps,
+            adopt_workers=settings.supervisor.adopt_workers,
+        ),
+        encoding="utf-8",
+    )
+    return unit, exe
+
+
+def _systemd_check(settings: Settings, queue_dir: Path, unit: Path) -> CheckResult:
     with patch(
         "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
-        return_value=fake_unit,
+        return_value=unit,
     ):
-        result = check_watchdog_installed(settings, queue_dir)
-    assert result.status == CheckStatus.PASS
-    assert result.detail == "systemd watchdog detected"
+        return check_watchdog_installed(settings, queue_dir)
+
+
+def test_check_watchdog_systemd_unit_that_matches(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit, _exe = _systemd_unit(tmp_path, settings, queue_dir)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert (result.status, result.detail) == (
+        CheckStatus.PASS,
+        f"systemd unit runs this queue's supervisor and matches its settings ({unit})",
+    )
+
+
+def test_check_watchdog_systemd_unit_from_older_settings(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    """A [watchdog] or [task_caps] change since the install is named."""
+    older = settings.model_copy(
+        update={"watchdog": settings.watchdog.model_copy(update={"restart_cooldown_s": 90.0})}
+    )
+    unit, _exe = _systemd_unit(tmp_path, older, queue_dir)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} differs from what install would write now for this queue's "
+        "settings: RestartSec"
+    )
+    assert result.remediation == (
+        f"Re-run `claude-task-runner install --queue {queue_dir.resolve()}`. If doctor read "
+        "another claude_runner.toml than the unit's --config, run doctor with that --config."
+    )
+
+
+def test_check_watchdog_systemd_unit_for_another_queue(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    other = tmp_path / "other-q"
+    other.mkdir()
+    unit, _exe = _systemd_unit(tmp_path, settings, other)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} runs the supervisor for {other}, not this queue, so nothing "
+        "restarts this queue's supervisor"
+    )
+
+
+def test_check_watchdog_systemd_unit_whose_binary_is_gone(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    """A unit left by a removed install points at a binary that is not there."""
+    gone = tmp_path / "old-venv" / "bin" / "claude-task-runner"
+    unit, _exe = _systemd_unit(tmp_path, settings, queue_dir, exe=gone)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} starts {gone}, which is not an executable file, so the unit "
+        "cannot start the supervisor"
+    )
+
+
+def test_check_watchdog_systemd_unit_without_a_command(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit = tmp_path / "claude-task-runner.service"
+    unit.write_text("[Unit]\n", encoding="utf-8")
+    result = _systemd_check(settings, queue_dir, unit)
+    assert (result.status, result.detail) == (
+        CheckStatus.WARN,
+        f"systemd unit {unit} has no ExecStart or no WorkingDirectory",
+    )
+
+
+def test_check_watchdog_systemd_unit_that_cannot_be_read(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit = tmp_path / "claude-task-runner.service"
+    unit.mkdir()
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} cannot be read: [Errno 21] Is a directory: '{unit}'"
+    )
 
 
 def test_check_watchdog_none(settings: Settings, tmp_path: Path, queue_dir: Path) -> None:
@@ -1476,15 +1579,13 @@ def test_check_watchdog_systemd_unit_skips_the_cron_registry(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
     """systemd restarts its own unit, so the cron registry is not consulted."""
-    fake_unit = tmp_path / "claude-task-runner.service"
-    fake_unit.write_text("[Unit]\n", encoding="utf-8")
+    fake_unit, _exe = _systemd_unit(tmp_path, settings, queue_dir)
     registry = queues_registry_path()
     registry.parent.mkdir(parents=True)
     registry.write_text("{not json", encoding="utf-8")
     with _watchdog_probes(fake_unit):
         result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.PASS
-    assert result.detail == "systemd watchdog detected"
 
 
 UNREGISTER_HEADER = "Register a queue that moved at its new path. Drop one that is gone for good:"

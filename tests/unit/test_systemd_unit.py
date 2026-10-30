@@ -24,10 +24,12 @@ from claude_task_runner.cron.systemd_unit import (
     apply_plan,
     build_install_plan,
     build_unit_text,
+    changed_directives,
     changed_start_directives,
     is_systemd_user_available,
     is_unit_active,
     uninstall,
+    unit_exec_start,
     unit_queue,
 )
 
@@ -927,6 +929,45 @@ class TestChangedStartDirectives:
         new = _unit_for("/q", watchdog=_DEFAULTS)
         old = "# ExecStart=/elsewhere\n; WorkingDirectory=/elsewhere\n" + new
         assert changed_start_directives(old, new) == []
+
+
+class TestChangedDirectives:
+    def test_same_unit(self) -> None:
+        text = _unit_for("/q", watchdog=_DEFAULTS)
+        assert changed_directives(text, text) == []
+
+    def test_every_changed_directive_is_named(self) -> None:
+        """Unlike changed_start_directives, the ones systemd reloads count too."""
+        old = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=True)
+        new = _unit_for(
+            "/q",
+            watchdog=_watchdog(
+                restart_cooldown_s=7, restart_backoff_max_s=700, crash_loop_threshold=9
+            ),
+            adopt_workers=False,
+        )
+        assert changed_directives(old, new) == [
+            "ExecStop",
+            "RestartSec",
+            "StartLimitBurst",
+            "StartLimitIntervalSec",
+            "TimeoutStopSec",
+        ]
+
+    def test_a_directive_on_one_side_only(self) -> None:
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        old = new + "Nice=5\n"
+        assert changed_directives(old, new) == ["Nice"]
+
+
+class TestUnitExecStart:
+    def test_the_command_install_wrote(self) -> None:
+        assert unit_exec_start(_unit_for("/q", watchdog=_DEFAULTS)) == (
+            "/usr/local/bin/claude-task-runner supervisor start --queue /q"
+        )
+
+    def test_none_without_one(self) -> None:
+        assert unit_exec_start("[Unit]\nDescription=x\n") is None
 
 
 class TestUnitQueue:

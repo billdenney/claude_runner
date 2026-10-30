@@ -1257,6 +1257,95 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
     )
 
 
+def _systemd_watchdog_result(settings: Settings, queue_dir: Path) -> CheckResult:
+    """PASS only when the installed unit runs this queue's supervisor, its
+    command's binary is there, and it is what ``install`` would write now.
+
+    The unit is compared with one built from the queue's current settings
+    around the unit's own ``ExecStart``, so a ``--config`` given to
+    ``install`` is kept; what differs is a setting changed since the
+    install (``[watchdog]``, ``[task_caps]``, ``[supervisor].adopt_workers``)
+    or a unit an older ``install`` wrote. Drop-ins from ``systemctl --user
+    edit`` live in another file and are not read."""
+    unit_path = systemd_mod.systemd_unit_path()
+    queue = queue_dir.resolve()
+    install = f"`claude-task-runner install --queue {queue}`"
+    reinstall = f"Re-run {install}."
+    try:
+        text = unit_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit {unit_path} cannot be read: {exc}",
+            remediation=f"Fix its permissions, or re-run {install}.",
+        )
+    exec_start = systemd_mod.unit_exec_start(text)
+    unit_queue = systemd_mod.unit_queue(text)
+    if exec_start is None or unit_queue is None:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit {unit_path} has no ExecStart or no WorkingDirectory",
+            remediation=reinstall,
+        )
+    if unit_queue.resolve() != queue:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} runs the supervisor for {unit_queue}, not this "
+                "queue, so nothing restarts this queue's supervisor"
+            ),
+            remediation=f"To run this queue's supervisor instead, re-run {install}.",
+        )
+    exe = exec_start.split(maxsplit=1)[0]
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} starts {exe}, which is not an executable file, "
+                "so the unit cannot start the supervisor"
+            ),
+            remediation=reinstall,
+        )
+    try:
+        expected = systemd_mod.build_unit_text(
+            supervisor_command=exec_start,
+            queue_dir=unit_queue,
+            watchdog=settings.watchdog,
+            task_caps=settings.task_caps,
+            adopt_workers=settings.supervisor.adopt_workers,
+        )
+    except systemd_mod.UnitSettingError as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit detected, but the queue's settings cannot be written to one: {exc}",
+            remediation="Fix the setting named above, then re-run `claude-task-runner install`.",
+        )
+    changed = systemd_mod.changed_directives(text, expected)
+    if changed:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} differs from what install would write now for this "
+                f"queue's settings: {', '.join(changed)}"
+            ),
+            remediation=(
+                f"{reinstall} If doctor read another claude_runner.toml than the unit's "
+                "--config, run doctor with that --config."
+            ),
+        )
+    return CheckResult(
+        name="watchdog_installed",
+        status=CheckStatus.PASS,
+        detail=f"systemd unit runs this queue's supervisor and matches its settings ({unit_path})",
+    )
+
+
 def _cron_watchdog_result(queue_dir: Path) -> CheckResult:
     """PASS only when the cron watchdog manages ``queue_dir``, the
     registry lists no other queue, and the queue is an existing directory.
@@ -1357,11 +1446,7 @@ def check_watchdog_installed(settings: Settings, queue_dir: Path) -> CheckResult
         logger.debug("unexpected error probing crontab: %s", exc)
 
     if systemd_present:
-        return CheckResult(
-            name="watchdog_installed",
-            status=CheckStatus.PASS,
-            detail="systemd watchdog detected",
-        )
+        return _systemd_watchdog_result(settings, queue_dir)
     if cron_present:
         return _cron_watchdog_result(queue_dir)
 

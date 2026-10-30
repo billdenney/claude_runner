@@ -486,14 +486,25 @@ def changed_start_directives(old_text: str | None, new_text: str) -> list[str]:
     apply at ``daemon-reload`` (see :data:`RELOADED_DIRECTIVES`)."""
     if old_text is None:
         return []
+    return [k for k in changed_directives(old_text, new_text) if k in START_DIRECTIVES]
+
+
+def changed_directives(old_text: str, new_text: str) -> list[str]:
+    """Return every directive whose values differ between two unit texts, sorted."""
     old, new = _directive_values(old_text), _directive_values(new_text)
-    return sorted(k for k in START_DIRECTIVES if old.get(k, []) != new.get(k, []))
+    return sorted(k for k in old.keys() | new.keys() if old.get(k, []) != new.get(k, []))
 
 
 def unit_queue(unit_text: str) -> Path | None:
     """Return the queue a unit runs: its ``WorkingDirectory=``, if it has one."""
     values = _directive_values(unit_text).get("WorkingDirectory")
     return Path(values[-1]) if values else None
+
+
+def unit_exec_start(unit_text: str) -> str | None:
+    """Return a unit's ``ExecStart=`` command line, if it has one."""
+    values = _directive_values(unit_text).get("ExecStart")
+    return values[-1] if values else None
 
 
 def is_unit_active(systemctl_executable: str = "systemctl") -> bool:
