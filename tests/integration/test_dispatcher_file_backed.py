@@ -637,6 +637,70 @@ def test_a_park_made_while_the_worker_runs_is_not_written_back(
 
 
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_record_a_reaper_made_while_the_worker_ran_stands(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    tmp_path: Path,
+    adopt: bool,
+) -> None:
+    """A reaper records the task as killed while the worker runs, and the
+    worker ends all the same. The reaper's record stands over the run's, as
+    on the adopted path, and the post-dispatch hook still runs, with the
+    attempt's session."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-reaped")
+    real_write = dispatcher_mod.write_state_atomic
+    reaped: list[TaskState] = []
+
+    def _spy(state: TaskState, path: Path) -> None:
+        real_write(state, path)
+        if state.session_id == "sess-reaped" and not reaped:
+            # The stuck-sleep-loop reaper, between two of the dispatcher's writes.
+            reaped.append(
+                state.model_copy(
+                    update={
+                        "status": "failed",
+                        "stop_reason": "killed_stuck_sleep_loop",
+                        "error": "stuck-sleep-loop: bash_pid=1 after 900s heartbeat staleness",
+                        "pid": None,
+                        "log_path": None,
+                    }
+                )
+            )
+            real_write(reaped[0], path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+    marker = tmp_path / "hook-ran"
+    hooks = _hooks().model_copy(
+        update={
+            "post_dispatch_command": (
+                f'shell:printf "%s %s %s" "$TASK_ID" "$ATTEMPT" "$SESSION_ID" > {marker}'
+            )
+        }
+    )
+
+    outcome = dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=fresh_plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=_caps(),
+        settings_hooks=hooks,
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+    )
+    assert isinstance(outcome, DispatchOutcome)
+
+    [record] = reaped
+    assert load_state(state_path_for(queue_dir, task.id)) == record == outcome.new_state
+    assert outcome.run_record.stop_reason == "end_turn"
+    assert marker.read_text() == f"{task.id} 1 sess-reaped"
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
 def test_a_terminal_result_read_ahead_of_the_loop_error_stands(
     queue_dir: Path,
     task: Task,
@@ -1058,6 +1122,61 @@ def test_a_park_that_cannot_be_written_is_said_and_not_reported(
     )
     assert parks == []
     assert load_state(state_path_for(queue_dir, task.id)).status == "running"
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_park_stands_down_for_a_record_another_writer_made(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+    adopt: bool,
+) -> None:
+    """While the stop fails, a reaper records the task. Its record wins: the
+    park is not written or reported, and dispatch raises, saying so, as the
+    adopted path does."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    raise_in_dispatch_loop(_INIT_LINES)
+    state_path = state_path_for(queue_dir, task.id)
+    reaped: list[TaskState] = []
+
+    def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        if not reaped:
+            reaped.append(
+                load_state(state_path).model_copy(
+                    update={
+                        "status": "failed",
+                        "stop_reason": "killed_by_silent_reaper",
+                        "pid": None,
+                        "log_path": None,
+                    }
+                )
+            )
+            write_state_atomic(reaped[0], state_path)
+        raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _dispatch(
+            queue_dir,
+            task,
+            fresh_plan,
+            adopt=adopt,
+            on_park=lambda state, why: parks.append((state, why)),
+        )
+
+    [worker] = spawned
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={worker.pid} "
+        "could not be stopped and another writer had already recorded its task as failed"
+    )
+    assert load_state(state_path) == reaped[0]
+    assert parks == []
 
 
 def test_a_worker_that_cannot_be_stopped_in_memory_is_not_parked(

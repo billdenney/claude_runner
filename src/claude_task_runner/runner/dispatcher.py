@@ -1586,6 +1586,31 @@ _LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
 """The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
 
 
+def _park_unstopped_worker(
+    state: TaskState,
+    state_path: Path,
+    pid: int,
+    on_park: Callable[[TaskState, str], None] | None,
+) -> str:
+    """Park ``state``'s worker ``pid``, which its loop error left running,
+    and say what became of the park, for :func:`_unstopped_after_loop_error`.
+
+    Through the recheck guard, so a record another writer made first
+    stands (:func:`_write_unless_finalized`). A park that is written goes
+    to ``on_park``.
+    """
+    parked = park_live_worker(state, why=_LOOP_ERROR_PARK)
+    try:
+        on_disk, wrote = _write_unless_finalized(parked, state_path, worker_pid=pid)
+    except OSError as exc:
+        return _park_not_written(state.task_id, pid, exc)
+    if not wrote:
+        return f"another writer had already recorded its task as {on_disk.status}"
+    if on_park is not None:
+        on_park(parked, _LOOP_ERROR_PARK)
+    return "is parked"
+
+
 def _park_not_written(task_id: str, pid: int, exc: OSError) -> str:
     """Log that the park of a worker that could not be stopped could not be
     written, as :func:`runner.orchestrator._park_live_worker` does; the
@@ -2128,7 +2153,10 @@ def dispatch(
       as soon as claude reports a new one, so a re-dispatch after a
       supervisor that died mid-run resumes the session.
     * Writes post-run state with appended :class:`RunRecord`, updated
-      ``status``, and refreshed ``session_id``.
+      ``status``, and refreshed ``session_id``, unless a reaper recorded
+      the attempt while the worker ran: its record stands, as on the
+      adopted path, except a park of this same worker
+      (:func:`_write_unless_finalized`).
     * When the worker cannot be started (no ``claude`` binary,
       :func:`_account_spawn`'s and :func:`_task_spawn`'s checks, or opening the log files or
       ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
@@ -2142,8 +2170,9 @@ def dispatch(
       that cap's kill; and the worker's own record when it had written
       its terminal result or exited on its own. A worker that cannot be
       stopped may still run, so no run is recorded: the task is parked
-      ``possibly_hung`` with its pid (:func:`park_live_worker`), the park
-      goes to ``on_park``, and :class:`DispatchError` is raised.
+      ``possibly_hung`` with its pid (:func:`park_live_worker`), unless
+      another writer recorded the attempt first, the park goes to
+      ``on_park``, and :class:`DispatchError` is raised.
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
@@ -2552,15 +2581,9 @@ def dispatch(
         if after is _AfterLoopError.RUNNING:
             outcome = "is not parked: this dispatch keeps no state"
             if persist_state:
-                parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-                try:
-                    write_state_atomic(parked, state_path_for(queue_dir, task.id))
-                except OSError as exc:
-                    outcome = _park_not_written(task.id, process.pid, exc)
-                else:
-                    if on_park is not None:
-                        on_park(parked, _LOOP_ERROR_PARK)
-                    outcome = "is parked"
+                outcome = _park_unstopped_worker(
+                    new_state, state_path_for(queue_dir, task.id), process.pid, on_park
+                )
             raise _unstopped_after_loop_error(
                 task.id, process.pid, loop_error, outcome=outcome
             ) from loop_error
@@ -2677,11 +2700,18 @@ def dispatch(
             settings_failure_classifier=settings_failure_classifier,
         )
 
+    # The hook gets this attempt's session whoever records the attempt.
+    attempt_session_id = final_state.session_id
     if persist_state:
-        write_state_atomic(final_state, state_path_for(queue_dir, task.id))
+        # A reaper may have recorded the attempt while the worker ran (a
+        # stuck sleep loop it killed, say). Its record wins, as on the
+        # adopted path, but a park of this worker gives way to its run.
+        final_state, _wrote = _write_unless_finalized(
+            final_state, state_path_for(queue_dir, task.id), worker_pid=process.pid
+        )
 
     _run_post_dispatch_hook(
-        settings_hooks, task, attempt=run_record.attempt, session_id=final_state.session_id
+        settings_hooks, task, attempt=run_record.attempt, session_id=attempt_session_id
     )
 
     return DispatchOutcome(
@@ -2865,18 +2895,7 @@ def adopt_worker(
             task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
         )
         if after is _AfterLoopError.RUNNING:
-            parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-            try:
-                on_disk, wrote = _write_unless_finalized(parked, state_path, worker_pid=pid)
-            except OSError as exc:
-                outcome = _park_not_written(task.id, pid, exc)
-            else:
-                if not wrote:
-                    outcome = f"another writer had already recorded its task as {on_disk.status}"
-                else:
-                    if on_park is not None:
-                        on_park(parked, _LOOP_ERROR_PARK)
-                    outcome = "is parked"
+            outcome = _park_unstopped_worker(new_state, state_path, pid, on_park)
             raise _unstopped_after_loop_error(
                 task.id, pid, loop_error, outcome=outcome
             ) from loop_error

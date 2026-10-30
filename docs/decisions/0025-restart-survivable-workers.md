@@ -127,6 +127,17 @@ work.
   `_demote_if_still_running` recheck guard (re-reads `status` before
   writing) already covers this; adopted slots additionally appear in
   `in_flight_slots` so the per-tick reaper sees fresh heartbeats.
+
+  > **Amended (2026-10-30):** that guard covered the reaper's side only.
+  > The monitors' running-state writes (the heartbeat, the monitor's tick,
+  > the session) on both paths, and the owned path's finalize and park,
+  > wrote unconditionally, so a reaper's record could be written back to
+  > `running` or replaced. Now all of them go through
+  > `runner.dispatcher._write_unless_finalized`. The running-state writes
+  > go ahead only while the task is still `running`. The finalize and the
+  > park also replace a park of their own worker. Otherwise the reaper's
+  > record stands, and the post-dispatch hook still runs. A run the reaper
+  > recorded has no RunRecord of its own, as on the adopted path.
 - **Kill-switch:** `[supervisor].adopt_workers = false` restores the
   pipe-backed, drain-on-stop, demote-on-restart behaviour for a
   conservative rollout.
