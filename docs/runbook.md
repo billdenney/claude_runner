@@ -324,8 +324,10 @@ worker when `[supervisor].adopt_workers` is off, and a worker no state
 records (found by its stream log) are parked as `worker_still_running`
 instead: a `failed` task would be dispatched again, and two workers in one
 worktree corrupt its branch. The same park happens when a dispatchable
-task turns out to have a worker still running. The supervisor reports each
-park (a `warning` notification and a `live_worker_parked` event).
+task turns out to have a worker still running, and when a worker cannot be
+stopped after its dispatch loop failed (see "A run failed with
+`dispatch_loop_error`"). The supervisor reports each park (a `warning`
+notification and a `live_worker_parked` event).
 
 While a `worker_still_running` worker runs it holds a slot of the account
 it runs on (`account list` counts it), and nothing dispatches its task. It
@@ -362,6 +364,42 @@ status.
    `failed` (`status: failed` in
    `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
    stopped) and the supervisor resumes its session.
+
+## A run failed with `dispatch_loop_error`
+
+**Symptom:** a run in `claude-task-runner queue show <id>` has stop reason
+`dispatch_loop_error` and the error `dispatch loop raised <Exception>:
+<message>`. The supervisor log has an ERROR with a traceback, `task <id>:
+dispatch loop raised ...; stopping worker pid=<pid>`.
+
+**Cause:** the supervisor's loop that watches a worker raised: a bug in the
+runner, a clock step, a cap kill that could not confirm the worker died, or
+a monitor thread that could not start. Rather than leave the worker running
+unwatched, the supervisor stopped it and recorded the run as failed. The
+failure counts toward the circuit breaker, and the task is dispatched
+again. A worker that had already written its terminal result, or had
+exited on its own, keeps its own record instead, and one whose cap kill
+raised is recorded as killed by that cap.
+
+A worker the supervisor cannot stop may still be running, so no run is
+recorded: the task is parked `possibly_hung` with stop reason
+`worker_still_running`, as in the section above, and the log also has
+`could not stop worker pid=<pid> after its dispatch loop failed`. `queue
+force-dispatch` with no supervisor running prints `force-dispatch failed:
+... could not be stopped and is parked` and exits 2.
+
+**Steps:**
+1. Read the traceback in the supervisor log, and report it: the loop is not
+   meant to raise.
+2. If several tasks fail this way in a row, stop the supervisor
+   (`systemctl --user stop claude-task-runner`) until the cause is fixed.
+   Each failure counts toward its task's circuit breaker, and a fault in
+   the loop fails every task it watches. Afterwards, set a task the breaker
+   stopped back to `status: pending` in
+   `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
+   stopped: no `queue` command resets a circuit breaker.
+3. For a parked worker, follow steps 1 and 2 of "After a restart, a task is
+   `failed` or `possibly_hung` while its worker still runs".
 
 ## Weekly throttled, no dispatch resuming
 

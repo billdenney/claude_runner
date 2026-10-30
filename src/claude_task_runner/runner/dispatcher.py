@@ -1963,6 +1963,16 @@ def dispatch(
       ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
       it was, and returns that outcome (:func:`_defer_unstartable`); no
       attempt is counted.
+    * When the dispatch loop raises (a bug, a clock step, a cap kill that
+      cannot confirm the worker died) or its monitor thread cannot start,
+      stops the worker rather than leave it unwatched, and records the
+      run: failed with :data:`DISPATCH_LOOP_ERROR_STOP_REASON` when the
+      stop ended it mid-run; killed by the cap when the loop raised from
+      that cap's kill; and the worker's own record when it had written
+      its terminal result or exited on its own. A worker that cannot be
+      stopped may still run, so no run is recorded: the task is parked
+      ``possibly_hung`` with its pid (:func:`park_live_worker`), the park
+      goes to ``on_park``, and :class:`DispatchError` is raised.
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
@@ -2526,6 +2536,13 @@ def adopt_worker(
     ``"running"`` (the :func:`_demote_if_still_running` race guard),
     mirroring the reaper's own TOCTOU mitigation so neither clobbers the
     other.
+
+    When the monitor's loop raises, or its monitor thread cannot start,
+    the worker is stopped through the identity-checked kill and the run
+    recorded as :func:`dispatch` records it. A worker that cannot be
+    stopped is parked ``possibly_hung`` with its pid, under the same
+    guard, so a reaper's record stands, and :class:`DispatchError` is
+    raised.
 
     ``settings_dispatch`` and ``settings_hooks`` are required, not
     defaulted: the finalize applies the owned path's gates with them (see
