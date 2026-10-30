@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import sys
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
@@ -26,6 +27,12 @@ pytest_plugins = ["pytester", "signal_gate"]
 
 # The signals supervisor.daemon.start_daemon installs handlers for.
 _DAEMON_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1)
+
+# tests/unit/_digit_limit.py builds an integer one digit past the limit on
+# int() of a string. PYTHONINTMAXSTRDIGITS=0 turns that limit off; the tests
+# then run with the default one.
+if sys.get_int_max_str_digits() == 0:
+    sys.set_int_max_str_digits(sys.int_info.default_max_str_digits)
 
 
 @pytest.fixture(autouse=True)

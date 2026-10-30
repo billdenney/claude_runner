@@ -678,6 +678,10 @@ def test_the_walk_searches_a_directory_whose_own_mtime_is_left_out(
     ("mtime", "usable"),
     [
         pytest.param(0.0, True, id="epoch"),
+        pytest.param(-1.0, True, id="before-epoch"),
+        pytest.param(-62135596800.0, True, id="first-second-of-year-1"),
+        pytest.param(-62135596801.0, False, id="year-0"),
+        pytest.param(-1e20, False, id="before-time_t"),
         pytest.param(253402300799.0, True, id="last-second-of-9999"),
         pytest.param(253402300800.0, False, id="year-10000"),
         pytest.param(1e20, False, id="past-time_t"),
@@ -687,7 +691,8 @@ def test_the_walk_searches_a_directory_whose_own_mtime_is_left_out(
     ],
 )
 def test_usable_mtime_known_answers(mtime: float, usable: bool) -> None:
-    """Usable means a datetime can hold it, up to the last second of 9999."""
+    """Usable means a datetime can hold it: from the first second of year 1
+    to the last second of 9999."""
     assert _usable_mtime(mtime) is usable
 
 
