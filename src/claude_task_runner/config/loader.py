@@ -311,7 +311,7 @@ def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
         ]
         table[model] = list(dict.fromkeys(renamed))
         renamed_models.append(model)
-    if renamed_models and first_time(("retired_effort_levels", source)):
+    if renamed_models and first_time("retired_effort_levels", source):
         spellings = ", ".join(f"{old!r} as {new!r}" for old, new in RETIRED_EFFORT_LEVELS.items())
         logger.warning(
             "%s: reading [effort_levels] %s, the claude CLI's name, for %s; "

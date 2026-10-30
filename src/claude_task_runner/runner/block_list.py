@@ -61,7 +61,7 @@ def blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[str]:
         try:
             row = json.loads(stripped)
         except ValueError as exc:
-            if first_time(("block_list_line", str(path), number, stripped)):
+            if first_time("block_list_line", str(path), number, stripped):
                 logger.warning(
                     "dispatch block-list %s line %d is not JSON (%s); it blocks nothing",
                     path,

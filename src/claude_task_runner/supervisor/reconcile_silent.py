@@ -429,7 +429,7 @@ def _latest_mtime_in_tree(
                 continue
             mtime = stat.st_mtime
             if not _usable_mtime(mtime):
-                if first_time(("reaper_walk", entry.path, mtime)):
+                if first_time("reaper_walk", entry.path, mtime):
                     unreported += 1
                     example = example or entry.path
             elif latest is None or mtime > latest:

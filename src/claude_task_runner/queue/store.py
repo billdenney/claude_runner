@@ -309,7 +309,7 @@ def _drop_retired_task_keys(payload: dict[str, Any], path: Path) -> None:
         if key not in payload:
             continue
         del payload[key]
-        if first_time(("retired_task_key", path, key)):
+        if first_time("retired_task_key", path, key):
             logger.warning(
                 "%s: ignoring the retired key %r (%s); delete it from the file",
                 path,
@@ -332,7 +332,7 @@ def _rename_retired_effort(payload: dict[str, Any], path: Path) -> None:
         return
     renamed = RETIRED_EFFORT_LEVELS[effort]
     payload["effort"] = renamed
-    if first_time(("retired_effort", path, effort)):
+    if first_time("retired_effort", path, effort):
         logger.warning(
             "%s: reading effort %r as %r, the claude CLI's name; update the file",
             path,
