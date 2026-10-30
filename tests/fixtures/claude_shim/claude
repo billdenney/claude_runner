@@ -17,6 +17,8 @@ Env vars:
 * ``SHIM_DURATION_MS`` (default ``500``)
 * ``SHIM_SLEEP_BEFORE_S`` (default ``0``) — sleep before the first event
 * ``SHIM_SLEEP_BETWEEN_S`` (default ``0``) — sleep between events
+* ``SHIM_SLEEP_BEFORE_RESULT_S`` (default ``0``) — sleep after the last
+   assistant event, before the result
 * ``SHIM_FAIL_FAST`` (default ``""``) — if set, exit non-zero immediately
    with this message on stderr (e.g. a ``--resume`` of an unknown session)
 * ``SHIM_NUM_ASSISTANT_MSGS`` (default ``2``)
@@ -58,6 +60,7 @@ def main() -> int:
     duration_ms = int(os.environ.get("SHIM_DURATION_MS", "500"))
     sleep_before = float(os.environ.get("SHIM_SLEEP_BEFORE_S", "0"))
     sleep_between = float(os.environ.get("SHIM_SLEEP_BETWEEN_S", "0"))
+    sleep_before_result = float(os.environ.get("SHIM_SLEEP_BEFORE_RESULT_S", "0"))
     num_msgs = int(os.environ.get("SHIM_NUM_ASSISTANT_MSGS", "2"))
 
     if sleep_before:
@@ -88,6 +91,8 @@ def main() -> int:
         if sleep_between:
             time.sleep(sleep_between)
 
+    if sleep_before_result:
+        time.sleep(sleep_before_result)
     emit(
         {
             "type": "result",

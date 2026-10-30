@@ -602,3 +602,102 @@ def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == worker.pid
     assert reloaded.runs == []
+
+
+_TOKEN_CAP = 5
+"""Below the 7 tokens of the shim's first assistant event, so its cap kill
+fires there, while the worker sleeps before its result."""
+
+
+def _dispatch_capped(queue_dir: Path, task: Task, plan: SpawnPlan, *, adopt: bool) -> object:
+    return dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=_caps().model_copy(update={"max_tokens_per_task": _TOKEN_CAP}),
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+    )
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The loop's cap kill raises TerminateFailed, which ends the loop. The
+    stop after it ends the worker, and the run is killed by the cap it
+    exceeded, not a dispatch_loop_error naming the failed kill."""
+    monkeypatch.setenv("SHIM_SLEEP_BEFORE_RESULT_S", "30")
+    real_terminate = dispatcher_mod._terminate
+    calls: list[int] = []
+
+    def _fails_once(process: subprocess.Popen[str]) -> None:
+        calls.append(process.pid)
+        if len(calls) == 1:
+            raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+        real_terminate(process)
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _fails_once)
+
+    outcome = _dispatch_capped(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert (calls, worker.returncode) == ([worker.pid, worker.pid], -signal.SIGTERM)
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap, run.error) == (
+        "killed_by_cap",
+        "tokens",
+        f"tokens cap exceeded: 7 > {_TOKEN_CAP}",
+    )
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_cap_kill_that_cannot_stop_the_worker_parks_it(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """Neither the cap kill nor the stop after it ends the worker, so the
+    task is parked with the worker on record and no run, and dispatch
+    raises."""
+    monkeypatch.setenv("SHIM_SLEEP_BEFORE_RESULT_S", "30")
+    calls: list[int] = []
+
+    def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        calls.append(process.pid)
+        raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _dispatch_capped(queue_dir, task, fresh_plan, adopt=adopt)
+
+    [worker] = spawned
+    assert (calls, worker.poll()) == ([worker.pid, worker.pid], None)
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised TerminateFailed: task pid {worker.pid} "
+        f"survived SIGKILL; worker pid={worker.pid} could not be stopped and is parked"
+    )
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert (reloaded.status, reloaded.stop_reason, reloaded.pid, reloaded.runs) == (
+        "possibly_hung",
+        "worker_still_running",
+        worker.pid,
+        [],
+    )

@@ -1030,6 +1030,14 @@ def _build_run_record(
     )
 
 
+@dataclass
+class _CapKill:
+    """The cap :func:`_dispatch_loop` stops its worker at, set before the
+    kill, so a caller still has it when the kill raises."""
+
+    violation: caps_mod.CapViolation | None = None
+
+
 def _dispatch_loop(
     *,
     lines: Iterable[str],
@@ -1040,12 +1048,15 @@ def _dispatch_loop(
     started_at: datetime,
     heartbeat_persist_fn: Callable[[datetime], None] | None = None,
     summary: StreamSummary | None = None,
+    cap_kill: _CapKill | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the stream ends or we kill it.
 
     Returns the StreamSummary and any cap violation observed. A caller that
     passes ``summary`` gets it filled in place, so what the loop parsed
-    before it raised (the session id, the usage so far) is still there.
+    before it raised (the session id, the usage so far) is still there; one
+    that passes ``cap_kill`` gets the cap a kill was for, though the kill
+    raised.
 
     The loop is decoupled from how its events arrive: ``lines`` is any
     iterable of NDJSON lines and ``terminate`` is the side-effect that
@@ -1130,6 +1141,8 @@ def _dispatch_loop(
                 cap_violation.observed,
                 cap_violation.cap,
             )
+            if cap_kill is not None:
+                cap_kill.violation = cap_violation
             terminate()
             break
 
@@ -1144,12 +1157,14 @@ def _dispatch_loop(
         )
         if status.verdict is hb_mod.HeartbeatVerdict.KILL:
             logger.warning("task %s heartbeat silent for %.0fs; SIGTERM", task.id, status.silence_s)
-            terminate()
             cap_violation = caps_mod.CapViolation(
                 which="duration",
                 observed=status.silence_s,
                 cap=float(settings_caps.heartbeat_silence_kill_s),
             )
+            if cap_kill is not None:
+                cap_kill.violation = cap_violation
+            terminate()
             break
 
     return summary, cap_violation
@@ -1219,11 +1234,13 @@ class TerminateFailed(RuntimeError):
     itself failed — EPERM, EINVAL, etc.) or the post-SIGKILL
     ``process.wait(timeout=2)`` timed out (the parent survived
     SIGKILL, suggesting a TASK_UNINTERRUPTIBLE kernel-level issue).
-    Callers MUST NOT treat the attempt as terminated when this is
-    raised: the state YAML stays ``"running"`` with the recorded pid
-    so the per-tick silent-orphan reaper can pick the orphan up on
-    its next pass instead of the dispatch finalizing a still-alive
-    subprocess to a slot-freeing ``failed``.
+    Callers must not treat the attempt as over when this is raised. From
+    a cap or silence kill it ends the dispatch loop: :func:`dispatch`
+    then tries the stop once more and, once the worker is gone, records
+    the run as killed by the cap; a worker the retry cannot stop either is
+    parked ``possibly_hung`` with its pid (:func:`park_live_worker`), and
+    :class:`DispatchError` is raised. A worker that may still run is never
+    recorded as finished, which would free its slot.
     """
 
 
@@ -1301,8 +1318,7 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     except OSError as exc:
         logger.error(
             "SIGKILL to PG %d (task pid %d) failed: %s — subprocess may "
-            "survive; dispatcher will NOT mark this slot free, leaving it "
-            "for the per-tick silent reaper",
+            "survive; its run is not recorded while it may still be running",
             pgid,
             process.pid,
             exc,
@@ -1316,8 +1332,8 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired as exc:
         logger.error(
             "task pid %d survived SIGKILL to PG %d — kernel-level issue "
-            "(TASK_UNINTERRUPTIBLE?); dispatcher will NOT mark this slot "
-            "free, leaving it for the per-tick silent reaper",
+            "(TASK_UNINTERRUPTIBLE?); its run is not recorded while it may "
+            "still be running",
             process.pid,
             pgid,
         )
@@ -1403,9 +1419,11 @@ def _name_loop_error(
     ``None`` when the loop did not raise, or when the worker had exited on
     its own before the stop (:attr:`_AfterLoopError.EXITED`): its own exit
     stands. A worker that wrote its terminal result before the loop raised
-    finished its work, and the run its result built stands.
+    finished its work, and the run its result built stands. So does a run
+    killed by a cap: the loop raised from that kill (:class:`TerminateFailed`),
+    and the stop after it finished the kill.
     """
-    if loop_error is None or summary.final_result is not None:
+    if loop_error is None or summary.final_result is not None or run.killed_by_cap is not None:
         return run
     return run.model_copy(
         update={
@@ -2227,10 +2245,10 @@ def dispatch(
         _terminate(process)
 
     summary = StreamSummary()
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
-        summary, cap_violation = _dispatch_loop(
+        _dispatch_loop(
             lines=lines,
             terminate=_terminate_owned,
             settings_caps=settings_caps,
@@ -2239,6 +2257,7 @@ def dispatch(
             started_at=started_at,
             heartbeat_persist_fn=heartbeat_persist_fn,
             summary=summary,
+            cap_kill=cap_kill,
         )
     except Exception as exc:
         # Escaping here would leave the worker running unsupervised and its
@@ -2248,6 +2267,7 @@ def dispatch(
     finally:
         if alive_monitor is not None:
             alive_monitor.stop()
+    cap_violation = cap_kill.violation
 
     # The loop's exception, when the stop after it ended the worker mid-run.
     stopped_for: Exception | None = None
@@ -2501,10 +2521,10 @@ def adopt_worker(
         if _alive():
             _terminate_by_pid(pid, alive=_alive, sleep_fn=sleep_fn)
 
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
-        _, cap_violation = _dispatch_loop(
+        _dispatch_loop(
             lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn),
             terminate=_terminate_adopted,
             settings_caps=settings_caps,
@@ -2512,6 +2532,7 @@ def adopt_worker(
             task=task,
             started_at=started_at,
             heartbeat_persist_fn=_persist_heartbeat,
+            cap_kill=cap_kill,
         )
     except Exception as exc:
         # As in dispatch(): escaping here would leave the worker unwatched
@@ -2521,6 +2542,7 @@ def adopt_worker(
         loop_error = exc
     finally:
         alive_monitor.stop()
+    cap_violation = cap_kill.violation
 
     # The loop's exception, when the stop after it ended the worker mid-run.
     stopped_for: Exception | None = None

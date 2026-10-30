@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1069,13 +1070,15 @@ def _seed_adopted(queue_dir: Path, lines: list[str]) -> tuple[Task, TaskState]:
     return task, _seed_running(queue_dir, task, log_path=log, started_at=_STARTED)
 
 
-def _adopt(queue_dir: Path, task: Task, state: TaskState) -> DispatchOutcome:
+def _adopt(
+    queue_dir: Path, task: Task, state: TaskState, *, caps: TaskCapsSettings | None = None
+) -> DispatchOutcome:
     return adopt_worker(
         task=task,
         state=state,
         queue_dir=queue_dir,
         clock=FakeClock(_RESTART),
-        settings_caps=_caps(),
+        settings_caps=caps if caps is not None else _caps(),
         settings_dispatch=_SETTINGS.dispatch,
         settings_hooks=_SETTINGS.hooks,
         sleep_fn=lambda _s: None,
@@ -1191,6 +1194,40 @@ def test_adopt_worker_that_cannot_be_stopped_is_parked_with_no_run(
     assert (reloaded.status, reloaded.stop_reason) == ("possibly_hung", "worker_still_running")
     assert reloaded.pid == _PID
     assert reloaded.runs == []
+
+
+def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loop's cap kill raises, which ends the loop. The stop after it
+    ends the worker, and the run is killed by the cap it exceeded, not a
+    dispatch_loop_error naming the failed kill."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+    real_kill = dispatcher_mod._terminate_by_pid
+    calls: list[int] = []
+
+    def _fails_once(pid: int, **kwargs: Any) -> None:
+        calls.append(pid)
+        if len(calls) == 1:
+            raise RuntimeError("signal failed")
+        real_kill(pid, **kwargs)
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate_by_pid", _fails_once)
+
+    outcome = _adopt(
+        queue_dir, task, state, caps=_caps().model_copy(update={"max_tokens_per_task": 50})
+    )
+
+    assert (calls, worker.signals) == ([_PID, _PID], [(_PID, signal.SIGTERM)])
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap, run.error) == (
+        "killed_by_cap",
+        "tokens",
+        "tokens cap exceeded: 100 > 50",
+    )
 
 
 def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
