@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, load_settings
-from claude_task_runner.config.schema import MAX_DURATION_S, TaskCapsSettings, WatchdogSettings
+from claude_task_runner.config.schema import (
+    MAX_DURATION_S,
+    REAPER_THRESHOLD_FLOORS,
+    TaskCapsSettings,
+    WatchdogSettings,
+)
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
     _SYSTEMD_MAX_WHOLE_SECONDS,
@@ -442,9 +447,13 @@ class TestDrainStopTimeout:
         Walks the schema, so a key added to ``[task_caps]`` later is checked
         here too."""
         before = _drain_unit(_CAPS).splitlines()
+        intervals = {threshold: interval for threshold, interval, _ in REAPER_THRESHOLD_FLOORS}
         seen = []
         for key, default in _CAPS.model_dump().items():
             other = (not default) if isinstance(default, bool) else default * 2 + 1
+            if key in intervals:
+                # A reaper threshold must span two of its write intervals.
+                other = max(other, 2 * getattr(_CAPS, intervals[key]))
             after = _drain_unit(_task_caps(**{key: other})).splitlines()
             changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
             if key == "max_duration_s_per_task":
