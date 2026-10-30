@@ -1454,6 +1454,19 @@ _LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
 """The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
 
 
+def _park_not_written(task_id: str, pid: int, exc: OSError) -> str:
+    """Log that the park of a worker that could not be stopped could not be
+    written, as :func:`runner.orchestrator._park_live_worker` does; the
+    outcome for the error the dispatch raises."""
+    logger.error(
+        "task %s: worker pid=%s could not be stopped, and its park could not be written (%s)",
+        task_id,
+        pid,
+        exc,
+    )
+    return f"its park could not be written ({exc})"
+
+
 def _unstopped_after_loop_error(
     task_id: str, pid: int, loop_error: Exception, *, outcome: str
 ) -> DispatchError:
@@ -2389,10 +2402,14 @@ def dispatch(
             outcome = "is not parked: this dispatch keeps no state"
             if persist_state:
                 parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-                write_state_atomic(parked, state_path_for(queue_dir, task.id))
-                if on_park is not None:
-                    on_park(parked, _LOOP_ERROR_PARK)
-                outcome = "is parked"
+                try:
+                    write_state_atomic(parked, state_path_for(queue_dir, task.id))
+                except OSError as exc:
+                    outcome = _park_not_written(task.id, process.pid, exc)
+                else:
+                    if on_park is not None:
+                        on_park(parked, _LOOP_ERROR_PARK)
+                    outcome = "is parked"
             raise _unstopped_after_loop_error(
                 task.id, process.pid, loop_error, outcome=outcome
             ) from loop_error
@@ -2685,13 +2702,17 @@ def adopt_worker(
         )
         if after is _AfterLoopError.RUNNING:
             parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-            written = _write_unless_finalized(parked, state_path, worker_pid=pid)
-            if written is not parked:
-                outcome = f"another writer had already recorded its task as {written.status}"
+            try:
+                on_disk, wrote = _write_unless_finalized(parked, state_path, worker_pid=pid)
+            except OSError as exc:
+                outcome = _park_not_written(task.id, pid, exc)
             else:
-                if on_park is not None:
-                    on_park(parked, _LOOP_ERROR_PARK)
-                outcome = "is parked"
+                if not wrote:
+                    outcome = f"another writer had already recorded its task as {on_disk.status}"
+                else:
+                    if on_park is not None:
+                        on_park(parked, _LOOP_ERROR_PARK)
+                    outcome = "is parked"
             raise _unstopped_after_loop_error(
                 task.id, pid, loop_error, outcome=outcome
             ) from loop_error
@@ -2810,9 +2831,9 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
 
 def _write_unless_finalized(
     state: TaskState, state_path: Path, *, worker_pid: int | None
-) -> TaskState:
+) -> tuple[TaskState, bool]:
     """Persist ``state`` unless another writer recorded the attempt first;
-    return what is on disk afterwards.
+    return what is on disk afterwards, and whether this wrote it.
 
     The ADR-0025 recheck guard: a per-tick reaper can move the task off
     ``running`` between a verdict and this write, and its record wins.
@@ -2827,19 +2848,19 @@ def _write_unless_finalized(
             "adopt_worker: recheck-load of %s failed (%s); persisting anyway", state_path, exc
         )
         write_state_atomic(state, state_path)
-        return state
+        return state, True
     if current.status == "running" or (
         is_parked_live_worker(current) and current.pid == worker_pid
     ):
         write_state_atomic(state, state_path)
-        return state
+        return state, True
     logger.info(
         "adopt_worker: task %s status changed to %s; "
         "standing down so the concurrent writer's record wins",
         state.task_id,
         current.status,
     )
-    return current
+    return current, False
 
 
 def _finalize_adopted(
@@ -2952,7 +2973,7 @@ def _finalize_adopted(
     # or reap). The hook gets this attempt's session whoever records it.
     attempt_session_id = final_state.session_id
 
-    final_state = _write_unless_finalized(
+    final_state, _wrote = _write_unless_finalized(
         final_state, state_path_for(queue_dir, task.id), worker_pid=prior.pid
     )
 

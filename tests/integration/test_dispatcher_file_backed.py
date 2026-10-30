@@ -914,6 +914,62 @@ def test_a_loop_that_raises_in_memory_returns_its_failed_run(
     assert outcome.run_record.stop_reason == "dispatch_loop_error"
 
 
+def _park_writes_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every write of a parked (possibly_hung) state fail, as a full
+    disk would; other writes go through."""
+    real_write = dispatcher_mod.write_state_atomic
+
+    def _write(state: TaskState, path: Path) -> None:
+        if state.status == "possibly_hung":
+            raise OSError(28, "No space left on device")
+        real_write(state, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _write)
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_park_that_cannot_be_written_is_said_and_not_reported(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+    adopt: bool,
+) -> None:
+    """The worker cannot be stopped and its park cannot be written. The
+    write's OSError does not replace the dispatch's error, which says so,
+    and no park is reported, since none was made."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    raise_in_dispatch_loop(_INIT_LINES)
+
+    def _cannot_stop(process: subprocess.Popen[str]) -> None:
+        raise dispatcher_mod.TerminateFailed(f"task pid {process.pid} survived SIGKILL")
+
+    monkeypatch.setattr(dispatcher_mod, "_terminate", _cannot_stop)
+    _park_writes_fail(monkeypatch)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _dispatch(
+            queue_dir,
+            task,
+            fresh_plan,
+            adopt=adopt,
+            on_park=lambda state, why: parks.append((state, why)),
+        )
+
+    [worker] = spawned
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={worker.pid} "
+        "could not be stopped and its park could not be written "
+        "([Errno 28] No space left on device)"
+    )
+    assert parks == []
+    assert load_state(state_path_for(queue_dir, task.id)).status == "running"
+
+
 def test_a_worker_that_cannot_be_stopped_in_memory_is_not_parked(
     queue_dir: Path,
     task: Task,
