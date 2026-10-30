@@ -407,6 +407,7 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
             candidates.append(path)
 
     offenders: list[str] = []
+    unread = 0
     for path in candidates:
         try:
             with path.open("rb") as fh:
@@ -416,6 +417,7 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
             # ValueError is TOMLDecodeError, UnicodeDecodeError, or the bare
             # one tomllib raises for an integer past the digit limit. Only
             # the legacy throttle key matters here.
+            unread += 1
             continue
         if "throttle" in payload:
             offenders.append(str(path))
@@ -432,10 +434,13 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
                 "and docs/cheatsheet.md#migration-from-throttle."
             ),
         )
+    detail = f"no legacy [throttle.*] blocks across {len(candidates) - unread} TOML(s)"
+    if unread:
+        detail += f"; {unread} that did not load left out (account_policies reports them)"
     return CheckResult(
         name="dispatch_pct_legacy",
         status=CheckStatus.PASS,
-        detail=f"no legacy [throttle.*] blocks across {len(candidates)} TOML(s)",
+        detail=detail,
     )
 
 

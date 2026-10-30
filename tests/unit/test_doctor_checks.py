@@ -514,7 +514,8 @@ def test_check_dispatch_pct_legacy_passes_over_a_toml_that_does_not_load(
 
     assert (legacy.status, legacy.detail) == (
         CheckStatus.PASS,
-        "no legacy [throttle.*] blocks across 1 TOML(s)",
+        "no legacy [throttle.*] blocks across 0 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
     )
     assert (policies.status, policies.remediation) == (
         CheckStatus.FAIL,
