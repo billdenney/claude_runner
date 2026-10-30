@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import signal
@@ -125,23 +126,29 @@ def stub_mtime(monkeypatch: pytest.MonkeyPatch) -> Callable[[Path, float], None]
 def raise_in_dispatch_loop(monkeypatch: pytest.MonkeyPatch) -> Callable[[int | None], None]:
     """Arm ``dispatcher._dispatch_loop`` to raise ``RuntimeError("boom")`` from
     its own iteration, after it has consumed ``lines_before`` lines (before
-    the first for 0), or after the last one for ``None``. The real loop runs
+    the first for 0), or after the last one for ``None``. The count runs
+    through its ``backlog`` and on into its ``lines``. The real loop runs
     until then."""
 
     def arm(lines_before: int | None) -> None:
         real_loop = dispatcher_mod._dispatch_loop
 
-        def _loop(*, lines: Iterable[str], **kwargs: Any) -> Any:
-            def _failing() -> Iterator[str]:
+        def _loop(*, lines: Iterable[str], backlog: Iterable[str] = (), **kwargs: Any) -> Any:
+            consumed = itertools.count(1)
+
+            def _failing(source: Iterable[str], *, last: bool) -> Iterator[str]:
                 if lines_before == 0:
                     raise RuntimeError("boom")
-                for count, line in enumerate(lines, start=1):
+                for line in source:
                     yield line
-                    if count == lines_before:
+                    if next(consumed) == lines_before:
                         raise RuntimeError("boom")
-                raise RuntimeError("boom")
+                if last:
+                    raise RuntimeError("boom")
 
-            return real_loop(lines=_failing(), **kwargs)
+            return real_loop(
+                lines=_failing(lines, last=True), backlog=_failing(backlog, last=False), **kwargs
+            )
 
         monkeypatch.setattr(dispatcher_mod, "_dispatch_loop", _loop)
 

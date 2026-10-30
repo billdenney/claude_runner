@@ -387,3 +387,39 @@ same worktrees, beside the two workers still running there.
   detected stuck sleep loop, and then only after
   `stuck_sleep_loop_kill_threshold_s` (600 s) of agent silence with a
   matching loop in the worker's process tree.
+
+## Amendment (2026-10-30) — the log so far is the adopted worker's past
+
+**What happened.** Adoption tailed the stream log from its first byte,
+through the same dispatch loop as a new worker's lines. Every line already
+in the log was written before the restart, but the loop stamped the agent
+heartbeat with the time it read each one, so the first event persisted
+`last_heartbeat_at` at the adoption time. A worker stuck in a poll loop
+since before the restart then read as freshly heard from. The
+stuck-sleep-loop check keys on `last_heartbeat_at` (decision 1 of the
+2026-10-16 amendment), so it waited a full
+`stuck_sleep_loop_kill_threshold_s` from the restart before it looked. The
+silence `heartbeat_silence_kill_s` measures (ADR-0037) also ran from the
+restart.
+
+**Decision.** The complete lines the log holds when the monitor attaches
+(`runner.dispatcher._log_backlog`) go through the dispatch loop as its
+backlog. They fill the run's summary, record the session and meet the
+per-event caps, but they stamp no heartbeat, and the tailer starts after
+them. `last_heartbeat_at` keeps the value the last supervisor wrote until
+the worker writes an event after the restart. The silence
+`heartbeat_silence_kill_s` measures runs from the log's last write, held
+between the attempt's start and now.
+
+**Consequences.**
+
+- After a restart, the stuck-sleep-loop check and `heartbeat_silence_kill_s`
+  see the agent's silence since before it, not since the adoption.
+- An agent event the last supervisor did not persist leaves
+  `last_heartbeat_at` older than the agent's last event: one written
+  within `heartbeat_persist_interval_s` of its last write, or while no
+  supervisor ran. Dating the backlog's events by the log's last write
+  instead would bring back the reset, since during a tool call that write
+  is a `tool_progress` line's, not the agent's. The older heartbeat only
+  makes the stuck-sleep-loop check look sooner, and that check acts only
+  on a sleep loop under the worker.

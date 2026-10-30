@@ -380,3 +380,132 @@ def test_a_session_that_cannot_be_recorded_is_logged_and_the_loop_goes_on(
         "task t-loop: could not record session sess-loop in its running state "
         "([Errno 28] No space left on device); the run records it when it ends"
     ]
+
+
+# ---------------------------------------------------------------------------
+# A backlog: the lines an adopted worker wrote before the loop started
+# ---------------------------------------------------------------------------
+
+
+class _Unread:
+    """Lines that record whether the loop asked for one."""
+
+    def __init__(self) -> None:
+        self.asked = False
+
+    def __iter__(self) -> _Unread:
+        return self
+
+    def __next__(self) -> str | None:
+        self.asked = True
+        raise StopIteration
+
+
+def test_the_backlog_fills_the_summary_but_stamps_no_heartbeat() -> None:
+    """The backlog's events fill the summary and record the session, but they
+    are the worker's past: the first heartbeat is the first line after them,
+    dated by the loop's clock."""
+    clock = FakeClock(_START)
+    persisted: list[datetime] = []
+    sessions: list[str] = []
+
+    summary, violation = _dispatch_loop(
+        lines=_then(clock, 120.0, _assistant(), _result()),
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        heartbeat_persist_fn=persisted.append,
+        session_persist_fn=sessions.append,
+        backlog=[_init(), _assistant(), _assistant()],
+        backlog_written_at=_START - timedelta(minutes=10),
+    )
+
+    assert violation is None
+    assert persisted == [_START + timedelta(seconds=120)]
+    assert sessions == ["sess-loop"]
+    assert (summary.cumulative_usage.input_tokens, summary.cumulative_usage.output_tokens) == (
+        30,
+        15,
+    )
+    assert summary.final_result is not None
+
+
+def test_a_backlog_of_bytes_is_parsed_as_the_tailer_would_decode_it() -> None:
+    """``_log_backlog`` gives bytes; an invalid UTF-8 line is skipped as drift."""
+    clock = FakeClock(_START)
+
+    summary, _violation = _dispatch_loop(
+        lines=[],
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        backlog=[_init().encode() + b"\n", b"\xff\xfe\n", _assistant().encode() + b"\n"],
+    )
+
+    assert (summary.session_id, summary.skipped_lines) == ("sess-loop", 1)
+    assert summary.cumulative_usage.input_tokens == 10
+
+
+def test_a_cap_the_backlog_is_past_stops_the_worker_before_a_new_line() -> None:
+    """A token cap the log so far exceeds stops the worker at once, and the
+    loop reads no line after the backlog."""
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+    lines = _Unread()
+
+    _summary, violation = _dispatch_loop(
+        lines=lines,
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(max_tokens=1_500_000),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        backlog=[_init(), _assistant(1_000_000, 0), _assistant(1_000_000, 0), _assistant()],
+    )
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="tokens", observed=2_000_000, cap=1_500_000)
+    assert not lines.asked
+
+
+def test_the_silence_kill_counts_from_the_backlogs_last_write() -> None:
+    """An adopted worker last wrote 895 s before the loop started. Ten quiet
+    seconds later the silence is 905 s, past the 900 s kill threshold; from
+    the loop's start it would be 10 s."""
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+
+    _summary, violation = _dispatch_loop(
+        lines=_then(clock, 10.0, None),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(kill=900.0),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        backlog=[_init(), _assistant()],
+        backlog_written_at=_START - timedelta(seconds=895),
+    )
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="duration", observed=905.0, cap=900.0)
+
+
+def test_without_a_backlog_write_time_the_silence_runs_from_the_start() -> None:
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+
+    _summary, violation = _dispatch_loop(
+        lines=_then(clock, 10.0, None, _result()),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(kill=900.0),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        backlog=[_init(), _assistant()],
+    )
+
+    assert (terminated, violation) == ([], None)

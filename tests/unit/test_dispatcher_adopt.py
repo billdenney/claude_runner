@@ -701,18 +701,20 @@ def test_finalize_exited_classifies_like_adopt_worker(
         pytest.param(None, _RESTART, id="log-missing"),
     ],
 )
-def test_log_finished_at_clamps_to_the_attempt(
+def test_last_log_write_at_clamps_to_the_attempt(
     tmp_path: Path, mtime: datetime | None, expected: datetime
 ) -> None:
-    """The finish time is the log's mtime, capped at now and floored at the
-    attempt's start (so the duration is never negative); now when the log
-    can't be stat'ed."""
+    """The last write is the log's mtime, capped at now and floored at the
+    attempt's start (so a finish dated by it never makes a negative
+    duration); now when the log can't be stat'ed."""
     log = tmp_path / "attempt-1.stream.jsonl"
     if mtime is not None:
         log.write_text("{}\n")
         _set_mtime(log, mtime)
 
-    got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
+    got = dispatcher_mod._last_log_write_at(
+        log, started_at=_STARTED, now=_RESTART, consequence="unused"
+    )
 
     assert got == expected
 
@@ -724,7 +726,7 @@ def test_log_finished_at_clamps_to_the_attempt(
         pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
     ],
 )
-def test_log_finished_at_dates_an_out_of_range_mtime_now(
+def test_last_log_write_at_dates_an_out_of_range_mtime_now(
     tmp_path: Path,
     stub_mtime: Callable[[Path, float], None],
     caplog: pytest.LogCaptureFixture,
@@ -732,18 +734,20 @@ def test_log_finished_at_dates_an_out_of_range_mtime_now(
     reason: str,
 ) -> None:
     """tmpfs stores an mtime past year 9999 as given. No datetime can hold
-    it, so the finish is dated now, as any mtime after now is, with a
-    WARNING."""
+    it, so the last write is dated now, as any mtime after now is, with a
+    WARNING that ends in the caller's consequence."""
     log = tmp_path / "attempt-1.stream.jsonl"
     stub_mtime(log, timestamp)
 
     with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
-        got = dispatcher_mod._log_finished_at(log, started_at=_STARTED, now=_RESTART)
+        got = dispatcher_mod._last_log_write_at(
+            log, started_at=_STARTED, now=_RESTART, consequence="dating the run at now"
+        )
 
     assert got == _RESTART
     assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
         f"{log} has an mtime no datetime can hold (timestamp {timestamp!r} is out of range: "
-        f"{reason}); dating the run that wrote it at now"
+        f"{reason}); dating the run at now"
     ]
 
 
@@ -1412,10 +1416,9 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     nothing is signalled, and the run is its own, a crash with no terminal
     result, not a dispatch_loop_error."""
     task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
-    answers = [dispatcher_mod.WorkerProbe.ALIVE]
 
     def _probe(_state: TaskState, _queue_dir: Path) -> object:
-        return answers.pop(0) if answers else dispatcher_mod.WorkerProbe.REUSED
+        return dispatcher_mod.WorkerProbe.REUSED
 
     signals: list[tuple[int, int]] = []
     monkeypatch.setattr(dispatcher_mod, "probe_recorded_worker", _probe)
@@ -1436,3 +1439,178 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     )
     [run] = reloaded.runs
     assert (run.stop_reason, run.pid) == ("process_exit_nonzero", _PID)
+
+
+# ---------------------------------------------------------------------------
+# The log so far is the adopted worker's past: it stamps no heartbeat, and
+# the silence the kill measures runs from its last write
+# ---------------------------------------------------------------------------
+
+
+def _running_heartbeats(monkeypatch: pytest.MonkeyPatch) -> list[datetime | None]:
+    """The ``last_heartbeat_at`` of each running state the dispatcher writes."""
+    real_write = dispatcher_mod.write_state_atomic
+    heartbeats: list[datetime | None] = []
+
+    def _spy(written: TaskState, path: Path) -> None:
+        if written.status == "running":
+            heartbeats.append(written.last_heartbeat_at)
+        real_write(written, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _spy)
+    return heartbeats
+
+
+def _seed_backlog(queue_dir: Path, heartbeat: datetime) -> tuple[Task, TaskState, Path]:
+    """A running worker whose log holds an init and an assistant event, and
+    whose last supervisor persisted ``heartbeat``."""
+    task = Task(id="060-adopt-backlog", title="t", prompt="p", working_dir=None)
+    log = _attempt_log(queue_dir, task.id)
+    _write_log(log, [_init_line(), _assistant_line()])
+    state = _seed_running(
+        queue_dir, task, log_path=log, started_at=_STARTED, last_heartbeat_at=heartbeat
+    )
+    return task, state, log
+
+
+def test_adopt_keeps_the_heartbeat_the_last_supervisor_wrote(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log's lines at the restart are the worker's past. They fill the
+    run's summary but stamp no heartbeat, so no running write moves
+    last_heartbeat_at off the last supervisor's: a worker silent since
+    before the restart still reads as silent."""
+    heartbeat = _RESTART - timedelta(minutes=20)
+    task, state, _log = _seed_backlog(queue_dir, heartbeat)
+    _AdoptedWorker(monkeypatch, alive=False)
+    heartbeats = _running_heartbeats(monkeypatch)
+
+    outcome = _adopt(queue_dir, task, state)
+
+    assert heartbeats != []
+    assert set(heartbeats) == {heartbeat}
+    assert outcome.new_state.session_id == "sess-adopt"
+    assert outcome.run_record.usage.input_tokens == 60
+
+
+def test_adopt_stamps_the_heartbeat_at_the_first_line_after_the_restart(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A line the worker writes after adoption is a heartbeat, dated by the
+    monitor's clock."""
+    heartbeat = _RESTART - timedelta(minutes=20)
+    task, state, log = _seed_backlog(queue_dir, heartbeat)
+    worker = _AdoptedWorker(monkeypatch)
+    heartbeats = _running_heartbeats(monkeypatch)
+    clock = FakeClock(_RESTART)
+    polls: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        polls.append(seconds)
+        if len(polls) == 1:
+            clock.advance(5.0)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(_assistant_line() + "\n")
+        elif len(polls) == 3:
+            worker.alive = False
+
+    adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        clock=clock,
+        settings_caps=_caps(),
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        sleep_fn=_sleep,
+    )
+
+    assert heartbeats[-1] == _RESTART + timedelta(seconds=5)
+    assert set(heartbeats[:-1]) == {heartbeat}
+
+
+def test_adopt_counts_silence_from_the_logs_last_write(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker last wrote its log 1000 s before the restart, past the
+    900 s kill threshold. The first tick stops it, measuring the silence
+    from that write; from the restart, it would measure none."""
+    task, state, log = _seed_backlog(queue_dir, _RESTART - timedelta(seconds=1000))
+    _set_mtime(log, _RESTART - timedelta(seconds=1000))
+    worker = _AdoptedWorker(monkeypatch)
+    monkeypatch.setattr(dispatcher_mod, "_CAP_TICK_S", 0.5)
+    polls: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        polls.append(seconds)
+        if len(polls) == 100:
+            worker.alive = False  # ends the run if no tick stops the worker
+
+    outcome = adopt_worker(
+        task=task,
+        state=state,
+        queue_dir=queue_dir,
+        clock=FakeClock(_RESTART),
+        settings_caps=_caps(kill=900.0),
+        settings_dispatch=_SETTINGS.dispatch,
+        settings_hooks=_SETTINGS.hooks,
+        sleep_fn=_sleep,
+    )
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap, run.error) == (
+        "killed_by_cap",
+        "duration",
+        "duration cap exceeded: 1000 > 900",
+    )
+
+
+def test_adopt_counts_silence_from_now_for_a_log_mtime_no_datetime_can_hold(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_mtime: Callable[[Path, float], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task, state, log = _seed_backlog(queue_dir, _RESTART - timedelta(minutes=20))
+    stub_mtime(log, 253402300800.0)
+    _AdoptedWorker(monkeypatch, alive=False)
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
+        _adopt(queue_dir, task, state)
+
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"{log} has an mtime no datetime can hold (timestamp 253402300800.0 is out of range: "
+        "year 10000 is out of range); counting its silence from now"
+    ]
+
+
+def test_finalize_exited_dates_a_log_mtime_no_datetime_can_hold_now(
+    queue_dir: Path,
+    stub_mtime: Callable[[Path, float], None],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task = Task(id="021-exited-mtime", title="t", prompt="p", working_dir=None)
+    log = _attempt_log(queue_dir, task.id)
+    _write_log(log, [_init_line(), _result_line()])
+    state = _seed_running(queue_dir, task, log_path=log, started_at=_STARTED)
+    stub_mtime(log, 253402300800.0)
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.file_mtime"):
+        outcome = finalize_exited_worker(
+            task=task,
+            state=state,
+            queue_dir=queue_dir,
+            settings_dispatch=_SETTINGS.dispatch,
+            settings_hooks=_SETTINGS.hooks,
+            clock=FakeClock(_RESTART),
+        )
+
+    assert outcome is not None
+    assert outcome.run_record.finished_at == _RESTART
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"{log} has an mtime no datetime can hold (timestamp 253402300800.0 is out of range: "
+        "year 10000 is out of range); dating the run that wrote it at now"
+    ]

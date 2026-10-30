@@ -41,6 +41,7 @@ ProcessPoolExecutor) when ``target_concurrency > 1``.
 from __future__ import annotations
 
 import errno
+import io
 import json
 import logging
 import os
@@ -346,6 +347,7 @@ def tail_lines(
     sleep_fn: Callable[[float], None] = time.sleep,
     read_fn: Callable[[Path, int], tuple[str, int]] | None = None,
     tick_s: float | None = None,
+    start_offset: int = 0,
 ) -> Iterator[str | None]:
     r"""Tail ``path`` line-by-line until the producer is gone.
 
@@ -383,12 +385,15 @@ def tail_lines(
     With ``tick_s``, the tailer also yields ``None`` each time it has
     polled that long (counted in ``poll_interval_s`` steps) without a line,
     for the dispatch loop's time caps.
+
+    Reading starts at byte ``start_offset``, the start of a line: the
+    caller has taken the lines before it (:func:`_log_backlog`).
     """
     if read_fn is None:
         read_fn = _read_from_offset
 
     buffer = ""
-    offset = 0
+    offset = start_offset
     idle_s = 0.0
 
     while True:
@@ -480,6 +485,30 @@ def _stderr_path_for_stdout_log(stdout_log: Path) -> Path:
     name = stdout_log.name
     base = name[: -len(".stream.jsonl")] if name.endswith(".stream.jsonl") else stdout_log.stem
     return stdout_log.with_name(f"{base}.stderr")
+
+
+def _log_backlog(path: Path) -> tuple[list[bytes], int]:
+    """The complete lines ``path`` holds now, and the byte offset just past them.
+
+    An adopted worker's log so far (:func:`adopt_worker`). A last line
+    without its newline is left for :func:`tail_lines`, which starts at the
+    offset. Lines end at ``\n`` only, as the tailer's do: a JSON string may
+    hold a raw U+2028, which ``str.splitlines`` would split at. A log that
+    is missing, or cannot be read, has no backlog, and the tailer reads it
+    from the start.
+    """
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return [], 0
+    except OSError as exc:
+        logger.warning(
+            "could not read %s before tailing it (%s); tailing it from the start", path, exc
+        )
+        return [], 0
+    end = data.rfind(b"\n") + 1
+    return io.BytesIO(data[:end]).readlines(), end
 
 
 def _reparse_stdout_file(path: Path) -> StreamSummary:
@@ -1127,6 +1156,8 @@ def _dispatch_loop(
     summary: StreamSummary | None = None,
     cap_kill: _CapKill | None = None,
     session_persist_fn: Callable[[str], None] | None = None,
+    backlog: Iterable[str | bytes] = (),
+    backlog_written_at: datetime | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the stream ends or we kill it.
 
@@ -1168,6 +1199,14 @@ def _dispatch_loop(
     the init event), so the running state names the session before the
     run ends: a re-dispatch after a supervisor that died mid-run resumes it.
     A failure is logged, and the run records the session when it ends.
+
+    ``backlog`` holds the lines the worker wrote before the loop started:
+    an adopted worker's log so far. Their events fill the summary, record
+    the session and meet the per-event caps, but they are no heartbeat,
+    since they say nothing of whether the worker is alive now; the running
+    state keeps the heartbeat the last supervisor wrote. The silence the
+    kill measures runs from ``backlog_written_at``, when the backlog's last
+    line was written, or from the loop's start without one.
     """
     summary = summary if summary is not None else StreamSummary()
     cap_kill = cap_kill if cap_kill is not None else _CapKill()
@@ -1178,7 +1217,7 @@ def _dispatch_loop(
     # When the last stream line came, an event or not: the silence the kill
     # measures. A tool_progress line counts, so a long tool call is not
     # silence; the stuck-sleep-loop reaper deals with a stuck one.
-    last_line_at = clock.now()
+    last_line_at = clock.now() if backlog_written_at is None else backlog_written_at
     recorded_session_id: str | None = None
 
     def _lines_until_a_time_cap() -> Iterator[str]:
@@ -1228,6 +1267,55 @@ def _dispatch_loop(
             terminate()
             return
 
+    def _after_an_event() -> bool:
+        """Record a new session id, and stop the worker at a cap the event
+        took it past. Whether it was stopped."""
+        nonlocal recorded_session_id
+        if (
+            session_persist_fn is not None
+            and summary.session_id is not None
+            and summary.session_id != recorded_session_id
+        ):
+            recorded_session_id = summary.session_id
+            try:
+                session_persist_fn(summary.session_id)
+            except Exception as exc:
+                logger.warning(
+                    "task %s: could not record session %s in its running state (%s); "
+                    "the run records it when it ends",
+                    task.id,
+                    summary.session_id,
+                    exc,
+                )
+
+        # An event is no silence, so the silence kill waits for a tick.
+        now = clock.now()
+        if now < started_at:
+            return False  # the clock stepped back; no cap has been exceeded
+        violation = caps_mod.evaluate_caps(
+            settings=settings_caps,
+            task=task,
+            cumulative_tokens=summary.cumulative_usage.total_tokens,
+            started_at=started_at,
+            now=now,
+        )
+        if violation is None:
+            return False
+        logger.warning(
+            "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
+            task.id,
+            violation.which,
+            violation.observed,
+            violation.cap,
+        )
+        cap_kill.violation = violation
+        terminate()
+        return True
+
+    for _event in parse_lines(backlog, summary=summary):
+        if _after_an_event():
+            return summary, cap_kill.violation
+
     for _event in parse_lines(_lines_until_a_time_cap(), summary=summary):
         # Every typed event ticks the in-memory heartbeat; the
         # in-process kill check below uses the un-coalesced value so a
@@ -1267,45 +1355,7 @@ def _dispatch_loop(
                 )
             last_persist_at = last_heartbeat
 
-        if (
-            session_persist_fn is not None
-            and summary.session_id is not None
-            and summary.session_id != recorded_session_id
-        ):
-            recorded_session_id = summary.session_id
-            try:
-                session_persist_fn(summary.session_id)
-            except Exception as exc:
-                logger.warning(
-                    "task %s: could not record session %s in its running state (%s); "
-                    "the run records it when it ends",
-                    task.id,
-                    summary.session_id,
-                    exc,
-                )
-
-        # After each event, check caps. An event is no silence, so the
-        # silence kill waits for a tick.
-        now = clock.now()
-        if now < started_at:
-            continue  # the clock stepped back; no cap has been exceeded
-        violation = caps_mod.evaluate_caps(
-            settings=settings_caps,
-            task=task,
-            cumulative_tokens=summary.cumulative_usage.total_tokens,
-            started_at=started_at,
-            now=now,
-        )
-        if violation is not None:
-            logger.warning(
-                "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
-                task.id,
-                violation.which,
-                violation.observed,
-                violation.cap,
-            )
-            cap_kill.violation = violation
-            terminate()
+        if _after_an_event():
             break
 
     return summary, cap_kill.violation
@@ -2716,7 +2766,12 @@ def adopt_worker(
       worker exited;
     * the recorded stdout log is tailed via :func:`tail_lines` and fed
       through the SAME :func:`_dispatch_loop` as an owned worker, so the
-      per-event cap / heartbeat / silence enforcement is identical;
+      per-event cap / heartbeat / silence enforcement is identical. The
+      lines already in the log are the loop's backlog
+      (:func:`_log_backlog`): they fill the summary and meet the caps but
+      stamp no heartbeat, so the state keeps the heartbeat the last
+      supervisor wrote, and the silence the kill measures runs from the
+      log's last write;
     * a cap/silence KILL terminates the worker by pid
       (:func:`_terminate_by_pid` → ``killpg``);
     * the heartbeat + ``dispatcher_alive_at`` are refreshed on the state
@@ -2836,8 +2891,17 @@ def adopt_worker(
     loop_error: Exception | None = None
     try:
         alive_monitor.start()
+        # The log so far is the worker's past: no heartbeat, and the silence
+        # the kill measures runs from its last write, not from this restart.
+        backlog, backlog_end = _log_backlog(log_path)
         _dispatch_loop(
-            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn, tick_s=_CAP_TICK_S),
+            lines=tail_lines(
+                log_path,
+                alive=_alive,
+                sleep_fn=sleep_fn,
+                tick_s=_CAP_TICK_S,
+                start_offset=backlog_end,
+            ),
             terminate=_terminate_adopted,
             settings_caps=settings_caps,
             clock=clock,
@@ -2846,6 +2910,13 @@ def adopt_worker(
             heartbeat_persist_fn=_persist_heartbeat,
             cap_kill=cap_kill,
             session_persist_fn=_persist_session,
+            backlog=backlog,
+            backlog_written_at=_last_log_write_at(
+                log_path,
+                started_at=started_at,
+                now=clock.now(),
+                consequence="counting its silence from now",
+            ),
         )
     except Exception as exc:
         # As in dispatch(): escaping here would leave the worker unwatched
@@ -2959,7 +3030,12 @@ def finalize_exited_worker(
         cap_violation=cap_violation,
         started_at=started_at,
         finished_at=(
-            _log_finished_at(log_path, started_at=started_at, now=now)
+            _last_log_write_at(
+                log_path,
+                started_at=started_at,
+                now=now,
+                consequence="dating the run that wrote it at now",
+            )
             if log_path is not None
             else now
         ),
@@ -2974,18 +3050,22 @@ def finalize_exited_worker(
     )
 
 
-def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> datetime:
-    """Date an exited worker's finish by its stdout log's last write.
+def _last_log_write_at(
+    log_path: Path, *, started_at: datetime, now: datetime, consequence: str
+) -> datetime:
+    """When the worker last wrote its stdout log: the log's mtime.
 
-    The terminal ``result`` event is the worker's last stdout write, so the
-    log's mtime is when it finished. ``now`` only dates the restart that
-    found it, which can be hours later. The mtime is capped at ``now`` and
-    floored at ``started_at``, the floor winning if the two conflict, since
-    a negative duration fails RunRecord validation. ``now`` when the log
-    can't be stat'ed, and for an mtime no datetime can hold (past year
-    9999, which tmpfs stores as given), as for any mtime after ``now``.
+    It dates an exited worker's finish, since the terminal ``result`` event
+    is the worker's last stdout write, and an adopted worker's last line
+    before the restart; ``now`` only dates the restart, which can be hours
+    later. The mtime is capped at ``now`` and floored at ``started_at``, the
+    floor winning if the two conflict, since a negative duration fails
+    RunRecord validation. ``now`` when the log can't be stat'ed, and for an
+    mtime no datetime can hold (past year 9999, which tmpfs stores as
+    given), as for any mtime after ``now``; ``consequence`` says what that
+    means in the WARNING an mtime no datetime can hold gets.
     """
-    mtime = file_mtime_utc(log_path, consequence="dating the run that wrote it at now")
+    mtime = file_mtime_utc(log_path, consequence=consequence)
     if mtime is None:
         return now
     return max(started_at, min(mtime, now))
