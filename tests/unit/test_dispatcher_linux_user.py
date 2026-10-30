@@ -50,8 +50,8 @@ class _FakePopen:
     """subprocess.Popen drop-in that captures argv and immediately exits 0.
 
     The dispatcher's stream-json loop iterates ``process.stdout`` so we
-    expose an empty iterable. ``communicate`` returns ("", "") and
-    ``returncode`` is 0 so the dispatch path lands the no-result branch
+    expose an empty iterable. ``communicate`` returns ("", "") and sets
+    ``returncode`` to 0 so the dispatch path lands the no-result branch
     in _build_run_record.
     """
 
@@ -61,7 +61,9 @@ class _FakePopen:
     def __init__(self, argv: list[str], *args: object, **kwargs: object) -> None:
         type(self).captured_argv.append(list(argv))
         type(self).captured_env.append(kwargs.get("env"))
-        self.returncode = 0
+        # None until reaped, as on Popen: the dispatcher reads it to tell a
+        # worker it has already reaped.
+        self.returncode: int | None = None
         # An empty iterable; the dispatcher iterates stdout via parse_lines.
         self.stdout = iter([])
         self.stderr = None
@@ -72,9 +74,11 @@ class _FakePopen:
         self._argv = argv
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.returncode = 0
         return ("", "")
 
     def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0
         return 0
 
     def terminate(self) -> None:
@@ -84,6 +88,7 @@ class _FakePopen:
         pass
 
     def poll(self) -> int | None:
+        self.returncode = 0
         return 0
 
 
