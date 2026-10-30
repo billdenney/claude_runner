@@ -65,8 +65,10 @@ class _FakeProcess:
         *,
         pid: int = 4242,
         wait_outcomes: list[int | type[BaseException]] | None = None,
+        returncode: int | None = None,
     ) -> None:
         self.pid = pid
+        self.returncode = returncode
         self._outcomes = list(wait_outcomes or [0])
         self.wait_calls: list[float | None] = []
 
@@ -136,6 +138,23 @@ def test_terminate_returns_silently_when_parent_already_gone() -> None:
     ):
         _terminate(process)  # type: ignore[arg-type]
 
+    killpg.assert_not_called()
+    assert process.wait_calls == []
+
+
+def test_terminate_sends_nothing_once_popen_has_reaped_the_worker() -> None:
+    """A worker ``Popen`` has reaped (the file tailer's ``poll`` does as it
+    exits) may have had its pid given to another process: nothing is looked
+    up, signalled or waited on."""
+    process = _FakeProcess(pid=3050, returncode=0)
+
+    with (
+        mock.patch.object(dispatcher_mod.os, "getpgid") as getpgid,
+        mock.patch.object(dispatcher_mod.os, "killpg") as killpg,
+    ):
+        _terminate(process)  # type: ignore[arg-type]
+
+    getpgid.assert_not_called()
     killpg.assert_not_called()
     assert process.wait_calls == []
 

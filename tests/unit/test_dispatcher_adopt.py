@@ -1199,8 +1199,9 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     raise_in_dispatch_loop: Callable[[int | None], None],
 ) -> None:
     """The recorded pid comes from a state file. When the identity check says
-    it now belongs to another process, the worker is gone: nothing is
-    signalled, and the run is recorded as a dispatch_loop_error failure."""
+    it now belongs to another process, the worker has exited on its own:
+    nothing is signalled, and the run is its own, a crash with no terminal
+    result, not a dispatch_loop_error."""
     task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
     answers = [dispatcher_mod.WorkerProbe.ALIVE]
 
@@ -1217,7 +1218,12 @@ def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     outcome = _adopt(queue_dir, task, state)
 
     assert signals == []
-    assert (outcome.new_state.status, outcome.run_record.stop_reason) == (
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
         "failed",
-        "dispatch_loop_error",
+        "process_exit_nonzero",
+        "claude exited with code -1 and no result event",
     )
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.pid) == ("process_exit_nonzero", _PID)

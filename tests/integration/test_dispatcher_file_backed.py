@@ -536,6 +536,36 @@ def test_a_terminal_result_written_before_the_loop_raised_stands(
     assert reloaded.session_id == "sess-done"
 
 
+def test_a_worker_that_exited_on_its_own_keeps_its_own_record(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """The worker fails and exits on its own, and the loop raises only after
+    that. Nothing is signalled, since the worker's pid may be another
+    process's by now, and its run records its own exit and stderr, not
+    dispatch_loop_error. File-backed: the tailer reaps the worker before the
+    loop ends, so it is gone when the loop raises."""
+    monkeypatch.setenv("SHIM_FAIL_FAST", "worker crashed")
+    raise_in_dispatch_loop(None)
+    stopped: list[int] = []
+    monkeypatch.setattr(dispatcher_mod, "_terminate", lambda process: stopped.append(process.pid))
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=True)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert (worker.returncode, stopped) == (1, [])
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.error) == ("process_exit_nonzero", "worker crashed")
+
+
 @pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
 def test_a_worker_that_cannot_be_stopped_is_parked_with_no_run(
     queue_dir: Path,

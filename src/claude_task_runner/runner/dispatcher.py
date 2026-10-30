@@ -1247,6 +1247,9 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
     Sequence:
 
+    0. ``process.returncode`` already set ⇒ ``Popen`` has reaped the
+       parent (the file tailer's ``poll`` does as the worker exits), so
+       its pid may be another process's by now; return without a signal.
     1. ``getpgid`` once. ``ProcessLookupError`` ⇒ the parent is
        already gone; return cleanly.
     2. ``killpg(pgid, SIGTERM)``. ``ProcessLookupError`` ⇒ the group
@@ -1264,6 +1267,8 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     own, as when a worker was started without its own session) raises
     :class:`TerminateFailed` at step 2, with nothing sent.
     """
+    if process.returncode is not None:
+        return
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
@@ -1326,6 +1331,17 @@ the exception. It is a failure like any other: it counts toward the circuit
 breaker, and the task is dispatched again."""
 
 
+class _AfterLoopError(StrEnum):
+    """What :func:`_stop_after_loop_error` found its worker to be, or made it."""
+
+    EXITED = "exited"
+    """Gone before the stop: it exited on its own, and nothing was signalled."""
+    STOPPED = "stopped"
+    """Gone after the stop."""
+    RUNNING = "running"
+    """Still running: the stop failed."""
+
+
 def _stop_after_loop_error(
     task_id: str,
     pid: int,
@@ -1333,13 +1349,26 @@ def _stop_after_loop_error(
     *,
     stop: Callable[[], None],
     gone: Callable[[], bool],
-) -> bool:
-    """Stop a worker whose dispatch loop raised ``exc``; whether it is gone.
+) -> _AfterLoopError:
+    """Stop a worker whose dispatch loop raised ``exc``; say what became of it.
 
-    Logs the loop's failure with its traceback, then calls ``stop``. A
-    ``stop`` that raises is logged. ``False`` when the worker still runs, so
-    the caller must not record the attempt as over.
+    Logs the loop's failure with its traceback. A worker already gone has
+    exited on its own: it is not signalled, since its pid may be another
+    process's by now, and its own record of the run stands. Otherwise calls
+    ``stop``; a ``stop`` that raises is logged.
+    :attr:`_AfterLoopError.RUNNING` means the worker still runs, so the
+    caller must not record the attempt as over.
     """
+    if gone():
+        logger.error(
+            "task %s: dispatch loop raised %s: %s; worker pid=%s had already exited",
+            task_id,
+            type(exc).__name__,
+            exc,
+            pid,
+            exc_info=exc,
+        )
+        return _AfterLoopError.EXITED
     logger.error(
         "task %s: dispatch loop raised %s: %s; stopping worker pid=%s",
         task_id,
@@ -1357,7 +1386,7 @@ def _stop_after_loop_error(
             pid,
             stop_exc,
         )
-    return gone()
+    return _AfterLoopError.STOPPED if gone() else _AfterLoopError.RUNNING
 
 
 def _loop_error_text(exc: Exception) -> str:
@@ -1368,11 +1397,13 @@ def _name_loop_error(
     run: RunRecord, loop_error: Exception | None, summary: StreamSummary
 ) -> RunRecord:
     """``run``, failed with :data:`DISPATCH_LOOP_ERROR_STOP_REASON` when the
-    dispatch loop raised and the worker was stopped mid-run.
+    worker was stopped mid-run after the dispatch loop raised ``loop_error``.
 
-    The exit code then records the stop, not its cause. A worker that wrote
-    its terminal result before the loop raised finished its work, and the
-    run its result built stands.
+    The exit code then records the stop, not its cause. ``loop_error`` is
+    ``None`` when the loop did not raise, or when the worker had exited on
+    its own before the stop (:attr:`_AfterLoopError.EXITED`): its own exit
+    stands. A worker that wrote its terminal result before the loop raised
+    finished its work, and the run its result built stands.
     """
     if loop_error is None or summary.final_result is not None:
         return run
@@ -2218,19 +2249,25 @@ def dispatch(
         if alive_monitor is not None:
             alive_monitor.stop()
 
-    if loop_error is not None and not _stop_after_loop_error(
-        task.id,
-        process.pid,
-        loop_error,
-        stop=_terminate_owned,
-        gone=lambda: process.poll() is not None,
-    ):
-        if persist_state:
-            parked = park_live_worker(
-                new_state, why="after its dispatch loop failed and it could not be stopped"
-            )
-            write_state_atomic(parked, state_path_for(queue_dir, task.id))
-        raise _parked_after_loop_error(task.id, process.pid, loop_error) from loop_error
+    # The loop's exception, when the stop after it ended the worker mid-run.
+    stopped_for: Exception | None = None
+    if loop_error is not None:
+        after = _stop_after_loop_error(
+            task.id,
+            process.pid,
+            loop_error,
+            stop=_terminate_owned,
+            gone=lambda: process.poll() is not None,
+        )
+        if after is _AfterLoopError.RUNNING:
+            if persist_state:
+                parked = park_live_worker(
+                    new_state, why="after its dispatch loop failed and it could not be stopped"
+                )
+                write_state_atomic(parked, state_path_for(queue_dir, task.id))
+            raise _parked_after_loop_error(task.id, process.pid, loop_error) from loop_error
+        if after is _AfterLoopError.STOPPED:
+            stopped_for = loop_error
 
     # Drain remaining output and stderr. If the process won't finish
     # within the grace period, SIGKILL its whole group (so any forked
@@ -2300,7 +2337,7 @@ def dispatch(
         account=account,
         pid=process.pid,
     )
-    run_record = _name_loop_error(run_record, loop_error, summary)
+    run_record = _name_loop_error(run_record, stopped_for, summary)
 
     # Detect open sidecar once and thread it through finalization. The
     # output-evidence gate (ADR-0020) consults it when deciding whether
@@ -2485,17 +2522,23 @@ def adopt_worker(
     finally:
         alive_monitor.stop()
 
-    if loop_error is not None and not _stop_after_loop_error(
-        task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
-    ):
-        _write_unless_finalized(
-            park_live_worker(
-                new_state, why="after its dispatch loop failed and it could not be stopped"
-            ),
-            state_path,
-            worker_pid=pid,
+    # The loop's exception, when the stop after it ended the worker mid-run.
+    stopped_for: Exception | None = None
+    if loop_error is not None:
+        after = _stop_after_loop_error(
+            task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
         )
-        raise _parked_after_loop_error(task.id, pid, loop_error) from loop_error
+        if after is _AfterLoopError.RUNNING:
+            _write_unless_finalized(
+                park_live_worker(
+                    new_state, why="after its dispatch loop failed and it could not be stopped"
+                ),
+                state_path,
+                worker_pid=pid,
+            )
+            raise _parked_after_loop_error(task.id, pid, loop_error) from loop_error
+        if after is _AfterLoopError.STOPPED:
+            stopped_for = loop_error
 
     # The tailer exits once the pid is gone; re-read the full log so the
     # summary reflects the worker's final flush (the live tailer may stop
@@ -2517,7 +2560,7 @@ def adopt_worker(
         settings_failure_classifier=settings_failure_classifier,
         settings_dispatch=settings_dispatch,
         settings_hooks=settings_hooks,
-        loop_error=loop_error,
+        loop_error=stopped_for,
     )
 
 
