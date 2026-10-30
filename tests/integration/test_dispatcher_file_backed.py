@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Callable
@@ -903,3 +904,84 @@ def test_a_cap_kill_that_cannot_stop_the_worker_parks_it(
         worker.pid,
         [],
     )
+
+
+# ---------------------------------------------------------------------------
+# A silent worker is stopped on a tick (ADR-0037)
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_with_caps(
+    queue_dir: Path, task: Task, plan: SpawnPlan, caps: TaskCapsSettings, *, adopt: bool
+) -> object:
+    return dispatch(
+        task=task,
+        state=TaskState(task_id=task.id),
+        plan=plan,
+        queue_dir=queue_dir,
+        clock=RealClock(),
+        settings_caps=caps,
+        settings_hooks=_hooks(),
+        claude_executable=str(SHIM_PATH),
+        adopt_workers=adopt,
+    )
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_worker_that_writes_nothing_is_stopped_at_its_duration_cap(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """No line ever comes, so no event checks the duration cap. A tick does,
+    and the run is killed by the cap."""
+    monkeypatch.setenv("SHIM_SLEEP_BEFORE_S", "30")
+    monkeypatch.setattr(dispatcher_mod, "_CAP_TICK_S", 0.2)
+    caps = _caps().model_copy(update={"max_duration_s_per_task": 1.0})
+
+    outcome = _dispatch_with_caps(queue_dir, task, fresh_plan, caps, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.returncode == -signal.SIGTERM
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap) == ("killed_by_cap", "duration")
+    assert run.error is not None
+    assert re.fullmatch(r"duration cap exceeded: \d+ > 1", run.error), run.error
+
+
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_worker_silent_past_the_kill_threshold_is_stopped(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The worker writes its init event and then nothing. Once it has been
+    silent past heartbeat_silence_kill_s, a tick stops it, and the silence is
+    recorded as the duration cap it hit, as before."""
+    monkeypatch.setenv("SHIM_SESSION_ID", "sess-silent")
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+    monkeypatch.setattr(dispatcher_mod, "_CAP_TICK_S", 0.2)
+    caps = _caps().model_copy(update={"heartbeat_silence_kill_s": 1.0})
+
+    outcome = _dispatch_with_caps(queue_dir, task, fresh_plan, caps, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.returncode == -signal.SIGTERM
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap) == ("killed_by_cap", "duration")
+    assert run.error is not None
+    assert re.fullmatch(r"duration cap exceeded: \d+ > 1", run.error), run.error
+    assert reloaded.session_id == "sess-silent"

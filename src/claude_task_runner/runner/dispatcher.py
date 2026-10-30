@@ -45,12 +45,14 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -265,9 +267,62 @@ def build_argv(
     return argv
 
 
-def _read_lines(stream: Iterable[str]) -> Iterable[str]:
+def _read_lines(stream: Iterable[str | None]) -> Iterable[str | None]:
     """Trivial pass-through; isolated for monkey-patching in tests."""
     yield from stream
+
+
+_CAP_TICK_S = 10.0
+"""Longest a line source waits for a line before it yields a tick (``None``),
+on which the dispatch loop checks the caps only the clock can trip
+(ADR-0037). Module-level so tests can shorten it."""
+
+
+class _PipeLines:
+    """A worker's stdout pipe as lines, with a tick when none comes for ``tick_s``.
+
+    Iterating yields each line with its newline, at end of file a last line
+    without one, and ``None`` after ``tick_s`` with no line. It reads the
+    descriptor itself and decodes each line as UTF-8 with replacement
+    characters, as the file tailer does. What it has read and not yielded
+    stays here, for :meth:`unread`; ``process.stdout``'s own buffer, which
+    nothing reads, stays empty.
+    """
+
+    def __init__(self, stream: IO[str], *, tick_s: float | None) -> None:
+        self._stream = stream
+        self._tick_s = tick_s
+        self._pending: deque[str] = deque()
+        self._partial = b""
+        self._eof = False
+
+    def __iter__(self) -> Iterator[str | None]:
+        fd = self._stream.fileno()
+        while True:
+            while self._pending:
+                yield self._pending.popleft()
+            if self._eof:
+                return
+            ready, _, _ = select.select([fd], [], [], self._tick_s)
+            if not ready:
+                yield None
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                self._eof = True
+                if self._partial:
+                    self._pending.append(self._partial.decode("utf-8", errors="replace"))
+                    self._partial = b""
+                continue
+            *complete, self._partial = (self._partial + chunk).split(b"\n")
+            self._pending.extend(line.decode("utf-8", errors="replace") + "\n" for line in complete)
+
+    def unread(self) -> str:
+        """What it has read and not yielded, which it then forgets."""
+        rest = "".join(self._pending) + self._partial.decode("utf-8", errors="replace")
+        self._pending.clear()
+        self._partial = b""
+        return rest
 
 
 # Poll cadence for the file tailer's no-data wait. Small enough that a
@@ -284,7 +339,8 @@ def tail_lines(
     poll_interval_s: float = _TAIL_POLL_INTERVAL_S,
     sleep_fn: Callable[[float], None] = time.sleep,
     read_fn: Callable[[Path, int], tuple[str, int]] | None = None,
-) -> Iterator[str]:
+    tick_s: float | None = None,
+) -> Iterator[str | None]:
     r"""Tail ``path`` line-by-line until the producer is gone.
 
     Yields only **complete, newline-terminated** lines (the trailing
@@ -317,12 +373,17 @@ def tail_lines(
     a file descriptor). ``read_fn`` / ``sleep_fn`` are injection seams
     for unit tests; the defaults read the real file from a byte offset
     and use ``time.sleep``.
+
+    With ``tick_s``, the tailer also yields ``None`` each time it has
+    polled that long (counted in ``poll_interval_s`` steps) without a line,
+    for the dispatch loop's time caps.
     """
     if read_fn is None:
         read_fn = _read_from_offset
 
     buffer = ""
     offset = 0
+    idle_s = 0.0
 
     while True:
         producer_alive = alive()
@@ -343,6 +404,7 @@ def tail_lines(
                     break
                 line = buffer[: idx + 1]
                 buffer = buffer[idx + 1 :]
+                idle_s = 0.0
                 yield line
 
         if not producer_alive:
@@ -350,7 +412,11 @@ def tail_lines(
             # was the final drain. Stop without sleeping so we don't hang.
             return
 
+        if tick_s is not None and idle_s >= tick_s:
+            idle_s = 0.0
+            yield None
         sleep_fn(poll_interval_s)
+        idle_s += poll_interval_s
 
 
 def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
@@ -1045,7 +1111,7 @@ class _CapKill:
 
 def _dispatch_loop(
     *,
-    lines: Iterable[str],
+    lines: Iterable[str | None],
     terminate: Callable[[], None],
     settings_caps: TaskCapsSettings,
     clock: Clock,
@@ -1065,14 +1131,20 @@ def _dispatch_loop(
 
     The loop is decoupled from how its events arrive: ``lines`` is any
     iterable of NDJSON lines and ``terminate`` is the side-effect that
-    stops the underlying worker on a cap/silence KILL. The owned path
-    (same-incarnation ``Popen``) passes ``_read_lines(process.stdout)``
-    or :func:`tail_lines` over the stdout log plus
+    stops the underlying worker on a cap/silence KILL. A ``None`` in
+    ``lines`` is a tick, which a source yields when no line has come for a
+    while (:data:`_CAP_TICK_S`): on a tick the loop checks the caps only the
+    clock can trip, the duration cap and ``heartbeat_silence_kill_s``, so a
+    worker that writes nothing at all is still stopped (ADR-0037). The
+    silence the kill measures runs from the last line of any kind, a
+    ``tool_progress`` heartbeat included. The owned path
+    (same-incarnation ``Popen``) passes a :class:`_PipeLines` reader of
+    ``process.stdout`` or :func:`tail_lines` over the stdout log, plus
     ``lambda: _terminate(process)``; the adopted path (a worker this
     supervisor did not spawn) passes :func:`tail_lines` over the
     recorded log file plus a ``killpg``-by-pid terminate. The per-event
-    heartbeat / cap / silence logic below is identical across both —
-    only the source of lines and the kill mechanism differ (ADR-0025).
+    and per-tick logic below is the same for all three; only the source
+    of lines and the kill mechanism differ (ADR-0025).
 
     ``heartbeat_persist_fn``, when supplied, is invoked at most once
     per ``settings_caps.heartbeat_persist_interval_s`` seconds with
@@ -1085,13 +1157,64 @@ def _dispatch_loop(
     ``heartbeat_silence_alert_s``.
     """
     summary = summary if summary is not None else StreamSummary()
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = cap_kill if cap_kill is not None else _CapKill()
     last_heartbeat: datetime | None = None
     last_persist_at: datetime | None = None
     persist_interval_s = settings_caps.heartbeat_persist_interval_s
     heartbeat_persist_failures = 0
+    # When the last stream line came, an event or not: the silence the kill
+    # measures. A tool_progress line counts, so a long tool call is not
+    # silence; the stuck-sleep-loop reaper deals with a stuck one.
+    last_line_at = clock.now()
 
-    for _event in parse_lines(_read_lines(lines), summary=summary):
+    def _lines_until_a_time_cap() -> Iterator[str]:
+        nonlocal last_line_at
+        for line in _read_lines(lines):
+            if line is not None:
+                last_line_at = clock.now()
+                yield line
+                continue
+            # A tick: no line for a while. Only the clock can trip a cap now.
+            now = clock.now()
+            if now < started_at or now < last_line_at:
+                continue  # the clock stepped back; the next tick measures again
+            violation = caps_mod.evaluate_caps(
+                settings=settings_caps,
+                task=task,
+                cumulative_tokens=summary.cumulative_usage.total_tokens,
+                started_at=started_at,
+                now=now,
+            )
+            if violation is not None:
+                logger.warning(
+                    "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
+                    task.id,
+                    violation.which,
+                    violation.observed,
+                    violation.cap,
+                )
+            else:
+                status = hb_mod.evaluate(
+                    settings=settings_caps,
+                    last_heartbeat_at=last_line_at,
+                    started_at=started_at,
+                    now=now,
+                )
+                if status.verdict is not hb_mod.HeartbeatVerdict.KILL:
+                    continue
+                logger.warning(
+                    "task %s wrote no stream output for %.0fs; SIGTERM", task.id, status.silence_s
+                )
+                violation = caps_mod.CapViolation(
+                    which="duration",
+                    observed=status.silence_s,
+                    cap=float(settings_caps.heartbeat_silence_kill_s),
+                )
+            cap_kill.violation = violation
+            terminate()
+            return
+
+    for _event in parse_lines(_lines_until_a_time_cap(), summary=summary):
         # Every typed event ticks the in-memory heartbeat; the
         # in-process kill check below uses the un-coalesced value so a
         # KILL fires as soon as the threshold is crossed, even when the
@@ -1130,49 +1253,31 @@ def _dispatch_loop(
                 )
             last_persist_at = last_heartbeat
 
-        # After each event, check caps.
-        cap_violation = caps_mod.evaluate_caps(
+        # After each event, check caps. An event is no silence, so the
+        # silence kill waits for a tick.
+        now = clock.now()
+        if now < started_at:
+            continue  # the clock stepped back; no cap has been exceeded
+        violation = caps_mod.evaluate_caps(
             settings=settings_caps,
             task=task,
             cumulative_tokens=summary.cumulative_usage.total_tokens,
             started_at=started_at,
-            now=clock.now(),
+            now=now,
         )
-        if cap_violation is not None:
+        if violation is not None:
             logger.warning(
                 "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
                 task.id,
-                cap_violation.which,
-                cap_violation.observed,
-                cap_violation.cap,
+                violation.which,
+                violation.observed,
+                violation.cap,
             )
-            if cap_kill is not None:
-                cap_kill.violation = cap_violation
+            cap_kill.violation = violation
             terminate()
             break
 
-        # Heartbeat-based kill (silence threshold). Alert-level transitions
-        # are surfaced by the supervisor by comparing TaskState.last_heartbeat_at;
-        # only a KILL verdict acts here.
-        status = hb_mod.evaluate(
-            settings=settings_caps,
-            last_heartbeat_at=last_heartbeat,
-            started_at=started_at,
-            now=clock.now(),
-        )
-        if status.verdict is hb_mod.HeartbeatVerdict.KILL:
-            logger.warning("task %s heartbeat silent for %.0fs; SIGTERM", task.id, status.silence_s)
-            cap_violation = caps_mod.CapViolation(
-                which="duration",
-                observed=status.silence_s,
-                cap=float(settings_caps.heartbeat_silence_kill_s),
-            )
-            if cap_kill is not None:
-                cap_kill.violation = cap_violation
-            terminate()
-            break
-
-    return summary, cap_violation
+    return summary, cap_kill.violation
 
 
 _MAX_ADD_DIRS_LOG_CHARS = 300
@@ -1470,13 +1575,12 @@ def _drain_pipes(
 ) -> tuple[str, str]:
     """What is left on a stopped worker's stdout and stderr pipes.
 
-    Read through the file objects, so lines the dispatch loop's iterator had
-    read ahead, and not yet yielded, are kept: ``communicate`` reads the
-    descriptors and would drop them. Each pipe is read on its own thread. A
-    pipe still open after ``timeout_s``, held by a process the stop did not
-    end, is left to its thread, and the text read from it so far is
-    returned. Nothing is signalled: the worker is reaped, so its pid is no
-    longer provably its own.
+    Read through the file objects, so whatever a file object had already
+    read is kept, each pipe on its own thread. A pipe still open after
+    ``timeout_s``, held by a process the stop did not end, is left to its
+    thread, and the text read from it so far is returned. Nothing is
+    signalled: the worker is reaped, so its pid is no longer provably its
+    own.
     """
     out: list[str] = []
     err: list[str] = []
@@ -2315,13 +2419,16 @@ def dispatch(
     # lines differs (a file tailer when file-backed, the stdout pipe
     # otherwise). The terminate is wrapped so the loop stays oblivious
     # to whether it's reading a pipe or a file (ADR-0025).
-    lines: Iterable[str]
+    lines: Iterable[str | None]
+    pipe_lines: _PipeLines | None = None
     if use_files:
         assert stdout_log_path is not None
-        lines = tail_lines(stdout_log_path, alive=lambda: process.poll() is None)
+        lines = tail_lines(
+            stdout_log_path, alive=lambda: process.poll() is None, tick_s=_CAP_TICK_S
+        )
     else:
         assert process.stdout is not None
-        lines = _read_lines(process.stdout)
+        lines = pipe_lines = _PipeLines(process.stdout, tick_s=_CAP_TICK_S)
 
     def _terminate_owned() -> None:
         _terminate(process)
@@ -2418,11 +2525,12 @@ def dispatch(
                 _signal_group(process, signal.SIGKILL)
                 stdout_remainder, stderr = process.communicate()
         else:
-            # The loop stopped reading mid-stream, so lines its iterator read
-            # ahead are in process.stdout's buffer, where communicate() does
-            # not look; and the worker is reaped, so nothing is signalled by
-            # its pid.
+            # The worker is reaped, so communicate()'s timeout path, which
+            # sends SIGKILL by its pid, must not run.
             stdout_remainder, stderr = _drain_pipes(process, task_id=task.id, timeout_s=10)
+        # The pipe reader's own read-ahead: lines it read and the loop never took.
+        assert pipe_lines is not None
+        stdout_remainder = pipe_lines.unread() + (stdout_remainder or "")
 
         # Re-parse any remainder lines. parse_lines updates `summary`
         # (cumulative usage, session id, final result) as a side effect;
@@ -2632,7 +2740,7 @@ def adopt_worker(
     try:
         alive_monitor.start()
         _dispatch_loop(
-            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn),
+            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn, tick_s=_CAP_TICK_S),
             terminate=_terminate_adopted,
             settings_caps=settings_caps,
             clock=clock,

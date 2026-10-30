@@ -49,6 +49,8 @@ from claude_task_runner.runner.dispatcher import (
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
 
+from ._worker_streams import empty_stdout
+
 DISPATCHER_LOGGER = "claude_task_runner.runner.dispatcher"
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 COOLDOWN_S = 60.0
@@ -64,11 +66,12 @@ class _FakePopen:
     def __init__(self, argv: list[str], *args: object, **kwargs: object) -> None:
         type(self).started.append({"argv": list(argv), **kwargs})
         self.returncode = 0
-        self.stdout = iter([])
+        self.stdout = empty_stdout()
         self.stderr = None
         self.pid = 4242
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.stdout.close()
         return ("", "")
 
     def wait(self, timeout: float | None = None) -> int:

@@ -1314,6 +1314,29 @@ def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
     )
 
 
+def test_adopt_worker_that_writes_nothing_more_is_stopped_at_its_duration_cap(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The adopted worker's log is empty and stays so, so no event checks the
+    duration cap; a tick does (ADR-0037). It started 30 minutes before the
+    restart, past its 10 minute cap."""
+    task, state = _seed_adopted(queue_dir, [])
+    worker = _AdoptedWorker(monkeypatch)
+    monkeypatch.setattr(dispatcher_mod, "_CAP_TICK_S", 0.5)
+
+    outcome = _adopt(queue_dir, task, state, caps=_caps(max_duration=600.0))
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    [run] = reloaded.runs
+    assert (run.stop_reason, run.killed_by_cap, run.error) == (
+        "killed_by_cap",
+        "duration",
+        "duration cap exceeded: 1800 > 600",
+    )
+
+
 def test_adopt_loop_error_never_signals_a_pid_another_process_holds(
     queue_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
