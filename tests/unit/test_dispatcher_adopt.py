@@ -1280,6 +1280,38 @@ def test_adopt_park_stands_down_for_a_record_another_writer_made(
     assert parks == []
 
 
+def test_adopt_park_that_cannot_be_written_is_said_and_not_reported(
+    queue_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_dispatch_loop: Callable[[int | None], None],
+) -> None:
+    """The adopted worker cannot be stopped and its park cannot be written:
+    adopt_worker raises its own error, saying so, and reports no park."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    _AdoptedWorker(monkeypatch, survives=True)
+    real_write = dispatcher_mod.write_state_atomic
+
+    def _write(written: TaskState, path: Path) -> None:
+        if written.status == "possibly_hung":
+            raise OSError(28, "No space left on device")
+        real_write(written, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", _write)
+    raise_in_dispatch_loop(1)
+    parks: list[tuple[TaskState, str]] = []
+
+    with pytest.raises(dispatcher_mod.DispatchError) as exc_info:
+        _adopt(queue_dir, task, state, on_park=lambda parked, why: parks.append((parked, why)))
+
+    assert str(exc_info.value) == (
+        f"task {task.id}: dispatch loop raised RuntimeError: boom; worker pid={_PID} "
+        "could not be stopped and its park could not be written "
+        "([Errno 28] No space left on device)"
+    )
+    assert parks == []
+    assert load_state(state_path_for(queue_dir, task.id)).status == "running"
+
+
 def test_adopt_cap_kill_that_raises_is_retried_and_recorded_as_the_cap(
     queue_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

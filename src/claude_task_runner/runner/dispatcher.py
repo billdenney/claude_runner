@@ -268,8 +268,14 @@ def build_argv(
 
 
 def _read_lines(stream: Iterable[str | None]) -> Iterable[str | None]:
-    """Trivial pass-through; isolated for monkey-patching in tests."""
-    yield from stream
+    """Trivial pass-through; isolated for monkey-patching in tests.
+
+    A ``for`` loop, not ``yield from``: closing this generator, as a raise
+    in the dispatch loop's body does, would otherwise close ``stream`` too,
+    and a stream closed under its reader loses the lines it had read ahead.
+    """
+    for line in stream:  # noqa: UP028 - yield from would close stream with this generator
+        yield line
 
 
 _CAP_TICK_S = 10.0
@@ -1332,7 +1338,13 @@ def _signal_group_by_pid(pid: int, sig: int) -> None:
 
 
 def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
-    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`)."""
+    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`).
+
+    Nothing, once ``Popen`` has reaped ``process``: its pid may be another
+    process's by now.
+    """
+    if process.returncode is not None:
+        return
     _signal_group_by_pid(process.pid, sig)
 
 
@@ -1548,6 +1560,19 @@ _LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
 """The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
 
 
+def _park_not_written(task_id: str, pid: int, exc: OSError) -> str:
+    """Log that the park of a worker that could not be stopped could not be
+    written, as :func:`runner.orchestrator._park_live_worker` does; the
+    outcome for the error the dispatch raises."""
+    logger.error(
+        "task %s: worker pid=%s could not be stopped, and its park could not be written (%s)",
+        task_id,
+        pid,
+        exc,
+    )
+    return f"its park could not be written ({exc})"
+
+
 def _unstopped_after_loop_error(
     task_id: str, pid: int, loop_error: Exception, *, outcome: str
 ) -> DispatchError:
@@ -1567,35 +1592,46 @@ def _read_rest(stream: IO[str], into: list[str]) -> None:
             for line in stream:
                 into.append(line)
     except (OSError, ValueError) as exc:
-        logger.warning("could not read the rest of a stopped worker's pipe: %s", exc)
+        # ValueError: the stream was already closed, so whatever it had read
+        # ahead, a terminal result perhaps, is lost.
+        logger.error("could not read the rest of a stopped worker's pipe: %s", exc)
 
 
 def _drain_pipes(
     process: subprocess.Popen[str], *, task_id: str, timeout_s: float
 ) -> tuple[str, str]:
-    """What is left on a stopped worker's stdout and stderr pipes.
+    """What is left on a reaped worker's stdout and stderr pipes.
 
     Read through the file objects, so whatever a file object had already
     read is kept, each pipe on its own thread. A pipe still open after
     ``timeout_s``, held by a process the stop did not end, is left to its
-    thread, and the text read from it so far is returned. Nothing is
-    signalled: the worker is reaped, so its pid is no longer provably its
-    own.
+    thread, and the text read from it so far is returned; that thread and
+    the pipe's descriptor stay until the holder exits, then end. A pipe
+    with no thread to read it ("can't start new thread") is left unread.
+    Nothing is signalled: the worker is reaped, so its pid is no longer
+    provably its own.
     """
     out: list[str] = []
     err: list[str] = []
-    readers = [
-        threading.Thread(
-            target=_read_rest,
-            args=(stream, into),
-            name=f"drain-{task_id}",
-            daemon=True,
+    readers: list[threading.Thread] = []
+    for stream, into in ((process.stdout, out), (process.stderr, err)):
+        if stream is None:
+            continue
+        reader = threading.Thread(
+            target=_read_rest, args=(stream, into), name=f"drain-{task_id}", daemon=True
         )
-        for stream, into in ((process.stdout, out), (process.stderr, err))
-        if stream is not None
-    ]
-    for reader in readers:
-        reader.start()
+        try:
+            reader.start()
+        except RuntimeError as exc:
+            logger.error(
+                "task %s: no thread could read the rest of worker pid=%s's output (%s); "
+                "recording its run without it",
+                task_id,
+                process.pid,
+                exc,
+            )
+            continue
+        readers.append(reader)
     deadline = time.monotonic() + timeout_s
     for reader in readers:
         reader.join(max(0.0, deadline - time.monotonic()))
@@ -2474,10 +2510,14 @@ def dispatch(
             outcome = "is not parked: this dispatch keeps no state"
             if persist_state:
                 parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-                write_state_atomic(parked, state_path_for(queue_dir, task.id))
-                if on_park is not None:
-                    on_park(parked, _LOOP_ERROR_PARK)
-                outcome = "is parked"
+                try:
+                    write_state_atomic(parked, state_path_for(queue_dir, task.id))
+                except OSError as exc:
+                    outcome = _park_not_written(task.id, process.pid, exc)
+                else:
+                    if on_park is not None:
+                        on_park(parked, _LOOP_ERROR_PARK)
+                    outcome = "is parked"
             raise _unstopped_after_loop_error(
                 task.id, process.pid, loop_error, outcome=outcome
             ) from loop_error
@@ -2518,15 +2558,17 @@ def dispatch(
         summary = _reparse_stdout_file(stdout_log_path)
         stderr_tail = _read_stderr_tail(stderr_log_path)
     else:
-        if loop_error is None:
+        if loop_error is None and process.returncode is None:
             try:
                 stdout_remainder, stderr = process.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 _signal_group(process, signal.SIGKILL)
                 stdout_remainder, stderr = process.communicate()
         else:
-            # The worker is reaped, so communicate()'s timeout path, which
-            # sends SIGKILL by its pid, must not run.
+            # A loop error's stop, or a cap kill's wait, has reaped the
+            # worker: communicate()'s timeout path would signal nothing by its
+            # pid and then wait on a process still holding a pipe for as long
+            # as it runs.
             stdout_remainder, stderr = _drain_pipes(process, task_id=task.id, timeout_s=10)
         # The pipe reader's own read-ahead: lines it read and the loop never took.
         assert pipe_lines is not None
@@ -2541,7 +2583,9 @@ def dispatch(
         # overwritten by `_finalize_state`. Remainder parsing is
         # stats-only.
         if stdout_remainder:
-            for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
+            # Split at newlines only: splitlines() also splits at U+2028 and
+            # the other line separators a JSON string may hold unescaped.
+            for _ in parse_lines(stdout_remainder.split("\n"), summary=summary):
                 pass
         stderr_tail = (stderr or "")[-500:] if stderr else ""
 
@@ -2767,13 +2811,17 @@ def adopt_worker(
         )
         if after is _AfterLoopError.RUNNING:
             parked = park_live_worker(new_state, why=_LOOP_ERROR_PARK)
-            written = _write_unless_finalized(parked, state_path, worker_pid=pid)
-            if written is not parked:
-                outcome = f"another writer had already recorded its task as {written.status}"
+            try:
+                on_disk, wrote = _write_unless_finalized(parked, state_path, worker_pid=pid)
+            except OSError as exc:
+                outcome = _park_not_written(task.id, pid, exc)
             else:
-                if on_park is not None:
-                    on_park(parked, _LOOP_ERROR_PARK)
-                outcome = "is parked"
+                if not wrote:
+                    outcome = f"another writer had already recorded its task as {on_disk.status}"
+                else:
+                    if on_park is not None:
+                        on_park(parked, _LOOP_ERROR_PARK)
+                    outcome = "is parked"
             raise _unstopped_after_loop_error(
                 task.id, pid, loop_error, outcome=outcome
             ) from loop_error
@@ -2891,9 +2939,9 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
 
 def _write_unless_finalized(
     state: TaskState, state_path: Path, *, worker_pid: int | None
-) -> TaskState:
+) -> tuple[TaskState, bool]:
     """Persist ``state`` unless another writer recorded the attempt first;
-    return what is on disk afterwards.
+    return what is on disk afterwards, and whether this wrote it.
 
     The ADR-0025 recheck guard: a per-tick reaper can move the task off
     ``running`` between a verdict and this write, and its record wins.
@@ -2908,19 +2956,19 @@ def _write_unless_finalized(
             "adopt_worker: recheck-load of %s failed (%s); persisting anyway", state_path, exc
         )
         write_state_atomic(state, state_path)
-        return state
+        return state, True
     if current.status == "running" or (
         is_parked_live_worker(current) and current.pid == worker_pid
     ):
         write_state_atomic(state, state_path)
-        return state
+        return state, True
     logger.info(
         "adopt_worker: task %s status changed to %s; "
         "standing down so the concurrent writer's record wins",
         state.task_id,
         current.status,
     )
-    return current
+    return current, False
 
 
 def _finalize_adopted(
@@ -3033,7 +3081,7 @@ def _finalize_adopted(
     # or reap). The hook gets this attempt's session whoever records it.
     attempt_session_id = final_state.session_id
 
-    final_state = _write_unless_finalized(
+    final_state, _wrote = _write_unless_finalized(
         final_state, state_path_for(queue_dir, task.id), worker_pid=prior.pid
     )
 

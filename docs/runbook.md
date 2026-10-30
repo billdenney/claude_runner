@@ -435,10 +435,12 @@ raised is recorded as killed by that cap.
 
 A worker the supervisor cannot stop may still be running, so no run is
 recorded: the task is parked `possibly_hung` with stop reason
-`worker_still_running`, as in the section above, and the log also has
-`could not stop worker pid=<pid> after its dispatch loop failed`. `queue
-force-dispatch` with no supervisor running prints `force-dispatch failed:
-... could not be stopped and is parked` and exits 2.
+`worker_still_running`, as in the section above. The log says why the stop
+failed: `could not stop worker pid=<pid> after its dispatch loop failed`
+when the kill itself failed, or, for an adopted worker that outlived its
+SIGKILL, `subprocess leak: adopted worker pid=<pid> did not exit ...`.
+`queue force-dispatch` with no supervisor running prints `force-dispatch
+failed: ... could not be stopped and is parked` and exits 2.
 
 **Steps:**
 1. Read the traceback in the supervisor log, and report it: the loop is not
@@ -451,7 +453,11 @@ force-dispatch` with no supervisor running prints `force-dispatch failed:
    `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
    stopped: no `queue` command resets a circuit breaker.
 3. For a parked worker, follow steps 1 and 2 of "After a restart, a task is
-   `failed` or `possibly_hung` while its worker still runs".
+   `failed` or `possibly_hung` while its worker still runs". A pipe-backed
+   worker (`[supervisor].adopt_workers` off, or `queue force-dispatch` with
+   no supervisor running) has a pipe as its stdout, not its log, so
+   `readlink /proc/<pid>/fd/1` prints `pipe:[...]`; `ps -o args= -p <pid>`
+   shows whether the pid is still a `claude` worker.
 
 ## Weekly throttled, no dispatch resuming
 
