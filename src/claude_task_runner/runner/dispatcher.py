@@ -506,8 +506,11 @@ class _DispatcherAliveMonitor:
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal the thread to exit and wait briefly for it to join."""
+        """Signal the thread to exit and wait briefly for it to join. After a
+        :meth:`start` that failed there is no thread to wait for."""
         self._stop_event.set()
+        if not self._thread.is_alive():
+            return
         # join() in case the test/supervisor doesn't care to wait, but
         # cap the wait at one interval so a stuck persist doesn't block
         # dispatch finalization.
@@ -1341,10 +1344,11 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
 
 DISPATCH_LOOP_ERROR_STOP_REASON = "dispatch_loop_error"
-"""``stop_reason`` of a run whose dispatch loop raised, and whose worker was
-then stopped before it wrote its terminal result. The run's ``error`` names
-the exception. It is a failure like any other: it counts toward the circuit
-breaker, and the task is dispatched again."""
+"""``stop_reason`` of a run whose dispatch loop raised (or the monitor thread
+started with it could not start), and whose worker was then stopped before it
+wrote its terminal result. The run's ``error`` names the exception. It is a
+failure like any other: it counts toward the circuit breaker, and the task is
+dispatched again."""
 
 
 class _AfterLoopError(StrEnum):
@@ -2279,7 +2283,6 @@ def dispatch(
             interval_s=settings_caps.dispatcher_alive_write_interval_s,
             task_id=task.id,
         )
-        alive_monitor.start()
     else:
         heartbeat_persist_fn = None
         alive_monitor = None
@@ -2304,6 +2307,8 @@ def dispatch(
     cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
+        if alive_monitor is not None:
+            alive_monitor.start()
         _dispatch_loop(
             lines=lines,
             terminate=_terminate_owned,
@@ -2574,7 +2579,6 @@ def adopt_worker(
         interval_s=settings_caps.dispatcher_alive_write_interval_s,
         task_id=task.id,
     )
-    alive_monitor.start()
 
     def _alive() -> bool:
         return probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE
@@ -2587,6 +2591,7 @@ def adopt_worker(
     cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
+        alive_monitor.start()
         _dispatch_loop(
             lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn),
             terminate=_terminate_adopted,

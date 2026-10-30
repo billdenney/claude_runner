@@ -593,6 +593,40 @@ def test_a_line_that_is_not_utf8_is_a_malformed_line(
     assert (run.stop_reason, run.skipped_stream_lines) == ("end_turn", 1)
 
 
+@pytest.mark.parametrize("adopt", [True, False], ids=["file-backed", "pipe"])
+def test_a_monitor_thread_that_cannot_start_stops_the_worker(
+    queue_dir: Path,
+    task: Task,
+    fresh_plan: SpawnPlan,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_shim_env: None,
+    spawned: list[subprocess.Popen[str]],
+    adopt: bool,
+) -> None:
+    """The dispatcher-alive monitor's thread cannot start. The worker is not
+    left running unwatched: it is stopped, and its run fails with
+    dispatch_loop_error naming the error."""
+    monkeypatch.setenv("SHIM_SLEEP_BETWEEN_S", "30")
+
+    def _cannot_start(_monitor: object) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(dispatcher_mod._DispatcherAliveMonitor, "start", _cannot_start)
+
+    outcome = _dispatch(queue_dir, task, fresh_plan, adopt=adopt)
+    assert isinstance(outcome, DispatchOutcome)
+
+    [worker] = spawned
+    assert worker.returncode == -signal.SIGTERM
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: can't start new thread",
+    )
+
+
 def test_a_worker_that_exited_on_its_own_keeps_its_own_record(
     queue_dir: Path,
     task: Task,

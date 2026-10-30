@@ -1142,6 +1142,32 @@ def test_adopt_loop_raising_before_the_first_line_stops_the_worker(
     assert reloaded.session_id == "sess-adopt"
 
 
+def test_adopt_monitor_thread_that_cannot_start_stops_the_worker(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher-alive monitor's thread cannot start. The adopted worker
+    is stopped, and its run fails with dispatch_loop_error naming the
+    error."""
+    task, state = _seed_adopted(queue_dir, [_init_line(), _assistant_line()])
+    worker = _AdoptedWorker(monkeypatch)
+
+    def _cannot_start(_monitor: object) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(dispatcher_mod._DispatcherAliveMonitor, "start", _cannot_start)
+
+    outcome = _adopt(queue_dir, task, state)
+
+    assert worker.signals == [(_PID, signal.SIGTERM)]
+    reloaded = load_state(state_path_for(queue_dir, task.id))
+    assert reloaded == outcome.new_state
+    assert (reloaded.status, reloaded.stop_reason, reloaded.error) == (
+        "failed",
+        "dispatch_loop_error",
+        "dispatch loop raised RuntimeError: can't start new thread",
+    )
+
+
 def test_adopt_terminal_result_written_before_the_loop_raised_stands(
     queue_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
