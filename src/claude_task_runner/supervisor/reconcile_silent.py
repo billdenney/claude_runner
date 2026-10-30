@@ -196,7 +196,8 @@ from typing import Literal
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.schema import TaskCapsSettings
-from claude_task_runner.file_mtime import file_mtime_utc, report_once
+from claude_task_runner.file_mtime import file_mtime_utc
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
@@ -394,9 +395,10 @@ def _latest_mtime_in_tree(
 
     An entry whose mtime :func:`_usable_mtime` rejects is left out: as
     the maximum it would hide every other file's activity. A directory left
-    out is still walked. One WARNING per walk counts the entries
-    :func:`~claude_task_runner.file_mtime.report_once` has not seen before
-    and names one, so each is reported once per process.
+    out is still walked. One WARNING per walk counts the entries no walk in
+    this process has reported before
+    (:func:`~claude_task_runner.once.first_time`) and names one, so each
+    path and mtime is reported once per process.
     """
     try:
         if not root.exists() or not root.is_dir():
@@ -427,7 +429,7 @@ def _latest_mtime_in_tree(
                 continue
             mtime = stat.st_mtime
             if not _usable_mtime(mtime):
-                if report_once(entry.path, mtime):
+                if first_time(("reaper_walk", entry.path, mtime)):
                     unreported += 1
                     example = example or entry.path
             elif latest is None or mtime > latest:

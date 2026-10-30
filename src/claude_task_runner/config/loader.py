@@ -37,6 +37,7 @@ from claude_task_runner.config.schema import (
     ResolvedAccount,
     Settings,
 )
+from claude_task_runner.once import first_time
 from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
 
 logger = logging.getLogger(__name__)
@@ -283,12 +284,6 @@ def _reject_retired_keys(payload: dict[str, Any], source: str) -> None:
         )
 
 
-_warned_retired_effort_sources: set[str] = set()
-"""Queue TOMLs already warned about for a retired effort spelling. The
-supervisor re-reads its TOML on every SIGHUP, so each file is warned about
-once per process."""
-
-
 def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
     """Rename retired spellings in ``payload``'s ``[effort_levels]`` in place.
 
@@ -316,8 +311,7 @@ def _rename_retired_effort_levels(payload: dict[str, Any], source: str) -> None:
         ]
         table[model] = list(dict.fromkeys(renamed))
         renamed_models.append(model)
-    if renamed_models and source not in _warned_retired_effort_sources:
-        _warned_retired_effort_sources.add(source)
+    if renamed_models and first_time(("retired_effort_levels", source)):
         spellings = ", ".join(f"{old!r} as {new!r}" for old, new in RETIRED_EFFORT_LEVELS.items())
         logger.warning(
             "%s: reading [effort_levels] %s, the claude CLI's name, for %s; "
