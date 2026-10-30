@@ -66,8 +66,11 @@ def already_gated(queue_dir: Path, block_file: str | None, task_id: str) -> bool
     if not block_file:
         return False
     try:
-        text = (queue_dir / block_file).read_text(encoding="utf-8")
-    except OSError:
+        # As the orchestrator reads it: a line that is not UTF-8 is skipped
+        # as malformed, and the other lines still count.
+        text = (queue_dir / block_file).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        # ValueError: a NUL byte in the configured path, which no file has.
         return False
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -176,7 +179,7 @@ def ensure_terminal_gate(
     try:
         with (queue_dir / block_file).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         # Never fail a run that succeeded because the register could not be
         # appended to; the task simply stays ungated as it was before.
         logger.warning(

@@ -1031,10 +1031,13 @@ def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[s
         return set()
     path = queue_dir / block_file
     try:
-        text = path.read_text(encoding="utf-8")
+        # A line that is not UTF-8 decodes with replacement characters and is
+        # skipped below as malformed; the other lines still count.
+        text = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return set()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: a NUL byte in the configured path, which no file has.
         logger.debug("dispatch block-list %s unreadable (%s); treating as empty", path, exc)
         return set()
 

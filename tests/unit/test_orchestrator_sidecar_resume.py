@@ -505,6 +505,39 @@ def test_dispatch_blocked_task_ids_reads_only_flagged_task_rows(queue_dir: Path)
     assert _dispatch_blocked_task_ids(queue_dir, name) == {"211-goulooze", "400-metrum"}
 
 
+def test_dispatch_blocked_task_ids_skips_a_line_that_is_not_utf8(queue_dir: Path) -> None:
+    """A line of bytes that are not UTF-8 is a malformed line: it is skipped,
+    and the rows around it still block."""
+    (queue_dir / "needs_acquisition.jsonl").write_bytes(
+        b'{"task": "211-goulooze", "block_dispatch": true}\n'
+        b"\xff{}\n"
+        b'{"task": "400-metrum", "block_dispatch": true}\n'
+    )
+    assert _dispatch_blocked_task_ids(queue_dir, "needs_acquisition.jsonl") == {
+        "211-goulooze",
+        "400-metrum",
+    }
+
+
+def test_dispatch_blocked_task_ids_path_no_file_can_have_is_empty(queue_dir: Path) -> None:
+    """A NUL byte in the configured path reads as an unreadable file."""
+    assert _dispatch_blocked_task_ids(queue_dir, "needs\x00acquisition.jsonl") == set()
+
+
+def test_eligible_candidates_survives_a_block_file_that_is_not_utf8(queue_dir: Path) -> None:
+    """The selector reads the block file on every tick; bytes that are not
+    UTF-8 in it must not stop it."""
+    task = _make_task("t-pending")
+    _write_task_yaml(queue_dir, task)
+    (queue_dir / "needs_acquisition.jsonl").write_bytes(b"\xff{}\n")
+
+    candidates = _eligible_candidates(
+        queue_dir, {}, set(), now=_NOW, block_file="needs_acquisition.jsonl"
+    )
+
+    assert [t.id for t in candidates] == ["t-pending"]
+
+
 def test_eligible_candidates_skips_blocked_pending_task(queue_dir: Path) -> None:
     """A pending task (normally eligible on its first attempt) is skipped
     when block-flagged — so the very first dispatch+defer is avoided —
