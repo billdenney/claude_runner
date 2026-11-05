@@ -301,16 +301,18 @@ def _frame_ends(raw: bytes) -> list[int]:
 
 
 def _panel(
-    *sections: tuple[str, str, str | None],
+    *sections: tuple[str, str | None, str | None],
     footer: str = "Esc to cancel",
     tail: tuple[str, ...] = (),
 ) -> bytes:
     """A 2.1.318-shaped /usage panel: the session-cost block, then each
-    ``(heading, gauge, resets)`` section (no Resets line for ``None``), then
-    ``tail`` and the closing line ``footer``."""
+    ``(heading, gauge, resets)`` section (no gauge or Resets line for
+    ``None``), then ``tail`` and the closing line ``footer``."""
     lines = ["  Session", "", "  Total cost:            $0.0000", ""]
     for heading, gauge, resets in sections:
-        lines += [f"  {heading}", f"  ████████          {gauge}"]
+        lines.append(f"  {heading}")
+        if gauge is not None:
+            lines.append(f"  ████████          {gauge}")
         if resets is not None:
             lines.append(f"  Resets {resets}")
         lines.append("")
@@ -460,6 +462,33 @@ class TestNoFiveHourSection:
         ):
             parse(raw, NOV_5, FakeClock(NOV_5))
 
+    def test_a_session_heading_does_not_lend_itself_to_the_next_section(self) -> None:
+        """A ``Current session`` heading drawn with no gauge of its own is
+        not the heading of the section under an unknown heading after it,
+        whose numbers would otherwise read as the 5-hour window."""
+        raw = _panel(
+            ("Current session", None, None),
+            ("Current 5h window", "3% used", "8pm (UTC)"),
+            WEEKLY,
+        )
+        with pytest.raises(UsageFormatDrift) as info:
+            parse(raw, NOV_5, FakeClock(NOV_5))
+        assert str(info.value) == (
+            "5-hour usage block not found, and the panel does not show that no 5-hour "
+            "window applies: 5-hour heading 'Current session' without a percentage and "
+            "reset; usage gauges under headings that name no known window: "
+            "['Current 5h window']"
+        )
+
+    def test_a_bar_on_its_own_line_keeps_the_heading(self) -> None:
+        raw = (
+            b"  Current session\r\n  \xe2\x96\x88\xe2\x96\x88\r\n  14% used\r\n"
+            b"  Resets 8pm (UTC)\r\n" + _panel(WEEKLY)
+        )
+        reading = parse(raw, NOV_5, FakeClock(NOV_5))
+        assert reading.five_hour is not None
+        assert reading.five_hour.utilization_pct == 14
+
     def test_a_gauge_with_no_line_above_it_is_drift(self) -> None:
         raw = b"  7% used\r\n  Resets 9pm (UTC)\r\n" + _panel(WEEKLY)
         with pytest.raises(UsageFormatDrift, match=r"name no known window: \[None\]$"):
@@ -529,7 +558,7 @@ class TestNoWeeklySection:
         ids=["per-model-only", "two-per-model", "session-only", "session-and-per-model"],
     )
     def test_missing_weekly_section_is_drift(
-        self, sections: tuple[tuple[str, str, str | None], ...], message: str
+        self, sections: tuple[tuple[str, str | None, str | None], ...], message: str
     ) -> None:
         with pytest.raises(UsageFormatDrift, match=f"^{re.escape(message)}"):
             parse(_panel(*sections), NOV_5, FakeClock(NOV_5))

@@ -173,9 +173,6 @@ unless `r` is pressed.
   stopped drawing `Current session` with no other trace would read as no
   5-hour window. Under `api_then_tty` the API source reads the same
   account independently.
-- A heading the parser does not recognise does not clear the heading
-  before it: a `Current session` heading with no reset followed by a
-  section under an unknown heading lends that section the 5-hour heading.
 
 ## Reversibility
 

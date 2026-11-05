@@ -184,7 +184,8 @@ class _BlockBuilder:
 
     Sections are emitted only when a complete (pct, resets) pair has
     been seen. The most recent header observed is associated with the
-    next emitted block. Every percentage line is also kept as a
+    next emitted block, unless a heading the parser does not recognise
+    comes in between. Every percentage line is also kept as a
     :class:`_Gauge`, whether or not a Resets line completes it.
     """
 
@@ -219,18 +220,27 @@ class _BlockBuilder:
             self.gauges.append(_Gauge(heading=above, pct=self.pending_pct))
             return
 
-        if self.pending_pct is not None:
-            resets_match = _RESETS_RE.match(stripped)
-            if resets_match is not None:
-                self.blocks.append(
-                    _Block(
-                        header=self.pending_header,
-                        pct=self.pending_pct,
-                        resets_raw=resets_match.group(1),
-                    )
-                )
+        resets_match = _RESETS_RE.match(stripped)
+        if resets_match is None:
+            # A line with words that is no header, gauge or reset is a
+            # heading the parser does not recognise. It starts another
+            # section, so the pending header (one drawn without a gauge of
+            # its own) does not carry over to that section's numbers. A bar
+            # drawn on a line of its own has no letters and ends nothing.
+            if any(char.isalpha() for char in stripped):
                 self.pending_header = None
-                self.pending_pct = None
+            return
+
+        if self.pending_pct is not None:
+            self.blocks.append(
+                _Block(
+                    header=self.pending_header,
+                    pct=self.pending_pct,
+                    resets_raw=resets_match.group(1),
+                )
+            )
+            self.pending_header = None
+            self.pending_pct = None
 
 
 def _scan(text: str) -> _BlockBuilder:
