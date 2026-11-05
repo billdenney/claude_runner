@@ -80,6 +80,11 @@ class UsageApiAuthExpired(UsageCaptureSpawnError):
 class UsageApiHeaderMissing(UsageFormatDrift):
     """The ``/v1/messages`` response was missing one of the documented headers.
 
+    Missing means a 7d header, or one of the two 5h headers without the
+    other. A response with neither 5h header is a reading with no 5-hour
+    window, unless it carries a ``-<w>-utilization`` header for a window
+    the source does not know, which raises this too (ADR-0038).
+
     Also raised when a required header is present but its value cannot
     become a reading: unparseable, not finite, a utilization outside
     [0, 100] percent, or a reset timestamp ``datetime`` cannot represent.
