@@ -48,6 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
@@ -1328,18 +1329,15 @@ def _is_unmeetable_dependency_reason(reason: str | None) -> bool:
     return reason is not None and reason.startswith(_UNMEETABLE_DEPENDENCY_PREFIX)
 
 
-_warned_timezone_less_retries: set[tuple[Path, datetime]] = set()
-"""``(state file, next_eligible_at)`` pairs already logged by
-:func:`_warn_timezone_less_retry`. The selector reads every state on every
-tick and the hold writes nothing, so each value is logged once per process,
-and again only once it is changed."""
-
-
 def _warn_timezone_less_retry(task_id: str, state_file: Path, retry_at: datetime) -> None:
-    """Log, once per file and value, that ``task_id`` is held for ``retry_at``."""
-    if (state_file, retry_at) in _warned_timezone_less_retries:
+    """Log, once per file and value, that ``task_id`` is held for ``retry_at``.
+
+    The selector reads every state on every tick and the hold writes
+    nothing, so each value is logged once per process, and again only once
+    it is changed.
+    """
+    if not first_time("timezone_less_retry", state_file, retry_at):
         return
-    _warned_timezone_less_retries.add((state_file, retry_at))
     logger.error(
         "holding task %s: %s: next_eligible_at %s has no timezone; write it with an "
         "offset, e.g. %s if it was meant as UTC",

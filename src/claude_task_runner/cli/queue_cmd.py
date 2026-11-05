@@ -487,7 +487,8 @@ def holds(
     ``retries_without_timezone``: the ``next_eligible_at_without_timezone``
     tasks, each with its ``state_file`` and the ``next_eligible_at`` written
     there with no offset; each is held until that value is rewritten in
-    UTC with an offset.
+    UTC with an offset. A task whose state no longer loads when it is read
+    is listed under ``unread_states`` instead.
     ``missing_dependencies``: the ``depends_on_missing`` tasks, each with
     the ``missing`` ids in its ``depends_on``, in the order it lists them.
     ``unmeetable_dependencies``: the ``depends_on_unmeetable`` tasks, each
