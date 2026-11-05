@@ -395,8 +395,40 @@ def test_a_plan_banner_has_no_api_billing_label() -> None:
 
 
 def test_label_below_the_banner_rows_is_ignored() -> None:
-    screen = "\n".join([""] * 6 + ["a tip about the · Claude API"])
+    screen = "\n".join(["Claude Code v2.1.318", "Opus 5.5 · Claude Max"] + [""] * 4)
+    screen += "\nOpus 5.5 · Claude API"
     assert _api_billing_label(screen) is None
+
+
+@pytest.mark.parametrize(
+    "tip",
+    [
+        "  Tip: tools you build can call the Claude API",
+        "  Docs · Claude API",
+        "  Billing for this org: API Usage Billing",
+    ],
+)
+def test_a_line_ending_in_a_billing_phrase_is_not_the_banner(tip: str) -> None:
+    """Only the row under ``Claude Code v...`` is the banner's billing row."""
+    raw = _subscribed() + f"\x1b[4;1H\x1b[2K{tip}".encode()
+    screen = render(raw, columns=80, rows=24)
+    assert screen.splitlines()[3].rstrip() == tip
+    assert _api_billing_label(screen) is None
+    assert _login_state(screen) is None
+
+
+def test_plan_capture_with_a_tip_ending_in_claude_api_reads_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """A plan account must not be told to log in again because of a tip."""
+    usage = (USAGE_FIXTURE / "real_2026-05-03_three_section.cap").read_bytes()
+    tip = b"\x1b[4;1H\x1b[2K  Tip: tools you build can call the Claude API"
+    child = FakeChild(clock, [_subscribed() + tip], [(b"/usage\r", [usage])])
+
+    raw, _cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [b"/usage\r", ESC, b"/exit\r"]
+    assert parse(raw, clock.now(), clock).seven_day.utilization_pct == 100
 
 
 def test_login_required_message_for_the_default_config_dir() -> None:

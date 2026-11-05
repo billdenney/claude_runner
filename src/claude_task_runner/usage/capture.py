@@ -138,10 +138,20 @@ shortcuts`` (manual or default mode), or ``<mode> on (shift+tab to cycle)``
 _BANNER_ROWS = 6
 """The top rows of the screen, which hold the welcome banner at start-up."""
 
-_API_BILLING_RE = re.compile(r"(?:·|\s)\s*(Claude API|API Usage Billing)\s*$", re.MULTILINE)
+_API_BILLING_RE = re.compile(
+    r"^[^\n]*Claude Code v\d[^\n]*\n"  # the banner's title row
+    r"[^\S\n]*[^\s·][^·\n]*·[^\S\n]*"  # the next row: logo and model, then " · "
+    r"(Claude API|API Usage Billing)[^\S\n]*$",  # the billing label, ending the row
+    re.MULTILINE,
+)
 """The banner's billing label when ``claude`` has no plan login: ``Claude
 API`` for a credential without a subscription, such as a ``setup-token``
-token, and ``API Usage Billing`` when it is not logged in to claude.ai."""
+token, and ``API Usage Billing`` when it is not logged in to claude.ai.
+
+Only the 2.1.318 banner row counts, ``<logo> <model> · <billing>`` right
+under ``Claude Code v<version>``, so a tip or notice that ends in either
+phrase does not. The boxed banner of older versions does not match, and
+the capture then goes on to ``/usage`` as it always did."""
 
 _NOT_LOGGED_IN_RE = re.compile(r"Not\s*logged\s*in")
 
