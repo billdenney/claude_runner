@@ -83,9 +83,10 @@ class UsageReading(BaseModel):
     ``None`` means only that no 5-hour window was reported: the API omits
     the 5h headers when no 5-hour window applies to the account
     (ADR-0038). It is never a stand-in for 0% or for a reading that
-    failed; a failed reading raises instead. The TTY parser always sets
-    it, since the ``/usage`` screen shows both windows. With ``None`` the
-    5-hour dispatch thresholds do not apply."""
+    failed; a failed reading raises instead. The TTY parser gives ``None``
+    only for a complete ``/usage`` panel that has a weekly section, no
+    5-hour section and nothing that could be one (ADR-0040). With ``None``
+    the 5-hour dispatch thresholds do not apply."""
 
     seven_day: WindowReading
 

@@ -1,10 +1,12 @@
 """Drift and capture-failure exceptions for usage parsing.
 
-**Format drift** — the parser couldn't extract two valid blocks from the
-raw bytes. Likely Anthropic changed the TUI layout. Raised by the parser
-itself; the supervisor halts dispatch on this. The other exceptions here
-tell a transient capture failure (a timeout, a network error) from a
-structural one, so the daemon can react to each.
+**Format drift** — the parser couldn't read the windows from the raw
+bytes: no weekly window, a percentage out of range, or no 5-hour window on
+a panel that does not show that none applies. Likely Anthropic changed the
+TUI layout. Raised by the parser itself; the supervisor halts dispatch on
+this. The other exceptions here tell a transient capture failure (a
+timeout, a network error) from a structural one, so the daemon can react
+to each.
 
 Nothing compares consecutive readings; see invariant 3 in
 ``docs/architecture.md``.

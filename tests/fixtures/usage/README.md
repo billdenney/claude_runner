@@ -17,8 +17,31 @@ tests/fixtures/usage/
 ├── synthetic_weekly_capped.expected.json
 ├── synthetic_zero.cap                 # 0% / 0% — fresh / unused
 ├── synthetic_zero.expected.json
+├── real_2026-11-05_weekly_only.cap    # no 5-hour window: weekly 16%, Fable 12%
+├── real_2026-11-05_session_and_weekly.cap  # 14% / 61%, Fable 0%
 └── ...
 ```
+
+An `.expected.json` with `"five_hour": null` is a panel without a 5-hour
+window (ADR-0040). `extra_windows`, when present, lists the per-model
+weekly sections; `usage parse-file` does not print them, so they are added
+by hand.
+
+The two `real_2026-11-05_*` captures come from `claude` 2.1.318 in an 80x24
+pseudo-terminal, from `/usage` through the panel's own fetch:
+
+- `weekly_only` is a plan with no 5-hour window. It is the whole stream of a
+  capture that timed out while it waited for two `Resets` byte runs, so it
+  holds no cleanup. Its panel opens at 15% under `Refreshing…` and the fetch
+  draws 16% and the Fable section.
+- `session_and_weekly` is a Team plan, cut where the capture sent Esc. Its
+  panel opens with the saved session and weekly sections and gains the
+  Fable section from the fetch. What Esc drew next is
+  `tests/fixtures/usage_cleanup/real_2026-11-05_session_and_weekly_after_esc.cap`.
+
+They were sanitised with same-length byte replacements, as the start-up
+fixtures were: the queue directory's name became `runner_queue_example`.
+They hold no token, e-mail address, organisation or account id.
 
 The `synthetic_*.cap` files are hand-crafted to exercise the parser's
 ANSI-stripping and block-extraction paths. They are deliberately
