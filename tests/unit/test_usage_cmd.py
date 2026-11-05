@@ -15,8 +15,7 @@ from unittest.mock import patch
 
 import pytest
 import typer
-from click.testing import Result
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from claude_task_runner.cli import app as cli_app
 from claude_task_runner.cli.usage_cmd import _bar, _default_captures_dir, app

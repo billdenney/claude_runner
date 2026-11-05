@@ -19,8 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from click.testing import Result
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from claude_task_runner.cli import app
 from claude_task_runner.supervisor import account_pause
