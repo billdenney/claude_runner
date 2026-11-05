@@ -310,6 +310,10 @@ when cron runs it, once a minute, so under cron a cooldown under a minute
 acts as one minute. After changing them, re-run
 `claude-task-runner install`: it rewrites the unit and reloads systemd, and
 the next crash uses the new values without the supervisor being restarted.
+Until then `claude-task-runner doctor` warns under `watchdog_installed`,
+naming each directive of the installed unit that differs from what
+`install` would write now. It also warns when the unit runs another
+queue's supervisor or starts a binary that is no longer there.
 Read the exception with `journalctl --user -u claude-task-runner`. Once the
 cause is fixed, `systemctl --user reset-failed claude-task-runner` clears
 the start limit, and `systemctl --user start claude-task-runner` starts the
