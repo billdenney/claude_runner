@@ -45,8 +45,11 @@ Three faults met there, and the second affected every account.
    work panel's first frame already holds two `Resets` lines, session and
    weekly, and the capture returned the earliest snapshot with two blocks:
    the saved numbers, without the `Current week (Fable)` section the fetch
-   adds. The personal panel opened at 15% and its fetch drew 16%; a later
-   work capture opened at 16% for the session and its fetch drew 17%.
+   adds. In the committed fixtures the personal panel opens at 15% and its
+   fetch draws 16%, and the work panel's numbers stay at 14% and 61% while
+   its fetch adds the Fable section. (Live work captures not committed
+   here also showed the fetch changing a number: session 16% to 17% in
+   one, weekly 65% to 66% in another.)
 3. **The parser required the `Current session` section.** ADR-0038 kept
    that requirement for the TTY path. Given the panel above, its
    positional fallback would have taken the weekly block for the 5-hour
@@ -173,6 +176,12 @@ unless `r` is pressed.
   stopped drawing `Current session` with no other trace would read as no
   5-hour window. Under `api_then_tty` the API source reads the same
   account independently.
+- Phase 2 judges the panel complete on a quiet poll of 250 ms. A redraw
+  that paused longer than that between two sections of its fetched frame
+  could end the wait one per-model section short. The weekly and session
+  numbers are already the fetched ones by then, since `Refreshing…` is
+  gone; the stream after the pad recovers the missing section only if it
+  lands within the pad.
 
 ## Reversibility
 
