@@ -186,7 +186,9 @@ def _parse_request_file(path: Path) -> ForceDispatchRequest | None:
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: JSONDecodeError, text that is not UTF-8, and the bare
+        # one json raises for an integer past the interpreter's digit limit.
         logger.warning("force-dispatch: cannot parse request %s: %s", path, exc)
         return None
     try:

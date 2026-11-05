@@ -35,6 +35,8 @@ from claude_task_runner.runner.dispatcher import (
     dispatch,
 )
 
+from ._worker_streams import empty_stdout
+
 
 class _FrozenClock:
     """Minimal Clock substitute for tests; advances on each .now() call."""
@@ -49,10 +51,10 @@ class _FrozenClock:
 class _FakePopen:
     """subprocess.Popen drop-in that captures argv and immediately exits 0.
 
-    The dispatcher's stream-json loop iterates ``process.stdout`` so we
-    expose an empty iterable. ``communicate`` returns ("", "") and
-    ``returncode`` is 0 so the dispatch path lands the no-result branch
-    in _build_run_record.
+    The dispatcher reads ``process.stdout`` through its descriptor, so it
+    is an empty pipe (:func:`empty_stdout`), closed by ``communicate``,
+    which returns ("", "") and sets ``returncode`` to 0 so the dispatch path
+    lands the no-result branch in _build_run_record.
     """
 
     captured_argv: ClassVar[list[list[str]]] = []
@@ -61,9 +63,10 @@ class _FakePopen:
     def __init__(self, argv: list[str], *args: object, **kwargs: object) -> None:
         type(self).captured_argv.append(list(argv))
         type(self).captured_env.append(kwargs.get("env"))
-        self.returncode = 0
-        # An empty iterable; the dispatcher iterates stdout via parse_lines.
-        self.stdout = iter([])
+        # None until reaped, as on Popen: the dispatcher reads it to tell a
+        # worker it has already reaped.
+        self.returncode: int | None = None
+        self.stdout = empty_stdout()
         self.stderr = None
         # Synthetic pid: real subprocess.Popen exposes one; _build_run_record
         # threads ``process.pid`` into the run record so the orchestrator's
@@ -72,9 +75,12 @@ class _FakePopen:
         self._argv = argv
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.stdout.close()
+        self.returncode = 0
         return ("", "")
 
     def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0
         return 0
 
     def terminate(self) -> None:
@@ -84,6 +90,7 @@ class _FakePopen:
         pass
 
     def poll(self) -> int | None:
+        self.returncode = 0
         return 0
 
 

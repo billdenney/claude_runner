@@ -26,8 +26,11 @@ from claude_task_runner.queue.store import (
     write_state_atomic,
     write_task_atomic,
 )
+from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import force_dispatch as fd_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
+
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 
 
 @pytest.fixture
@@ -138,6 +141,20 @@ class TestRequestIO:
         bad.write_text("not json {")
         reqs = fd_mod.list_requests(queue_dir)
         assert [r.task_id for r in reqs] == ["good"]
+
+    def test_list_requests_skips_one_with_an_integer_past_the_digit_limit(
+        self, queue_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """json raises a bare ValueError for it, not JSONDecodeError."""
+        fd_mod.write_request(queue_dir, "good")
+        bad = fd_mod.force_dispatch_dir(queue_dir) / "bad.req"
+        bad.write_text(f'{{"task_id": "bad", "n": {PAST_DIGIT_LIMIT}}}', encoding="utf-8")
+        with caplog.at_level("WARNING", logger="claude_task_runner.runner.force_dispatch"):
+            reqs = fd_mod.list_requests(queue_dir)
+        assert [r.task_id for r in reqs] == ["good"]
+        assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+            f"force-dispatch: cannot parse request {bad}: {digit_limit_error()}"
+        ]
 
     def test_consume_request_is_idempotent(self, queue_dir: Path) -> None:
         fd_mod.write_request(queue_dir, "t1")
@@ -937,6 +954,33 @@ class TestForceDispatchCLI:
             result = runner_cli.invoke(app, ["force-dispatch", "t1", "--queue", str(queue_dir)])
         assert result.exit_code == 2
         assert "force-dispatch failed" in result.stdout
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["human", "json"])
+    def test_a_worker_the_dispatch_could_not_stop_is_reported(
+        self, queue_dir: Path, runner_cli: CliRunner, as_json: bool
+    ) -> None:
+        """dispatch() raises DispatchError when its loop failed and it could
+        not stop the worker, having parked the task. That is reported as the
+        refusals are, exit 2, not as a traceback."""
+        from claude_task_runner.cli.queue_cmd import app
+
+        _make_task(queue_dir, "t1")
+        message = (
+            "task t1: dispatch loop raised RuntimeError: boom; worker pid=4242 "
+            "could not be stopped and is parked"
+        )
+        with patch(
+            "claude_task_runner.cli.queue_cmd.fd_mod.dispatch_synchronously",
+            side_effect=dispatcher_mod.DispatchError(message),
+        ):
+            result = runner_cli.invoke(
+                app, ["force-dispatch", "t1", "--queue", str(queue_dir), *(["--json"] * as_json)]
+            )
+        assert result.exit_code == 2
+        if as_json:
+            assert json.loads(result.stdout) == {"ok": False, "error": message}
+        else:
+            assert " ".join(result.stdout.split()) == f"force-dispatch failed: {message}"
 
     def test_supervised_picked_up_human_output(
         self, queue_dir: Path, runner_cli: CliRunner

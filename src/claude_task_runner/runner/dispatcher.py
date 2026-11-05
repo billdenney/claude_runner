@@ -45,12 +45,14 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -59,7 +61,7 @@ from pathlib import Path
 from typing import IO
 
 from claude_task_runner import process_signals
-from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
+from claude_task_runner.clock import Clock, utc_from_timestamp
 from claude_task_runner.config.linux_user import current_username as _resolve_self_user
 from claude_task_runner.config.paths import ConfigDirError, TaskPathError, existing_config_dir
 from claude_task_runner.config.schema import (
@@ -68,6 +70,8 @@ from claude_task_runner.config.schema import (
     HookSettings,
     TaskCapsSettings,
 )
+from claude_task_runner.file_mtime import file_mtime_utc
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import (
     RunRecord,
     Task,
@@ -264,9 +268,68 @@ def build_argv(
     return argv
 
 
-def _read_lines(stream: Iterable[str]) -> Iterable[str]:
-    """Trivial pass-through; isolated for monkey-patching in tests."""
-    yield from stream
+def _read_lines(stream: Iterable[str | None]) -> Iterable[str | None]:
+    """Trivial pass-through; isolated for monkey-patching in tests.
+
+    A ``for`` loop, not ``yield from``: closing this generator, as a raise
+    in the dispatch loop's body does, would otherwise close ``stream`` too,
+    and a stream closed under its reader loses the lines it had read ahead.
+    """
+    for line in stream:  # noqa: UP028 - yield from would close stream with this generator
+        yield line
+
+
+_CAP_TICK_S = 10.0
+"""Longest a line source waits for a line before it yields a tick (``None``),
+on which the dispatch loop checks the caps only the clock can trip
+(ADR-0037). Module-level so tests can shorten it."""
+
+
+class _PipeLines:
+    """A worker's stdout pipe as lines, with a tick when none comes for ``tick_s``.
+
+    Iterating yields each line with its newline, at end of file a last line
+    without one, and ``None`` after ``tick_s`` with no line. It reads the
+    descriptor itself and decodes each line as UTF-8 with replacement
+    characters, as the file tailer does. What it has read and not yielded
+    stays here, for :meth:`unread`; ``process.stdout``'s own buffer, which
+    nothing reads, stays empty.
+    """
+
+    def __init__(self, stream: IO[str], *, tick_s: float | None) -> None:
+        self._stream = stream
+        self._tick_s = tick_s
+        self._pending: deque[str] = deque()
+        self._partial = b""
+        self._eof = False
+
+    def __iter__(self) -> Iterator[str | None]:
+        fd = self._stream.fileno()
+        while True:
+            while self._pending:
+                yield self._pending.popleft()
+            if self._eof:
+                return
+            ready, _, _ = select.select([fd], [], [], self._tick_s)
+            if not ready:
+                yield None
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                self._eof = True
+                if self._partial:
+                    self._pending.append(self._partial.decode("utf-8", errors="replace"))
+                    self._partial = b""
+                continue
+            *complete, self._partial = (self._partial + chunk).split(b"\n")
+            self._pending.extend(line.decode("utf-8", errors="replace") + "\n" for line in complete)
+
+    def unread(self) -> str:
+        """What it has read and not yielded, which it then forgets."""
+        rest = "".join(self._pending) + self._partial.decode("utf-8", errors="replace")
+        self._pending.clear()
+        self._partial = b""
+        return rest
 
 
 # Poll cadence for the file tailer's no-data wait. Small enough that a
@@ -283,7 +346,8 @@ def tail_lines(
     poll_interval_s: float = _TAIL_POLL_INTERVAL_S,
     sleep_fn: Callable[[float], None] = time.sleep,
     read_fn: Callable[[Path, int], tuple[str, int]] | None = None,
-) -> Iterator[str]:
+    tick_s: float | None = None,
+) -> Iterator[str | None]:
     r"""Tail ``path`` line-by-line until the producer is gone.
 
     Yields only **complete, newline-terminated** lines (the trailing
@@ -316,12 +380,17 @@ def tail_lines(
     a file descriptor). ``read_fn`` / ``sleep_fn`` are injection seams
     for unit tests; the defaults read the real file from a byte offset
     and use ``time.sleep``.
+
+    With ``tick_s``, the tailer also yields ``None`` each time it has
+    polled that long (counted in ``poll_interval_s`` steps) without a line,
+    for the dispatch loop's time caps.
     """
     if read_fn is None:
         read_fn = _read_from_offset
 
     buffer = ""
     offset = 0
+    idle_s = 0.0
 
     while True:
         producer_alive = alive()
@@ -342,6 +411,7 @@ def tail_lines(
                     break
                 line = buffer[: idx + 1]
                 buffer = buffer[idx + 1 :]
+                idle_s = 0.0
                 yield line
 
         if not producer_alive:
@@ -349,7 +419,11 @@ def tail_lines(
             # was the final drain. Stop without sleeping so we don't hang.
             return
 
+        if tick_s is not None and idle_s >= tick_s:
+            idle_s = 0.0
+            yield None
         sleep_fn(poll_interval_s)
+        idle_s += poll_interval_s
 
 
 def _read_from_offset(path: Path, offset: int) -> tuple[str, int]:
@@ -506,8 +580,11 @@ class _DispatcherAliveMonitor:
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal the thread to exit and wait briefly for it to join."""
+        """Signal the thread to exit and wait briefly for it to join. After a
+        :meth:`start` that failed there is no thread to wait for."""
         self._stop_event.set()
+        if not self._thread.is_alive():
+            return
         # join() in case the test/supervisor doesn't care to wait, but
         # cap the wait at one interval so a stuck persist doesn't block
         # dispatch finalization.
@@ -536,11 +613,12 @@ def _pid_alive(pid: int) -> bool:
     treated as alive so the adopt monitor doesn't finalize a worker
     prematurely on a transient probe failure (ADR-0025).
 
-    A pid no worker can have, 1 or less or this process's own, is refused
-    by :mod:`claude_task_runner.process_signals` and reported dead: probing
+    A pid no worker can have, 1 or less, this process's own, or above
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, is refused by
+    :mod:`claude_task_runner.process_signals` and reported dead: probing
     pid 1 fails with EPERM, which would otherwise read as a live worker
     and lead the reapers to signal its process group, every process the
-    user owns.
+    user owns, and ``os.kill`` raises ``OverflowError`` above ``PID_T_MAX``.
     """
     try:
         process_signals.kill(pid, 0)
@@ -1030,9 +1108,17 @@ def _build_run_record(
     )
 
 
+@dataclass
+class _CapKill:
+    """The cap :func:`_dispatch_loop` stops its worker at, set before the
+    kill, so a caller still has it when the kill raises."""
+
+    violation: caps_mod.CapViolation | None = None
+
+
 def _dispatch_loop(
     *,
-    lines: Iterable[str],
+    lines: Iterable[str | None],
     terminate: Callable[[], None],
     settings_caps: TaskCapsSettings,
     clock: Clock,
@@ -1040,23 +1126,33 @@ def _dispatch_loop(
     started_at: datetime,
     heartbeat_persist_fn: Callable[[datetime], None] | None = None,
     summary: StreamSummary | None = None,
+    cap_kill: _CapKill | None = None,
+    session_persist_fn: Callable[[str], None] | None = None,
 ) -> tuple[StreamSummary, caps_mod.CapViolation | None]:
     """Run the consume-and-monitor loop until the stream ends or we kill it.
 
     Returns the StreamSummary and any cap violation observed. A caller that
     passes ``summary`` gets it filled in place, so what the loop parsed
-    before it raised (the session id, the usage so far) is still there.
+    before it raised (the session id, the usage so far) is still there; one
+    that passes ``cap_kill`` gets the cap a kill was for, though the kill
+    raised.
 
     The loop is decoupled from how its events arrive: ``lines`` is any
     iterable of NDJSON lines and ``terminate`` is the side-effect that
-    stops the underlying worker on a cap/silence KILL. The owned path
-    (same-incarnation ``Popen``) passes ``_read_lines(process.stdout)``
-    or :func:`tail_lines` over the stdout log plus
+    stops the underlying worker on a cap/silence KILL. A ``None`` in
+    ``lines`` is a tick, which a source yields when no line has come for a
+    while (:data:`_CAP_TICK_S`): on a tick the loop checks the caps only the
+    clock can trip, the duration cap and ``heartbeat_silence_kill_s``, so a
+    worker that writes nothing at all is still stopped (ADR-0037). The
+    silence the kill measures runs from the last line of any kind, a
+    ``tool_progress`` heartbeat included. The owned path
+    (same-incarnation ``Popen``) passes a :class:`_PipeLines` reader of
+    ``process.stdout`` or :func:`tail_lines` over the stdout log, plus
     ``lambda: _terminate(process)``; the adopted path (a worker this
     supervisor did not spawn) passes :func:`tail_lines` over the
     recorded log file plus a ``killpg``-by-pid terminate. The per-event
-    heartbeat / cap / silence logic below is identical across both —
-    only the source of lines and the kill mechanism differ (ADR-0025).
+    and per-tick logic below is the same for all three; only the source
+    of lines and the kill mechanism differ (ADR-0025).
 
     ``heartbeat_persist_fn``, when supplied, is invoked at most once
     per ``settings_caps.heartbeat_persist_interval_s`` seconds with
@@ -1067,15 +1163,73 @@ def _dispatch_loop(
     second) from thrashing the filesystem — one write per interval
     is enough since the interval is well below
     ``heartbeat_silence_alert_s``.
+
+    ``session_persist_fn``, when supplied, is invoked with each session id
+    claude reports that it was not yet invoked with (in practice, once, at
+    the init event), so the running state names the session before the
+    run ends: a re-dispatch after a supervisor that died mid-run resumes it.
+    A failure is logged, and the run records the session when it ends.
     """
     summary = summary if summary is not None else StreamSummary()
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = cap_kill if cap_kill is not None else _CapKill()
     last_heartbeat: datetime | None = None
     last_persist_at: datetime | None = None
     persist_interval_s = settings_caps.heartbeat_persist_interval_s
     heartbeat_persist_failures = 0
+    # When the last stream line came, an event or not: the silence the kill
+    # measures. A tool_progress line counts, so a long tool call is not
+    # silence; the stuck-sleep-loop reaper deals with a stuck one.
+    last_line_at = clock.now()
+    recorded_session_id: str | None = None
 
-    for _event in parse_lines(_read_lines(lines), summary=summary):
+    def _lines_until_a_time_cap() -> Iterator[str]:
+        nonlocal last_line_at
+        for line in _read_lines(lines):
+            if line is not None:
+                last_line_at = clock.now()
+                yield line
+                continue
+            # A tick: no line for a while. Only the clock can trip a cap now.
+            now = clock.now()
+            if now < started_at or now < last_line_at:
+                continue  # the clock stepped back; the next tick measures again
+            violation = caps_mod.evaluate_caps(
+                settings=settings_caps,
+                task=task,
+                cumulative_tokens=summary.cumulative_usage.total_tokens,
+                started_at=started_at,
+                now=now,
+            )
+            if violation is not None:
+                logger.warning(
+                    "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
+                    task.id,
+                    violation.which,
+                    violation.observed,
+                    violation.cap,
+                )
+            else:
+                status = hb_mod.evaluate(
+                    settings=settings_caps,
+                    last_heartbeat_at=last_line_at,
+                    started_at=started_at,
+                    now=now,
+                )
+                if status.verdict is not hb_mod.HeartbeatVerdict.KILL:
+                    continue
+                logger.warning(
+                    "task %s wrote no stream output for %.0fs; SIGTERM", task.id, status.silence_s
+                )
+                violation = caps_mod.CapViolation(
+                    which="duration",
+                    observed=status.silence_s,
+                    cap=float(settings_caps.heartbeat_silence_kill_s),
+                )
+            cap_kill.violation = violation
+            terminate()
+            return
+
+    for _event in parse_lines(_lines_until_a_time_cap(), summary=summary):
         # Every typed event ticks the in-memory heartbeat; the
         # in-process kill check below uses the un-coalesced value so a
         # KILL fires as soon as the threshold is crossed, even when the
@@ -1114,45 +1268,48 @@ def _dispatch_loop(
                 )
             last_persist_at = last_heartbeat
 
-        # After each event, check caps.
-        cap_violation = caps_mod.evaluate_caps(
+        if (
+            session_persist_fn is not None
+            and summary.session_id is not None
+            and summary.session_id != recorded_session_id
+        ):
+            recorded_session_id = summary.session_id
+            try:
+                session_persist_fn(summary.session_id)
+            except Exception as exc:
+                logger.warning(
+                    "task %s: could not record session %s in its running state (%s); "
+                    "the run records it when it ends",
+                    task.id,
+                    summary.session_id,
+                    exc,
+                )
+
+        # After each event, check caps. An event is no silence, so the
+        # silence kill waits for a tick.
+        now = clock.now()
+        if now < started_at:
+            continue  # the clock stepped back; no cap has been exceeded
+        violation = caps_mod.evaluate_caps(
             settings=settings_caps,
             task=task,
             cumulative_tokens=summary.cumulative_usage.total_tokens,
             started_at=started_at,
-            now=clock.now(),
+            now=now,
         )
-        if cap_violation is not None:
+        if violation is not None:
             logger.warning(
                 "task %s exceeded %s cap (%.0f > %.0f); SIGTERM",
                 task.id,
-                cap_violation.which,
-                cap_violation.observed,
-                cap_violation.cap,
+                violation.which,
+                violation.observed,
+                violation.cap,
             )
+            cap_kill.violation = violation
             terminate()
             break
 
-        # Heartbeat-based kill (silence threshold). Alert-level transitions
-        # are surfaced by the supervisor by comparing TaskState.last_heartbeat_at;
-        # only a KILL verdict acts here.
-        status = hb_mod.evaluate(
-            settings=settings_caps,
-            last_heartbeat_at=last_heartbeat,
-            started_at=started_at,
-            now=clock.now(),
-        )
-        if status.verdict is hb_mod.HeartbeatVerdict.KILL:
-            logger.warning("task %s heartbeat silent for %.0fs; SIGTERM", task.id, status.silence_s)
-            terminate()
-            cap_violation = caps_mod.CapViolation(
-                which="duration",
-                observed=status.silence_s,
-                cap=float(settings_caps.heartbeat_silence_kill_s),
-            )
-            break
-
-    return summary, cap_violation
+    return summary, cap_kill.violation
 
 
 _MAX_ADD_DIRS_LOG_CHARS = 300
@@ -1207,7 +1364,13 @@ def _signal_group_by_pid(pid: int, sig: int) -> None:
 
 
 def _signal_group(process: subprocess.Popen[str], sig: int) -> None:
-    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`)."""
+    """Send ``sig`` to ``process``'s whole group (see :func:`_signal_group_by_pid`).
+
+    Nothing, once ``Popen`` has reaped ``process``: its pid may be another
+    process's by now.
+    """
+    if process.returncode is not None:
+        return
     _signal_group_by_pid(process.pid, sig)
 
 
@@ -1219,11 +1382,13 @@ class TerminateFailed(RuntimeError):
     itself failed — EPERM, EINVAL, etc.) or the post-SIGKILL
     ``process.wait(timeout=2)`` timed out (the parent survived
     SIGKILL, suggesting a TASK_UNINTERRUPTIBLE kernel-level issue).
-    Callers MUST NOT treat the attempt as terminated when this is
-    raised: the state YAML stays ``"running"`` with the recorded pid
-    so the per-tick silent-orphan reaper can pick the orphan up on
-    its next pass instead of the dispatch finalizing a still-alive
-    subprocess to a slot-freeing ``failed``.
+    Callers must not treat the attempt as over when this is raised. From
+    a cap or silence kill it ends the dispatch loop: :func:`dispatch`
+    then tries the stop once more and, once the worker is gone, records
+    the run as killed by the cap; a worker the retry cannot stop either is
+    parked ``possibly_hung`` with its pid (:func:`park_live_worker`), and
+    :class:`DispatchError` is raised. A worker that may still run is never
+    recorded as finished, which would free its slot.
     """
 
 
@@ -1247,6 +1412,9 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
     Sequence:
 
+    0. ``process.returncode`` already set ⇒ ``Popen`` has reaped the
+       parent (the file tailer's ``poll`` does as the worker exits), so
+       its pid may be another process's by now; return without a signal.
     1. ``getpgid`` once. ``ProcessLookupError`` ⇒ the parent is
        already gone; return cleanly.
     2. ``killpg(pgid, SIGTERM)``. ``ProcessLookupError`` ⇒ the group
@@ -1264,6 +1432,8 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     own, as when a worker was started without its own session) raises
     :class:`TerminateFailed` at step 2, with nothing sent.
     """
+    if process.returncode is not None:
+        return
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
@@ -1296,8 +1466,7 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     except OSError as exc:
         logger.error(
             "SIGKILL to PG %d (task pid %d) failed: %s — subprocess may "
-            "survive; dispatcher will NOT mark this slot free, leaving it "
-            "for the per-tick silent reaper",
+            "survive; its run is not recorded while it may still be running",
             pgid,
             process.pid,
             exc,
@@ -1311,8 +1480,8 @@ def _terminate(process: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired as exc:
         logger.error(
             "task pid %d survived SIGKILL to PG %d — kernel-level issue "
-            "(TASK_UNINTERRUPTIBLE?); dispatcher will NOT mark this slot "
-            "free, leaving it for the per-tick silent reaper",
+            "(TASK_UNINTERRUPTIBLE?); its run is not recorded while it may "
+            "still be running",
             process.pid,
             pgid,
         )
@@ -1320,10 +1489,22 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
 
 DISPATCH_LOOP_ERROR_STOP_REASON = "dispatch_loop_error"
-"""``stop_reason`` of a run whose dispatch loop raised, and whose worker was
-then stopped before it wrote its terminal result. The run's ``error`` names
-the exception. It is a failure like any other: it counts toward the circuit
-breaker, and the task is dispatched again."""
+"""``stop_reason`` of a run whose dispatch loop raised (or the monitor thread
+started with it could not start), and whose worker was then stopped before it
+wrote its terminal result. The run's ``error`` names the exception. It is a
+failure like any other: it counts toward the circuit breaker, and the task is
+dispatched again."""
+
+
+class _AfterLoopError(StrEnum):
+    """What :func:`_stop_after_loop_error` found its worker to be, or made it."""
+
+    EXITED = "exited"
+    """Gone before the stop: it exited on its own, and nothing was signalled."""
+    STOPPED = "stopped"
+    """Gone after the stop."""
+    RUNNING = "running"
+    """Still running: the stop failed."""
 
 
 def _stop_after_loop_error(
@@ -1333,13 +1514,26 @@ def _stop_after_loop_error(
     *,
     stop: Callable[[], None],
     gone: Callable[[], bool],
-) -> bool:
-    """Stop a worker whose dispatch loop raised ``exc``; whether it is gone.
+) -> _AfterLoopError:
+    """Stop a worker whose dispatch loop raised ``exc``; say what became of it.
 
-    Logs the loop's failure with its traceback, then calls ``stop``. A
-    ``stop`` that raises is logged. ``False`` when the worker still runs, so
-    the caller must not record the attempt as over.
+    Logs the loop's failure with its traceback. A worker already gone has
+    exited on its own: it is not signalled, since its pid may be another
+    process's by now, and its own record of the run stands. Otherwise calls
+    ``stop``; a ``stop`` that raises is logged.
+    :attr:`_AfterLoopError.RUNNING` means the worker still runs, so the
+    caller must not record the attempt as over.
     """
+    if gone():
+        logger.error(
+            "task %s: dispatch loop raised %s: %s; worker pid=%s had already exited",
+            task_id,
+            type(exc).__name__,
+            exc,
+            pid,
+            exc_info=exc,
+        )
+        return _AfterLoopError.EXITED
     logger.error(
         "task %s: dispatch loop raised %s: %s; stopping worker pid=%s",
         task_id,
@@ -1357,7 +1551,7 @@ def _stop_after_loop_error(
             pid,
             stop_exc,
         )
-    return gone()
+    return _AfterLoopError.STOPPED if gone() else _AfterLoopError.RUNNING
 
 
 def _loop_error_text(exc: Exception) -> str:
@@ -1368,13 +1562,17 @@ def _name_loop_error(
     run: RunRecord, loop_error: Exception | None, summary: StreamSummary
 ) -> RunRecord:
     """``run``, failed with :data:`DISPATCH_LOOP_ERROR_STOP_REASON` when the
-    dispatch loop raised and the worker was stopped mid-run.
+    worker was stopped mid-run after the dispatch loop raised ``loop_error``.
 
-    The exit code then records the stop, not its cause. A worker that wrote
-    its terminal result before the loop raised finished its work, and the
-    run its result built stands.
+    The exit code then records the stop, not its cause. ``loop_error`` is
+    ``None`` when the loop did not raise, or when the worker had exited on
+    its own before the stop (:attr:`_AfterLoopError.EXITED`): its own exit
+    stands. A worker that wrote its terminal result before the loop raised
+    finished its work, and the run its result built stands. So does a run
+    killed by a cap: the loop raised from that kill (:class:`TerminateFailed`),
+    and the stop after it finished the kill.
     """
-    if loop_error is None or summary.final_result is not None:
+    if loop_error is None or summary.final_result is not None or run.killed_by_cap is not None:
         return run
     return run.model_copy(
         update={
@@ -1384,13 +1582,119 @@ def _name_loop_error(
     )
 
 
-def _parked_after_loop_error(task_id: str, pid: int, loop_error: Exception) -> DispatchError:
-    """The error a dispatch raises, from ``loop_error``, once it parked a
-    worker it could not stop."""
+_LOOP_ERROR_PARK = "after its dispatch loop failed and it could not be stopped"
+"""The ``why`` of a park after a loop error (:func:`park_live_worker`)."""
+
+
+def _park_unstopped_worker(
+    state: TaskState,
+    state_path: Path,
+    pid: int,
+    on_park: Callable[[TaskState, str], None] | None,
+) -> str:
+    """Park ``state``'s worker ``pid``, which its loop error left running,
+    and say what became of the park, for :func:`_unstopped_after_loop_error`.
+
+    Through the recheck guard, so a record another writer made first
+    stands (:func:`_write_unless_finalized`). A park that is written goes
+    to ``on_park``.
+    """
+    parked = park_live_worker(state, why=_LOOP_ERROR_PARK)
+    try:
+        on_disk, wrote = _write_unless_finalized(parked, state_path, worker_pid=pid)
+    except OSError as exc:
+        return _park_not_written(state.task_id, pid, exc)
+    if not wrote:
+        return f"another writer had already recorded its task as {on_disk.status}"
+    if on_park is not None:
+        on_park(parked, _LOOP_ERROR_PARK)
+    return "is parked"
+
+
+def _park_not_written(task_id: str, pid: int, exc: OSError) -> str:
+    """Log that the park of a worker that could not be stopped could not be
+    written, as :func:`runner.orchestrator._park_live_worker` does; the
+    outcome for the error the dispatch raises."""
+    logger.error(
+        "task %s: worker pid=%s could not be stopped, and its park could not be written (%s)",
+        task_id,
+        pid,
+        exc,
+    )
+    return f"its park could not be written ({exc})"
+
+
+def _unstopped_after_loop_error(
+    task_id: str, pid: int, loop_error: Exception, *, outcome: str
+) -> DispatchError:
+    """The error a dispatch raises, from ``loop_error``, when it could not
+    stop its worker; ``outcome`` says what became of the task."""
     return DispatchError(
         f"task {task_id}: {_loop_error_text(loop_error)}; "
-        f"worker pid={pid} could not be stopped and is parked"
+        f"worker pid={pid} could not be stopped and {outcome}"
     )
+
+
+def _read_rest(stream: IO[str], into: list[str]) -> None:
+    """Append what is left on ``stream`` to ``into`` a line at a time, so a
+    reader given up on keeps what it read, then close it."""
+    try:
+        with stream:
+            for line in stream:
+                into.append(line)
+    except (OSError, ValueError) as exc:
+        # ValueError: the stream was already closed, so whatever it had read
+        # ahead, a terminal result perhaps, is lost.
+        logger.error("could not read the rest of a stopped worker's pipe: %s", exc)
+
+
+def _drain_pipes(
+    process: subprocess.Popen[str], *, task_id: str, timeout_s: float
+) -> tuple[str, str]:
+    """What is left on a reaped worker's stdout and stderr pipes.
+
+    Read through the file objects, so whatever a file object had already
+    read is kept, each pipe on its own thread. A pipe still open after
+    ``timeout_s``, held by a process the stop did not end, is left to its
+    thread, and the text read from it so far is returned; that thread and
+    the pipe's descriptor stay until the holder exits, then end. A pipe
+    with no thread to read it ("can't start new thread") is left unread.
+    Nothing is signalled: the worker is reaped, so its pid is no longer
+    provably its own.
+    """
+    out: list[str] = []
+    err: list[str] = []
+    readers: list[threading.Thread] = []
+    for stream, into in ((process.stdout, out), (process.stderr, err)):
+        if stream is None:
+            continue
+        reader = threading.Thread(
+            target=_read_rest, args=(stream, into), name=f"drain-{task_id}", daemon=True
+        )
+        try:
+            reader.start()
+        except RuntimeError as exc:
+            logger.error(
+                "task %s: no thread could read the rest of worker pid=%s's output (%s); "
+                "recording its run without it",
+                task_id,
+                process.pid,
+                exc,
+            )
+            continue
+        readers.append(reader)
+    deadline = time.monotonic() + timeout_s
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        logger.warning(
+            "task %s: worker pid=%s's output is still open %.0fs after it stopped; "
+            "recording its run from what was read",
+            task_id,
+            process.pid,
+            timeout_s,
+        )
+    return "".join(out), "".join(err)
 
 
 def _terminate_by_pid(
@@ -1838,19 +2142,37 @@ def dispatch(
     persist_state: bool = True,
     adopt_workers: bool = False,
     spawn_gate: SpawnGate | None = None,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> DispatchOutcome:
     """Run one attempt for ``task`` and return the resulting state delta.
 
     Side effects (when ``persist_state=True``, the default):
 
     * Writes pre-run state with ``status="running"``.
+    * Writes the session id and its host account into the running state
+      as soon as claude reports a new one, so a re-dispatch after a
+      supervisor that died mid-run resumes the session.
     * Writes post-run state with appended :class:`RunRecord`, updated
-      ``status``, and refreshed ``session_id``.
+      ``status``, and refreshed ``session_id``, unless a reaper recorded
+      the attempt while the worker ran: its record stands, as on the
+      adopted path, except a park of this same worker
+      (:func:`_write_unless_finalized`).
     * When the worker cannot be started (no ``claude`` binary,
       :func:`_account_spawn`'s and :func:`_task_spawn`'s checks, or opening the log files or
       ``Popen`` raising), writes ``deferred`` instead, from ``state`` as
       it was, and returns that outcome (:func:`_defer_unstartable`); no
       attempt is counted.
+    * When the dispatch loop raises (a bug, a clock step, a cap kill that
+      cannot confirm the worker died) or its monitor thread cannot start,
+      stops the worker rather than leave it unwatched, and records the
+      run: failed with :data:`DISPATCH_LOOP_ERROR_STOP_REASON` when the
+      stop ended it mid-run; killed by the cap when the loop raised from
+      that cap's kill; and the worker's own record when it had written
+      its terminal result or exited on its own. A worker that cannot be
+      stopped may still run, so no run is recorded: the task is parked
+      ``possibly_hung`` with its pid (:func:`park_live_worker`), unless
+      another writer recorded the attempt first, the park goes to
+      ``on_park``, and :class:`DispatchError` is raised.
 
     The supervisor wraps this call with the throttling / concurrency
     decisions from :mod:`claude_task_runner.throttle.decision`.
@@ -1872,6 +2194,10 @@ def dispatch(
     the worker's pid is on record, so a stopping supervisor waits for
     that, and after the supervisor has closed it a daemon thread starts
     no worker. ``None`` (callers outside the supervisor) skips it.
+
+    ``on_park`` receives the park of a worker this dispatch could not stop
+    after its loop failed, with its ``why``, so the supervisor reports it as
+    it reports its other parks.
     """
     # A worker that cannot be started parks the task (_defer_unstartable):
     # the checks run before the ``running`` write below, and a process that
@@ -2050,6 +2376,10 @@ def dispatch(
             stdout=stdout_sink,
             stderr=stderr_sink,
             text=True,
+            # As the file tailer reads: a line that is not UTF-8 is a
+            # malformed line, not an exception in the dispatch loop.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             cwd=str(task.working_dir) if task.working_dir else None,
             env=spawn_env,
@@ -2149,7 +2479,9 @@ def dispatch(
     #
     # The state lock serializes the read-modify-write so neither writer
     # clobbers the other's field. Both update ``new_state`` (the local
-    # source of truth) and atomic-write the YAML.
+    # source of truth) and atomic-write the YAML, but only while the YAML
+    # still says ``running``: once a reaper has moved the task off it,
+    # they stand down rather than write it back (``_write_running``).
     #
     # Only persist when ``persist_state`` is True — the dispatch
     # function's normal path. When the caller has opted into in-memory
@@ -2164,25 +2496,35 @@ def dispatch(
         def _persist_heartbeat(when: datetime) -> None:
             nonlocal new_state
             with state_lock:
-                new_state = new_state.model_copy(update={"last_heartbeat_at": when})
-                write_state_atomic(new_state, state_path)
+                new_state = _write_running(new_state, state_path, {"last_heartbeat_at": when})
 
         def _persist_alive(when: datetime) -> None:
             nonlocal new_state
             with state_lock:
-                new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
-                write_state_atomic(new_state, state_path)
+                new_state = _write_running(new_state, state_path, {"dispatcher_alive_at": when})
+
+        def _persist_session(session_id: str) -> None:
+            nonlocal new_state
+            with state_lock:
+                if session_id == new_state.session_id:
+                    return  # a resumed session, already on record
+                # A new session is hosted on the account it runs on
+                # (ADR-0024), as _finalize_state records it at the end.
+                new_state = _write_running(
+                    new_state, state_path, {"session_id": session_id, "session_account": account}
+                )
 
         heartbeat_persist_fn = _persist_heartbeat
+        session_persist_fn: Callable[[str], None] | None = _persist_session
         alive_monitor = _DispatcherAliveMonitor(
             persist_fn=_persist_alive,
             clock=clock,
             interval_s=settings_caps.dispatcher_alive_write_interval_s,
             task_id=task.id,
         )
-        alive_monitor.start()
     else:
         heartbeat_persist_fn = None
+        session_persist_fn = None
         alive_monitor = None
 
     # Build the line source + terminate callback for the loop. Both
@@ -2190,22 +2532,27 @@ def dispatch(
     # lines differs (a file tailer when file-backed, the stdout pipe
     # otherwise). The terminate is wrapped so the loop stays oblivious
     # to whether it's reading a pipe or a file (ADR-0025).
-    lines: Iterable[str]
+    lines: Iterable[str | None]
+    pipe_lines: _PipeLines | None = None
     if use_files:
         assert stdout_log_path is not None
-        lines = tail_lines(stdout_log_path, alive=lambda: process.poll() is None)
+        lines = tail_lines(
+            stdout_log_path, alive=lambda: process.poll() is None, tick_s=_CAP_TICK_S
+        )
     else:
         assert process.stdout is not None
-        lines = _read_lines(process.stdout)
+        lines = pipe_lines = _PipeLines(process.stdout, tick_s=_CAP_TICK_S)
 
     def _terminate_owned() -> None:
         _terminate(process)
 
     summary = StreamSummary()
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
-        summary, cap_violation = _dispatch_loop(
+        if alive_monitor is not None:
+            alive_monitor.start()
+        _dispatch_loop(
             lines=lines,
             terminate=_terminate_owned,
             settings_caps=settings_caps,
@@ -2214,6 +2561,8 @@ def dispatch(
             started_at=started_at,
             heartbeat_persist_fn=heartbeat_persist_fn,
             summary=summary,
+            cap_kill=cap_kill,
+            session_persist_fn=session_persist_fn,
         )
     except Exception as exc:
         # Escaping here would leave the worker running unsupervised and its
@@ -2223,20 +2572,29 @@ def dispatch(
     finally:
         if alive_monitor is not None:
             alive_monitor.stop()
+    cap_violation = cap_kill.violation
 
-    if loop_error is not None and not _stop_after_loop_error(
-        task.id,
-        process.pid,
-        loop_error,
-        stop=_terminate_owned,
-        gone=lambda: process.poll() is not None,
-    ):
-        if persist_state:
-            parked = park_live_worker(
-                new_state, why="after its dispatch loop failed and it could not be stopped"
-            )
-            write_state_atomic(parked, state_path_for(queue_dir, task.id))
-        raise _parked_after_loop_error(task.id, process.pid, loop_error) from loop_error
+    # The loop's exception, when the stop after it ended the worker mid-run.
+    stopped_for: Exception | None = None
+    if loop_error is not None:
+        after = _stop_after_loop_error(
+            task.id,
+            process.pid,
+            loop_error,
+            stop=_terminate_owned,
+            gone=lambda: process.poll() is not None,
+        )
+        if after is _AfterLoopError.RUNNING:
+            outcome = "is not parked: this dispatch keeps no state"
+            if persist_state:
+                outcome = _park_unstopped_worker(
+                    new_state, state_path_for(queue_dir, task.id), process.pid, on_park
+                )
+            raise _unstopped_after_loop_error(
+                task.id, process.pid, loop_error, outcome=outcome
+            ) from loop_error
+        if after is _AfterLoopError.STOPPED:
+            stopped_for = loop_error
 
     # Drain remaining output and stderr. If the process won't finish
     # within the grace period, SIGKILL its whole group (so any forked
@@ -2272,11 +2630,21 @@ def dispatch(
         summary = _reparse_stdout_file(stdout_log_path)
         stderr_tail = _read_stderr_tail(stderr_log_path)
     else:
-        try:
-            stdout_remainder, stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            _signal_group(process, signal.SIGKILL)
-            stdout_remainder, stderr = process.communicate()
+        if loop_error is None and process.returncode is None:
+            try:
+                stdout_remainder, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                _signal_group(process, signal.SIGKILL)
+                stdout_remainder, stderr = process.communicate()
+        else:
+            # A loop error's stop, or a cap kill's wait, has reaped the
+            # worker: communicate()'s timeout path would signal nothing by its
+            # pid and then wait on a process still holding a pipe for as long
+            # as it runs.
+            stdout_remainder, stderr = _drain_pipes(process, task_id=task.id, timeout_s=10)
+        # The pipe reader's own read-ahead: lines it read and the loop never took.
+        assert pipe_lines is not None
+        stdout_remainder = pipe_lines.unread() + (stdout_remainder or "")
 
         # Re-parse any remainder lines. parse_lines updates `summary`
         # (cumulative usage, session id, final result) as a side effect;
@@ -2287,7 +2655,9 @@ def dispatch(
         # overwritten by `_finalize_state`. Remainder parsing is
         # stats-only.
         if stdout_remainder:
-            for _ in parse_lines(stdout_remainder.splitlines(), summary=summary):
+            # Split at newlines only: splitlines() also splits at U+2028 and
+            # the other line separators a JSON string may hold unescaped.
+            for _ in parse_lines(stdout_remainder.split("\n"), summary=summary):
                 pass
         stderr_tail = (stderr or "")[-500:] if stderr else ""
 
@@ -2306,7 +2676,7 @@ def dispatch(
         account=account,
         pid=process.pid,
     )
-    run_record = _name_loop_error(run_record, loop_error, summary)
+    run_record = _name_loop_error(run_record, stopped_for, summary)
 
     # Detect open sidecar once and thread it through finalization. The
     # output-evidence gate (ADR-0020) consults it when deciding whether
@@ -2336,11 +2706,18 @@ def dispatch(
             settings_failure_classifier=settings_failure_classifier,
         )
 
+    # The hook gets this attempt's session whoever records the attempt.
+    attempt_session_id = final_state.session_id
     if persist_state:
-        write_state_atomic(final_state, state_path_for(queue_dir, task.id))
+        # A reaper may have recorded the attempt while the worker ran (a
+        # stuck sleep loop it killed, say). Its record wins, as on the
+        # adopted path, but a park of this worker gives way to its run.
+        final_state, _wrote = _write_unless_finalized(
+            final_state, state_path_for(queue_dir, task.id), worker_pid=process.pid
+        )
 
     _run_post_dispatch_hook(
-        settings_hooks, task, attempt=run_record.attempt, session_id=final_state.session_id
+        settings_hooks, task, attempt=run_record.attempt, session_id=attempt_session_id
     )
 
     return DispatchOutcome(
@@ -2362,6 +2739,7 @@ def adopt_worker(
     settings_failure_classifier: FailureClassifierSettings | None = None,
     account: str | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> DispatchOutcome:
     """Monitor a worker this supervisor did NOT spawn, to completion.
 
@@ -2379,7 +2757,9 @@ def adopt_worker(
       (:func:`_terminate_by_pid` → ``killpg``);
     * the heartbeat + ``dispatcher_alive_at`` are refreshed on the state
       YAML while tailing, so the per-tick reaper sees HEALTHY and never
-      demotes the adopted task out from under us.
+      demotes the adopted task out from under us. Should a reaper move the
+      task off ``running`` all the same, the refreshes stop rather than
+      write it back (:func:`_write_running`).
 
     On completion (the pid is gone) the outcome is **inferred** from the
     terminal stream-json ``result`` event captured in the
@@ -2392,10 +2772,21 @@ def adopt_worker(
     mirroring the reaper's own TOCTOU mitigation so neither clobbers the
     other.
 
+    When the monitor's loop raises, or its monitor thread cannot start,
+    the worker is stopped through the identity-checked kill and the run
+    recorded as :func:`dispatch` records it. A worker that cannot be
+    stopped is parked ``possibly_hung`` with its pid, under the same
+    guard, so a reaper's record stands, and :class:`DispatchError` is
+    raised.
+
     ``settings_dispatch`` and ``settings_hooks`` are required, not
     defaulted: the finalize applies the owned path's gates with them (see
     :func:`_finalize_adopted`), and a caller that leaves one out must fail
     rather than silently skip a gate.
+
+    ``on_park`` receives the park of a worker this monitor could not stop
+    after its loop failed, with its ``why``, so the supervisor reports it
+    as it reports its other parks.
     """
     started_at = state.last_started_at if state.last_started_at is not None else clock.now()
     log_path = Path(state.log_path) if state.log_path is not None else None
@@ -2437,7 +2828,9 @@ def adopt_worker(
 
     # Shared running-state writer (heartbeat + dispatcher-alive) — same
     # lock discipline as dispatch()'s monitor so the two fields don't
-    # clobber each other. ``new_state`` is the local source of truth.
+    # clobber each other. ``new_state`` is the local source of truth, and
+    # it is written only while the YAML still says ``running``
+    # (``_write_running``).
     new_state = state
     state_lock = threading.Lock()
     state_path = state_path_for(queue_dir, task.id)
@@ -2445,14 +2838,21 @@ def adopt_worker(
     def _persist_heartbeat(when: datetime) -> None:
         nonlocal new_state
         with state_lock:
-            new_state = new_state.model_copy(update={"last_heartbeat_at": when})
-            write_state_atomic(new_state, state_path)
+            new_state = _write_running(new_state, state_path, {"last_heartbeat_at": when})
 
     def _persist_alive(when: datetime) -> None:
         nonlocal new_state
         with state_lock:
-            new_state = new_state.model_copy(update={"dispatcher_alive_at": when})
-            write_state_atomic(new_state, state_path)
+            new_state = _write_running(new_state, state_path, {"dispatcher_alive_at": when})
+
+    def _persist_session(session_id: str) -> None:
+        nonlocal new_state
+        with state_lock:
+            if session_id == new_state.session_id:
+                return  # recorded by the supervisor that started the worker
+            new_state = _write_running(
+                new_state, state_path, {"session_id": session_id, "session_account": account}
+            )
 
     alive_monitor = _DispatcherAliveMonitor(
         persist_fn=_persist_alive,
@@ -2460,7 +2860,6 @@ def adopt_worker(
         interval_s=settings_caps.dispatcher_alive_write_interval_s,
         task_id=task.id,
     )
-    alive_monitor.start()
 
     def _alive() -> bool:
         return probe_recorded_worker(state, queue_dir) is WorkerProbe.ALIVE
@@ -2470,17 +2869,20 @@ def adopt_worker(
         if _alive():
             _terminate_by_pid(pid, alive=_alive, sleep_fn=sleep_fn)
 
-    cap_violation: caps_mod.CapViolation | None = None
+    cap_kill = _CapKill()
     loop_error: Exception | None = None
     try:
-        _, cap_violation = _dispatch_loop(
-            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn),
+        alive_monitor.start()
+        _dispatch_loop(
+            lines=tail_lines(log_path, alive=_alive, sleep_fn=sleep_fn, tick_s=_CAP_TICK_S),
             terminate=_terminate_adopted,
             settings_caps=settings_caps,
             clock=clock,
             task=task,
             started_at=started_at,
             heartbeat_persist_fn=_persist_heartbeat,
+            cap_kill=cap_kill,
+            session_persist_fn=_persist_session,
         )
     except Exception as exc:
         # As in dispatch(): escaping here would leave the worker unwatched
@@ -2490,18 +2892,21 @@ def adopt_worker(
         loop_error = exc
     finally:
         alive_monitor.stop()
+    cap_violation = cap_kill.violation
 
-    if loop_error is not None and not _stop_after_loop_error(
-        task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
-    ):
-        _write_unless_finalized(
-            park_live_worker(
-                new_state, why="after its dispatch loop failed and it could not be stopped"
-            ),
-            state_path,
-            worker_pid=pid,
+    # The loop's exception, when the stop after it ended the worker mid-run.
+    stopped_for: Exception | None = None
+    if loop_error is not None:
+        after = _stop_after_loop_error(
+            task.id, pid, loop_error, stop=_terminate_adopted, gone=lambda: not _alive()
         )
-        raise _parked_after_loop_error(task.id, pid, loop_error) from loop_error
+        if after is _AfterLoopError.RUNNING:
+            outcome = _park_unstopped_worker(new_state, state_path, pid, on_park)
+            raise _unstopped_after_loop_error(
+                task.id, pid, loop_error, outcome=outcome
+            ) from loop_error
+        if after is _AfterLoopError.STOPPED:
+            stopped_for = loop_error
 
     # The tailer exits once the pid is gone; re-read the full log so the
     # summary reflects the worker's final flush (the live tailer may stop
@@ -2523,7 +2928,7 @@ def adopt_worker(
         settings_failure_classifier=settings_failure_classifier,
         settings_dispatch=settings_dispatch,
         settings_hooks=settings_hooks,
-        loop_error=loop_error,
+        loop_error=stopped_for,
     )
 
 
@@ -2606,45 +3011,68 @@ def _log_finished_at(log_path: Path, *, started_at: datetime, now: datetime) -> 
     can't be stat'ed, and for an mtime no datetime can hold (past year
     9999, which tmpfs stores as given), as for any mtime after ``now``.
     """
-    try:
-        mtime = utc_from_timestamp(log_path.stat().st_mtime)
-    except (OSError, TimestampOutOfRange):
+    mtime = file_mtime_utc(log_path, consequence="dating the run that wrote it at now")
+    if mtime is None:
         return now
     return max(started_at, min(mtime, now))
 
 
 def _write_unless_finalized(
     state: TaskState, state_path: Path, *, worker_pid: int | None
-) -> TaskState:
+) -> tuple[TaskState, bool]:
     """Persist ``state`` unless another writer recorded the attempt first;
-    return what is on disk afterwards.
+    return what is on disk afterwards, and whether this wrote it.
 
     The ADR-0025 recheck guard: a per-tick reaper can move the task off
     ``running`` between a verdict and this write, and its record wins.
     The write goes ahead while the task is still ``running`` or parked on
     this same worker (:func:`is_parked_live_worker`, ``worker_pid``), and
-    when the recheck cannot load the file.
+    when the recheck cannot load the file. With ``worker_pid`` None it goes
+    ahead only while the task is ``running``, so a write of the running
+    state never turns a park back into a run (:func:`_write_running`). A
+    stand-down is logged once per attempt and status, since the
+    running-state writes repeat.
     """
     try:
         current = load_state(state_path)
     except Exception as exc:
         logger.warning(
-            "adopt_worker: recheck-load of %s failed (%s); persisting anyway", state_path, exc
+            "task %s: recheck-load of %s failed (%s); persisting anyway",
+            state.task_id,
+            state_path,
+            exc,
         )
         write_state_atomic(state, state_path)
-        return state
+        return state, True
     if current.status == "running" or (
-        is_parked_live_worker(current) and current.pid == worker_pid
+        worker_pid is not None and is_parked_live_worker(current) and current.pid == worker_pid
     ):
         write_state_atomic(state, state_path)
-        return state
-    logger.info(
-        "adopt_worker: task %s status changed to %s; "
-        "standing down so the concurrent writer's record wins",
-        state.task_id,
-        current.status,
-    )
-    return current
+        return state, True
+    if first_time("write_unless_finalized", state.task_id, state.attempts, current.status):
+        logger.info(
+            "task %s: status changed to %s; standing down so the concurrent writer's record wins",
+            state.task_id,
+            current.status,
+        )
+    return current, False
+
+
+def _write_running(state: TaskState, state_path: Path, update: dict[str, object]) -> TaskState:
+    """Write a monitor's ``update`` into its task's running ``state``; return
+    the state it now holds.
+
+    The heartbeat, the monitor's tick and the session are written while the
+    worker runs, from a copy of the state the dispatch started with, which
+    says ``running``. Once another writer, such as a reaper marking the task
+    ``possibly_hung``, has moved it off ``running``, writing that copy would
+    put the task back, so the write stands down and ``state`` comes back
+    unchanged (:func:`_write_unless_finalized`, with no worker pid). The
+    run's finalize then decides between that record and its own.
+    """
+    updated = state.model_copy(update=update)
+    _on_disk, wrote = _write_unless_finalized(updated, state_path, worker_pid=None)
+    return updated if wrote else state
 
 
 def _finalize_adopted(
@@ -2757,7 +3185,7 @@ def _finalize_adopted(
     # or reap). The hook gets this attempt's session whoever records it.
     attempt_session_id = final_state.session_id
 
-    final_state = _write_unless_finalized(
+    final_state, _wrote = _write_unless_finalized(
         final_state, state_path_for(queue_dir, task.id), worker_pid=prior.pid
     )
 

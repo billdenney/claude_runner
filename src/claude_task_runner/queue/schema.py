@@ -26,7 +26,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from claude_task_runner.process_signals import PID_MAX
+from claude_task_runner.process_signals import PID_T_MAX
 
 CURRENT_SCHEMA_VERSION = 2
 
@@ -129,7 +129,7 @@ class RunRecord(_StrictBase):
     killed_by_cap: Literal["tokens", "duration"] | None = None
     """Set when the run was SIGTERM'd by ``runner.caps`` because a
     per-task safety cap was exceeded."""
-    pid: int | None = Field(default=None, ge=1, le=PID_MAX)
+    pid: int | None = Field(default=None, ge=1, le=PID_T_MAX)
     """OS pid of the ``claude`` subprocess this run spawned.
 
     Populated by the dispatcher's run-record builder. Distinct from
@@ -145,8 +145,8 @@ class RunRecord(_StrictBase):
 
     ``None`` on legacy run records that predate this field, on
     pre-dispatch-hook failures (no subprocess was spawned), and on the
-    adopted path's resume of an already-finalized worker. At most
-    :data:`~claude_task_runner.process_signals.PID_MAX`, as for
+    adopted path's resume of an already-finalized worker. Between 1 and
+    :data:`~claude_task_runner.process_signals.PID_T_MAX`, as for
     :attr:`TaskState.pid`."""
     account: str | None = None
     """Which account this attempt was dispatched through. Matches the
@@ -349,7 +349,7 @@ class TaskState(_StrictBase):
     verification step. ``None`` on legacy state YAMLs that pre-date the
     field — the reaper treats that as "old format" and falls back to
     ``last_heartbeat_at`` alone (the pre-Layer-2 behaviour)."""
-    pid: int | None = Field(default=None, ge=1, le=PID_MAX)
+    pid: int | None = Field(default=None, ge=1, le=PID_T_MAX)
     """OS pid of the most recently spawned ``claude`` subprocess for
     this task. Written by the dispatcher right after ``Popen`` (so the
     YAML carries a live pointer to the subprocess while it's running)
@@ -361,11 +361,12 @@ class TaskState(_StrictBase):
     that have not yet been dispatched, and on tasks whose most recent
     dispatch has finalized normally.
 
-    At most :data:`~claude_task_runner.process_signals.PID_MAX`, the
-    largest C ``pid_t``. No process can have a larger pid, and
-    ``os.kill`` raises ``OverflowError`` for one, so a state YAML recording
-    one fails to load and the corrupt-state quarantine (ADR-0028) takes it
-    instead of a probe of it crashing supervisor startup."""
+    Between 1 and :data:`~claude_task_runner.process_signals.PID_T_MAX`,
+    the largest C ``pid_t``. ``os.kill`` takes 0 and negative pids for
+    process groups and raises ``OverflowError`` above the maximum, so a
+    state YAML recording a pid outside that range fails to load, and the
+    corrupt-state quarantine (ADR-0028) takes it at startup, before any
+    pass probes the pid."""
     log_path: str | None = None
     """Absolute path to the current attempt's stream-json log file, when
     the dispatcher runs in file-backed mode (``[supervisor].adopt_workers``).

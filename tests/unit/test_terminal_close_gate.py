@@ -272,6 +272,26 @@ class TestAlreadyGated:
     def test_missing_file_reads_as_not_gated(self, queue_dir: Path) -> None:
         assert not terminal_gate_mod.already_gated(queue_dir, BLOCK_FILE, "t1")
 
+    def test_a_line_that_is_not_utf8_is_skipped(self, queue_dir: Path) -> None:
+        (queue_dir / BLOCK_FILE).write_bytes(
+            b"\xff{}\n" + json.dumps({"task": "t1", "block_dispatch": True}).encode() + b"\n"
+        )
+        assert terminal_gate_mod.already_gated(queue_dir, BLOCK_FILE, "t1")
+
+    def test_a_path_no_file_can_have_reads_as_not_gated(self, queue_dir: Path) -> None:
+        assert not terminal_gate_mod.already_gated(queue_dir, "needs\x00acquisition.jsonl", "t1")
+
+    def test_a_path_no_file_can_have_is_not_appended_to(self, queue_dir: Path) -> None:
+        """The append fails as an unwritable register does: the run stands,
+        and the task stays ungated."""
+        assert not terminal_gate_mod.ensure_terminal_gate(
+            queue_dir=queue_dir,
+            block_file="needs\x00acquisition.jsonl",
+            task_id="t1",
+            stop_reason="end_turn",
+            deliverable=None,
+        )
+
 
 def _expected_auto_row() -> dict[str, object]:
     """Every field of the row the gate writes for ``_skip_task``, except the

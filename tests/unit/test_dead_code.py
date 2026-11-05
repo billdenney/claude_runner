@@ -61,7 +61,6 @@ VULTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("usage/source.py", "set_readings"): "FakeUsageSource method; tests call it",
     ("observability.py", "_reset_for_tests"): "tests reset logging setup with it",
     ("queue/schema.py", "resumed_from_session"): "RunRecord field, persisted to state YAML",
-    ("queue/schema.py", "killed_by_cap"): "RunRecord field, persisted to state YAML",
     ("queue/schema.py", "skipped_stream_lines"): "RunRecord field, persisted to state YAML",
     ("queue/schema.py", "responded_at"): "SidecarResponse field, persisted to response JSON",
     ("usage/capture.py", "logfile_read"): "set on the pexpect child, which reads it",

@@ -28,6 +28,8 @@ from claude_task_runner.cron.registry import (
 )
 from claude_task_runner.supervisor.pidfile import acquire_global_lock, global_lock_path
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -188,6 +190,7 @@ CORRUPT_PAYLOADS = {
     "configs-not-an-object": '{"queues": ["/q"], "configs": ["/c.toml"]}',
     "config-not-a-string": '{"queues": ["/q"], "configs": {"/q": 7}}',
     "config-not-absolute": '{"queues": ["/q"], "configs": {"/q": "c.toml"}}',
+    "int-past-digit-limit": f'{{"queues": ["/q"], "n": {PAST_DIGIT_LIMIT}}}',
 }
 """Every way a readable ``queues.json`` can fail to hold a registry."""
 
@@ -235,6 +238,33 @@ class TestReadRegisteredQueues:
         backup = path.with_suffix(path.suffix + ".broken")
         assert backup.read_text(encoding="utf-8") == payload
         assert any(str(path) in r.getMessage() for r in caplog.records), caplog.text
+
+    @pytest.mark.parametrize(
+        ("content", "error"),
+        [
+            pytest.param(
+                f'{{"queues": [], "n": {PAST_DIGIT_LIMIT}}}'.encode(),
+                digit_limit_error(),
+                id="int-past-digit-limit",
+            ),
+            pytest.param(
+                b"\xff{}",
+                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+                id="not-utf8",
+            ),
+        ],
+    )
+    def test_a_bare_value_error_from_json_is_a_registry_error(
+        self, content: bytes, error: str
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError; the
+        watchdog's lenient reader catches only RegistryError."""
+        path = queues_registry_path()
+        path.parent.mkdir(parents=True)
+        path.write_bytes(content)
+        with pytest.raises(RegistryError) as raised:
+            read_registered_queues()
+        assert str(raised.value) == f"corrupt queues registry at {path} ({error})"
 
     def test_unreadable_registry_raises(self) -> None:
         """A directory where the file should be: the read fails with an OSError."""

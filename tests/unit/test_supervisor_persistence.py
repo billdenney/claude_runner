@@ -17,6 +17,11 @@ from claude_task_runner.supervisor.persistence import (
 )
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
+NOT_UTF8 = "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+"""What decoding the byte 0xff as UTF-8 says."""
+
 
 @pytest.fixture
 def queue_dir(tmp_path: Path) -> Path:
@@ -99,6 +104,28 @@ class TestErrors:
         path.write_text("{not json")
         with pytest.raises(SupervisorPersistenceError, match="invalid JSON"):
             load(path)
+
+    @pytest.mark.parametrize(
+        ("content", "error"),
+        [
+            pytest.param(
+                f'{{"schema_version": {PAST_DIGIT_LIMIT}}}'.encode(),
+                digit_limit_error(),
+                id="int-past-digit-limit",
+            ),
+            pytest.param(b"\xff{}", NOT_UTF8, id="not-utf8"),
+        ],
+    )
+    def test_load_turns_a_bare_value_error_into_invalid_json(
+        self, queue_dir: Path, content: bytes, error: str
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError; the
+        daemon and the CLI catch only SupervisorPersistenceError."""
+        path = supervisor_state_path(queue_dir)
+        path.write_bytes(content)
+        with pytest.raises(SupervisorPersistenceError) as raised:
+            load(path)
+        assert str(raised.value) == f"{path}: invalid JSON: {error}"
 
     def test_load_non_object_raises(self, queue_dir: Path) -> None:
         path = supervisor_state_path(queue_dir)

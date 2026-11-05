@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from claude_task_runner.config.loader import (
 )
 from claude_task_runner.config.schema import Settings, WorktreeReclaimSettings
 from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
+
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 
 
 class TestDeepMerge:
@@ -88,6 +91,24 @@ class TestLoadSettings:
         toml.write_text("not = valid = toml = at all\n")
         with pytest.raises(ConfigError, match="Invalid TOML"):
             load_settings(toml)
+
+    def test_an_integer_past_the_digit_limit_is_invalid_toml(self, tmp_path: Path) -> None:
+        """tomllib raises a bare ValueError for it, not TOMLDecodeError."""
+        toml = tmp_path / "huge.toml"
+        toml.write_text(f"[session]\nmax_resume_attempts = {PAST_DIGIT_LIMIT}\n")
+        with pytest.raises(ConfigError) as raised:
+            load_settings(toml)
+        assert str(raised.value) == f"Invalid TOML in {toml}: {digit_limit_error()}"
+
+    def test_a_nul_byte_in_the_path_cannot_be_read(self, tmp_path: Path) -> None:
+        """os.open's wording differs by version ("embedded null byte" on
+        3.11.1), so the expected error comes from this interpreter's."""
+        toml = tmp_path / "bad\x00name.toml"
+        with pytest.raises(ValueError) as refused:
+            os.open(toml, os.O_RDONLY)
+        with pytest.raises(ConfigError) as raised:
+            load_settings(toml)
+        assert str(raised.value) == f"Cannot read {toml}: {refused.value}"
 
     def test_unknown_key_rejected(self, tmp_path: Path) -> None:
         toml = tmp_path / "extra.toml"

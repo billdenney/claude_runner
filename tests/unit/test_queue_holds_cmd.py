@@ -22,6 +22,7 @@ import pytest
 
 from claude_task_runner.cli import queue_cmd as queue_cmd_mod
 from claude_task_runner.clock import FakeClock
+from claude_task_runner.queue.schema import Task
 from claude_task_runner.queue.store import (
     load_state,
     queue_runtime_dir,
@@ -809,3 +810,44 @@ def test_a_state_changed_after_the_selection_is_noted_not_raised(
         f"state of {task_id} not read, so not detailed above: {error.splitlines()[0]}"
         for task_id, error in errors.items()
     ]
+
+
+def test_an_eligible_state_torn_after_the_selection_is_noted_not_counted(
+    queue: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between the selection and the read of its status, an eligible task's
+    state stops parsing. The task stays eligible but in no ``by_status``
+    count, and its error is listed with the other states not read."""
+    _config(queue)
+    for task_id in ("fresh", "torn"):
+        add_task(queue, task_id)
+    torn = state_path_for(queue, "torn")
+    real_select = orch_mod._eligible_candidates
+
+    def select_then_tear(*args: object, **kwargs: object) -> list[Task]:
+        eligible = real_select(*args, **kwargs)  # type: ignore[arg-type]
+        torn.write_text("{not: [yaml", encoding="utf-8")
+        return eligible
+
+    monkeypatch.setattr(orch_mod, "_eligible_candidates", select_then_tear)
+
+    add_state(queue, "torn", "failed")
+    holds = _holds(queue)
+    add_state(queue, "torn", "failed")
+    text = invoke_cli(["queue", "holds", "--queue", str(queue)])
+
+    with pytest.raises(ValueError) as exc:
+        load_state(torn)
+    error = str(exc.value)
+    eligible = holds["eligible"]
+    assert isinstance(eligible, dict)
+    assert (eligible["count"], sorted(eligible["task_ids"]), eligible["by_status"]) == (
+        2,
+        ["fresh", "torn"],
+        {"new": 1},
+    )
+    assert holds["unread_states"] == [{"task_id": "torn", "error": error}]
+    assert text.exit_code == 0, text.output
+    lines = text.stdout.splitlines()
+    assert "  torn (state not read; no account now)" in lines
+    assert f"state of torn not read, so not detailed above: {error.splitlines()[0]}" in lines

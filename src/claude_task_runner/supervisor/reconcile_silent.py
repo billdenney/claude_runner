@@ -187,15 +187,18 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 from claude_task_runner import process_signals
 from claude_task_runner.clock import Clock, TimestampOutOfRange, utc_from_timestamp
 from claude_task_runner.config.schema import TaskCapsSettings
+from claude_task_runner.file_mtime import file_mtime_utc
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import TaskState
 from claude_task_runner.queue.store import (
     list_state_files,
@@ -371,8 +374,15 @@ headroom for nested R/Python subpackages while keeping the worst-case
 walk bounded even on a pathological tree."""
 
 
+_FUTURE_MTIME_SLACK = timedelta(seconds=60)
+"""How far after ``now`` an mtime may lie and still count as a sign of life.
+No write comes from the future, but a file written while a reaper pass runs
+is dated after the ``now`` the pass took when it started."""
+
+
 def _latest_mtime_in_tree(
     root: Path,
+    now: datetime,
     *,
     max_depth: int = _FS_WALK_MAX_DEPTH,
     skip_names: frozenset[str] = _FS_WALK_SKIP_NAMES,
@@ -390,6 +400,15 @@ def _latest_mtime_in_tree(
     Failures (permission errors, lost symlink targets, races against
     file deletion) are swallowed silently — the caller should treat
     ``None`` as "no observable activity" and proceed accordingly.
+
+    An entry whose mtime :func:`_mtime_problem` rejects at ``now`` is left
+    out: one no datetime can hold would, as the maximum, hide every other
+    file's activity, and one dated after now would keep a hung task looking
+    alive until that date. A directory left out is still walked. For each
+    kind of problem, one WARNING per walk counts the entries no walk in
+    this process has reported before
+    (:func:`~claude_task_runner.once.first_time`) and names one, so each
+    path and mtime is reported once per process.
     """
     try:
         if not root.exists() or not root.is_dir():
@@ -398,6 +417,8 @@ def _latest_mtime_in_tree(
         return None
 
     latest: float | None = None
+    unreported: Counter[str] = Counter()
+    examples: dict[str, str] = {}
 
     def _walk(current: Path, depth: int) -> None:
         nonlocal latest
@@ -417,13 +438,43 @@ def _latest_mtime_in_tree(
             except OSError:
                 continue
             mtime = stat.st_mtime
-            if latest is None or mtime > latest:
+            problem = _mtime_problem(mtime, now)
+            if problem is not None:
+                if first_time("reaper_walk", entry.path, mtime):
+                    unreported[problem] += 1
+                    examples.setdefault(problem, entry.path)
+            elif latest is None or mtime > latest:
                 latest = mtime
             if entry.is_dir(follow_symlinks=False):
                 _walk(Path(entry.path), depth + 1)
 
     _walk(root, depth=0)
+    for problem, count in unreported.items():
+        logger.warning(
+            "silent-orphan reaper: leaving out %d file(s) under %s %s, e.g. %s; "
+            "each such file is reported once",
+            count,
+            root,
+            problem,
+            examples[problem],
+        )
     return latest
+
+
+def _mtime_problem(mtime: float, now: datetime) -> str | None:
+    """Why ``mtime`` cannot date a sign of life at ``now``, or ``None`` when it can.
+
+    No datetime can hold it (past year 9999, which tmpfs stores as given),
+    or it lies more than :data:`_FUTURE_MTIME_SLACK` after ``now``: a bogus
+    touch or a clock step, which proves nothing about the worker.
+    """
+    try:
+        at = utc_from_timestamp(mtime)
+    except TimestampOutOfRange:
+        return "whose mtime no datetime can hold"
+    if at - now > _FUTURE_MTIME_SLACK:
+        return "dated after now"
+    return None
 
 
 _BASH_POLL_ANTIPATTERN_RE = re.compile(
@@ -744,7 +795,7 @@ def reconcile_silent_orphans(
     *,
     settings: TaskCapsSettings,
     clock: Clock,
-    fs_mtime_fn: Callable[[Path], float | None] | None = None,
+    fs_mtime_fn: Callable[[Path, datetime], float | None] | None = None,
     stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
     terminate_fn: Callable[[int], bool] | None = None,
     worker_probe_fn: Callable[[TaskState], WorkerProbe] | None = None,
@@ -827,7 +878,7 @@ def reap_silent_orphans_tick(
     *,
     settings: TaskCapsSettings,
     clock: Clock,
-    fs_mtime_fn: Callable[[Path], float | None] | None = None,
+    fs_mtime_fn: Callable[[Path, datetime], float | None] | None = None,
     stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None] | None = None,
     terminate_fn: Callable[[int], bool] | None = None,
     worker_probe_fn: Callable[[TaskState], WorkerProbe] | None = None,
@@ -952,8 +1003,9 @@ class _Liveness:
         )
 
 
-def _read_liveness(state: TaskState) -> _Liveness | None:
-    """``state``'s liveness timestamps, or ``None`` without a recorded start."""
+def _read_liveness(state: TaskState, now: datetime) -> _Liveness | None:
+    """``state``'s liveness timestamps at ``now``, or ``None`` without a
+    recorded start."""
     started_at = state.last_started_at
     if started_at is None:
         return None
@@ -965,33 +1017,35 @@ def _read_liveness(state: TaskState) -> _Liveness | None:
         started_at=started_at,
         agent_heartbeat_at=_this_attempt(state.last_heartbeat_at),
         monitor_at=_this_attempt(state.dispatcher_alive_at),
-        log_written_at=_this_attempt(_log_written_at(state)),
+        log_written_at=_this_attempt(_log_written_at(state, now)),
     )
 
 
-def _log_written_at(state: TaskState) -> datetime | None:
+def _log_written_at(state: TaskState, now: datetime) -> datetime | None:
     """When the worker last wrote its stream log, or ``None`` with no log.
 
-    Also ``None``, with a WARNING, for an mtime no datetime can hold (past
-    year 9999, which tmpfs stores as given): that is no sign of life.
+    Also ``None``, with a WARNING the first time, for an mtime no datetime
+    can hold (past year 9999, which tmpfs stores as given) or one dated more
+    than :data:`_FUTURE_MTIME_SLACK` after ``now``: neither is a sign of
+    life.
     """
     if state.log_path is None:
         return None
-    try:
-        mtime = os.stat(state.log_path).st_mtime
-    except OSError:
-        return None
-    try:
-        return utc_from_timestamp(mtime)
-    except TimestampOutOfRange as exc:
+    consequence = (
+        f"the silent-orphan reaper does not count it as a sign of life for {state.task_id}"
+    )
+    written_at = file_mtime_utc(state.log_path, consequence=consequence)
+    if written_at is None or written_at - now <= _FUTURE_MTIME_SLACK:
+        return written_at
+    if first_time("future_log_mtime", state.log_path, written_at):
         logger.warning(
-            "silent-orphan reaper: %s: worker log %s has an mtime out of range (%s); "
-            "not counting it as a sign of life",
-            state.task_id,
+            "%s is dated %s, after now (%s); %s",
             state.log_path,
-            exc,
+            written_at.isoformat(),
+            now.isoformat(),
+            consequence,
         )
-        return None
+    return None
 
 
 def _sign_of_life_fresh(liveness: _Liveness, settings: TaskCapsSettings, now: datetime) -> bool:
@@ -1016,7 +1070,7 @@ def liveness_verdict(
     filesystem activity has that activity's time as its heartbeat, and is
     HEALTHY here only if it is within ``heartbeat_silence_alert_s``.
     """
-    liveness = _read_liveness(state)
+    liveness = _read_liveness(state, now)
     if liveness is None:
         return None
     if _sign_of_life_fresh(liveness, settings, now):
@@ -1041,7 +1095,7 @@ def _classify_and_act(
     silent_stop_reason: str,
     kill_error_prefix: str,
     recheck_running_before_write: bool,
-    fs_mtime_fn: Callable[[Path], float | None],
+    fs_mtime_fn: Callable[[Path, datetime], float | None],
     stuck_loop_detect_fn: Callable[[int], tuple[int, str] | None],
     terminate_fn: Callable[[int], bool],
     worker_probe_fn: Callable[[TaskState], WorkerProbe],
@@ -1098,7 +1152,7 @@ def _classify_and_act(
     # A running state without a recorded start is anomalous; leave it for
     # reconcile_orphans's broad demotion sweep (the startup case) or the
     # orchestrator's natural reap (the per-tick case).
-    liveness = _read_liveness(state)
+    liveness = _read_liveness(state, now)
     if liveness is None:
         return None
     started_at = liveness.started_at
@@ -1311,7 +1365,7 @@ def _maybe_refresh_from_filesystem(
     state: TaskState,
     settings: TaskCapsSettings,
     now: datetime,
-    fs_mtime_fn: Callable[[Path], float | None],
+    fs_mtime_fn: Callable[[Path, datetime], float | None],
     require_recheck: bool,
 ) -> bool:
     """If ``state``'s working_dir has been touched recently, refresh
@@ -1351,7 +1405,7 @@ def _maybe_refresh_from_filesystem(
         return False
 
     try:
-        latest_mtime = fs_mtime_fn(working_dir)
+        latest_mtime = fs_mtime_fn(working_dir, now)
     except Exception as exc:
         logger.warning(
             "silent-orphan reaper: %s: fs_mtime_fn raised %s; skipping FS check",
@@ -1367,22 +1421,22 @@ def _maybe_refresh_from_filesystem(
     if fs_silence_s > settings.zombie_verify_fs_activity_window_s:
         return False
 
+    # The default walk leaves out an mtime no datetime can hold and one
+    # dated after now; an injected fs_mtime_fn is held to the same rule,
+    # since either would date the refreshed heartbeat wrongly.
+    problem = _mtime_problem(latest_mtime, now)
+    if problem is not None:
+        logger.warning(
+            "silent-orphan reaper: %s: the newest file under %s is one %s; skipping FS check",
+            state.task_id,
+            working_dir,
+            problem,
+        )
+        return False
     # FS-confirmed activity. Refresh last_heartbeat_at from the mtime
     # so the next reaper pass measures silence from the most-recent
     # confirmed activity (NOT from the prior stale stream-json event).
-    try:
-        mtime_dt = utc_from_timestamp(latest_mtime)
-    except TimestampOutOfRange as exc:
-        # An mtime no datetime can hold (past year 9999, say) is no
-        # evidence of activity: act on the heartbeat verdict instead.
-        logger.warning(
-            "silent-orphan reaper: %s: newest file mtime under %s is out of range (%s); "
-            "skipping FS check",
-            state.task_id,
-            working_dir,
-            exc,
-        )
-        return False
+    mtime_dt = utc_from_timestamp(latest_mtime)
     refreshed = state.model_copy(update={"last_heartbeat_at": mtime_dt})
 
     outcome = _demote_if_still_running(state_path, refreshed, require_recheck=require_recheck)

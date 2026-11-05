@@ -31,11 +31,16 @@ from claude_task_runner.config.schema import (
     AccountPolicy,
     ResolvedAccount,
 )
+from claude_task_runner.queue.schema import Task, TaskState
 from claude_task_runner.queue.store import (
+    QueueSchemaError,
+    load_state,
     queue_runtime_dir,
     state_path_for,
     task_path_for,
     todo_dir,
+    write_state_atomic,
+    write_task_atomic,
 )
 from claude_task_runner.runner import orchestrator as orchestrator_mod
 from claude_task_runner.runner.in_flight import DispatchSlot
@@ -636,3 +641,35 @@ def test_supervisor_logs_a_drained_queue_once(
     assert _idle_lines(caplog) == [
         (logging.INFO, "no eligible tasks: 1 unfinished held (depends_on 1)")
     ]
+
+
+def test_preview_reports_a_state_unreadable_since_the_selector_read_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preview reloads each eligible task's state for its status. One
+    rewritten unreadable after the selector read it has no status: the
+    task stays eligible and its error is reported, rather than failing
+    the preview."""
+    qd = tmp_path / "q"
+    qd.mkdir()
+    queue_runtime_dir(qd)
+    for task_id in ("t1", "t2"):
+        write_task_atomic(Task(id=task_id, title="t", prompt="p"), task_path_for(qd, task_id))
+    torn = state_path_for(qd, "t1")
+    write_state_atomic(TaskState(task_id="t1", status="failed"), torn)
+    real_select = orchestrator_mod._eligible_candidates
+
+    def _select_then_tear(*args: Any, **kwargs: Any) -> list[Task]:
+        eligible = real_select(*args, **kwargs)
+        torn.write_text("{not: [yaml", encoding="utf-8")
+        return eligible
+
+    monkeypatch.setattr(orchestrator_mod, "_eligible_candidates", _select_then_tear)
+
+    preview = orchestrator_mod.preview_selection(qd, load_settings(None), snapshot=None, now=NOW)
+
+    with pytest.raises(QueueSchemaError) as unread:
+        load_state(torn)
+    assert sorted(t.id for t in preview.eligible) == ["t1", "t2"]
+    assert preview.eligible_statuses == {"t2": "new"}
+    assert preview.unread_states == {"t1": str(unread.value)}

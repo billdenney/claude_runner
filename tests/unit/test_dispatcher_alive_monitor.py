@@ -17,6 +17,8 @@ import itertools
 import time
 from datetime import UTC, datetime
 
+import pytest
+
 from claude_task_runner.clock import RealClock
 from claude_task_runner.runner.dispatcher import _DispatcherAliveMonitor
 
@@ -94,6 +96,31 @@ def test_stop_idempotent_and_joins_quickly() -> None:
     # is already joined).
     monitor.stop()
     assert len(persists) >= 1
+
+
+def test_stop_after_a_start_whose_thread_could_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``start()`` makes its first write, then raises when its thread cannot
+    start; ``stop()`` then has no thread to join and returns."""
+    persists: list[datetime] = []
+    monitor = _DispatcherAliveMonitor(
+        persist_fn=persists.append,
+        clock=RealClock(),
+        interval_s=60.0,
+        task_id="t-alive-unstarted",
+    )
+
+    def _cannot_start() -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(monitor._thread, "start", _cannot_start)
+
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        monitor.start()
+    monitor.stop()
+
+    assert len(persists) == 1
 
 
 def test_persist_failure_does_not_crash_thread() -> None:

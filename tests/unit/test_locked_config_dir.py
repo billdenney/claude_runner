@@ -86,8 +86,13 @@ def test_the_api_source_reports_missing_credentials(config_dir: Path) -> None:
     assert str(excinfo.value) == f"could not read {creds}: {DENIED}: '{creds}'"
 
 
-def test_whoami_reads_no_credentials(config_dir: Path) -> None:
-    assert read_credentials(str(config_dir)) == {}
+def test_whoami_reads_no_credentials(config_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    creds = config_dir / ".credentials.json"
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.usage.whoami"):
+        assert read_credentials(str(config_dir)) == {}
+    assert [r.getMessage() for r in caplog.records] == [
+        f"could not read {creds}: {DENIED}: '{creds}'; reporting no credentials"
+    ]
 
 
 def test_claude_init_leaves_it_alone(config_dir: Path, tmp_path: Path) -> None:

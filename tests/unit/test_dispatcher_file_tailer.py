@@ -211,3 +211,50 @@ def test_missing_file_polled_until_producer_dies(tmp_path: Path) -> None:
     lines = list(tail_lines(log, alive=lambda: alive["v"], sleep_fn=sleep_fn))
     assert lines == []
     assert sleeps["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Ticks: a None after tick_s of polls with no line (ADR-0037)
+# ---------------------------------------------------------------------------
+
+
+def test_a_tick_comes_after_tick_s_of_polls_with_no_line() -> None:
+    """With poll_interval_s 0.1 and tick_s 0.3, a tick follows three quiet
+    polls; a line starts the count again."""
+    fake = _FakeFile()
+    fake.content = "a\n"
+    polls = {"n": 0}
+
+    def sleep_fn(_s: float) -> None:
+        polls["n"] += 1
+        if polls["n"] == 5:
+            fake.append("b\n")
+        if polls["n"] == 9:
+            fake.alive = False
+
+    items = _drain(
+        tail_lines(
+            Path("x"),
+            alive=fake.is_alive,
+            poll_interval_s=0.1,
+            sleep_fn=sleep_fn,
+            read_fn=fake.read,
+            tick_s=0.3,
+        )
+    )
+
+    assert items == ["a\n", None, "b\n", None]
+
+
+def test_no_tick_without_tick_s() -> None:
+    fake = _FakeFile()
+    polls = {"n": 0}
+
+    def sleep_fn(_s: float) -> None:
+        polls["n"] += 1
+        if polls["n"] == 50:
+            fake.alive = False
+
+    items = _drain(tail_lines(Path("x"), alive=fake.is_alive, sleep_fn=sleep_fn, read_fn=fake.read))
+
+    assert items == []
