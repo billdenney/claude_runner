@@ -21,7 +21,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from claude_task_runner.runner.dispatcher import tail_lines
+import pytest
+
+from claude_task_runner.runner.dispatcher import _log_backlog, tail_lines
 
 
 class _FakeFile:
@@ -258,3 +260,71 @@ def test_no_tick_without_tick_s() -> None:
     items = _drain(tail_lines(Path("x"), alive=fake.is_alive, sleep_fn=sleep_fn, read_fn=fake.read))
 
     assert items == []
+
+
+# ---------------------------------------------------------------------------
+# An adopted worker's log so far (_log_backlog), and the tailer after it
+# ---------------------------------------------------------------------------
+
+
+def _tail_from(log: Path, offset: int) -> list[str | None]:
+    return list(tail_lines(log, alive=lambda: False, sleep_fn=lambda _s: None, start_offset=offset))
+
+
+def test_the_tailer_starts_at_start_offset(tmp_path: Path) -> None:
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_bytes(b"x\ny\nz\n")
+
+    assert _tail_from(log, 2) == ["y\n", "z\n"]
+
+
+def test_the_backlog_is_the_complete_lines_and_the_offset_past_them(tmp_path: Path) -> None:
+    """A last line without its newline is left for the tailer, which reads
+    it from the offset once its newline comes."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_bytes(b'{"a":1}\n{"b":2}\n{"c":')
+
+    backlog, end = _log_backlog(log)
+
+    assert (backlog, end) == ([b'{"a":1}\n', b'{"b":2}\n'], 16)
+    with log.open("ab") as handle:
+        handle.write(b"3}\n")
+    assert _tail_from(log, end) == ['{"c":3}\n']
+
+
+def test_a_backlog_line_ends_at_a_newline_only(tmp_path: Path) -> None:
+    """A JSON string may hold a raw U+2028, which ``str.splitlines`` would
+    split at, and bytes that are not UTF-8 stay as they are."""
+    log = tmp_path / "attempt-1.stream.jsonl"
+    line = '{"text":"a\u2028b"}\n'.encode()
+    log.write_bytes(line + b"\xff\xfe\n")
+
+    assert _log_backlog(log) == ([line, b"\xff\xfe\n"], len(line) + 3)
+
+
+@pytest.mark.parametrize("content", [b"", b'{"c":'], ids=["empty", "no-newline-yet"])
+def test_a_log_with_no_complete_line_has_no_backlog(tmp_path: Path, content: bytes) -> None:
+    log = tmp_path / "attempt-1.stream.jsonl"
+    log.write_bytes(content)
+
+    assert _log_backlog(log) == ([], 0)
+
+
+def test_a_missing_log_has_no_backlog(tmp_path: Path) -> None:
+    assert _log_backlog(tmp_path / "missing.stream.jsonl") == ([], 0)
+
+
+def test_a_log_that_cannot_be_read_has_no_backlog(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The tailer then reads it from the start, as it did before backlogs."""
+    log = tmp_path / "a-directory"
+    log.mkdir()
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.runner.dispatcher"):
+        assert _log_backlog(log) == ([], 0)
+
+    assert [r.getMessage() for r in caplog.records] == [
+        f"could not read {log} before tailing it ([Errno 21] Is a directory: '{log}'); "
+        "tailing it from the start"
+    ]

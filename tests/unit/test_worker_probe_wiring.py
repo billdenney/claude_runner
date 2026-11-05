@@ -267,12 +267,14 @@ def test_adoption_monitor_does_not_signal_a_pid_that_changed_hands(
 ) -> None:
     """A cap is breached on the first event, by which time the pid has gone
     to another process: the monitor's terminate checks again and signals
-    nothing. The first probe is the tailer's, before it reads the log."""
+    nothing. The log's lines so far are read without a probe, so the
+    terminate's is the first."""
     state = _seed(queue_dir, "t-cap", lines=[_INIT, _INIT])
-    answers = [WorkerProbe.ALIVE]
+    probes: list[WorkerProbe] = []
 
     def probe(_state: TaskState, _queue_dir: Path) -> WorkerProbe:
-        return answers.pop(0) if answers else WorkerProbe.REUSED
+        probes.append(WorkerProbe.REUSED)
+        return WorkerProbe.REUSED
 
     monkeypatch.setattr(dispatcher_mod, "probe_recorded_worker", probe)
     signalled: list[tuple[int, int]] = []
@@ -299,6 +301,7 @@ def test_adoption_monitor_does_not_signal_a_pid_that_changed_hands(
     )
 
     assert signalled == []
+    assert probes == [WorkerProbe.REUSED]  # the terminate's, and no other
     assert outcome.run_record.killed_by_cap == "duration"
 
 
