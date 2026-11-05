@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 import typer
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from claude_task_runner.cli import app as cli_app
 from claude_task_runner.cli.usage_cmd import _bar, _default_captures_dir, app
@@ -24,6 +24,7 @@ from claude_task_runner.usage.drift import (
     UsageCaptureSpawnError,
     UsageCaptureTimeout,
 )
+from claude_task_runner.usage.models import UsageReading, WindowReading
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "usage"
 
@@ -508,3 +509,83 @@ def test_whoami_account_classes(runner: CliRunner) -> None:
             result = runner.invoke(app, ["whoami", "--quick"])
         assert result.exit_code == 0, f"snap={snap}"
         assert expect in result.stdout, f"snap={snap}, stdout={result.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# A reading with no 5-hour window (ADR-0038). The TTY parser always reports
+# both windows, so these patch the parser; the CLI must still show the
+# missing window as "not reported" or null, never as 0%.
+# ---------------------------------------------------------------------------
+
+
+def _weekly_only_reading() -> UsageReading:
+    return UsageReading(
+        captured_at=datetime(2026, 10, 31, 1, 10, tzinfo=UTC),
+        five_hour=None,
+        seven_day=WindowReading(
+            utilization_pct=12,
+            resets_at_raw="1794394800",
+            resets_at=datetime(2026, 11, 11, 11, 0, tzinfo=UTC),
+        ),
+    )
+
+
+def _invoke_weekly_only(runner: CliRunner, tmp_path: Path, *args: str) -> Result:
+    with (
+        patch(
+            "claude_task_runner.cli.usage_cmd.capture_mod.capture",
+            return_value=(b"", tmp_path / "fake.cap"),
+        ),
+        patch(
+            "claude_task_runner.cli.usage_cmd.parser_mod.parse",
+            return_value=_weekly_only_reading(),
+        ),
+    ):
+        return runner.invoke(app, list(args))
+
+
+def test_render_shows_a_missing_5h_window_as_not_reported(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    result = _invoke_weekly_only(runner, tmp_path, "render")
+    assert result.exit_code == 0, result.stdout
+    lines = result.stdout.splitlines()
+    assert "  5-hour session   not reported" in lines
+    assert f"  7-day weekly     {_bar(12)}  12%" in lines
+    assert "Resets 1794394800" in result.stdout
+    assert "0%" not in result.stdout.replace("12%", "")
+
+
+def test_json_gives_a_missing_5h_window_as_null(runner: CliRunner, tmp_path: Path) -> None:
+    result = _invoke_weekly_only(runner, tmp_path, "json")
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["five_hour"] is None
+    assert payload["seven_day"] == {
+        "utilization": 12,
+        "resets_at_raw": "1794394800",
+        "resets_at": "2026-11-11T11:00:00+00:00",
+    }
+    assert payload["extra_windows"] == []
+
+
+def test_healthcheck_passes_a_reading_with_no_5h_window(runner: CliRunner, tmp_path: Path) -> None:
+    """No 5h reset to fail to parse, so no WARN."""
+    result = _invoke_weekly_only(runner, tmp_path, "healthcheck")
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout.strip() == "PASS 5h=not reported weekly=12%"
+
+
+def test_parse_file_gives_a_missing_5h_window_as_null(
+    runner: CliRunner, fixture_path: Path
+) -> None:
+    with patch(
+        "claude_task_runner.cli.usage_cmd.parser_mod.parse",
+        return_value=_weekly_only_reading(),
+    ):
+        result = runner.invoke(app, ["parse-file", str(fixture_path)])
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == {
+        "five_hour": None,
+        "seven_day": {"utilization": 12, "resets_at_raw": "1794394800"},
+    }

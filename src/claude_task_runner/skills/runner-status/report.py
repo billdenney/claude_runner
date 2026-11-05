@@ -443,6 +443,12 @@ def _them(n: int) -> str:
     return "it" if n == 1 else "them"
 
 
+def _util(value: object) -> str:
+    """A utilization from supervisor.json. ``null`` is a 5-hour window the
+    account's last reading did not report, which is not 0% (ADR-0038)."""
+    return "not reported" if value is None else f"{value}%"
+
+
 def held_words(name: str, n: int) -> str:
     """``n`` tasks held by category ``name``, in plain words."""
     if name.startswith("readiness_"):
@@ -1213,12 +1219,12 @@ def supervisor_json_section(facts: Facts) -> str:
     saved = facts.saved_at.strftime("%Y-%m-%dT%H:%M:%SZ") if facts.saved_at else "?"
     fields = [
         ("state", d.get("state")),
-        ("5h util", f"{d.get('last_5h_util_pct', '?')}%"),
+        ("5h util", _util(d.get("last_5h_util_pct", "?"))),
         ("weekly util", f"{d.get('last_weekly_util_pct', '?')}%"),
         ("in_flight", len(d.get("in_flight") or [])),
         ("since", d.get("since", "?")),
         ("scheduled_wakeup", d.get("scheduled_wakeup_at", "-")),
-        ("5h reset_at", d.get("last_5h_reset_at", "?")),
+        ("5h reset_at", d.get("last_5h_reset_at", "?") or "—"),
         ("weekly reset_at", d.get("last_weekly_reset_at", "?")),
         ("drift", d.get("last_drift_message", "") or "-"),
         ("last saved", saved),
@@ -1229,7 +1235,9 @@ def supervisor_json_section(facts: Facts) -> str:
         "_The supervisor's own record, rewritten every time it checks the queue (each poll "
         "interval), so `last saved` shows whether it is still working. `state` is its overall "
         "mode; `5h util` and `weekly util` are how much of the 5-hour and weekly usage "
-        "allowance is used; `in_flight` counts tasks running now; `scheduled_wakeup` is when "
+        'allowance is used (`not reported`, with `5h reset_at` "—", when the account has '
+        "no 5-hour window); "
+        "`in_flight` counts tasks running now; `scheduled_wakeup` is when "
         "it next re-checks a throttled account, not when that account resumes; times are UTC._",
         "",
         "| field | value |",
@@ -1332,8 +1340,9 @@ def per_account_section(facts: Facts) -> str:
         "throttled_weekly waits until its weekly use falls back under plan, no_reading and "
         "error_drift take none until a reading arrives. `in-flight` is how many tasks the "
         "account is running now; `target` (the throttle target) is how many the throttle lets "
-        'it run, "—" when no reading has set one; `wakeup` is when the supervisor re-checks; '
-        "times are UTC._",
+        'it run, "—" when no reading has set one; `5h` is "not reported" and `5h reset` "—" '
+        "for an account whose reading has no 5-hour window; `wakeup` is when the supervisor "
+        "re-checks; times are UTC._",
         "",
         "| account | state | 5h | weekly | paused | in-flight | target | "
         "5h reset | weekly reset | wakeup | last capture |",
@@ -1345,12 +1354,12 @@ def per_account_section(facts: Facts) -> str:
         target = a.get("target_concurrency")
         out.append(
             f"| {name} | `{a.get('state', '?')}` "
-            f"| {a.get('last_5h_util_pct', '?')}% "
+            f"| {_util(a.get('last_5h_util_pct', '?'))} "
             f"| {a.get('last_weekly_util_pct', '?')}% "
             f"| {'yes' if is_paused else ''} "
             f"| {in_flight_by_account.get(name, 0)} "
             f"| {'—' if target is None else target} "
-            f"| {a.get('last_5h_reset_at', '—')} "
+            f"| {a.get('last_5h_reset_at') or '—'} "
             f"| {a.get('last_weekly_reset_at', '—')} "
             f"| {a.get('scheduled_wakeup_at') or '—'} "
             f"| {a.get('last_capture_at') or '—'} |"

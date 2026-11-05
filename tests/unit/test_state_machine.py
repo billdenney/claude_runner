@@ -141,14 +141,19 @@ def usage_settings(_base_settings) -> UsageSettings:
 
 def _reading(
     *,
-    five_pct: int,
+    five_pct: int | None,
     weekly_pct: int,
     five_resets: datetime | None = None,
     weekly_resets: datetime | None = None,
 ) -> UsageReading:
+    """``five_pct=None`` is a reading with no 5-hour window."""
     return UsageReading(
         captured_at=datetime(2026, 5, 4, 12, 0, tzinfo=UTC),
-        five_hour=WindowReading(utilization_pct=five_pct, resets_at_raw="x", resets_at=five_resets),
+        five_hour=(
+            None
+            if five_pct is None
+            else WindowReading(utilization_pct=five_pct, resets_at_raw="x", resets_at=five_resets)
+        ),
         seven_day=WindowReading(
             utilization_pct=weekly_pct, resets_at_raw="x", resets_at=weekly_resets
         ),
@@ -477,6 +482,170 @@ class TestThrottledWeekly:
             clock,
         )
         assert new.state is SupervisorState.DISPATCHING
+
+
+class TestNoFiveHourWindow:
+    """A reading with no 5-hour window (ADR-0038). The weekly trace and the
+    policy's caps decide; the snapshot records ``None`` for the 5h fields,
+    replacing whatever an earlier reading left there."""
+
+    @staticmethod
+    def _weekly_only(clock: FakeClock, weekly_pct: int) -> UsageReading:
+        # Half-way through the week: the default curve's target is ~39.4%.
+        return _reading(
+            five_pct=None,
+            weekly_pct=weekly_pct,
+            weekly_resets=clock.now() + timedelta(seconds=SEVEN_DAYS_S / 2),
+        )
+
+    @staticmethod
+    def _had_a_5h_window() -> SupervisorSnapshot:
+        return _initial(SupervisorState.DISPATCHING).model_copy(
+            update={
+                "last_5h_util_pct": 37,
+                "last_5h_reset_at": datetime(2026, 5, 4, 13, 0, tzinfo=UTC),
+            }
+        )
+
+    def test_weekly_under_target_dispatches(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        snap = _initial(SupervisorState.NO_READING)
+        new, actions = step(
+            _input(
+                snap,
+                self._weekly_only(clock, 12),
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=3,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.DISPATCHING
+        assert new.target_concurrency == 5
+        assert new.scheduled_wakeup_at is None
+        assert new.last_5h_util_pct is None
+        assert new.last_5h_reset_at is None
+        assert new.last_weekly_util_pct == 12
+        assert new.last_reading_at == clock.now()
+        assert StopDispatch not in _action_types(actions)
+        transitions = [
+            a.payload
+            for a in actions
+            if isinstance(a, EmitEvent) and a.event_type == "state_transition"
+        ]
+        assert transitions == [
+            {"from": "no_reading", "to": "dispatching", "five_hour_util": None, "weekly_util": 12}
+        ]
+
+    def test_weekly_over_target_throttles_weekly(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        new, actions = step(
+            _input(
+                _initial(SupervisorState.DISPATCHING),
+                self._weekly_only(clock, 45),
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=3,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.THROTTLED_WEEKLY
+        assert new.target_concurrency == 0
+        assert new.last_5h_util_pct is None
+        # The catch-up time, unclamped: 72h before the reset (see test_decision).
+        catch_up = clock.now() + timedelta(seconds=SEVEN_DAYS_S / 2) - timedelta(hours=72)
+        assert new.scheduled_wakeup_at == catch_up
+        assert ScheduleWakeupAt(when=catch_up) in actions
+        assert StopDispatch in _action_types(actions)
+
+    def test_replaces_an_earlier_5h_window(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        """The last 5h utilization and reset do not outlive the window."""
+        new, _ = step(
+            _input(
+                self._had_a_5h_window(),
+                self._weekly_only(clock, 12),
+                policy,
+                supervisor_settings,
+                usage_settings,
+                pending=3,
+            ),
+            clock,
+        )
+        assert new.last_5h_util_pct is None
+        assert new.last_5h_reset_at is None
+
+    def test_idle_records_null_5h(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        new, actions = step(
+            _input(
+                self._had_a_5h_window(),
+                self._weekly_only(clock, 12),
+                policy,
+                supervisor_settings,
+                usage_settings,
+            ),
+            clock,
+        )
+        assert new.state is SupervisorState.IDLE
+        assert new.target_concurrency == 5
+        assert new.last_5h_util_pct is None
+        assert new.last_5h_reset_at is None
+        transition = next(
+            a for a in actions if isinstance(a, EmitEvent) and a.event_type == "state_transition"
+        )
+        assert transition.payload["five_hour_util"] is None
+
+    def test_drift_recovery_counts_weekly_only_readings_as_clean(
+        self,
+        policy: ResolvedPolicy,
+        clock: FakeClock,
+        supervisor_settings: SupervisorSettings,
+        usage_settings: UsageSettings,
+    ) -> None:
+        snap = self._had_a_5h_window().model_copy(
+            update={"state": SupervisorState.ERROR_DRIFT, "consecutive_clean_polls": 0}
+        )
+        reading = self._weekly_only(clock, 12)
+        needed = usage_settings.drift_recovery_clean_polls
+        for clean in range(1, needed):
+            snap, _ = step(
+                _input(snap, reading, policy, supervisor_settings, usage_settings, pending=2),
+                clock,
+            )
+            assert snap.state is SupervisorState.ERROR_DRIFT
+            assert snap.consecutive_clean_polls == clean
+            assert snap.last_5h_util_pct is None
+            assert snap.last_5h_reset_at is None
+            assert snap.last_weekly_util_pct == 12
+        snap, _ = step(
+            _input(snap, reading, policy, supervisor_settings, usage_settings, pending=2),
+            clock,
+        )
+        assert snap.state is SupervisorState.DISPATCHING
+        assert snap.consecutive_clean_polls == 0
 
 
 # ----------------------------------------------------------------------------

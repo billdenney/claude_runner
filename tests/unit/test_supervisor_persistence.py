@@ -240,7 +240,7 @@ class TestMigrationV3ToV4:
         path = self._write_v3(queue_dir, v2)
         snap = load(path)
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.state is SupervisorState.NO_READING
         assert snap.accounts["default"].state is SupervisorState.NO_READING
 
@@ -282,7 +282,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.state is SupervisorState.NO_READING
         assert snap.accounts["a"].state is SupervisorState.NO_READING
         # Other states, their wakeups and in-flight tasks are untouched.
@@ -300,7 +300,7 @@ class TestMigrationV4ToV5:
         }
         snap = load(self._write(queue_dir, v4))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.state is SupervisorState.THROTTLED_5H
         assert snap.scheduled_wakeup_at == datetime(2026, 9, 25, 17, 5, tzinfo=UTC)
 
@@ -310,7 +310,7 @@ class TestMigrationV4ToV5:
         v3 = {"schema_version": 3, "state": "stopped", "since": "2026-09-25T12:00:00+00:00"}
         snap = load(self._write(queue_dir, v3))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.state is SupervisorState.NO_READING
 
     def test_malformed_account_entry_still_fails_loud(self, queue_dir: Path) -> None:
@@ -354,7 +354,7 @@ class TestMigrationV5ToV6:
         }
         snap = load(self._write(queue_dir, v5))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.target_concurrency is None
         assert snap.accounts["a"].target_concurrency is None
         # Nothing else changes meaning, so nothing else is rewritten.
@@ -396,10 +396,10 @@ class TestMigrationV5ToV6:
         with pytest.raises(SupervisorPersistenceError, match="target_concurrency"):
             load(self._write(queue_dir, v6))
 
-    def test_written_snapshot_is_v8(self, queue_dir: Path) -> None:
+    def test_written_snapshot_is_v9(self, queue_dir: Path) -> None:
         path = supervisor_state_path(queue_dir)
         write_atomic(initial_snapshot(since=datetime(2026, 9, 25, 12, 0, tzinfo=UTC)), path)
-        assert json.loads(path.read_text())["schema_version"] == 8
+        assert json.loads(path.read_text())["schema_version"] == 9
 
 
 class TestMigrationV6ToV7:
@@ -440,7 +440,7 @@ class TestMigrationV6ToV7:
         v6 = {"schema_version": 6, **entry, "accounts": {"a": dict(entry)}}
         snap = load(self._write(queue_dir, v6))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         rewritten = loaded_state is SupervisorState.NO_READING
         for view in (snap, snap.accounts["a"]):
             assert view.state is loaded_state
@@ -503,7 +503,7 @@ class TestMigrationV6ToV7:
         }
         snap = load(self._write(queue_dir, v5))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.state is SupervisorState.THROTTLED_WEEKLY
         for name in ("personal", "work"):
             loaded = snap.accounts[name]
@@ -567,7 +567,7 @@ class TestMigrationV7ToV8:
         v7 = {"schema_version": 7, **entry, "accounts": {"a": dict(entry)}}
         snap = load(self._write(queue_dir, v7))
         assert snap is not None
-        assert snap.schema_version == 8
+        assert snap.schema_version == 9
         assert snap.accounts["a"].policy_error is None
         assert snap.accounts["a"].state is SupervisorState.DISPATCHING
         assert snap.accounts["a"].target_concurrency == 3
@@ -586,3 +586,74 @@ class TestMigrationV7ToV8:
         assert loaded is not None
         assert loaded.accounts["a"].policy_error == error
         assert json.loads(path.read_text())["accounts"]["a"]["policy_error"] == error
+
+
+class TestMigrationV8ToV9:
+    """v9 lets ``last_5h_util_pct`` be ``null``, for an account whose reading
+    reports no 5-hour window (ADR-0038); a v8 file needs no rewrite."""
+
+    def _write(self, queue_dir: Path, payload: dict) -> Path:
+        path = supervisor_state_path(queue_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_v8_loads_with_its_5h_utilization_unchanged(self, queue_dir: Path) -> None:
+        entry = {
+            "state": "dispatching",
+            "since": "2026-10-30T12:00:00+00:00",
+            "last_5h_util_pct": 37,
+            "last_5h_reset_at": "2026-10-30T15:00:00+00:00",
+            "last_weekly_util_pct": 12,
+            "target_concurrency": 3,
+            "last_reading_at": "2026-10-30T12:00:00+00:00",
+        }
+        v8 = {"schema_version": 8, **entry, "accounts": {"a": dict(entry)}}
+        snap = load(self._write(queue_dir, v8))
+        assert snap is not None
+        assert snap.schema_version == 9
+        assert snap.last_5h_util_pct == 37
+        assert snap.accounts["a"].last_5h_util_pct == 37
+        assert snap.accounts["a"].last_5h_reset_at == datetime(2026, 10, 30, 15, 0, tzinfo=UTC)
+        assert snap.accounts["a"].last_weekly_util_pct == 12
+        assert snap.accounts["a"].state is SupervisorState.DISPATCHING
+        assert snap.accounts["a"].target_concurrency == 3
+
+    def test_no_5h_window_round_trips_as_null(self, queue_dir: Path) -> None:
+        path = supervisor_state_path(queue_dir)
+        snap = initial_snapshot(since=datetime(2026, 10, 31, tzinfo=UTC), account_names=["a"])
+        no_5h = {"last_5h_util_pct": None, "last_5h_reset_at": None, "last_weekly_util_pct": 12}
+        snap = snap.model_copy(
+            update={**no_5h, "accounts": {"a": snap.accounts["a"].model_copy(update=no_5h)}}
+        )
+        write_atomic(snap, path)
+        on_disk = json.loads(path.read_text())
+        assert on_disk["last_5h_util_pct"] is None
+        assert on_disk["accounts"]["a"]["last_5h_util_pct"] is None
+        assert on_disk["accounts"]["a"]["last_5h_reset_at"] is None
+        loaded = load(path)
+        assert loaded is not None
+        assert loaded.last_5h_util_pct is None
+        assert loaded.accounts["a"].last_5h_util_pct is None
+        assert loaded.accounts["a"].last_5h_reset_at is None
+        assert loaded.accounts["a"].last_weekly_util_pct == 12
+
+    @pytest.mark.parametrize("value", [-1, 101, "high"])
+    def test_a_5h_utilization_outside_the_range_still_fails_loud(
+        self, queue_dir: Path, value: object
+    ) -> None:
+        """Only ``null`` is newly valid; the 0-100 bounds still hold."""
+        v9 = {
+            "schema_version": 9,
+            "state": "idle",
+            "since": "2026-10-31T12:00:00+00:00",
+            "accounts": {
+                "a": {
+                    "state": "idle",
+                    "since": "2026-10-31T12:00:00+00:00",
+                    "last_5h_util_pct": value,
+                }
+            },
+        }
+        with pytest.raises(SupervisorPersistenceError, match="last_5h_util_pct"):
+            load(self._write(queue_dir, v9))

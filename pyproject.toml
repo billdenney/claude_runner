@@ -84,10 +84,14 @@ select = [
     "UP",  # pyupgrade
     "SIM", # flake8-simplify
     "RUF", # ruff-specific
+    "TID251", # banned imports (see banned-api below)
 ]
 ignore = [
     "E501",  # line length handled by formatter
 ]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"click".msg = "click is not a declared dependency, and typer 0.27+ does not install it; use typer and typer.testing (CliRunner, Result)."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B011"]  # asserts in tests are fine
