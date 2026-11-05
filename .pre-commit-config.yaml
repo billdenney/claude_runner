@@ -14,12 +14,11 @@
 #   pre-commit run --all-files
 #
 # The hooks below mirror the GitHub Actions CI lint steps so anything
-# green here is green in CI. Keep the ruff revision in sync with the
-# ``ruff>=...`` pin in pyproject.toml's [project.optional-dependencies]
-# dev extras.
+# green here is green in CI. The ruff revision must equal the ruff pin in
+# .github/ci-constraints.txt (tests/unit/test_ci_constraints.py checks it).
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.17.4
     hooks:
       - id: ruff
         name: ruff check (lint)

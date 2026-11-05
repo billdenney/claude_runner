@@ -1,6 +1,6 @@
 """CI's version pins agree with the dev extras, and every CI install uses them.
 
-``.github/ci-constraints.txt`` pins mypy and types-PyYAML to exact versions
+``.github/ci-constraints.txt`` pins ruff, mypy and types-PyYAML to exact versions
 for CI's ``pip install -e '.[dev]' -c .github/ci-constraints.txt``. A pin
 below a floor in ``pyproject.toml``'s dev extras would make that install
 fail, and an install step without ``-c`` would take whatever was released
@@ -23,7 +23,8 @@ CONSTRAINTS = REPO_ROOT / ".github" / "ci-constraints.txt"
 CONSTRAINTS_ARG = ".github/ci-constraints.txt"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 STORE = REPO_ROOT / "src" / "claude_task_runner" / "queue" / "store.py"
-PINNED = ("mypy", "types-pyyaml")
+PINNED = ("mypy", "ruff", "types-pyyaml")
+PRE_COMMIT = REPO_ROOT / ".pre-commit-config.yaml"
 
 _PIN = re.compile(r"^([A-Za-z0-9_.\-]+)==([0-9][0-9.]*)$")
 _FLOOR = re.compile(r"^([A-Za-z0-9_.\-]+)>=([0-9][0-9.]*)$")
@@ -170,8 +171,16 @@ def _shell_blocks(markdown: str) -> list[str]:
     return re.findall(r"^```(?:sh|bash|shell)\n(.*?)^```", markdown, re.MULTILINE | re.DOTALL)
 
 
-def test_mypy_and_its_yaml_stubs_are_pinned() -> None:
+def test_ruff_mypy_and_its_yaml_stubs_are_pinned() -> None:
     assert sorted(_pins()) == list(PINNED)
+
+
+def test_the_pre_commit_ruff_is_the_pinned_ruff() -> None:
+    """The ruff hook runs its own ruff release, named by its ``rev``; any other
+    release than CI's can pass a commit that CI then fails, or the reverse."""
+    config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
+    revs = [repo["rev"] for repo in config["repos"] if repo["repo"].endswith("/ruff-pre-commit")]
+    assert revs == [f"v{_pins()['ruff']}"]
 
 
 def test_every_pin_meets_the_dev_extras_floor() -> None:
