@@ -90,12 +90,15 @@ pre-commit run --all-files
 ```
 
 CI installs the dev extras with `-c .github/ci-constraints.txt`, as above,
-which pins mypy and types-PyYAML to exact versions, so a new release of
-either cannot fail CI, or make a local `mypy src` disagree with it, without
-a change in this repository. To move to newer ones, set the new versions
-there, install them locally with
-`pip install -c .github/ci-constraints.txt mypy types-PyYAML`, and run
-`mypy src`; fix what it reports in the same pull request. Bump them when a
+which pins ruff, mypy and types-PyYAML to exact versions, so a new release
+of any of them cannot fail CI, or make a local `ruff check` or `mypy src`
+disagree with it, without a change in this repository. To move to newer
+ones, set the new versions there, install them locally with
+`pip install -c .github/ci-constraints.txt ruff mypy types-PyYAML`, and run
+the pipeline below; fix what it reports in the same pull request. A new
+ruff version also goes into `.pre-commit-config.yaml`'s ruff `rev` and the
+`ruff>=` floor in `pyproject.toml`'s dev extras, so the hooks run the same
+ruff as CI. Bump them when a
 release is wanted, or when the floors in `pyproject.toml`'s dev extras rise
 above the pins.
 
