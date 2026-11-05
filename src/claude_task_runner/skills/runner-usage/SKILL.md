@@ -21,8 +21,9 @@ For "what's my usage?" / "/runner-usage" prompts:
 
 1. Run `claude-task-runner usage render`. This spawns `claude /usage`
    under pyte, parses the rendered TUI, and prints a colored block
-   with both windows + any per-model extra windows the plan exposes
-   (e.g. "7-day Sonnet only").
+   with the 5-hour and 7-day windows + any per-model extra windows the
+   plan exposes (e.g. "7-day Fable"). A plan with no 5-hour window
+   shows "not reported" for it (ADR-0040).
 
 2. Report the output as-is. The colors carry meaning (green < 70%,
    yellow 70-90%, red >= 90%) so don't paraphrase; show the rendered
@@ -85,6 +86,10 @@ work whoami`), and without it the command stops with a usage error
   `[[accounts]]`, the legacy `[claude].config_dir` does (empty means
   `~/.claude`); once `[[accounts]]` is declared, `[claude].config_dir`
   is ignored.
-- `[usage].capture_post_data_pad_ms` (default 4000) is how long we
-  wait after the placeholder for the OAuth response to land. If the
-  user reports stale numbers, suggest bumping this.
+- `[usage].capture_usage_timeout_s` (default 15) bounds the wait for
+  the `/usage` panel to finish its own fetch: its `Refreshing…` line
+  gone and its closing line `Esc to cancel` alone. A capture that times
+  out names what the panel still showed.
+- `[usage].capture_post_data_pad_ms` (default 4000) is how long the
+  capture keeps reading after that; the screen after it is read when it
+  still shows every section.

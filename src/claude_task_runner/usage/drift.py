@@ -28,10 +28,12 @@ class UsageFormatDrift(ValueError):
 
 
 class UsageCaptureTimeout(RuntimeError):
-    """`claude /usage` did not render both Resets lines within the timeout.
+    """`claude /usage` did not draw a complete panel within the timeout.
 
-    This is NOT format drift — the TUI structure may be unchanged but the
-    OAuth API was slow, or `claude` was unresponsive.
+    Also raised when ``claude`` exits before then, and when the panel says
+    its fetch failed (it offers a retry). This is NOT format drift — the
+    TUI structure may be unchanged but the OAuth API was slow or refused
+    the fetch, or `claude` was unresponsive.
     """
 
 
