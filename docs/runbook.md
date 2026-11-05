@@ -28,6 +28,20 @@ header naming a 5-hour window, only windows the source knows, and a
 representative claim of another window (`seven_day`) is not drift: it
 reads as an account with no 5-hour window (ADR-0038).
 
+The TTY parser's message `5-hour usage block not found, and the panel does
+not show that no 5-hour window applies: ...` is the same rule on the
+`/usage` screen (ADR-0040). A complete panel with a `Current week (all
+models)` section, no `Current session` heading anywhere, and every `NN%
+used` gauge under a `Current week (...)` or credit heading reads as an
+account with no 5-hour window. The message lists each check that failed:
+a panel that is not complete, whose fetch failed, or that was dismissed; a
+5-hour heading without its percentage and reset; or gauges under headings
+that name no known window, which is how a renamed session section shows. A
+forensics `.cap` holds the capture's cleanup too, whose render keeps only
+the panel's lower rows, so `parse-file` on one reports `the panel was
+dismissed` for a panel without a session section; the bytes `usage capture
+--save` writes stop before the cleanup.
+
 **Steps:**
 1. Get the raw output. With the TTY usage source, the capture that failed
    to parse is already on disk as the newest
@@ -68,6 +82,14 @@ the usage source, so an account added that way is never read. With
 (`<config_dir>/oauth-token`, ADR-0021) is read through the API alone, the
 only account of a one-account queue included: a revoked token shows as
 failed readings rather than falling back to `claude /usage`.
+
+A TTY capture waits for the `/usage` panel to finish its own fetch
+(ADR-0040). `the /usage panel was not complete within <n>s: it still shows
+'Refreshing…'` means the fetch did not land within
+`[usage].capture_usage_timeout_s`; `the /usage panel could not refresh its
+numbers: '<line>'` means the panel reported the fetch failed (the line is
+its own message, such as `Could not refresh usage data`), and the next
+capture tries again.
 
 **Steps:**
 1. Set `[logging].level = "DEBUG"` and look for `usage_capture_error`

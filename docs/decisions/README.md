@@ -47,6 +47,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0037 | A silent worker meets its time caps on a tick, and a future mtime is no sign of life | accepted | 2026-10-30 |
 | 0038 | A usage reading may have no 5-hour window | accepted | 2026-11-05 |
 | 0039 | The TTY usage capture reads the plan login, from the rendered screen | accepted | 2026-11-05 |
+| 0040 | The TTY capture waits for the complete `/usage` panel, which may have no 5-hour window | accepted | 2026-11-05 |
 
 ## Template
 
