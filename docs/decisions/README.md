@@ -44,6 +44,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0034 | Reclaim the worktrees of finished tasks | accepted | 2026-09-25 |
 | 0035 | Per-account caps are the only concurrency limit by default | accepted | 2026-10-15 |
 | 0036 | A `depends_on` id that names no task is a loud hold, not a wait | accepted | 2026-10-23 |
+| 0038 | A usage reading may have no 5-hour window | accepted | 2026-11-05 |
 
 ## Template
 

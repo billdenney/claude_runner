@@ -17,7 +17,15 @@ drift log.
 
 **Causes:** Anthropic changed the `/usage` TUI layout. Most common forms:
 field rename (`Resets` → `Resets at`), new section added, ANSI escape
-sequence variant.
+sequence variant. A message naming `rate-limit headers` comes from the
+API source, which an account reads alone under `[usage].source = "api"`,
+or under `"api_then_tty"` with a long-lived token; otherwise the API
+source's failure is an INFO `falling through to TTY` log line. It means a
+7d header is missing, only one of the two 5h headers came back, or a
+response without the 5h pair named a window the source does not know
+(`_KNOWN_WINDOWS` in `usage/api_source.py`). A response with the 7d pair
+and no 5h headers at all is not drift: it reads as an account with no
+5-hour window (ADR-0038).
 
 **Steps:**
 1. Get the raw output. With the TTY usage source, the capture that failed
