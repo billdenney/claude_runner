@@ -4,13 +4,12 @@ An ``OSError`` escaping ``capture()`` used to escape the supervisor's
 ``safe_poll`` too and end the supervisor loop. Creating the captures
 directory and spawning ``claude`` now raise :class:`UsageCaptureSpawnError`,
 which the tick skips; a ``.cap`` that cannot be written costs only the
-forensics file, not the reading.
+forensics file, not the reading; that case runs through the capture's
+start-up screens in test_capture_tui.py.
 """
 
 from __future__ import annotations
 
-import io
-import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,36 +25,6 @@ from claude_task_runner.usage import capture as capture_mod
 from claude_task_runner.usage.drift import UsageCaptureSpawnError
 
 NOW = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
-FIXTURE = Path(__file__).parent.parent / "fixtures" / "usage" / "synthetic_normal.cap"
-CAPTURE_LOGGER = "claude_task_runner.usage.capture"
-
-
-class _FakeChild:
-    """A ``claude`` whose TUI is ready at once and shows a recorded ``/usage``.
-
-    The whole recording reaches ``logfile_read`` on the first ``expect``, as
-    pexpect would copy it while matching ``shortcuts``.
-    """
-
-    def __init__(self, raw: bytes) -> None:
-        self._raw = raw
-        self._answers = iter([3, 0, 0, 0])  # shortcuts, Resets, Resets, EOF
-        self.logfile_read: io.BytesIO | None = None
-
-    def expect(self, *args: Any, **kwargs: Any) -> int:
-        if self._raw and self.logfile_read is not None:
-            self.logfile_read.write(self._raw)
-            self._raw = b""
-        return next(self._answers)
-
-    def send(self, data: bytes) -> None:
-        pass
-
-    def sendline(self, data: str) -> None:
-        pass
-
-    def isalive(self) -> bool:
-        return False
 
 
 @pytest.fixture
@@ -110,32 +79,3 @@ def test_a_claude_that_cannot_be_spawned(
         capture_mod.capture(settings, FakeClock(NOW), captures_dir=tmp_path / "caps")
     assert str(caught.value) == f"cannot start claude: {shown}"
     assert caught.value.__cause__ is error
-
-
-def test_a_written_capture_returns_its_path(settings: UsageSettings, tmp_path: Path) -> None:
-    raw = FIXTURE.read_bytes()
-    captures_dir = tmp_path / "caps"
-    with patch.object(capture_mod.pexpect, "spawn", return_value=_FakeChild(raw)):
-        got, path = capture_mod.capture(settings, FakeClock(NOW), captures_dir=captures_dir)
-    assert got == raw
-    assert path == captures_dir / "20261029T120000Z.cap"
-    assert path.read_bytes() == raw
-
-
-def test_a_capture_file_that_cannot_be_written_keeps_the_reading(
-    settings: UsageSettings, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    raw = FIXTURE.read_bytes()
-    captures_dir = tmp_path / "caps"
-    cap = captures_dir / "20261029T120000Z.cap"
-    with (
-        patch.object(capture_mod.pexpect, "spawn", return_value=_FakeChild(raw)),
-        patch.object(Path, "write_bytes", side_effect=OSError(28, "No space left on device")),
-        caplog.at_level(logging.WARNING, logger=CAPTURE_LOGGER),
-    ):
-        got, path = capture_mod.capture(settings, FakeClock(NOW), captures_dir=captures_dir)
-    assert (got, path) == (raw, None)
-    assert not cap.exists()
-    assert [r.getMessage() for r in caplog.records if r.name == CAPTURE_LOGGER] == [
-        f"usage capture: cannot write the forensics file {cap}: [Errno 28] No space left on device"
-    ]

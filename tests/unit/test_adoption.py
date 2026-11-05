@@ -177,6 +177,42 @@ def test_adopts_healthy_live_filebacked_worker(
     assert "100-healthy" in stub_worker
 
 
+def test_adoption_hands_its_park_callback_to_the_monitor(
+    queue_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adopted worker's monitor parks a worker it cannot stop after its
+    loop failed, and reports that park through the callback adoption got."""
+    log = _make_log(queue_dir, "100-healthy")
+    _seed_running(
+        queue_dir,
+        "100-healthy",
+        pid=4321,
+        log_path=log,
+        started_at=_NOW - timedelta(seconds=120),
+        last_heartbeat_at=_NOW - timedelta(seconds=10),
+    )
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        dispatcher_mod, "adopt_worker", lambda *, on_park, **_kw: callbacks.append(on_park)
+    )
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: True)
+
+    def _on_park(_state: TaskState, _why: str) -> None:
+        raise AssertionError("not called here")
+
+    slots: dict[str, DispatchSlot] = {}
+    adopt_running_workers(
+        queue_dir,
+        settings=_settings(),
+        clock=FakeClock(_NOW),
+        in_flight_slots=slots,
+        on_park=_on_park,
+    )
+    slots["100-healthy"].thread.join(timeout=10)
+
+    assert callbacks == [_on_park]
+
+
 def test_dead_pid_not_adopted(queue_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A running task whose pid is gone is NOT adopted (left for the
     demotion sweep)."""

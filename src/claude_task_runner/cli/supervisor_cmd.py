@@ -51,6 +51,7 @@ from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 from claude_task_runner.usage.api_source import ApiUsageSource
+from claude_task_runner.usage.models import utilization_text
 from claude_task_runner.usage.source import (
     ApiThenTtyUsageSource,
     ClaudeUsageSource,
@@ -143,9 +144,9 @@ def _build_per_account_source(
         long_lived = False
 
     if mode == "tty":
-        # Long-lived bearer + tty-only source: still build the TTY
-        # source; the CLI will pick up CLAUDE_CODE_OAUTH_TOKEN at
-        # spawn time (PR 14 dispatcher change). No composite to undo.
+        # The TTY capture reads the account's claude.ai login whether or
+        # not a long-lived token exists; without that login it fails with
+        # UsageCaptureLoginRequired (ADR-0039). No composite to undo.
         return _build_tty_source(settings, queue_path, config_dir=config_dir)
     if mode == "api":
         return _build_api_source(settings, config_dir=config_dir)
@@ -668,7 +669,7 @@ def status(
         console.print(
             literal(
                 styled("5h util:", "bold"),
-                f"          {snapshot.last_5h_util_pct}%   ",
+                f"          {utilization_text(snapshot.last_5h_util_pct)}   ",
                 styled("Weekly util:", "bold"),
                 f" {snapshot.last_weekly_util_pct}%",
             )

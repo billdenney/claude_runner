@@ -62,6 +62,7 @@ from claude_task_runner.supervisor.states import (
 from claude_task_runner.throttle.decision import weekly_catch_up
 from claude_task_runner.throttle.policy import ResolvedPolicy, resolve
 from claude_task_runner.usage.drift import usage_error_kind
+from claude_task_runner.usage.models import NOT_REPORTED
 
 app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
 
@@ -114,6 +115,8 @@ def _state_fields(
     return {
         "state": state.state.value if state is not None else None,
         "paused": name in paused,
+        # None for an account with no state, and for one whose last reading
+        # reported no 5-hour window (ADR-0038); ``state`` tells them apart.
         "last_5h_util_pct": state.last_5h_util_pct if state is not None else None,
         "last_weekly_util_pct": state.last_weekly_util_pct if state is not None else None,
         "in_flight_count": in_flight_count,
@@ -304,7 +307,14 @@ def _print_account(
     """The human-readable lines of one ``account list`` row."""
     paused_tag = styled(" (paused)", "yellow") if row["paused"] else ""
     state_str = row["state"] or "—"
-    util_5h_s = f"{row['last_5h_util_pct']}%" if row["state"] is not None else "—"
+    util_5h = row["last_5h_util_pct"]
+    if row["state"] is None:
+        util_5h_s = "—"
+    elif util_5h is None:
+        # The account's last reading reported no 5-hour window.
+        util_5h_s = NOT_REPORTED
+    else:
+        util_5h_s = f"{util_5h}%"
     util_w_s = f"{row['last_weekly_util_pct']}%" if row["state"] is not None else "—"
     console.print(literal(styled(decl.name, "bold"), paused_tag))
     console.print(literal("  config_dir:      ", decl.config_dir or "(default ~/.claude)"))

@@ -407,13 +407,17 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
             candidates.append(path)
 
     offenders: list[str] = []
+    unread = 0
     for path in candidates:
         try:
             with path.open("rb") as fh:
                 payload = tomllib.load(fh)
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError):
-            # check_account_policies reports a file that does not load;
-            # only the legacy throttle key matters here.
+        except (OSError, ValueError):
+            # check_account_policies reports a file that does not load: the
+            # ValueError is TOMLDecodeError, UnicodeDecodeError, or the bare
+            # one tomllib raises for an integer past the digit limit. Only
+            # the legacy throttle key matters here.
+            unread += 1
             continue
         if "throttle" in payload:
             offenders.append(str(path))
@@ -430,10 +434,13 @@ def check_dispatch_pct_legacy(settings: Settings, queue_dir: Path) -> CheckResul
                 "and docs/cheatsheet.md#migration-from-throttle."
             ),
         )
+    detail = f"no legacy [throttle.*] blocks across {len(candidates) - unread} TOML(s)"
+    if unread:
+        detail += f"; {unread} that did not load left out (account_policies reports them)"
     return CheckResult(
         name="dispatch_pct_legacy",
         status=CheckStatus.PASS,
-        detail=f"no legacy [throttle.*] blocks across {len(candidates)} TOML(s)",
+        detail=detail,
     )
 
 
@@ -1187,8 +1194,9 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
       them; the runner will fall back to TTY in ``api_then_tty`` mode
       but ``api``-only configurations would stop working).
 
-    Reports the resolved 5h / weekly utilization per account so the
-    operator can compare against ``claude /usage`` and confirm the
+    Reports the resolved 5h / weekly utilization per account (5h "not
+    reported" for an account the API gives no 5-hour window, ADR-0038)
+    so the operator can compare against ``claude /usage`` and confirm the
     API path is trustworthy before flipping ``[usage].source`` to
     ``"api_then_tty"``.
     """
@@ -1202,6 +1210,7 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
         UsageApiHeaderMissing,
         UsageApiNetworkError,
     )
+    from claude_task_runner.usage.models import utilization_text
 
     if not settings.accounts:
         return CheckResult(
@@ -1236,11 +1245,13 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
         except UsageApiNetworkError as exc:
             failures.append(f"{acct.name}: network ({exc})")
             continue
+        five_h_resets = (
+            f"5h resets {reading.five_hour.resets_at}, " if reading.five_hour is not None else ""
+        )
         rows.append(
-            f"{acct.name}: 5h={reading.five_hour.utilization_pct}% "
+            f"{acct.name}: 5h={utilization_text(reading.five_hour_util_pct)} "
             f"weekly={reading.seven_day.utilization_pct}% "
-            f"(5h resets {reading.five_hour.resets_at}, "
-            f"weekly resets {reading.seven_day.resets_at})"
+            f"({five_h_resets}weekly resets {reading.seven_day.resets_at})"
         )
 
     if failures:
@@ -1254,6 +1265,95 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
         name="api_usage_source",
         status=CheckStatus.PASS,
         detail="API readings: " + "; ".join(rows),
+    )
+
+
+def _systemd_watchdog_result(settings: Settings, queue_dir: Path) -> CheckResult:
+    """PASS only when the installed unit runs this queue's supervisor, its
+    command's binary is there, and it is what ``install`` would write now.
+
+    The unit is compared with one built from the queue's current settings
+    around the unit's own ``ExecStart``, so a ``--config`` given to
+    ``install`` is kept; what differs is a setting changed since the
+    install (``[watchdog]``, ``[task_caps]``, ``[supervisor].adopt_workers``)
+    or a unit an older ``install`` wrote. Drop-ins from ``systemctl --user
+    edit`` live in another file and are not read."""
+    unit_path = systemd_mod.systemd_unit_path()
+    queue = queue_dir.resolve()
+    install = f"`claude-task-runner install --queue {queue}`"
+    reinstall = f"Re-run {install}."
+    try:
+        text = unit_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit {unit_path} cannot be read: {exc}",
+            remediation=f"Fix its permissions, or re-run {install}.",
+        )
+    exec_start = systemd_mod.unit_exec_start(text)
+    unit_queue = systemd_mod.unit_queue(text)
+    if exec_start is None or unit_queue is None:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit {unit_path} has no ExecStart or no WorkingDirectory",
+            remediation=reinstall,
+        )
+    if unit_queue.resolve() != queue:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} runs the supervisor for {unit_queue}, not this "
+                "queue, so nothing restarts this queue's supervisor"
+            ),
+            remediation=f"To run this queue's supervisor instead, re-run {install}.",
+        )
+    exe = exec_start.split(maxsplit=1)[0]
+    if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} starts {exe}, which is not an executable file, "
+                "so the unit cannot start the supervisor"
+            ),
+            remediation=reinstall,
+        )
+    try:
+        expected = systemd_mod.build_unit_text(
+            supervisor_command=exec_start,
+            queue_dir=unit_queue,
+            watchdog=settings.watchdog,
+            task_caps=settings.task_caps,
+            adopt_workers=settings.supervisor.adopt_workers,
+        )
+    except systemd_mod.UnitSettingError as exc:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=f"systemd unit detected, but the queue's settings cannot be written to one: {exc}",
+            remediation="Fix the setting named above, then re-run `claude-task-runner install`.",
+        )
+    changed = systemd_mod.changed_directives(text, expected)
+    if changed:
+        return CheckResult(
+            name="watchdog_installed",
+            status=CheckStatus.WARN,
+            detail=(
+                f"systemd unit {unit_path} differs from what install would write now for this "
+                f"queue's settings: {', '.join(changed)}"
+            ),
+            remediation=(
+                f"{reinstall} If doctor read another claude_runner.toml than the unit's "
+                "--config, run doctor with that --config."
+            ),
+        )
+    return CheckResult(
+        name="watchdog_installed",
+        status=CheckStatus.PASS,
+        detail=f"systemd unit runs this queue's supervisor and matches its settings ({unit_path})",
     )
 
 
@@ -1357,11 +1457,7 @@ def check_watchdog_installed(settings: Settings, queue_dir: Path) -> CheckResult
         logger.debug("unexpected error probing crontab: %s", exc)
 
     if systemd_present:
-        return CheckResult(
-            name="watchdog_installed",
-            status=CheckStatus.PASS,
-            detail="systemd watchdog detected",
-        )
+        return _systemd_watchdog_result(settings, queue_dir)
     if cron_present:
         return _cron_watchdog_result(queue_dir)
 

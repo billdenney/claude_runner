@@ -17,7 +17,9 @@ Dispatch gates on that per-account state.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -31,7 +33,12 @@ from claude_task_runner.config.schema import (
 )
 from claude_task_runner.supervisor.actions import Notify
 from claude_task_runner.supervisor.daemon import TickContext, run_one_tick
-from claude_task_runner.supervisor.persistence import initial_snapshot
+from claude_task_runner.supervisor.persistence import (
+    initial_snapshot,
+    load,
+    supervisor_state_path,
+    write_atomic,
+)
 from claude_task_runner.supervisor.states import (
     AccountState,
     SupervisorSnapshot,
@@ -610,3 +617,51 @@ def test_unnamed_reading_with_several_accounts_updates_only_the_top_level(
     assert new_snap.state is SupervisorState.DISPATCHING
     assert new_snap.target_concurrency == target
     assert new_snap.accounts == snap.accounts
+
+
+def test_weekly_only_reading_dispatches_and_persists_a_null_5h(tmp_path: Path) -> None:
+    """An account the API reports no 5-hour window for (ADR-0038) takes tasks
+    on its weekly reading, and supervisor.json records null for its 5h
+    fields, replacing the 0 it held; the other account is untouched."""
+    clock = FakeClock(start=datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC))
+    snap = _snapshot_with_two_accounts()
+    work_before = snap.accounts["work"]
+    reading = UsageReading(
+        captured_at=clock.now(),
+        five_hour=None,
+        seven_day=WindowReading(
+            utilization_pct=12,
+            resets_at_raw="1779753600",
+            # Half-way through the week: the curve's target is ~39%.
+            resets_at=datetime(2026, 5, 26, tzinfo=UTC),
+        ),
+        account="personal",
+    )
+
+    new_snap, _ = run_one_tick(
+        snap,
+        TickContext(
+            settings=_utc_settings(),
+            poll_result=reading,
+            pending_count=3,
+            in_flight_count=0,
+            account_policies=_POLICIES_5_AND_1,
+        ),
+        clock,
+    )
+
+    personal = new_snap.accounts["personal"]
+    assert personal.state is SupervisorState.DISPATCHING
+    assert personal.target_concurrency == 5
+    assert personal.last_5h_util_pct is None
+    assert personal.last_5h_reset_at is None
+    assert personal.last_weekly_util_pct == 12
+    assert personal.last_weekly_reset_at == datetime(2026, 5, 26, tzinfo=UTC)
+    assert new_snap.accounts["work"] == work_before
+
+    path = supervisor_state_path(tmp_path)
+    write_atomic(new_snap, path)
+    assert json.loads(path.read_text())["accounts"]["personal"]["last_5h_util_pct"] is None
+    loaded = load(path)
+    assert loaded is not None
+    assert loaded.accounts["personal"] == personal

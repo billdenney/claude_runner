@@ -49,6 +49,8 @@ from claude_task_runner.runner.dispatcher import (
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
 
+from ._worker_streams import empty_stdout
+
 DISPATCHER_LOGGER = "claude_task_runner.runner.dispatcher"
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 COOLDOWN_S = 60.0
@@ -63,15 +65,20 @@ class _FakePopen:
 
     def __init__(self, argv: list[str], *args: object, **kwargs: object) -> None:
         type(self).started.append({"argv": list(argv), **kwargs})
-        self.returncode = 0
-        self.stdout = iter([])
+        # None until reaped, as on Popen: the dispatcher reads it to tell a
+        # worker it has already reaped.
+        self.returncode: int | None = None
+        self.stdout = empty_stdout()
         self.stderr = None
         self.pid = 4242
 
     def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.stdout.close()
+        self.returncode = 0
         return ("", "")
 
     def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0
         return 0
 
     def terminate(self) -> None:
@@ -81,6 +88,7 @@ class _FakePopen:
         pass
 
     def poll(self) -> int | None:
+        self.returncode = 0
         return 0
 
 
@@ -604,3 +612,72 @@ def test_a_fixed_config_dir_runs_the_task_after_the_cooldown(
     assert len(after.runs) == 1
     assert after.status != "deferred"
     assert [started["env"]["CLAUDE_CONFIG_DIR"] for started in _FakePopen.started] == [str(mount)]
+
+
+# ---------------------------------------------------------------------------
+# A dispatch ends the deferral
+# ---------------------------------------------------------------------------
+
+DEFERRED = PRIOR.model_copy(
+    update={
+        "status": "deferred",
+        "deferral_count": 3,
+        "deferred_reason": "cannot start the worker: CLAUDE_CONFIG_DIR does not exist: /mnt/x",
+        "next_eligible_at": NOW - timedelta(seconds=1),
+        "stop_reason": UNSTARTABLE_STOP_REASON,
+    }
+)
+"""A task parked three times in a row, whose cooldown has passed."""
+
+
+@pytest.fixture
+def written_states(monkeypatch: pytest.MonkeyPatch) -> list[TaskState]:
+    """Every state the dispatcher writes, in order."""
+    states: list[TaskState] = []
+    real = dispatcher_mod.write_state_atomic
+
+    def record(state: TaskState, path: Path) -> None:
+        states.append(state)
+        real(state, path)
+
+    monkeypatch.setattr(dispatcher_mod, "write_state_atomic", record)
+    return states
+
+
+@pytest.mark.usefixtures("home")
+def test_a_dispatch_clears_the_deferral(
+    queue_dir: Path, config_dir: Path, written_states: list[TaskState]
+) -> None:
+    """``deferral_count`` counts deferrals in a row, so the ``running`` write
+    resets it, and the reason and retry time of a deferral that has ended
+    leave the state with it."""
+    with _which("claude"), patch("subprocess.Popen", _FakePopen):
+        outcome = _dispatch(queue_dir, _task(), claude_config_dir=str(config_dir), state=DEFERRED)
+    running = written_states[0]
+    assert running.status == "running"
+    for state in (running, outcome.new_state, load_state(state_path_for(queue_dir, "t1"))):
+        assert (state.deferral_count, state.deferred_reason, state.next_eligible_at) == (
+            0,
+            None,
+            None,
+        )
+
+
+@pytest.mark.usefixtures("home")
+def test_a_worker_that_fails_to_start_after_the_running_write_counts_on(
+    tmp_path: Path, queue_dir: Path, config_dir: Path, written_states: list[TaskState]
+) -> None:
+    """The deferral replaces the ``running`` write and is made from the state
+    before it, so a fourth deferral in a row is counted as the fourth."""
+    missing = tmp_path / "worktree-not-created"
+    with _which("claude"):
+        outcome = _dispatch(
+            queue_dir, _task(missing), claude_config_dir=str(config_dir), state=DEFERRED
+        )
+    assert [s.status for s in written_states] == ["running", "deferred"]
+    assert written_states[0].deferral_count == 0
+    assert outcome.new_state.deferral_count == 4
+    assert outcome.new_state.deferred_reason == (
+        f"cannot start the worker: [Errno 2] No such file or directory: '{missing}'"
+    )
+    assert outcome.new_state.next_eligible_at == NOW + timedelta(seconds=COOLDOWN_S)

@@ -56,7 +56,12 @@ introduces a new on-disk file MUST update this document in the same PR.
    heartbeat does not count `tool_progress`, so it stands still through a
    long tool call; the silent-orphan reaper and startup adoption also count
    the monitor's `dispatcher_alive_at` and the worker's writes to its stream
-   log (`supervisor.reconcile_silent.liveness_verdict`).
+   log (`supervisor.reconcile_silent.liveness_verdict`). The loader
+   rejects an alert window under two monitor ticks
+   (`dispatcher_alive_write_interval_s`), and a kill threshold under two
+   heartbeat writes (`heartbeat_persist_interval_s`): the reaper measures
+   each against a timestamp written once an interval, which a working task
+   keeps under two intervals old.
 6. If task hits a sidecar question: writes
    `<queue>/.claude_task_runner/sidecar/<id>/request-NNN.json`, transitions
    task to `awaiting_sidecar`. The request stays open until **every**
@@ -112,6 +117,13 @@ all I/O happens in `supervisor/daemon.py` based on the action list.
    `fivehr_stop_pct`; classify into `Dispatching`, `SlowingDown`,
    or `Throttled5h`. The linear concurrency ramp shape is unchanged
    from ADR-0004.
+
+A reading with no 5-hour window (`reading.five_hour is None`: the API
+reports only the windows that apply to the account) skips step 2, so the
+weekly check alone decides between `ThrottledWeekly` and `Dispatching`,
+and a weekly wakeup is not clamped to a 5h reset. `supervisor.json` then
+holds `null` for the account's `last_5h_util_pct` and `last_5h_reset_at`,
+and status output says "not reported" (ADR-0038).
 
 ### How the decision gates dispatch
 
@@ -296,8 +308,10 @@ There is no separate drift log. Parser drift leaves three pieces of evidence:
 - The supervisor log has one `notify[error]: parser drift: ...` line from the
   tick that entered `ErrorDrift`.
 - With the TTY usage source, the capture that failed to parse is the newest
-  `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. The API source writes
-  no `.cap`, and neither does a capture that times out or cannot spawn.
+  `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. A TTY capture that
+  fails after `claude` started (a timeout, no claude.ai login) leaves its
+  `.cap` there too. The API source writes no `.cap`, and neither does a
+  capture that cannot spawn `claude`.
 
 ## Key invariants
 

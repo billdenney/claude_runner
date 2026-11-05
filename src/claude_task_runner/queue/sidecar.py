@@ -102,13 +102,7 @@ def write_response(queue_dir: Path, response: SidecarResponse) -> Path:
 
 
 def read_request(path: Path) -> SidecarRequest:
-    try:
-        with path.open("rb") as fh:
-            payload = json.load(fh)
-    except OSError as exc:
-        raise QueueIOError(f"failed to read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise QueueSchemaError(f"{path}: invalid JSON: {exc}") from exc
+    payload = load_sidecar_payload(path)
     try:
         return SidecarRequest.model_validate(payload)
     except ValidationError as exc:
@@ -254,7 +248,9 @@ def load_sidecar_payload(path: Path) -> Any:
             return json.load(fh)
     except OSError as exc:
         raise QueueIOError(f"failed to read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # JSONDecodeError, and the bare ValueErrors json raises for bytes that
+        # are not UTF-8 and for an integer past the interpreter's digit limit.
         raise QueueSchemaError(f"{path}: invalid JSON: {exc}") from exc
 
 

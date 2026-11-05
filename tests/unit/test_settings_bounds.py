@@ -90,7 +90,18 @@ BOUNDED_BY_ANOTHER_SETTING = {
         "poll interval over five years is rejected by that rule, not by its own "
         "bound. One more than the ceiling still fails on the field's own bound. "
         "[failure_classifier].deferral_recheck_cooldown_s must also be at least "
-        "one poll interval, so a long poll needs a cooldown as long."
+        "two poll intervals, so a long poll needs a cooldown twice as long."
+    ),
+    ("claude_runner.toml", "task_caps.dispatcher_alive_write_interval_s"): (
+        "[task_caps].heartbeat_silence_alert_s must be at least two of these "
+        "intervals and is itself at most ten years, so an interval over five years "
+        "is rejected by that rule (REAPER_THRESHOLD_FLOORS), not by its own bound."
+    ),
+    ("claude_runner.toml", "task_caps.heartbeat_persist_interval_s"): (
+        "[task_caps].stuck_sleep_loop_kill_threshold_s, and heartbeat_silence_kill_s "
+        "when on, must be at least two of these intervals and are themselves at "
+        "most ten years, so an interval over five years is rejected by that rule "
+        "(REAPER_THRESHOLD_FLOORS), not by its own bound."
     ),
 }
 """Duration settings whose ceiling alone cannot load, and why."""
@@ -130,8 +141,10 @@ class TestEveryDurationIsAtMostTenYears:
 
     def test_poll_interval_is_bounded_by_the_reading_age(self, tmp_path: Path) -> None:
         """Ten years alone fails the two-cycle rule; five years, with the
-        reading age at its own ceiling and a cooldown of at least one poll,
-        is the largest that loads."""
+        reading age at its own ceiling and a cooldown of at least two polls,
+        is the largest that loads. pydantic stops at the first after-validator
+        that fails, so each rule is reached only once the ones declared
+        before it on ``Settings`` pass: this test relies on that order."""
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(toml_setting("usage.poll_interval_s", str(MAX_DURATION_S)))
         with pytest.raises(ConfigError, match="under two capture cycles"):
@@ -141,13 +154,38 @@ class TestEveryDurationIsAtMostTenYears:
             f"max_reading_age_s = {MAX_DURATION_S}\n"
         )
         toml.write_text(five_years)
-        with pytest.raises(ConfigError, match="under one supervisor tick"):
+        with pytest.raises(ConfigError, match="under two supervisor ticks"):
             load_settings(toml)
         toml.write_text(
-            five_years
-            + f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {MAX_DURATION_S // 2}\n"
+            five_years + f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {MAX_DURATION_S}\n"
         )
         assert load_settings(toml).usage.poll_interval_s == MAX_DURATION_S // 2
+
+    @pytest.mark.parametrize(
+        ("interval", "thresholds"),
+        [
+            ("dispatcher_alive_write_interval_s", ["heartbeat_silence_alert_s"]),
+            (
+                "heartbeat_persist_interval_s",
+                ["heartbeat_silence_kill_s", "stuck_sleep_loop_kill_threshold_s"],
+            ),
+        ],
+    )
+    def test_write_intervals_are_bounded_by_their_thresholds(
+        self, tmp_path: Path, interval: str, thresholds: list[str]
+    ) -> None:
+        """Ten years alone fails the two-interval rule; five years, with the
+        thresholds measured against it at their own ceiling, is the largest
+        that loads."""
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(toml_setting(f"task_caps.{interval}", str(MAX_DURATION_S)))
+        with pytest.raises(ConfigError, match="under two write intervals"):
+            load_settings(toml)
+        toml.write_text(
+            f"[task_caps]\n{interval} = {MAX_DURATION_S // 2}\n"
+            + "".join(f"{threshold} = {MAX_DURATION_S}\n" for threshold in thresholds)
+        )
+        assert getattr(load_settings(toml).task_caps, interval) == MAX_DURATION_S // 2
 
     def test_every_float_setting_is_a_duration(self) -> None:
         """A float setting named otherwise would escape the ceiling."""

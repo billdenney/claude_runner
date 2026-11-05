@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from claude_task_runner.config.loader import (
 )
 from claude_task_runner.config.schema import Settings, WorktreeReclaimSettings
 from claude_task_runner.runner.effort_levels import RETIRED_EFFORT_LEVELS
+
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 
 
 class TestDeepMerge:
@@ -88,6 +91,24 @@ class TestLoadSettings:
         toml.write_text("not = valid = toml = at all\n")
         with pytest.raises(ConfigError, match="Invalid TOML"):
             load_settings(toml)
+
+    def test_an_integer_past_the_digit_limit_is_invalid_toml(self, tmp_path: Path) -> None:
+        """tomllib raises a bare ValueError for it, not TOMLDecodeError."""
+        toml = tmp_path / "huge.toml"
+        toml.write_text(f"[session]\nmax_resume_attempts = {PAST_DIGIT_LIMIT}\n")
+        with pytest.raises(ConfigError) as raised:
+            load_settings(toml)
+        assert str(raised.value) == f"Invalid TOML in {toml}: {digit_limit_error()}"
+
+    def test_a_nul_byte_in_the_path_cannot_be_read(self, tmp_path: Path) -> None:
+        """os.open's wording differs by version ("embedded null byte" on
+        3.11.1), so the expected error comes from this interpreter's."""
+        toml = tmp_path / "bad\x00name.toml"
+        with pytest.raises(ValueError) as refused:
+            os.open(toml, os.O_RDONLY)
+        with pytest.raises(ConfigError) as raised:
+            load_settings(toml)
+        assert str(raised.value) == f"Cannot read {toml}: {refused.value}"
 
     def test_unknown_key_rejected(self, tmp_path: Path) -> None:
         toml = tmp_path / "extra.toml"
@@ -468,45 +489,106 @@ class TestMaxReadingAge:
 
 
 class TestDeferralCooldownSpansATick:
-    """``[failure_classifier].deferral_recheck_cooldown_s`` must be at least one tick.
+    """``[failure_classifier].deferral_recheck_cooldown_s`` must be at least two ticks.
 
     The selector checks a deferred task's ``next_eligible_at`` once a tick
-    and nothing wakes the supervisor for it, so a shorter cooldown (``0``
-    included) re-dispatches a still-blocked task every tick.
+    and nothing wakes the supervisor for it. A deferral is stamped just after
+    one selection and the next comes a poll interval plus that tick's work
+    later, so a cooldown of one interval has passed by then and a
+    still-blocked task is re-dispatched every tick.
     """
 
-    def _toml(self, tmp_path: Path, *, cooldown: float, poll: float = 60) -> Path:
+    def _toml(
+        self, tmp_path: Path, *, cooldown: float, poll: float = 60, accounts: int = 1
+    ) -> Path:
+        names = "".join(
+            f'[[accounts]]\nname = "a{i}"\nconfig_dir = "{tmp_path}"\n' for i in range(accounts)
+        )
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(
-            f"[usage]\npoll_interval_s = {poll}\nmax_reading_age_s = {2 * poll}\n"
-            f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {cooldown}\n"
+            f"[usage]\npoll_interval_s = {poll}\nmax_reading_age_s = {2 * poll * accounts}\n"
+            f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {cooldown}\n\n{names}"
         )
         return toml
 
     def test_default_is_900_seconds(self) -> None:
         assert load_settings(None).failure_classifier.deferral_recheck_cooldown_s == 900
 
+    @pytest.mark.parametrize("accounts", [1, 2, 5])
+    def test_exactly_two_ticks_loads(self, tmp_path: Path, accounts: int) -> None:
+        """The floor is two ticks whatever the number of accounts: every
+        tick's selection checks every deferred task."""
+        settings = load_settings(self._toml(tmp_path, cooldown=120, accounts=accounts))
+        assert settings.failure_classifier.deferral_recheck_cooldown_s == 120
+        assert len(settings.accounts) == accounts
+
+    @pytest.mark.parametrize("accounts", [1, 2, 5])
+    def test_under_two_ticks_is_rejected(self, tmp_path: Path, accounts: int) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(self._toml(tmp_path, cooldown=119.5, accounts=accounts))
+        assert (
+            "[failure_classifier].deferral_recheck_cooldown_s = 119.5 s is under two "
+            "supervisor ticks, 2 x [usage].poll_interval_s 60 s = 120 s. Deferred tasks are "
+            "checked once a tick, so a shorter cooldown re-dispatches a still-blocked task "
+            "every tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+        ) in str(excinfo.value)
+
+    def test_one_tick_is_rejected(self, tmp_path: Path) -> None:
+        """One interval has passed by the next selection, so it skips nothing."""
+        with pytest.raises(ConfigError, match="cooldown_s = 60 s is under two"):
+            load_settings(self._toml(tmp_path, cooldown=60))
+
+    def test_zero_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 0 s is under two"):
+            load_settings(self._toml(tmp_path, cooldown=0))
+
+    def test_a_value_just_under_is_not_rounded_up(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match=r"cooldown_s = 119\.99999 s is under two"):
+            load_settings(self._toml(tmp_path, cooldown=119.99999))
+
+    def test_default_needs_polls_of_450_seconds_or_less(self, tmp_path: Path) -> None:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text("[usage]\npoll_interval_s = 450\nmax_reading_age_s = 900\n")
+        assert load_settings(toml).usage.poll_interval_s == 450
+        toml.write_text("[usage]\npoll_interval_s = 451\nmax_reading_age_s = 902\n")
+        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under two"):
+            load_settings(toml)
+
+
+class TestReclaimIntervalSpansATick:
+    """``[worktree_reclaim].interval_s`` must be at least one tick while the
+    periodic pass is on: the pass is checked once a tick, so a shorter
+    interval runs it every tick, the same as one tick."""
+
+    def _toml(self, tmp_path: Path, *, interval: float, periodic: bool = True) -> Path:
+        toml = tmp_path / "claude_runner.toml"
+        toml.write_text(
+            "[usage]\npoll_interval_s = 60\n\n[worktree_reclaim]\n"
+            f"periodic = {'true' if periodic else 'false'}\ninterval_s = {interval}\n"
+        )
+        return toml
+
     def test_exactly_one_tick_loads(self, tmp_path: Path) -> None:
-        settings = load_settings(self._toml(tmp_path, cooldown=60))
-        assert settings.failure_classifier.deferral_recheck_cooldown_s == 60
+        assert load_settings(self._toml(tmp_path, interval=60)).worktree_reclaim.interval_s == 60
 
     def test_under_one_tick_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError) as excinfo:
-            load_settings(self._toml(tmp_path, cooldown=59.5))
+            load_settings(self._toml(tmp_path, interval=59.5))
         assert (
-            "[failure_classifier].deferral_recheck_cooldown_s = 59.5 s is under one "
-            "supervisor tick, [usage].poll_interval_s = 60 s. Deferred tasks are checked "
-            "once a tick, so a shorter cooldown re-dispatches a still-blocked task every "
-            "tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+            "[worktree_reclaim].interval_s = 59.5 s is under one supervisor tick, "
+            "[usage].poll_interval_s = 60 s. The pass is checked once a tick, so a shorter "
+            "interval runs it every tick. Raise interval_s or lower poll_interval_s."
         ) in str(excinfo.value)
 
-    def test_zero_is_rejected(self, tmp_path: Path) -> None:
-        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 0 s is under one"):
-            load_settings(self._toml(tmp_path, cooldown=0))
+    def test_not_checked_while_the_pass_is_off(self, tmp_path: Path) -> None:
+        settings = load_settings(self._toml(tmp_path, interval=1, periodic=False))
+        assert settings.worktree_reclaim.interval_s == 1
 
-    def test_default_rejects_a_poll_longer_than_it(self, tmp_path: Path) -> None:
-        """The 900 s default needs polls of 900 s or less."""
+    def test_default_loads_with_the_longest_default_compatible_poll(self, tmp_path: Path) -> None:
+        """The 3600 s default allows any poll the 900 s cooldown default does."""
         toml = tmp_path / "claude_runner.toml"
-        toml.write_text("[usage]\npoll_interval_s = 901\nmax_reading_age_s = 1802\n")
-        with pytest.raises(ConfigError, match="deferral_recheck_cooldown_s = 900 s is under one"):
-            load_settings(toml)
+        toml.write_text(
+            "[usage]\npoll_interval_s = 450\nmax_reading_age_s = 900\n"
+            "\n[worktree_reclaim]\nperiodic = true\n"
+        )
+        assert load_settings(toml).worktree_reclaim.interval_s == 3600

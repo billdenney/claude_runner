@@ -206,6 +206,9 @@ class Facts:
     psline: str
     started_at: datetime | None
     saved_at: datetime | None
+    saved_at_error: str | None
+    """Why ``supervisor.json``'s modification time could not be read, when
+    the file exists but ``saved_at`` is ``None``."""
     snapshot: dict[str, Any] | None
     snapshot_error: str | None
     config_unknown: str
@@ -364,23 +367,29 @@ def gather() -> Facts:
     snapshot: dict[str, Any] | None = None
     snapshot_error: str | None = None
     saved_at: datetime | None = None
+    saved_at_error: str | None = None
     if sup_json.exists():
         try:
-            saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
             with open(sup_json, encoding="utf-8") as fh:
                 loaded = json.load(fh)
-        except (OSError, ValueError, OverflowError) as exc:
-            # fromtimestamp raises ValueError for a year outside 1..9999,
-            # OverflowError past the platform's time_t, and OSError when
-            # gmtime rejects a value that fits time_t. This script runs
-            # under the system python3 and cannot import the package's
-            # clock.utc_from_timestamp, which turns all three into one error.
+        except (OSError, ValueError) as exc:
             snapshot_error = str(exc)
         else:
             if isinstance(loaded, dict):
                 snapshot = loaded
             else:
                 snapshot_error = f"it holds a JSON {type(loaded).__name__}, not an object"
+        # The save time is read on its own, so a modification time no date
+        # can hold leaves the record itself readable.
+        try:
+            saved_at = datetime.fromtimestamp(sup_json.stat().st_mtime, UTC)
+        except (OSError, ValueError, OverflowError) as exc:
+            # fromtimestamp raises ValueError for a year outside 1..9999,
+            # OverflowError past the platform's time_t, and OSError when
+            # gmtime rejects a value that fits time_t. This script runs
+            # under the system python3 and cannot import the package's
+            # clock.utc_from_timestamp, which turns all three into one error.
+            saved_at_error = str(exc)
 
     log_path = runtime / "supervisor.log"
     candidates = [
@@ -404,6 +413,7 @@ def gather() -> Facts:
         psline=_env("RS_PSLINE"),
         started_at=started_at,
         saved_at=saved_at,
+        saved_at_error=saved_at_error,
         snapshot=snapshot,
         snapshot_error=snapshot_error,
         config_unknown=_env("RS_CONFIG_UNKNOWN"),
@@ -441,6 +451,12 @@ def _plural(n: int, word: str) -> str:
 
 def _them(n: int) -> str:
     return "it" if n == 1 else "them"
+
+
+def _util(value: object) -> str:
+    """A utilization from supervisor.json. ``null`` is a 5-hour window the
+    account's last reading did not report, which is not 0% (ADR-0038)."""
+    return "not reported" if value is None else f"{value}%"
 
 
 def held_words(name: str, n: int) -> str:
@@ -631,6 +647,14 @@ def _supervisor_line(facts: Facts, notes: Notes) -> tuple[str, bool]:
             f"{facts.queue}`; a watchdog, if installed, restarts it within a few minutes."
         )
         return "not running.", False
+    if facts.saved_at is None and facts.saved_at_error is not None:
+        notes.attention.append(
+            f"The modification time of the supervisor's record "
+            f"({facts.runtime / 'supervisor.json'}) cannot be read ({facts.saved_at_error}), "
+            "so when it last saved its state is unknown. A running supervisor rewrites it at "
+            "every check; if this lasts, look at the file."
+        )
+        return "its process is running, but when it last saved its state is unknown.", False
     if facts.saved_at is None:
         notes.attention.append(
             "The supervisor has not saved its state yet; it normally does within a minute of "
@@ -845,6 +869,28 @@ def _missing_dependency_notes(holds: dict[str, Any], notes: Notes) -> None:
     )
 
 
+def _retry_without_timezone_notes(holds: dict[str, Any], notes: Notes) -> None:
+    """Tasks held because the retry time in their state file has no
+    timezone: each stays held until the file gives it in UTC with an offset."""
+    rows = [r for r in holds.get("retries_without_timezone") or [] if isinstance(r, dict)]
+    if not rows:
+        return
+    items = [
+        f"{r.get('task_id')}: next_eligible_at {r.get('next_eligible_at')} in {r.get('state_file')}"
+        for r in rows
+    ]
+    n = len(rows)
+    lead = (
+        "1 task is held because its retry time has no timezone"
+        if n == 1
+        else f"{n} tasks are held because their retry times have no timezone"
+    )
+    notes.attention.append(
+        f"{lead} ({_listing(items)}). Rewrite each next_eligible_at in UTC with an offset, "
+        "for example 2026-10-15T12:00:00+00:00; the supervisor does not guess a timezone."
+    )
+
+
 def _unmeetable_dependency_rows(holds: dict[str, Any]) -> list[tuple[str, list[str]]]:
     """``queue holds``' ``unmeetable_dependencies``: each task held
     ``depends_on_unmeetable``, with each dependency that cannot finish
@@ -985,6 +1031,7 @@ def _tasks_line(facts: Facts, notes: Notes, live: bool, room: int | None) -> str
     _retry_notes(facts, holds, notes)
     _missing_dependency_notes(holds, notes)
     _unmeetable_dependency_notes(holds, notes)
+    _retry_without_timezone_notes(holds, notes)
 
     queue = facts.queue
     doctor = f"`claude-task-runner doctor --queue {queue}` lists the files."
@@ -1213,12 +1260,12 @@ def supervisor_json_section(facts: Facts) -> str:
     saved = facts.saved_at.strftime("%Y-%m-%dT%H:%M:%SZ") if facts.saved_at else "?"
     fields = [
         ("state", d.get("state")),
-        ("5h util", f"{d.get('last_5h_util_pct', '?')}%"),
+        ("5h util", _util(d.get("last_5h_util_pct", "?"))),
         ("weekly util", f"{d.get('last_weekly_util_pct', '?')}%"),
         ("in_flight", len(d.get("in_flight") or [])),
         ("since", d.get("since", "?")),
         ("scheduled_wakeup", d.get("scheduled_wakeup_at", "-")),
-        ("5h reset_at", d.get("last_5h_reset_at", "?")),
+        ("5h reset_at", d.get("last_5h_reset_at", "?") or "—"),
         ("weekly reset_at", d.get("last_weekly_reset_at", "?")),
         ("drift", d.get("last_drift_message", "") or "-"),
         ("last saved", saved),
@@ -1229,7 +1276,9 @@ def supervisor_json_section(facts: Facts) -> str:
         "_The supervisor's own record, rewritten every time it checks the queue (each poll "
         "interval), so `last saved` shows whether it is still working. `state` is its overall "
         "mode; `5h util` and `weekly util` are how much of the 5-hour and weekly usage "
-        "allowance is used; `in_flight` counts tasks running now; `scheduled_wakeup` is when "
+        'allowance is used (`not reported`, with `5h reset_at` "—", when the account has '
+        "no 5-hour window); "
+        "`in_flight` counts tasks running now; `scheduled_wakeup` is when "
         "it next re-checks a throttled account, not when that account resumes; times are UTC._",
         "",
         "| field | value |",
@@ -1332,8 +1381,9 @@ def per_account_section(facts: Facts) -> str:
         "throttled_weekly waits until its weekly use falls back under plan, no_reading and "
         "error_drift take none until a reading arrives. `in-flight` is how many tasks the "
         "account is running now; `target` (the throttle target) is how many the throttle lets "
-        'it run, "—" when no reading has set one; `wakeup` is when the supervisor re-checks; '
-        "times are UTC._",
+        'it run, "—" when no reading has set one; `5h` is "not reported" and `5h reset` "—" '
+        "for an account whose reading has no 5-hour window; `wakeup` is when the supervisor "
+        "re-checks; times are UTC._",
         "",
         "| account | state | 5h | weekly | paused | in-flight | target | "
         "5h reset | weekly reset | wakeup | last capture |",
@@ -1345,12 +1395,12 @@ def per_account_section(facts: Facts) -> str:
         target = a.get("target_concurrency")
         out.append(
             f"| {name} | `{a.get('state', '?')}` "
-            f"| {a.get('last_5h_util_pct', '?')}% "
+            f"| {_util(a.get('last_5h_util_pct', '?'))} "
             f"| {a.get('last_weekly_util_pct', '?')}% "
             f"| {'yes' if is_paused else ''} "
             f"| {in_flight_by_account.get(name, 0)} "
             f"| {'—' if target is None else target} "
-            f"| {a.get('last_5h_reset_at', '—')} "
+            f"| {a.get('last_5h_reset_at') or '—'} "
             f"| {a.get('last_weekly_reset_at', '—')} "
             f"| {a.get('scheduled_wakeup_at') or '—'} "
             f"| {a.get('last_capture_at') or '—'} |"

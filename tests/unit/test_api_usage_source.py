@@ -59,6 +59,8 @@ from claude_task_runner.usage.source import (
     FakeUsageSource,
 )
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 # ---------------------------------------------------------------------------
 # _headers_to_reading — pure parsing path. All these tests are
 # deterministic and free of I/O.
@@ -261,6 +263,270 @@ def test_headers_to_reading_recognised_statuses_silent(
 
 
 # ---------------------------------------------------------------------------
+# A response with no 5-hour window (ADR-0038). The two header sets are the
+# rate-limit headers of real responses: an account the server reports only
+# the 7-day window for, and one it reports both windows for.
+# ---------------------------------------------------------------------------
+
+
+_WEEKLY_ONLY_HEADERS = {
+    "anthropic-ratelimit-unified-7d-reset": "1794394800",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.12",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    "anthropic-ratelimit-unified-overage-reset": "1796083200",
+    "anthropic-ratelimit-unified-overage-status": "allowed",
+    "anthropic-ratelimit-unified-overage-utilization": "0.0",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    "anthropic-ratelimit-unified-reset": "1794394800",
+    "anthropic-ratelimit-unified-status": "allowed",
+}
+
+_BOTH_WINDOWS_HEADERS = {
+    "anthropic-ratelimit-unified-5h-reset": "1793908800",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.11",
+    "anthropic-ratelimit-unified-7d-reset": "1794193200",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.61",
+    "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+    "anthropic-ratelimit-unified-overage-reset": "1796083200",
+    "anthropic-ratelimit-unified-overage-status": "allowed",
+    "anthropic-ratelimit-unified-overage-utilization": "0.0",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    "anthropic-ratelimit-unified-reset": "1793908800",
+    "anthropic-ratelimit-unified-status": "allowed",
+}
+
+_CAPTURED_AT = datetime(2026, 10, 31, 1, 10, tzinfo=UTC)
+
+
+def test_weekly_only_response_reads_with_no_five_hour_window(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="claude_task_runner.usage.api_source"):
+        reading = _headers_to_reading(dict(_WEEKLY_ONLY_HEADERS), _CAPTURED_AT)
+
+    assert reading.five_hour is None
+    assert reading.five_hour_util_pct is None
+    assert reading.seven_day.utilization_pct == 12
+    assert reading.seven_day.resets_at == datetime(2026, 11, 11, 11, 0, tzinfo=UTC)
+    assert reading.seven_day.resets_at_raw == "1794394800"
+    assert reading.captured_at == _CAPTURED_AT
+    assert caplog.records == []
+
+
+def test_both_windows_response_reads_both() -> None:
+    reading = _headers_to_reading(dict(_BOTH_WINDOWS_HEADERS), _CAPTURED_AT)
+
+    assert reading.five_hour is not None
+    assert reading.five_hour.utilization_pct == 11
+    assert reading.five_hour_util_pct == 11
+    assert reading.five_hour.resets_at == datetime(2026, 11, 5, 20, 0, tzinfo=UTC)
+    assert reading.seven_day.utilization_pct == 61
+    assert reading.seven_day.resets_at == datetime(2026, 11, 9, 3, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("present", "absent"),
+    [
+        ("anthropic-ratelimit-unified-5h-utilization", "anthropic-ratelimit-unified-5h-reset"),
+        ("anthropic-ratelimit-unified-5h-reset", "anthropic-ratelimit-unified-5h-utilization"),
+    ],
+)
+def test_one_five_hour_header_without_the_other_raises(present: str, absent: str) -> None:
+    """Half a 5h pair is a broken response, not an account with no 5-hour window."""
+    h = {**_WEEKLY_ONLY_HEADERS, present: _BOTH_WINDOWS_HEADERS[present]}
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, _CAPTURED_AT)
+    assert str(exc_info.value) == (
+        f"missing rate-limit headers from /v1/messages: [{absent!r}]. "
+        "Possible Anthropic header rename — falling back to TTY source."
+    )
+
+
+_SEVEN_DAY_PAIR = [
+    "anthropic-ratelimit-unified-7d-utilization",
+    "anthropic-ratelimit-unified-7d-reset",
+]
+
+
+@pytest.mark.parametrize(
+    ("base", "missing"),
+    [
+        (_BOTH_WINDOWS_HEADERS, _SEVEN_DAY_PAIR),
+        (
+            _WEEKLY_ONLY_HEADERS,
+            [
+                "anthropic-ratelimit-unified-5h-utilization",
+                "anthropic-ratelimit-unified-5h-reset",
+                *_SEVEN_DAY_PAIR,
+            ],
+        ),
+    ],
+    ids=["with-5h", "without-5h"],
+)
+def test_missing_seven_day_pair_raises(base: dict[str, str], missing: list[str]) -> None:
+    h = {k: v for k, v in base.items() if k not in _SEVEN_DAY_PAIR}
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, _CAPTURED_AT)
+    assert str(exc_info.value) == (
+        f"missing rate-limit headers from /v1/messages: {missing}. "
+        "Possible Anthropic header rename — falling back to TTY source."
+    )
+
+
+@pytest.mark.parametrize("absent", _SEVEN_DAY_PAIR)
+def test_weekly_only_response_missing_one_seven_day_header_raises(absent: str) -> None:
+    h = {k: v for k, v in _WEEKLY_ONLY_HEADERS.items() if k != absent}
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, _CAPTURED_AT)
+    assert str(exc_info.value).startswith(
+        "missing rate-limit headers from /v1/messages: ["
+        "'anthropic-ratelimit-unified-5h-utilization', "
+        f"'anthropic-ratelimit-unified-5h-reset', {absent!r}]."
+    )
+
+
+_NO_5H_PAIR = (
+    "missing rate-limit headers from /v1/messages: ["
+    "'anthropic-ratelimit-unified-5h-utilization', 'anthropic-ratelimit-unified-5h-reset'], "
+    "and the response does not show that no 5-hour window applies: "
+)
+_FALL_BACK = ". Possible Anthropic header rename — falling back to TTY source."
+_CLAIM = "anthropic-ratelimit-unified-representative-claim"
+
+
+def _without(headers: dict[str, str], *names: str) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k not in names}
+
+
+@pytest.mark.parametrize(
+    ("headers", "doubts"),
+    [
+        (
+            {**_WEEKLY_ONLY_HEADERS, _CLAIM: "five_hour"},
+            f"{_CLAIM} is 'five_hour'",
+        ),
+        (
+            {
+                **_WEEKLY_ONLY_HEADERS,
+                "anthropic-ratelimit-5h-utilization": "0.11",
+                "anthropic-ratelimit-5h-reset": "1793908800",
+            },
+            "5-hour headers ['anthropic-ratelimit-5h-reset', 'anthropic-ratelimit-5h-utilization']",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "anthropic-ratelimit-unified-5h-status": "allowed"},
+            "5-hour headers ['anthropic-ratelimit-unified-5h-status']",
+        ),
+        (
+            {
+                "anthropic-ratelimit-unified-7d-utilization": "0.12",
+                "anthropic-ratelimit-unified-7d-reset": "1794394800",
+            },
+            f"no {_CLAIM} header",
+        ),
+        (
+            _without(_WEEKLY_ONLY_HEADERS, _CLAIM),
+            f"no {_CLAIM} header",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "anthropic-ratelimit-unified-3h-utilization": "0.4"},
+            "unrecognised window headers ['anthropic-ratelimit-unified-3h-utilization']",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "Anthropic-Ratelimit-Unified-3H-Utilization": "0.4"},
+            "unrecognised window headers ['anthropic-ratelimit-unified-3h-utilization']",
+        ),
+        (
+            {
+                **_WEEKLY_ONLY_HEADERS,
+                _CLAIM: "five_hour",
+                "anthropic-ratelimit-unified-five_hour-utilization": "0.4",
+            },
+            f"{_CLAIM} is 'five_hour'; "
+            "5-hour headers ['anthropic-ratelimit-unified-five_hour-utilization']; "
+            "unrecognised window headers ['anthropic-ratelimit-unified-five_hour-utilization']",
+        ),
+    ],
+    ids=[
+        "claim-five_hour",
+        "5h-without-unified-prefix",
+        "lone-5h-status",
+        "only-the-7d-pair",
+        "no-claim",
+        "unknown-3h-window",
+        "unknown-3h-window-mixed-case",
+        "renamed-5h-window",
+    ],
+)
+def test_missing_5h_pair_without_proof_of_no_5h_window_raises(
+    headers: dict[str, str], doubts: str
+) -> None:
+    """Without the 5h pair, a response reads as having no 5-hour window only
+    when it shows none applies. A claim of five_hour, a 5h header under
+    another name, no claim at all, or a window this module does not know
+    each leave a 5-hour window possible, so each raises."""
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(headers, _CAPTURED_AT)
+    assert str(exc_info.value) == _NO_5H_PAIR + doubts + _FALL_BACK
+    assert usage_error_kind(str(exc_info.value)) == "format"
+
+
+@pytest.mark.parametrize("claim", ["seven_day", "Seven_Day ", "overage"])
+def test_weekly_only_response_with_another_claim_reads(claim: str) -> None:
+    """Any representative claim that names no 5-hour window is evidence."""
+    reading = _headers_to_reading({**_WEEKLY_ONLY_HEADERS, _CLAIM: claim}, _CAPTURED_AT)
+    assert reading.five_hour is None
+    assert reading.seven_day.utilization_pct == 12
+
+
+def test_unrecognised_window_beside_both_windows_is_ignored() -> None:
+    """With the 5h pair present nothing is missing; an extra window is
+    ignored, as every header the reading does not use is."""
+    h = {**_BOTH_WINDOWS_HEADERS, "anthropic-ratelimit-unified-3h-utilization": "0.4"}
+    reading = _headers_to_reading(h, _CAPTURED_AT)
+    assert reading.five_hour is not None
+    assert reading.five_hour.utilization_pct == 11
+    assert reading.seven_day.utilization_pct == 61
+
+
+@pytest.mark.parametrize(
+    ("header", "value", "message"),
+    [
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "nan",
+            "anthropic-ratelimit-unified-7d-utilization value 'nan' is not a finite percentage",
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "12",
+            "anthropic-ratelimit-unified-7d-utilization value '12' is 1200%, outside [0, 100]",
+        ),
+    ],
+)
+def test_weekly_only_response_with_an_invalid_seven_day_value_raises(
+    header: str, value: str, message: str
+) -> None:
+    """The 7d pair must be valid, not only present, for a reading with no
+    5-hour window."""
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading({**_WEEKLY_ONLY_HEADERS, header: value}, _CAPTURED_AT)
+    assert str(exc_info.value) == message
+
+
+def test_weekly_only_response_with_an_unparseable_reset_raises() -> None:
+    h = {**_WEEKLY_ONLY_HEADERS, "anthropic-ratelimit-unified-7d-reset": "next week"}
+    with pytest.raises(UsageApiHeaderMissing) as exc_info:
+        _headers_to_reading(h, _CAPTURED_AT)
+    assert str(exc_info.value).startswith(
+        "unparseable anthropic-ratelimit-unified-7d-reset header value 'next week': "
+    )
+
+
+# ---------------------------------------------------------------------------
 # _read_oauth_token — uses tmp_path to write throwaway credentials files.
 # ---------------------------------------------------------------------------
 
@@ -295,6 +561,17 @@ def test_read_oauth_token_invalid_json_raises(tmp_path: Path) -> None:
     (config_dir / ".credentials.json").write_text("not json {", encoding="utf-8")
     with pytest.raises(CredentialsNotFound):
         _read_oauth_token(str(config_dir))
+
+
+def test_read_oauth_token_integer_past_the_digit_limit_raises(tmp_path: Path) -> None:
+    """json raises a bare ValueError for it, not JSONDecodeError."""
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    creds = config_dir / ".credentials.json"
+    creds.write_text(f'{{"claudeAiOauth": {{"expiresAt": {PAST_DIGIT_LIMIT}}}}}', encoding="utf-8")
+    with pytest.raises(CredentialsNotFound) as raised:
+        _read_oauth_token(str(config_dir))
+    assert str(raised.value) == f"could not read {creds}: {digit_limit_error()}"
 
 
 def test_read_oauth_token_no_matching_key_raises(tmp_path: Path) -> None:
@@ -498,6 +775,16 @@ def test_api_source_read_raises_header_missing_when_headers_absent(tmp_path: Pat
         src.read()
 
 
+def test_api_source_read_weekly_only_response(tmp_path: Path) -> None:
+    config_dir = _make_creds(tmp_path)
+    src = ApiUsageSource(FakeClock(start=_CAPTURED_AT), config_dir=config_dir)
+    with patch("urllib.request.urlopen", return_value=_MockResponse(headers=_WEEKLY_ONLY_HEADERS)):
+        reading = src.read()
+    assert reading.five_hour is None
+    assert reading.seven_day.utilization_pct == 12
+    assert reading.captured_at == _CAPTURED_AT
+
+
 # ---------------------------------------------------------------------------
 # ApiThenTtyUsageSource — composite fall-through.
 # ---------------------------------------------------------------------------
@@ -528,6 +815,17 @@ def test_composite_returns_api_reading_on_success() -> None:
     composite = ApiThenTtyUsageSource(api=api, tty=tty)
     out = composite.read()
     assert out.five_hour.utilization_pct == 7
+    tty.read.assert_not_called()
+
+
+def test_composite_returns_a_weekly_only_api_reading_without_the_tty() -> None:
+    """A reading with no 5-hour window is a clean reading, not a failure
+    to fall through on."""
+    api_reading = _headers_to_reading(dict(_WEEKLY_ONLY_HEADERS), _CAPTURED_AT)
+    tty = MagicMock()
+    out = ApiThenTtyUsageSource(api=FakeUsageSource([api_reading]), tty=tty).read()
+    assert out.five_hour is None
+    assert out.seven_day.utilization_pct == 12
     tty.read.assert_not_called()
 
 

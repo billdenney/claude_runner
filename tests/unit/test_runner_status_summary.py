@@ -893,6 +893,51 @@ def test_one_task_whose_dependency_does_not_exist_and_the_details(
     ), section
 
 
+def test_tasks_held_for_a_retry_time_without_a_timezone_are_named(
+    queue: Path, bin_dir: Path
+) -> None:
+    """The Tasks line counts them, and an attention note names each task,
+    its offsetless value and the state file to fix, singular and plural."""
+    row = {
+        "task_id": "hand-parked",
+        "state_file": "/q/.claude_task_runner/state/hand-parked.yaml",
+        "next_eligible_at": "2099-01-01T00:00:00",
+    }
+    holds = {
+        "eligible": {"count": 0, "task_ids": [], "by_status": {}},
+        "held": {"next_eligible_at_without_timezone": 1},
+        "completed": 0,
+        "todo_tasks": 1,
+        "retries_without_timezone": [row],
+    }
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    summary = _summary(queue, bin_dir)
+    assert (
+        "- **Tasks:** 1 has a retry time with no timezone (fix its state file); 0 finished.\n"
+    ) in summary
+    assert (
+        "- 1 task is held because its retry time has no timezone (hand-parked: "
+        "next_eligible_at 2099-01-01T00:00:00 in /q/.claude_task_runner/state/hand-parked.yaml)"
+        ". Rewrite each next_eligible_at in UTC with an offset, for example "
+        "2026-10-15T12:00:00+00:00; the supervisor does not guess a timezone.\n"
+    ) in summary
+
+    other = {**row, "task_id": "also-parked", "state_file": "/q/s/also-parked.yaml"}
+    holds["held"] = {"next_eligible_at_without_timezone": 2}
+    holds["todo_tasks"] = 2
+    holds["retries_without_timezone"] = [row, other]
+    _cli_with(bin_dir, queue=(json.dumps(holds), "", 0))
+    summary = _summary(queue, bin_dir)
+    assert (
+        "- **Tasks:** 2 have retry times with no timezone (fix their state files); 0 finished.\n"
+    ) in summary
+    assert (
+        "- 2 tasks are held because their retry times have no timezone (hand-parked: "
+        "next_eligible_at 2099-01-01T00:00:00 in /q/.claude_task_runner/state/hand-parked.yaml; "
+        "also-parked: next_eligible_at 2099-01-01T00:00:00 in /q/s/also-parked.yaml). "
+    ) in summary
+
+
 def test_nothing_running_although_tasks_can_start(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:
@@ -1055,12 +1100,12 @@ def test_unreadable_supervisor_json(
         pytest.param(1e20, "timestamp out of range for platform time_t", id="past-time_t"),
     ],
 )
-def test_a_supervisor_json_mtime_no_datetime_can_hold_is_reported(
+def test_a_supervisor_json_mtime_no_datetime_can_hold_leaves_the_record_readable(
     queue: Path, monkeypatch: pytest.MonkeyPatch, mtime: float, error: str
 ) -> None:
     """The record's save time comes from its mtime. One no datetime can hold
-    (``ValueError`` or ``OverflowError`` from ``fromtimestamp``) is reported
-    as the record being unreadable, not raised out of the report."""
+    (``ValueError`` or ``OverflowError`` from ``fromtimestamp``) makes the
+    save time unknown, with the error, while the record itself still loads."""
     report = _report_module()
     path = persist_mod.supervisor_state_path(queue)
     _supervisor_json(queue, {})
@@ -1077,7 +1122,52 @@ def test_a_supervisor_json_mtime_no_datetime_can_hold_is_reported(
 
     facts = report.gather()
 
-    assert facts.snapshot_error == error
+    assert (facts.saved_at, facts.saved_at_error) == (None, error)
+    assert facts.snapshot_error is None
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
+
+
+def _fromtimestamp_error(timestamp: float) -> str:
+    """What this interpreter's ``fromtimestamp`` says about ``timestamp``.
+    At 2**63 Python 3.11.1 raises OSError (errno 75); 3.11.15 and 3.12 on
+    raise OverflowError."""
+    with pytest.raises((ValueError, OverflowError, OSError)) as raised:
+        datetime.fromtimestamp(timestamp, UTC)
+    return str(raised.value)
+
+
+def test_a_real_supervisor_json_mtime_past_time_t_is_reported_as_unknown(
+    far_future_mtime_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On tmpfs an mtime of 2**63 - 1 is stored and its float rounds up to
+    2**63, which fromtimestamp rejects. The summary says when the
+    supervisor last saved is unknown, and why."""
+    report = _report_module()
+    queue = far_future_mtime_dir / "queue"
+    (queue / "todo").mkdir(parents=True)
+    queue_runtime_dir(queue)
+    _supervisor_json(queue, {})
+    path = persist_mod.supervisor_state_path(queue)
+    os.utime(path, (2**63 - 1, 2**63 - 1))
+    monkeypatch.setenv("RS_QUEUE", str(queue))
+    monkeypatch.setenv("RS_NOW", _report_now().isoformat())
+    monkeypatch.setenv("RS_PID_STATE", "alive")
+
+    facts = report.gather()
+
+    error = _fromtimestamp_error(path.stat().st_mtime)
+    assert (facts.saved_at, facts.saved_at_error) == (None, error)
+    assert facts.snapshot == json.loads(path.read_text(encoding="utf-8"))
+    summary = report.plain_summary(facts)
+    assert (
+        "- **Supervisor:** its process is running, but when it last saved its state is unknown."
+        in summary
+    )
+    assert (
+        f"- The modification time of the supervisor's record ({path}) cannot be read ({error}), "
+        "so when it last saved its state is unknown. A running supervisor rewrites it at every "
+        "check; if this lasts, look at the file.\n"
+    ) in summary
 
 
 def test_supervisor_json_details_count_the_in_flight_records(
@@ -1091,6 +1181,32 @@ def test_supervisor_json_details_count_the_in_flight_records(
     data["in_flight_task_ids"] = []
     path.write_text(json.dumps(data), encoding="utf-8")
     assert "\n| in_flight | `2` |\n" in _run(queue, bin_dir).stdout
+
+
+def test_details_show_a_missing_5h_window_as_not_reported(
+    queue: Path, tmp_path: Path, bin_dir: Path
+) -> None:
+    """supervisor.json's ``null`` 5h utilization (ADR-0038) is "not
+    reported" in both tables, and its ``null`` reset a dash, never 0%."""
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.DISPATCHING, last_5h_util_pct=None, last_weekly_util_pct=12
+        ),
+        work=_state(SupervisorState.DISPATCHING, last_5h_util_pct=11, last_weekly_util_pct=61),
+    )
+    path = persist_mod.supervisor_state_path(queue)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["last_5h_util_pct"] = None
+    data["last_5h_reset_at"] = None
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    out = _run(queue, bin_dir).stdout
+    assert "\n| 5h util | `not reported` |\n" in out
+    assert "\n| 5h reset_at | `—` |\n" in out
+    assert "\n| personal | `dispatching` | not reported | 12% |  | 0 | — | — | " in out
+    assert "\n| work | `dispatching` | 11% | 61% |  | 0 | — | — | " in out
 
 
 @pytest.fixture
@@ -1386,8 +1502,12 @@ def test_poll_interval_is_the_supervisors_own(
     with the queue's own file (60 s) it would look stuck."""
     dirs = _config(queue, tmp_path, {"personal": 5, "work": 3})
     other = tmp_path / "other.toml"
-    # max_reading_age_s must cover two capture cycles of the accounts.
-    usage = "[usage]\npoll_interval_s = 600\nmax_reading_age_s = 3600\n"
+    # max_reading_age_s must cover two capture cycles of the accounts, and the
+    # deferral cooldown two polls.
+    usage = (
+        "[usage]\npoll_interval_s = 600\nmax_reading_age_s = 3600\n"
+        "\n[failure_classifier]\ndeferral_recheck_cooldown_s = 1200\n"
+    )
     other.write_text(_config_text(dirs, usage), encoding="utf-8")
     states = {
         "personal": _state(SupervisorState.DISPATCHING),
@@ -1859,6 +1979,8 @@ def test_every_held_category_has_plain_words() -> None:
         "completed",
     }
     assert sorted(categories - set(report._HELD_WORDS)) == []
+    # in_flight is counted as running, apart from the held list.
+    assert sorted(categories - {"in_flight"} - set(report._HELD_ORDER)) == []
 
     task = Task.model_validate(
         {

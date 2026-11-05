@@ -280,19 +280,25 @@ def answer_sidecar(
         sys.stderr.write("supply exactly one of --answers / --answers-file\n")
         raise typer.Exit(code=2)
 
+    text: str | bytes
     if answers_json is not None:
         text = answers_json
     else:
         assert answers_file is not None
         try:
-            text = answers_file.read_text()
+            # Bytes: json works out UTF-8, UTF-16 or UTF-32 (with or without
+            # a byte-order mark) and decodes them itself, so bytes in none of
+            # them fail below, as invalid JSON.
+            text = answers_file.read_bytes()
         except OSError as exc:
             sys.stderr.write(f"failed to read {answers_file}: {exc}\n")
             raise typer.Exit(code=2) from exc
 
     try:
         raw = _json.loads(text)
-    except _json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # JSONDecodeError, UnicodeDecodeError, and the bare ValueError json
+        # raises for an integer past the interpreter's digit limit.
         sys.stderr.write(f"invalid JSON: {exc}\n")
         raise typer.Exit(code=2) from exc
 

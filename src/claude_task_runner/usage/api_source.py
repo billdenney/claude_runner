@@ -13,6 +13,14 @@ Anthropic docs, so the source treats absent / renamed headers as
 :class:`UsageApiHeaderMissing` — a format-drift signal the supervisor
 can route on without confusing it for a network timeout.
 
+The server reports the windows that apply to the account. When no
+5-hour window applies, the response carries the 7d headers, no header
+naming a 5-hour window, and a representative claim of another window
+(``seven_day``); the reading's ``five_hour`` is then ``None`` (ADR-0038).
+A response without the 5h pair that lacks any of that evidence raises,
+so a renamed or partly missing 5h window is never read as "no 5-hour
+limit". :func:`_no_five_hour_window_doubts` lists the checks.
+
 Authentication: two-stage lookup per account.
 
 1. **Long-lived token (PR 14)** — if ``<config_dir>/oauth-token``
@@ -51,6 +59,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -100,6 +109,36 @@ Statuses NOT in this set are logged once per capture (not raised)
 so ops can extend the enumeration as Anthropic introduces new
 values. The log is the early-warning channel; promotion to
 state-machine signals (if any) belongs in a separate ADR."""
+
+_FIVE_HOUR_HEADERS: tuple[str, str] = (
+    "anthropic-ratelimit-unified-5h-utilization",
+    "anthropic-ratelimit-unified-5h-reset",
+)
+_SEVEN_DAY_HEADERS: tuple[str, str] = (
+    "anthropic-ratelimit-unified-7d-utilization",
+    "anthropic-ratelimit-unified-7d-reset",
+)
+
+_KNOWN_WINDOWS: frozenset[str] = frozenset({"5h", "7d", "overage"})
+"""Every ``<w>`` of an ``anthropic-ratelimit-unified-<w>-utilization``
+header this module recognises. The reading uses ``5h`` and ``7d``;
+``overage`` is reported alongside them and not read. A response
+without the 5h pair is a reading with no 5-hour window only when every
+utilization header it carries names one of these: an unknown one may
+be the 5-hour window under a new name."""
+
+_UTILIZATION_HEADER_RE = re.compile(r"anthropic-ratelimit-unified-(.+)-utilization")
+"""Matches a lower-cased window utilization header; group 1 is the window."""
+
+_REPRESENTATIVE_CLAIM_HEADER = "anthropic-ratelimit-unified-representative-claim"
+"""Names the window the response's overall ``-unified-status`` and
+``-unified-reset`` describe: ``five_hour`` for an account with a 5-hour
+window, ``seven_day`` for one the server reports only the 7-day window
+for."""
+
+_FIVE_HOUR_MARKERS: tuple[str, ...] = ("5h", "five")
+"""Substrings that tie a lower-cased header name, or the representative
+claim's value, to a 5-hour window."""
 
 # OAuth credential file keys, in priority order. Different Claude Code
 # versions and login flows have stored the access token under different
@@ -172,7 +211,9 @@ class ApiUsageSource:
         UsageApiHeaderMissing
             The response was OK but didn't carry the documented
             rate-limit headers, or one's value cannot become a reading
-            (unparseable, not finite, or out of range).
+            (unparseable, not finite, or out of range). A response with
+            the 7d headers and no 5h headers is not this: it reads with
+            ``five_hour=None`` (see :func:`_headers_to_reading`).
         UsageApiNetworkError
             Connection failed, TLS failed, DNS failed, or any non-
             auth HTTP error code.
@@ -250,7 +291,9 @@ def _read_oauth_token(config_dir: str) -> str:
             f"OAuth credentials file not found: {creds_path}. "
             f"Run `CLAUDE_CONFIG_DIR={creds_path.parent} claude /login` first."
         ) from None
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: JSONDecodeError, bytes that are not UTF-8, and the bare
+        # one json raises for an integer past the interpreter's digit limit.
         raise CredentialsNotFound(f"could not read {creds_path}: {exc}") from exc
 
     for path in _CREDENTIAL_KEY_PATHS:
@@ -274,9 +317,15 @@ def _read_oauth_token(config_dir: str) -> str:
 def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> UsageReading:
     """Convert response headers into a :class:`UsageReading`.
 
-    Raises :class:`UsageApiHeaderMissing` if any of the four required
-    headers (``-5h-utilization``, ``-5h-reset``, ``-7d-utilization``,
-    ``-7d-reset``) is absent or has a value :func:`_window_from_headers`
+    The 7d pair (``-7d-utilization``, ``-7d-reset``) is required. The 5h
+    pair is read when both are present. When neither is, ``five_hour`` is
+    ``None`` only if the response shows that no 5-hour window applies
+    (:func:`_no_five_hour_window_doubts` finds nothing).
+
+    Raises :class:`UsageApiHeaderMissing` when either 7d header is
+    absent, when only one of the two 5h headers is present, when neither
+    is and the response does not show that no 5-hour window applies, or
+    when a present window's value is one :func:`_window_from_headers`
     rejects.
 
     Header lookup is case-insensitive — ``urllib`` preserves the wire
@@ -284,25 +333,21 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
     """
     lower = {k.lower(): v for k, v in headers.items()}
 
-    five_h_util_raw = lower.get("anthropic-ratelimit-unified-5h-utilization")
-    five_h_reset_raw = lower.get("anthropic-ratelimit-unified-5h-reset")
-    week_util_raw = lower.get("anthropic-ratelimit-unified-7d-utilization")
-    week_reset_raw = lower.get("anthropic-ratelimit-unified-7d-reset")
-    missing = [
-        name
-        for name, val in (
-            ("anthropic-ratelimit-unified-5h-utilization", five_h_util_raw),
-            ("anthropic-ratelimit-unified-5h-reset", five_h_reset_raw),
-            ("anthropic-ratelimit-unified-7d-utilization", week_util_raw),
-            ("anthropic-ratelimit-unified-7d-reset", week_reset_raw),
-        )
-        if val is None
-    ]
-    if missing:
+    missing = [name for name in (*_FIVE_HOUR_HEADERS, *_SEVEN_DAY_HEADERS) if name not in lower]
+    no_five_hour = missing == list(_FIVE_HOUR_HEADERS)
+    if missing and not no_five_hour:
         raise UsageApiHeaderMissing(
             f"missing rate-limit headers from /v1/messages: {missing}. "
             "Possible Anthropic header rename — falling back to TTY source."
         )
+    if no_five_hour:
+        doubts = _no_five_hour_window_doubts(lower)
+        if doubts:
+            raise UsageApiHeaderMissing(
+                f"missing rate-limit headers from /v1/messages: {missing}, and the "
+                f"response does not show that no 5-hour window applies: {'; '.join(doubts)}. "
+                "Possible Anthropic header rename — falling back to TTY source."
+            )
 
     # Log unknown statuses without raising; the supervisor's state
     # machine drives off the utilization percentage, so an unknown
@@ -321,28 +366,61 @@ def _headers_to_reading(headers: dict[str, str], captured_at: datetime) -> Usage
                 sorted(_KNOWN_OK_STATUSES),
             )
 
-    # After the `missing` check above, none of these are None; the
-    # explicit assertion narrows the type for mypy without adding a
-    # runtime ignore comment.
-    assert five_h_util_raw is not None
-    assert five_h_reset_raw is not None
-    assert week_util_raw is not None
-    assert week_reset_raw is not None
-    five_h = _window_from_headers(
-        window="5h",
-        utilization=five_h_util_raw,
-        reset=five_h_reset_raw,
+    five_h = (
+        None
+        if no_five_hour
+        else _window_from_headers(
+            window="5h",
+            utilization=lower[_FIVE_HOUR_HEADERS[0]],
+            reset=lower[_FIVE_HOUR_HEADERS[1]],
+        )
     )
     week = _window_from_headers(
         window="7d",
-        utilization=week_util_raw,
-        reset=week_reset_raw,
+        utilization=lower[_SEVEN_DAY_HEADERS[0]],
+        reset=lower[_SEVEN_DAY_HEADERS[1]],
     )
     return UsageReading(
         captured_at=captured_at,
         five_hour=five_h,
         seven_day=week,
     )
+
+
+def _no_five_hour_window_doubts(lower: dict[str, str]) -> list[str]:
+    """Why a response without the 5h pair may still have a 5-hour window.
+
+    ``lower`` maps lower-cased header names to values. An empty list means
+    the response shows that no 5-hour window applies, so it reads with
+    ``five_hour=None``. That takes all three of:
+
+    * a representative claim (:data:`_REPRESENTATIVE_CLAIM_HEADER`) whose
+      value names no 5-hour window: ``seven_day``, not ``five_hour``;
+    * no header name containing ``5h`` or ``five``, which would be a 5h
+      header under another prefix, or a 5h status without its pair;
+    * no ``-<w>-utilization`` header for a window outside
+      :data:`_KNOWN_WINDOWS`.
+    """
+    doubts: list[str] = []
+    claim = lower.get(_REPRESENTATIVE_CLAIM_HEADER)
+    if claim is None:
+        doubts.append(f"no {_REPRESENTATIVE_CLAIM_HEADER} header")
+    elif any(marker in claim.strip().lower() for marker in _FIVE_HOUR_MARKERS):
+        doubts.append(f"{_REPRESENTATIVE_CLAIM_HEADER} is {claim!r}")
+    five_hour_names = sorted(
+        name for name in lower if any(marker in name for marker in _FIVE_HOUR_MARKERS)
+    )
+    if five_hour_names:
+        doubts.append(f"5-hour headers {five_hour_names}")
+    unknown = sorted(
+        name
+        for name in lower
+        if (match := _UTILIZATION_HEADER_RE.fullmatch(name)) is not None
+        and match.group(1) not in _KNOWN_WINDOWS
+    )
+    if unknown:
+        doubts.append(f"unrecognised window headers {unknown}")
+    return doubts
 
 
 def _window_from_headers(*, window: str, utilization: str, reset: str) -> WindowReading:

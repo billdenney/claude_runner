@@ -157,9 +157,12 @@ class FailureClassifierSettings(_StrictModel):
     often a still-blocked task is tried again, so a long wait (e.g. a paper
     awaiting operator re-acquisition, a mount not up yet) re-checks
     periodically instead of being re-picked every tick and starving ready
-    work. Default 15 min. Must be at least ``[usage].poll_interval_s``: the
-    selector checks the cooldown once a tick, so a shorter one would re-pick
-    the task every tick (see ``Settings``)."""
+    work. Default 15 min. Must be at least twice ``[usage].poll_interval_s``:
+    the selector checks the cooldown once a tick, and a deferral is stamped
+    just after one selection while the next comes a poll interval plus that
+    tick's work later, so a cooldown of one interval has passed by then and
+    the task would be re-picked every tick. Two intervals make it skip at
+    least one tick (see ``Settings``)."""
     sidecar_refile_loop_threshold: int = Field(default=4, ge=1)
     """Consecutive no-progress sidecar re-files (a dispatch that ends
     ``awaiting_sidecar`` without committing anything) after which the
@@ -192,6 +195,10 @@ class TaskCapsSettings(_StrictModel):
     the *active*-case freshness signal; keeping it well below
     ``heartbeat_silence_alert_s`` still gives the reaper a recent
     timestamp for tasks that are actively emitting events.
+
+    Must be at most half of ``stuck_sleep_loop_kill_threshold_s``, and of
+    ``heartbeat_silence_kill_s`` when that is on
+    (:data:`REAPER_THRESHOLD_FLOORS`).
     """
 
     dispatcher_alive_write_interval_s: float = Field(gt=0, default=30.0, le=MAX_DURATION_S)
@@ -211,6 +218,9 @@ class TaskCapsSettings(_StrictModel):
     * Dead monitor — both stale. The reaper falls through to the
       filesystem activity verification step (see
       ``zombie_verify_fs_activity_window_s``).
+
+    Must be at most half of ``heartbeat_silence_alert_s``
+    (:data:`REAPER_THRESHOLD_FLOORS`).
     """
 
     zombie_verify_fs_activity_window_s: float = Field(gt=0, default=600.0, le=MAX_DURATION_S)
@@ -292,9 +302,68 @@ class TaskCapsSettings(_StrictModel):
     the duration-cap-only behaviour.
     """
 
+    @model_validator(mode="after")
+    def _validate_thresholds_span_two_writes(self) -> TaskCapsSettings:
+        """Reject a threshold under two of the write intervals it is measured
+        against (:data:`REAPER_THRESHOLD_FLOORS`).
+
+        The reaper compares each threshold with the age of a timestamp the
+        dispatcher writes at most once an interval. The monitor's tick stays
+        under two intervals old through one late write, and the agent's
+        persisted heartbeat stays under two intervals old while the agent
+        emits an event at least once an interval. A shorter threshold would
+        read such a task as silent. A ``heartbeat_silence_kill_s`` of 0 is
+        off and not checked.
+        """
+        for threshold, interval, why in REAPER_THRESHOLD_FLOORS:
+            value = getattr(self, threshold)
+            interval_s = getattr(self, interval)
+            if 0 < value < 2 * interval_s:
+                raise ValueError(
+                    f"[task_caps].{threshold} = {value:g} s is under two write intervals: "
+                    f"[task_caps].{interval} {interval_s:g} s x 2 = {2 * interval_s:g} s. "
+                    f"{why} Raise {threshold} or lower {interval}."
+                )
+        return self
+
+
+REAPER_THRESHOLD_FLOORS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        "heartbeat_silence_alert_s",
+        "dispatcher_alive_write_interval_s",
+        "The reaper counts a task as alive while its monitor's tick, written once an "
+        "interval, is within heartbeat_silence_alert_s, so a shorter window reads a "
+        "running task as silent when one tick is late.",
+    ),
+    (
+        "heartbeat_silence_kill_s",
+        "heartbeat_persist_interval_s",
+        "The reaper measures the agent's silence from its persisted heartbeat, written at "
+        "most once an interval, which an agent emitting an event each interval keeps under "
+        "two intervals old, so a shorter threshold can kill such an agent.",
+    ),
+    (
+        "stuck_sleep_loop_kill_threshold_s",
+        "heartbeat_persist_interval_s",
+        "The stuck-sleep-loop scan starts once the agent's persisted heartbeat, written at "
+        "most once an interval, is that old; an agent emitting an event each interval keeps "
+        "it under two intervals old, so a shorter threshold scans such an agent's process "
+        "tree, and can kill it.",
+    ),
+)
+"""``(threshold, interval, why)`` for each ``[task_caps]`` threshold the reaper
+measures against a timestamp the dispatcher writes once an interval. Each
+must be at least twice its interval, as ``[usage].max_reading_age_s`` must
+span two capture cycles; ``why`` says what a shorter one does."""
+
 
 class WatchdogSettings(_StrictModel):
     restart_cooldown_s: float = Field(gt=0, le=MAX_DURATION_S)
+    """Seconds after a restart before the watchdog restarts the supervisor
+    again; the systemd unit's ``RestartSec``. The cron watchdog checks it
+    only when cron runs it, once a minute by default, so under cron a value
+    below the cron interval acts as that interval. Nothing checks this at
+    load, since the cron schedule is not in the settings."""
     restart_backoff_max_s: float = Field(gt=0, le=MAX_DURATION_S)
     crash_loop_threshold: int = Field(ge=1)
     transient_config_escalation_s: float = Field(default=600.0, ge=0, le=MAX_DURATION_S)
@@ -417,7 +486,10 @@ class WorktreeReclaimSettings(_StrictModel):
     interval_s: float = Field(default=3600.0, gt=0, le=MAX_DURATION_S)
     """Seconds between two periodic supervisor passes. The first pass runs on
     the supervisor's first tick; a pass that raises still waits a full
-    interval before the next attempt."""
+    interval before the next attempt. Must be at least
+    ``[usage].poll_interval_s``: the supervisor checks it once a tick, so
+    one interval of a tick runs the pass every tick, and a shorter one
+    could not mean what it says (see ``Settings``)."""
 
     max_per_pass: int = Field(default=20, ge=1)
     """Upper bound on removals attempted by one periodic pass. The pass runs
@@ -1101,20 +1173,49 @@ class Settings(_StrictModel):
 
     @model_validator(mode="after")
     def _validate_deferral_cooldown_spans_a_tick(self) -> Settings:
-        """Reject a deferral cooldown shorter than one supervisor tick.
+        """Reject a deferral cooldown shorter than two supervisor ticks.
 
         The selector compares a deferred task's ``next_eligible_at`` with the
-        clock once a tick, and nothing wakes the supervisor for it. A shorter
-        cooldown therefore cannot mean what it says: a still-blocked task is
-        re-dispatched, its hook re-run and its slot held, every tick.
+        clock once a tick, and nothing wakes the supervisor for it. A deferral
+        is stamped just after a selection; the next selection comes one poll
+        interval later plus that tick's own work (the usage capture among
+        it). A cooldown of one interval has passed by then, so a
+        still-blocked task would be re-dispatched, its hook re-run and its
+        slot held, every tick. Two intervals make it skip at least one tick
+        while a tick's work stays under one interval. Unlike
+        ``max_reading_age_s``, this does not scale with the accounts: every
+        tick's selection checks every deferred task.
         """
         cooldown_s = self.failure_classifier.deferral_recheck_cooldown_s
         poll_s = self.usage.poll_interval_s
-        if cooldown_s < poll_s:
+        if cooldown_s < 2 * poll_s:
             raise ValueError(
-                f"[failure_classifier].deferral_recheck_cooldown_s = {cooldown_s:g} s is under "
-                f"one supervisor tick, [usage].poll_interval_s = {poll_s:g} s. Deferred tasks "
-                "are checked once a tick, so a shorter cooldown re-dispatches a still-blocked "
-                "task every tick. Raise deferral_recheck_cooldown_s or lower poll_interval_s."
+                f"[failure_classifier].deferral_recheck_cooldown_s = {cooldown_s:.10g} s is "
+                f"under two supervisor ticks, 2 x [usage].poll_interval_s {poll_s:.10g} s = "
+                f"{2 * poll_s:.10g} s. Deferred tasks are checked once a tick, so a shorter "
+                "cooldown re-dispatches a still-blocked task every tick. Raise "
+                "deferral_recheck_cooldown_s or lower poll_interval_s."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_reclaim_interval_spans_a_tick(self) -> Settings:
+        """Reject a worktree-reclaim interval shorter than one supervisor tick.
+
+        The supervisor checks whether the periodic pass is due once a tick,
+        so an ``interval_s`` of one tick already runs it every tick, and a
+        shorter one would quietly mean the same. Checked only while
+        ``periodic`` is on, since nothing reads the interval otherwise.
+        """
+        if not self.worktree_reclaim.periodic:
+            return self
+        interval_s = self.worktree_reclaim.interval_s
+        poll_s = self.usage.poll_interval_s
+        if interval_s < poll_s:
+            raise ValueError(
+                f"[worktree_reclaim].interval_s = {interval_s:.10g} s is under one supervisor "
+                f"tick, [usage].poll_interval_s = {poll_s:.10g} s. The pass is checked once a "
+                "tick, so a shorter interval runs it every tick. Raise interval_s or lower "
+                "poll_interval_s."
             )
         return self

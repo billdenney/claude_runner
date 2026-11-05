@@ -16,12 +16,16 @@ regardless of where the lines came from.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.config.schema import TaskCapsSettings
 from claude_task_runner.queue.schema import Task
-from claude_task_runner.runner.dispatcher import _dispatch_loop
+from claude_task_runner.runner.caps import CapViolation
+from claude_task_runner.runner.dispatcher import TerminateFailed, _CapKill, _dispatch_loop
 
 
 def _caps(*, max_tokens: int = 0, max_duration: float = 0.0, kill: float = 0.0) -> TaskCapsSettings:
@@ -165,3 +169,343 @@ def test_heartbeat_persist_fn_invoked() -> None:
     # First event always persists (no prior timestamp to rate-limit on).
     assert len(persists) == 1
     assert persists[0] == clock.now()
+
+
+def _kill_fails() -> None:
+    raise TerminateFailed("task pid 4242 survived SIGKILL")
+
+
+def test_a_cap_kill_that_raises_leaves_its_cap_with_the_caller() -> None:
+    """The kill raises out of the loop, and ``cap_kill`` still holds the cap
+    it was for, so the caller can record the run as killed by it."""
+    clock = FakeClock(datetime(2026, 6, 13, 12, 0, tzinfo=UTC))
+    cap_kill = _CapKill()
+
+    with pytest.raises(TerminateFailed):
+        _dispatch_loop(
+            lines=[_init(), _assistant(1_000_000, 0), _assistant(1_000_000, 0), _result()],
+            terminate=_kill_fails,
+            settings_caps=_caps(max_tokens=1_500_000),
+            clock=clock,
+            task=_task(),
+            started_at=clock.now(),
+            cap_kill=cap_kill,
+        )
+
+    assert cap_kill.violation == CapViolation(which="tokens", observed=2_000_000, cap=1_500_000)
+
+
+_START = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
+
+
+def _then(clock: FakeClock, *steps: str | float | None) -> Iterator[str | None]:
+    """Each step: a line to yield, ``None`` for a tick, or seconds the clock
+    moves on before the next step."""
+    for step in steps:
+        if isinstance(step, float):
+            clock.advance(step)
+        else:
+            yield step
+
+
+def _tool_progress() -> str:
+    """A ``tool_progress`` heartbeat, which claude writes every 30 s while a
+    tool runs. parse_lines yields no event for it."""
+    return json.dumps(
+        {
+            "type": "tool_progress",
+            "tool_name": "Bash",
+            "elapsed_time_seconds": 30,
+            "heartbeat": True,
+        }
+    )
+
+
+def _run(
+    steps: tuple[str | float | None, ...], caps: TaskCapsSettings
+) -> tuple[list[str], CapViolation | None]:
+    """Run the loop over ``steps`` from ``_START``: the kills it made and the
+    violation it returned."""
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+    _summary, violation = _dispatch_loop(
+        lines=_then(clock, *steps),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=caps,
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+    )
+    return terminated, violation
+
+
+def test_a_tick_after_silence_past_the_kill_stops_the_worker() -> None:
+    """With no line for longer than heartbeat_silence_kill_s, the next tick
+    kills the worker and records the silence as the duration cap it hit;
+    the loop reads no further."""
+    terminated, violation = _run((_init(), 901.0, None, _assistant(), _result()), _caps(kill=900.0))
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="duration", observed=901.0, cap=900.0)
+
+
+def test_a_tick_past_the_duration_cap_stops_a_worker_with_no_events() -> None:
+    """A worker that never writes a line still meets the duration cap."""
+    terminated, violation = _run((14401.0, None), _caps(max_duration=14400.0))
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="duration", observed=14401.0, cap=14400.0)
+
+
+def test_a_tick_within_both_limits_lets_the_loop_go_on() -> None:
+    terminated, violation = _run(
+        (_init(), 600.0, None, _result()), _caps(max_duration=14400.0, kill=900.0)
+    )
+
+    assert (terminated, violation) == ([], None)
+
+
+def test_a_tool_progress_line_is_no_silence() -> None:
+    """claude writes tool_progress while a long tool call runs. It is no
+    event, but it is a line, so the silence the kill measures starts again
+    from it."""
+    terminated, violation = _run(
+        (_init(), 600.0, _tool_progress(), 600.0, None, _result()), _caps(kill=900.0)
+    )
+
+    assert (terminated, violation) == ([], None)
+
+
+class _SettableClock:
+    """A wall clock a test sets, backwards too, as a system clock can be."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def now(self) -> datetime:
+        return self.at
+
+    def monotonic(self) -> float:
+        return 0.0
+
+
+def test_a_clock_stepped_back_trips_nothing() -> None:
+    """A wall clock set back before the start, at an event or at a tick, is
+    no silence and no duration: the loop neither raises nor kills."""
+    clock = _SettableClock(_START)
+
+    def _steps() -> Iterator[str | None]:
+        yield _init()
+        clock.at = _START - timedelta(seconds=10)
+        yield _assistant()
+        yield None
+        yield _result()
+
+    terminated: list[str] = []
+    _summary, violation = _dispatch_loop(
+        lines=_steps(),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(max_duration=1000.0, kill=900.0),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+    )
+
+    assert (terminated, violation) == ([], None)
+
+
+def test_a_silence_kill_that_raises_leaves_its_cap_with_the_caller() -> None:
+    """The silence kill records its duration cap before the kill too."""
+    clock = FakeClock(_START)
+    cap_kill = _CapKill()
+
+    with pytest.raises(TerminateFailed):
+        _dispatch_loop(
+            lines=_then(clock, _init(), 1000.0, None),
+            terminate=_kill_fails,
+            settings_caps=_caps(kill=900.0),
+            clock=clock,
+            task=_task(),
+            started_at=_START,
+            cap_kill=cap_kill,
+        )
+
+    assert cap_kill.violation == CapViolation(which="duration", observed=1000.0, cap=900.0)
+
+
+def test_the_session_is_recorded_once_when_claude_reports_it() -> None:
+    """The init event's session id goes to session_persist_fn at once, and
+    the events after it do not send it again."""
+    clock = FakeClock(_START)
+    recorded: list[str] = []
+
+    _dispatch_loop(
+        lines=[_init(), _assistant(), _assistant(), _result()],
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        session_persist_fn=recorded.append,
+    )
+
+    assert recorded == ["sess-loop"]
+
+
+def test_a_session_that_cannot_be_recorded_is_logged_and_the_loop_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock(_START)
+
+    def _fails(_session_id: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.runner.dispatcher"):
+        summary, violation = _dispatch_loop(
+            lines=[_init(), _assistant(), _result()],
+            terminate=lambda: None,
+            settings_caps=_caps(),
+            clock=clock,
+            task=_task(),
+            started_at=_START,
+            session_persist_fn=_fails,
+        )
+
+    assert (summary.session_id, summary.final_result is not None, violation) == (
+        "sess-loop",
+        True,
+        None,
+    )
+    assert [r.getMessage() for r in caplog.records] == [
+        "task t-loop: could not record session sess-loop in its running state "
+        "([Errno 28] No space left on device); the run records it when it ends"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# A backlog: the lines an adopted worker wrote before the loop started
+# ---------------------------------------------------------------------------
+
+
+class _Unread:
+    """Lines that record whether the loop asked for one."""
+
+    def __init__(self) -> None:
+        self.asked = False
+
+    def __iter__(self) -> _Unread:
+        return self
+
+    def __next__(self) -> str | None:
+        self.asked = True
+        raise StopIteration
+
+
+def test_the_backlog_fills_the_summary_but_stamps_no_heartbeat() -> None:
+    """The backlog's events fill the summary and record the session, but they
+    are the worker's past: the first heartbeat is the first line after them,
+    dated by the loop's clock."""
+    clock = FakeClock(_START)
+    persisted: list[datetime] = []
+    sessions: list[str] = []
+
+    summary, violation = _dispatch_loop(
+        lines=_then(clock, 120.0, _assistant(), _result()),
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        heartbeat_persist_fn=persisted.append,
+        session_persist_fn=sessions.append,
+        backlog=[_init(), _assistant(), _assistant()],
+        backlog_written_at=_START - timedelta(minutes=10),
+    )
+
+    assert violation is None
+    assert persisted == [_START + timedelta(seconds=120)]
+    assert sessions == ["sess-loop"]
+    assert (summary.cumulative_usage.input_tokens, summary.cumulative_usage.output_tokens) == (
+        30,
+        15,
+    )
+    assert summary.final_result is not None
+
+
+def test_a_backlog_of_bytes_is_parsed_as_the_tailer_would_decode_it() -> None:
+    """``_log_backlog`` gives bytes; an invalid UTF-8 line is skipped as drift."""
+    clock = FakeClock(_START)
+
+    summary, _violation = _dispatch_loop(
+        lines=[],
+        terminate=lambda: None,
+        settings_caps=_caps(),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        backlog=[_init().encode() + b"\n", b"\xff\xfe\n", _assistant().encode() + b"\n"],
+    )
+
+    assert (summary.session_id, summary.skipped_lines) == ("sess-loop", 1)
+    assert summary.cumulative_usage.input_tokens == 10
+
+
+def test_a_cap_the_backlog_is_past_stops_the_worker_before_a_new_line() -> None:
+    """A token cap the log so far exceeds stops the worker at once, and the
+    loop reads no line after the backlog."""
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+    lines = _Unread()
+
+    _summary, violation = _dispatch_loop(
+        lines=lines,
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(max_tokens=1_500_000),
+        clock=clock,
+        task=_task(),
+        started_at=_START,
+        backlog=[_init(), _assistant(1_000_000, 0), _assistant(1_000_000, 0), _assistant()],
+    )
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="tokens", observed=2_000_000, cap=1_500_000)
+    assert not lines.asked
+
+
+def test_the_silence_kill_counts_from_the_backlogs_last_write() -> None:
+    """An adopted worker last wrote 895 s before the loop started. Ten quiet
+    seconds later the silence is 905 s, past the 900 s kill threshold; from
+    the loop's start it would be 10 s."""
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+
+    _summary, violation = _dispatch_loop(
+        lines=_then(clock, 10.0, None),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(kill=900.0),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        backlog=[_init(), _assistant()],
+        backlog_written_at=_START - timedelta(seconds=895),
+    )
+
+    assert terminated == ["kill"]
+    assert violation == CapViolation(which="duration", observed=905.0, cap=900.0)
+
+
+def test_without_a_backlog_write_time_the_silence_runs_from_the_start() -> None:
+    clock = FakeClock(_START)
+    terminated: list[str] = []
+
+    _summary, violation = _dispatch_loop(
+        lines=_then(clock, 10.0, None, _result()),
+        terminate=lambda: terminated.append("kill"),
+        settings_caps=_caps(kill=900.0),
+        clock=clock,
+        task=_task(),
+        started_at=_START - timedelta(hours=1),
+        backlog=[_init(), _assistant()],
+    )
+
+    assert (terminated, violation) == ([], None)

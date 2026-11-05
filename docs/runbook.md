@@ -17,7 +17,16 @@ drift log.
 
 **Causes:** Anthropic changed the `/usage` TUI layout. Most common forms:
 field rename (`Resets` → `Resets at`), new section added, ANSI escape
-sequence variant.
+sequence variant. A message naming `rate-limit headers` comes from the
+API source, which an account reads alone under `[usage].source = "api"`,
+or under `"api_then_tty"` with a long-lived token; otherwise the API
+source's failure is an INFO `falling through to TTY` log line. It means a
+7d header is missing, only one of the two 5h headers came back, or a
+response without the 5h pair did not show that no 5-hour window applies:
+the message lists each check that failed. A response with the 7d pair, no
+header naming a 5-hour window, only windows the source knows, and a
+representative claim of another window (`seven_day`) is not drift: it
+reads as an account with no 5-hour window (ADR-0038).
 
 **Steps:**
 1. Get the raw output. With the TTY usage source, the capture that failed
@@ -74,6 +83,44 @@ failed readings rather than falling back to `claude /usage`.
    `claude-task-runner queue force-dispatch <task_id>` bypasses this check,
    as it bypasses the throttle.
 4. After changing `[[accounts]]`, restart the supervisor.
+
+## A usage capture says `claude` has no claude.ai login
+
+**Symptom:** `claude-task-runner usage --account <name> healthcheck` (or
+`render`, `json`, `capture`, `refresh`) fails within a few seconds, and the
+message says `claude for config dir <dir> bills as 'API Usage Billing', so
+/usage shows no plan limits: <dir>/.credentials.json holds no current
+claude.ai login. ...` (or `'Claude API'`). `healthcheck` exits 3, as for a
+spawn error. An account the supervisor reads through the TTY source enters
+`error_drift` with that message as its `Last drift:` line, and the log has
+one `notify[error]: usage login failed: ...` line.
+
+**Cause:** the TTY capture reads the plan's limits through the account's
+claude.ai login, which `claude` keeps in `<config_dir>/.credentials.json`.
+The welcome banner names API billing instead of the plan when that login is
+missing, or expired with no refresh token (`API Usage Billing`, usually with
+`Not logged in · Run /login`), or when `claude` runs on a credential that
+carries no subscription (`Claude API`). A `claude setup-token` token is one:
+it is for inference only, so the capture never uses `<config_dir>/oauth-token`
+and drops an inherited `CLAUDE_CODE_OAUTH_TOKEN` (ADR-0039). The dispatcher
+and the API source still use the token, so dispatch is unaffected.
+
+**Steps:**
+1. Confirm what the CLI sees, in a shell without the token variable:
+   `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<dir> claude auth status
+   --text`. `Login: Expired` or `Not logged in` is this case.
+2. Log in to the plan's claude.ai account (Max, Team, ...) for that config
+   dir: `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<dir> claude auth
+   login --claudeai`, or `/login` inside `claude` started the same way. For
+   the default `~/.claude` leave out `CLAUDE_CONFIG_DIR`. This rewrites
+   `<dir>/.credentials.json` and leaves `<dir>/oauth-token` as it is.
+3. Re-run the healthcheck; it prints `PASS 5h=...% weekly=...%`. An account
+   in `error_drift` leaves it after `[usage].drift_recovery_clean_polls`
+   clean readings.
+
+A later login to the same claude.ai account elsewhere can revoke this
+login's refresh token (the failure behind ADR-0021); the capture then
+reports this again, and step 2 repeats.
 
 ## Fewer tasks in flight than the accounts' caps allow
 
@@ -258,9 +305,15 @@ account file is broken"). A start refused because a file could not be read
 yet exits 1 and is retried. `install` writes
 those three from the queue's `[watchdog].restart_cooldown_s`,
 `[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
-(30 s, 5 and 600 s by default). After changing them, re-run
+(30 s, 5 and 600 s by default). The cron watchdog reads the cooldown only
+when cron runs it, once a minute, so under cron a cooldown under a minute
+acts as one minute. After changing them, re-run
 `claude-task-runner install`: it rewrites the unit and reloads systemd, and
 the next crash uses the new values without the supervisor being restarted.
+Until then `claude-task-runner doctor` warns under `watchdog_installed`,
+naming each directive of the installed unit that differs from what
+`install` would write now. It also warns when the unit runs another
+queue's supervisor or starts a binary that is no longer there.
 Read the exception with `journalctl --user -u claude-task-runner`. Once the
 cause is fixed, `systemctl --user reset-failed claude-task-runner` clears
 the start limit, and `systemctl --user start claude-task-runner` starts the
@@ -293,6 +346,13 @@ supervisor again.
 **Symptom:** A task's state shows `possibly_hung` and last_heartbeat is
 N hours old.
 
+A supervisor may still be monitoring the worker of a task the per-tick
+reaper parked as `worker_still_running` (its monitor fell silent long
+enough for the reaper to judge it so). The task then stays parked until
+the worker exits, and its run is recorded as usual: the monitor does not
+write it back to `running`. Step 1 shows whether the worker is still
+making progress.
+
 **Steps:**
 1. Read `<queue>/.claude_task_runner/logs/<id>/attempt-N.stream.jsonl` —
    does it show partial progress, or is it truly silent?
@@ -301,8 +361,13 @@ N hours old.
    an API call. Kill it: `kill <pid>`.
 3. The runner will mark the task `failed` (environmental); on next tick
    the supervisor will dispatch via `--resume <session_id>` automatically.
-4. If hangs are common, reduce `task_caps.heartbeat_silence_kill_s` from
-   default 0 (off) to e.g. 600 to auto-kill silent tasks.
+4. If hangs are common, set `task_caps.heartbeat_silence_kill_s` (default
+   0, off) to e.g. 600. The dispatcher then stops a worker that writes no
+   stream output for that long, checking every 10 s (ADR-0037). A long
+   tool call is not silence: claude writes a `tool_progress` line every
+   30 s while one runs. Whatever this is set to, a worker that writes
+   nothing at all is stopped at its duration cap
+   (`task_caps.max_duration_s_per_task`, 4 h by default).
 
 ## After a restart, a task is `failed` or `possibly_hung` while its worker still runs
 
@@ -324,8 +389,10 @@ worker when `[supervisor].adopt_workers` is off, and a worker no state
 records (found by its stream log) are parked as `worker_still_running`
 instead: a `failed` task would be dispatched again, and two workers in one
 worktree corrupt its branch. The same park happens when a dispatchable
-task turns out to have a worker still running. The supervisor reports each
-park (a `warning` notification and a `live_worker_parked` event).
+task turns out to have a worker still running, and when a worker cannot be
+stopped after its dispatch loop failed (see "A run failed with
+`dispatch_loop_error`"). The supervisor reports each park (a `warning`
+notification and a `live_worker_parked` event).
 
 While a `worker_still_running` worker runs it holds a slot of the account
 it runs on (`account list` counts it), and nothing dispatches its task. It
@@ -362,6 +429,95 @@ status.
    `failed` (`status: failed` in
    `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
    stopped) and the supervisor resumes its session.
+
+## A task's state file was quarantined at startup
+
+**Symptom:** the supervisor's log says
+`quarantined N corrupt state file(s) on startup: [...]`, with a `warning`
+notification (`corrupt-state quarantine: task <id> ...`) and a
+`corrupt_state_quarantined` event per task. The task's state file is now
+`<queue>/.claude_task_runner/state/.corrupt/<id>.<timestamp>.yaml`.
+
+**Cause:** at startup, before any other recovery pass, the supervisor moves
+every state file it cannot load into `state/.corrupt/` (ADR-0028), so that
+no pass skips the task forever. A file fails to load when a crash or power
+loss truncated it, when a hand edit broke it, or when it records a value no
+process or date can hold: a `pid` (the task's or a run's) below 1 or above
+2147483647, the C `pid_t` maximum, or an integer of more than 4300 digits.
+The runner never writes such a value; only a hand edit or bit rot does. The
+quarantine then decides the task from what it can still read at the head of
+the file:
+
+- A `completed` task gets a minimal state that keeps `completed`, so its
+  finished work is not redone. Its runs and session id are not kept.
+- A task whose worker still runs (the recorded worker, or a process writing
+  the task's stream log) is parked `possibly_hung` with that worker on
+  record (see the section above), so no second worker starts.
+- Any other task has no state, reverts to pending and runs again from the
+  start, even if its last worker had finished: the quarantined file's
+  record of that run is not read.
+
+**Steps:**
+1. The quarantined copy keeps the original bytes:
+   `ls <queue>/.claude_task_runner/state/.corrupt/`. Compare it with the
+   task's log, `<queue>/.claude_task_runner/logs/<id>/`, to see what the
+   last attempt did.
+2. To keep a task from running again (its work is done, say), stop the
+   supervisor, then look for `<queue>/.claude_task_runner/state/<id>.yaml`.
+   A task left without state can be dispatched on the supervisor's first
+   tick, so a file there is a new attempt's record. Do not move the copy
+   over it: with `[supervisor].adopt_workers` on (the default) that
+   attempt's worker keeps running after the supervisor stops, and its
+   record would be lost. Start the supervisor again and let the attempt
+   finish.
+3. With no such file, fix the copy, set its `status: completed`, move it
+   back to `<queue>/.claude_task_runner/state/<id>.yaml`, and start the
+   supervisor. A `pending` or `failed` copy is dispatched again. A
+   `running` one is settled at startup like any task whose worker is gone,
+   which runs it again unless its log ends in a successful result. A copy
+   moved back unfixed is quarantined again.
+
+## A run failed with `dispatch_loop_error`
+
+**Symptom:** a run in `claude-task-runner queue show <id>` has stop reason
+`dispatch_loop_error` and the error `dispatch loop raised <Exception>:
+<message>`. The supervisor log has an ERROR with a traceback, `task <id>:
+dispatch loop raised ...; stopping worker pid=<pid>`.
+
+**Cause:** the supervisor's loop that watches a worker raised: a bug in the
+runner, a clock step, a cap kill that could not confirm the worker died, or
+a monitor thread that could not start. Rather than leave the worker running
+unwatched, the supervisor stopped it and recorded the run as failed. The
+failure counts toward the circuit breaker, and the task is dispatched
+again. A worker that had already written its terminal result, or had
+exited on its own, keeps its own record instead, and one whose cap kill
+raised is recorded as killed by that cap.
+
+A worker the supervisor cannot stop may still be running, so no run is
+recorded: the task is parked `possibly_hung` with stop reason
+`worker_still_running`, as in the section above. The log says why the stop
+failed: `could not stop worker pid=<pid> after its dispatch loop failed`
+when the kill itself failed, or, for an adopted worker that outlived its
+SIGKILL, `subprocess leak: adopted worker pid=<pid> did not exit ...`.
+`queue force-dispatch` with no supervisor running prints `force-dispatch
+failed: ... could not be stopped and is parked` and exits 2.
+
+**Steps:**
+1. Read the traceback in the supervisor log, and report it: the loop is not
+   meant to raise.
+2. If several tasks fail this way in a row, stop the supervisor
+   (`systemctl --user stop claude-task-runner`) until the cause is fixed.
+   Each failure counts toward its task's circuit breaker, and a fault in
+   the loop fails every task it watches. Afterwards, set a task the breaker
+   stopped back to `status: pending` in
+   `<queue>/.claude_task_runner/state/<id>.yaml`, with the supervisor
+   stopped: no `queue` command resets a circuit breaker.
+3. For a parked worker, follow steps 1 and 2 of "After a restart, a task is
+   `failed` or `possibly_hung` while its worker still runs". A pipe-backed
+   worker (`[supervisor].adopt_workers` off, or `queue force-dispatch` with
+   no supervisor running) has a pipe as its stdout, not its log, so
+   `readlink /proc/<pid>/fd/1` prints `pipe:[...]`; `ps -o args= -p <pid>`
+   shows whether the pid is still a `claude` worker.
 
 ## Weekly throttled, no dispatch resuming
 
@@ -443,8 +599,10 @@ task that does not run.
      depends on a member waits under `depends_on`.
    - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
-     `next_eligible_at` printed below the reason has passed, the supervisor
-     tries the task again and runs the hook again.
+     `next_eligible_at` printed below the reason has passed
+     (`[failure_classifier].deferral_recheck_cooldown_s` after the deferral,
+     15 minutes by default), the supervisor tries the task again and runs
+     the hook again.
    - `cannot start the worker:` — the supervisor could not start `claude`
      for the task: the `claude` binary is not on PATH, the account's
      `config_dir` does not exist or names an unknown `~user`, `sudo` is
@@ -456,11 +614,16 @@ task that does not run.
      the circuit breaker is not fed. Fix the cause; the supervisor tries
      again once `next_eligible_at` has passed
      (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
-     default, and never less than `[usage].poll_interval_s`, since the
-     cooldown is checked once a tick), and the task runs.
+     default), and the task runs. The cooldown is checked once a tick, and
+     the next tick's selection comes a little more than one
+     `[usage].poll_interval_s` after the deferral, so the settings refuse a
+     cooldown under two poll intervals: one would have passed by then and
+     the task would be tried every tick.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
-     has none.
+     has none. Write the time in UTC with an offset
+     (`2026-10-15T12:00:00+00:00`): one with no offset never passes, and the
+     task is held as `next_eligible_at_without_timezone` until it is fixed.
 
 ## Nothing dispatches, but an account has room
 
@@ -533,8 +696,9 @@ not paused or throttled.
    - `next_eligible_at_without_timezone` — a `deferred` state whose
      `next_eligible_at` has no timezone, as a hand edit such as
      `2099-01-01T00:00:00` does. It cannot be compared with the clock, so the
-     task is held until the value is fixed, and every tick logs an ERROR
-     naming the state file. Timestamps are UTC: write it with an offset, e.g.
+     task is held until the value is fixed. The supervisor logs an ERROR
+     naming the state file once for each such value it reads, not every
+     tick. Timestamps are UTC: write it with an offset, e.g.
      `2099-01-01T00:00:00+00:00`. Other tasks dispatch as usual.
    - `invalid_effort` — see "A task stays `deferred`".
    - A status name (`possibly_hung`, `running`, `failed_circuit_breaker`,
@@ -885,7 +1049,9 @@ On 2026-09-25 the nlmixr2lib queue had 305 of them, holding 36 GB.
    ```
 
    Each pass removes at most `max_per_pass` worktrees, so clear a large
-   backlog with the CLI first. Task YAMLs are read from `todo/` and `done/`
+   backlog with the CLI first. A pass runs every `interval_s` (an hour by
+   default); the supervisor checks it once a tick, so the settings refuse
+   an `interval_s` under `[usage].poll_interval_s`. Task YAMLs are read from `todo/` and `done/`
    (`[worktree_reclaim].task_dirs`). A task whose YAML has moved anywhere else
    is invisible to the runner: add that directory to `task_dirs`, or remove
    its worktree by hand.

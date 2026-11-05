@@ -55,7 +55,7 @@ def _caps() -> TaskCapsSettings:
         max_duration_s_per_task=0,
         heartbeat_silence_alert_s=600,
         heartbeat_silence_kill_s=0,
-        dispatcher_alive_write_interval_s=600.0,
+        dispatcher_alive_write_interval_s=300.0,
     )
 
 

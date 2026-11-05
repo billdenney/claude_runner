@@ -1,12 +1,10 @@
-"""Tests for ``usage.capture._build_spawn_env`` (PR 15).
+"""Tests for ``usage.capture._build_spawn_env``.
 
-PR 14 added per-account long-lived OAuth tokens at
-``<config_dir>/oauth-token`` and wired them into ``ApiUsageSource``
-and ``dispatcher.py``. The TTY capture path in ``usage/capture.py``
-was missed: it spawned ``claude /usage`` with ``CLAUDE_CONFIG_DIR``
-but no ``CLAUDE_CODE_OAUTH_TOKEN``, so pure-tty ``[usage].source``
-deployments couldn't benefit from ``setup-token``. PR 15 closes
-that gap via the same helper pattern.
+The TTY capture must read the account's claude.ai login. Under
+``CLAUDE_CODE_OAUTH_TOKEN`` the CLI uses that token instead, and a
+``setup-token`` token cannot show the plan's limits in ``/usage``
+(ADR-0039), so the capture's environment never carries the variable:
+not from the account's ``oauth-token`` file, and not inherited.
 """
 
 from __future__ import annotations
@@ -23,14 +21,28 @@ from claude_task_runner.usage.drift import UsageCaptureSpawnError
 # ---------------------------------------------------------------------------
 
 
-def test_empty_config_dir_returns_none() -> None:
+def test_empty_config_dir_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """Empty ``claude_config_dir`` means "use the supervisor's env
     unchanged"; pexpect spawn's ``env=None`` triggers inheritance."""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     assert _build_spawn_env("") is None
 
 
+def test_empty_config_dir_drops_an_inherited_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config dir, the env is the supervisor's minus the token,
+    and no ``CLAUDE_CONFIG_DIR`` is added."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "inherited-value")
+    monkeypatch.setenv("FROM_SUPERVISOR_PROCESS", "sentinel-value")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    env = _build_spawn_env("")
+    assert env is not None
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert env["FROM_SUPERVISOR_PROCESS"] == "sentinel-value"
+
+
 # ---------------------------------------------------------------------------
-# Set config_dir without oauth-token: only CLAUDE_CONFIG_DIR is added.
+# Set config_dir: CLAUDE_CONFIG_DIR is added, the supervisor's env kept.
 # ---------------------------------------------------------------------------
 
 
@@ -50,35 +62,25 @@ def test_config_dir_inherits_supervisors_env(tmp_path: Path, monkeypatch) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Long-lived token: CLAUDE_CODE_OAUTH_TOKEN is added when oauth-token exists.
+# Long-lived token: never in the capture's environment.
 # ---------------------------------------------------------------------------
 
 
-def test_long_lived_token_exported_alongside_config_dir(tmp_path: Path) -> None:
+def test_long_lived_token_file_is_not_exported(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     (tmp_path / "oauth-token").write_text("sk-ant-oat01-LONG\n", encoding="utf-8")
     env = _build_spawn_env(str(tmp_path))
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-LONG"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
-def test_long_lived_token_overrides_any_inherited_value(tmp_path: Path, monkeypatch) -> None:
-    """If the supervisor itself was launched with
-    CLAUDE_CODE_OAUTH_TOKEN set (e.g. someone exported it for
-    development), the per-account file wins — that's what the
-    operator presumably intended by putting it under <config_dir>."""
+def test_inherited_token_is_dropped(tmp_path: Path, monkeypatch) -> None:
+    """A supervisor launched with CLAUDE_CODE_OAUTH_TOKEN set (exported for
+    development, say) must not pass it on: the CLI would prefer it to the
+    account's login, and the per-account file is not exported either."""
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "inherited-value")
     (tmp_path / "oauth-token").write_text("sk-ant-oat01-PERACCOUNT\n", encoding="utf-8")
-    env = _build_spawn_env(str(tmp_path))
-    assert env is not None
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-PERACCOUNT"
-
-
-def test_empty_long_lived_file_not_exported(tmp_path: Path) -> None:
-    """A half-written oauth-token file (read_long_lived_token returns
-    None for empty / whitespace-only) must not export an empty token
-    that would 401 the CLI."""
-    (tmp_path / "oauth-token").write_text("   \n", encoding="utf-8")
     env = _build_spawn_env(str(tmp_path))
     assert env is not None
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env

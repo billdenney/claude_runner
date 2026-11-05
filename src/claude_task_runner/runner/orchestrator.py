@@ -39,7 +39,6 @@ machine. The orchestrator returns the updated snapshot (with refreshed
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import threading
 from collections import Counter
@@ -49,9 +48,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
+from claude_task_runner.once import first_time
 from claude_task_runner.queue.schema import RunRecord, Task, TaskState
 from claude_task_runner.queue.sidecar import list_open_sidecars
 from claude_task_runner.queue.store import (
+    QueueIOError,
+    QueueSchemaError,
     iter_pending_tasks,
     iter_state_files,
     list_pending_tasks,
@@ -65,6 +67,7 @@ from claude_task_runner.runner import account_dispatch as account_dispatch_mod
 from claude_task_runner.runner import dispatcher as dispatcher_mod
 from claude_task_runner.runner import effort_levels as effort_levels_mod
 from claude_task_runner.runner import readiness as readiness_mod
+from claude_task_runner.runner.block_list import blocked_task_ids
 from claude_task_runner.runner.in_flight import DispatchSlot, to_in_flight_records
 from claude_task_runner.runner.session import plan_next_spawn
 from claude_task_runner.runner.spawn_gate import SpawnGate
@@ -1005,56 +1008,6 @@ def _clear_session_for_fresh_dispatch(queue_dir: Path, task_id: str) -> None:
         pass
 
 
-def _dispatch_blocked_task_ids(queue_dir: Path, block_file: str | None) -> set[str]:
-    """Return task ids an operator has flagged ``block_dispatch: true`` (ADR-0029).
-
-    ``block_file`` is the queue-relative path from
-    ``[dispatch].dispatch_block_file``; ``None`` / empty means the
-    feature is off, so this returns an empty set. The file is JSONL:
-    each line is parsed independently and contributes a task id only
-    when it is a JSON object with ``block_dispatch is True`` and a
-    non-empty string ``task``. Every other line — an index row, a
-    ``target_path`` re-acquisition row, a blank line, or malformed
-    JSON — is skipped, so a mixed-content block-list (the
-    ``needs_acquisition.jsonl`` convention carries all three kinds) is
-    read without acting on rows this selector shouldn't.
-
-    Fail-safe by construction: an unreadable file or an unparseable
-    line yields NO blocked id, so the affected task simply dispatches
-    and the pre-dispatch hook re-checks the block. A block-list problem
-    therefore *under*-blocks (a wasted defer at worst) rather than
-    *over*-blocking (stranding a runnable task) — the safe direction.
-    """
-    if not block_file:
-        return set()
-    path = queue_dir / block_file
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return set()
-    except OSError as exc:
-        logger.debug("dispatch block-list %s unreadable (%s); treating as empty", path, exc)
-        return set()
-
-    blocked: set[str] = set()
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except ValueError:
-            # A non-JSON / partially-written line is not a block entry;
-            # skip it (debug, not warning — the block file is expected
-            # to carry rows this reader deliberately ignores).
-            continue
-        if isinstance(entry, dict) and entry.get("block_dispatch") is True:
-            tid = entry.get("task")
-            if isinstance(tid, str) and tid:
-                blocked.add(tid)
-    return blocked
-
-
 def _is_parked_with(state: TaskState | None, reason: str) -> bool:
     """True iff ``state`` is already parked as ``deferred`` with exactly ``reason``."""
     return state is not None and state.status == "deferred" and state.deferred_reason == reason
@@ -1093,9 +1046,21 @@ def _park_deferred(
     costs one write each — not one per task per tick. ``attempts`` /
     ``runs`` are untouched: a hold is not an attempt and must never feed the
     circuit breaker.
+
+    A ``deferred`` state reaches a gate only once its own reason no longer
+    holds it: ``next_eligible_at`` has passed or was never set (a reason
+    written by hand without one is only a label). Its reason is then
+    replaced, so the one it had is logged at INFO rather than lost.
     """
     if _is_parked_with(state, reason):
         return  # already parked with this exact reason — no rewrite, no churn
+    if state is not None and state.status == "deferred" and state.deferred_reason:
+        logger.info(
+            "task %s: parked: %s (replaces deferred_reason: %s)",
+            task_id,
+            reason,
+            state.deferred_reason,
+        )
     base = state if state is not None else TaskState(task_id=task_id)
     new_state = base.model_copy(
         update={
@@ -1364,6 +1329,25 @@ def _is_unmeetable_dependency_reason(reason: str | None) -> bool:
     return reason is not None and reason.startswith(_UNMEETABLE_DEPENDENCY_PREFIX)
 
 
+def _warn_timezone_less_retry(task_id: str, state_file: Path, retry_at: datetime) -> None:
+    """Log, once per file and value, that ``task_id`` is held for ``retry_at``.
+
+    The selector reads every state on every tick and the hold writes
+    nothing, so each value is logged once per process, and again only once
+    it is changed.
+    """
+    if not first_time("timezone_less_retry", state_file, retry_at):
+        return
+    logger.error(
+        "holding task %s: %s: next_eligible_at %s has no timezone; write it with an "
+        "offset, e.g. %s if it was meant as UTC",
+        task_id,
+        state_file,
+        retry_at,
+        retry_at.replace(tzinfo=UTC).isoformat(),
+    )
+
+
 def _eligible_candidates(
     queue_dir: Path,
     in_flight_slots: Collection[str],
@@ -1384,7 +1368,8 @@ def _eligible_candidates(
     # ``now`` gates the re-check cooldown for `deferred` tasks; the
     # production caller (tick_dispatch) always passes ``clock.now()``.
     # When omitted (older unit tests that exercise non-deferred paths),
-    # a deferred task simply isn't cooldown-gated.
+    # a deferred task simply isn't cooldown-gated and its
+    # ``next_eligible_at`` is not read.
     #
     # ``effort_levels`` is the merged ``[effort_levels]`` table the effort
     # gate checks each task's (model, effort) against. Required, with no
@@ -1426,7 +1411,7 @@ def _eligible_candidates(
     # Operator-maintained dispatch block-list (ADR-0029, Part 2): task
     # ids flagged `block_dispatch: true`. Read once per call. Off (empty)
     # unless the queue set `[dispatch].dispatch_block_file`.
-    blocked_ids = _dispatch_blocked_task_ids(queue_dir, block_file)
+    blocked_ids = blocked_task_ids(queue_dir, block_file)
     if blocked_ids:
         logger.debug("dispatch block-list active: %d task(s) parked", len(blocked_ids))
 
@@ -1582,26 +1567,17 @@ def _skip_category(
                 # with a fresh cooldown. The cooldown is what keeps a
                 # still-blocked task from being re-picked every tick.
                 retry_at = state.next_eligible_at
-                if retry_at is not None and retry_at.utcoffset() is None:
-                    # A hand edit without an offset. Comparing it with the
-                    # aware clock raises TypeError, which would stop the
-                    # whole selector; guessing a zone could release the task
-                    # hours early or late. Hold just this task until fixed.
-                    logger.error(
-                        "holding task %s: %s: next_eligible_at %s has no timezone; "
-                        "write it in UTC with an offset, e.g. %s",
-                        task.id,
-                        sp,
-                        retry_at,
-                        retry_at.replace(tzinfo=UTC).isoformat(),
-                    )
-                    return _SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE
-                if (
-                    now is not None
-                    and state.next_eligible_at is not None
-                    and now < state.next_eligible_at
-                ):
-                    return _SKIP_DEFERRED_COOLDOWN
+                if now is not None and retry_at is not None:
+                    if retry_at.utcoffset() is None:
+                        # A hand edit without an offset. Comparing it with
+                        # the aware clock raises TypeError, which would stop
+                        # the whole selector; guessing a zone could release
+                        # the task hours early or late. Hold just this task
+                        # until fixed.
+                        _warn_timezone_less_retry(task.id, sp, retry_at)
+                        return _SKIP_NEXT_ELIGIBLE_AT_WITHOUT_TIMEZONE
+                    if now < retry_at:
+                        return _SKIP_DEFERRED_COOLDOWN
                 # cooldown elapsed (or unset) → fall through, re-attempt.
             elif state.status != "awaiting_sidecar":
                 # Any other non-dispatchable status (running,
@@ -1782,7 +1758,13 @@ class SelectionPreview:
     """The tasks it would admit, in dispatch order."""
     eligible_statuses: dict[str, str]
     """Each admitted task's state status, ``new`` when it has no state file
-    yet: an ``awaiting_sidecar`` task here has had every question answered."""
+    yet: an ``awaiting_sidecar`` task here has had every question answered.
+    A task in ``unread_states`` has none."""
+    unread_states: dict[str, str]
+    """Admitted tasks whose state no longer loads when the preview reads
+    its status (a hand edit since the selector read it, say), each with the
+    error. A state removed since makes the task ``new`` instead. The next
+    tick's selector skips a state that does not load."""
     routes: dict[str, str | None]
     """For each admitted task, the account a tick would dispatch it through
     now (:func:`_route`, session affinity and its TTL included), or ``None``
@@ -1866,12 +1848,18 @@ def preview_selection(
     accounts_by_name = {a.name: a for a in resolution.accounts}
     broken = {b.name: b.error for b in resolution.broken}
     statuses: dict[str, str] = {}
+    unread: dict[str, str] = {}
     routes: dict[str, str | None] = {}
     affinity_held: list[str] = []
     for task in eligible:
         sp = state_file_path(queue_dir, task.id)
-        # The selector loaded this state a moment ago, so it parses.
-        statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        # The selector parsed this state a moment ago; one rewritten since
+        # (a hand edit) is reported with its error rather than failing the
+        # whole preview.
+        try:
+            statuses[task.id] = load_state(sp).status if sp.exists() else "new"
+        except (QueueIOError, QueueSchemaError) as exc:
+            unread[task.id] = str(exc)
         choice = _route(
             task,
             queue_dir=queue_dir,
@@ -1898,6 +1886,7 @@ def preview_selection(
     return SelectionPreview(
         eligible=eligible,
         eligible_statuses=statuses,
+        unread_states=unread,
         routes=routes,
         affinity_held=affinity_held,
         skips=skips,
@@ -2032,6 +2021,7 @@ def _dispatch_one_safely(
                 getattr(getattr(settings, "supervisor", None), "adopt_workers", False)
             ),
             spawn_gate=spawn_gate,
+            on_park=on_park,
         )
     except Exception:
         logger.exception("dispatch failed for task %s", task.id)

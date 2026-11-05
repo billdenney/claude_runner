@@ -15,7 +15,7 @@ links to the decision log under [decisions/](decisions/) explain the
 | Pending sidecar questions | `/runner-answer-sidecar` skill or `claude-task-runner sidecar list` (counts per question, not per file — see `n_outstanding_questions`) |
 | Supervisor log (throttle / drift notices) | `journalctl --user -f -u claude-task-runner` under the systemd unit, or `tail -F <queue>/.claude_task_runner/supervisor.log` when the cron watchdog started the supervisor (see [where the log goes](architecture.md#supervisor-log-and-drift-evidence)) |
 | Parser drift | `claude-task-runner supervisor status` shows state `error_drift` and a `Last drift:` line; with the TTY usage source the capture that failed to parse is the newest `<queue>/.claude_task_runner/usage_captures/<ts>.cap` |
-| Usage capture failures (timeout / spawn) | Not logged at the default INFO level; set `[logging].level = "DEBUG"` to log `usage_capture_error` events, or reproduce with `claude-task-runner usage healthcheck` (exit 2 = timeout, or a usage error such as a queue of several accounts without `--account`; 3 = spawn error) |
+| Usage capture failures (timeout / spawn) | Not logged at the default INFO level; set `[logging].level = "DEBUG"` to log `usage_capture_error` events, or reproduce with `claude-task-runner usage healthcheck` (exit 2 = timeout, or a usage error such as a queue of several accounts without `--account`; 3 = spawn error, or `claude` has no claude.ai login for that config dir, which the message says, see the runbook) |
 
 ## Configuration precedence
 
@@ -117,7 +117,8 @@ The JSON snapshot includes `state`, `last_5h_util_pct`,
 `last_weekly_util_pct`, `target_concurrency` and `scheduled_wakeup_at` —
 the inputs and output of the most recent dispatch decision, `IDLE`
 included — and `last_reading_at`, when that decision's clean reading
-was taken.
+was taken. `last_5h_util_pct` is `null` when that reading reported no
+5-hour window, as the API does for an account with none (ADR-0038).
 
 On each transition the supervisor also emits `state_transition` /
 `throttled_5h_entry` / `throttled_weekly_entry` events whose payloads
@@ -276,10 +277,10 @@ out files that are already fully covered:
 pytest -m "not live" --cov --cov-report=term-missing:skip-covered
 ```
 
-The largest standing gap is `usage/capture.py`: its `capture()` drives
-the real `claude` TUI through pexpect, and the suite never spawns a real
-`claude`, so only the helpers around it are covered (callers mock
-`capture()` itself). The gate is set with that gap in place. Most other
+`usage/capture.py` drives the real `claude` TUI through pexpect, and the
+suite never spawns a real `claude`: `tests/unit/test_capture_tui.py` runs
+`capture()` against a stand-in child that replays recorded start-up
+screens, which reaches its main paths but not every failure branch. Most
 misses sit in I/O-heavy modules — chiefly the typer commands in
 `cli/*_cmd.py`, `runner/dispatcher` and `doctor/checks` — so new code
 there needs tests of its own to hold the total above the gate.

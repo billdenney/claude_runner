@@ -33,6 +33,9 @@ Migrates an older file one way at load time, one version at a time:
 * v7 → v8: only the version changes. The new ``policy_error`` field
   starts as ``None`` until the next tick reads each account's
   ``runner-account.toml``.
+* v8 → v9: only the version changes. ``last_5h_util_pct`` may now be
+  ``null``, for an account whose reading reports no 5-hour window
+  (ADR-0038); every v8 value is still valid.
 """
 
 from __future__ import annotations
@@ -244,6 +247,18 @@ def _migrate_v7_to_v8(payload: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v8_to_v9(payload: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade a v8 supervisor.json payload to v9.
+
+    v9 only lets ``last_5h_util_pct`` be ``null``, top level and in each
+    account; a v8 file holds an integer there, which is still valid.
+    Nothing else changes meaning.
+    """
+    migrated = dict(payload)
+    migrated["schema_version"] = 9
+    return migrated
+
+
 def load(path: Path) -> SupervisorSnapshot | None:
     """Read a persisted snapshot, or ``None`` if the file doesn't exist.
 
@@ -251,7 +266,7 @@ def load(path: Path) -> SupervisorSnapshot | None:
     can't be parsed — the daemon treats that as "fail loudly" rather
     than silently overwriting potentially-recoverable state.
 
-    An older file is migrated one way (v2 → v3 → ... → v8) before
+    An older file is migrated one way (v2 → v3 → ... → v9) before
     it is validated; the module docstring describes each step.
     """
     if not path.exists():
@@ -261,7 +276,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
             payload = json.load(fh)
     except OSError as exc:
         raise SupervisorPersistenceError(f"failed to read {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # JSONDecodeError, and the bare ValueErrors json raises for bytes that
+        # are not UTF-8 and for an integer past the interpreter's digit limit.
         raise SupervisorPersistenceError(f"{path}: invalid JSON: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -286,6 +303,9 @@ def load(path: Path) -> SupervisorSnapshot | None:
     if sv == 7:
         payload = _migrate_v7_to_v8(payload)
         sv = 8
+    if sv == 8:
+        payload = _migrate_v8_to_v9(payload)
+        sv = 9
     if sv != SUPERVISOR_SCHEMA_VERSION:
         raise SupervisorPersistenceError(
             f"{path}: schema_version={sv} does not match supported {SUPERVISOR_SCHEMA_VERSION}"

@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from claude_task_runner.claude_init import ensure_initialized
+from claude_task_runner.claude_init import FULLSCREEN_UPSELL_LIMIT, ensure_initialized
+
+from ._digit_limit import PAST_DIGIT_LIMIT
 
 
 def _write_claude_json(config_dir: Path, payload: dict[str, object]) -> Path:
@@ -21,7 +23,7 @@ def _write_claude_json(config_dir: Path, payload: dict[str, object]) -> Path:
 
 
 class TestEnsureInitializedFlagFlips:
-    def test_writes_both_flags_on_fresh_file(self, tmp_path: Path) -> None:
+    def test_writes_every_key_on_fresh_file(self, tmp_path: Path) -> None:
         cfg = tmp_path / "fresh-config"
         _write_claude_json(cfg, {"numStartups": 1})
         trust = tmp_path / "workspace"
@@ -33,6 +35,7 @@ class TestEnsureInitializedFlagFlips:
         data = json.loads((cfg / ".claude.json").read_text())
         assert data["hasCompletedOnboarding"] is True
         assert data["projects"][str(trust.resolve())]["hasTrustDialogAccepted"] is True
+        assert data["fullscreenUpsellSeenCount"] == 3
 
     def test_preserves_unrelated_keys(self, tmp_path: Path) -> None:
         cfg = tmp_path / "cfg"
@@ -101,6 +104,50 @@ class TestEnsureInitializedFlagFlips:
         assert str(link) not in data["projects"]
 
 
+class TestFullscreenUpsellCount:
+    """``fullscreenUpsellSeenCount`` is raised to the limit, never lowered."""
+
+    def _ready(self, tmp_path: Path, seen: object) -> tuple[Path, Path]:
+        cfg = tmp_path / "cfg"
+        trust = tmp_path / "workspace"
+        trust.mkdir()
+        _write_claude_json(
+            cfg,
+            {
+                "hasCompletedOnboarding": True,
+                "projects": {str(trust.resolve()): {"hasTrustDialogAccepted": True}},
+                "fullscreenUpsellSeenCount": seen,
+            },
+        )
+        return cfg, trust
+
+    def test_limit_matches_the_cli(self) -> None:
+        assert FULLSCREEN_UPSELL_LIMIT == 3
+
+    @pytest.mark.parametrize("seen", [0, 2, True, "3", "5", None, 2.5, 5.0])
+    def test_below_limit_or_not_a_count_is_set_to_the_limit(
+        self, tmp_path: Path, seen: object
+    ) -> None:
+        cfg, trust = self._ready(tmp_path, seen)
+
+        changed = ensure_initialized(cfg, trust)
+
+        assert changed is True
+        data = json.loads((cfg / ".claude.json").read_text())
+        assert data["fullscreenUpsellSeenCount"] == 3
+        assert type(data["fullscreenUpsellSeenCount"]) is int
+
+    @pytest.mark.parametrize("seen", [3, 7])
+    def test_at_or_above_limit_is_left_alone(self, tmp_path: Path, seen: int) -> None:
+        cfg, trust = self._ready(tmp_path, seen)
+        before = (cfg / ".claude.json").read_bytes()
+
+        changed = ensure_initialized(cfg, trust)
+
+        assert changed is False
+        assert (cfg / ".claude.json").read_bytes() == before
+
+
 class TestEnsureInitializedNoOps:
     def test_missing_claude_json_is_noop(self, tmp_path: Path) -> None:
         cfg = tmp_path / "fresh-no-claude-json"
@@ -124,6 +171,26 @@ class TestEnsureInitializedNoOps:
 
         assert changed is False
         assert (cfg / ".claude.json").read_text() == "{not-json"
+
+    @pytest.mark.parametrize(
+        "content",
+        [f'{{"n": {PAST_DIGIT_LIMIT}}}'.encode(), b"\xff{}"],
+        ids=["int-past-digit-limit", "not-utf8"],
+    )
+    def test_json_that_raises_a_bare_value_error_is_noop(
+        self, tmp_path: Path, content: bytes
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError."""
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / ".claude.json").write_bytes(content)
+        trust = tmp_path / "workspace"
+        trust.mkdir()
+
+        changed = ensure_initialized(cfg, trust)
+
+        assert changed is False
+        assert (cfg / ".claude.json").read_bytes() == content
 
     def test_non_dict_root_is_noop(self, tmp_path: Path) -> None:
         cfg = tmp_path / "cfg"
@@ -262,6 +329,7 @@ class TestEnsureInitializedAtomicity:
             {
                 "hasCompletedOnboarding": True,
                 "projects": {str(trust.resolve()): {"hasTrustDialogAccepted": True}},
+                "fullscreenUpsellSeenCount": 3,
             },
         )
         before = (cfg / ".claude.json").stat().st_mtime_ns

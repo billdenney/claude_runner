@@ -121,8 +121,10 @@ with a line saying what it shows and defining its terms:
   its settings file and any problem that stops it taking tasks; then the
   queue ceiling with its parts.
 - **Per-account state**, from supervisor.json's `accounts` map: state,
-  5h/weekly util, paused (read from the `account_paused/` markers, which
-  `supervisor.json` trails by a tick), in-flight count, throttle target,
+  5h/weekly util (5h "not reported" for an account whose usage reading
+  has no 5-hour window, ADR-0038), paused (read from the
+  `account_paused/` markers, which `supervisor.json` trails by a tick),
+  in-flight count, throttle target,
   reset + wakeup times, last-capture timestamp. The target is the most
   tasks dispatch lets the account run (below its `max_concurrency`): the
   ADR-0022 ramp while `slowing_down`, 0 while throttled, "—" when no
@@ -269,7 +271,8 @@ or recent failures), follow the prioritized triage flow below.
       `account list --json`'s `weekly_catch_up_at` ("resumes about …, when
       its weekly use falls back under plan"). `scheduled_wakeup_at` is
       only the supervisor's next re-check, clamped to the next 5-hour
-      reset, so never give it as the resume time.
+      reset when the account has a 5-hour window, so never give it as
+      the resume time.
 
    5. **5h throttle** — if `snapshot.state in ("throttled_5h",
       "slowing_down")`: print 5h utilization + state. For each
@@ -376,7 +379,10 @@ or recent failures), follow the prioritized triage flow below.
        - Anything else was written by hand or by another tool. The
          reason is only a label and does not hold the task. Once its
          `next_eligible_at` passes, or at the next tick if it has none,
-         the task can be dispatched again. If a gate holds it then, the
+         the task can be dispatched again. A `next_eligible_at` with no
+         offset never passes: the task is held as
+         `next_eligible_at_without_timezone` until the time is written in
+         UTC with an offset. If a gate holds it then, the
          gate's own reason replaces the hand-written one. List each task
          with its reason and `next_eligible_at`.
 
@@ -408,7 +414,8 @@ or recent failures), follow the prioritized triage flow below.
 
    12. **Healthy summary** — if none of the above, one terse line:
        "Supervisor (state) · 5h NN% · weekly NN% · pending K ·
-       in-flight M · ceiling C".
+       in-flight M · ceiling C", with "5h not reported" for an account
+       whose reading has no 5-hour window (never "5h 0%").
 
 3. **Don't auto-fix anything.** This skill is read-only. If the user
    wants action (resume a failed task, answer a sidecar, restart the

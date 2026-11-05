@@ -80,6 +80,12 @@ class UsageApiAuthExpired(UsageCaptureSpawnError):
 class UsageApiHeaderMissing(UsageFormatDrift):
     """The ``/v1/messages`` response was missing one of the documented headers.
 
+    Missing means a 7d header, or one of the two 5h headers without the
+    other. A response with neither 5h header is a reading with no 5-hour
+    window only when it shows that none applies: a representative claim
+    of another window, no header naming a 5-hour window, and no window
+    the source does not know. Otherwise it raises this too (ADR-0038).
+
     Also raised when a required header is present but its value cannot
     become a reading: unparseable, not finite, a utilization outside
     [0, 100] percent, or a reset timestamp ``datetime`` cannot represent.
@@ -100,4 +106,17 @@ class UsageApiNetworkError(UsageCaptureTimeout):
     Inherits from ``UsageCaptureTimeout`` so the daemon classifies it
     the same way as a slow TTY capture — observable as a transient
     failure rather than a structural one.
+    """
+
+
+class UsageCaptureLoginRequired(UsageApiAuthExpired):
+    """``claude`` in the account's config dir has no claude.ai plan login.
+
+    Raised by the TTY capture when the TUI's banner names API billing
+    (``Claude API`` or ``API Usage Billing``) instead of a plan: the CLI
+    then has no subscription to read, and ``/usage`` shows the session's
+    cost but not the plan's limit bars. Only an interactive ``/login`` for
+    that config dir fixes it, so it is an auth failure (``ErrorDrift``),
+    not a capture to retry; its message names ``.credentials.json``, one of
+    :data:`AUTH_FAILURE_MARKERS`. See ADR-0039.
     """
