@@ -100,6 +100,15 @@ def build_mixed_queue(qd: Path, missing_file: Path) -> None:
         next_eligible_at=NOW + timedelta(days=365),
     )
 
+    # A hand-edited retry time with no offset, unquoted, so YAML itself turns
+    # it into a datetime: the selector cannot compare it with the clock.
+    add_task(qd, "retry-no-timezone")
+    state_path_for(qd, "retry-no-timezone").write_text(
+        "schema_version: 2\ntask_id: retry-no-timezone\nstatus: deferred\n"
+        "deferred_reason: parked by hand\nnext_eligible_at: 2026-10-15 12:00:00\n",
+        encoding="utf-8",
+    )
+
     for status in ("running", "possibly_hung", "failed_circuit_breaker", "weekly_paused"):
         add_task(qd, f"status-{status}")
         add_state(qd, f"status-{status}", status)
@@ -171,6 +180,7 @@ MIXED_EXPECTED_SKIPS = Counter(
         "unparseable_state": 1,
         "unanswered_sidecar": 1,
         "deferred_cooldown": 1,
+        "next_eligible_at_without_timezone": 1,
         "running": 1,
         "possibly_hung": 1,
         "failed_circuit_breaker": 1,
@@ -202,6 +212,8 @@ MIXED_EXPECTED_UNMEETABLE = {
     ]
 }
 """The ``depends_on_unmeetable`` task and the circuit-broken task it names."""
+MIXED_EXPECTED_WITHOUT_TIMEZONE = {"retry-no-timezone": "2026-10-15T12:00:00"}
+"""The ``next_eligible_at_without_timezone`` task and its retry time, as written."""
 STALE_HOLDS = ("effort-fixed", "file-arrived")
 """The eligible tasks whose state still carries a gate's cleared hold."""
 

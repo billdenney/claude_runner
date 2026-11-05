@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -131,6 +131,7 @@ def adopt_running_workers(
     clock: Clock,
     in_flight_slots: dict[str, DispatchSlot],
     prior_in_flight: Sequence[InFlightRecord] = (),
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> list[AdoptionResult]:
     """Adopt HEALTHY restart-survivable workers; return what was adopted.
 
@@ -198,6 +199,7 @@ def adopt_running_workers(
         thread = threading.Thread(
             target=_adopt_one_safely,
             args=(task, state, queue_dir, clock, settings, account),
+            kwargs={"on_park": on_park},
             name=f"adopt-{state.task_id}",
             # Adoption only runs when adopt_workers is on, so the monitor
             # thread is always daemon: a fast stop abandons it and the
@@ -746,11 +748,14 @@ def _adopt_one_safely(
     clock: Clock,
     settings: Settings,
     account: str | None,
+    on_park: Callable[[TaskState, str], None] | None = None,
 ) -> None:
     """Thread entrypoint — monitor an adopted worker, log on error.
 
     Mirrors :func:`runner.orchestrator._dispatch_one_safely`: a crash in
-    one adoption thread must not take the supervisor down.
+    one adoption thread must not take the supervisor down. ``on_park``
+    receives a park :func:`runner.dispatcher.adopt_worker` makes, to be
+    reported at the next tick.
     """
     try:
         dispatcher_mod.adopt_worker(
@@ -763,6 +768,7 @@ def _adopt_one_safely(
             settings_hooks=settings.hooks,
             settings_failure_classifier=settings.failure_classifier,
             account=account,
+            on_park=on_park,
         )
     except Exception:
         logger.exception("adopt_worker failed for task %s", task.id)

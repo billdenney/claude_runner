@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,7 +29,11 @@ from claude_task_runner.queue.sidecar import (
 )
 from claude_task_runner.queue.store import QueueIOError, QueueSchemaError
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 from ._sidecar_files import write_request
+
+NOT_UTF8 = "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+"""What decoding the byte 0xff as UTF-8 says."""
 
 
 @pytest.fixture
@@ -142,6 +147,32 @@ class TestErrors:
         path.write_text("{not json")
         with pytest.raises(QueueSchemaError, match="invalid JSON"):
             read_request(path)
+
+    @pytest.mark.parametrize(
+        "reader", [read_request, load_sidecar_payload], ids=["read_request", "load_sidecar_payload"]
+    )
+    @pytest.mark.parametrize(
+        ("content", "error"),
+        [
+            pytest.param(
+                f'{{"task_id": {PAST_DIGIT_LIMIT}}}'.encode(),
+                digit_limit_error(),
+                id="int-past-digit-limit",
+            ),
+            pytest.param(b"\xff{}", NOT_UTF8, id="not-utf8"),
+        ],
+    )
+    def test_a_bare_value_error_from_json_is_a_schema_error(
+        self, queue_dir: Path, reader: Callable[[Path], object], content: bytes, error: str
+    ) -> None:
+        """json raises these as bare ValueErrors, not JSONDecodeError; the
+        sidecar listing catches only QueueIOError and QueueSchemaError."""
+        sidecar_dir_for(queue_dir, "001")
+        path = request_path(queue_dir, "001", 1)
+        path.write_bytes(content)
+        with pytest.raises(QueueSchemaError) as raised:
+            reader(path)
+        assert str(raised.value) == f"{path}: invalid JSON: {error}"
 
     def test_validation_failure_surfaces(self, queue_dir: Path) -> None:
         sidecar_dir_for(queue_dir, "001")
@@ -329,6 +360,15 @@ class TestUndecidableSidecarsFailLoud:
         assert len(items) == 1
         assert items[0].error is not None
         assert "invalid JSON" in items[0].error
+
+    def test_a_request_with_an_integer_past_the_digit_limit_is_open(self, queue_dir: Path) -> None:
+        sidecar_dir_for(queue_dir, "001")
+        path = request_path(queue_dir, "001", 1)
+        path.write_text(f'{{"task_id": "001", "sequence": {PAST_DIGIT_LIMIT}}}')
+        items = list(open_sidecars(queue_dir))
+        assert [(i.task_id, i.sequence, i.error) for i in items] == [
+            ("001", 1, f"{path}: invalid JSON: {digit_limit_error()}")
+        ]
 
     def test_question_without_an_id_is_open(self, queue_dir: Path) -> None:
         sidecar_dir_for(queue_dir, "001")

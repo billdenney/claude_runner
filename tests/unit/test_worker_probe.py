@@ -215,6 +215,23 @@ def test_unreadable_boot_time_skips_the_start_check(
     assert probe_worker(_PID, log_path=str(log), started_at=_STARTED) is WorkerProbe.ALIVE
 
 
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        pytest.param("btime 1790000000", datetime(2026, 9, 21, 14, 13, 20, tzinfo=UTC), id="valid"),
+        pytest.param("btime abc", None, id="not-a-number"),
+        pytest.param("btime 253402300800", None, id="past-year-9999"),
+        pytest.param("", None, id="no-btime-line"),
+    ],
+)
+def test_boot_time_reads_btime_and_refuses_what_no_datetime_can_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, line: str, expected: datetime | None
+) -> None:
+    (tmp_path / "stat").write_text(f"cpu  1 2 3 4\n{line}\nprocesses 99\n")
+    _use(monkeypatch, tmp_path)
+    assert dispatcher_mod._boot_time() == expected
+
+
 @pytest.mark.usefixtures("alive")
 def test_without_a_start_time_or_readable_stdout_existence_decides(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -47,6 +47,7 @@ from pathlib import Path
 import structlog
 
 from claude_task_runner.queue.sidecar import OpenSidecar, open_sidecars
+from claude_task_runner.runner.block_list import blocked_task_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -58,32 +59,11 @@ AUTO_GATE_STATUS = "AUTO_GATED"
 def already_gated(queue_dir: Path, block_file: str | None, task_id: str) -> bool:
     """True when ``task_id`` already has a ``block_dispatch: true`` row.
 
-    Mirrors the orchestrator's reader: every line is parsed independently
-    and a line that is blank, malformed, or not task-keyed contributes
-    nothing. An unreadable file reads as "not gated", which is the safe
-    direction here — the worst case is a duplicate row, not a lost gate.
+    Reads the file as the selector does (:func:`runner.block_list.blocked_task_ids`).
+    An unreadable file reads as "not gated", which is the safe direction
+    here: the worst case is a duplicate row, not a lost gate.
     """
-    if not block_file:
-        return False
-    try:
-        text = (queue_dir / block_file).read_text(encoding="utf-8")
-    except OSError:
-        return False
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except ValueError:
-            continue
-        if (
-            isinstance(entry, dict)
-            and entry.get("block_dispatch") is True
-            and entry.get("task") == task_id
-        ):
-            return True
-    return False
+    return task_id in blocked_task_ids(queue_dir, block_file)
 
 
 def unanswered_asks(queue_dir: Path, task_id: str) -> list[OpenSidecar]:
@@ -176,7 +156,7 @@ def ensure_terminal_gate(
     try:
         with (queue_dir / block_file).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         # Never fail a run that succeeded because the register could not be
         # appended to; the task simply stays ungated as it was before.
         logger.warning(

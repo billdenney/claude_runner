@@ -1194,6 +1194,7 @@ def start_daemon(
                 clock=clk,
                 in_flight_slots=in_flight_slots,
                 prior_in_flight=snapshot.in_flight,
+                on_park=parked_tracker.note_park,
             )
             adopted_ids = {a.task_id for a in adopted}
             for adoption in adopted:

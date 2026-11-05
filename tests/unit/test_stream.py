@@ -19,6 +19,8 @@ from claude_task_runner.runner.stream import (
     parse_lines,
 )
 
+from ._digit_limit import PAST_DIGIT_LIMIT
+
 SAMPLE_INIT = '{"type": "system", "subtype": "init", "session_id": "abc-123"}'
 SAMPLE_ASSISTANT = (
     '{"type": "assistant", "message": {"content": '
@@ -46,6 +48,10 @@ class TestParseLine:
 
     def test_malformed_returns_none(self) -> None:
         assert parse_line("{not json") is None
+
+    def test_an_integer_past_the_digit_limit_returns_none(self) -> None:
+        """json raises a bare ValueError for it, not JSONDecodeError."""
+        assert parse_line(f'{{"type": "result", "n": {PAST_DIGIT_LIMIT}}}') is None
 
     def test_top_level_array_returns_none(self) -> None:
         assert parse_line("[1, 2, 3]") is None

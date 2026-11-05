@@ -27,8 +27,10 @@ from claude_task_runner.cli.install_skills_cmd import SKILL_NAMES, SkillState
 from claude_task_runner.cli.install_skills_cmd import app as install_skills_app
 from claude_task_runner.config.loader import load_settings
 from claude_task_runner.config.schema import AccountSettings, Settings
+from claude_task_runner.cron import systemd_unit as systemd_mod
 from claude_task_runner.cron.registry import queues_registry_path, register_queue
 from claude_task_runner.doctor.checks import (
+    CheckResult,
     CheckStatus,
     _current_username,
     _extract_paths,
@@ -67,6 +69,7 @@ from claude_task_runner.supervisor.persistence import (
 from claude_task_runner.supervisor.pidfile import acquire_global_lock
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
 from ._fs_faults import unsearchable
 from ._skill_installs import make
 
@@ -493,6 +496,63 @@ def test_check_dispatch_pct_legacy_per_account_with_throttle_fails(
     result = check_dispatch_pct_legacy(s, queue_dir)
     assert result.status == CheckStatus.FAIL
     assert str(cfg_dir / "runner-account.toml") in result.remediation
+
+
+def test_check_dispatch_pct_legacy_passes_over_a_toml_that_does_not_load(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """tomllib raises a bare ValueError for an integer past the digit limit.
+    check_account_policies reports that file; this check passes over it."""
+    from claude_task_runner.doctor.checks import check_account_policies, check_dispatch_pct_legacy
+
+    cfg_dir = tmp_path / "personal"
+    cfg_dir.mkdir()
+    path = cfg_dir / "runner-account.toml"
+    path.write_text(f"[concurrency]\nmax_concurrency = {PAST_DIGIT_LIMIT}\n", encoding="utf-8")
+    s = _set_accounts(settings, [AccountSettings(name="personal", config_dir=str(cfg_dir))])
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+    policies = check_account_policies(s)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 0 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
+    )
+    assert (policies.status, policies.remediation) == (
+        CheckStatus.FAIL,
+        f"personal: Invalid TOML in {path}: {digit_limit_error()}",
+    )
+
+
+def test_check_dispatch_pct_legacy_counts_only_the_tomls_it_read(
+    settings: Settings, queue_dir: Path, tmp_path: Path
+) -> None:
+    """Of two account files, one loads and one does not: the detail counts
+    the one it read and says it left the other out."""
+    from claude_task_runner.doctor.checks import check_dispatch_pct_legacy
+
+    good = tmp_path / "personal"
+    good.mkdir()
+    (good / "runner-account.toml").write_text("[concurrency]\nmax_concurrency = 2\n")
+    bad = tmp_path / "work"
+    bad.mkdir()
+    (bad / "runner-account.toml").write_text("[concurrency\n")
+    s = _set_accounts(
+        settings,
+        [
+            AccountSettings(name="personal", config_dir=str(good)),
+            AccountSettings(name="work", config_dir=str(bad)),
+        ],
+    )
+
+    legacy = check_dispatch_pct_legacy(s, queue_dir)
+
+    assert (legacy.status, legacy.detail) == (
+        CheckStatus.PASS,
+        "no legacy [throttle.*] blocks across 1 TOML(s); 1 that did not load left out "
+        "(account_policies reports them)",
+    )
 
 
 def test_check_dispatch_pct_legacy_dispatch_pct_block_passes(
@@ -1036,6 +1096,23 @@ def test_check_state_yamls_invalid_file(settings: Settings, queue_dir: Path) -> 
     assert result.status == CheckStatus.FAIL
 
 
+def test_check_state_yamls_flags_a_pid_past_the_digit_limit(
+    settings: Settings, queue_dir: Path
+) -> None:
+    """The check reports the file instead of dying on its ValueError."""
+    state_dir = queue_dir / ".claude_task_runner" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "huge.yaml").write_text(
+        f"schema_version: 2\ntask_id: huge\npid: {PAST_DIGIT_LIMIT}\n", encoding="utf-8"
+    )
+    result = check_state_yamls(settings, queue_dir)
+    assert (result.status, result.detail, result.remediation) == (
+        CheckStatus.FAIL,
+        "1 of 1 state YAMLs invalid",
+        f"huge.yaml: {state_dir / 'huge.yaml'}: invalid YAML: {digit_limit_error()}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # check_orphaned_sessions (ADR-0024)
 # ---------------------------------------------------------------------------
@@ -1291,18 +1368,119 @@ def test_check_skills_installed_reports_broken_and_unchecked_together(
 # ---------------------------------------------------------------------------
 
 
-def test_check_watchdog_systemd_present(
-    settings: Settings, tmp_path: Path, queue_dir: Path
-) -> None:
-    fake_unit = tmp_path / "claude-task-runner.service"
-    fake_unit.write_text("[Unit]\n", encoding="utf-8")
+def _systemd_unit(
+    tmp_path: Path, settings: Settings, queue_dir: Path, *, exe: Path | None = None
+) -> tuple[Path, Path]:
+    """A unit as ``install`` writes it for ``queue_dir`` and ``settings``,
+    starting an executable stand-in for ``claude-task-runner``."""
+    if exe is None:
+        exe = tmp_path / "bin" / "claude-task-runner"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_text("#!/bin/sh\n", encoding="utf-8")
+        exe.chmod(0o755)
+    unit = tmp_path / "claude-task-runner.service"
+    unit.write_text(
+        systemd_mod.build_unit_text(
+            supervisor_command=f"{exe} supervisor start --queue {queue_dir}",
+            queue_dir=queue_dir,
+            watchdog=settings.watchdog,
+            task_caps=settings.task_caps,
+            adopt_workers=settings.supervisor.adopt_workers,
+        ),
+        encoding="utf-8",
+    )
+    return unit, exe
+
+
+def _systemd_check(settings: Settings, queue_dir: Path, unit: Path) -> CheckResult:
     with patch(
         "claude_task_runner.doctor.checks.systemd_mod.systemd_unit_path",
-        return_value=fake_unit,
+        return_value=unit,
     ):
-        result = check_watchdog_installed(settings, queue_dir)
-    assert result.status == CheckStatus.PASS
-    assert result.detail == "systemd watchdog detected"
+        return check_watchdog_installed(settings, queue_dir)
+
+
+def test_check_watchdog_systemd_unit_that_matches(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit, _exe = _systemd_unit(tmp_path, settings, queue_dir)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert (result.status, result.detail) == (
+        CheckStatus.PASS,
+        f"systemd unit runs this queue's supervisor and matches its settings ({unit})",
+    )
+
+
+def test_check_watchdog_systemd_unit_from_older_settings(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    """A [watchdog] or [task_caps] change since the install is named."""
+    older = settings.model_copy(
+        update={"watchdog": settings.watchdog.model_copy(update={"restart_cooldown_s": 90.0})}
+    )
+    unit, _exe = _systemd_unit(tmp_path, older, queue_dir)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} differs from what install would write now for this queue's "
+        "settings: RestartSec"
+    )
+    assert result.remediation == (
+        f"Re-run `claude-task-runner install --queue {queue_dir.resolve()}`. If doctor read "
+        "another claude_runner.toml than the unit's --config, run doctor with that --config."
+    )
+
+
+def test_check_watchdog_systemd_unit_for_another_queue(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    other = tmp_path / "other-q"
+    other.mkdir()
+    unit, _exe = _systemd_unit(tmp_path, settings, other)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} runs the supervisor for {other}, not this queue, so nothing "
+        "restarts this queue's supervisor"
+    )
+
+
+def test_check_watchdog_systemd_unit_whose_binary_is_gone(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    """A unit left by a removed install points at a binary that is not there."""
+    gone = tmp_path / "old-venv" / "bin" / "claude-task-runner"
+    unit, _exe = _systemd_unit(tmp_path, settings, queue_dir, exe=gone)
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} starts {gone}, which is not an executable file, so the unit "
+        "cannot start the supervisor"
+    )
+
+
+def test_check_watchdog_systemd_unit_without_a_command(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit = tmp_path / "claude-task-runner.service"
+    unit.write_text("[Unit]\n", encoding="utf-8")
+    result = _systemd_check(settings, queue_dir, unit)
+    assert (result.status, result.detail) == (
+        CheckStatus.WARN,
+        f"systemd unit {unit} has no ExecStart or no WorkingDirectory",
+    )
+
+
+def test_check_watchdog_systemd_unit_that_cannot_be_read(
+    settings: Settings, tmp_path: Path, queue_dir: Path
+) -> None:
+    unit = tmp_path / "claude-task-runner.service"
+    unit.mkdir()
+    result = _systemd_check(settings, queue_dir, unit)
+    assert result.status == CheckStatus.WARN
+    assert result.detail == (
+        f"systemd unit {unit} cannot be read: [Errno 21] Is a directory: '{unit}'"
+    )
 
 
 def test_check_watchdog_none(settings: Settings, tmp_path: Path, queue_dir: Path) -> None:
@@ -1476,15 +1654,13 @@ def test_check_watchdog_systemd_unit_skips_the_cron_registry(
     settings: Settings, tmp_path: Path, queue_dir: Path, watchdog_home: Path
 ) -> None:
     """systemd restarts its own unit, so the cron registry is not consulted."""
-    fake_unit = tmp_path / "claude-task-runner.service"
-    fake_unit.write_text("[Unit]\n", encoding="utf-8")
+    fake_unit, _exe = _systemd_unit(tmp_path, settings, queue_dir)
     registry = queues_registry_path()
     registry.parent.mkdir(parents=True)
     registry.write_text("{not json", encoding="utf-8")
     with _watchdog_probes(fake_unit):
         result = check_watchdog_installed(settings, queue_dir)
     assert result.status == CheckStatus.PASS
-    assert result.detail == "systemd watchdog detected"
 
 
 UNREGISTER_HEADER = "Register a queue that moved at its new path. Drop one that is gone for good:"

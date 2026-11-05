@@ -13,9 +13,8 @@ Covers the wiring (not ``adopt_worker``'s own logic — that's in
   worker's task is demoted (the legacy behaviour), and a live one's is
   parked ``possibly_hung``, so no second worker is dispatched beside it;
 * a worker that exited while no supervisor ran, leaving a terminal
-  ``result`` event in its log, is recorded from the log (the 2026-09-26
-  restart incident) whatever its heartbeat age; one that left no result
-  event is still demoted, as before;
+  ``result`` event in its log, is recorded from the log whatever its
+  heartbeat age; one that left no result event is still demoted;
 * against real worker processes and the host's ``/proc`` (the 2026-10-16
   restart incident): a worker in a long tool call, whose agent heartbeat
   is minutes old, is adopted and finalized from its log; one with no sign
@@ -32,9 +31,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import shutil
 import signal
-import tempfile
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -56,6 +53,7 @@ from claude_task_runner.queue.store import (
     write_task_atomic,
 )
 from claude_task_runner.runner import dispatcher as dispatcher_mod
+from claude_task_runner.supervisor import adoption as adoption_mod
 from claude_task_runner.supervisor import persistence as persist_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.reconcile import LIVE_WORKER_STOP_REASON, ORPHAN_STOP_REASON
@@ -138,6 +136,35 @@ def _run_daemon(
         max_ticks=0,
     )
     return notifications, events
+
+
+def test_daemon_hands_startup_adoption_the_park_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An adopted worker's monitor that parks its worker reports the park to
+    the tracker the ticks drain and report, as every other park is."""
+    qd = _queue(tmp_path)
+    trackers: list[adoption_mod.ParkedWorkerTracker] = []
+
+    class _Tracker(adoption_mod.ParkedWorkerTracker):
+        def __init__(self) -> None:
+            super().__init__()
+            trackers.append(self)
+
+    calls: list[dict[str, object]] = []
+
+    def _adopt(*_args: object, **kwargs: object) -> list[object]:
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(adoption_mod, "ParkedWorkerTracker", _Tracker)
+    monkeypatch.setattr(adoption_mod, "adopt_running_workers", _adopt)
+
+    _run_daemon(qd, _settings(adopt=True), monkeypatch)
+
+    [tracker] = trackers
+    [kwargs] = calls
+    assert kwargs["on_park"] == tracker.note_park
 
 
 def test_daemon_adopts_healthy_worker_and_shields_from_demotion(
@@ -235,7 +262,7 @@ def test_daemon_kill_switch_adopts_nothing(
 
 
 # ---------------------------------------------------------------------------
-# A worker that exited while no supervisor ran (2026-09-26 restart incident)
+# A worker that exited while no supervisor ran
 # ---------------------------------------------------------------------------
 
 _EXITED_PID = 4101117
@@ -297,12 +324,11 @@ def _seed_exited(qd: Path, task_id: str, lines: list[str], *, heartbeat_age: tim
 @pytest.mark.parametrize(
     "heartbeat_age",
     [
-        # The incident: the new supervisor started ~70 s after the old one
-        # stopped, inside the 300 s alert window, so reconcile_orphans
-        # demoted the finished task to failed for a re-dispatch.
+        # Inside the 300 s alert window, where reconcile_orphans would
+        # demote an unrecorded task to failed for a re-dispatch.
         pytest.param(timedelta(seconds=70), id="restart-inside-alert-window"),
-        # A longer gap: the silent-orphan reaper would park the finished
-        # task possibly_hung for the operator instead.
+        # Past it, where the silent-orphan reaper would park it
+        # possibly_hung for the operator.
         pytest.param(timedelta(hours=1), id="restart-past-alert-window"),
     ],
 )
@@ -616,76 +642,50 @@ def test_daemon_starts_with_an_out_of_range_task_pid(
     _seed_exited(qd, "t-pid", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70))
     path = state_path_for(qd, "t-pid")
     path.write_text(path.read_text().replace(f"pid: {_EXITED_PID}\n", f"pid: {pid}\n"))
+    original = path.read_bytes()
 
     _notifications, events = _run_daemon(qd, _settings(adopt=True), monkeypatch)
 
     assert not path.exists()
-    assert [
-        (p["task_id"], p["preserved_status"]) for k, p in events if k == "corrupt_state_quarantined"
-    ] == [("t-pid", None)]
-
-
-def _far_future_mtime_dir(tmp_path: Path) -> Path:
-    """A directory whose filesystem stores an mtime past year 9999 as given.
-
-    ext4 clamps a far-future mtime to year 2446, so the queue goes on tmpfs
-    (``/dev/shm``), which keeps 64-bit seconds; skipped where neither works.
-    """
-    shm = Path("/dev/shm")
-    if shm.is_dir() and os.access(shm, os.W_OK):
-        root = Path(tempfile.mkdtemp(dir=shm, prefix="ctr-mtime-"))
-        probe = root / "probe"
-        probe.write_text("x")
-        os.utime(probe, (253402300800, 253402300800))
-        if probe.stat().st_mtime == 253402300800:
-            probe.unlink()
-            return root
-        shutil.rmtree(root)
-    pytest.skip("no writable filesystem here stores an mtime past year 9999")
+    quarantined = [p for k, p in events if k == "corrupt_state_quarantined"]
+    assert [(p["task_id"], p["preserved_status"]) for p in quarantined] == [("t-pid", None)]
+    assert Path(str(quarantined[0]["quarantined_path"])).read_bytes() == original
 
 
 def test_daemon_starts_with_a_worker_log_mtime_past_year_9999(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    far_future_mtime_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The startup silent-orphan reaper reads each running worker's log
     mtime as a sign of life. One no datetime can hold (past year 9999,
     possible on tmpfs) must not crash startup: it is no sign of life, and
     the task is handled on the others."""
-    root = _far_future_mtime_dir(tmp_path)
-    try:
-        qd = _queue(root)
-        log = _seed_exited(qd, "t-mtime", [_INIT, _ASSISTANT], heartbeat_age=timedelta(seconds=70))
-        os.utime(log, (253402300800, 253402300800))
-        monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+    qd = _queue(far_future_mtime_dir)
+    log = _seed_exited(qd, "t-mtime", [_INIT, _ASSISTANT], heartbeat_age=timedelta(seconds=70))
+    os.utime(log, (253402300800, 253402300800))
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
 
-        _run_daemon(qd, _settings(adopt=True), monkeypatch)
+    _run_daemon(qd, _settings(adopt=True), monkeypatch)
 
-        reloaded = load_state(state_path_for(qd, "t-mtime"))
-        assert (reloaded.status, reloaded.stop_reason) == ("failed", ORPHAN_STOP_REASON)
-    finally:
-        shutil.rmtree(root)
+    reloaded = load_state(state_path_for(qd, "t-mtime"))
+    assert (reloaded.status, reloaded.stop_reason) == ("failed", ORPHAN_STOP_REASON)
 
 
 def test_daemon_records_an_exited_worker_whose_log_mtime_is_past_year_9999(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    far_future_mtime_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The exited-worker finalize dates the run by its log's last write. An
     mtime no datetime can hold dates it at now, like any mtime after now,
     and the finished run is still recorded rather than left for the
     demotion as a failed finalize."""
-    root = _far_future_mtime_dir(tmp_path)
-    try:
-        qd = _queue(root)
-        log = _seed_exited(
-            qd, "t-mtime-done", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70)
-        )
-        os.utime(log, (253402300800, 253402300800))
-        monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
+    qd = _queue(far_future_mtime_dir)
+    log = _seed_exited(
+        qd, "t-mtime-done", [_INIT, _ASSISTANT, _SUCCESS], heartbeat_age=timedelta(seconds=70)
+    )
+    os.utime(log, (253402300800, 253402300800))
+    monkeypatch.setattr(dispatcher_mod, "_pid_alive", lambda _pid: False)
 
-        _run_daemon(qd, _settings(adopt=True), monkeypatch)
+    _run_daemon(qd, _settings(adopt=True), monkeypatch)
 
-        reloaded = load_state(state_path_for(qd, "t-mtime-done"))
-        assert reloaded.status == "completed"
-        assert [run.finished_at for run in reloaded.runs] == [_NOW]
-    finally:
-        shutil.rmtree(root)
+    reloaded = load_state(state_path_for(qd, "t-mtime-done"))
+    assert reloaded.status == "completed"
+    assert [run.finished_at for run in reloaded.runs] == [_NOW]

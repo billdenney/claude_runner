@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from claude_task_runner.config.loader import CONFIG_ERROR_EXIT_STATUS, load_settings
-from claude_task_runner.config.schema import MAX_DURATION_S, TaskCapsSettings, WatchdogSettings
+from claude_task_runner.config.schema import (
+    MAX_DURATION_S,
+    REAPER_THRESHOLD_FLOORS,
+    TaskCapsSettings,
+    WatchdogSettings,
+)
 from claude_task_runner.cron.systemd_unit import (
     _SYSTEMD_MAX_UNSIGNED,
     _SYSTEMD_MAX_WHOLE_SECONDS,
@@ -24,10 +29,12 @@ from claude_task_runner.cron.systemd_unit import (
     apply_plan,
     build_install_plan,
     build_unit_text,
+    changed_directives,
     changed_start_directives,
     is_systemd_user_available,
     is_unit_active,
     uninstall,
+    unit_exec_start,
     unit_queue,
 )
 
@@ -442,9 +449,13 @@ class TestDrainStopTimeout:
         Walks the schema, so a key added to ``[task_caps]`` later is checked
         here too."""
         before = _drain_unit(_CAPS).splitlines()
+        intervals = {threshold: interval for threshold, interval, _ in REAPER_THRESHOLD_FLOORS}
         seen = []
         for key, default in _CAPS.model_dump().items():
             other = (not default) if isinstance(default, bool) else default * 2 + 1
+            if key in intervals:
+                # A reaper threshold must span two of its write intervals.
+                other = max(other, 2 * getattr(_CAPS, intervals[key]))
             after = _drain_unit(_task_caps(**{key: other})).splitlines()
             changed = [(old, new) for old, new in zip(before, after, strict=True) if old != new]
             if key == "max_duration_s_per_task":
@@ -927,6 +938,45 @@ class TestChangedStartDirectives:
         new = _unit_for("/q", watchdog=_DEFAULTS)
         old = "# ExecStart=/elsewhere\n; WorkingDirectory=/elsewhere\n" + new
         assert changed_start_directives(old, new) == []
+
+
+class TestChangedDirectives:
+    def test_same_unit(self) -> None:
+        text = _unit_for("/q", watchdog=_DEFAULTS)
+        assert changed_directives(text, text) == []
+
+    def test_every_changed_directive_is_named(self) -> None:
+        """Unlike changed_start_directives, the ones systemd reloads count too."""
+        old = _unit_for("/q", watchdog=_DEFAULTS, adopt_workers=True)
+        new = _unit_for(
+            "/q",
+            watchdog=_watchdog(
+                restart_cooldown_s=7, restart_backoff_max_s=700, crash_loop_threshold=9
+            ),
+            adopt_workers=False,
+        )
+        assert changed_directives(old, new) == [
+            "ExecStop",
+            "RestartSec",
+            "StartLimitBurst",
+            "StartLimitIntervalSec",
+            "TimeoutStopSec",
+        ]
+
+    def test_a_directive_on_one_side_only(self) -> None:
+        new = _unit_for("/q", watchdog=_DEFAULTS)
+        old = new + "Nice=5\n"
+        assert changed_directives(old, new) == ["Nice"]
+
+
+class TestUnitExecStart:
+    def test_the_command_install_wrote(self) -> None:
+        assert unit_exec_start(_unit_for("/q", watchdog=_DEFAULTS)) == (
+            "/usr/local/bin/claude-task-runner supervisor start --queue /q"
+        )
+
+    def test_none_without_one(self) -> None:
+        assert unit_exec_start("[Unit]\nDescription=x\n") is None
 
 
 class TestUnitQueue:

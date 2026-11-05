@@ -33,6 +33,8 @@ from claude_task_runner.config.schema import (
     Settings,
 )
 
+from ._digit_limit import PAST_DIGIT_LIMIT, digit_limit_error
+
 
 class TestAccountSettings:
     def test_minimal_valid(self) -> None:
@@ -247,6 +249,15 @@ class TestLoadAccountPolicy:
         (tmp_path / "runner-account.toml").write_text("not = valid = toml", encoding="utf-8")
         with pytest.raises(ConfigError):
             load_account_policy(str(tmp_path))
+
+    def test_an_integer_past_the_digit_limit_is_invalid_toml(self, tmp_path: Path) -> None:
+        """tomllib raises a bare ValueError for it, not TOMLDecodeError;
+        resolve_accounts turns only a ConfigError into a broken account."""
+        path = tmp_path / "runner-account.toml"
+        path.write_text(f"[concurrency]\nmax_concurrency = {PAST_DIGIT_LIMIT}\n", encoding="utf-8")
+        with pytest.raises(ConfigError) as raised:
+            load_account_policy(str(tmp_path))
+        assert str(raised.value) == f"Invalid TOML in {path}: {digit_limit_error()}"
 
     def test_unknown_field_rejected(self, tmp_path: Path) -> None:
         """extra='forbid' on AccountPolicy catches typos in per-account files."""

@@ -45,6 +45,7 @@ from claude_task_runner.supervisor.reconcile_silent import (
     STEADY_SILENT_STOP_REASON,
     ReapResult,
     _latest_mtime_in_tree,
+    _mtime_problem,
     liveness_verdict,
     reap_silent_orphans_tick,
     reconcile_silent_orphans,
@@ -370,7 +371,7 @@ def test_fs_recent_mtime_makes_silent_healthy(tmp_path: Path) -> None:
     # default 600s FS window).
     fresh_mtime_unix = (_now() - timedelta(seconds=60)).timestamp()
 
-    def stub_mtime(_path: Path) -> float | None:
+    def stub_mtime(_path: Path, _now: datetime) -> float | None:
         return fresh_mtime_unix
 
     results = reap_silent_orphans_tick(
@@ -411,7 +412,7 @@ def test_fs_stale_mtime_still_kills(tmp_path: Path) -> None:
     # Latest mtime is 1h ago — well past the default 600s window.
     stale_mtime_unix = (_now() - timedelta(seconds=3600)).timestamp()
 
-    def stub_mtime(_path: Path) -> float | None:
+    def stub_mtime(_path: Path, _now: datetime) -> float | None:
         return stale_mtime_unix
 
     calls: list[int] = []
@@ -462,7 +463,7 @@ def test_fs_mtime_exactly_window_old_counts_as_activity(tmp_path: Path) -> None:
         {"t-fs-at-window"},
         settings=_settings(alert=300, kill=0, fs_window=600),
         clock=FakeClock(_now()),
-        fs_mtime_fn=lambda _path: mtime.timestamp(),
+        fs_mtime_fn=lambda _path, _now: mtime.timestamp(),
     )
 
     assert results == []
@@ -495,7 +496,7 @@ def test_fs_mtime_one_second_past_window_is_not_activity(tmp_path: Path) -> None
         {"t-fs-past-window"},
         settings=_settings(alert=300, kill=0, fs_window=600),
         clock=FakeClock(_now()),
-        fs_mtime_fn=lambda _path: mtime.timestamp(),
+        fs_mtime_fn=lambda _path, _now: mtime.timestamp(),
         worker_probe_fn=worker_gone,
     )
 
@@ -535,7 +536,8 @@ def test_fs_mtime_no_datetime_can_hold_is_not_activity(
     """A file mtime past year 9999 passes the window check (it lies in the
     future), but no datetime can hold it. It proves nothing: the FS check
     is skipped with a WARNING and the heartbeat verdict applies, exactly as
-    for an mtime past the window, instead of the reaper raising."""
+    for an mtime past the window. An injected ``fs_mtime_fn`` is held to
+    the rule the default walk applies."""
     qd = _queue(tmp_path)
     work = tmp_path / "work"
     work.mkdir()
@@ -556,24 +558,267 @@ def test_fs_mtime_no_datetime_can_hold_is_not_activity(
             {"t-fs-far-future"},
             settings=_settings(alert=300, kill=0, fs_window=600),
             clock=FakeClock(_now()),
-            fs_mtime_fn=lambda _path: mtime,
+            fs_mtime_fn=lambda _path, _now: mtime,
             worker_probe_fn=worker_gone,
         )
 
     assert [r.verdict for r in results] == [HeartbeatVerdict.SILENT]
     after = load_state(state_path_for(qd, "t-fs-far-future"))
     assert (after.status, after.last_heartbeat_at) == ("possibly_hung", before.last_heartbeat_at)
-    warnings = [
+    assert [
         r.getMessage()
         for r in caplog.records
-        if r.levelname == "WARNING" and "newest file mtime" in r.getMessage()
+        if r.levelname == "WARNING" and "the newest file" in r.getMessage()
+    ] == [
+        f"silent-orphan reaper: t-fs-far-future: the newest file under {work} is one "
+        "whose mtime no datetime can hold; skipping FS check"
     ]
-    assert len(warnings) == 1, warnings
-    assert warnings[0].startswith(
-        f"silent-orphan reaper: t-fs-far-future: newest file mtime under {work} "
-        f"is out of range (timestamp {mtime!r} is out of range: "
-    ), warnings[0]
-    assert warnings[0].endswith("); skipping FS check"), warnings[0]
+
+
+def test_fs_mtime_dated_after_now_is_not_activity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file dated after now (a bogus touch, a clock step) proves nothing
+    either. Counted, it would move the heartbeat into the future, and the
+    task would never be reaped."""
+    qd = _queue(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    _seed_task_and_state(
+        qd,
+        "t-fs-future",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-future"))
+    in_2100 = datetime(2100, 1, 1, tzinfo=UTC).timestamp()
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        results = reap_silent_orphans_tick(
+            qd,
+            {"t-fs-future"},
+            settings=_settings(alert=300, kill=0, fs_window=600),
+            clock=FakeClock(_now()),
+            fs_mtime_fn=lambda _path, _now: in_2100,
+            worker_probe_fn=worker_gone,
+        )
+
+    assert [r.verdict for r in results] == [HeartbeatVerdict.SILENT]
+    after = load_state(state_path_for(qd, "t-fs-future"))
+    assert (after.status, after.last_heartbeat_at) == ("possibly_hung", before.last_heartbeat_at)
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and "the newest file" in r.getMessage()
+    ] == [
+        f"silent-orphan reaper: t-fs-future: the newest file under {work} is one "
+        "dated after now; skipping FS check"
+    ]
+
+
+def test_the_walk_leaves_out_an_mtime_dated_after_now(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stray file dated 2100 is the maximum; left out, the file written a
+    minute ago wins. One WARNING names it; the next walk adds none."""
+    work = tmp_path / "work"
+    work.mkdir()
+    now = datetime.now(UTC)
+    recent = work / "recent_output.txt"
+    recent.write_text("x")
+    recent_at = now - timedelta(seconds=60)
+    os.utime(recent, (recent_at.timestamp(), recent_at.timestamp()))
+    stray = work / "stray.bin"
+    stray.write_text("x")
+    in_2100 = datetime(2100, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(stray, (in_2100, in_2100))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        walks = [_latest_mtime_in_tree(work, now), _latest_mtime_in_tree(work, now)]
+
+    assert walks == [recent_at.timestamp(), recent_at.timestamp()]
+    assert _walk_warnings(caplog) == [
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} dated after now, "
+        f"e.g. {stray}; each such file is reported once"
+    ]
+
+
+def _mixed_tree(root: Path, recent_at: datetime) -> tuple[Path, Path]:
+    """``root/work`` holding a file written at ``recent_at`` and a stray file
+    whose mtime is past year 9999 (``root`` is on tmpfs, which keeps it)."""
+    work = root / "work"
+    work.mkdir()
+    recent = work / "recent_output.txt"
+    recent.write_text("x")
+    os.utime(recent, (recent_at.timestamp(), recent_at.timestamp()))
+    stray = work / "stray.bin"
+    stray.write_text("x")
+    os.utime(stray, (253402300800, 253402300800))
+    return work, stray
+
+
+def test_the_walk_leaves_out_an_mtime_no_datetime_can_hold(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The newest usable mtime wins, not the stray's: as the maximum it
+    would hide every other file. One WARNING names the count and a path;
+    the reaper walks the tree on every pass, and the next walk adds none."""
+    recent_at = _now() - timedelta(seconds=60)
+    work, stray = _mixed_tree(far_future_mtime_dir, recent_at)
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        walks = [
+            _latest_mtime_in_tree(work, datetime.now(UTC)),
+            _latest_mtime_in_tree(work, datetime.now(UTC)),
+        ]
+
+    assert walks == [recent_at.timestamp(), recent_at.timestamp()]
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {stray}; each such file is reported once"
+    ]
+
+
+def _walk_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "claude_task_runner.supervisor.reconcile_silent"
+    ]
+
+
+def test_one_warning_counts_the_strays_a_walk_has_not_reported(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two strays make one WARNING with a count of two, naming either one
+    (the walk's order is the directory's). A third, added before the next
+    walk, is the only one that walk reports."""
+    recent_at = _now() - timedelta(seconds=60)
+    work, stray = _mixed_tree(far_future_mtime_dir, recent_at)
+    second = work / "second.bin"
+    second.write_text("x")
+    os.utime(second, (253402300801, 253402300801))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        first_walk = _latest_mtime_in_tree(work, datetime.now(UTC))
+        third = work / "third.bin"
+        third.write_text("x")
+        os.utime(third, (253402300802, 253402300802))
+        second_walk = _latest_mtime_in_tree(work, datetime.now(UTC))
+
+    assert (first_walk, second_walk) == (recent_at.timestamp(), recent_at.timestamp())
+    warnings = _walk_warnings(caplog)
+    assert len(warnings) == 2, warnings
+    assert warnings[0] in [
+        f"silent-orphan reaper: leaving out 2 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {example}; each such file is reported once"
+        for example in (stray, second)
+    ]
+    assert warnings[1] == (
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {third}; each such file is reported once"
+    )
+
+
+def test_the_walk_searches_a_directory_whose_own_mtime_is_left_out(
+    far_future_mtime_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory's own mtime is left out like a file's, but what it
+    holds is still walked: the file written inside it is the newest."""
+    work = far_future_mtime_dir / "work"
+    sub = work / "sub"
+    sub.mkdir(parents=True)
+    recent_at = _now() - timedelta(seconds=60)
+    inside = sub / "output.txt"
+    inside.write_text("x")
+    os.utime(inside, (recent_at.timestamp(), recent_at.timestamp()))
+    os.utime(sub, (253402300800, 253402300800))
+
+    with caplog.at_level("WARNING", logger="claude_task_runner.supervisor.reconcile_silent"):
+        assert _latest_mtime_in_tree(work, datetime.now(UTC)) == recent_at.timestamp()
+
+    assert _walk_warnings(caplog) == [
+        f"silent-orphan reaper: leaving out 1 file(s) under {work} whose mtime no "
+        f"datetime can hold, e.g. {sub}; each such file is reported once"
+    ]
+
+
+_OUT_OF_RANGE = "whose mtime no datetime can hold"
+_END_OF_TIME = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+"""A ``now`` no mtime a datetime can hold lies after, for the range checks."""
+
+
+@pytest.mark.parametrize(
+    ("mtime", "problem"),
+    [
+        pytest.param(0.0, None, id="epoch"),
+        pytest.param(-1.0, None, id="before-epoch"),
+        pytest.param(-62135596800.0, None, id="first-second-of-year-1"),
+        pytest.param(-62135596801.0, _OUT_OF_RANGE, id="year-0"),
+        pytest.param(-1e20, _OUT_OF_RANGE, id="before-time_t"),
+        pytest.param(253402300799.0, None, id="last-second-of-9999"),
+        pytest.param(253402300800.0, _OUT_OF_RANGE, id="year-10000"),
+        pytest.param(1e20, _OUT_OF_RANGE, id="past-time_t"),
+        pytest.param(float("nan"), _OUT_OF_RANGE, id="nan"),
+        pytest.param(float("inf"), _OUT_OF_RANGE, id="inf"),
+        pytest.param(float("-inf"), _OUT_OF_RANGE, id="-inf"),
+    ],
+)
+def test_mtime_problem_range_known_answers(mtime: float, problem: str | None) -> None:
+    """A datetime can hold an mtime from the first second of year 1 to the
+    last second of 9999."""
+    assert _mtime_problem(mtime, _END_OF_TIME) == problem
+
+
+@pytest.mark.parametrize(
+    ("offset_s", "problem"),
+    [
+        pytest.param(-3600.0, None, id="an-hour-ago"),
+        pytest.param(0.0, None, id="now"),
+        pytest.param(60.0, None, id="a-minute-ahead"),
+        pytest.param(61.0, "dated after now", id="past-the-slack"),
+        pytest.param(86400.0 * 365 * 74, "dated after now", id="year-2100"),
+    ],
+)
+def test_mtime_problem_after_now_known_answers(offset_s: float, problem: str | None) -> None:
+    """An mtime up to a minute after ``now`` still counts: a file written
+    while a reaper pass runs is dated after the ``now`` the pass took when
+    it started. Later than that, it is no sign of life."""
+    assert _mtime_problem(_now().timestamp() + offset_s, _now()) == problem
+
+
+def test_a_stray_far_future_file_does_not_hide_recent_activity(far_future_mtime_dir: Path) -> None:
+    """End to end with the real walk: a file written a minute ago keeps the
+    silent task HEALTHY, with its heartbeat refreshed to that write, even
+    beside a file whose mtime is past year 9999."""
+    qd = _queue(far_future_mtime_dir)
+    recent_at = _now() - timedelta(seconds=60)
+    work, _stray = _mixed_tree(far_future_mtime_dir, recent_at)
+    _seed_task_and_state(
+        qd,
+        "t-fs-mixed",
+        started_at=_now() - timedelta(seconds=3600),
+        last_heartbeat_at=_now() - timedelta(seconds=2000),
+        dispatcher_alive_at=None,
+        pid=42,
+        working_dir=work,
+    )
+    before = load_state(state_path_for(qd, "t-fs-mixed"))
+
+    results = reap_silent_orphans_tick(
+        qd,
+        {"t-fs-mixed"},
+        settings=_settings(alert=300, kill=0, fs_window=600),
+        clock=FakeClock(_now()),
+    )
+
+    assert results == []
+    assert load_state(state_path_for(qd, "t-fs-mixed")) == before.model_copy(
+        update={"last_heartbeat_at": recent_at}
+    )
 
 
 def test_fs_check_skipped_when_no_working_dir(tmp_path: Path) -> None:
@@ -593,7 +838,7 @@ def test_fs_check_skipped_when_no_working_dir(tmp_path: Path) -> None:
 
     fs_calls = {"n": 0}
 
-    def stub_mtime(_path: Path) -> float | None:
+    def stub_mtime(_path: Path, _now: datetime) -> float | None:
         fs_calls["n"] += 1
         return None
 
@@ -633,7 +878,7 @@ def test_fs_check_skipped_when_task_yaml_missing(tmp_path: Path) -> None:
 
     fs_calls = {"n": 0}
 
-    def stub_mtime(_path: Path) -> float | None:
+    def stub_mtime(_path: Path, _now: datetime) -> float | None:
         fs_calls["n"] += 1
         return None
 
@@ -668,7 +913,7 @@ def test_fs_check_skipped_when_function_raises(tmp_path: Path) -> None:
         working_dir=work,
     )
 
-    def boom(_path: Path) -> float | None:
+    def boom(_path: Path, _now: datetime) -> float | None:
         raise OSError("permission denied")
 
     results = reap_silent_orphans_tick(
@@ -708,7 +953,7 @@ def test_fs_check_not_invoked_when_dispatcher_alive_fresh(
 
     fs_calls = {"n": 0}
 
-    def stub_mtime(_path: Path) -> float | None:
+    def stub_mtime(_path: Path, _now: datetime) -> float | None:
         fs_calls["n"] += 1
         return None
 
@@ -738,7 +983,7 @@ def test_latest_mtime_finds_recent_file(tmp_path: Path) -> None:
     sub.mkdir()
     (sub / "b.txt").write_text("world")
 
-    latest = _latest_mtime_in_tree(root)
+    latest = _latest_mtime_in_tree(root, datetime.now(UTC))
     assert latest is not None
     # Both files were just written; the latest mtime should be at least
     # as recent as the last write.
@@ -767,7 +1012,7 @@ def test_latest_mtime_skips_noisy_dirs(tmp_path: Path) -> None:
     _os.utime(noisy, (newer, newer))
     _ = _time  # quiet pyflakes when run on an older test selector
 
-    latest = _latest_mtime_in_tree(root)
+    latest = _latest_mtime_in_tree(root, datetime.now(UTC))
     assert latest is not None
     # The .git mtime is bigger but was skipped; the latest visible
     # mtime is the report's.
@@ -776,7 +1021,7 @@ def test_latest_mtime_skips_noisy_dirs(tmp_path: Path) -> None:
 
 def test_latest_mtime_handles_missing_root() -> None:
     """A nonexistent root returns None rather than raising."""
-    assert _latest_mtime_in_tree(Path("/no/such/path/exists/here")) is None
+    assert _latest_mtime_in_tree(Path("/no/such/path/exists/here"), datetime.now(UTC)) is None
 
 
 def test_latest_mtime_handles_max_depth(tmp_path: Path) -> None:
@@ -799,7 +1044,7 @@ def test_latest_mtime_handles_max_depth(tmp_path: Path) -> None:
     _os.utime(too_deep, (far_future, far_future))
 
     # With max_depth=2 the deeply-buried file is invisible.
-    latest = _latest_mtime_in_tree(root, max_depth=2)
+    latest = _latest_mtime_in_tree(root, datetime.now(UTC), max_depth=2)
     assert latest is not None
     assert latest < far_future
 
@@ -829,7 +1074,7 @@ def test_dispatcher_alive_wins_even_when_fs_is_stale(tmp_path: Path, live_worker
         working_dir=work,
     )
 
-    def fail_if_called(_path: Path) -> float | None:
+    def fail_if_called(_path: Path, _now: datetime) -> float | None:
         raise AssertionError("FS check must not run when dispatcher_alive_at is fresh")
 
     results = reap_silent_orphans_tick(
@@ -861,7 +1106,7 @@ def test_steady_silent_stop_reason_used_when_no_fs_evidence(tmp_path: Path) -> N
         working_dir=work,
     )
 
-    def no_activity(_path: Path) -> float | None:
+    def no_activity(_path: Path, _now: datetime) -> float | None:
         return None
 
     results = reap_silent_orphans_tick(
@@ -912,7 +1157,7 @@ def test_fs_refresh_recheck_failure_treated_as_healthy_not_demoted(tmp_path: Pat
 
     fresh_mtime_unix = (_now() - timedelta(seconds=60)).timestamp()
 
-    def stub_mtime_then_corrupt(_path: Path) -> float | None:
+    def stub_mtime_then_corrupt(_path: Path, _now: datetime) -> float | None:
         # Report fresh activity (forces the refresh path), then corrupt
         # the state file so the refresh write's recheck-load raises.
         sp.write_text("not: valid: yaml: ][", encoding="utf-8")
