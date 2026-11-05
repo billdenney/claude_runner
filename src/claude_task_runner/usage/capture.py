@@ -357,7 +357,7 @@ def capture(
     UsageCaptureLoginRequired
         If the banner shows API billing, or ``claude`` asks for a login
         method: it has no claude.ai plan login in that config dir. A
-        ``UsageCaptureSpawnError`` subclass.
+        ``UsageApiAuthExpired`` subclass.
     UsageCaptureTimeout
         If the input box or both ``Resets`` lines do not appear within
         their configured timeouts.
