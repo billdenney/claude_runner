@@ -53,7 +53,10 @@ have ended `claude`.
    arrives, into a pyte screen the size of the PTY (`render.LiveScreen`;
    the PTY is now spawned at an explicit 80x24, pexpect's default). The
    input box is ready when its footer is on the screen, in any mode
-   (`? for shortcuts`, or `<mode> on (… to cycle)`), and no prompt is.
+   (`? for shortcuts`, or `<mode> on (… to cycle)`), the input row is
+   too (a row starting with `❯` right under a rule), and no prompt is.
+   Every recorded dialog takes the input row's place, so one this table
+   does not know ends phase 1 in a timeout rather than taking `/usage`.
 2. **Prompts are answered from a table.** The trust prompt gets the
    option `Yes, I trust this folder`: 2.1.318 focuses `No, exit`, so
    phase 1 sends Down until the focus marker is on "Yes", then Enter
@@ -64,9 +67,11 @@ have ended `claude`.
    `Enter to confirm · Esc to cancel` footer, gets Esc, which never opts
    in; trust comes before that rule because Esc on it is "No, exit".
    Keys go only after a poll in which `claude` drew nothing, so they
-   answer a whole frame, and the same keys go again after 2 s without
+   answer a whole frame, and Esc or Down goes again after 2 s without
    a change: in its first seconds 2.1.318 redraws the trust prompt with
-   the focus reset and drops a key sent before. A prompt still drawn at
+   the focus reset and drops a key sent before. Enter is never repeated:
+   on a TUI that acted on it but has not redrawn yet, a second Enter
+   would land on the next screen, possibly the fullscreen offer. A prompt still drawn at
    the timeout is named in it. After the post-ready pad phase 1 runs
    again, so a dialog that opened in the pad (the offer appears about a
    second after the input box) is closed before `/usage` is typed. The
@@ -129,6 +134,14 @@ have ended `claude`.
   out on every tick.
 - `fullscreenUpsellSeenCount` is 3 in every config dir the runner
   spawns `claude` with, interactive sessions included.
+
+## Known limits
+
+- A dialog drawn over the input box that leaves both the input row and
+  the footer visible counts as ready, and `/usage` is typed into it.
+  Phase 2 then times out, so it is loud, not silent.
+- A dropped Enter is not repeated: the capture times out naming the
+  prompt, and the next capture tries again.
 
 ## Reversibility
 

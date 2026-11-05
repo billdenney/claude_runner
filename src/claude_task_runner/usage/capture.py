@@ -136,6 +136,13 @@ _INPUT_BOX_FOOTER_RE = re.compile(r"\?\s*for\s*shortcuts|\son\s*\([^()\n]*\bto\s
 shortcuts`` (manual or default mode), or ``<mode> on (shift+tab to cycle)``
 (auto, accept edits, plan, bypass permissions)."""
 
+_INPUT_ROW_RE = re.compile(r"─{20,}[^\n]*\n[^\S\n]*\u276f")
+"""The input box itself: a row that starts with the prompt marker U+276F
+right under a rule. The recorded dialogs (trust, theme, login method,
+fullscreen offer) take its place, so a dialog this module does not know
+stops phase 1 short of typing ``/usage`` into it, even with the footer
+still drawn."""
+
 _BANNER_ROWS = 6
 """The top rows of the screen, which hold the welcome banner at start-up."""
 
@@ -215,13 +222,14 @@ def _await_input_box(
 ) -> tuple[str, int]:
     """Read ``child`` into ``screen`` until the input box is ready for a command.
 
-    Ready means the footer under the input box is drawn and no prompt from
+    Ready means the input box and its footer are drawn and no prompt from
     :data:`_PROMPTS` is. A prompt gets its keys once ``claude`` has drawn
-    nothing new for a poll, so the keys answer the whole frame; the same
-    keys go again only after :data:`_RESEND_S` without a change that calls
-    for other keys, so a key the TUI dropped is repeated and one it is
-    still acting on is not. (2.1.318 can redraw the trust prompt with its
-    focus reset in its first seconds, dropping a key sent before.)
+    nothing new for a poll, so the keys answer the whole frame; Esc or
+    Down goes again only after :data:`_RESEND_S` without a change that
+    calls for other keys, so a key the TUI dropped is repeated and one it
+    is still acting on is not, and Enter never goes twice in a row.
+    (2.1.318 can redraw the trust prompt with its focus reset in its first
+    seconds, dropping a key sent before.)
 
     ``keys_sent`` is how many keys this capture has sent to prompts so
     far; :data:`_MAX_ANSWERS` bounds the total over the capture.
@@ -249,13 +257,17 @@ def _await_input_box(
             raise _login_required("asks which login method to use", claude_config_dir)
         prompt = _showing_prompt(text)
         if prompt is None:
-            if _INPUT_BOX_FOOTER_RE.search(text):
+            if _INPUT_BOX_FOOTER_RE.search(text) and _INPUT_ROW_RE.search(text):
                 return text, answers
             last_sent = None
         elif quiet:
             keys = prompt.keys_for(text)
             now = clock.monotonic()
-            if keys and ((prompt, keys) != last_sent or now - sent_at >= _RESEND_S):
+            # Enter is never repeated: on a TUI that acted on it but has not
+            # redrawn yet, a second one would land on the next screen, where
+            # it could accept the fullscreen offer.
+            repeat = keys != _ENTER and now - sent_at >= _RESEND_S
+            if keys and ((prompt, keys) != last_sent or repeat):
                 if answers == _MAX_ANSWERS:
                     raise UsageCaptureTimeout(
                         f"claude still shows {prompt.name} after {answers} answers"

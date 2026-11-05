@@ -376,6 +376,42 @@ def test_a_dropped_key_is_sent_again_after_the_resend_interval(clock: FakeClock)
     assert child.sent_at == [0.25, 2.25, 2.5]
 
 
+def test_enter_is_never_sent_twice_in_a_row(clock: FakeClock) -> None:
+    """A trust prompt that stays focused on "Yes" after Enter gets no second
+    Enter: the TUI may have acted on it and not redrawn yet."""
+    child = FakeChild(
+        clock,
+        [_fixture("trust_prompt")],
+        [(DOWN, [_fixture("trust_prompt_after_down")])],
+    )
+
+    with pytest.raises(UsageCaptureTimeout, match=r"it still shows the folder trust prompt$"):
+        _await(child, clock)
+
+    assert child.sent == [DOWN, ENTER]
+
+
+def test_unknown_dialog_over_the_footer_is_not_ready(clock: FakeClock) -> None:
+    """A dialog that takes the input box's place, footer still drawn, does
+    not get /usage typed into it: phase 1 times out instead."""
+    dialog = (
+        b"\x1b[9;1H\x1b[J"
+        + "─".encode() * 80
+        + b"\r\n  Something new to try\r\n  1. Sure\r\n  2. Later\r\n"
+        + b"\r\n  \xe2\x8f\xb5\xe2\x8f\xb5 auto mode on (shift+tab to cycle)"
+    )
+    raw = _fixture("auto_mode_claude_api") + dialog
+    screen = render(raw, columns=80, rows=24)
+    assert "auto mode on (shift+tab to cycle)" in screen
+    assert "\u276f" not in screen
+    child = FakeChild(clock, [raw])
+
+    with pytest.raises(UsageCaptureTimeout, match=r"did not become ready within 10\.0s$"):
+        _await(child, clock)
+
+    assert child.sent == []
+
+
 def test_theme_picker_keeps_the_highlighted_theme(clock: FakeClock) -> None:
     """Enter only: the picker has no numbers, and a stray key would reach
     the next first-run screen."""
