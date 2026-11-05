@@ -14,7 +14,7 @@ from datetime import UTC, datetime, time, timedelta
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.supervisor.states import SupervisorState
 from claude_task_runner.throttle.curve import SEVEN_DAYS_S
-from claude_task_runner.throttle.decision import decide, weekly_catch_up
+from claude_task_runner.throttle.decision import Decision, decide, weekly_catch_up
 from claude_task_runner.throttle.policy import (
     ResolvedBand,
     ResolvedNight,
@@ -57,19 +57,24 @@ def _policy(
 
 def _reading(
     *,
-    five_h_pct: int,
+    five_h_pct: int | None,
     weekly_pct: int,
     five_h_resets_at: datetime | None,
     weekly_resets_at: datetime | None,
     captured_at: datetime | None = None,
 ) -> UsageReading:
+    """``five_h_pct=None`` is a reading with no 5-hour window."""
     captured = captured_at or datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
     return UsageReading(
         captured_at=captured,
-        five_hour=WindowReading(
-            utilization_pct=five_h_pct,
-            resets_at_raw="x",
-            resets_at=five_h_resets_at,
+        five_hour=(
+            None
+            if five_h_pct is None
+            else WindowReading(
+                utilization_pct=five_h_pct,
+                resets_at_raw="x",
+                resets_at=five_h_resets_at,
+            )
         ),
         seven_day=WindowReading(
             utilization_pct=weekly_pct,
@@ -290,6 +295,91 @@ class TestWeeklyCatchUp:
         )
         assert d.state is SupervisorState.THROTTLED_WEEKLY
         assert d.wakeup_at == weekly_resets_at - timedelta(hours=114)
+
+
+class TestNoFiveHourWindow:
+    """A reading with no 5-hour window (ADR-0038): the 5h thresholds do not
+    apply, and the weekly trace decides alone."""
+
+    NOW = datetime(2026, 5, 27, 12, 0, tzinfo=UTC)
+    WEEKLY_RESETS_AT = NOW + timedelta(seconds=SEVEN_DAYS_S / 2)
+    """Half-way through the week: the default curve's target is 30/0.762 ~ 39.4%."""
+
+    def _decide(self, weekly_pct: int, *, day_slow: int = 40, day_stop: int = 60) -> Decision:
+        reading = _reading(
+            five_h_pct=None,
+            weekly_pct=weekly_pct,
+            five_h_resets_at=None,
+            weekly_resets_at=self.WEEKLY_RESETS_AT,
+        )
+        return decide(
+            _policy(timezone="UTC", day_slow=day_slow, day_stop=day_stop),
+            reading,
+            FakeClock(self.NOW),
+            poll_interval_s=POLL,
+            window_start_delay_s=450,
+        )
+
+    def test_weekly_under_target_dispatches_at_max_concurrency(self) -> None:
+        d = self._decide(weekly_pct=12)
+        assert d.state is SupervisorState.DISPATCHING
+        assert d.target_concurrency == 5
+        assert d.wakeup_at is None
+        assert d.message == ""
+        assert d.observed_5h_pct is None
+        assert d.observed_weekly_pct == 12
+        assert d.target_pct is not None and 39.0 < d.target_pct < 40.0
+
+    def test_weekly_over_target_throttles_until_the_catch_up(self) -> None:
+        """No 5h reset clamps the wakeup: it is the catch-up time itself."""
+        d = self._decide(weekly_pct=45)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.target_concurrency == 0
+        assert d.observed_5h_pct is None
+        assert d.observed_weekly_pct == 45
+        assert d.wakeup_at == weekly_catch_up(
+            _policy(timezone="UTC"), observed_pct=45.0, resets_at=self.WEEKLY_RESETS_AT
+        )
+        # 45% is met at t = 45/60 * 128/168 = 96/168, 72h before the reset.
+        assert d.wakeup_at == self.WEEKLY_RESETS_AT - timedelta(hours=72)
+
+    def test_five_hour_thresholds_of_zero_do_not_apply(self) -> None:
+        """A missing window is not 0%: thresholds at 0 would throttle a 0%
+        reading, and do not touch one with no 5-hour window."""
+        d = self._decide(weekly_pct=12, day_slow=0, day_stop=0)
+        assert d.state is SupervisorState.DISPATCHING
+        assert d.target_concurrency == 5
+        assert d.fivehr_slowdown_pct == 0
+        assert d.fivehr_stop_pct == 0
+        assert d.band == "day"
+
+    def test_zero_percent_five_hour_window_does_meet_zero_thresholds(self) -> None:
+        """The control for the test above: the same thresholds stop a reading
+        whose 5-hour window is reported at 0%."""
+        reading = _reading(
+            five_h_pct=0,
+            weekly_pct=12,
+            five_h_resets_at=self.NOW + timedelta(hours=2),
+            weekly_resets_at=self.WEEKLY_RESETS_AT,
+        )
+        d = decide(
+            _policy(timezone="UTC", day_slow=0, day_stop=0),
+            reading,
+            FakeClock(self.NOW),
+            poll_interval_s=POLL,
+        )
+        assert d.state is SupervisorState.THROTTLED_5H
+        assert d.observed_5h_pct == 0
+
+    def test_no_weekly_reset_and_no_five_hour_window_dispatches(self) -> None:
+        reading = _reading(
+            five_h_pct=None, weekly_pct=99, five_h_resets_at=None, weekly_resets_at=None
+        )
+        d = decide(_policy(timezone="UTC"), reading, FakeClock(self.NOW), poll_interval_s=POLL)
+        assert d.state is SupervisorState.DISPATCHING
+        assert d.target_concurrency == 5
+        assert d.target_pct is None
+        assert d.observed_5h_pct is None
 
 
 class TestWeeklyResetUnparseable:

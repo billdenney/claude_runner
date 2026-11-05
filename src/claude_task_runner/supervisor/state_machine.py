@@ -76,6 +76,24 @@ class StepInput:
     in_flight_count: int
 
 
+def _reading_fields(reading: UsageReading, snapshot: SupervisorSnapshot) -> dict[str, object]:
+    """The snapshot's ``last_*`` utilization and reset fields for a clean reading.
+
+    An unparseable reset keeps the snapshot's last known one. A reading
+    with no 5-hour window (ADR-0038) sets both 5h fields to ``None``:
+    no 5-hour window applies, so no earlier one's reset does either.
+    """
+    five_hour_reset = None
+    if reading.five_hour is not None:
+        five_hour_reset = reading.five_hour.resets_at or snapshot.last_5h_reset_at
+    return {
+        "last_5h_util_pct": reading.five_hour_util_pct,
+        "last_weekly_util_pct": reading.seven_day.utilization_pct,
+        "last_5h_reset_at": five_hour_reset,
+        "last_weekly_reset_at": reading.seven_day.resets_at or snapshot.last_weekly_reset_at,
+    }
+
+
 def _entry(
     state: SupervisorState,
     *,
@@ -100,12 +118,7 @@ def _entry(
     }
     if reading is not None:
         update["last_reading_at"] = clock.now()
-        update["last_5h_util_pct"] = reading.five_hour.utilization_pct
-        update["last_weekly_util_pct"] = reading.seven_day.utilization_pct
-        if reading.five_hour.resets_at is not None:
-            update["last_5h_reset_at"] = reading.five_hour.resets_at
-        if reading.seven_day.resets_at is not None:
-            update["last_weekly_reset_at"] = reading.seven_day.resets_at
+        update.update(_reading_fields(reading, snapshot))
     if consecutive_clean_polls is not None:
         update["consecutive_clean_polls"] = consecutive_clean_polls
     if last_drift_message is not None:
@@ -119,10 +132,12 @@ def _state_transition(
     previous_state: SupervisorState,
     new_state: SupervisorState,
     *,
-    five_hour_util: int,
+    five_hour_util: int | None,
     weekly_util: int,
 ) -> EmitEvent:
-    """The ``state_transition`` event, with the utilization the change was judged on."""
+    """The ``state_transition`` event, with the utilization the change was judged on.
+
+    ``five_hour_util`` is ``None`` when the reading had no 5-hour window."""
     return EmitEvent(
         event_type="state_transition",
         payload={
@@ -355,12 +370,7 @@ def step(
                 update={
                     "consecutive_clean_polls": clean,
                     "last_reading_at": clock.now(),
-                    "last_5h_util_pct": reading.five_hour.utilization_pct,
-                    "last_weekly_util_pct": reading.seven_day.utilization_pct,
-                    "last_5h_reset_at": (reading.five_hour.resets_at or snapshot.last_5h_reset_at),
-                    "last_weekly_reset_at": (
-                        reading.seven_day.resets_at or snapshot.last_weekly_reset_at
-                    ),
+                    **_reading_fields(reading, snapshot),
                 }
             )
             actions.append(StopDispatch())
@@ -408,7 +418,7 @@ def step(
                 _state_transition(
                     snapshot.state,
                     SupervisorState.IDLE,
-                    five_hour_util=reading.five_hour.utilization_pct,
+                    five_hour_util=reading.five_hour_util_pct,
                     weekly_util=reading.seven_day.utilization_pct,
                 )
             )
@@ -445,7 +455,7 @@ def step(
             _state_transition(
                 snapshot.state,
                 decision.state,
-                five_hour_util=reading.five_hour.utilization_pct,
+                five_hour_util=reading.five_hour_util_pct,
                 weekly_util=reading.seven_day.utilization_pct,
             )
         )

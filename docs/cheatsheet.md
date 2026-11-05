@@ -117,7 +117,8 @@ The JSON snapshot includes `state`, `last_5h_util_pct`,
 `last_weekly_util_pct`, `target_concurrency` and `scheduled_wakeup_at` —
 the inputs and output of the most recent dispatch decision, `IDLE`
 included — and `last_reading_at`, when that decision's clean reading
-was taken.
+was taken. `last_5h_util_pct` is `null` when that reading reported no
+5-hour window, as the API does for an account with none (ADR-0038).
 
 On each transition the supervisor also emits `state_transition` /
 `throttled_5h_entry` / `throttled_weekly_entry` events whose payloads

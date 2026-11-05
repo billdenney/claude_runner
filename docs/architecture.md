@@ -113,6 +113,13 @@ all I/O happens in `supervisor/daemon.py` based on the action list.
    or `Throttled5h`. The linear concurrency ramp shape is unchanged
    from ADR-0004.
 
+A reading with no 5-hour window (`reading.five_hour is None`: the API
+reports only the windows that apply to the account) skips step 2, so the
+weekly check alone decides between `ThrottledWeekly` and `Dispatching`,
+and a weekly wakeup is not clamped to a 5h reset. `supervisor.json` then
+holds `null` for the account's `last_5h_util_pct` and `last_5h_reset_at`,
+and status output says "not reported" (ADR-0038).
+
 ### How the decision gates dispatch
 
 Each tick captures `/usage` for one account (round-robin across

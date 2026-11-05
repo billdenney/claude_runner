@@ -41,7 +41,7 @@ from claude_task_runner.supervisor.states import (
 def _state(
     *,
     state: SupervisorState = SupervisorState.DISPATCHING,
-    util_5h: int = 0,
+    util_5h: int | None = 0,
     util_weekly: int = 0,
     paused: bool = False,
     target: int | None = None,
@@ -185,6 +185,34 @@ class TestUnpinnedPolicy:
             in_flight=[],
         )
         assert choice.account == "a"
+
+    @pytest.mark.parametrize("other_5h", [0, 50])
+    def test_no_5h_window_ranks_ahead_of_any_5h_utilization(self, other_5h: int) -> None:
+        """An account whose reading reported no 5-hour window has no 5-hour
+        limit to approach, so it wins even against 0% and a lower weekly."""
+        choice = choose_account(
+            task=_task(),
+            accounts={"personal": _account("personal"), "work": _account("work")},
+            account_states={
+                "personal": _state(util_5h=None, util_weekly=12),
+                "work": _state(util_5h=other_5h, util_weekly=0),
+            },
+            in_flight=[],
+        )
+        assert choice.account == "personal"
+        assert choice.reason == "picked 'personal' (5h_util=not reported, weekly_util=12%)"
+
+    def test_no_5h_window_on_both_tiebreaks_by_weekly(self) -> None:
+        choice = choose_account(
+            task=_task(),
+            accounts={"a": _account("a"), "b": _account("b")},
+            account_states={
+                "a": _state(util_5h=None, util_weekly=61),
+                "b": _state(util_5h=None, util_weekly=12),
+            },
+            in_flight=[],
+        )
+        assert choice.account == "b"
 
     def test_tiebreak_weekly_picks_lower(self) -> None:
         """Same 5h util but different weekly util → lower weekly wins."""

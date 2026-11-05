@@ -2,6 +2,7 @@
 
 * ``render`` (default) — print a colored snapshot.
 * ``json`` — print one-line JSON: ``{"five_hour":..., "seven_day":...}``.
+  ``five_hour`` is ``null`` for a reading that reports no 5-hour window.
 * ``healthcheck`` — capture+parse; exit non-zero on drift / timeout.
 * ``capture`` — capture only; save the raw .cap to a path.
 * ``parse-file`` — parse a previously-saved .cap and print the result.
@@ -41,6 +42,7 @@ from claude_task_runner.usage.drift import (
     UsageCaptureTimeout,
     UsageFormatDrift,
 )
+from claude_task_runner.usage.models import NOT_REPORTED, WindowReading, utilization_text
 
 app = typer.Typer(no_args_is_help=False, invoke_without_command=True, rich_markup_mode=None)
 
@@ -94,6 +96,18 @@ def _bar(pct: int) -> str:
     filled = pct // 5
     empty = 20 - filled
     return "█" * filled + "░" * empty
+
+
+def _window_json(window: WindowReading | None) -> dict[str, object] | None:
+    """One window of ``usage json``; ``None`` (JSON ``null``) for a window
+    the reading did not report."""
+    if window is None:
+        return None
+    return {
+        "utilization": window.utilization_pct,
+        "resets_at_raw": window.resets_at_raw,
+        "resets_at": window.resets_at.isoformat() if window.resets_at else None,
+    }
 
 
 @app.callback()
@@ -169,6 +183,11 @@ def render(ctx: typer.Context) -> None:
         ("5-hour session", reading.five_hour),
         ("7-day weekly", reading.seven_day),
     ):
+        if window is None:
+            console.print(
+                literal("  ", styled(f"{label:<16}", "bold"), " ", styled(NOT_REPORTED, "dim"))
+            )
+            continue
         pct = window.utilization_pct
         color = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
         bar = _bar(pct)
@@ -213,20 +232,8 @@ def to_json(ctx: typer.Context) -> None:
         raise typer.Exit(code=EXIT_PARSE_DRIFT) from exc
 
     payload = {
-        "five_hour": {
-            "utilization": reading.five_hour.utilization_pct,
-            "resets_at_raw": reading.five_hour.resets_at_raw,
-            "resets_at": (
-                reading.five_hour.resets_at.isoformat() if reading.five_hour.resets_at else None
-            ),
-        },
-        "seven_day": {
-            "utilization": reading.seven_day.utilization_pct,
-            "resets_at_raw": reading.seven_day.resets_at_raw,
-            "resets_at": (
-                reading.seven_day.resets_at.isoformat() if reading.seven_day.resets_at else None
-            ),
-        },
+        "five_hour": _window_json(reading.five_hour),
+        "seven_day": _window_json(reading.seven_day),
         "extra_windows": [
             {
                 "label": w.label,
@@ -281,7 +288,7 @@ def healthcheck(ctx: typer.Context) -> None:
         raise typer.Exit(code=EXIT_UNEXPECTED) from exc
 
     warns: list[str] = []
-    if reading.five_hour.resets_at is None:
+    if reading.five_hour is not None and reading.five_hour.resets_at is None:
         warns.append("5h resets_at unparseable")
     if reading.seven_day.resets_at is None:
         warns.append("weekly resets_at unparseable")
@@ -292,7 +299,7 @@ def healthcheck(ctx: typer.Context) -> None:
         console.print(
             literal(
                 styled("PASS", "bold green"),
-                f" 5h={reading.five_hour.utilization_pct}% "
+                f" 5h={utilization_text(reading.five_hour_util_pct)} "
                 f"weekly={reading.seven_day.utilization_pct}%",
             )
         )
@@ -490,10 +497,14 @@ def parse_file(
         raise typer.Exit(code=EXIT_PARSE_DRIFT) from exc
 
     payload = {
-        "five_hour": {
-            "utilization": reading.five_hour.utilization_pct,
-            "resets_at_raw": reading.five_hour.resets_at_raw,
-        },
+        "five_hour": (
+            None
+            if reading.five_hour is None
+            else {
+                "utilization": reading.five_hour.utilization_pct,
+                "resets_at_raw": reading.five_hour.resets_at_raw,
+            }
+        ),
         "seven_day": {
             "utilization": reading.seven_day.utilization_pct,
             "resets_at_raw": reading.seven_day.resets_at_raw,

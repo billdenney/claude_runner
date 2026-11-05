@@ -1687,6 +1687,58 @@ def test_all_checks_api_usage_on_when_enabled(
     assert "claude /login" in api_result.remediation
 
 
+def test_check_api_usage_source_reports_a_missing_5h_window_as_not_reported(
+    settings: Settings,
+) -> None:
+    """An account the API gives no 5-hour window (ADR-0038) passes, with its
+    5h shown as "not reported" and no 5h reset."""
+    from claude_task_runner.doctor.checks import check_api_usage_source
+    from claude_task_runner.usage.models import UsageReading, WindowReading
+
+    captured = datetime(2026, 10, 31, 1, 10, tzinfo=UTC)
+    readings = [
+        UsageReading(
+            captured_at=captured,
+            five_hour=None,
+            seven_day=WindowReading(
+                utilization_pct=12,
+                resets_at_raw="1794394800",
+                resets_at=datetime(2026, 11, 11, 11, 0, tzinfo=UTC),
+            ),
+        ),
+        UsageReading(
+            captured_at=captured,
+            five_hour=WindowReading(
+                utilization_pct=11,
+                resets_at_raw="1793908800",
+                resets_at=datetime(2026, 11, 5, 20, 0, tzinfo=UTC),
+            ),
+            seven_day=WindowReading(
+                utilization_pct=61,
+                resets_at_raw="1794193200",
+                resets_at=datetime(2026, 11, 9, 3, 0, tzinfo=UTC),
+            ),
+        ),
+    ]
+    s = settings.model_copy(
+        update={
+            "accounts": [
+                AccountSettings(name="personal", config_dir=""),
+                AccountSettings(name="work", config_dir=""),
+            ]
+        }
+    )
+    with patch("claude_task_runner.usage.api_source.ApiUsageSource.read", side_effect=readings):
+        result = check_api_usage_source(s)
+    assert result.status is CheckStatus.PASS
+    assert result.detail == (
+        "API readings: personal: 5h=not reported weekly=12% "
+        "(weekly resets 2026-11-11 11:00:00+00:00); "
+        "work: 5h=11% weekly=61% "
+        "(5h resets 2026-11-05 20:00:00+00:00, weekly resets 2026-11-09 03:00:00+00:00)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # check_working_dir_template — ADR-0023.
 # ---------------------------------------------------------------------------

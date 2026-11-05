@@ -136,6 +136,25 @@ def test_refresh_all_continues_past_failures(tmp_path: Path) -> None:
     assert by_name["work"].reading is None
 
 
+def test_refresh_all_details_say_not_reported_for_a_missing_5h_window(tmp_path: Path) -> None:
+    """A reading with no 5-hour window (ADR-0038) reads "not reported", not 0%."""
+    weekly_only = _reading().model_copy(update={"five_hour": None})
+    with patch(
+        "claude_task_runner.usage.oauth_refresh.ClaudeUsageSource.read",
+        side_effect=[_reading(), weekly_only],
+    ):
+        results = refresh_all_accounts(
+            accounts=[_FakeAccount(name="work", config_dir=""), _FakeAccount("personal", "")],
+            settings=load_settings(None).usage,
+            captures_dir=tmp_path,
+            clock=RealClock(),
+        )
+    assert [(r.account, r.success, r.detail) for r in results] == [
+        ("work", True, "5h=8% weekly=76%"),
+        ("personal", True, "5h=not reported weekly=76%"),
+    ]
+
+
 def test_refresh_all_empty_accounts_returns_empty_list(tmp_path: Path) -> None:
     settings = load_settings(None).usage
     results = refresh_all_accounts(
