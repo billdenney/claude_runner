@@ -48,6 +48,7 @@ Thumbs.db
 ~/.claude_task_runner/
 *.cap
 !tests/fixtures/usage/*.cap
+!tests/fixtures/usage_startup/*.cap
 
 # Per-task git worktrees created inside the repo (Claude Code / the runner's
 # own dispatch hooks put one here per task). They are checkouts, not sources.

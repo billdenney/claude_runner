@@ -84,6 +84,44 @@ failed readings rather than falling back to `claude /usage`.
    as it bypasses the throttle.
 4. After changing `[[accounts]]`, restart the supervisor.
 
+## A usage capture says `claude` has no claude.ai login
+
+**Symptom:** `claude-task-runner usage --account <name> healthcheck` (or
+`render`, `json`, `capture`, `refresh`) fails within a few seconds, and the
+message says `claude for config dir <dir> bills as 'API Usage Billing', so
+/usage shows no plan limits: <dir>/.credentials.json holds no current
+claude.ai login. ...` (or `'Claude API'`). `healthcheck` exits 3, as for a
+spawn error. An account the supervisor reads through the TTY source enters
+`error_drift` with that message as its `Last drift:` line, and the log has
+one `notify[error]: usage login failed: ...` line.
+
+**Cause:** the TTY capture reads the plan's limits through the account's
+claude.ai login, which `claude` keeps in `<config_dir>/.credentials.json`.
+The welcome banner names API billing instead of the plan when that login is
+missing, or expired with no refresh token (`API Usage Billing`, usually with
+`Not logged in · Run /login`), or when `claude` runs on a credential that
+carries no subscription (`Claude API`). A `claude setup-token` token is one:
+it is for inference only, so the capture never uses `<config_dir>/oauth-token`
+and drops an inherited `CLAUDE_CODE_OAUTH_TOKEN` (ADR-0039). The dispatcher
+and the API source still use the token, so dispatch is unaffected.
+
+**Steps:**
+1. Confirm what the CLI sees, in a shell without the token variable:
+   `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<dir> claude auth status
+   --text`. `Login: Expired` or `Not logged in` is this case.
+2. Log in to the plan's claude.ai account (Max, Team, ...) for that config
+   dir: `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<dir> claude auth
+   login --claudeai`, or `/login` inside `claude` started the same way. For
+   the default `~/.claude` leave out `CLAUDE_CONFIG_DIR`. This rewrites
+   `<dir>/.credentials.json` and leaves `<dir>/oauth-token` as it is.
+3. Re-run the healthcheck; it prints `PASS 5h=...% weekly=...%`. An account
+   in `error_drift` leaves it after `[usage].drift_recovery_clean_polls`
+   clean readings.
+
+A later login to the same claude.ai account elsewhere can revoke this
+login's refresh token (the failure behind ADR-0021); the capture then
+reports this again, and step 2 repeats.
+
 ## Fewer tasks in flight than the accounts' caps allow
 
 **Symptom:** The accounts are dispatching, not paused, and tasks are

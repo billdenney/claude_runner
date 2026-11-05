@@ -2,7 +2,7 @@
 don't get stuck at first-run onboarding or per-directory trust prompts.
 
 The interactive ``claude`` TUI (which the runner uses for ``/usage`` captures)
-gates on two flags in ``<config_dir>/.claude.json``:
+gates on these keys in ``<config_dir>/.claude.json``:
 
 * ``hasCompletedOnboarding`` — when missing/False, claude shows the
   first-run theme picker before drawing the TUI's input field. The
@@ -11,8 +11,12 @@ gates on two flags in ``<config_dir>/.claude.json``:
 * ``projects[<abs_dir>].hasTrustDialogAccepted`` — when missing/False
   for the spawn's CWD, claude shows the per-directory "Quick safety
   check" prompt. Same ANSI-split problem when trying to dismiss.
+* ``fullscreenUpsellSeenCount`` — below :data:`FULLSCREEN_UPSELL_LIMIT`,
+  Claude Code 2.1.318 may open a "Try the new fullscreen renderer?"
+  dialog over the input box, with "Yes, try it" focused, so a stray Enter
+  would opt in.
 
-This module's :func:`ensure_initialized` flips both flags ahead of time.
+This module's :func:`ensure_initialized` sets all three ahead of time.
 It is idempotent (re-running it is a fast no-op once the flags are set)
 and atomic (tmp + ``os.replace``), so calling it on every spawn is cheap.
 
@@ -31,12 +35,23 @@ from claude_task_runner.config.paths import expand_config_dir, expand_task_path
 
 logger = logging.getLogger(__name__)
 
+FULLSCREEN_UPSELL_LIMIT = 3
+"""The ``fullscreenUpsellSeenCount`` at which Claude Code stops offering the
+fullscreen renderer: ``M3t`` in the 2.1.318 bundle, which shows the offer
+only while the count is below it and counts each showing."""
+
 
 def ensure_initialized(
     config_dir: str | Path | None,
     trust_dir: str | Path,
 ) -> bool:
     """Ensure ``config_dir/.claude.json`` is past onboarding and trusts ``trust_dir``.
+
+    It also sets ``fullscreenUpsellSeenCount`` to
+    :data:`FULLSCREEN_UPSELL_LIMIT`, so the fullscreen-renderer offer stays
+    closed. Only an integer count at or above the limit is left as it is;
+    anything else (a lower count, a float such as ``5.0``, a string such as
+    ``"5"``, a bool, a missing key) becomes the limit.
 
     Parameters
     ----------
@@ -92,6 +107,11 @@ def ensure_initialized(
 
     if data.get("hasCompletedOnboarding") is not True:
         data["hasCompletedOnboarding"] = True
+        changed = True
+
+    seen = data.get("fullscreenUpsellSeenCount")
+    if isinstance(seen, bool) or not isinstance(seen, int) or seen < FULLSCREEN_UPSELL_LIMIT:
+        data["fullscreenUpsellSeenCount"] = FULLSCREEN_UPSELL_LIMIT
         changed = True
 
     projects = data.setdefault("projects", {})

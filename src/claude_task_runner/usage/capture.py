@@ -2,19 +2,28 @@
 
 Two phases:
 
-1. **Trust prompt vs TUI ready** — race the "Yes, I trust this folder"
-   prompt against the "shortcuts" marker. If trust prompt appears first,
-   send Enter and continue waiting. Otherwise the welcome screen is
-   already drawn.
+1. **Input box ready** — feed the stream into a virtual terminal the size
+   of the PTY until the screen shows the input box's footer with no
+   dialog over it. The checks read the rendered screen, not the byte
+   stream: the TUI paints the words of a line with cursor-column jumps
+   between them, so a phrase is rarely contiguous in the bytes. On the
+   way, first-run prompts are answered (trust: "Yes, I trust this folder";
+   theme picker: the highlighted theme) and the fullscreen-renderer offer,
+   or any other confirm dialog, is closed with Esc, which never opts in.
+   A login-method screen, or a banner that names API billing once the
+   input box is ready, ends the capture with
+   :class:`UsageCaptureLoginRequired`, because ``/usage`` then has no plan
+   limits to show (ADR-0039).
 2. **Submit /usage and wait for both Resets** — the TUI panel first shows
    "Loading usage data…" while it queries the OAuth API, then renders the
    actual numbers. We wait for two ``Resets`` matches.
 
 Cleanup: send Esc, then ``/exit``, then expect EOF.
 
-The full PTY stream (including ANSI) is always persisted to a forensics
-.cap file in ``<runtime_dir>/usage_captures/<ts>.cap`` for post-mortem
-debugging. See ADR-0008.
+The full PTY stream (including ANSI) is persisted to a forensics .cap
+file in ``<runtime_dir>/usage_captures/<ts>.cap`` for post-mortem
+debugging, whether the capture succeeds or fails once ``claude`` has
+started. See ADR-0008.
 """
 
 from __future__ import annotations
@@ -23,7 +32,9 @@ import contextlib
 import io
 import logging
 import os
+import re
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -32,9 +43,125 @@ import pexpect
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.paths import ConfigDirError, existing_config_dir
 from claude_task_runner.config.schema import UsageSettings
-from claude_task_runner.usage.drift import UsageCaptureSpawnError, UsageCaptureTimeout
+from claude_task_runner.usage.drift import (
+    UsageCaptureLoginRequired,
+    UsageCaptureSpawnError,
+    UsageCaptureTimeout,
+)
+from claude_task_runner.usage.render import LiveScreen
 
 logger = logging.getLogger(__name__)
+
+_PTY_ROWS = 24
+_PTY_COLUMNS = 80
+"""The pseudo-terminal ``claude`` draws into: pexpect's default size, at
+which the parser fixtures were recorded. Phase 1 renders at the same size,
+so it reads the screen ``claude`` drew."""
+
+_POLL_S = 0.25
+"""Longest wait for output before phase 1 looks at the screen again."""
+
+_READ_CHUNK = 65536
+
+_RESEND_S = 2.0
+"""How long a prompt may stay unchanged after its keys before phase 1 sends
+them again: the TUI drops keys that arrive while it is still starting."""
+
+_MAX_ANSWERS = 8
+"""Keys a capture sends to prompts, over both runs of phase 1, before it
+gives up: a bound on a prompt that ignores them, or a TUI that keeps
+opening new ones."""
+
+_ENTER = b"\r"
+_ESC = b"\x1b"
+_DOWN = b"\x1b[B"
+
+_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+_FOCUSED_OPTION_RE = re.compile(r"^\s*\u276f\s*(?:\d+\.\s*)?(\S.*?)\s*$", re.MULTILINE)
+"""The option a selection list has the focus on, after its marker U+276F
+(heavy right-pointing angle quotation mark)."""
+
+
+@dataclass(frozen=True)
+class _Prompt:
+    """Something drawn over the input box, and how to answer it."""
+
+    name: str
+    pattern: re.Pattern[str]
+    keys: bytes = b""
+    choose: re.Pattern[str] | None = None
+    """The option to pick, for a prompt answered by choice instead of ``keys``."""
+
+    def keys_for(self, screen: str) -> bytes | None:
+        """The keys to send to this prompt as ``screen`` shows it.
+
+        For a prompt with ``choose``: Enter when the focus is on that
+        option, Down while it is not, ``None`` while no focus is drawn.
+        """
+        if self.choose is None:
+            return self.keys
+        focused = _FOCUSED_OPTION_RE.search(screen)
+        if focused is None:
+            return None
+        return _ENTER if self.choose.search(focused.group(1)) else _DOWN
+
+
+_PROMPTS = (
+    # 2.1.318 focuses "No, exit", which Enter or Esc would choose; older
+    # versions focused "1. Yes, proceed". Trust prompts come before the Esc
+    # rules for that reason.
+    _Prompt(
+        "the folder trust prompt",
+        re.compile(r"Yes,\s*I\s*trust\s*this\s*folder|Quick\s*safety\s*check"),
+        choose=re.compile(r"^Yes\b"),
+    ),
+    # The first-run theme picker: Enter keeps the highlighted theme.
+    _Prompt("the theme picker", re.compile(r"colorblind-friendly"), _ENTER),
+    # "Yes, try it" has the focus, so Enter would opt in; Esc is "Not now".
+    _Prompt("the fullscreen-renderer offer", re.compile(r"fullscreen\s*renderer\?"), _ESC),
+    # Any other dialog with this footer: Esc cancels without choosing.
+    _Prompt(
+        "a confirm dialog",
+        re.compile(r"Enter\s*to\s*confirm\s*·\s*Esc\s*to\s*cancel"),
+        _ESC,
+    ),
+)
+
+_LOGIN_METHOD_RE = re.compile(r"Select\s*login\s*method")
+"""The first-run screen of a config dir with no login, after the theme."""
+
+_INPUT_BOX_FOOTER_RE = re.compile(r"\?\s*for\s*shortcuts|\son\s*\([^()\n]*\bto\s*cycle\)")
+"""The footer under the input box, in any permission mode: ``? for
+shortcuts`` (manual or default mode), or ``<mode> on (shift+tab to cycle)``
+(auto, accept edits, plan, bypass permissions)."""
+
+_INPUT_ROW_RE = re.compile(r"─{20,}[^\n]*\n[^\S\n]*\u276f")
+"""The input box itself: a row that starts with the prompt marker U+276F
+right under a rule. The recorded dialogs (trust, theme, login method,
+fullscreen offer) take its place, so a dialog this module does not know
+stops phase 1 short of typing ``/usage`` into it, even with the footer
+still drawn."""
+
+_BANNER_ROWS = 6
+"""The top rows of the screen, which hold the welcome banner at start-up."""
+
+_API_BILLING_RE = re.compile(
+    r"^[^\n]*Claude Code v\d[^\n]*\n"  # the banner's title row
+    r"[^\S\n]*[^\s·][^·\n]*·[^\S\n]*"  # the next row: logo and model, then " · "
+    r"(Claude API|API Usage Billing)[^\S\n]*$",  # the billing label, ending the row
+    re.MULTILINE,
+)
+"""The banner's billing label when ``claude`` has no plan login: ``Claude
+API`` for a credential without a subscription, such as a ``setup-token``
+token, and ``API Usage Billing`` when it is not logged in to claude.ai.
+
+Only the 2.1.318 banner row counts, ``<logo> <model> · <billing>`` right
+under ``Claude Code v<version>``, so a tip or notice that ends in either
+phrase does not. The boxed banner of older versions does not match, and
+the capture then goes on to ``/usage`` as it always did."""
+
+_NOT_LOGGED_IN_RE = re.compile(r"Not\s*logged\s*in")
 
 
 def _format_filename(when: datetime) -> str:
@@ -44,21 +171,19 @@ def _format_filename(when: datetime) -> str:
 def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
     """Build the env dict passed to ``pexpect.spawn`` for a usage capture.
 
-    Returns ``None`` when ``claude_config_dir`` is empty — meaning the
-    pexpect spawn inherits the supervisor's process environment
-    unchanged (the original PR 6 single-account behaviour).
+    The capture authenticates with the account's claude.ai login in
+    ``.credentials.json``. It never passes ``CLAUDE_CODE_OAUTH_TOKEN``, and
+    drops one it would inherit: the CLI prefers that variable to the login,
+    and a ``setup-token`` token in it has no ``user:profile`` scope, so
+    ``/usage`` can show no plan limits (ADR-0039). The account's
+    ``<config_dir>/oauth-token`` stays with the dispatcher and the API
+    source.
 
-    When ``claude_config_dir`` is set:
-
-    * ``CLAUDE_CONFIG_DIR`` is exported so the spawned ``claude /usage``
-      reads the right account's ``.credentials.json``.
-    * If the account has a long-lived OAuth token at
-      ``<config_dir>/oauth-token`` (PR 14), ``CLAUDE_CODE_OAUTH_TOKEN``
-      is also exported so the CLI uses the long-lived bearer instead
-      of ``.credentials.json``'s short-lived ``accessToken``. This
-      closes the gap that PR 14 left in pure-tty ``[usage].source``
-      deployments — without it, `setup-token` long-lived tokens never
-      reach the TTY capture path.
+    Returns ``None`` when ``claude_config_dir`` is empty and the
+    environment holds no ``CLAUDE_CODE_OAUTH_TOKEN``: the pexpect spawn
+    then inherits the supervisor's process environment unchanged. When
+    ``claude_config_dir`` is set, ``CLAUDE_CONFIG_DIR`` is exported so the
+    spawned ``claude`` reads that account's files.
 
     Raises :class:`UsageCaptureSpawnError` when ``claude_config_dir``
     points at a path that does not exist on disk, cannot be checked (a
@@ -67,21 +192,122 @@ def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
     error type, which the supervisor's poll catches).
     """
     if not claude_config_dir:
-        return None
+        if _TOKEN_ENV not in os.environ:
+            return None
+        return {key: value for key, value in os.environ.items() if key != _TOKEN_ENV}
     try:
         config_path = existing_config_dir(claude_config_dir)
     except ConfigDirError as exc:
         raise UsageCaptureSpawnError(str(exc)) from exc
-    env: dict[str, str] = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
-    # Local import to keep `oauth_token_file` out of the import graph
-    # for callers that never construct a capture env (e.g. CLI tools
-    # that import this module just for ``_format_filename``).
-    from claude_task_runner.usage.oauth_token_file import read_long_lived_token
-
-    long_lived = read_long_lived_token(claude_config_dir)
-    if long_lived is not None:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
+    env = {key: value for key, value in os.environ.items() if key != _TOKEN_ENV}
+    env["CLAUDE_CONFIG_DIR"] = str(config_path)
     return env
+
+
+def _showing_prompt(screen: str) -> _Prompt | None:
+    """The first of :data:`_PROMPTS` drawn on ``screen``, if any."""
+    for prompt in _PROMPTS:
+        if prompt.pattern.search(screen):
+            return prompt
+    return None
+
+
+def _await_input_box(
+    child: pexpect.spawn[bytes],
+    screen: LiveScreen,
+    clock: Clock,
+    timeout_s: float,
+    claude_config_dir: str,
+    keys_sent: int = 0,
+) -> tuple[str, int]:
+    """Read ``child`` into ``screen`` until the input box is ready for a command.
+
+    Ready means the input box and its footer are drawn and no prompt from
+    :data:`_PROMPTS` is. A prompt gets its keys once ``claude`` has drawn
+    nothing new for a poll, so the keys answer the whole frame; Esc or
+    Down goes again only after :data:`_RESEND_S` without a change that
+    calls for other keys, so a key the TUI dropped is repeated and one it
+    is still acting on is not, and Enter never goes twice in a row.
+    (2.1.318 can redraw the trust prompt with its focus reset in its first
+    seconds, dropping a key sent before.)
+
+    ``keys_sent`` is how many keys this capture has sent to prompts so
+    far; :data:`_MAX_ANSWERS` bounds the total over the capture.
+
+    Returns the rendered screen and the new total of keys sent. Raises
+    :class:`UsageCaptureLoginRequired` when ``claude`` asks for a login
+    method, and :class:`UsageCaptureTimeout` when it exits, when the total
+    would pass :data:`_MAX_ANSWERS`, or when it is not ready within
+    ``timeout_s`` of ``clock``; the timeout names the prompt still drawn.
+    """
+    deadline = clock.monotonic() + timeout_s
+    last_sent: tuple[_Prompt, bytes] | None = None
+    sent_at = 0.0
+    answers = keys_sent
+    while True:
+        try:
+            screen.feed(child.read_nonblocking(_READ_CHUNK, timeout=_POLL_S))
+            quiet = False
+        except pexpect.TIMEOUT:
+            quiet = True
+        except pexpect.EOF as exc:
+            raise UsageCaptureTimeout("claude exited before its input box appeared") from exc
+        text = screen.text()
+        if _LOGIN_METHOD_RE.search(text):
+            raise _login_required("asks which login method to use", claude_config_dir)
+        prompt = _showing_prompt(text)
+        if prompt is None:
+            if _INPUT_BOX_FOOTER_RE.search(text) and _INPUT_ROW_RE.search(text):
+                return text, answers
+            last_sent = None
+        elif quiet:
+            keys = prompt.keys_for(text)
+            now = clock.monotonic()
+            # Enter is never repeated: on a TUI that acted on it but has not
+            # redrawn yet, a second one would land on the next screen, where
+            # it could accept the fullscreen offer.
+            repeat = keys != _ENTER and now - sent_at >= _RESEND_S
+            if keys and ((prompt, keys) != last_sent or repeat):
+                if answers == _MAX_ANSWERS:
+                    raise UsageCaptureTimeout(
+                        f"claude still shows {prompt.name} after {answers} answers"
+                    )
+                child.send(keys)
+                last_sent = (prompt, keys)
+                sent_at = now
+                answers += 1
+        if clock.monotonic() >= deadline:
+            showing = f"; it still shows {prompt.name}" if prompt is not None else ""
+            raise UsageCaptureTimeout(f"TUI did not become ready within {timeout_s}s{showing}")
+
+
+def _api_billing_label(screen: str) -> str | None:
+    """The API-billing label in the welcome banner of ``screen``, if any."""
+    banner = "\n".join(screen.splitlines()[:_BANNER_ROWS])
+    match = _API_BILLING_RE.search(banner)
+    return match.group(1) if match is not None else None
+
+
+def _login_state(screen: str) -> str | None:
+    """How a ready ``screen`` shows that ``claude`` has no plan login, if it does."""
+    label = _api_billing_label(screen)
+    if label is None:
+        return None
+    if _NOT_LOGGED_IN_RE.search(screen):
+        return f"bills as {label!r} and says it is not logged in"
+    return f"bills as {label!r}"
+
+
+def _login_required(state: str, claude_config_dir: str) -> UsageCaptureLoginRequired:
+    """The error for a ``claude`` that has no plan login; ``state`` says how it shows."""
+    where = claude_config_dir or "~/.claude"
+    command = f"CLAUDE_CONFIG_DIR={claude_config_dir} claude" if claude_config_dir else "claude"
+    return UsageCaptureLoginRequired(
+        f"claude for config dir {where} {state}, so /usage shows no plan limits: "
+        f"{where}/.credentials.json holds no current claude.ai login. Run `{command}` in a "
+        f"shell without {_TOKEN_ENV} set and log in with /login (docs/runbook.md, "
+        "'A usage capture says claude has no claude.ai login')."
+    )
 
 
 def _rotate_captures(captures_dir: Path, keep: int) -> None:
@@ -114,7 +340,7 @@ def capture(
     settings
         Pre-validated usage section of the config.
     clock
-        Time source for naming the capture file.
+        Time source for naming the capture file and for phase 1's waits.
     captures_dir
         Where to write the forensics .cap. Created if it does not exist.
     claude_executable
@@ -128,8 +354,12 @@ def capture(
     ------
     UsageCaptureSpawnError
         If the ``claude`` binary cannot be located or launched.
+    UsageCaptureLoginRequired
+        If the banner shows API billing, or ``claude`` asks for a login
+        method: it has no claude.ai plan login in that config dir. A
+        ``UsageCaptureSpawnError`` subclass.
     UsageCaptureTimeout
-        If the trust prompt or both ``Resets`` lines do not appear within
+        If the input box or both ``Resets`` lines do not appear within
         their configured timeouts.
     """
     if shutil.which(claude_executable) is None:
@@ -140,8 +370,9 @@ def capture(
 
     spawn_env = _build_spawn_env(claude_config_dir)
 
-    # Pre-trust the spawn CWD and mark onboarding complete in the target
-    # .claude.json. Idempotent — a no-op once the flags are set. Done for
+    # Pre-trust the spawn CWD, mark onboarding complete and close the
+    # fullscreen-renderer offer in the target .claude.json. Idempotent — a
+    # no-op once the keys are set. Done for
     # the default CLAUDE_CONFIG_DIR too (config_path defaults to ~/.claude
     # inside the helper) so fresh accounts don't hit the trust dialog.
     from claude_task_runner.claude_init import ensure_initialized as _ensure_claude_init
@@ -149,6 +380,7 @@ def capture(
     _ensure_claude_init(claude_config_dir or None, Path.cwd())
 
     log_buf = io.BytesIO()
+    screen = LiveScreen(columns=_PTY_COLUMNS, rows=_PTY_ROWS)
     child: pexpect.spawn[bytes] | None = None
     try:
         # encoding=None -> raw bytes mode. We strip ANSI in the parser.
@@ -157,66 +389,25 @@ def capture(
             timeout=settings.capture_trust_timeout_s,
             encoding=None,
             env=spawn_env,
+            dimensions=(_PTY_ROWS, _PTY_COLUMNS),
         )
         child.logfile_read = log_buf
 
-        # Phase 1: race onboarding prompts against the TUI-ready marker.
-        #
-        # Different .claude config dirs land at different first frames; we
-        # loop, dismissing whichever prompt appears, until the "shortcuts"
-        # footer marks the TUI as ready (or we hit a timeout slice without
-        # any match).
-        #
-        # Known dismissable prompts:
-        #   - "Yes, I trust this folder"  (Claude <= 2.1.131 trust prompt)
-        #   - "Quick safety check"        (Claude >= 2.1.141 trust prompt)
-        #   - "colorblind-friendly"       (first-run theme picker — appears
-        #                                  when .claude.json lacks
-        #                                  `hasCompletedOnboarding=true`;
-        #                                  the longer phrases like
-        #                                  "Choose the text style" are
-        #                                  split by ANSI cursor escapes,
-        #                                  so we anchor on a contiguous
-        #                                  hyphenated word from the option
-        #                                  list.)
-        # Each is dismissed by sending Enter (trust prompts accept the
-        # highlighted default) or "1" + Enter (theme picker selects the
-        # first option, "Auto"). Operator escape hatches: pre-set
-        # `hasTrustDialogAccepted=true` and `hasCompletedOnboarding=true`
-        # in <config_dir>/.claude.json to skip both prompts entirely.
-        ready = False
-        for _attempt in range(5):  # bound dismissals — guards a stuck loop
-            try:
-                idx = child.expect(
-                    [
-                        b"Yes, I trust this folder",  # 0: legacy trust
-                        b"Quick safety check",  # 1: newer trust
-                        b"colorblind-friendly",  # 2: theme picker
-                        b"shortcuts",  # 3: TUI ready
-                        pexpect.TIMEOUT,  # 4
-                    ],
-                    timeout=settings.capture_trust_timeout_s,
-                )
-            except pexpect.EOF as exc:
-                raise UsageCaptureTimeout("claude exited before any TUI marker appeared") from exc
-            if idx in (0, 1):
-                child.sendline("")  # Enter accepts the default
-            elif idx == 2:
-                child.sendline("1")  # "1" = Auto theme
-            elif idx == 3:
-                ready = True
-                break
-            else:  # TIMEOUT — nothing matched this slice; give up
-                break
-
-        if not ready:
-            raise UsageCaptureTimeout(
-                f"TUI did not become ready within {settings.capture_trust_timeout_s}s"
-            )
-
-        # Pad before sending /usage — "shortcuts" appears before the input
-        # field is actually accepting commands.
+        # Phase 1: wait for the input box, answering prompts on the way.
+        # The footer appears before the input field accepts commands, and a
+        # dialog can open in the pad after it, so the wait runs again: no
+        # key may reach a dialog. The banner is read from the later screen,
+        # by which time a "Not logged in" notice has been drawn too.
+        _, keys_sent = _await_input_box(
+            child, screen, clock, settings.capture_trust_timeout_s, claude_config_dir
+        )
         _sleep_ms(settings.capture_post_ready_pad_ms)
+        ready_screen, _ = _await_input_box(
+            child, screen, clock, settings.capture_trust_timeout_s, claude_config_dir, keys_sent
+        )
+        state = _login_state(ready_screen)
+        if state is not None:
+            raise _login_required(state, claude_config_dir)
 
         # Phase 2: send /usage and wait for both Resets lines.
         # The TUI shows placeholder values immediately ("Refreshing…"),
@@ -284,6 +475,14 @@ def capture(
             with contextlib.suppress(OSError):
                 child.terminate(force=True)
 
+    except BaseException:
+        # Keep what claude drew for the post-mortem; a failed write must
+        # not replace the capture's own error.
+        if child is not None:
+            with contextlib.suppress(OSError):
+                capture_path.write_bytes(log_buf.getvalue())
+                _rotate_captures(captures_dir, settings.capture_rotation_count)
+        raise
     finally:
         if child is not None and child.isalive():
             with contextlib.suppress(OSError):

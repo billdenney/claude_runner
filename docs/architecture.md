@@ -303,8 +303,10 @@ There is no separate drift log. Parser drift leaves three pieces of evidence:
 - The supervisor log has one `notify[error]: parser drift: ...` line from the
   tick that entered `ErrorDrift`.
 - With the TTY usage source, the capture that failed to parse is the newest
-  `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. The API source writes
-  no `.cap`, and neither does a capture that times out or cannot spawn.
+  `<queue>/.claude_task_runner/usage_captures/<ts>.cap`. A TTY capture that
+  fails after `claude` started (a timeout, no claude.ai login) leaves its
+  `.cap` there too. The API source writes no `.cap`, and neither does a
+  capture that cannot spawn `claude`.
 
 ## Key invariants
 
