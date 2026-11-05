@@ -1093,9 +1093,21 @@ def _park_deferred(
     costs one write each — not one per task per tick. ``attempts`` /
     ``runs`` are untouched: a hold is not an attempt and must never feed the
     circuit breaker.
+
+    A ``deferred`` state reaches a gate only once its own reason no longer
+    holds it: ``next_eligible_at`` has passed or was never set (a reason
+    written by hand without one is only a label). Its reason is then
+    replaced, so the one it had is logged at INFO rather than lost.
     """
     if _is_parked_with(state, reason):
         return  # already parked with this exact reason — no rewrite, no churn
+    if state is not None and state.status == "deferred" and state.deferred_reason:
+        logger.info(
+            "task %s: parked: %s (replaces deferred_reason: %s)",
+            task_id,
+            reason,
+            state.deferred_reason,
+        )
     base = state if state is not None else TaskState(task_id=task_id)
     new_state = base.model_copy(
         update={

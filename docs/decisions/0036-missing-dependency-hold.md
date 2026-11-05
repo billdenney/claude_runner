@@ -103,7 +103,9 @@ status it accepts, so it still starts such a task on request.
   `failed` task, or an `awaiting_sidecar` one whose questions are answered,
   as `pending`, not as the status it had.
 - As with those gates, the park replaces a `deferred_reason` set by hand
-  without a `next_eligible_at`, since such a reason does not hold the task.
+  without a `next_eligible_at`, since such a reason does not hold the task,
+  and logs the reason it replaces at INFO (ADR-0030, amendment of
+  2026-10-30).
 - As with those gates, a park whose state write fails is retried, and its
   WARNING logged again, on every tick until the write succeeds.
 
