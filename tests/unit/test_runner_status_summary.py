@@ -1109,10 +1109,12 @@ def test_details_show_a_missing_5h_window_as_not_reported(
     path = persist_mod.supervisor_state_path(queue)
     data = json.loads(path.read_text(encoding="utf-8"))
     data["last_5h_util_pct"] = None
+    data["last_5h_reset_at"] = None
     path.write_text(json.dumps(data), encoding="utf-8")
 
     out = _run(queue, bin_dir).stdout
     assert "\n| 5h util | `not reported` |\n" in out
+    assert "\n| 5h reset_at | `—` |\n" in out
     assert "\n| personal | `dispatching` | not reported | 12% |  | 0 | — | — | " in out
     assert "\n| work | `dispatching` | 11% | 61% |  | 0 | — | — | " in out
 

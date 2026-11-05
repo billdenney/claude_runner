@@ -1224,7 +1224,7 @@ def supervisor_json_section(facts: Facts) -> str:
         ("in_flight", len(d.get("in_flight") or [])),
         ("since", d.get("since", "?")),
         ("scheduled_wakeup", d.get("scheduled_wakeup_at", "-")),
-        ("5h reset_at", d.get("last_5h_reset_at", "?")),
+        ("5h reset_at", d.get("last_5h_reset_at", "?") or "—"),
         ("weekly reset_at", d.get("last_weekly_reset_at", "?")),
         ("drift", d.get("last_drift_message", "") or "-"),
         ("last saved", saved),
@@ -1235,7 +1235,8 @@ def supervisor_json_section(facts: Facts) -> str:
         "_The supervisor's own record, rewritten every time it checks the queue (each poll "
         "interval), so `last saved` shows whether it is still working. `state` is its overall "
         "mode; `5h util` and `weekly util` are how much of the 5-hour and weekly usage "
-        "allowance is used (`not reported` when the account has no 5-hour window); "
+        'allowance is used (`not reported`, with `5h reset_at` "—", when the account has '
+        "no 5-hour window); "
         "`in_flight` counts tasks running now; `scheduled_wakeup` is when "
         "it next re-checks a throttled account, not when that account resumes; times are UTC._",
         "",
