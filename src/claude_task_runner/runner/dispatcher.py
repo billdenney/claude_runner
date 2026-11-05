@@ -3470,7 +3470,12 @@ def _finalize_state(
                     ),
                 }
             )
-        elif evidence.has_deliverable and not evidence.has_commit:
+        elif (
+            evidence.has_deliverable
+            and not evidence.has_commit
+            and queue_dir is not None
+            and settings_dispatch is not None
+        ):
             # ADR-0033: a terminal close (skip / defer). The run wrote its
             # report, committed nothing and left the worktree clean, so there
             # is no code to collect -- but the task is still selectable the
@@ -3478,16 +3483,13 @@ def _finalize_state(
             # verdict at full effort. Only the block_dispatch register stops
             # that, and until now nothing wrote a row except an operator by
             # hand. Status is unchanged: this IS a genuine completion.
-            if queue_dir is not None and settings_dispatch is not None:
-                terminal_gate_mod.ensure_terminal_gate(
-                    queue_dir=queue_dir,
-                    block_file=settings_dispatch.dispatch_block_file,
-                    task_id=task.id,
-                    stop_reason=run.stop_reason,
-                    deliverable=(
-                        str(task.deliverable_paths[0]) if task.deliverable_paths else None
-                    ),
-                )
+            terminal_gate_mod.ensure_terminal_gate(
+                queue_dir=queue_dir,
+                block_file=settings_dispatch.dispatch_block_file,
+                task_id=task.id,
+                stop_reason=run.stop_reason,
+                deliverable=(str(task.deliverable_paths[0]) if task.deliverable_paths else None),
+            )
 
     new_runs = [*prior.runs, run]
 
