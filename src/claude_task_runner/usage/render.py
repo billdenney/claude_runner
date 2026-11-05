@@ -17,6 +17,8 @@ its output as plain text.
 
 from __future__ import annotations
 
+import codecs
+
 import pyte
 
 # Generous defaults so wide TUIs (multi-column layouts, the full /usage
@@ -49,8 +51,30 @@ def render(raw: bytes, *, columns: int = DEFAULT_COLUMNS, rows: int = DEFAULT_RO
     if not raw:
         return ""
 
-    screen = pyte.Screen(columns, rows)
-    stream = pyte.Stream(screen)
-    # pyte expects str; decode permissively so undecodable bytes don't crash.
-    stream.feed(raw.decode("utf-8", errors="replace"))
-    return "\n".join(screen.display)
+    screen = LiveScreen(columns=columns, rows=rows)
+    screen.feed(raw, final=True)
+    return screen.text()
+
+
+class LiveScreen:
+    """A virtual terminal fed the PTY stream piece by piece as it arrives.
+
+    The usage capture reads the screen while ``claude`` is still drawing it,
+    so each read feeds only the new bytes instead of re-rendering the whole
+    stream. A UTF-8 sequence split across two reads is decoded once both
+    halves have arrived.
+    """
+
+    def __init__(self, *, columns: int, rows: int) -> None:
+        self._screen = pyte.Screen(columns, rows)
+        self._stream = pyte.Stream(self._screen)
+        # pyte expects str; decode permissively so undecodable bytes don't crash.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(self, data: bytes, *, final: bool = False) -> None:
+        """Draw ``data``; ``final`` flushes a trailing incomplete UTF-8 sequence."""
+        self._stream.feed(self._decoder.decode(data, final=final))
+
+    def text(self) -> str:
+        """The screen as newline-joined rows, each exactly ``columns`` wide."""
+        return "\n".join(self._screen.display)

@@ -101,3 +101,16 @@ class UsageApiNetworkError(UsageCaptureTimeout):
     the same way as a slow TTY capture — observable as a transient
     failure rather than a structural one.
     """
+
+
+class UsageCaptureLoginRequired(UsageApiAuthExpired):
+    """``claude`` in the account's config dir has no claude.ai plan login.
+
+    Raised by the TTY capture when the TUI's banner names API billing
+    (``Claude API`` or ``API Usage Billing``) instead of a plan: the CLI
+    then has no subscription to read, and ``/usage`` shows the session's
+    cost but not the plan's limit bars. Only an interactive ``/login`` for
+    that config dir fixes it, so it is an auth failure (``ErrorDrift``),
+    not a capture to retry; its message names ``.credentials.json``, one of
+    :data:`AUTH_FAILURE_MARKERS`. See ADR-0039.
+    """
