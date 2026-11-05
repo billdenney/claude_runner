@@ -90,7 +90,7 @@ BOUNDED_BY_ANOTHER_SETTING = {
         "poll interval over five years is rejected by that rule, not by its own "
         "bound. One more than the ceiling still fails on the field's own bound. "
         "[failure_classifier].deferral_recheck_cooldown_s must also be at least "
-        "one poll interval, so a long poll needs a cooldown as long."
+        "two poll intervals, so a long poll needs a cooldown twice as long."
     ),
 }
 """Duration settings whose ceiling alone cannot load, and why."""
@@ -130,8 +130,10 @@ class TestEveryDurationIsAtMostTenYears:
 
     def test_poll_interval_is_bounded_by_the_reading_age(self, tmp_path: Path) -> None:
         """Ten years alone fails the two-cycle rule; five years, with the
-        reading age at its own ceiling and a cooldown of at least one poll,
-        is the largest that loads."""
+        reading age at its own ceiling and a cooldown of at least two polls,
+        is the largest that loads. pydantic stops at the first after-validator
+        that fails, so each rule is reached only once the ones declared
+        before it on ``Settings`` pass: this test relies on that order."""
         toml = tmp_path / "claude_runner.toml"
         toml.write_text(toml_setting("usage.poll_interval_s", str(MAX_DURATION_S)))
         with pytest.raises(ConfigError, match="under two capture cycles"):
@@ -141,11 +143,10 @@ class TestEveryDurationIsAtMostTenYears:
             f"max_reading_age_s = {MAX_DURATION_S}\n"
         )
         toml.write_text(five_years)
-        with pytest.raises(ConfigError, match="under one supervisor tick"):
+        with pytest.raises(ConfigError, match="under two supervisor ticks"):
             load_settings(toml)
         toml.write_text(
-            five_years
-            + f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {MAX_DURATION_S // 2}\n"
+            five_years + f"\n[failure_classifier]\ndeferral_recheck_cooldown_s = {MAX_DURATION_S}\n"
         )
         assert load_settings(toml).usage.poll_interval_s == MAX_DURATION_S // 2
 

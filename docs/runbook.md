@@ -305,7 +305,9 @@ account file is broken"). A start refused because a file could not be read
 yet exits 1 and is retried. `install` writes
 those three from the queue's `[watchdog].restart_cooldown_s`,
 `[watchdog].crash_loop_threshold` and `[watchdog].restart_backoff_max_s`
-(30 s, 5 and 600 s by default). After changing them, re-run
+(30 s, 5 and 600 s by default). The cron watchdog reads the cooldown only
+when cron runs it, once a minute, so under cron a cooldown under a minute
+acts as one minute. After changing them, re-run
 `claude-task-runner install`: it rewrites the unit and reloads systemd, and
 the next crash uses the new values without the supervisor being restarted.
 Read the exception with `journalctl --user -u claude-task-runner`. Once the
@@ -490,8 +492,10 @@ task that does not run.
      depends on a member waits under `depends_on`.
    - `pre-dispatch hook deferred (exit 1):` — the pre-dispatch hook asked
      to wait, and the rest of the reason is its stderr (ADR-0026). Once the
-     `next_eligible_at` printed below the reason has passed, the supervisor
-     tries the task again and runs the hook again.
+     `next_eligible_at` printed below the reason has passed
+     (`[failure_classifier].deferral_recheck_cooldown_s` after the deferral,
+     15 minutes by default), the supervisor tries the task again and runs
+     the hook again.
    - `cannot start the worker:` — the supervisor could not start `claude`
      for the task: the `claude` binary is not on PATH, the account's
      `config_dir` does not exist or names an unknown `~user`, `sudo` is
@@ -503,8 +507,11 @@ task that does not run.
      the circuit breaker is not fed. Fix the cause; the supervisor tries
      again once `next_eligible_at` has passed
      (`[failure_classifier].deferral_recheck_cooldown_s`, 15 minutes by
-     default, and never less than `[usage].poll_interval_s`, since the
-     cooldown is checked once a tick), and the task runs.
+     default), and the task runs. The cooldown is checked once a tick, and
+     the next tick's selection comes a little more than one
+     `[usage].poll_interval_s` after the deferral, so the settings refuse a
+     cooldown under two poll intervals: one would have passed by then and
+     the task would be tried every tick.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
      has none.
@@ -932,7 +939,9 @@ On 2026-09-25 the nlmixr2lib queue had 305 of them, holding 36 GB.
    ```
 
    Each pass removes at most `max_per_pass` worktrees, so clear a large
-   backlog with the CLI first. Task YAMLs are read from `todo/` and `done/`
+   backlog with the CLI first. A pass runs every `interval_s` (an hour by
+   default); the supervisor checks it once a tick, so the settings refuse
+   an `interval_s` under `[usage].poll_interval_s`. Task YAMLs are read from `todo/` and `done/`
    (`[worktree_reclaim].task_dirs`). A task whose YAML has moved anywhere else
    is invisible to the runner: add that directory to `task_dirs`, or remove
    its worktree by hand.
