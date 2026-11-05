@@ -36,6 +36,8 @@ from claude_task_runner.usage.drift import UsageCaptureSpawnError, UsageCaptureT
 
 logger = logging.getLogger(__name__)
 
+_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
 
 def _format_filename(when: datetime) -> str:
     return when.strftime("%Y%m%dT%H%M%SZ.cap")
@@ -44,21 +46,19 @@ def _format_filename(when: datetime) -> str:
 def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
     """Build the env dict passed to ``pexpect.spawn`` for a usage capture.
 
-    Returns ``None`` when ``claude_config_dir`` is empty — meaning the
-    pexpect spawn inherits the supervisor's process environment
-    unchanged (the original PR 6 single-account behaviour).
+    The capture authenticates with the account's claude.ai login in
+    ``.credentials.json``. It never passes ``CLAUDE_CODE_OAUTH_TOKEN``, and
+    drops one it would inherit: the CLI prefers that variable to the login,
+    and a ``setup-token`` token in it has no ``user:profile`` scope, so
+    ``/usage`` can show no plan limits (ADR-0039). The account's
+    ``<config_dir>/oauth-token`` stays with the dispatcher and the API
+    source.
 
-    When ``claude_config_dir`` is set:
-
-    * ``CLAUDE_CONFIG_DIR`` is exported so the spawned ``claude /usage``
-      reads the right account's ``.credentials.json``.
-    * If the account has a long-lived OAuth token at
-      ``<config_dir>/oauth-token`` (PR 14), ``CLAUDE_CODE_OAUTH_TOKEN``
-      is also exported so the CLI uses the long-lived bearer instead
-      of ``.credentials.json``'s short-lived ``accessToken``. This
-      closes the gap that PR 14 left in pure-tty ``[usage].source``
-      deployments — without it, `setup-token` long-lived tokens never
-      reach the TTY capture path.
+    Returns ``None`` when ``claude_config_dir`` is empty and the
+    environment holds no ``CLAUDE_CODE_OAUTH_TOKEN``: the pexpect spawn
+    then inherits the supervisor's process environment unchanged. When
+    ``claude_config_dir`` is set, ``CLAUDE_CONFIG_DIR`` is exported so the
+    spawned ``claude`` reads that account's files.
 
     Raises :class:`UsageCaptureSpawnError` when ``claude_config_dir``
     points at a path that does not exist on disk, cannot be checked (a
@@ -67,20 +67,15 @@ def _build_spawn_env(claude_config_dir: str) -> dict[str, str] | None:
     error type, which the supervisor's poll catches).
     """
     if not claude_config_dir:
-        return None
+        if _TOKEN_ENV not in os.environ:
+            return None
+        return {key: value for key, value in os.environ.items() if key != _TOKEN_ENV}
     try:
         config_path = existing_config_dir(claude_config_dir)
     except ConfigDirError as exc:
         raise UsageCaptureSpawnError(str(exc)) from exc
-    env: dict[str, str] = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_path)}
-    # Local import to keep `oauth_token_file` out of the import graph
-    # for callers that never construct a capture env (e.g. CLI tools
-    # that import this module just for ``_format_filename``).
-    from claude_task_runner.usage.oauth_token_file import read_long_lived_token
-
-    long_lived = read_long_lived_token(claude_config_dir)
-    if long_lived is not None:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
+    env = {key: value for key, value in os.environ.items() if key != _TOKEN_ENV}
+    env["CLAUDE_CONFIG_DIR"] = str(config_path)
     return env
 
 
