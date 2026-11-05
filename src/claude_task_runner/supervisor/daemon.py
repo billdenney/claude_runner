@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
+from typing import cast
 
 from claude_task_runner.clock import Clock, RealClock
 from claude_task_runner.config.linux_user import needs_sudo
@@ -85,6 +86,7 @@ from claude_task_runner.usage.drift import (
     UsageFormatDrift,
 )
 from claude_task_runner.usage.models import UsageReading
+from claude_task_runner.usage.multi_account_source import MultiAccountSourceError
 from claude_task_runner.usage.source import UsageSource
 from claude_task_runner.worktree import reclaim as reclaim_mod
 
@@ -100,6 +102,13 @@ def safe_poll(source: UsageSource) -> PollResult:
 
     Returns the relevant exception object (not raised) so the daemon
     loop stays simple and the state machine can route on type.
+
+    An ``OSError`` the capture did not turn into one of them (a pty or file
+    descriptor that cannot be had, a working directory that has gone) is
+    logged and returned as a :class:`UsageCaptureSpawnError`, so the tick
+    is skipped like any capture that could not start instead of ending the
+    supervisor. An account the multi-account source attributed it to stays
+    attributed.
     """
     try:
         return source.read()
@@ -109,6 +118,18 @@ def safe_poll(source: UsageSource) -> PollResult:
         return exc
     except UsageCaptureSpawnError as exc:
         return exc
+    except OSError as exc:
+        logger.error("usage poll failed: %s", exc, exc_info=True)
+        return _spawn_error_from(exc)
+
+
+def _spawn_error_from(exc: OSError) -> UsageCaptureSpawnError:
+    """``exc`` as a :class:`UsageCaptureSpawnError`, keeping its account."""
+    if isinstance(exc, MultiAccountSourceError):
+        inner = UsageCaptureSpawnError(f"usage capture failed: {exc.original}")
+        # wrap returns an instance of inner's type as well.
+        return cast("UsageCaptureSpawnError", MultiAccountSourceError.wrap(exc.account, inner))
+    return UsageCaptureSpawnError(f"usage capture failed: {exc}")
 
 
 @dataclass(frozen=True)

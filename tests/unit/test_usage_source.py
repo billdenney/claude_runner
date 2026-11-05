@@ -90,6 +90,25 @@ def test_claude_usage_source_read_returns_parsed_reading(tmp_path: Path) -> None
     assert result.capture_path == str(fake_path)
 
 
+def test_claude_usage_source_read_without_a_capture_file(tmp_path: Path) -> None:
+    """A capture whose .cap could not be written still gives its reading,
+    with no capture_path rather than one naming a file that is not there."""
+    settings = load_settings(None).usage
+    clock = FakeClock(datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC))
+    with (
+        patch(
+            "claude_task_runner.usage.source.capture_mod.capture",
+            return_value=(b"raw bytes", None),
+        ),
+        patch(
+            "claude_task_runner.usage.source.parser_mod.parse",
+            return_value=_make_reading(util_5h=33, util_wk=12),
+        ),
+    ):
+        result = ClaudeUsageSource(settings, clock, captures_dir=tmp_path).read()
+    assert (result.five_hour.utilization_pct, result.capture_path) == (33, None)
+
+
 def test_claude_usage_source_read_propagates_capture_args(tmp_path: Path) -> None:
     """The settings / captures_dir / executable / config_dir handed in at
     construction time must flow through to capture_mod.capture."""

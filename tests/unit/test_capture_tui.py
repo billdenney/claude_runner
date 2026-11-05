@@ -18,11 +18,13 @@ behaviour:
 from __future__ import annotations
 
 import io
+import logging
 import sys
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pexpect
 import pytest
@@ -687,3 +689,42 @@ def test_capture_with_a_plan_banner_reads_usage(
     assert reading.five_hour.resets_at_raw == "10:59pm (UTC)"
     assert reading.seven_day.utilization_pct == 100
     assert reading.seven_day.resets_at_raw == "3am (UTC)"
+
+
+def _plan_capture_child(clock: FakeClock) -> tuple[FakeChild, bytes]:
+    """A plan account's ``claude`` showing the 2026-05-03 /usage panel, and
+    the bytes the capture records from it."""
+    usage = (USAGE_FIXTURE / "real_2026-05-03_three_section.cap").read_bytes()
+    return FakeChild(clock, [_subscribed()], [(b"/usage\r", [usage])]), _subscribed() + usage
+
+
+def test_a_written_capture_returns_its_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    child, recorded = _plan_capture_child(clock)
+    raw, cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+    assert raw == recorded
+    assert cap_path == tmp_path / "caps" / "20261105T170000Z.cap"
+    assert cap_path.read_bytes() == recorded
+
+
+def test_a_capture_file_that_cannot_be_written_keeps_the_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    child, recorded = _plan_capture_child(clock)
+    cap = tmp_path / "caps" / "20261105T170000Z.cap"
+    with (
+        patch.object(Path, "write_bytes", side_effect=OSError(28, "No space left on device")),
+        caplog.at_level(logging.WARNING, logger="claude_task_runner.usage.capture"),
+    ):
+        raw, cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+    assert (raw, cap_path) == (recorded, None)
+    assert not cap.exists()
+    assert [
+        r.getMessage() for r in caplog.records if r.name == "claude_task_runner.usage.capture"
+    ] == [
+        f"usage capture: cannot write the forensics file {cap}: [Errno 28] No space left on device"
+    ]
