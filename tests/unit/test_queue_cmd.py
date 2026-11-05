@@ -316,6 +316,38 @@ class TestStates:
             "  next_eligible_at: 2026-09-26T12:15:00Z",
         ]
 
+    def test_human_output_flags_a_retry_time_with_no_timezone(
+        self, runner: CliRunner, queue_dir: Path
+    ) -> None:
+        """The supervisor never compares a ``next_eligible_at`` with no offset
+        with its clock, so the task does not retry then; the line says why."""
+        _seed_state(
+            queue_dir,
+            "001",
+            status="deferred",
+            deferred_reason="parked by hand",
+            next_eligible_at=datetime(2099, 1, 1),
+        )
+        _seed_state(
+            queue_dir,
+            "002",
+            status="deferred",
+            deferred_reason=HOOK_DEFERRAL,
+            next_eligible_at=NEXT_ELIGIBLE_AT,
+        )
+        result = runner.invoke(app, ["states", "--queue", str(queue_dir)])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines() == [
+            "001  deferred",
+            "  deferred_reason: parked by hand",
+            "  next_eligible_at: 2099-01-01T00:00:00 (no timezone: held until it is written in "
+            "UTC with an offset)",
+            "002  deferred",
+            "  deferred_reason: pre-dispatch hook deferred (exit 1): DEFERRED: awaiting trim "
+            "for PMID_19660004.pdf",
+            "  next_eligible_at: 2026-09-26T12:15:00Z",
+        ]
+
     @pytest.mark.parametrize(
         "reason",
         [

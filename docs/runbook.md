@@ -621,7 +621,9 @@ task that does not run.
      the task would be tried every tick.
    - Anything else was written by hand. The supervisor treats the task as
      ready again once its `next_eligible_at` has passed, or at once when it
-     has none.
+     has none. Write the time in UTC with an offset
+     (`2026-10-15T12:00:00+00:00`): one with no offset never passes, and the
+     task is held as `next_eligible_at_without_timezone` until it is fixed.
 
 ## Nothing dispatches, but an account has room
 
@@ -694,8 +696,9 @@ not paused or throttled.
    - `next_eligible_at_without_timezone` — a `deferred` state whose
      `next_eligible_at` has no timezone, as a hand edit such as
      `2099-01-01T00:00:00` does. It cannot be compared with the clock, so the
-     task is held until the value is fixed, and every tick logs an ERROR
-     naming the state file. Timestamps are UTC: write it with an offset, e.g.
+     task is held until the value is fixed. The supervisor logs an ERROR
+     naming the state file once for each such value it reads, not every
+     tick. Timestamps are UTC: write it with an offset, e.g.
      `2099-01-01T00:00:00+00:00`. Other tasks dispatch as usual.
    - `invalid_effort` — see "A task stays `deferred`".
    - A status name (`possibly_hung`, `running`, `failed_circuit_breaker`,
