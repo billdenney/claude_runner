@@ -386,27 +386,98 @@ def test_weekly_only_response_missing_one_seven_day_header_raises(absent: str) -
     )
 
 
-@pytest.mark.parametrize(
-    "header",
-    [
-        "anthropic-ratelimit-unified-3h-utilization",
-        "Anthropic-Ratelimit-Unified-3H-Utilization",
-        "anthropic-ratelimit-unified-five_hour-utilization",
-    ],
-    ids=["3h", "3h-mixed-case", "renamed-5h"],
+_NO_5H_PAIR = (
+    "missing rate-limit headers from /v1/messages: ["
+    "'anthropic-ratelimit-unified-5h-utilization', 'anthropic-ratelimit-unified-5h-reset'], "
+    "and the response does not show that no 5-hour window applies: "
 )
-def test_unrecognised_window_without_five_hour_raises(header: str) -> None:
-    """A window this module does not know may be the 5-hour window renamed,
-    so a response without the 5h pair must not read as having no 5-hour
-    window while one is present."""
-    h = {**_WEEKLY_ONLY_HEADERS, header: "0.4"}
+_FALL_BACK = ". Possible Anthropic header rename — falling back to TTY source."
+_CLAIM = "anthropic-ratelimit-unified-representative-claim"
+
+
+def _without(headers: dict[str, str], *names: str) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k not in names}
+
+
+@pytest.mark.parametrize(
+    ("headers", "doubts"),
+    [
+        (
+            {**_WEEKLY_ONLY_HEADERS, _CLAIM: "five_hour"},
+            f"{_CLAIM} is 'five_hour'",
+        ),
+        (
+            {
+                **_WEEKLY_ONLY_HEADERS,
+                "anthropic-ratelimit-5h-utilization": "0.11",
+                "anthropic-ratelimit-5h-reset": "1793908800",
+            },
+            "5-hour headers ['anthropic-ratelimit-5h-reset', 'anthropic-ratelimit-5h-utilization']",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "anthropic-ratelimit-unified-5h-status": "allowed"},
+            "5-hour headers ['anthropic-ratelimit-unified-5h-status']",
+        ),
+        (
+            {
+                "anthropic-ratelimit-unified-7d-utilization": "0.12",
+                "anthropic-ratelimit-unified-7d-reset": "1794394800",
+            },
+            f"no {_CLAIM} header",
+        ),
+        (
+            _without(_WEEKLY_ONLY_HEADERS, _CLAIM),
+            f"no {_CLAIM} header",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "anthropic-ratelimit-unified-3h-utilization": "0.4"},
+            "unrecognised window headers ['anthropic-ratelimit-unified-3h-utilization']",
+        ),
+        (
+            {**_WEEKLY_ONLY_HEADERS, "Anthropic-Ratelimit-Unified-3H-Utilization": "0.4"},
+            "unrecognised window headers ['anthropic-ratelimit-unified-3h-utilization']",
+        ),
+        (
+            {
+                **_WEEKLY_ONLY_HEADERS,
+                _CLAIM: "five_hour",
+                "anthropic-ratelimit-unified-five_hour-utilization": "0.4",
+            },
+            f"{_CLAIM} is 'five_hour'; "
+            "5-hour headers ['anthropic-ratelimit-unified-five_hour-utilization']; "
+            "unrecognised window headers ['anthropic-ratelimit-unified-five_hour-utilization']",
+        ),
+    ],
+    ids=[
+        "claim-five_hour",
+        "5h-without-unified-prefix",
+        "lone-5h-status",
+        "only-the-7d-pair",
+        "no-claim",
+        "unknown-3h-window",
+        "unknown-3h-window-mixed-case",
+        "renamed-5h-window",
+    ],
+)
+def test_missing_5h_pair_without_proof_of_no_5h_window_raises(
+    headers: dict[str, str], doubts: str
+) -> None:
+    """Without the 5h pair, a response reads as having no 5-hour window only
+    when it shows none applies. A claim of five_hour, a 5h header under
+    another name, no claim at all, or a window this module does not know
+    each leave a 5-hour window possible, so each raises."""
     with pytest.raises(UsageApiHeaderMissing) as exc_info:
-        _headers_to_reading(h, _CAPTURED_AT)
-    assert str(exc_info.value) == (
-        "no 5h rate-limit headers from /v1/messages, and unrecognised window headers "
-        f"[{header.lower()!r}]. Possible Anthropic header rename — falling back to TTY source."
-    )
+        _headers_to_reading(headers, _CAPTURED_AT)
+    assert str(exc_info.value) == _NO_5H_PAIR + doubts + _FALL_BACK
     assert usage_error_kind(str(exc_info.value)) == "format"
+
+
+@pytest.mark.parametrize("claim", ["seven_day", "Seven_Day ", "overage"])
+def test_weekly_only_response_with_another_claim_reads(claim: str) -> None:
+    """Any representative claim that names no 5-hour window is evidence."""
+    reading = _headers_to_reading({**_WEEKLY_ONLY_HEADERS, _CLAIM: claim}, _CAPTURED_AT)
+    assert reading.five_hour is None
+    assert reading.seven_day.utilization_pct == 12
 
 
 def test_unrecognised_window_beside_both_windows_is_ignored() -> None:

@@ -62,18 +62,30 @@ account at 12% of its weekly allowance took no tasks.
 5-hour window. It is never a stand-in for 0%, never carries a made-up reset
 time, and never stands for a failed reading, which still raises.
 
-**The API source accepts a response with no 5-hour window, and nothing
-looser.** `_headers_to_reading` gives `five_hour=None` when the response has
-neither 5h header, the 7d pair is present and valid, and no
-`anthropic-ratelimit-unified-<w>-utilization` header names a window outside
-`5h`, `7d` and `overage`. Otherwise it raises `UsageApiHeaderMissing` as
-before: when either 7d header is missing, when only one of the two 5h
-headers is present, when a value cannot become a reading, and when a
-window it does not know appears in a response without the 5h pair, since
-that window may be the 5-hour window under a new name and must not read as
-"no 5-hour limit". A response with both 5h headers ignores any other window,
-as it always did. The `falling back to TTY source` messages are unchanged
-for the cases that still raise.
+**The API source accepts a response with no 5-hour window only on
+positive evidence that none applies.** `_headers_to_reading` gives
+`five_hour=None` when all of these hold:
+
+- neither `anthropic-ratelimit-unified-5h-utilization` nor
+  `anthropic-ratelimit-unified-5h-reset` is present;
+- the 7d pair is present and both values are valid;
+- `anthropic-ratelimit-unified-representative-claim` is present and its
+  value names no 5-hour window: it contains neither `five` nor `5h`, case
+  ignored (the personal account sends `seven_day`);
+- no header name contains `5h` or `five`, case ignored: not a 5h header
+  under another prefix (`anthropic-ratelimit-5h-utilization`), and not a
+  5h status without its pair (`anthropic-ratelimit-unified-5h-status`);
+- every `anthropic-ratelimit-unified-<w>-utilization` header names `5h`,
+  `7d` or `overage`, since a window it does not know may be the 5-hour
+  window under a new name.
+
+Every other response without the 5h pair raises `UsageApiHeaderMissing`,
+with a message that lists the missing headers and each check that failed,
+and ends with the usual `falling back to TTY source`. So does a response
+with a 7d header missing, with only one of the two 5h headers, or with a
+value that cannot become a reading, as before. A response with both 5h
+headers ignores any other window and the representative claim, as it
+always did.
 
 **The TTY parser keeps requiring both windows.** The `/usage` screen shows
 both, so one missing there is still drift.
@@ -115,10 +127,13 @@ name.
   sent, and the reading would look the same as one from an account that
   has a 5-hour window and has not used it, so the 5h bands would go on
   applying to a window that does not exist.
-- **Accept any response without the 5h pair.** A rename of the 5h headers
-  (to `-5hr-` or `-five_hour-`, say) would then read as "no 5-hour limit",
-  and dispatch would run past a limit that exists. Requiring every
-  utilization header to name a known window keeps a rename loud.
+- **Accept any response without the 5h pair, or one whose only fault is
+  an unknown window.** A rename of the 5h headers (to `-5hr-` or
+  `-five_hour-`, say), a changed prefix, a response that lost the pair but
+  kept its 5h status, or one that names `five_hour` as its representative
+  claim would then read as "no 5-hour limit", and dispatch would run past a
+  limit that exists. Requiring the claim of another window and the absence
+  of every 5h-like header keeps each of those loud.
 - **Keep the last 5h reading the account had.** The window no longer
   applies, so its utilization and reset would only grow staler, and the
   throttle would keep acting on them.
@@ -135,8 +150,9 @@ name.
   weekly trace (`[dispatch_pct.week]`) and its `max_concurrency`. Its 5h
   bands take effect again with the first reading that has a 5-hour window;
   there is no setting to change.
-- A response carrying a window the source does not know, without the 5h
-  pair, is drift until `_KNOWN_WINDOWS` in `usage/api_source.py` lists it.
+- A response without the 5h pair that carries a window the source does not
+  know, or no representative claim, is drift until `usage/api_source.py`
+  learns it (`_KNOWN_WINDOWS` for a window).
 - A reader of `supervisor.json` outside the runner must allow `null` in
   `last_5h_util_pct`.
 - Going back to a supervisor built before this change means removing or
