@@ -67,12 +67,14 @@ have ended `claude`.
    answer a whole frame, and the same keys go again after 2 s without
    a change: in its first seconds 2.1.318 redraws the trust prompt with
    the focus reset and drops a key sent before. A prompt still drawn at
-   the timeout is named in it, and at most eight keys are sent. After the
-   post-ready pad phase 1 runs again, so a dialog that opened in the pad
-   (the offer appears about a second after the input box) is closed
-   before `/usage` is typed.
+   the timeout is named in it. After the post-ready pad phase 1 runs
+   again, so a dialog that opened in the pad (the offer appears about a
+   second after the input box) is closed before `/usage` is typed. The
+   bound of eight keys spans the whole capture, both runs of phase 1
+   together.
 3. **`ensure_initialized` raises `fullscreenUpsellSeenCount` to 3**, so
-   the offer stays closed; the Esc rule is the fallback for a CLI that
+   the offer stays closed; an integer count of 3 or more is kept, any
+   other value becomes 3. The Esc rule is the fallback for a CLI that
    counts differently.
 4. **The capture authenticates with the account's login, never the
    long-lived token.** `_build_spawn_env` drops `CLAUDE_CODE_OAUTH_TOKEN`,

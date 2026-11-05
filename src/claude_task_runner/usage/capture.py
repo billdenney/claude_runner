@@ -68,8 +68,9 @@ _RESEND_S = 2.0
 them again: the TUI drops keys that arrive while it is still starting."""
 
 _MAX_ANSWERS = 8
-"""Keys phase 1 sends to prompts before it gives up: a bound on a prompt
-that ignores them, or a TUI that keeps opening new ones."""
+"""Keys a capture sends to prompts, over both runs of phase 1, before it
+gives up: a bound on a prompt that ignores them, or a TUI that keeps
+opening new ones."""
 
 _ENTER = b"\r"
 _ESC = b"\x1b"
@@ -210,7 +211,8 @@ def _await_input_box(
     clock: Clock,
     timeout_s: float,
     claude_config_dir: str,
-) -> str:
+    keys_sent: int = 0,
+) -> tuple[str, int]:
     """Read ``child`` into ``screen`` until the input box is ready for a command.
 
     Ready means the footer under the input box is drawn and no prompt from
@@ -221,16 +223,19 @@ def _await_input_box(
     still acting on is not. (2.1.318 can redraw the trust prompt with its
     focus reset in its first seconds, dropping a key sent before.)
 
-    Returns the rendered screen. Raises :class:`UsageCaptureLoginRequired`
-    when ``claude`` asks for a login method, and
-    :class:`UsageCaptureTimeout` when it exits, when a prompt takes more
-    than :data:`_MAX_ANSWERS` keys, or when it is not ready within
+    ``keys_sent`` is how many keys this capture has sent to prompts so
+    far; :data:`_MAX_ANSWERS` bounds the total over the capture.
+
+    Returns the rendered screen and the new total of keys sent. Raises
+    :class:`UsageCaptureLoginRequired` when ``claude`` asks for a login
+    method, and :class:`UsageCaptureTimeout` when it exits, when the total
+    would pass :data:`_MAX_ANSWERS`, or when it is not ready within
     ``timeout_s`` of ``clock``; the timeout names the prompt still drawn.
     """
     deadline = clock.monotonic() + timeout_s
     last_sent: tuple[_Prompt, bytes] | None = None
     sent_at = 0.0
-    answers = 0
+    answers = keys_sent
     while True:
         try:
             screen.feed(child.read_nonblocking(_READ_CHUNK, timeout=_POLL_S))
@@ -245,7 +250,7 @@ def _await_input_box(
         prompt = _showing_prompt(text)
         if prompt is None:
             if _INPUT_BOX_FOOTER_RE.search(text):
-                return text
+                return text, answers
             last_sent = None
         elif quiet:
             keys = prompt.keys_for(text)
@@ -381,10 +386,12 @@ def capture(
         # dialog can open in the pad after it, so the wait runs again: no
         # key may reach a dialog. The banner is read from the later screen,
         # by which time a "Not logged in" notice has been drawn too.
-        _await_input_box(child, screen, clock, settings.capture_trust_timeout_s, claude_config_dir)
-        _sleep_ms(settings.capture_post_ready_pad_ms)
-        ready_screen = _await_input_box(
+        _, keys_sent = _await_input_box(
             child, screen, clock, settings.capture_trust_timeout_s, claude_config_dir
+        )
+        _sleep_ms(settings.capture_post_ready_pad_ms)
+        ready_screen, _ = _await_input_box(
+            child, screen, clock, settings.capture_trust_timeout_s, claude_config_dir, keys_sent
         )
         state = _login_state(ready_screen)
         if state is not None:

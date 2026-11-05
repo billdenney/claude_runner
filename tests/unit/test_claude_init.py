@@ -122,7 +122,7 @@ class TestFullscreenUpsellCount:
     def test_limit_matches_the_cli(self) -> None:
         assert FULLSCREEN_UPSELL_LIMIT == 3
 
-    @pytest.mark.parametrize("seen", [0, 2, True, "3", None, 2.5])
+    @pytest.mark.parametrize("seen", [0, 2, True, "3", "5", None, 2.5, 5.0])
     def test_below_limit_or_not_a_count_is_set_to_the_limit(
         self, tmp_path: Path, seen: object
     ) -> None:

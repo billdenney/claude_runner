@@ -47,9 +47,11 @@ def ensure_initialized(
 ) -> bool:
     """Ensure ``config_dir/.claude.json`` is past onboarding and trusts ``trust_dir``.
 
-    It also raises ``fullscreenUpsellSeenCount`` to
+    It also sets ``fullscreenUpsellSeenCount`` to
     :data:`FULLSCREEN_UPSELL_LIMIT`, so the fullscreen-renderer offer stays
-    closed; a higher count is left as it is.
+    closed. Only an integer count at or above the limit is left as it is;
+    anything else (a lower count, a float such as ``5.0``, a string such as
+    ``"5"``, a bool, a missing key) becomes the limit.
 
     Parameters
     ----------

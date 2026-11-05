@@ -113,6 +113,10 @@ class FakeChild:
         """Have ``claude`` draw ``data`` next, as it would during a wait."""
         self._chunks.append(data)
 
+    def add_replies(self, script: list[tuple[bytes, list[bytes]]]) -> None:
+        """Extend the script of keys and replies."""
+        self._script.extend(script)
+
     def send(self, data: bytes) -> int:
         self.sent.append(data)
         self.sent_at.append(self.clock.monotonic())
@@ -160,7 +164,8 @@ def _screen() -> LiveScreen:
 
 
 def _await(child: FakeChild, clock: FakeClock, timeout_s: float = 10.0) -> str:
-    return _await_input_box(child, _screen(), clock, timeout_s, "")  # type: ignore[arg-type]
+    screen, _ = _await_input_box(child, _screen(), clock, timeout_s, "")  # type: ignore[arg-type]
+    return screen
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +289,54 @@ def test_offer_that_keeps_coming_back_stops_at_the_bound(clock: FakeClock) -> No
     # the screen showed no prompt in between.
     assert child.sent == [ESC] * 8
     assert child.sent_at == [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+
+
+def test_keys_sent_count_toward_one_bound_per_capture(clock: FakeClock) -> None:
+    """The total carries over from the first run of phase 1 to the second."""
+    upsell = _fixture("fullscreen_upsell")
+    child = FakeChild(clock, [upsell], [(ESC, [CLEAR, upsell])] * 3)
+
+    with pytest.raises(
+        UsageCaptureTimeout,
+        match="still shows the fullscreen-renderer offer after 8 answers",
+    ):
+        _await_input_box(child, _screen(), clock, 10.0, "", 6)  # type: ignore[arg-type]
+
+    assert child.sent == [ESC] * 2
+
+
+def test_the_total_of_keys_sent_is_returned(clock: FakeClock) -> None:
+    child = FakeChild(
+        clock,
+        [_fixture("fullscreen_upsell")],
+        [(ESC, [_fixture("fullscreen_upsell_after_esc")])],
+    )
+
+    _, keys_sent = _await_input_box(child, _screen(), clock, 10.0, "", 3)  # type: ignore[arg-type]
+
+    assert keys_sent == 4
+
+
+def test_capture_bounds_keys_over_both_runs_of_phase_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """Prompts before the pad and after it share one bound of 8 keys."""
+    upsell = _fixture("fullscreen_upsell")
+    after = _fixture("fullscreen_upsell_after_esc")
+    # Before the pad: the offer comes back 4 times, then the input box.
+    child = FakeChild(clock, [upsell], [(ESC, [CLEAR, upsell])] * 4 + [(ESC, [after])])
+
+    def pad(milliseconds: int) -> None:
+        # In the pad: the offer again, and it keeps coming back.
+        child.draw(CLEAR + upsell)
+        child.add_replies([(ESC, [CLEAR, upsell])] * 8)
+
+    monkeypatch.setattr(capture_mod, "_sleep_ms", pad)
+
+    with pytest.raises(UsageCaptureTimeout, match="after 8 answers"):
+        _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [ESC] * 8
 
 
 def test_trust_prompt_is_answered_yes_never_the_focused_no(clock: FakeClock) -> None:
