@@ -1093,6 +1093,30 @@ def test_supervisor_json_details_count_the_in_flight_records(
     assert "\n| in_flight | `2` |\n" in _run(queue, bin_dir).stdout
 
 
+def test_details_show_a_missing_5h_window_as_not_reported(
+    queue: Path, tmp_path: Path, bin_dir: Path
+) -> None:
+    """supervisor.json's ``null`` 5h utilization (ADR-0038) is "not
+    reported" in both tables, and its ``null`` reset a dash, never 0%."""
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.DISPATCHING, last_5h_util_pct=None, last_weekly_util_pct=12
+        ),
+        work=_state(SupervisorState.DISPATCHING, last_5h_util_pct=11, last_weekly_util_pct=61),
+    )
+    path = persist_mod.supervisor_state_path(queue)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["last_5h_util_pct"] = None
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    out = _run(queue, bin_dir).stdout
+    assert "\n| 5h util | `not reported` |\n" in out
+    assert "\n| personal | `dispatching` | not reported | 12% |  | 0 | — | — | " in out
+    assert "\n| work | `dispatching` | 11% | 61% |  | 0 | — | — | " in out
+
+
 @pytest.fixture
 def worker() -> Iterator[Callable[[Path], int]]:
     """Start a stand-in worker writing to ``log``, as the dispatcher's

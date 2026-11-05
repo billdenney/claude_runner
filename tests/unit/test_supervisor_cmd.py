@@ -469,6 +469,27 @@ def test_status_json_output(runner: CliRunner, queue_dir: Path) -> None:
     assert payload["snapshot"]["state"] == "idle"
 
 
+def test_status_shows_no_5h_window_as_not_reported(runner: CliRunner, queue_dir: Path) -> None:
+    """A last reading with no 5-hour window (ADR-0038) is "not reported" in
+    the text and ``null`` in ``--json``, never 0%."""
+    snap = _make_snapshot(
+        SupervisorState.DISPATCHING, last_5h_util_pct=None, last_weekly_util_pct=12
+    )
+    state_path = queue_dir / ".claude_task_runner" / "supervisor.json"
+    supervisor_write_atomic(snap, state_path)
+
+    text = runner.invoke(app, ["status", "--queue", str(queue_dir)])
+    assert text.exit_code == 0, text.output
+    util_lines = [line for line in _plain(text.stdout).splitlines() if "5h util:" in line]
+    assert util_lines == ["5h util:          not reported   Weekly util: 12%"]
+
+    as_json = runner.invoke(app, ["status", "--queue", str(queue_dir), "--json"])
+    assert as_json.exit_code == 0, as_json.output
+    snapshot = _json.loads(as_json.stdout)["snapshot"]
+    assert snapshot["last_5h_util_pct"] is None
+    assert snapshot["last_weekly_util_pct"] == 12
+
+
 def test_status_color_categories_render(runner: CliRunner, queue_dir: Path) -> None:
     """Visit all three color branches for state coloring: green / yellow / red.
 

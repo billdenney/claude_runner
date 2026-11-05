@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from click.testing import Result
 from typer.testing import CliRunner
 
 from claude_task_runner.cli import app
@@ -690,6 +691,58 @@ class TestAccountListHumanReadable:
         assert "personal (paused)" not in result.stdout
         # linux_user line printed for the work account.
         assert "bw" in result.stdout
+
+
+class TestAccountListNoFiveHourWindow:
+    """An account whose last reading reported no 5-hour window (ADR-0038):
+    ``--json`` gives ``null``, and the text says "not reported", not 0%."""
+
+    def _list(self, runner: CliRunner, tmp_path: Path, *extra: str) -> Result:
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(
+            tmp_path, accounts=[("personal", "", None), ("work", "", None)]
+        )
+        since = datetime(2026, 10, 31, tzinfo=UTC)
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                "personal": AccountState(
+                    state=SupervisorState.DISPATCHING,
+                    since=since,
+                    last_5h_util_pct=None,
+                    last_weekly_util_pct=12,
+                ),
+                "work": AccountState(
+                    state=SupervisorState.DISPATCHING,
+                    since=since,
+                    last_5h_util_pct=11,
+                    last_weekly_util_pct=61,
+                ),
+            },
+        )
+        return runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir), *extra],
+        )
+
+    def test_json_gives_null(self, runner: CliRunner, tmp_path: Path) -> None:
+        result = self._list(runner, tmp_path, "--json")
+        assert result.exit_code == 0, result.output
+        by_name = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
+        assert by_name["personal"]["state"] == "dispatching"
+        assert by_name["personal"]["last_5h_util_pct"] is None
+        assert by_name["personal"]["last_weekly_util_pct"] == 12
+        assert by_name["work"]["last_5h_util_pct"] == 11
+
+    def test_text_says_not_reported(self, runner: CliRunner, tmp_path: Path) -> None:
+        result = self._list(runner, tmp_path)
+        assert result.exit_code == 0, result.output
+        state_lines = [line.strip() for line in result.stdout.splitlines() if "state:" in line]
+        assert state_lines == [
+            "state:           dispatching   5h=not reported   weekly=12%   in_flight=0/1",
+            "state:           dispatching   5h=11%   weekly=61%   in_flight=0/1",
+        ]
 
 
 class TestAccountPauseResumeHumanReadable:

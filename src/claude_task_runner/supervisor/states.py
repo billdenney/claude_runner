@@ -16,7 +16,9 @@ entered; v6 adds ``target_concurrency``, the per-account dispatch cap
 from the last throttle decision; v7 adds the ``no_reading`` state and
 ``last_reading_at``, so an account takes tasks only on a recent clean
 reading; v8 adds ``policy_error``, set while an account's
-``runner-account.toml`` does not load. The legacy top-level fields remain populated (mirrored from
+``runner-account.toml`` does not load; v9 lets ``last_5h_util_pct`` be
+``None``, for a reading that reports no 5-hour window (ADR-0038). The
+legacy top-level fields remain populated (mirrored from
 ``accounts[<active>]`` after each tick).
 """
 
@@ -27,7 +29,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SUPERVISOR_SCHEMA_VERSION = 8
+SUPERVISOR_SCHEMA_VERSION = 9
 """Supervisor.json schema version.
 
 Bumped from 3 to 4 (ADR-0022) when ``paused_weekly`` and
@@ -57,7 +59,13 @@ cycle.
 Bumped from 7 to 8 when ``policy_error`` was added to
 :class:`AccountState`. A v7 file needs no rewrite: the field starts as
 ``None`` and the next tick sets it from the account's file. As with v6,
-the bump makes an older supervisor refuse the file with a version error."""
+the bump makes an older supervisor refuse the file with a version error.
+
+Bumped from 8 to 9 when ``last_5h_util_pct`` became nullable, for an
+account whose reading reports no 5-hour window (ADR-0038). A v8 file
+needs no rewrite: every value it holds is still valid. The bump makes an
+older supervisor refuse a v9 file with a version error rather than a
+validation error on the first ``null``."""
 
 
 class SupervisorState(StrEnum):
@@ -141,7 +149,10 @@ class AccountState(BaseModel):
     since: datetime
     """When this account entered ``state``."""
 
-    last_5h_util_pct: int = Field(ge=0, le=100, default=0)
+    last_5h_util_pct: int | None = Field(ge=0, le=100, default=0)
+    """5-hour utilization from the last clean reading, or ``None`` when
+    that reading reported no 5-hour window (ADR-0038), and
+    ``last_5h_reset_at`` is then ``None`` too. 0 before any reading."""
     last_weekly_util_pct: int = Field(ge=0, le=100, default=0)
     last_5h_reset_at: datetime | None = None
     last_weekly_reset_at: datetime | None = None
@@ -229,7 +240,9 @@ class SupervisorSnapshot(BaseModel):
     since: datetime
     """When the supervisor entered ``state`` (global)."""
 
-    last_5h_util_pct: int = Field(ge=0, le=100, default=0)
+    last_5h_util_pct: int | None = Field(ge=0, le=100, default=0)
+    """Mirror of :attr:`AccountState.last_5h_util_pct` for the account this
+    view reflects: ``None`` when its last reading reported no 5-hour window."""
     last_weekly_util_pct: int = Field(ge=0, le=100, default=0)
     last_5h_reset_at: datetime | None = None
     last_weekly_reset_at: datetime | None = None

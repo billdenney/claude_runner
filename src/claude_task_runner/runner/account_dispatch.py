@@ -31,7 +31,10 @@ Selection rule
    capacity).
 4. All accounts are equal priority. Pick the one with the lowest
    ``last_5h_util_pct``. Tie-break by ``last_weekly_util_pct``, then
-   account name (lexicographic, deterministic).
+   account name (lexicographic, deterministic). An account whose last
+   reading reported no 5-hour window (``last_5h_util_pct`` is ``None``,
+   ADR-0038) has no 5-hour limit to approach, so it ranks ahead of every
+   account that has one.
 
 Capacity
 --------
@@ -63,6 +66,7 @@ from claude_task_runner.supervisor.states import (
     InFlightRecord,
     SupervisorState,
 )
+from claude_task_runner.usage.models import utilization_text
 
 _DISPATCHABLE_STATES: frozenset[SupervisorState] = frozenset(
     {
@@ -79,6 +83,17 @@ round-robin cycle away. An IDLE account keeps the ``target_concurrency``
 of the reading that idled it, which :func:`account_cap` applies. An
 account that has no recent clean reading is NO_READING, not IDLE, and
 takes no tasks (``state_machine.expire_stale_readings``)."""
+
+
+def _five_hour_rank(last_5h_util_pct: int | None) -> tuple[int, int]:
+    """Sort key for an account's 5-hour utilization: lower ranks first.
+
+    ``None`` (no 5-hour window reported) ranks ahead of every utilization,
+    0% included, as the account has no 5-hour limit to approach.
+    """
+    if last_5h_util_pct is None:
+        return (0, 0)
+    return (1, last_5h_util_pct)
 
 
 @dataclass(frozen=True)
@@ -245,7 +260,7 @@ def choose_account(
             )
         return DispatchChoice(account=pinned, reason=f"pinned to {pinned!r}")
 
-    candidates: list[tuple[tuple[int, int, str], str]] = []
+    candidates: list[tuple[tuple[tuple[int, int], int, str], str]] = []
     blocked_reasons = [f"{name}: takes no tasks until its error is fixed" for name in broken]
     for name, acct in accounts.items():
         maybe_state = account_states.get(name)
@@ -264,7 +279,7 @@ def choose_account(
             )
             continue
         sort_key = (
-            maybe_state.last_5h_util_pct,
+            _five_hour_rank(maybe_state.last_5h_util_pct),
             maybe_state.last_weekly_util_pct,
             name,
         )
@@ -281,7 +296,8 @@ def choose_account(
     return DispatchChoice(
         account=picked,
         reason=(
-            f"picked {picked!r} (5h_util={account_states[picked].last_5h_util_pct}%, "
+            f"picked {picked!r} "
+            f"(5h_util={utilization_text(account_states[picked].last_5h_util_pct)}, "
             f"weekly_util={account_states[picked].last_weekly_util_pct}%)"
         ),
     )

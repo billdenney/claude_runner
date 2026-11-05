@@ -1187,8 +1187,9 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
       them; the runner will fall back to TTY in ``api_then_tty`` mode
       but ``api``-only configurations would stop working).
 
-    Reports the resolved 5h / weekly utilization per account so the
-    operator can compare against ``claude /usage`` and confirm the
+    Reports the resolved 5h / weekly utilization per account (5h "not
+    reported" for an account the API gives no 5-hour window, ADR-0038)
+    so the operator can compare against ``claude /usage`` and confirm the
     API path is trustworthy before flipping ``[usage].source`` to
     ``"api_then_tty"``.
     """
@@ -1202,6 +1203,7 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
         UsageApiHeaderMissing,
         UsageApiNetworkError,
     )
+    from claude_task_runner.usage.models import utilization_text
 
     if not settings.accounts:
         return CheckResult(
@@ -1236,11 +1238,13 @@ def check_api_usage_source(settings: Settings) -> CheckResult:
         except UsageApiNetworkError as exc:
             failures.append(f"{acct.name}: network ({exc})")
             continue
+        five_h_resets = (
+            f"5h resets {reading.five_hour.resets_at}, " if reading.five_hour is not None else ""
+        )
         rows.append(
-            f"{acct.name}: 5h={reading.five_hour.utilization_pct}% "
+            f"{acct.name}: 5h={utilization_text(reading.five_hour_util_pct)} "
             f"weekly={reading.seven_day.utilization_pct}% "
-            f"(5h resets {reading.five_hour.resets_at}, "
-            f"weekly resets {reading.seven_day.resets_at})"
+            f"({five_h_resets}weekly resets {reading.seven_day.resets_at})"
         )
 
     if failures:

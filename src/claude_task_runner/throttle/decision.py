@@ -20,6 +20,11 @@ Decision order (per ADR-0022):
        (at stop).
      * else → ``DISPATCHING`` at ``max_concurrency``.
 
+A reading with no 5-hour window (``reading.five_hour is None``,
+ADR-0038) skips step 2: the 5h thresholds do not apply, so the weekly
+check alone decides between ``THROTTLED_WEEKLY`` and ``DISPATCHING``,
+and a weekly wakeup is the catch-up time with no 5h reset to clamp it.
+
 In-flight tasks are NEVER killed by the decision — the
 ``target_concurrency`` only gates *new* dispatches. The state machine
 records it on the account's :class:`supervisor.states.AccountState`, and
@@ -38,7 +43,7 @@ from claude_task_runner.supervisor.states import SupervisorState
 from claude_task_runner.throttle import curve as _curve
 from claude_task_runner.throttle import time_of_day as _tod
 from claude_task_runner.throttle.policy import ResolvedPolicy
-from claude_task_runner.usage.models import UsageReading
+from claude_task_runner.usage.models import UsageReading, WindowReading
 
 FIVE_HOUR_LENGTH_S: float = 5.0 * 3600.0
 """Nominal length of the 5-hour window. Fallback when ``resets_at`` is
@@ -69,16 +74,19 @@ class Decision:
     """Curve value at the current elapsed fraction; ``None`` only when
     ``reading.seven_day.resets_at`` is unparseable so the curve has
     nothing to anchor to."""
-    observed_5h_pct: int
+    observed_5h_pct: int | None
+    """``None`` when the reading reported no 5-hour window."""
     observed_weekly_pct: int
     band: str
-    """Which 5h band was active: ``"day"`` or ``"night"``."""
+    """Which 5h band was active: ``"day"`` or ``"night"``. Its thresholds
+    are reported even when the reading has no 5-hour window for them to
+    apply to."""
     fivehr_slowdown_pct: int
     fivehr_stop_pct: int
 
 
 def _next_5h_reset_wakeup(
-    reading: UsageReading,
+    five_hour: WindowReading,
     now: datetime,
     *,
     window_start_delay_s: float,
@@ -88,8 +96,8 @@ def _next_5h_reset_wakeup(
     Falls back to ``now + FIVE_HOUR_LENGTH_S + delay`` when
     ``resets_at`` is unparseable.
     """
-    if reading.five_hour.resets_at is not None:
-        return reading.five_hour.resets_at + timedelta(seconds=window_start_delay_s)
+    if five_hour.resets_at is not None:
+        return five_hour.resets_at + timedelta(seconds=window_start_delay_s)
     return now + timedelta(seconds=FIVE_HOUR_LENGTH_S + window_start_delay_s)
 
 
@@ -196,7 +204,8 @@ def decide(
         :data:`curve.SEVEN_DAYS_S`. Exposed for tests.
     """
     now = clock.now()
-    observed_5h = reading.five_hour.utilization_pct
+    five_hour = reading.five_hour
+    observed_5h = reading.five_hour_util_pct
     observed_weekly = reading.seven_day.utilization_pct
 
     # ---- Weekly check ---------------------------------------------------
@@ -234,9 +243,6 @@ def decide(
     slow_pct = band.fivehr_slowdown_pct
     stop_pct = band.fivehr_stop_pct
 
-    five_h_reset_wakeup = _next_5h_reset_wakeup(
-        reading, now, window_start_delay_s=window_start_delay_s
-    )
     min_wakeup = now + timedelta(seconds=poll_interval_s)
 
     # ---- Decision -------------------------------------------------------
@@ -244,7 +250,12 @@ def decide(
         # Clamp: never sleep past the next 5h reset, never busy-spin.
         candidate = catch_up_at
         assert candidate is not None  # weekly_throttled implies resets_at present
-        wakeup = max(min_wakeup, min(five_h_reset_wakeup, candidate))
+        if five_hour is not None:
+            five_h_reset = _next_5h_reset_wakeup(
+                five_hour, now, window_start_delay_s=window_start_delay_s
+            )
+            candidate = min(five_h_reset, candidate)
+        wakeup = max(min_wakeup, candidate)
         message = (
             f"weekly utilization {observed_weekly}% > target "
             f"{weekly_target:.1f}%; pausing dispatch until trace catches up"
@@ -262,48 +273,56 @@ def decide(
             fivehr_stop_pct=stop_pct,
         )
 
-    if observed_5h >= stop_pct:
-        message = (
-            f"5h utilization {observed_5h}% >= stop {stop_pct}% ({band_name}); "
-            "pausing dispatch until next 5h reset"
+    # A reading with no 5-hour window has no 5h thresholds to apply, so it
+    # dispatches at max_concurrency below.
+    if five_hour is not None:
+        five_h_pct = five_hour.utilization_pct
+        five_h_wakeup = max(
+            min_wakeup,
+            _next_5h_reset_wakeup(five_hour, now, window_start_delay_s=window_start_delay_s),
         )
-        return Decision(
-            state=SupervisorState.THROTTLED_5H,
-            target_concurrency=0,
-            wakeup_at=max(min_wakeup, five_h_reset_wakeup),
-            message=message,
-            target_pct=weekly_target,
-            observed_5h_pct=observed_5h,
-            observed_weekly_pct=observed_weekly,
-            band=band_name,
-            fivehr_slowdown_pct=slow_pct,
-            fivehr_stop_pct=stop_pct,
-        )
+        if five_h_pct >= stop_pct:
+            message = (
+                f"5h utilization {five_h_pct}% >= stop {stop_pct}% ({band_name}); "
+                "pausing dispatch until next 5h reset"
+            )
+            return Decision(
+                state=SupervisorState.THROTTLED_5H,
+                target_concurrency=0,
+                wakeup_at=five_h_wakeup,
+                message=message,
+                target_pct=weekly_target,
+                observed_5h_pct=five_h_pct,
+                observed_weekly_pct=observed_weekly,
+                band=band_name,
+                fivehr_slowdown_pct=slow_pct,
+                fivehr_stop_pct=stop_pct,
+            )
 
-    if observed_5h >= slow_pct:
-        target_c = _linear_ramp(
-            observed_pct=observed_5h,
-            slowdown_pct=slow_pct,
-            stop_pct=stop_pct,
-            max_concurrency=policy.max_concurrency,
-        )
-        message = (
-            f"slowing dispatch: 5h={observed_5h}% in [{slow_pct}, {stop_pct}) "
-            f"({band_name}); target concurrency={target_c}/"
-            f"{policy.max_concurrency}"
-        )
-        return Decision(
-            state=SupervisorState.SLOWING_DOWN,
-            target_concurrency=target_c,
-            wakeup_at=max(min_wakeup, five_h_reset_wakeup),
-            message=message,
-            target_pct=weekly_target,
-            observed_5h_pct=observed_5h,
-            observed_weekly_pct=observed_weekly,
-            band=band_name,
-            fivehr_slowdown_pct=slow_pct,
-            fivehr_stop_pct=stop_pct,
-        )
+        if five_h_pct >= slow_pct:
+            target_c = _linear_ramp(
+                observed_pct=five_h_pct,
+                slowdown_pct=slow_pct,
+                stop_pct=stop_pct,
+                max_concurrency=policy.max_concurrency,
+            )
+            message = (
+                f"slowing dispatch: 5h={five_h_pct}% in [{slow_pct}, {stop_pct}) "
+                f"({band_name}); target concurrency={target_c}/"
+                f"{policy.max_concurrency}"
+            )
+            return Decision(
+                state=SupervisorState.SLOWING_DOWN,
+                target_concurrency=target_c,
+                wakeup_at=five_h_wakeup,
+                message=message,
+                target_pct=weekly_target,
+                observed_5h_pct=five_h_pct,
+                observed_weekly_pct=observed_weekly,
+                band=band_name,
+                fivehr_slowdown_pct=slow_pct,
+                fivehr_stop_pct=stop_pct,
+            )
 
     return Decision(
         state=SupervisorState.DISPATCHING,

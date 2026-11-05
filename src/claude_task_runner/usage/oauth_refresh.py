@@ -42,7 +42,7 @@ from claude_task_runner.usage.drift import (
     UsageCaptureTimeout,
     UsageFormatDrift,
 )
-from claude_task_runner.usage.models import UsageReading
+from claude_task_runner.usage.models import UsageReading, utilization_text
 from claude_task_runner.usage.source import ClaudeUsageSource
 
 logger = logging.getLogger(__name__)
@@ -159,7 +159,7 @@ def refresh_all_accounts(
                     config_dir=acct.config_dir,
                     success=True,
                     detail=(
-                        f"5h={reading.five_hour.utilization_pct}% "
+                        f"5h={utilization_text(reading.five_hour_util_pct)} "
                         f"weekly={reading.seven_day.utilization_pct}%"
                     ),
                     reading=reading,

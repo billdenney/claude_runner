@@ -1,8 +1,10 @@
 """Data classes for parsed usage readings.
 
 A `UsageReading` is the validated result of capturing and parsing
-`claude /usage`. It captures both windows (5-hour and 7-day) plus enough
-metadata to handle reset-time-parse failures gracefully. See ADR-0008.
+`claude /usage`, or of the API source's rate-limit headers. It captures
+the 7-day window, the 5-hour window when one applies to the account, and
+enough metadata to handle reset-time-parse failures gracefully. See
+ADR-0008 and ADR-0038.
 """
 
 from __future__ import annotations
@@ -12,7 +14,19 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
-__all__ = ["ExtraWindow", "UsageReading", "WindowReading"]
+__all__ = ["NOT_REPORTED", "ExtraWindow", "UsageReading", "WindowReading", "utilization_text"]
+
+NOT_REPORTED = "not reported"
+"""How a window the reading did not report is shown: never as 0%."""
+
+
+def utilization_text(pct: int | None) -> str:
+    """``"42%"``, or :data:`NOT_REPORTED` for a window the reading lacks.
+
+    ``None`` is a 5-hour utilization from a reading that reported no
+    5-hour window (:attr:`UsageReading.five_hour`).
+    """
+    return NOT_REPORTED if pct is None else f"{pct}%"
 
 
 class WindowReading(BaseModel):
@@ -54,7 +68,7 @@ class ExtraWindow(BaseModel):
 
 
 class UsageReading(BaseModel):
-    """A complete `/usage` snapshot: both windows + capture metadata."""
+    """A complete usage snapshot: the windows that apply + capture metadata."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -63,7 +77,16 @@ class UsageReading(BaseModel):
     captured_at: datetime
     """When we ran `claude /usage`. UTC."""
 
-    five_hour: WindowReading
+    five_hour: WindowReading | None
+    """The 5-hour window, or ``None`` when the source reported none.
+
+    ``None`` means only that no 5-hour window was reported: the API omits
+    the 5h headers when no 5-hour window applies to the account
+    (ADR-0038). It is never a stand-in for 0% or for a reading that
+    failed; a failed reading raises instead. The TTY parser always sets
+    it, since the ``/usage`` screen shows both windows. With ``None`` the
+    5-hour dispatch thresholds do not apply."""
+
     seven_day: WindowReading
 
     extra_windows: list[ExtraWindow] = Field(default_factory=list)
@@ -82,3 +105,8 @@ class UsageReading(BaseModel):
 
     Added in PR 8 (per-account ``/usage`` capture). Backward compatible
     with PR 1-7 readings which omit the field."""
+
+    @property
+    def five_hour_util_pct(self) -> int | None:
+        """``five_hour.utilization_pct``, or ``None`` with no 5-hour window."""
+        return self.five_hour.utilization_pct if self.five_hour is not None else None

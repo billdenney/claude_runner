@@ -51,6 +51,7 @@ from claude_task_runner.supervisor import pidfile as pidfile_mod
 from claude_task_runner.supervisor.daemon import start_daemon
 from claude_task_runner.supervisor.states import SupervisorSnapshot, SupervisorState
 from claude_task_runner.usage.api_source import ApiUsageSource
+from claude_task_runner.usage.models import utilization_text
 from claude_task_runner.usage.source import (
     ApiThenTtyUsageSource,
     ClaudeUsageSource,
@@ -668,7 +669,7 @@ def status(
         console.print(
             literal(
                 styled("5h util:", "bold"),
-                f"          {snapshot.last_5h_util_pct}%   ",
+                f"          {utilization_text(snapshot.last_5h_util_pct)}   ",
                 styled("Weekly util:", "bold"),
                 f" {snapshot.last_weekly_util_pct}%",
             )
