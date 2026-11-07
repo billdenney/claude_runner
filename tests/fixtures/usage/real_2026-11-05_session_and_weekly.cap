@@ -1,0 +1,61 @@
+Claude Code's fullscreen renderer has repeatedly failed to start on this machine, so it has been turned off here. Run /tui fullscreen to try it again (this also resets after an update).
+7[r8[?25h[?25l[?2004h[?2031h[?1004h]0;✳ Claude Code[38;5;174m ▐[48;5;16m▛███▛█[12G[39m[49m[1mClaude[19GCode[24G[22m[38;5;246mv2.1.318[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[12G[38;5;246mOpus[17G5.5[21G·[23GClaude[30GTeam[39m
+[38;5;174m ▝▝[7G▝▝[12G[38;5;246m~/gitlab/runner_queue_example[39m
+
+[3GGet[7Gto[10Gfinished[19Gwork[24Gsooner[31Gwith[36GOpus[41G5.5.[46GSwitch[53Ganytime[61Gwith[66G[38;5;153m/model[39m.
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+❯ [2mTry[7G"how[12Gdo[15GI[17Glog[21Gan[24Gerror?"[22m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;220m⏵⏵[6Gauto[11Gmode[16Gon[38;5;246m (shift+tab[30Gto[33Gcycle)[40G·[42G←[44Gfor[48Gagents[61G◐[63Gmedium[70G·[72G/effort[39m
+[2C[3A[?25h]11;?[c[>0q[?u]7501;?[c]0;◐ Claude Code[?25l[2D[3B[4A[48;5;237m[38;5;246m❯ [38;5;231m/usage[39m                                                                        [1B[49m[K[1B[38;5;174m·[39m [38;5;174mMarinating[38;5;216m…[38;5;174m [39m[K[2C[1B[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;220m⏵⏵[6Gauto[11Gmode[16Gon[38;5;246m (shift+tab[30Gto[33Gcycle)[40G·[42Gesc[46Gto[49Ginterrupt[59G·[61G←[63Gfor[67Gagents[39m
+[61G[38;5;246m◐[63Gmedium[70G·[72G/effort[39m
+[2C[4A[?25h]0;✳ Claude Code[?25l[2D[4B[7A[38;5;153m────────────────────────────────────────────────────────────────────────────────[2C[1B[1mSettings[13G[22m[39mStatus[22GConfig[30G[48;5;153m[38;5;16m[1m Usage [39G[22m[39m[49mStats[1B[K[1B  [1mSession[1B[22m[K[2C[1B[38;5;246mTotal cost:    [19G       $0.0000[39m[K[2C[1B[38;5;246mTotal duration (API):  0s[61G[39m[K
+[3G[38;5;246mTotal[9Gduration[18G(wall):[26G3s[39m
+[3G[38;5;246mTotal[9Gcode[14Gchanges:[26G0[28Glines[34Gadded,[41G0[43Glines[49Gremoved[39m
+[3G[38;5;246mUsage:[26G0[28Ginput,[35G0[37Goutput,[45G0[47Gcache[53Gread,[59G0[61Gcache[67Gwrite[39m
+
+[3G[1mCurrent[11Gsession[22m
+[3G[48;5;102m[38;5;153m███████                                           [54G[39m[49m14%[58Gused
+[3G[38;5;246mResets[10G8pm[14G(UTC)[39m
+
+[3G[1mCurrent[11Gweek[16G(all[21Gmodels)[22m
+[3G[48;5;102m[38;5;153m██████████████████████████████▌                   [54G[39m[49m61%[58Gused
+[3G[38;5;246mResets[10GNov[14G9,[17G3am[21G(UTC)[39m
+
+[3G[1mWhat's[10Gcontributing[23Gto[26Gyour[31Gusage?[22m
+[3G[38;5;246mApproximate[15G·[17Gsessions[26Gon[29Gthis[34Gmachine[42Gonly[39m
+
+[3G[38;5;246mScanning[12Glocal[18Gsessions…[39m
+
+[3G[38;5;246mRefreshing…[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[23A[30D[23B[2C[8A[1mCurrent week (Fable)[22m[K[2C[1B[48;5;102m[38;5;153m                                                  [54G[39m[49m0%[57Gused[2C[1B[38;5;246mResets Nov 9, 3am (UTC)[2C[1B[39m[K[2C[1B[1mWhat's contributing to your usage?[2C[1B[22m[38;5;246mApp[7Goximate · sessions on this machine only[2C[2BScanning local sessions…[39m
+
+[3G[1mUsage[9Gcredits[22m
+[3G[38;5;246m$0.00[9Gspent[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[23A[30D[23B[2C[6A[38;5;246mLast 24h[12G· shares overlap[2C[2B[39m79%  Start fresh[20Gwhen[25Gyou[29Gswitch[36Gtasks[38;5;246m · run /clear[2C[1B[39m51%  Run /extract-literature-model[38Gon[41Ga[43Gcheaper[51Gmodel[2C[1B35%[8GGive[13G"general-purpose"[31Gsubagents[41Ga[43Gcheaper[51Gmodel[2C[1B17%  Trim ~/.claude/CLAUDE.md[38;5;246m · 11k tokens per request[39m
+[3G10%[8GRun[12Gfewer[18Gsessions[27Gat[30Gonce[38;5;246m ·[37Gup[40Gto[43G4[45Gat[48Gonce[39m
+
+[3GSkills[27G[38;5;246m%[29Gof[32Gusage[39m
+[3G[38;5;246m/extract-literature-model[34G51%[39m
+[3G[38;5;246m/agent-stop-and-ask[35G4%[39m
+
+[3GSubagents[27G[38;5;246m%[29Gof[32Gusage[39m
+[3G[38;5;246mgeneral-purpose[34G24%[39m
+
+[3G[38;5;246mf[5Gto[8Gfix[12G3[14Gof[17G5[19G·[21Gd[23Gto[26Gday[30G·[32Gw[34Gto[37Gweek[39m
+
+[3G[1mUsage[9Gcredits[22m
+[3G[38;5;246m$0.00[9Gspent[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[23A

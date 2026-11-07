@@ -174,7 +174,11 @@ def test_usage_parser_canary_fixture_replay(cap_path: Path) -> None:
 
     reading = parse_usage(cap_path.read_bytes(), captured_at, clock)
 
-    assert reading.five_hour.utilization_pct == expected["five_hour"]["utilization"]
-    assert reading.five_hour.resets_at_raw == expected["five_hour"]["resets_at_raw"]
+    if expected["five_hour"] is None:
+        assert reading.five_hour is None
+    else:
+        assert reading.five_hour is not None
+        assert reading.five_hour.utilization_pct == expected["five_hour"]["utilization"]
+        assert reading.five_hour.resets_at_raw == expected["five_hour"]["resets_at_raw"]
     assert reading.seven_day.utilization_pct == expected["seven_day"]["utilization"]
     assert reading.seven_day.resets_at_raw == expected["seven_day"]["resets_at_raw"]

@@ -1,0 +1,14 @@
+{
+  "five_hour": null,
+  "seven_day": {
+    "utilization": 16,
+    "resets_at_raw": "Nov 11, 11am (UTC)"
+  },
+  "extra_windows": [
+    {
+      "label": "Fable",
+      "utilization_pct": 12,
+      "resets_at_raw": "Nov 11, 11am (UTC)"
+    }
+  ]
+}

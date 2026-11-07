@@ -119,7 +119,8 @@ all I/O happens in `supervisor/daemon.py` based on the action list.
    from ADR-0004.
 
 A reading with no 5-hour window (`reading.five_hour is None`: the API
-reports only the windows that apply to the account) skips step 2, so the
+reports only the windows that apply to the account, and the `/usage` panel
+draws only theirs; ADR-0038, ADR-0040) skips step 2, so the
 weekly check alone decides between `ThrottledWeekly` and `Dispatching`,
 and a weekly wakeup is not clamped to a 5h reset. `supervisor.json` then
 holds `null` for the account's `last_5h_util_pct` and `last_5h_reset_at`,

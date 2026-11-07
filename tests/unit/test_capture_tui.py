@@ -12,13 +12,16 @@ behaviour:
   the focused "No, exit";
 * a dropped key is sent again after the resend interval, never sooner;
 * a banner that names API billing, or a login-method screen, stops the
-  capture before ``/usage``, at once, with ``UsageCaptureLoginRequired``.
+  capture before ``/usage``, at once, with ``UsageCaptureLoginRequired``;
+* phase 2 waits for the complete ``/usage`` panel, however many sections
+  it has, and never reads the numbers it opens with under ``Refreshing…``.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 import sys
 from collections import deque
 from datetime import UTC, datetime
@@ -38,6 +41,7 @@ from claude_task_runner.usage.capture import (
     _await_input_box,
     _login_required,
     _login_state,
+    _parse_target,
 )
 from claude_task_runner.usage.drift import (
     UsageApiAuthExpired,
@@ -45,11 +49,13 @@ from claude_task_runner.usage.drift import (
     UsageCaptureTimeout,
     usage_error_kind,
 )
+from claude_task_runner.usage.parser import panel_pending as parser_panel_pending
 from claude_task_runner.usage.parser import parse
 from claude_task_runner.usage.render import LiveScreen, render
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "usage_startup"
 USAGE_FIXTURE = Path(__file__).parent.parent / "fixtures" / "usage"
+CLEANUP_FIXTURE = Path(__file__).parent.parent / "fixtures" / "usage_cleanup"
 ESC = b"\x1b"
 ENTER = b"\r"
 DOWN = b"\x1b[B"
@@ -75,7 +81,8 @@ class FakeChild:
     the capture is expected to send, in order, with the chunks ``claude``
     draws in reply. A key off the script gets no reply. Each read returns
     one chunk. An empty read advances ``clock`` by the read's timeout, as
-    a real wait would.
+    a real wait would; so does an empty chunk, which stands for a poll in
+    which ``claude`` drew nothing before it drew the next chunk.
     """
 
     def __init__(
@@ -100,6 +107,10 @@ class FakeChild:
         return data
 
     def read_nonblocking(self, size: int, timeout: float) -> bytes:
+        if self._chunks and not self._chunks[0]:
+            self._chunks.popleft()
+            self.clock.advance(timeout)
+            raise pexpect.TIMEOUT("no output")
         if self._chunks:
             chunk = self._chunks.popleft()
             if len(chunk) > size:
@@ -728,3 +739,219 @@ def test_a_capture_file_that_cannot_be_written_keeps_the_reading(
     ] == [
         f"usage capture: cannot write the forensics file {cap}: [Errno 28] No space left on device"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: the /usage panel, with any number of sections (ADR-0040).
+# ---------------------------------------------------------------------------
+
+_FRAME_END = re.compile(rb"\x1b\[\d+C\x1b\[\d+A")
+"""The cursor move with which claude 2.1.318 ends each frame it draws."""
+
+
+def _frame_ends(raw: bytes) -> list[int]:
+    """Where each frame claude drew after ``/usage`` ends in ``raw``."""
+    return [m.end() for m in _FRAME_END.finditer(raw, raw.index(b"/usage"))]
+
+
+def _first_complete(raw: bytes) -> int:
+    """The end of the first frame after which the panel in ``raw`` is complete."""
+    return min(end for end in _frame_ends(raw) if parser_panel_pending(render(raw[:end])) is None)
+
+
+def _panel_capture(name: str) -> tuple[bytes, bytes, bytes]:
+    """A 2026-11-05 capture split where the capture's keys changed it.
+
+    Returns the start-up up to the ready input box, the frames up to the
+    last one that still shows the numbers the panel opened with under
+    ``Refreshing…``, and the frames after it.
+    """
+    raw = (USAGE_FIXTURE / f"real_2026-11-05_{name}.cap").read_bytes()
+    typed = raw.index(b"/usage")
+    ready = raw.rindex(b"\x1b[?25h", 0, typed) + len(b"\x1b[?25h")
+    seeded = max(end for end in _frame_ends(raw) if "Refreshing…" in render(raw[:end]))
+    return raw[:ready], raw[ready:seeded], raw[seeded:]
+
+
+def test_capture_reads_a_weekly_only_panel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """Known answer: the plan without a 5-hour window, whose panel has two
+    Resets lines on screen but sends one of them in fragments."""
+    startup, seeded, fetched = _panel_capture("weekly_only")
+    assert b"Resets" not in fetched
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded, b"", fetched])])
+
+    raw, cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [b"/usage\r", ESC, b"/exit\r"]
+    assert raw == startup + seeded + fetched
+    assert cap_path.read_bytes() == raw
+    reading = parse(raw, clock.now(), clock)
+    assert reading.five_hour is None
+    assert reading.seven_day.utilization_pct == 16
+    assert reading.seven_day.resets_at_raw == "Nov 11, 11am (UTC)"
+    assert [(w.label, w.utilization_pct) for w in reading.extra_windows] == [("Fable", 12)]
+    # The second run of phase 1 waited one poll; phase 2 judged the panel on
+    # two quiet polls, the first still refreshing; then the 1 ms pad.
+    assert clock.monotonic() == pytest.approx(0.25 + 0.5 + 0.001)
+
+
+def test_capture_waits_past_the_numbers_the_panel_opens_with(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """The work panel opens with its saved session and weekly sections, two
+    Resets lines, and gains the Fable section only from its fetch."""
+    startup, seeded, fetched = _panel_capture("session_and_weekly")
+    assert "Refreshing…" in render(startup + seeded)
+    assert "Current week (Fable)" not in render(startup + seeded)
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded, b"", fetched])])
+
+    raw, _cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    reading = parse(raw, clock.now(), clock)
+    assert reading.five_hour is not None
+    assert reading.five_hour.utilization_pct == 14
+    assert reading.seven_day.utilization_pct == 61
+    assert [(w.label, w.utilization_pct) for w in reading.extra_windows] == [("Fable", 0)]
+
+
+def test_capture_reads_the_panel_after_the_pad_when_it_holds_every_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """Frames drawn in the pad are part of the bytes returned when the panel
+    is still complete there, with the same sections."""
+    startup, seeded, fetched = _panel_capture("session_and_weekly")
+    split = _first_complete(startup + seeded + fetched) - len(startup + seeded)
+    first, later = fetched[:split], fetched[split:]
+    assert later
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded, b"", first, b"", later])])
+
+    raw, _cap_path = _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert raw == startup + seeded + first + later
+
+
+def test_a_panel_still_refreshing_at_the_deadline_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    startup, seeded, _fetched = _panel_capture("weekly_only")
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded])])
+
+    with pytest.raises(
+        UsageCaptureTimeout,
+        match=r"^the /usage panel was not complete within 15\.0s: it still shows 'Refreshing…'$",
+    ):
+        _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [b"/usage\r"]
+    assert clock.monotonic() == pytest.approx(0.25 + 15.0)
+    caps = sorted((tmp_path / "caps").glob("*.cap"))
+    assert [p.read_bytes() for p in caps] == [startup + seeded]
+
+
+def test_a_panel_whose_fetch_failed_stops_the_capture_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """The panel keeps its older numbers, notes the failure and offers a
+    retry, which nothing sends: waiting would only reach the deadline."""
+    startup, seeded, _fetched = _panel_capture("weekly_only")
+    failed = (
+        b"\x1b[J\r\n  Current week (all models)\r\n  15% used\r\n  Resets Nov 11, 11am (UTC)\r\n"
+        b"\r\n  Could not refresh usage data\r\n\r\n  r to retry \xc2\xb7 Esc to cancel\r\n"
+    )
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded, b"", failed])])
+
+    with pytest.raises(
+        UsageCaptureTimeout,
+        match=r"^the /usage panel could not refresh its numbers: 'Could not refresh usage data'$",
+    ):
+        _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [b"/usage\r"]
+    assert clock.monotonic() == pytest.approx(0.25 + 0.5)
+
+
+def test_claude_exiting_before_the_panel_is_complete_is_a_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    startup, seeded, _fetched = _panel_capture("weekly_only")
+    child = FakeChild(clock, [startup], [(b"/usage\r", [seeded])])
+    real_send = child.send
+
+    def send_then_exit(data: bytes) -> int:
+        sent = real_send(data)
+        child._alive = False
+        return sent
+
+    monkeypatch.setattr(child, "send", send_then_exit)
+
+    with pytest.raises(
+        UsageCaptureTimeout, match=r"^claude exited before the /usage panel was complete$"
+    ):
+        _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+
+class _KeepsDrawing(FakeChild):
+    """A child that, once its chunks are read, draws a cursor move each poll."""
+
+    def read_nonblocking(self, size: int, timeout: float) -> bytes:
+        if self._chunks:
+            return super().read_nonblocking(size, timeout)
+        self.clock.advance(timeout)
+        return self._deliver(b"\x1b[?25l")
+
+
+def test_a_panel_never_left_quiet_is_bounded_by_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: FakeClock
+) -> None:
+    """The panel is judged only on a quiet screen; one claude keeps redrawing
+    still ends at the deadline."""
+    startup, seeded, fetched = _panel_capture("weekly_only")
+    child = _KeepsDrawing(clock, [startup], [(b"/usage\r", [seeded + fetched])])
+
+    with pytest.raises(
+        UsageCaptureTimeout,
+        match=r"^the /usage panel was not complete within 15\.0s: claude kept drawing$",
+    ):
+        _run_capture(monkeypatch, tmp_path, clock, child, {})
+
+    assert child.sent == [b"/usage\r"]
+    # One poll for the second run of phase 1, then the whole deadline.
+    assert clock.monotonic() == pytest.approx(0.25 + 15.0)
+
+
+def _work_streams() -> tuple[bytes, bytes, bytes]:
+    """The work capture up to its first complete frame, up to the end of
+    its panel, and with the cleanup Esc drew."""
+    raw = (USAGE_FIXTURE / "real_2026-11-05_session_and_weekly.cap").read_bytes()
+    tail = (CLEANUP_FIXTURE / "real_2026-11-05_session_and_weekly_after_esc.cap").read_bytes()
+    return raw[: _first_complete(raw)], raw, raw + tail
+
+
+def test_parse_target_takes_the_later_panel_with_every_section() -> None:
+    at_complete, after_pad, _dismissed = _work_streams()
+    assert _parse_target(at_complete, after_pad) == after_pad
+
+
+def test_parse_target_keeps_the_complete_panel_when_one_is_unchanged() -> None:
+    at_complete, _after_pad, _dismissed = _work_streams()
+    assert _parse_target(at_complete, at_complete) == at_complete
+
+
+def test_parse_target_keeps_the_complete_panel_when_sections_are_lost() -> None:
+    """The render after Esc still ends in the panel's closing line, but the
+    session section is gone from it."""
+    at_complete, _after_pad, dismissed = _work_streams()
+    assert parser_panel_pending(render(dismissed)) is None
+    assert _parse_target(at_complete, dismissed) == at_complete
+
+
+@pytest.mark.parametrize(
+    "later",
+    [b"\r\n  Refreshing\xe2\x80\xa6\r\n", b"\r\n  r to retry \xc2\xb7 Esc to cancel\r\n"],
+    ids=["refreshing", "retry"],
+)
+def test_parse_target_keeps_the_complete_panel_when_the_later_one_is_not(later: bytes) -> None:
+    at_complete, after_pad, _dismissed = _work_streams()
+    assert _parse_target(at_complete, after_pad + later) == at_complete

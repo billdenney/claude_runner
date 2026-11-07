@@ -14,9 +14,16 @@ Two phases:
    input box is ready, ends the capture with
    :class:`UsageCaptureLoginRequired`, because ``/usage`` then has no plan
    limits to show (ADR-0039).
-2. **Submit /usage and wait for both Resets** — the TUI panel first shows
-   "Loading usage data…" while it queries the OAuth API, then renders the
-   actual numbers. We wait for two ``Resets`` matches.
+2. **Submit /usage and wait for the complete panel** — the stream is fed
+   into a second virtual terminal, the size the parser renders at. The
+   panel opens with ``Loading usage data…`` or with older numbers under
+   ``Refreshing…``, and draws the numbers of its own fetch, in as many
+   sections as the plan has, once that fetch lands. It is complete when,
+   on a screen ``claude`` drew nothing new on for a poll, its closing line
+   reads ``Esc to cancel`` alone and nothing is in flight
+   (:func:`parser.panel_pending`); a closing line that offers a retry
+   means the fetch failed. The stream then drains for
+   ``capture_post_data_pad_ms`` (ADR-0040).
 
 Cleanup: send Esc, then ``/exit``, then expect EOF.
 
@@ -43,6 +50,8 @@ import pexpect
 from claude_task_runner.clock import Clock
 from claude_task_runner.config.paths import ConfigDirError, existing_config_dir
 from claude_task_runner.config.schema import UsageSettings
+from claude_task_runner.usage import parser as parser_mod
+from claude_task_runner.usage import render as render_mod
 from claude_task_runner.usage.drift import (
     UsageCaptureLoginRequired,
     UsageCaptureSpawnError,
@@ -281,6 +290,72 @@ def _await_input_box(
             raise UsageCaptureTimeout(f"TUI did not become ready within {timeout_s}s{showing}")
 
 
+def _await_usage_panel(
+    child: pexpect.spawn[bytes],
+    screen: LiveScreen,
+    clock: Clock,
+    timeout_s: float,
+) -> None:
+    """Read ``child`` into ``screen`` until the ``/usage`` panel is complete.
+
+    The panel is judged only on a screen ``claude`` drew nothing new on for
+    a poll, never halfway through a frame, and is complete when
+    :func:`parser.panel_pending` finds nothing left to draw. ``screen``
+    renders at the parser's size, so the panel judged complete is the one
+    the parser reads.
+
+    Raises :class:`UsageCaptureTimeout` when ``claude`` exits, when the
+    panel says its fetch failed (:func:`parser.panel_refresh_failure`),
+    and when it is not complete within ``timeout_s`` of ``clock``; the
+    timeout says what the panel still lacked.
+    """
+    deadline = clock.monotonic() + timeout_s
+    while True:
+        try:
+            screen.feed(child.read_nonblocking(_READ_CHUNK, timeout=_POLL_S))
+        except pexpect.TIMEOUT:
+            text = screen.text()
+            failure = parser_mod.panel_refresh_failure(text)
+            if failure is not None:
+                raise UsageCaptureTimeout(
+                    f"the /usage panel could not refresh its numbers: {failure!r}"
+                ) from None
+            if parser_mod.panel_pending(text) is None:
+                return
+        except pexpect.EOF as exc:
+            raise UsageCaptureTimeout("claude exited before the /usage panel was complete") from exc
+        if clock.monotonic() >= deadline:
+            pending = parser_mod.panel_pending(screen.text()) or "claude kept drawing"
+            raise UsageCaptureTimeout(
+                f"the /usage panel was not complete within {timeout_s}s: {pending}"
+            )
+
+
+def _parse_target(at_complete: bytes, after_pad: bytes) -> bytes:
+    """The stream the parser reads: ``after_pad`` or ``at_complete``.
+
+    ``at_complete`` is the stream up to the screen phase 2 judged complete,
+    ``after_pad`` the stream after the pad that followed. The later one is
+    read when its panel is still complete and still shows every section the
+    earlier one did, so numbers redrawn during the pad win. Otherwise, as
+    when the panel scrolled away, moved to another view or failed a fetch
+    during the pad, the screen judged complete is read.
+    """
+    if after_pad == at_complete:
+        return at_complete
+    later = render_mod.render(after_pad)
+    if (
+        parser_mod.panel_refresh_failure(later) is not None
+        or parser_mod.panel_pending(later) is not None
+    ):
+        return at_complete
+    sections = {
+        block.header for block in parser_mod._extract_blocks(render_mod.render(at_complete))
+    }
+    later_sections = {block.header for block in parser_mod._extract_blocks(later)}
+    return after_pad if sections <= later_sections else at_complete
+
+
 def _api_billing_label(screen: str) -> str | None:
     """The API-billing label in the welcome banner of ``screen``, if any."""
     banner = "\n".join(screen.splitlines()[:_BANNER_ROWS])
@@ -332,17 +407,21 @@ def capture(
 ) -> tuple[bytes, Path | None]:
     """Spawn ``claude``, send ``/usage``, and return the raw PTY bytes.
 
-    The raw bytes are also persisted to ``captures_dir/<ISO>.cap`` for
-    forensics. Returns ``(raw_bytes, capture_path)``; ``capture_path`` is
-    ``None`` when the ``.cap`` could not be written, which is logged as a
-    warning and does not cost the reading.
+    The bytes returned run from the spawn to the complete ``/usage`` panel,
+    or to the end of the pad after it (:func:`_parse_target`); they stop
+    before the cleanup closes the panel. The whole stream, cleanup
+    included, is persisted to ``captures_dir/<ISO>.cap`` for forensics.
+    Returns ``(raw_bytes, capture_path)``; ``capture_path`` is ``None``
+    when the ``.cap`` could not be written, which is logged as a warning
+    and does not cost the reading.
 
     Parameters
     ----------
     settings
         Pre-validated usage section of the config.
     clock
-        Time source for naming the capture file and for phase 1's waits.
+        Time source for naming the capture file and for the waits of
+        phases 1 and 2.
     captures_dir
         Where to write the forensics .cap. Created if it does not exist.
     claude_executable
@@ -362,8 +441,9 @@ def capture(
         method: it has no claude.ai plan login in that config dir. A
         ``UsageApiAuthExpired`` subclass.
     UsageCaptureTimeout
-        If the input box or both ``Resets`` lines do not appear within
-        their configured timeouts.
+        If the input box does not appear, or the ``/usage`` panel is not
+        complete, within its configured timeout, or if the panel says its
+        fetch failed.
     """
     if shutil.which(claude_executable) is None:
         raise UsageCaptureSpawnError(f"binary not found in PATH: {claude_executable}")
@@ -422,61 +502,24 @@ def capture(
         if state is not None:
             raise _login_required(state, claude_config_dir)
 
-        # Phase 2: send /usage and wait for both Resets lines.
-        # The TUI shows placeholder values immediately ("Refreshing…"),
-        # then overwrites with the real values from the OAuth API. If
-        # we exit at the first 2 Resets we'd capture the placeholder.
-        # Strategy: wait for both Resets to appear, THEN drain output for
-        # `capture_post_data_pad_ms` so the API response has time to land
-        # and overwrite. The parser takes the *last* 2 blocks, so the
-        # placeholder is naturally discarded.
+        # Phase 2: send /usage and wait until the panel is complete. The
+        # second screen renders the whole stream at the parser's size, so
+        # the panel it judges is the one the parser reads.
+        panel = LiveScreen(columns=render_mod.DEFAULT_COLUMNS, rows=render_mod.DEFAULT_ROWS)
+        panel.feed(log_buf.getvalue())
         child.send(b"/usage\r")
-        resets_seen = 0
-        deadline_s = settings.capture_usage_timeout_s
-        while resets_seen < 2:
-            try:
-                idx = child.expect(
-                    [b"Resets", pexpect.TIMEOUT],
-                    timeout=deadline_s,
-                )
-            except pexpect.EOF as exc:
-                raise UsageCaptureTimeout("claude exited mid-/usage rendering") from exc
-            if idx == 1:
-                raise UsageCaptureTimeout(
-                    f"only saw {resets_seen} of 2 Resets lines within "
-                    f"{settings.capture_usage_timeout_s}s"
-                )
-            resets_seen += 1
+        _await_usage_panel(child, panel, clock, settings.capture_usage_timeout_s)
+        at_complete = log_buf.getvalue()
 
-        # EARLIEST SNAPSHOT: right after both Resets markers appeared.
-        # The TUI has finished rendering the 5-hour and weekly blocks at
-        # this point (we wouldn't have seen 2 Resets otherwise). Some
-        # TUI versions then auto-navigate or scroll the panel away
-        # during the post-data-pad drain, so capturing here is the
-        # safest moment to preserve the data the parser needs.
-        snapshot_post_resets = log_buf.getvalue()
-
-        # Drain post-Resets output so any in-place redraws of the
-        # placeholder by the real OAuth response are captured. Older
-        # TUI versions used in-place redraw to replace "Refreshing…"
-        # placeholders; the parser handles this by taking the LAST two
-        # blocks. Newer TUI versions auto-navigate to a daily view
-        # during this window; the snapshot above is the fallback for
-        # that case.
+        # The pad: a redraw of the numbers that lands in it is what the
+        # parser reads (_parse_target). An exit during it keeps what was drawn.
         if settings.capture_post_data_pad_ms > 0:
-            # Process exit during the drain is fine; whatever we captured is
-            # what we get.
             with contextlib.suppress(pexpect.EOF):
                 child.expect(
                     pexpect.TIMEOUT,
                     timeout=settings.capture_post_data_pad_ms / 1000.0,
                 )
-
-        # LATER SNAPSHOT: after the drain but before cleanup. Used as
-        # the primary parse target when it differs from the
-        # post-Resets snapshot AND contains usage blocks (we'll only
-        # know after attempting to parse — see the caller).
-        raw_for_parse = log_buf.getvalue()
+        after_pad = log_buf.getvalue()
 
         # Cleanup: Esc, then /exit, then EOF.
         child.send(b"\x1b")
@@ -510,67 +553,8 @@ def capture(
         logger.warning("usage capture: cannot write the forensics file %s: %s", capture_path, exc)
     _rotate_captures(captures_dir, settings.capture_rotation_count)
 
-    # Pick the best snapshot for the parser. We have up to three
-    # candidates, EARLIEST first:
-    #   * `snapshot_post_resets`: log_buf RIGHT after both Resets
-    #     markers appeared.
-    #   * `raw_for_parse`: log_buf after the post-data-pad drain.
-    #   * `raw_full`: log_buf including cleanup.
-    #
-    # Decision rule: render each candidate via pyte and count the
-    # blocks the parser's block-builder would extract. Return the
-    # FIRST candidate (earliest, freshest) that yields >= 2 blocks.
-    # If none reach 2 blocks, return the candidate with the most
-    # blocks; tiebreak to the latest (consistent with the original
-    # "drain handles placeholder overwrite" semantics for legacy TUIs).
-    #
-    # This rendering-aware choice handles both:
-    #   - LEGACY TUI: placeholder "Refreshing…" overwritten in-place
-    #     by API response during the drain. Late snapshots are
-    #     correct; early ones may show the placeholder.
-    #   - NEW TUI (>= 2.1.141): the /usage panel auto-navigates to a
-    #     daily-Sonnet view during the drain, removing the main
-    #     blocks from the visible screen state. Early snapshot wins.
-    #
-    # Local import to avoid module-load cycles; the parser/render
-    # modules are siblings under `usage/`.
-    from claude_task_runner.usage import parser as _parser
-    from claude_task_runner.usage import render as _render
-
-    try:
-        candidates: list[tuple[str, bytes]] = [
-            ("post_resets", snapshot_post_resets),
-            ("post_drain", raw_for_parse),
-            ("full", raw_full),
-        ]
-    except UnboundLocalError:
-        # Phase 2 didn't reach the snapshot point; return the full stream.
-        return raw_full, written_path
-
-    best = (-1, candidates[-1][1])  # (n_blocks, raw) — start with full
-    for label, candidate in candidates:
-        try:
-            blocks = _parser._extract_blocks(_render.render(candidate))
-        except Exception:
-            # A candidate that can't be rendered/parsed is skipped in
-            # favour of the others; log which one (and why) so a total
-            # parse failure leaves a forensic trail in the .cap file's
-            # vicinity instead of vanishing silently.
-            logger.debug(
-                "usage capture: snapshot %r (%d bytes, %s) failed to parse; skipping",
-                label,
-                len(candidate),
-                capture_path.name,
-                exc_info=True,
-            )
-            continue
-        n = len(blocks)
-        if n >= 2:
-            # Earliest snapshot with at least 2 blocks wins — return now.
-            return candidate, written_path
-        if n > best[0]:
-            best = (n, candidate)
-    return best[1], written_path
+    # Esc closes the panel, so the stream after cleanup is never the one parsed.
+    return _parse_target(at_complete, after_pad), written_path
 
 
 def _sleep_ms(milliseconds: int) -> None:

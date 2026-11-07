@@ -1,10 +1,12 @@
 """Drift and capture-failure exceptions for usage parsing.
 
-**Format drift** — the parser couldn't extract two valid blocks from the
-raw bytes. Likely Anthropic changed the TUI layout. Raised by the parser
-itself; the supervisor halts dispatch on this. The other exceptions here
-tell a transient capture failure (a timeout, a network error) from a
-structural one, so the daemon can react to each.
+**Format drift** — the parser couldn't read the windows from the raw
+bytes: no weekly window, a percentage out of range, or no 5-hour window on
+a panel that does not show that none applies. Likely Anthropic changed the
+TUI layout. Raised by the parser itself; the supervisor halts dispatch on
+this. The other exceptions here tell a transient capture failure (a
+timeout, a network error) from a structural one, so the daemon can react
+to each.
 
 Nothing compares consecutive readings; see invariant 3 in
 ``docs/architecture.md``.
@@ -26,10 +28,12 @@ class UsageFormatDrift(ValueError):
 
 
 class UsageCaptureTimeout(RuntimeError):
-    """`claude /usage` did not render both Resets lines within the timeout.
+    """`claude /usage` did not draw a complete panel within the timeout.
 
-    This is NOT format drift — the TUI structure may be unchanged but the
-    OAuth API was slow, or `claude` was unresponsive.
+    Also raised when ``claude`` exits before then, and when the panel says
+    its fetch failed (it offers a retry). This is NOT format drift — the
+    TUI structure may be unchanged but the OAuth API was slow or refused
+    the fetch, or `claude` was unresponsive.
     """
 
 
