@@ -10,7 +10,9 @@ from claude_task_runner.throttle.curve import (
     SEVEN_DAYS_S,
     elapsed_for_target_pct,
     elapsed_fraction,
+    end_of_week_only,
     target_pct,
+    window_open,
 )
 
 
@@ -182,17 +184,91 @@ class TestElapsedForTargetPct:
                         )
 
 
-class TestElapsedForTargetDegenerate:
-    """Defensive branches of :func:`elapsed_for_target_pct` for degenerate inputs.
+class TestEndOfWeekOnly:
+    """``early_pct = 0`` confines dispatch to the EOW segment (ADR-0041).
 
-    These are unreachable from validated TOML (the schema enforces positive
-    pcts) but the function is a pure helper and the branches exist for
-    safety. Pinned here so the coverage gate doesn't regress quietly.
+    A 12h segment of a 168h week opens at t = 156/168. Before it the
+    target is 0 and the window is closed; inside it the target is a flat
+    ``eow_pct``, not a ramp from 0.
     """
 
-    def test_eow_fraction_zero_and_early_pct_zero(self) -> None:
-        # Pure segment A with a flat (always-0) target: any observed > 0
-        # is already above the cap, so caller should wake at week reset.
+    EWS = 12 * 3600 / SEVEN_DAYS_S
+    OPENS = 156 / 168
+
+    def test_end_of_week_only_is_early_pct_zero(self) -> None:
+        assert end_of_week_only(0.0)
+        assert end_of_week_only(0)
+        assert not end_of_week_only(1.0)
+        assert not end_of_week_only(60.0)
+
+    def test_window_closed_before_the_segment_and_open_inside_it(self) -> None:
+        for t in (0.0, 0.5, self.OPENS - 1e-9):
+            assert not window_open(t, early_pct=0.0, eow_window_fraction=self.EWS), t
+        for t in (self.OPENS, (self.OPENS + 1.0) / 2, 1.0):
+            assert window_open(t, early_pct=0.0, eow_window_fraction=self.EWS), t
+
+    def test_window_open_at_the_exact_opening_computed_from_seconds(self) -> None:
+        # decide() computes both sides from seconds; the opening instant must
+        # count as open, or the wakeup lands one poll short of dispatch.
+        elapsed = 1.0 - (12 * 3600) / SEVEN_DAYS_S
+        assert window_open(elapsed, early_pct=0.0, eow_window_fraction=self.EWS)
+
+    def test_a_sloped_curve_is_always_open(self) -> None:
+        for t in (0.0, 0.3, 1.0):
+            assert window_open(t, early_pct=60.0, eow_window_fraction=self.EWS)
+
+    def test_zero_length_segment_never_opens(self) -> None:
+        for t in (0.0, 0.5, 1.0):
+            assert not window_open(t, early_pct=0.0, eow_window_fraction=0.0)
+
+    def test_whole_week_segment_is_always_open(self) -> None:
+        for t in (0.0, 0.5, 1.0):
+            assert window_open(t, early_pct=0.0, eow_window_fraction=1.0)
+
+    def test_target_is_zero_then_a_flat_eow_pct(self) -> None:
+        def at(t: float) -> float:
+            return target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=self.EWS)
+
+        assert at(0.0) == 0.0
+        assert at(0.5) == 0.0
+        assert at(self.OPENS - 1e-9) == 0.0
+        assert at(self.OPENS) == 97.0
+        assert at((self.OPENS + 1.0) / 2) == 97.0
+        assert at(1.0) == 97.0
+
+    def test_target_with_zero_and_whole_week_segments(self) -> None:
+        for t in (0.0, 0.5, 1.0):
+            assert target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=0.0) == 0.0
+            assert target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=1.0) == 97.0
+
+    def test_target_clamps_eow_pct_above_100(self) -> None:
+        v = target_pct(1.0, early_pct=0.0, eow_pct=150.0, eow_window_fraction=self.EWS)
+        assert v == 100.0
+
+    def test_catch_up_below_eow_pct_is_the_opening(self) -> None:
+        for observed in (-5.0, 0.0, 1.0, 68.0, 96.0):
+            t = elapsed_for_target_pct(
+                observed, early_pct=0.0, eow_pct=97.0, eow_window_fraction=self.EWS
+            )
+            assert t == pytest.approx(self.OPENS, abs=1e-12), observed
+
+    def test_catch_up_at_or_above_eow_pct_is_the_reset(self) -> None:
+        for observed in (97.0, 99.0):
+            t = elapsed_for_target_pct(
+                observed, early_pct=0.0, eow_pct=97.0, eow_window_fraction=self.EWS
+            )
+            assert t == 1.0
+
+    def test_catch_up_on_a_zero_length_segment_is_the_reset(self) -> None:
         assert (
             elapsed_for_target_pct(5.0, early_pct=0.0, eow_pct=95.0, eow_window_fraction=0.0) == 1.0
+        )
+        assert (
+            elapsed_for_target_pct(0.0, early_pct=0.0, eow_pct=95.0, eow_window_fraction=0.0) == 1.0
+        )
+
+    def test_catch_up_on_a_whole_week_segment_is_now(self) -> None:
+        assert (
+            elapsed_for_target_pct(50.0, early_pct=0.0, eow_pct=95.0, eow_window_fraction=1.0)
+            == 0.0
         )

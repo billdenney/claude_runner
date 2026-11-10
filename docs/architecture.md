@@ -92,7 +92,7 @@ States in `supervisor/states.py`:
 - `Dispatching` — predicted 5h pct < `dispatch_pct.<band>.fivehr_slowdown_pct`.
 - `SlowingDown` — predicted 5h pct in [slowdown, stop); the account's dispatch cap falls linearly from its `max_concurrency` towards 0.
 - `Throttled5h` — 5h utilization ≥ `fivehr_stop_pct` for the active band.
-- `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve.
+- `ThrottledWeekly` — observed weekly utilization > `target_pct(elapsed_now)` on the trace curve, or, with `early_pct = 0`, the account's end-of-week window is not open yet (ADR-0041).
 - `ErrorDrift` — last poll raised `UsageFormatDrift`; requires N clean polls to recover.
 - `NoReading` — no clean usage reading for the account within `[usage].max_reading_age_s`, or none yet; takes no tasks until a capture succeeds. Every account starts here.
 
@@ -111,6 +111,11 @@ all I/O happens in `supervisor/daemon.py` based on the action list.
    `ThrottledWeekly` with `target_concurrency=0` and an analytical
    wakeup (`elapsed_for_target_pct(observed)` mapped back to a
    datetime, clamped to the next 5h reset and `now + poll_interval_s`).
+   With `early_pct = 0` the curve is a step (ADR-0041):
+   `throttle.curve.window_open` is false before the last
+   `eow_time_switch`, which is `ThrottledWeekly` whatever the reading,
+   with the window's opening as the wakeup; inside it the target is a
+   flat `eow_pct`.
 2. **Then 5h.** `throttle.time_of_day.which_band(now_local, …)`
    picks `day` or `night` (wrap-aware hard step). Compare observed
    5h utilization to that band's `fivehr_slowdown_pct` /

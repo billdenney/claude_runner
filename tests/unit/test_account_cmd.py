@@ -651,6 +651,28 @@ class TestAccountListHumanReadable:
         # No snapshot ⇒ state should render as "—".
         assert "—" in result.stdout
 
+    def test_zero_override_is_shown_not_read_as_inherited(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``early_pct = 0`` is a real override (ADR-0041); ``~`` means inherited."""
+        cfg_dir = tmp_path / "personal"
+        cfg_dir.mkdir()
+        (cfg_dir / "runner-account.toml").write_text(
+            "[concurrency]\nmax_concurrency = 5\n\n"
+            '[dispatch_pct.week]\nearly_pct = 0\neow_pct = 97\neow_time_switch = "12h"\n',
+            encoding="utf-8",
+        )
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
+        result = runner.invoke(
+            app,
+            ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "week early=0/eow=97@12h" in result.stdout
+        assert "day ~/~, night ~/~ [~-~]" in result.stdout
+
     def test_with_snapshot_renders_state_and_paused_marker(
         self, runner: CliRunner, tmp_path: Path
     ) -> None:

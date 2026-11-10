@@ -12,6 +12,9 @@ Decision order (per ADR-0022):
    observed), clamped to the next 5h reset (so the operator sees a
    familiar horizon in ``runner-status``) and to ``now +
    poll_interval_s`` (so the supervisor never busy-spins).
+   With ``early_pct = 0`` (ADR-0041) the account is also
+   ``THROTTLED_WEEKLY`` whenever the end-of-week window is closed,
+   whatever it has used, and wakes when the window opens.
 2. **Then 5h.** Pick day or night band by local time-of-day. Compare
    observed 5h to the band's thresholds:
      * ``≥ fivehr_stop_pct`` → ``THROTTLED_5H``.
@@ -151,6 +154,22 @@ def weekly_catch_up(
     )
 
 
+def _window_closed_message(policy: ResolvedPolicy, resets_at: datetime) -> str:
+    """Why an end-of-week-only account (``early_pct = 0``) takes no tasks yet."""
+    switch_s = policy.week.eow_time_switch_s
+    if switch_s <= 0:
+        return (
+            "early_pct = 0 takes tasks only in the last eow_time_switch before the "
+            "weekly reset, and eow_time_switch is 0, so this account takes none"
+        )
+    opens = resets_at - timedelta(seconds=switch_s)
+    return (
+        f"early_pct = 0: waiting for the end-of-week window, the last "
+        f"{switch_s / 3600:g}h before the weekly reset, which opens at "
+        f"{opens.isoformat(timespec='minutes')}"
+    )
+
+
 def _linear_ramp(
     *,
     observed_pct: int,
@@ -211,6 +230,7 @@ def decide(
     # ---- Weekly check ---------------------------------------------------
     weekly_target: float | None = None
     weekly_throttled = False
+    window_closed = False
     catch_up_at: datetime | None = None
     if reading.seven_day.resets_at is not None:
         elapsed = _curve.elapsed_fraction(
@@ -223,7 +243,12 @@ def decide(
             eow_pct=float(policy.week.eow_pct),
             eow_window_fraction=eow_window_fraction,
         )
-        if float(observed_weekly) > weekly_target:
+        window_closed = not _curve.window_open(
+            elapsed,
+            early_pct=float(policy.week.early_pct),
+            eow_window_fraction=eow_window_fraction,
+        )
+        if window_closed or float(observed_weekly) > weekly_target:
             weekly_throttled = True
             catch_up_at = weekly_catch_up(
                 policy,
@@ -256,10 +281,14 @@ def decide(
             )
             candidate = min(five_h_reset, candidate)
         wakeup = max(min_wakeup, candidate)
-        message = (
-            f"weekly utilization {observed_weekly}% > target "
-            f"{weekly_target:.1f}%; pausing dispatch until trace catches up"
-        )
+        if window_closed:
+            assert reading.seven_day.resets_at is not None  # window_closed implies it
+            message = _window_closed_message(policy, reading.seven_day.resets_at)
+        else:
+            message = (
+                f"weekly utilization {observed_weekly}% > target "
+                f"{weekly_target:.1f}%; pausing dispatch until trace catches up"
+            )
         return Decision(
             state=SupervisorState.THROTTLED_WEEKLY,
             target_concurrency=0,

@@ -9,6 +9,11 @@ The supervisor's weekly trace-following decision rule (ADR-0022) is:
   when the target catches up — solved analytically via
   :func:`elapsed_for_target_pct`.
 
+``early_pct = 0`` gives the curve a different shape (ADR-0041): no
+target before the EOW segment, and a flat ``eow_pct`` throughout it,
+so the account takes tasks only in the last ``eow_window_fraction`` of
+the week. :func:`window_open` says where that holds dispatch closed.
+
 The math is identical to the curve in the superseded
 :mod:`supervisor.pacing`; this module renames the parameters and adds
 the inverse. No I/O, no datetime work — caller passes a fraction.
@@ -47,6 +52,33 @@ def elapsed_fraction(
     return max(0.0, min(1.0, raw))
 
 
+def end_of_week_only(early_pct: float) -> bool:
+    """Whether the curve confines dispatch to the EOW segment (ADR-0041).
+
+    ``early_pct = 0`` sets no target before the segment, so the account
+    takes tasks only in the last ``eow_time_switch`` before the weekly
+    reset, up to ``eow_pct``.
+    """
+    return early_pct == 0.0
+
+
+def window_open(elapsed: float, *, early_pct: float, eow_window_fraction: float) -> bool:
+    """Whether the weekly curve lets the account take tasks at all at ``elapsed``.
+
+    Always ``True`` for a sloped curve, whose comparison of observed with
+    target decides alone. For an end-of-week-only curve
+    (:func:`end_of_week_only`) it is ``True`` only inside the EOW segment,
+    from ``1 - eow_window_fraction`` to the reset: before it, the target is
+    0 and a reading of 0% must not dispatch either. A zero-length segment
+    never opens.
+    """
+    if not end_of_week_only(early_pct):
+        return True
+    t = max(0.0, min(1.0, elapsed))
+    f = max(0.0, min(1.0, eow_window_fraction))
+    return f > 0.0 and t >= 1.0 - f
+
+
 def target_pct(
     elapsed: float,
     *,
@@ -69,12 +101,17 @@ def target_pct(
       ``eow_pct`` unused). ``1`` collapses the pre-EOW segment (curve
       ramps 0 → ``eow_pct`` over the full week; ``early_pct`` unused).
 
+    ``early_pct = 0`` is a step instead (ADR-0041): ``0`` while
+    :func:`window_open` is ``False``, ``eow_pct`` while it is ``True``.
+
     Output clamps to ``[0, 100]``.
     """
     t = max(0.0, min(1.0, elapsed))
     f = max(0.0, min(1.0, eow_window_fraction))
     b = 1.0 - f
-    if f == 0.0:
+    if end_of_week_only(early_pct):
+        value = eow_pct if window_open(t, early_pct=early_pct, eow_window_fraction=f) else 0.0
+    elif f == 0.0:
         value = t * early_pct
     elif f == 1.0:
         value = t * eow_pct
@@ -107,19 +144,26 @@ def elapsed_for_target_pct(
 
     Degenerate ``eow_window_fraction`` cases mirror those in
     :func:`target_pct`.
+
+    For an end-of-week-only curve (``early_pct = 0``, ADR-0041) every
+    observed value below ``eow_pct`` is met when the EOW segment opens,
+    ``1 - eow_window_fraction``; a zero-length segment never opens, so
+    the answer is ``1.0``, the reset.
     """
     if observed_pct >= eow_pct:
         return 1.0
-    if observed_pct <= 0.0:
-        return 0.0
 
     f = max(0.0, min(1.0, eow_window_fraction))
     b = 1.0 - f
 
+    if end_of_week_only(early_pct):
+        return 1.0 if f == 0.0 else b
+
+    if observed_pct <= 0.0:
+        return 0.0
+
     if f == 0.0:
         # All segment A across the full week; curve hits early_pct at t=1.
-        if early_pct == 0.0:
-            return 1.0
         return min(1.0, observed_pct / early_pct)
 
     if f == 1.0:
@@ -154,5 +198,7 @@ __all__ = [
     "SEVEN_DAYS_S",
     "elapsed_for_target_pct",
     "elapsed_fraction",
+    "end_of_week_only",
     "target_pct",
+    "window_open",
 ]

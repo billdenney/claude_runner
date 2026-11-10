@@ -48,6 +48,7 @@ numbered file. ADRs are never edited after acceptance, except to mark
 | 0038 | A usage reading may have no 5-hour window | accepted | 2026-11-05 |
 | 0039 | The TTY usage capture reads the plan login, from the rendered screen | accepted | 2026-11-05 |
 | 0040 | The TTY capture waits for the complete `/usage` panel, which may have no 5-hour window | accepted | 2026-11-05 |
+| 0041 | `early_pct = 0` confines an account to an end-of-week window | accepted | 2026-11-10 |
 
 ## Template
 

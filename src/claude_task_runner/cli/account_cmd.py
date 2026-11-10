@@ -297,6 +297,16 @@ def list_accounts(
         raise typer.Exit(code=1)
 
 
+def _override(value: object) -> str:
+    """A per-account ``[dispatch_pct.*]`` field as ``account list`` shows it.
+
+    ``None`` inherits the queue-wide value and shows as ``~``. A ``0`` is a
+    real override (``early_pct = 0`` confines dispatch to the end of the
+    week, ADR-0041), so it must not read as inherited.
+    """
+    return "~" if value is None else str(value)
+
+
 def _print_account(
     console: Console,
     decl: AccountSettings,
@@ -327,14 +337,15 @@ def _print_account(
     if acct is not None:
         console.print(literal("  max_concurrency: ", acct.policy.concurrency.max_concurrency))
         dp = acct.policy.dispatch_pct
-        day_s = f"day {dp.day.fivehr_slowdown_pct or '~'}/{dp.day.fivehr_stop_pct or '~'}"
+        day_s = f"day {_override(dp.day.fivehr_slowdown_pct)}/{_override(dp.day.fivehr_stop_pct)}"
         night_s = (
-            f"night {dp.night.fivehr_slowdown_pct or '~'}/{dp.night.fivehr_stop_pct or '~'}"
-            f" [{dp.night.time_start or '~'}-{dp.night.time_end or '~'}]"
+            f"night {_override(dp.night.fivehr_slowdown_pct)}/"
+            f"{_override(dp.night.fivehr_stop_pct)}"
+            f" [{_override(dp.night.time_start)}-{_override(dp.night.time_end)}]"
         )
         week_s = (
-            f"week early={dp.week.early_pct or '~'}/eow={dp.week.eow_pct or '~'}"
-            f"@{dp.week.eow_time_switch or '~'}"
+            f"week early={_override(dp.week.early_pct)}/eow={_override(dp.week.eow_pct)}"
+            f"@{_override(dp.week.eow_time_switch)}"
         )
         console.print(literal(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}"))
     console.print(

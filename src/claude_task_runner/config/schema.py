@@ -865,10 +865,14 @@ class DispatchPctWeek(_StrictModel):
     then from ``early_pct`` to ``eow_pct`` at week reset. The
     supervisor reads observed weekly utilization and stops dispatch
     when ``observed > target(elapsed_now)``. See ADR-0022.
+
+    ``early_pct = 0`` confines dispatch to the EOW segment instead: none
+    before it, and up to a flat ``eow_pct`` inside it. See ADR-0041.
     """
 
     early_pct: int = Field(ge=0, le=100)
-    """Target utilization (%) at the start of the EOW segment."""
+    """Target utilization (%) at the start of the EOW segment. ``0`` means
+    the account takes tasks only inside the EOW segment (ADR-0041)."""
 
     eow_pct: int = Field(ge=0, le=100)
     """Target utilization (%) at week reset (end of EOW segment)."""

@@ -136,7 +136,9 @@ max_reading_age_s           = 600       # an account takes tasks only on a clean
 # 2. Weekly side — single sloped target line. From 0 at week start
 #    rising to `early_pct` at the EOW elbow (`eow_time_switch` before
 #    week reset), then steeper to `eow_pct` at reset. Observed > target
-#    ⇒ THROTTLED_WEEKLY; else weekly allows dispatch.
+#    ⇒ THROTTLED_WEEKLY; else weekly allows dispatch. `early_pct = 0` is
+#    a step instead (ADR-0041): no dispatch before the last
+#    `eow_time_switch`, then up to `eow_pct` until the reset.
 # ---------------------------------------------------------------------------
 [dispatch_pct]
 timezone = ""             # IANA name (e.g. "America/New_York"); "" = system local; an unknown name fails to load
