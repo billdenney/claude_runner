@@ -608,6 +608,39 @@ def test_end_of_week_only_window_due_by_now(
     )
 
 
+def test_end_of_week_only_after_its_reset(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
+) -> None:
+    """The last reading predates the weekly reset: its window opening is
+    past, but the new week's window has not opened, so the account waits
+    for a reading of the new week rather than starting at the next check."""
+    weekly_reset = report_now.replace(second=0) - timedelta(minutes=1)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_WEEKLY,
+            last_weekly_util_pct=90,
+            last_weekly_reset_at=weekly_reset,
+            target_concurrency=0,
+            scheduled_wakeup_at=report_now + timedelta(minutes=1),
+        ),
+        running={"work": 3},
+        extra=END_OF_WEEK_ONLY,
+    )
+    supervisor()
+    assert _summary(queue, bin_dir).endswith(
+        _info(
+            "personal's week has reset since its last usage reading, so it waits for a reading "
+            "of the new week and then for its end-of-week window. Nothing to do."
+        )
+    )
+
+
 def test_weekly_throttle_without_a_reset_time(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:

@@ -144,9 +144,15 @@ def weekly_catch_up(
     current weekly window; observed at or above ``eow_pct`` gives the reset
     itself.
 
-    With ``early_pct = 0`` (ADR-0041) it is when the end-of-week window
-    opens, for any observed value up to ``eow_pct``, and the reset above it.
+    With ``early_pct = 0`` (ADR-0041) it is the opening of the end-of-week
+    window the account waits for, :func:`end_of_week_opening`, whenever
+    that window both opens and closes.
     """
+    opening = end_of_week_opening(
+        policy, observed_pct=observed_pct, resets_at=resets_at, weekly_window_s=weekly_window_s
+    )
+    if opening is not None:
+        return opening
     return _weekly_catch_up_at(
         observed_pct=observed_pct,
         resets_at=resets_at,
@@ -157,8 +163,46 @@ def weekly_catch_up(
     )
 
 
-def _window_closed_message(policy: ResolvedPolicy, resets_at: datetime, now: datetime) -> str:
-    """Why an end-of-week-only account (``early_pct = 0``) takes no tasks yet."""
+def end_of_week_opening(
+    policy: ResolvedPolicy,
+    *,
+    observed_pct: float,
+    resets_at: datetime,
+    weekly_window_s: float = _curve.SEVEN_DAYS_S,
+) -> datetime | None:
+    """The end-of-week window an ``early_pct = 0`` account waits for (ADR-0041).
+
+    For a reading up to ``eow_pct``, this week's opening, ``eow_time_switch``
+    before ``resets_at``. Above ``eow_pct`` the account takes nothing more
+    this week, so it is next week's opening, one weekly window later.
+
+    ``None`` for a sloped curve, and for a window that never opens
+    (``eow_time_switch`` of 0) or never closes (a whole weekly window or
+    more), whose catch-up is the curve's own.
+    """
+    if not _curve.end_of_week_only(policy.week.early_pct):
+        return None
+    switch_s = policy.week.eow_time_switch_s
+    if switch_s <= 0 or switch_s >= weekly_window_s:
+        return None
+    opens = resets_at - timedelta(seconds=switch_s)
+    if observed_pct > policy.week.eow_pct:
+        return opens + timedelta(seconds=weekly_window_s)
+    return opens
+
+
+def _end_of_week_message(
+    policy: ResolvedPolicy,
+    *,
+    observed_pct: int,
+    resets_at: datetime,
+    now: datetime,
+    weekly_window_s: float,
+) -> str | None:
+    """Why a weekly-throttled ``early_pct = 0`` account takes no tasks.
+
+    ``None`` when the window never closes, so the curve's own message holds.
+    """
     switch_s = policy.week.eow_time_switch_s
     if switch_s <= 0:
         return (
@@ -171,11 +215,21 @@ def _window_closed_message(policy: ResolvedPolicy, resets_at: datetime, now: dat
             "has passed, so the end-of-week window is closed until a reading of the new "
             "week shows when it opens"
         )
-    opens = resets_at - timedelta(seconds=switch_s)
+    opening = end_of_week_opening(
+        policy, observed_pct=observed_pct, resets_at=resets_at, weekly_window_s=weekly_window_s
+    )
+    if opening is None:
+        return None
+    if observed_pct > policy.week.eow_pct:
+        return (
+            f"early_pct = 0: weekly utilization {observed_pct}% > eow_pct "
+            f"{policy.week.eow_pct}%, so this account takes no more tasks this week; the "
+            f"next end-of-week window opens at {opening.isoformat(timespec='minutes')}"
+        )
     return (
         f"early_pct = 0: waiting for the end-of-week window, the last "
         f"{switch_s / 3600:g}h before the weekly reset, which opens at "
-        f"{opens.isoformat(timespec='minutes')}"
+        f"{opening.isoformat(timespec='minutes')}"
     )
 
 
@@ -290,14 +344,22 @@ def decide(
             )
             candidate = min(five_h_reset, candidate)
         wakeup = max(min_wakeup, candidate)
-        if window_closed:
-            assert reading.seven_day.resets_at is not None  # window_closed implies it
-            message = _window_closed_message(policy, reading.seven_day.resets_at, now)
-        else:
-            message = (
-                f"weekly utilization {observed_weekly}% > target "
-                f"{weekly_target:.1f}%; pausing dispatch until trace catches up"
+        assert reading.seven_day.resets_at is not None  # weekly_throttled implies it
+        eow_message = (
+            _end_of_week_message(
+                policy,
+                observed_pct=observed_weekly,
+                resets_at=reading.seven_day.resets_at,
+                now=now,
+                weekly_window_s=weekly_window_s,
             )
+            if _curve.end_of_week_only(policy.week.early_pct)
+            else None
+        )
+        message = eow_message or (
+            f"weekly utilization {observed_weekly}% > target "
+            f"{weekly_target:.1f}%; pausing dispatch until trace catches up"
+        )
         return Decision(
             state=SupervisorState.THROTTLED_WEEKLY,
             target_concurrency=0,
@@ -380,5 +442,6 @@ __all__ = [
     "FIVE_HOUR_LENGTH_S",
     "Decision",
     "decide",
+    "end_of_week_opening",
     "weekly_catch_up",
 ]

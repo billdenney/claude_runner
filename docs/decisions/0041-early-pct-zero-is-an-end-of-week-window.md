@@ -45,13 +45,15 @@ instead of a ramp:
   window`), the target is 0 and the window is closed. A closed window is
   `THROTTLED_WEEKLY` whatever the reading, 0% included. The wakeup, and the
   catch-up time `account list` reports, is the moment the window opens,
-  for any reading up to and including `eow_pct`; above it, the reset. The
-  supervisor message says the account is waiting for the window and gives
-  the opening.
+  for any reading up to and including `eow_pct`. The supervisor message
+  says the account is waiting for the window and gives the opening.
 - **Inside the window**, from its opening up to the reset, the target is a
   flat `eow_pct`. The ordinary rule applies: the account dispatches while
-  observed is not above `eow_pct`, and is `THROTTLED_WEEKLY` until the
-  reset once it is. The 5h bands still apply to an account that has a
+  observed is not above `eow_pct`. Once it is, the account takes nothing
+  more that week, and since the next week's window stays closed until
+  `eow_time_switch` before its own reset, the catch-up is next week's
+  opening, one weekly window after this one (`end_of_week_opening`); the
+  message says so. The 5h bands still apply to an account that has a
   5-hour window.
 - **At and after the reset** the window is closed. A reading whose reset
   has passed still belongs to the old week, and it can stay the current
@@ -61,7 +63,8 @@ instead of a ramp:
   window.
 - **Edges.** A zero-length window (`eow_time_switch = "0h"`) never opens,
   and the message says the account takes no tasks. A window of a week or
-  more is always open, so the account runs up to `eow_pct` all week.
+  more is always open, so the account runs up to `eow_pct` all week, and
+  over it waits for the reset as a sloped curve does.
 
 No setting is added. `early_pct` already accepts 0, `early_pct < eow_pct`
 already holds, and every `early_pct > 0` curve is unchanged, including at
@@ -75,11 +78,13 @@ and a reset with any microseconds, `decide` at the reported opening
 already dispatches.
 
 **Status output names the window.** `account list --json` gives
-`weekly_window_opens_at`, the opening, for an `early_pct = 0` account
-throttled at or under `eow_pct`, and `account list` prints it as "window
-opens". The runner-status report says such an account is waiting for its
-end-of-week window and dates the opening, instead of calling its use over
-plan.
+`weekly_window_opens_at`, the opening the account waits for (this week's,
+or next week's over `eow_pct`), for a weekly-throttled `early_pct = 0`
+account, and `account list` prints it as "window opens". The runner-status
+report says such an account is waiting for its end-of-week window and
+dates the opening, instead of calling its use over plan. When the reading
+predates a reset that has since passed, the report says the account waits
+for a reading of the new week rather than that its window should be open.
 
 `account list` showed a per-account `0` as `~`, the mark for an inherited
 value, because it printed `value or '~'`. It now shows `~` only for an

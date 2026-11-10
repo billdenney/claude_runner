@@ -14,7 +14,12 @@ from datetime import UTC, datetime, time, timedelta
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.supervisor.states import SupervisorState
 from claude_task_runner.throttle.curve import SEVEN_DAYS_S
-from claude_task_runner.throttle.decision import Decision, decide, weekly_catch_up
+from claude_task_runner.throttle.decision import (
+    Decision,
+    decide,
+    end_of_week_opening,
+    weekly_catch_up,
+)
 from claude_task_runner.throttle.policy import (
     ResolvedBand,
     ResolvedNight,
@@ -583,19 +588,25 @@ class TestEndOfWeekOnly:
         assert d.state is SupervisorState.DISPATCHING
         assert d.target_concurrency == 5
 
-    def test_inside_the_window_above_eow_pct_it_waits_for_the_reset(self) -> None:
+    NEXT_OPENS = OPENS + timedelta(days=7)
+    """Next week's window: after the reset this week's use no longer counts,
+    but the new week's window stays closed until 12h before its reset."""
+
+    def test_inside_the_window_above_eow_pct_it_waits_for_next_weeks_window(self) -> None:
         now = self.OPENS + timedelta(hours=6)
         d = self._decide(now, weekly_pct=98)
         assert d.state is SupervisorState.THROTTLED_WEEKLY
-        assert d.wakeup_at == self.RESETS
+        assert d.wakeup_at == self.NEXT_OPENS
         assert d.message == (
-            "weekly utilization 98% > target 97.0%; pausing dispatch until trace catches up"
+            "early_pct = 0: weekly utilization 98% > eow_pct 97%, so this account takes no "
+            "more tasks this week; the next end-of-week window opens at 2026-11-17T23:00+00:00"
         )
 
-    def test_before_the_window_above_eow_pct_it_waits_for_the_reset(self) -> None:
+    def test_before_the_window_above_eow_pct_it_waits_for_next_weeks_window(self) -> None:
         d = self._decide(self.OPENS - timedelta(hours=1), weekly_pct=99)
         assert d.state is SupervisorState.THROTTLED_WEEKLY
-        assert d.wakeup_at == self.RESETS
+        assert d.wakeup_at == self.NEXT_OPENS
+        assert d.message.startswith("early_pct = 0: weekly utilization 99% > eow_pct 97%")
 
     def test_a_five_hour_reset_before_the_opening_clamps_the_wakeup(self) -> None:
         now = self.OPENS - timedelta(hours=8)
@@ -624,7 +635,22 @@ class TestEndOfWeekOnly:
         policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=12 * 3600)
         assert weekly_catch_up(policy, observed_pct=68.0, resets_at=self.RESETS) == self.OPENS
         assert weekly_catch_up(policy, observed_pct=97.0, resets_at=self.RESETS) == self.OPENS
-        assert weekly_catch_up(policy, observed_pct=98.0, resets_at=self.RESETS) == self.RESETS
+        assert weekly_catch_up(policy, observed_pct=98.0, resets_at=self.RESETS) == (
+            self.NEXT_OPENS
+        )
+
+    def test_end_of_week_opening_is_none_unless_the_window_opens_and_closes(self) -> None:
+        def opening(early: int, switch_s: float, observed: float = 50.0) -> datetime | None:
+            policy = _policy(early_pct=early, eow_pct=97, eow_switch_s=switch_s)
+            return end_of_week_opening(policy, observed_pct=observed, resets_at=self.RESETS)
+
+        assert opening(0, 12 * 3600) == self.OPENS
+        assert opening(0, 12 * 3600, observed=97.0) == self.OPENS
+        assert opening(0, 12 * 3600, observed=97.5) == self.NEXT_OPENS
+        assert opening(60, 12 * 3600) is None
+        assert opening(0, 0) is None
+        assert opening(0, SEVEN_DAYS_S) is None
+        assert opening(0, 2 * SEVEN_DAYS_S) is None
 
     def test_at_eow_pct_before_the_window_it_wakes_at_the_opening_and_dispatches(self) -> None:
         before = self._decide(self.OPENS - timedelta(hours=1), weekly_pct=97)

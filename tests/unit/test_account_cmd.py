@@ -410,10 +410,10 @@ class TestAccountList:
     def test_end_of_week_only_account_reports_its_window_opening(
         self, runner: CliRunner, tmp_path: Path
     ) -> None:
-        """An ``early_pct = 0`` account throttled at or under eow_pct waits for
-        its window (ADR-0041): its catch-up is the opening, 12h before the
-        reset, and is also given as ``weekly_window_opens_at``. Over eow_pct
-        it waits for the reset, and a sloped-curve account has no opening."""
+        """An ``early_pct = 0`` account waits for an end-of-week window
+        (ADR-0041): at or under eow_pct this week's, 12h before the reset;
+        over it next week's, a week later. Its catch-up is that opening, also
+        given as ``weekly_window_opens_at``. A sloped-curve account has none."""
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
         dirs = {n: tmp_path / n for n in ("kept", "over", "sloped")}
@@ -449,14 +449,15 @@ class TestAccountList:
         assert result.exit_code == 0, result.output
         by_name = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
         opens = resets - timedelta(hours=12)
+        next_opens = opens + timedelta(days=7)
         assert {n: by_name[n]["weekly_catch_up_at"] for n in dirs} == {
             "kept": str(opens),
-            "over": str(resets),
+            "over": str(next_opens),
             "sloped": str(resets - timedelta(hours=104)),
         }
         assert {n: by_name[n]["weekly_window_opens_at"] for n in dirs} == {
             "kept": str(opens),
-            "over": None,
+            "over": str(next_opens),
             "sloped": None,
         }
 
@@ -466,8 +467,8 @@ class TestAccountList:
         assert [line for line in lines if line.startswith(("resumes about:", "window opens:"))] == [
             f"window opens:    {opens} (early_pct = 0: it takes tasks only in the end-of-week "
             "window; scheduled_wakeup_at is only the next re-check)",
-            f"resumes about:   {resets} (when its weekly use is back under plan; "
-            "scheduled_wakeup_at is only the next re-check)",
+            f"window opens:    {next_opens} (early_pct = 0: it takes tasks only in the "
+            "end-of-week window; scheduled_wakeup_at is only the next re-check)",
             f"resumes about:   {resets - timedelta(hours=104)} (when its weekly use is back "
             "under plan; scheduled_wakeup_at is only the next re-check)",
         ]

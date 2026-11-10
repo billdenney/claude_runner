@@ -490,6 +490,12 @@ def _account_times(facts: Facts, name: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
+def _reset_passed(times: dict[str, Any], now: datetime) -> bool:
+    """Whether the weekly reset of an account's last reading is already past."""
+    reset = _parse_time(times.get("last_weekly_reset_at"))
+    return reset is not None and reset <= now
+
+
 def _account_line(row: dict[str, Any]) -> tuple[str, bool]:
     """``(what the account is doing, whether it takes tasks)``."""
     in_flight = int(row.get("in_flight_count") or 0)
@@ -594,6 +600,11 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
             notes.info.append(
                 f"{name} is kept for the end of its week (early_pct = 0) and starts again about "
                 f"{_when(opens)}, when that window opens. Nothing to do."
+            )
+        elif opens is not None and _reset_passed(times, facts.now):
+            notes.info.append(
+                f"{name}'s week has reset since its last usage reading, so it waits for a "
+                f"reading of the new week and then for its end-of-week window. Nothing to do."
             )
         elif opens is not None:
             about = f" (about {_when(recheck)})" if recheck and recheck > facts.now else ""
