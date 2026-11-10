@@ -528,6 +528,119 @@ def test_weekly_throttle_resumes_when_use_falls_back_under_plan(
     )
 
 
+END_OF_WEEK_ONLY = '\n[dispatch_pct.week]\nearly_pct = 0\neow_pct = 97\neow_time_switch = "12h"\n'
+"""A queue curve that keeps every account for the last 12h of its week (ADR-0041)."""
+
+
+def test_end_of_week_only_account_waits_for_its_window(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
+) -> None:
+    """An ``early_pct = 0`` account throttled before its window is waiting
+    for the window, not over plan: the report says so and dates the
+    opening, 12 hours before a reset 20 hours after the report's time."""
+    weekly_reset = report_now.replace(second=0) + timedelta(hours=20)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_WEEKLY,
+            last_weekly_util_pct=68,
+            last_weekly_reset_at=weekly_reset,
+            target_concurrency=0,
+            scheduled_wakeup_at=report_now + timedelta(hours=1),
+        ),
+        running={"work": 3},
+        extra=END_OF_WEEK_ONLY,
+    )
+    _tasks(queue, new=2)
+    supervisor()
+
+    assert _summary(queue, bin_dir) == (
+        RUNNING
+        + _accounts(
+            "personal: not taking new tasks until its end-of-week window opens (68% used)",
+            "work: taking tasks, 3 of 3 slots in use",
+        )
+        + f"- **How many can run:** {EIGHT} Right now 3 running, with no room for more.\n"
+        "- **Tasks:** 3 running; 2 can start as soon as a slot is free; 0 finished.\n"
+        + NO_QUESTIONS
+        + _info(
+            "personal is kept for the end of its week (early_pct = 0) and starts again about "
+            f"{_when(weekly_reset - timedelta(hours=12))}, when that window opens. Nothing to do."
+        )
+    )
+
+
+def test_end_of_week_only_window_due_by_now(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
+) -> None:
+    """The window opened after the last reading; the account starts at the
+    supervisor's next check."""
+    weekly_reset = report_now.replace(second=0) + timedelta(hours=11)
+    recheck = report_now + timedelta(minutes=1)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_WEEKLY,
+            last_weekly_util_pct=68,
+            last_weekly_reset_at=weekly_reset,
+            target_concurrency=0,
+            scheduled_wakeup_at=recheck,
+        ),
+        running={"work": 3},
+        extra=END_OF_WEEK_ONLY,
+    )
+    supervisor()
+    assert _summary(queue, bin_dir).endswith(
+        _info(
+            "personal's end-of-week window should be open by now, so it should start again at "
+            f"its next check (about {_when(recheck)}). Nothing to do."
+        )
+    )
+
+
+def test_end_of_week_only_after_its_reset(
+    queue: Path,
+    tmp_path: Path,
+    bin_dir: Path,
+    supervisor: Callable[..., int],
+    report_now: datetime,
+) -> None:
+    """The last reading predates the weekly reset: its window opening is
+    past, but the new week's window has not opened, so the account waits
+    for a reading of the new week rather than starting at the next check."""
+    weekly_reset = report_now.replace(second=0) - timedelta(minutes=1)
+    _two_accounts(
+        queue,
+        tmp_path,
+        personal=_state(
+            SupervisorState.THROTTLED_WEEKLY,
+            last_weekly_util_pct=90,
+            last_weekly_reset_at=weekly_reset,
+            target_concurrency=0,
+            scheduled_wakeup_at=report_now + timedelta(minutes=1),
+        ),
+        running={"work": 3},
+        extra=END_OF_WEEK_ONLY,
+    )
+    supervisor()
+    assert _summary(queue, bin_dir).endswith(
+        _info(
+            "personal's week has reset since its last usage reading, so it waits for a reading "
+            "of the new week and then for its end-of-week window. Nothing to do."
+        )
+    )
+
+
 def test_weekly_throttle_without_a_reset_time(
     queue: Path, tmp_path: Path, bin_dir: Path, supervisor: Callable[..., int]
 ) -> None:

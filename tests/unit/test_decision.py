@@ -14,7 +14,12 @@ from datetime import UTC, datetime, time, timedelta
 from claude_task_runner.clock import FakeClock
 from claude_task_runner.supervisor.states import SupervisorState
 from claude_task_runner.throttle.curve import SEVEN_DAYS_S
-from claude_task_runner.throttle.decision import Decision, decide, weekly_catch_up
+from claude_task_runner.throttle.decision import (
+    Decision,
+    decide,
+    end_of_week_opening,
+    weekly_catch_up,
+)
 from claude_task_runner.throttle.policy import (
     ResolvedBand,
     ResolvedNight,
@@ -522,3 +527,215 @@ class TestDefensiveBranches:
 
         out = _linear_ramp(observed_pct=65, slowdown_pct=70, stop_pct=60, max_concurrency=5)
         assert out == 0
+
+
+class TestEndOfWeekOnly:
+    """``early_pct = 0`` (ADR-0041): an account takes tasks only in the last
+    ``eow_time_switch`` before its weekly reset, up to ``eow_pct``.
+
+    The policy mirrors an account with no 5-hour window kept for the end of
+    the week: early 0, eow 97, a 12h window, five tasks at once.
+    """
+
+    RESETS = datetime(2026, 11, 11, 11, 0, tzinfo=UTC)
+    OPENS = RESETS - timedelta(hours=12)
+
+    def _decide(
+        self,
+        now: datetime,
+        weekly_pct: int,
+        *,
+        eow_switch_s: float = 12 * 3600,
+        five_h_pct: int | None = None,
+        five_h_resets_at: datetime | None = None,
+    ) -> Decision:
+        policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=eow_switch_s, timezone="UTC")
+        reading = _reading(
+            five_h_pct=five_h_pct,
+            weekly_pct=weekly_pct,
+            five_h_resets_at=five_h_resets_at,
+            weekly_resets_at=self.RESETS,
+        )
+        return decide(policy, reading, FakeClock(now), poll_interval_s=POLL)
+
+    def test_before_the_window_it_waits_for_the_opening(self) -> None:
+        d = self._decide(self.OPENS - timedelta(hours=8), weekly_pct=68)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.target_concurrency == 0
+        assert d.target_pct == 0.0
+        assert d.wakeup_at == self.OPENS
+        assert d.message == (
+            "early_pct = 0: waiting for the end-of-week window, the last 12h before "
+            "the weekly reset, which opens at 2026-11-10T23:00+00:00"
+        )
+
+    def test_a_fresh_week_at_zero_percent_does_not_dispatch(self) -> None:
+        # Observed 0% is not above a 0% target, so only the closed window
+        # keeps the account from starting tasks the moment its week resets.
+        d = self._decide(self.RESETS - timedelta(days=7), weekly_pct=0)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.target_concurrency == 0
+        assert d.wakeup_at == self.OPENS
+
+    def test_the_window_opens_on_time(self) -> None:
+        d = self._decide(self.OPENS, weekly_pct=75)
+        assert d.state is SupervisorState.DISPATCHING
+        assert d.target_concurrency == 5
+        assert d.target_pct == 97.0
+
+    def test_inside_the_window_it_runs_up_to_eow_pct(self) -> None:
+        d = self._decide(self.OPENS + timedelta(hours=6), weekly_pct=97)
+        assert d.state is SupervisorState.DISPATCHING
+        assert d.target_concurrency == 5
+
+    NEXT_OPENS = OPENS + timedelta(days=7)
+    """Next week's window: after the reset this week's use no longer counts,
+    but the new week's window stays closed until 12h before its reset."""
+
+    def test_inside_the_window_above_eow_pct_it_waits_for_next_weeks_window(self) -> None:
+        now = self.OPENS + timedelta(hours=6)
+        d = self._decide(now, weekly_pct=98)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == self.NEXT_OPENS
+        assert d.message == (
+            "early_pct = 0: weekly utilization 98% > eow_pct 97%, so this account takes no "
+            "more tasks this week; the next end-of-week window opens at 2026-11-17T23:00+00:00"
+        )
+
+    def test_before_the_window_above_eow_pct_it_waits_for_next_weeks_window(self) -> None:
+        d = self._decide(self.OPENS - timedelta(hours=1), weekly_pct=99)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == self.NEXT_OPENS
+        assert d.message.startswith("early_pct = 0: weekly utilization 99% > eow_pct 97%")
+
+    def test_a_five_hour_reset_before_the_opening_clamps_the_wakeup(self) -> None:
+        now = self.OPENS - timedelta(hours=8)
+        five_h_reset = now + timedelta(hours=2)
+        d = self._decide(now, weekly_pct=20, five_h_pct=10, five_h_resets_at=five_h_reset)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == five_h_reset
+
+    def test_inside_the_window_the_5h_bands_still_apply(self) -> None:
+        now = datetime(2026, 11, 11, 3, 0, tzinfo=UTC)  # night band, inside the window
+        d = self._decide(
+            now, weekly_pct=50, five_h_pct=95, five_h_resets_at=now + timedelta(hours=1)
+        )
+        assert d.state is SupervisorState.THROTTLED_5H
+
+    def test_a_zero_length_window_never_opens(self) -> None:
+        d = self._decide(self.OPENS, weekly_pct=0, eow_switch_s=0)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.wakeup_at == self.RESETS
+        assert d.message == (
+            "early_pct = 0 takes tasks only in the last eow_time_switch before the weekly "
+            "reset, and eow_time_switch is 0, so this account takes none"
+        )
+
+    def test_weekly_catch_up_is_the_opening(self) -> None:
+        policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=12 * 3600)
+        assert weekly_catch_up(policy, observed_pct=68.0, resets_at=self.RESETS) == self.OPENS
+        assert weekly_catch_up(policy, observed_pct=97.0, resets_at=self.RESETS) == self.OPENS
+        assert weekly_catch_up(policy, observed_pct=98.0, resets_at=self.RESETS) == (
+            self.NEXT_OPENS
+        )
+
+    def test_end_of_week_opening_is_none_unless_the_window_opens_and_closes(self) -> None:
+        def opening(early: int, switch_s: float, observed: float = 50.0) -> datetime | None:
+            policy = _policy(early_pct=early, eow_pct=97, eow_switch_s=switch_s)
+            return end_of_week_opening(policy, observed_pct=observed, resets_at=self.RESETS)
+
+        assert opening(0, 12 * 3600) == self.OPENS
+        assert opening(0, 12 * 3600, observed=97.0) == self.OPENS
+        assert opening(0, 12 * 3600, observed=97.5) == self.NEXT_OPENS
+        assert opening(60, 12 * 3600) is None
+        assert opening(0, 0) is None
+        assert opening(0, SEVEN_DAYS_S) is None
+        assert opening(0, 2 * SEVEN_DAYS_S) is None
+
+    def test_at_eow_pct_before_the_window_it_wakes_at_the_opening_and_dispatches(self) -> None:
+        before = self._decide(self.OPENS - timedelta(hours=1), weekly_pct=97)
+        assert before.state is SupervisorState.THROTTLED_WEEKLY
+        assert before.wakeup_at == self.OPENS
+        at_opening = self._decide(self.OPENS, weekly_pct=97)
+        assert at_opening.state is SupervisorState.DISPATCHING
+
+    def test_a_reading_past_its_reset_keeps_the_window_closed(self) -> None:
+        # The last reading of a week stays current for up to a poll after the
+        # reset; the new week's window is closed, so 0% then must not dispatch.
+        now = self.RESETS + timedelta(minutes=3)
+        d = self._decide(now, weekly_pct=10)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.target_concurrency == 0
+        assert d.target_pct == 0.0
+        assert d.wakeup_at == now + timedelta(seconds=POLL)
+        assert d.message == (
+            "early_pct = 0: the weekly reset at 2026-11-11T11:00+00:00 has passed, so the "
+            "end-of-week window is closed until a reading of the new week shows when it opens"
+        )
+
+    def test_a_window_of_a_week_or_more_is_always_open(self) -> None:
+        for switch_s in (SEVEN_DAYS_S, 2 * SEVEN_DAYS_S):
+            mid_week = self._decide(self.RESETS - timedelta(days=4), 0, eow_switch_s=switch_s)
+            assert mid_week.state is SupervisorState.DISPATCHING
+            assert mid_week.target_pct == 97.0
+            over = self._decide(self.RESETS - timedelta(days=4), 98, eow_switch_s=switch_s)
+            assert over.state is SupervisorState.THROTTLED_WEEKLY
+            assert over.wakeup_at == self.RESETS
+
+    def test_a_fourteen_day_window_opens_12h_before_its_reset(self) -> None:
+        policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=12 * 3600, timezone="UTC")
+
+        def at(now: datetime) -> Decision:
+            reading = _reading(
+                five_h_pct=None, weekly_pct=40, five_h_resets_at=None, weekly_resets_at=self.RESETS
+            )
+            return decide(
+                policy,
+                reading,
+                FakeClock(now),
+                poll_interval_s=POLL,
+                weekly_window_s=2 * SEVEN_DAYS_S,
+            )
+
+        before = at(self.RESETS - timedelta(days=10))
+        assert before.state is SupervisorState.THROTTLED_WEEKLY
+        assert before.wakeup_at == self.OPENS
+        assert at(self.OPENS).state is SupervisorState.DISPATCHING
+
+    def test_the_reported_opening_dispatches_for_every_whole_second_switch(self) -> None:
+        """eow_time_switch is whole seconds (config.duration); readings carry
+        microseconds at most. At the opening weekly_catch_up reports, decide()
+        must already dispatch, or the account starts a poll late."""
+        for window_s in (SEVEN_DAYS_S, 2 * SEVEN_DAYS_S):
+            for switch_s in (1, 59, 3600, 12 * 3600, 12 * 3600 + 1, 40 * 3600, 86399, 518401):
+                policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=float(switch_s))
+                for micro in (0, 1, 123456, 999999):
+                    resets = self.RESETS + timedelta(microseconds=micro)
+                    opens = weekly_catch_up(
+                        policy, observed_pct=50.0, resets_at=resets, weekly_window_s=window_s
+                    )
+                    reading = _reading(
+                        five_h_pct=None,
+                        weekly_pct=50,
+                        five_h_resets_at=None,
+                        weekly_resets_at=resets,
+                    )
+                    d = decide(
+                        policy,
+                        reading,
+                        FakeClock(opens),
+                        poll_interval_s=POLL,
+                        weekly_window_s=window_s,
+                    )
+                    assert d.state is SupervisorState.DISPATCHING, (window_s, switch_s, micro)
+
+    def test_a_sloped_curve_still_dispatches_at_zero_percent_at_week_start(self) -> None:
+        reading = _reading(
+            five_h_pct=None,
+            weekly_pct=0,
+            five_h_resets_at=None,
+            weekly_resets_at=self.RESETS,
+        )
+        now = self.RESETS - timedelta(days=7)
+        d = decide(_policy(timezone="UTC"), reading, FakeClock(now), poll_interval_s=POLL)
+        assert d.state is SupervisorState.DISPATCHING

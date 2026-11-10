@@ -552,6 +552,10 @@ utilization above the trace target for the current elapsed fraction.
    `early_pct + ((t - (1 - eow_frac)) / eow_frac) * (eow_pct - early_pct)`
    (EOW segment). With defaults `early_pct=60`, `eow_pct=95`,
    `eow_time_switch="40h"`, the EOW elbow is at `t ≈ 0.76`.
+   With `early_pct = 0` the account waits for its end-of-week window
+   instead (ADR-0041): the supervisor message names the time it opens,
+   `eow_time_switch` before the reset, and from then on the target is a
+   flat `eow_pct`.
 2. The supervisor's `scheduled_wakeup_at` should already point to
    the analytical catch-up time (when the curve rises to meet
    observed); confirm via `claude-task-runner supervisor status`.

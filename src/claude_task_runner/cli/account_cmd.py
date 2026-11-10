@@ -59,7 +59,7 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
-from claude_task_runner.throttle.decision import weekly_catch_up
+from claude_task_runner.throttle.decision import end_of_week_opening, weekly_catch_up
 from claude_task_runner.throttle.policy import ResolvedPolicy, resolve
 from claude_task_runner.usage.drift import usage_error_kind
 from claude_task_runner.usage.models import NOT_REPORTED
@@ -97,6 +97,7 @@ def _state_fields(
         state = snapshot.accounts.get(name)
         in_flight_count = account_in_flight_count(name, snapshot.in_flight)
     catch_up: datetime | None = None
+    window_opens: datetime | None = None
     if (
         state is not None
         and resolved is not None
@@ -104,6 +105,11 @@ def _state_fields(
         and state.last_weekly_reset_at is not None
     ):
         catch_up = weekly_catch_up(
+            resolved,
+            observed_pct=float(state.last_weekly_util_pct),
+            resets_at=state.last_weekly_reset_at,
+        )
+        window_opens = end_of_week_opening(
             resolved,
             observed_pct=float(state.last_weekly_util_pct),
             resets_at=state.last_weekly_reset_at,
@@ -131,6 +137,10 @@ def _state_fields(
         # target curve rises to its last reading. Not the supervisor's
         # next re-check (scheduled_wakeup_at), which comes sooner.
         "weekly_catch_up_at": catch_up,
+        # The same time when it is the opening of the end-of-week window an
+        # ``early_pct = 0`` account waits for, this week's or, over eow_pct,
+        # next week's (ADR-0041); else None.
+        "weekly_window_opens_at": window_opens,
         # Why an ERROR_DRIFT account has no reading: ``auth`` (log in
         # again) or ``format`` (the usage page changed), with the message.
         "usage_error": usage_error,
@@ -297,6 +307,16 @@ def list_accounts(
         raise typer.Exit(code=1)
 
 
+def _override(value: object) -> str:
+    """A per-account ``[dispatch_pct.*]`` field as ``account list`` shows it.
+
+    ``None`` inherits the queue-wide value and shows as ``~``. A ``0`` is a
+    real override (``early_pct = 0`` confines dispatch to the end of the
+    week, ADR-0041), so it must not read as inherited.
+    """
+    return "~" if value is None else str(value)
+
+
 def _print_account(
     console: Console,
     decl: AccountSettings,
@@ -327,14 +347,15 @@ def _print_account(
     if acct is not None:
         console.print(literal("  max_concurrency: ", acct.policy.concurrency.max_concurrency))
         dp = acct.policy.dispatch_pct
-        day_s = f"day {dp.day.fivehr_slowdown_pct or '~'}/{dp.day.fivehr_stop_pct or '~'}"
+        day_s = f"day {_override(dp.day.fivehr_slowdown_pct)}/{_override(dp.day.fivehr_stop_pct)}"
         night_s = (
-            f"night {dp.night.fivehr_slowdown_pct or '~'}/{dp.night.fivehr_stop_pct or '~'}"
-            f" [{dp.night.time_start or '~'}-{dp.night.time_end or '~'}]"
+            f"night {_override(dp.night.fivehr_slowdown_pct)}/"
+            f"{_override(dp.night.fivehr_stop_pct)}"
+            f" [{_override(dp.night.time_start)}-{_override(dp.night.time_end)}]"
         )
         week_s = (
-            f"week early={dp.week.early_pct or '~'}/eow={dp.week.eow_pct or '~'}"
-            f"@{dp.week.eow_time_switch or '~'}"
+            f"week early={_override(dp.week.early_pct)}/eow={_override(dp.week.eow_pct)}"
+            f"@{_override(dp.week.eow_time_switch)}"
         )
         console.print(literal(f"  dispatch_pct:    {day_s}, {night_s}, {week_s}"))
     console.print(
@@ -344,7 +365,15 @@ def _print_account(
             f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
         )
     )
-    if row["weekly_catch_up_at"] is not None:
+    if row["weekly_window_opens_at"] is not None:
+        console.print(
+            literal(
+                f"  window opens:    {row['weekly_window_opens_at']} (early_pct = 0: it takes "
+                "tasks only in the end-of-week window; scheduled_wakeup_at is only the next "
+                "re-check)"
+            )
+        )
+    elif row["weekly_catch_up_at"] is not None:
         console.print(
             literal(
                 f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "

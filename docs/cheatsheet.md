@@ -47,7 +47,9 @@ throttle stack into two pictures the operator can hold in mind:
    week reset), then steeper to `eow_pct` at reset. If observed weekly
    utilization is above the target line, dispatch is THROTTLED_WEEKLY
    until the line catches up. No weekly slowdown band — all graceful
-   degradation lives on the 5h side.
+   degradation lives on the 5h side. `early_pct = 0` is a step instead
+   (ADR-0041): no dispatch at all before the last `eow_time_switch`,
+   then up to `eow_pct` until the reset.
 
 ### 5h side — day / night bands
 
@@ -65,7 +67,7 @@ throttle stack into two pictures the operator can hold in mind:
 
 | Setting | Default | When to bump | When to lower |
 |---|---|---|---|
-| `[dispatch_pct.week].early_pct` | 60 | Toward 70 if you want less reserved for the EOW burst | Toward 50 for a bigger end-of-week push |
+| `[dispatch_pct.week].early_pct` | 60 | Toward 70 if you want less reserved for the EOW burst | Toward 50 for a bigger end-of-week push; `0` to use the account only in the last `eow_time_switch` before its reset, up to `eow_pct` (ADR-0041) |
 | `[dispatch_pct.week].eow_pct` | 95 | Toward 99 if your queue can reliably burn the final tokens; risky | Toward 90 for more safety margin |
 | `[dispatch_pct.week].eow_time_switch` | `"40h"` | Lengthen if your nighttime windows are narrow and you want multiple opportunities | Shorten to confine the steep ramp closer to reset |
 
@@ -372,6 +374,7 @@ from pathlib import Path
 
 from claude_task_runner.config.schema import Settings
 from claude_task_runner.config.loader import load_settings
+
 print(load_settings(Path("path/to/queue/claude_runner.toml")))
 ```
 
