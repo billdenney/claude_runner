@@ -204,8 +204,14 @@ class TestEndOfWeekOnly:
     def test_window_closed_before_the_segment_and_open_inside_it(self) -> None:
         for t in (0.0, 0.5, self.OPENS - 1e-9):
             assert not window_open(t, early_pct=0.0, eow_window_fraction=self.EWS), t
-        for t in (self.OPENS, (self.OPENS + 1.0) / 2, 1.0):
+        for t in (self.OPENS, (self.OPENS + 1.0) / 2, 1.0 - 1e-9):
             assert window_open(t, early_pct=0.0, eow_window_fraction=self.EWS), t
+
+    def test_window_closed_at_and_past_the_reset(self) -> None:
+        # elapsed clamps to 1 for a reading whose reset has passed: a new week
+        # has begun, and its window is closed until a reading dates it.
+        for t in (1.0, 1.5):
+            assert not window_open(t, early_pct=0.0, eow_window_fraction=self.EWS), t
 
     def test_window_open_at_the_exact_opening_computed_from_seconds(self) -> None:
         # decide() computes both sides from seconds; the opening instant must
@@ -234,26 +240,32 @@ class TestEndOfWeekOnly:
         assert at(self.OPENS - 1e-9) == 0.0
         assert at(self.OPENS) == 97.0
         assert at((self.OPENS + 1.0) / 2) == 97.0
-        assert at(1.0) == 97.0
+        assert at(1.0 - 1e-9) == 97.0
+        assert at(1.0) == 0.0
 
     def test_target_with_zero_and_whole_week_segments(self) -> None:
         for t in (0.0, 0.5, 1.0):
             assert target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=0.0) == 0.0
             assert target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=1.0) == 97.0
+            assert target_pct(t, early_pct=0.0, eow_pct=97.0, eow_window_fraction=1.5) == 97.0
 
     def test_target_clamps_eow_pct_above_100(self) -> None:
-        v = target_pct(1.0, early_pct=0.0, eow_pct=150.0, eow_window_fraction=self.EWS)
+        v = target_pct(
+            (self.OPENS + 1.0) / 2, early_pct=0.0, eow_pct=150.0, eow_window_fraction=self.EWS
+        )
         assert v == 100.0
 
-    def test_catch_up_below_eow_pct_is_the_opening(self) -> None:
-        for observed in (-5.0, 0.0, 1.0, 68.0, 96.0):
+    def test_catch_up_up_to_eow_pct_is_the_opening(self) -> None:
+        # The step reaches eow_pct at the opening, and decide() dispatches at
+        # observed == target, so a reading of exactly eow_pct is met there too.
+        for observed in (-5.0, 0.0, 1.0, 68.0, 96.0, 97.0):
             t = elapsed_for_target_pct(
                 observed, early_pct=0.0, eow_pct=97.0, eow_window_fraction=self.EWS
             )
             assert t == pytest.approx(self.OPENS, abs=1e-12), observed
 
-    def test_catch_up_at_or_above_eow_pct_is_the_reset(self) -> None:
-        for observed in (97.0, 99.0):
+    def test_catch_up_above_eow_pct_is_the_reset(self) -> None:
+        for observed in (97.5, 99.0):
             t = elapsed_for_target_pct(
                 observed, early_pct=0.0, eow_pct=97.0, eow_window_fraction=self.EWS
             )

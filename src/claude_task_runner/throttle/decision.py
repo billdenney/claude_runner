@@ -143,6 +143,9 @@ def weekly_catch_up(
     running can raise the observed figure. ``resets_at`` is the end of the
     current weekly window; observed at or above ``eow_pct`` gives the reset
     itself.
+
+    With ``early_pct = 0`` (ADR-0041) it is when the end-of-week window
+    opens, for any observed value up to ``eow_pct``, and the reset above it.
     """
     return _weekly_catch_up_at(
         observed_pct=observed_pct,
@@ -154,13 +157,19 @@ def weekly_catch_up(
     )
 
 
-def _window_closed_message(policy: ResolvedPolicy, resets_at: datetime) -> str:
+def _window_closed_message(policy: ResolvedPolicy, resets_at: datetime, now: datetime) -> str:
     """Why an end-of-week-only account (``early_pct = 0``) takes no tasks yet."""
     switch_s = policy.week.eow_time_switch_s
     if switch_s <= 0:
         return (
             "early_pct = 0 takes tasks only in the last eow_time_switch before the "
             "weekly reset, and eow_time_switch is 0, so this account takes none"
+        )
+    if now >= resets_at:
+        return (
+            f"early_pct = 0: the weekly reset at {resets_at.isoformat(timespec='minutes')} "
+            "has passed, so the end-of-week window is closed until a reading of the new "
+            "week shows when it opens"
         )
     opens = resets_at - timedelta(seconds=switch_s)
     return (
@@ -283,7 +292,7 @@ def decide(
         wakeup = max(min_wakeup, candidate)
         if window_closed:
             assert reading.seven_day.resets_at is not None  # window_closed implies it
-            message = _window_closed_message(policy, reading.seven_day.resets_at)
+            message = _window_closed_message(policy, reading.seven_day.resets_at, now)
         else:
             message = (
                 f"weekly utilization {observed_weekly}% > target "

@@ -506,6 +506,12 @@ def _account_line(row: dict[str, Any]) -> tuple[str, bool]:
             f"({row.get('last_5h_util_pct')}% used){still}",
             False,
         )
+    if state == "throttled_weekly" and row.get("weekly_window_opens_at"):
+        return (
+            f"not taking new tasks until its end-of-week window opens "
+            f"({row.get('last_weekly_util_pct')}% used){still}",
+            False,
+        )
     if state == "throttled_weekly":
         return (
             f"not taking new tasks, because it is using its weekly allowance faster than planned "
@@ -583,7 +589,19 @@ def _account_notes(facts: Facts, row: dict[str, Any], live: bool, notes: Notes) 
     elif state == "throttled_weekly":
         catch_up = _parse_time(row.get("weekly_catch_up_at"))
         recheck = _parse_time(times.get("scheduled_wakeup_at"))
-        if catch_up is not None and catch_up > facts.now:
+        opens = _parse_time(row.get("weekly_window_opens_at"))
+        if opens is not None and opens > facts.now:
+            notes.info.append(
+                f"{name} is kept for the end of its week (early_pct = 0) and starts again about "
+                f"{_when(opens)}, when that window opens. Nothing to do."
+            )
+        elif opens is not None:
+            about = f" (about {_when(recheck)})" if recheck and recheck > facts.now else ""
+            notes.info.append(
+                f"{name}'s end-of-week window should be open by now, so it should start again "
+                f"at its next check{about}. Nothing to do."
+            )
+        elif catch_up is not None and catch_up > facts.now:
             notes.info.append(
                 f"{name} starts again about {_when(catch_up)}, when its weekly use falls back "
                 f"under plan. Nothing to do."
@@ -1297,8 +1315,8 @@ def accounts_section(facts: Facts) -> str:
         "slows down to save its 5-hour allowance, 0 while it is throttled, paused, without a "
         "usage reading, or when it cannot take tasks at all (its runner-account.toml does not "
         'load, for one: "problem" says what). "In flight" means running now. '
-        '"Resumes about" is when a weekly-throttled account\'s use falls back under plan. The '
-        "queue ceiling is the most tasks the whole queue may run at once._",
+        '"Resumes about" is when a weekly-throttled account\'s use falls back under plan, or when '
+        "the end-of-week window of an account with `early_pct = 0` opens. The queue ceiling is the most tasks the whole queue may run at once._",
         "",
     ]
     data = facts.accounts.data
@@ -1378,7 +1396,8 @@ def per_account_section(facts: Facts) -> str:
         "",
         "_What each account's last usage reading says. `state`: dispatching or idle take tasks, "
         "slowing_down takes fewer, throttled_5h waits for its 5-hour window to reset, "
-        "throttled_weekly waits until its weekly use falls back under plan, no_reading and "
+        "throttled_weekly waits until its weekly use falls back under plan (or, with "
+        "`early_pct = 0`, until its end-of-week window opens), no_reading and "
         "error_drift take none until a reading arrives. `in-flight` is how many tasks the "
         "account is running now; `target` (the throttle target) is how many the throttle lets "
         'it run, "—" when no reading has set one; `5h` is "not reported" and `5h reset` "—" '

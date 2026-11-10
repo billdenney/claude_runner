@@ -37,7 +37,8 @@ non-specialist can read in ten seconds, as five short lines:
   `[usage].poll_interval_s` of the settings it was started with.
 - **Accounts**: one line each: taking tasks (slots in use out of the slots
   it is allowed now), or not, and why (paused, its 5-hour allowance used
-  up, using its weekly allowance faster than planned, no recent usage
+  up, using its weekly allowance faster than planned, waiting for its
+  end-of-week window (an account with `early_pct = 0`), no recent usage
   reading, its usage could not be read, or a problem that stops it taking
   tasks at all until fixed, such as a runner-account.toml that does not
   load).
@@ -77,7 +78,8 @@ its last record, not as running now.
 
 The facts come from the runner, not from re-reading its files:
 `claude-task-runner account list --json` (each account's state, caps,
-pause, settings-file error, `weekly_catch_up_at` and `usage_error`, and the
+pause, settings-file error, `weekly_catch_up_at`, `weekly_window_opens_at`
+and `usage_error`, and the
 queue ceiling), `claude-task-runner queue holds --json` (the supervisor's
 candidate selection run once, read-only, with the poll interval, the
 parked workers, why each task waiting for a retry time was deferred, the
@@ -157,7 +159,9 @@ with a line saying what it shows and defining its terms:
      allowance is used up (it resumes when the 5-hour window resets) or
      because it is using its weekly allowance faster than planned (it
      resumes when its weekly use falls back under plan, which the summary
-     dates);
+     dates), or because it is kept for the end of its week with
+     `early_pct = 0` and its window has not opened yet (ADR-0041; the
+     summary dates the opening);
    - "awaiting_sidecar": the task stopped to ask a question, and keeps
      this status until it runs again, so an awaiting_sidecar task may
      already be answered and only waiting for a slot. Only **Questions for
@@ -269,7 +273,10 @@ or recent failures), follow the prioritized triage flow below.
       yellow. The trace-following rule (ADR-0022) resumes the account
       when the weekly curve catches up with its use: give that time from
       `account list --json`'s `weekly_catch_up_at` ("resumes about …, when
-      its weekly use falls back under plan"). `scheduled_wakeup_at` is
+      its weekly use falls back under plan"). When `weekly_window_opens_at`
+      is set, the account has `early_pct = 0` and is waiting for its
+      end-of-week window (ADR-0041): say so and give that time instead
+      of calling its use over plan. `scheduled_wakeup_at` is
       only the supervisor's next re-check, clamped to the next 5-hour
       reset when the account has a 5-hour window, so never give it as
       the resume time.

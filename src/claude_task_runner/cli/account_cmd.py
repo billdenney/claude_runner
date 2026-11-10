@@ -59,6 +59,7 @@ from claude_task_runner.supervisor.states import (
     SupervisorSnapshot,
     SupervisorState,
 )
+from claude_task_runner.throttle.curve import end_of_week_only
 from claude_task_runner.throttle.decision import weekly_catch_up
 from claude_task_runner.throttle.policy import ResolvedPolicy, resolve
 from claude_task_runner.usage.drift import usage_error_kind
@@ -108,6 +109,17 @@ def _state_fields(
             observed_pct=float(state.last_weekly_util_pct),
             resets_at=state.last_weekly_reset_at,
         )
+    window_opens: datetime | None = None
+    if (
+        catch_up is not None
+        and resolved is not None
+        and state is not None
+        and end_of_week_only(resolved.week.early_pct)
+        and state.last_weekly_util_pct <= resolved.week.eow_pct
+    ):
+        # Throttled at or under eow_pct, an end-of-week-only account is
+        # waiting for its window, and the catch-up time is its opening.
+        window_opens = catch_up
     usage_error: dict[str, str] | None = None
     if state is not None and state.state is SupervisorState.ERROR_DRIFT:
         message = state.last_drift_message
@@ -131,6 +143,9 @@ def _state_fields(
         # target curve rises to its last reading. Not the supervisor's
         # next re-check (scheduled_wakeup_at), which comes sooner.
         "weekly_catch_up_at": catch_up,
+        # The same time when it is the opening of the end-of-week window an
+        # ``early_pct = 0`` account waits for (ADR-0041), else None.
+        "weekly_window_opens_at": window_opens,
         # Why an ERROR_DRIFT account has no reading: ``auth`` (log in
         # again) or ``format`` (the usage page changed), with the message.
         "usage_error": usage_error,
@@ -355,7 +370,15 @@ def _print_account(
             f"in_flight={row['in_flight_count']}/{row['dispatch_cap']}"
         )
     )
-    if row["weekly_catch_up_at"] is not None:
+    if row["weekly_window_opens_at"] is not None:
+        console.print(
+            literal(
+                f"  window opens:    {row['weekly_window_opens_at']} (early_pct = 0: it takes "
+                "tasks only in the end-of-week window; scheduled_wakeup_at is only the next "
+                "re-check)"
+            )
+        )
+    elif row["weekly_catch_up_at"] is not None:
         console.print(
             literal(
                 f"  resumes about:   {row['weekly_catch_up_at']} (when its weekly use is back "

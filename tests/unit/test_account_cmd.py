@@ -407,6 +407,71 @@ class TestAccountList:
         assert "in_flight=2/2" in human.stdout
         assert "in_flight=0/1" in human.stdout
 
+    def test_end_of_week_only_account_reports_its_window_opening(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """An ``early_pct = 0`` account throttled at or under eow_pct waits for
+        its window (ADR-0041): its catch-up is the opening, 12h before the
+        reset, and is also given as ``weekly_window_opens_at``. Over eow_pct
+        it waits for the reset, and a sloped-curve account has no opening."""
+        queue_dir = tmp_path / "q"
+        queue_dir.mkdir()
+        dirs = {n: tmp_path / n for n in ("kept", "over", "sloped")}
+        for name, cfg in dirs.items():
+            cfg.mkdir()
+            week = (
+                ""
+                if name == "sloped"
+                else '[dispatch_pct.week]\nearly_pct = 0\neow_pct = 97\neow_time_switch = "12h"\n'
+            )
+            (cfg / "runner-account.toml").write_text(
+                "[concurrency]\nmax_concurrency = 5\n\n" + week, encoding="utf-8"
+            )
+        config = _write_queue_config(
+            tmp_path, accounts=[(n, str(d), None) for n, d in dirs.items()]
+        )
+        since = datetime(2026, 11, 10, tzinfo=UTC)
+        resets = datetime(2026, 11, 11, 11, 0, tzinfo=UTC)
+        _seed_snapshot(
+            queue_dir,
+            accounts={
+                name: AccountState(
+                    state=SupervisorState.THROTTLED_WEEKLY,
+                    since=since,
+                    last_weekly_util_pct=pct,
+                    last_weekly_reset_at=resets,
+                )
+                for name, pct in (("kept", 97), ("over", 98), ("sloped", 30))
+            },
+        )
+        args = ["account", "list", "--config", str(config), "--queue", str(queue_dir)]
+        result = runner.invoke(app, [*args, "--json"])
+        assert result.exit_code == 0, result.output
+        by_name = {r["name"]: r for r in json.loads(result.stdout)["accounts"]}
+        opens = resets - timedelta(hours=12)
+        assert {n: by_name[n]["weekly_catch_up_at"] for n in dirs} == {
+            "kept": str(opens),
+            "over": str(resets),
+            "sloped": str(resets - timedelta(hours=104)),
+        }
+        assert {n: by_name[n]["weekly_window_opens_at"] for n in dirs} == {
+            "kept": str(opens),
+            "over": None,
+            "sloped": None,
+        }
+
+        text = runner.invoke(app, args, env={"COLUMNS": "1000"})
+        assert text.exit_code == 0, text.output
+        lines = [line.strip() for line in text.stdout.splitlines()]
+        assert [line for line in lines if line.startswith(("resumes about:", "window opens:"))] == [
+            f"window opens:    {opens} (early_pct = 0: it takes tasks only in the end-of-week "
+            "window; scheduled_wakeup_at is only the next re-check)",
+            f"resumes about:   {resets} (when its weekly use is back under plan; "
+            "scheduled_wakeup_at is only the next re-check)",
+            f"resumes about:   {resets - timedelta(hours=104)} (when its weekly use is back "
+            "under plan; scheduled_wakeup_at is only the next re-check)",
+        ]
+
 
 class TestAccountPauseResume:
     def test_pause_unknown_account_errors(self, runner: CliRunner, tmp_path: Path) -> None:
@@ -662,16 +727,28 @@ class TestAccountListHumanReadable:
             '[dispatch_pct.week]\nearly_pct = 0\neow_pct = 97\neow_time_switch = "12h"\n',
             encoding="utf-8",
         )
+        other = tmp_path / "work"
+        other.mkdir()
+        (other / "runner-account.toml").write_text(
+            "[concurrency]\nmax_concurrency = 3\n\n[dispatch_pct.day]\nfivehr_slowdown_pct = 0\n",
+            encoding="utf-8",
+        )
         queue_dir = tmp_path / "q"
         queue_dir.mkdir()
-        config = _write_queue_config(tmp_path, accounts=[("personal", str(cfg_dir), None)])
+        config = _write_queue_config(
+            tmp_path, accounts=[("personal", str(cfg_dir), None), ("work", str(other), None)]
+        )
         result = runner.invoke(
             app,
             ["account", "list", "--config", str(config), "--queue", str(queue_dir)],
+            env={"COLUMNS": "1000"},
         )
         assert result.exit_code == 0, result.output
-        assert "week early=0/eow=97@12h" in result.stdout
-        assert "day ~/~, night ~/~ [~-~]" in result.stdout
+        lines = [line.strip() for line in result.stdout.splitlines()]
+        assert [line for line in lines if line.startswith("dispatch_pct:")] == [
+            "dispatch_pct:    day ~/~, night ~/~ [~-~], week early=0/eow=97@12h",
+            "dispatch_pct:    day 0/~, night ~/~ [~-~], week early=~/eow=~@~",
+        ]
 
     def test_with_snapshot_renders_state_and_paused_marker(
         self, runner: CliRunner, tmp_path: Path

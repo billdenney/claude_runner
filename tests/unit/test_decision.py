@@ -623,7 +623,85 @@ class TestEndOfWeekOnly:
     def test_weekly_catch_up_is_the_opening(self) -> None:
         policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=12 * 3600)
         assert weekly_catch_up(policy, observed_pct=68.0, resets_at=self.RESETS) == self.OPENS
-        assert weekly_catch_up(policy, observed_pct=97.0, resets_at=self.RESETS) == self.RESETS
+        assert weekly_catch_up(policy, observed_pct=97.0, resets_at=self.RESETS) == self.OPENS
+        assert weekly_catch_up(policy, observed_pct=98.0, resets_at=self.RESETS) == self.RESETS
+
+    def test_at_eow_pct_before_the_window_it_wakes_at_the_opening_and_dispatches(self) -> None:
+        before = self._decide(self.OPENS - timedelta(hours=1), weekly_pct=97)
+        assert before.state is SupervisorState.THROTTLED_WEEKLY
+        assert before.wakeup_at == self.OPENS
+        at_opening = self._decide(self.OPENS, weekly_pct=97)
+        assert at_opening.state is SupervisorState.DISPATCHING
+
+    def test_a_reading_past_its_reset_keeps_the_window_closed(self) -> None:
+        # The last reading of a week stays current for up to a poll after the
+        # reset; the new week's window is closed, so 0% then must not dispatch.
+        now = self.RESETS + timedelta(minutes=3)
+        d = self._decide(now, weekly_pct=10)
+        assert d.state is SupervisorState.THROTTLED_WEEKLY
+        assert d.target_concurrency == 0
+        assert d.target_pct == 0.0
+        assert d.wakeup_at == now + timedelta(seconds=POLL)
+        assert d.message == (
+            "early_pct = 0: the weekly reset at 2026-11-11T11:00+00:00 has passed, so the "
+            "end-of-week window is closed until a reading of the new week shows when it opens"
+        )
+
+    def test_a_window_of_a_week_or_more_is_always_open(self) -> None:
+        for switch_s in (SEVEN_DAYS_S, 2 * SEVEN_DAYS_S):
+            mid_week = self._decide(self.RESETS - timedelta(days=4), 0, eow_switch_s=switch_s)
+            assert mid_week.state is SupervisorState.DISPATCHING
+            assert mid_week.target_pct == 97.0
+            over = self._decide(self.RESETS - timedelta(days=4), 98, eow_switch_s=switch_s)
+            assert over.state is SupervisorState.THROTTLED_WEEKLY
+            assert over.wakeup_at == self.RESETS
+
+    def test_a_fourteen_day_window_opens_12h_before_its_reset(self) -> None:
+        policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=12 * 3600, timezone="UTC")
+
+        def at(now: datetime) -> Decision:
+            reading = _reading(
+                five_h_pct=None, weekly_pct=40, five_h_resets_at=None, weekly_resets_at=self.RESETS
+            )
+            return decide(
+                policy,
+                reading,
+                FakeClock(now),
+                poll_interval_s=POLL,
+                weekly_window_s=2 * SEVEN_DAYS_S,
+            )
+
+        before = at(self.RESETS - timedelta(days=10))
+        assert before.state is SupervisorState.THROTTLED_WEEKLY
+        assert before.wakeup_at == self.OPENS
+        assert at(self.OPENS).state is SupervisorState.DISPATCHING
+
+    def test_the_reported_opening_dispatches_for_every_whole_second_switch(self) -> None:
+        """eow_time_switch is whole seconds (config.duration); readings carry
+        microseconds at most. At the opening weekly_catch_up reports, decide()
+        must already dispatch, or the account starts a poll late."""
+        for window_s in (SEVEN_DAYS_S, 2 * SEVEN_DAYS_S):
+            for switch_s in (1, 59, 3600, 12 * 3600, 12 * 3600 + 1, 40 * 3600, 86399, 518401):
+                policy = _policy(early_pct=0, eow_pct=97, eow_switch_s=float(switch_s))
+                for micro in (0, 1, 123456, 999999):
+                    resets = self.RESETS + timedelta(microseconds=micro)
+                    opens = weekly_catch_up(
+                        policy, observed_pct=50.0, resets_at=resets, weekly_window_s=window_s
+                    )
+                    reading = _reading(
+                        five_h_pct=None,
+                        weekly_pct=50,
+                        five_h_resets_at=None,
+                        weekly_resets_at=resets,
+                    )
+                    d = decide(
+                        policy,
+                        reading,
+                        FakeClock(opens),
+                        poll_interval_s=POLL,
+                        weekly_window_s=window_s,
+                    )
+                    assert d.state is SupervisorState.DISPATCHING, (window_s, switch_s, micro)
 
     def test_a_sloped_curve_still_dispatches_at_zero_percent_at_week_start(self) -> None:
         reading = _reading(

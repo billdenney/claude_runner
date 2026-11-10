@@ -68,15 +68,21 @@ def window_open(elapsed: float, *, early_pct: float, eow_window_fraction: float)
     Always ``True`` for a sloped curve, whose comparison of observed with
     target decides alone. For an end-of-week-only curve
     (:func:`end_of_week_only`) it is ``True`` only inside the EOW segment,
-    from ``1 - eow_window_fraction`` to the reset: before it, the target is
-    0 and a reading of 0% must not dispatch either. A zero-length segment
-    never opens.
+    from ``1 - eow_window_fraction`` up to the reset: before it, the target
+    is 0 and a reading of 0% must not dispatch either.
+
+    ``elapsed = 1`` is the reset itself, or a reading whose reset has
+    passed (:func:`elapsed_fraction` clamps), so a new week has begun and
+    its window is closed. A zero-length segment never opens; a segment of
+    the whole window never closes.
     """
     if not end_of_week_only(early_pct):
         return True
     t = max(0.0, min(1.0, elapsed))
     f = max(0.0, min(1.0, eow_window_fraction))
-    return f > 0.0 and t >= 1.0 - f
+    if f == 1.0:
+        return True
+    return f > 0.0 and 1.0 - f <= t < 1.0
 
 
 def target_pct(
@@ -135,7 +141,7 @@ def elapsed_for_target_pct(
     ``target_pct(t) ≥ observed_pct`` — i.e. the elapsed fraction at
     which the curve catches up to ``observed_pct``.
 
-    Edge cases:
+    Edge cases of a sloped curve:
 
     * ``observed_pct ≥ eow_pct``: returns ``1.0``. The curve maxes out
       at ``eow_pct``; if observed is already above the cap, the
@@ -145,19 +151,20 @@ def elapsed_for_target_pct(
     Degenerate ``eow_window_fraction`` cases mirror those in
     :func:`target_pct`.
 
-    For an end-of-week-only curve (``early_pct = 0``, ADR-0041) every
-    observed value below ``eow_pct`` is met when the EOW segment opens,
-    ``1 - eow_window_fraction``; a zero-length segment never opens, so
-    the answer is ``1.0``, the reset.
+    For an end-of-week-only curve (``early_pct = 0``, ADR-0041) the
+    answer is when the EOW segment opens, ``1 - eow_window_fraction``,
+    for every observed value up to and including ``eow_pct``, since the
+    step reaches ``eow_pct`` there. Above ``eow_pct``, or with a
+    zero-length segment that never opens, it is ``1.0``, the reset.
     """
-    if observed_pct >= eow_pct:
-        return 1.0
-
     f = max(0.0, min(1.0, eow_window_fraction))
     b = 1.0 - f
 
     if end_of_week_only(early_pct):
-        return 1.0 if f == 0.0 else b
+        return 1.0 if f == 0.0 or observed_pct > eow_pct else b
+
+    if observed_pct >= eow_pct:
+        return 1.0
 
     if observed_pct <= 0.0:
         return 0.0
