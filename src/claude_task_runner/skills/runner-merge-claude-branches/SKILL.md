@@ -430,7 +430,9 @@ exists to repair. Repair, then regenerate.
    each branch in the merge set added**: present in NEWS.md at its merged
    commit, absent at its fork point. A branch left out of the merge adds
    nothing, and one that moved on after it was merged adds only what the
-   merged part added.
+   merged part added. The new bullets go before the development
+   section's first bullet, each followed by the separator the file puts
+   between neighbouring bullets (a blank line, or none).
 
    This provenance gate replaced one that parsed "Add <Author> <Year>" and
    kept a bullet when a shipped model file had that author and year. On

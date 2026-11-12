@@ -427,3 +427,45 @@ def test_a_fold_in_round_keeps_the_bullets_the_consolidation_added(
     assert (wt / "NEWS.md").read_text() == consolidated.replace(
         "# development version\n", "# development version\n\n- Add late 2020 x model.\n", 1
     )
+
+
+@pytest.mark.parametrize(
+    ("base", "expected"),
+    [
+        (
+            "# development version\n\n- Add Base 2000 x.\n- Add Old 1999 y.\n",
+            "# development version\n\n- Add A 2020 a.\n- Add B 2021 b.\n- Add Base 2000 x.\n"
+            "- Add Old 1999 y.\n",
+        ),
+        (
+            "# development version\n- Add Base 2000 x.\n\n- Add Old 1999 y.\n",
+            "# development version\n- Add A 2020 a.\n\n- Add B 2021 b.\n\n- Add Base 2000 x.\n\n"
+            "- Add Old 1999 y.\n",
+        ),
+        (
+            "# development version\n\n# pkg 0.3.0\n\n- Add Old 1999 y.\n",
+            "# development version\n\n- Add A 2020 a.\n\n- Add B 2021 b.\n\n# pkg 0.3.0\n\n"
+            "- Add Old 1999 y.\n",
+        ),
+    ],
+    ids=["adjacent-bullets", "blank-separated-from-the-heading", "no-bullet-yet"],
+)
+def test_the_new_bullets_are_spaced_as_the_file_spaces_its_bullets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str, expected: str
+) -> None:
+    """Each new bullet goes before the section's first bullet, with the
+    separator the file puts between neighbouring bullets: none, or a blank
+    line. A section with no bullet yet gets them after its heading."""
+
+    def with_bullet(bullet: str) -> str:
+        return base.replace("# development version\n", f"# development version\n{bullet}\n", 1)
+
+    proc, wt = _run_two(
+        tmp_path,
+        monkeypatch,
+        base,
+        ("a", with_bullet("- Add A 2020 a.")),
+        ("b", with_bullet("- Add B 2021 b.")),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (wt / "NEWS.md").read_text() == expected
