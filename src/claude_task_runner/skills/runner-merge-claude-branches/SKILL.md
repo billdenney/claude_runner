@@ -555,6 +555,29 @@ exists to repair. Repair, then regenerate.
     Renders every `vignettes/articles/*.Rmd` in a callr subprocess so a
     single failure doesn't poison the others.
 
+    **The gate never touches the user library or the worktree.** It builds
+    the worktree's package with `R CMD build` (which works on a copy of the
+    source) and installs the tarball with `R CMD INSTALL` into a private
+    library inside its own temporary directory, which R removes when the
+    gate exits. The workers get that library first on their library path
+    and in `R_LIBS`, which a process a vignette starts inherits. Installing
+    into the live user library would swap the package under every other R
+    session on the host, and `remotes::install_local` cannot reinstall over
+    a copy whose `RemoteType` is `git`. Each worker passes its own temporary
+    directory to `rmarkdown::render()` as `intermediates_dir`, so the knitted
+    markdown and the figures never land beside the Rmd: an `R CMD build` of
+    the same worktree running alongside the gate reads a tree the gate
+    leaves as it found it. `--skip-install` renders against whatever copy
+    the library already has.
+
+    **Each worker runs rxode2 and data.table on 2 threads** (`--rx-threads`,
+    0 leaves each package's own default). Both default to half the machine's
+    cores: 2 on the 4-vCPU `ubuntu-latest` runners CI renders on, 16 on a
+    32-core host. The pin makes the gate render as CI does, which matters
+    because an rxode2 simulation seeded with `rxSetSeed()` draws different
+    numbers on a different thread count, and keeps `--jobs` workers at 2
+    threads each rather than half the cores each.
+
     **The workers run against a DESCRIPTION-only library path** (default;
     `--full-lib` opts out). The gate links only the packages declared in
     DESCRIPTION's Depends/Imports/Suggests/LinkingTo, plus the render
@@ -622,6 +645,10 @@ exists to repair. Repair, then regenerate.
 
     Skipping this gate (`--skip-vignettes`) is allowed only for
     iteration. NEVER push without it green on the final pass.
+
+    Regression tests: `TestVerifyVignettesParallel` in
+    `tests/unit/test_merge_skill_scripts.py` (the render test needs R with
+    nlmixr2lib and rxode2; CI skips it).
 
 9. **Per-task tracking is automatic.** Because step 4 used real
    merges, each source `claude/<task-id>` branch tip is already an

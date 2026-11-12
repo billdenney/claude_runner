@@ -4446,8 +4446,25 @@ class TestDedupKeepsEveryModelAndWord:
         assert {e.model for e in _entries(dd, dropped)} <= {e.model for e in _entries(dd, kept)}
 
 
+GATE_PKG_VIGNETTE = """\
+---
+title: "gate"
+---
+
+```{r}
+library(gatepkg)
+stopifnot(gate_answer() == 42)
+writeLines(c(find.package("gatepkg"), Sys.getenv("R_LIBS"),
+             rxode2::getRxThreads(), data.table::getDTthreads()), "RECORD")
+plot(1:3)
+```
+"""
+
+
 class TestVerifyVignettesParallel:
-    """Nothing here renders a vignette: that needs nlmixr2lib and rxode2."""
+    """Only test_renders_from_a_private_library_and_writes_nothing renders a
+    vignette, where nlmixr2lib and rxode2 are installed: every worker loads
+    them."""
 
     @pytest.fixture
     def rscript(self) -> str:
@@ -4471,6 +4488,67 @@ class TestVerifyVignettesParallel:
     def test_parses(self, rscript: str) -> None:
         proc = run(rscript, "-e", "invisible(parse(file = commandArgs(TRUE)[1]))", VIGNETTES_R)
         assert (proc.returncode, proc.stderr) == (0, "")
+
+    def test_renders_from_a_private_library_and_writes_nothing(
+        self, rscript_with_callr: str, tmp_path: Path
+    ) -> None:
+        """The package is installed into the gate's own temporary library,
+        never the user's, and the workers find it there through R_LIBS too.
+        The worktree is read-only throughout: an install or a render that
+        wrote into it would fail the vignette. Each worker runs rxode2 and
+        data.table on 2 threads, as a 4-vCPU CI runner does."""
+        probe = run(
+            rscript_with_callr,
+            "-e",
+            "ok <- all(vapply(c('nlmixr2lib', 'rxode2', 'rmarkdown'), requireNamespace,"
+            " logical(1), quietly = TRUE)); quit(status = if (ok) 0L else 1L)",
+        )
+        if probe.returncode != 0:
+            pytest.skip("nlmixr2lib, rxode2 or rmarkdown is not installed; the worker loads them")
+        wt = tmp_path / "wt"
+        record = tmp_path / "record.txt"
+        files = {
+            "DESCRIPTION": (
+                "Package: gatepkg\nVersion: 0.0.1\nTitle: Gate\nDescription: Gate test.\n"
+                "License: MIT\nAuthor: A\nMaintainer: A <a@example.org>\n"
+            ),
+            "NAMESPACE": "export(gate_answer)\n",
+            "R/answer.R": "gate_answer <- function() 42\n",
+            "vignettes/articles/gate.Rmd": GATE_PKG_VIGNETTE.replace("RECORD", str(record)),
+        }
+        for rel, text in files.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(text)
+        before = sorted(str(p.relative_to(wt)) for p in wt.rglob("*"))
+        writable = [wt, *(p for p in wt.rglob("*") if p.is_dir())]
+        for path in writable:
+            path.chmod(0o555)
+        try:
+            proc = run(
+                rscript_with_callr,
+                VIGNETTES_R,
+                "--worktree",
+                wt,
+                "--full-lib",
+                "--jobs",
+                "1",
+                "--results",
+                tmp_path / "results.jsonl",
+            )
+        finally:
+            for path in writable:
+                path.chmod(0o755)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "SUMMARY: 1 ok / 0 failed / 1 total\n" in proc.stdout
+        assert sorted(str(p.relative_to(wt)) for p in wt.rglob("*")) == before
+        installed_at, r_libs, rx_threads, dt_threads = record.read_text().splitlines()
+        assert (rx_threads, dt_threads) == ("2", "2")
+        private = Path(installed_at).parent
+        assert private.name == "lib" and private.parent.name.startswith("vignette-gate-")
+        assert r_libs.split(os.pathsep)[0] == str(private)
+        assert not private.exists(), "the gate's temporary library outlived the gate"
+        user = run(rscript_with_callr, "-e", "cat(nzchar(system.file(package = 'gatepkg')))")
+        assert user.stdout == "FALSE"
 
     def test_no_vignettes_is_a_clean_pass(self, rscript_with_callr: str, tmp_path: Path) -> None:
         """--skip-install keeps it off the network; no results file is written."""
