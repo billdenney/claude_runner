@@ -61,8 +61,10 @@ def push_model_branch(
     push_task_branch(repo, f"claude/{name}", files, f"Add {upper} 2020 {name} model")
 
 
-def merge(repo: Path, *flags: str) -> subprocess.CompletedProcess[str]:
-    return run("bash", MERGE_BRANCHES, "--repo", repo, "--branch-name", BRANCH, *flags)
+def merge(
+    repo: Path, *flags: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return run("bash", MERGE_BRANCHES, "--repo", repo, "--branch-name", BRANCH, *flags, env=env)
 
 
 def path_in_git_dir(wt: Path, name: str) -> Path:
@@ -352,6 +354,17 @@ def fake_tool(tmp_path: Path, name: str, script: str) -> dict[str, str]:
     return {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
 
+def news_union_crashes(tmp_path: Path) -> dict[str, str]:
+    """The environment in which union_merge_news.py crashes: the round stops
+    after its merges, before its repairs complete."""
+    return fake_tool(
+        tmp_path,
+        "python3",
+        '#!/bin/bash\ncase "$1" in */union_merge_news.py) exit 3 ;; esac\n'
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+    )
+
+
 def test_a_fold_in_whose_merges_all_fail_leaves_the_round_before_as_it_was(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -448,24 +461,7 @@ def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
     repo = consolidated
     wt = repo / ".worktrees" / BRANCH
     tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
-    env = fake_tool(
-        tmp_path,
-        "python3",
-        '#!/bin/bash\ncase "$1" in */union_merge_news.py) exit 3 ;; esac\n'
-        f'exec {shlex.quote(sys.executable)} "$@"\n',
-    )
-    proc = run(
-        "bash",
-        MERGE_BRANCHES,
-        "--repo",
-        repo,
-        "--branch-name",
-        BRANCH,
-        "--fold-in",
-        "--yes",
-        *NO_R,
-        env=env,
-    )
+    proc = merge(repo, "--fold-in", "--yes", *NO_R, env=news_union_crashes(tmp_path))
     assert proc.returncode == 5, proc.stdout + proc.stderr
     assert proc.stderr.endswith(
         "ERROR: union_merge_news.py failed on NEWS.md\n"
@@ -494,6 +490,99 @@ def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
         for name, text in records(wt).items()
         if f".before-{tip[:12]}" in name
     } == before
+
+
+def test_a_stopped_round_that_was_pushed_is_not_put_back_behind_origin(
+    consolidated: Path, tmp_path: Path
+) -> None:
+    """The operator pushed a round that stopped before its repairs. Putting
+    the branch back at the round's start would leave it behind origin, and
+    its next push would be rejected, so --fold-in refuses and changes
+    nothing."""
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    tip = git(wt, "rev-parse", "HEAD").strip()
+    proc = merge(repo, "--fold-in", "--yes", *NO_R, env=news_union_crashes(tmp_path))
+    assert proc.returncode == 5, proc.stdout + proc.stderr
+    git(wt, "push", "-q", "origin", BRANCH)
+    pushed, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+
+    refused = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert (refused.returncode, refused.stderr) == (
+        3,
+        f"ERROR: --fold-in: the fold-in round from {tip[:12]} stopped before its repairs"
+        f" completed, but origin/{BRANCH}, at {pushed[:12]}, has commits {tip[:12]} lacks: the"
+        f" stopped round was pushed, or other work was. Putting {BRANCH} back at {tip[:12]}"
+        " would leave it behind origin, so nothing was changed. Consolidate afresh on a new"
+        f" --branch-name, or reconcile {BRANCH} with origin by hand.\n",
+    )
+    assert (git(wt, "rev-parse", "HEAD").strip(), records(wt)) == (pushed, before)
+
+
+def test_a_stopped_round_is_put_back_when_origin_cannot_be_reached(
+    consolidated: Path, tmp_path: Path
+) -> None:
+    """The fetch that would show a pushed round fails: the round is put back,
+    against origin as last fetched, and the fold-in says so."""
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    tip = git(wt, "rev-parse", "HEAD").strip()
+    proc = merge(repo, "--fold-in", "--yes", *NO_R, env=news_union_crashes(tmp_path))
+    assert proc.returncode == 5, proc.stdout + proc.stderr
+    shutil.rmtree(tmp_path / "origin.git")
+
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 3, again.stdout + again.stderr
+    assert again.stderr.startswith(
+        f"    (fold-in) WARNING: cannot fetch {BRANCH} from origin; comparing with"
+        f" origin/{BRANCH} as last fetched, if it was.\n"
+    )
+    assert f"    is back at {tip[:12]}, with the records of the round before it.\n" in again.stdout
+    assert git(wt, "rev-parse", "HEAD").strip() == tip
+
+
+def test_a_stopped_round_never_pushed_is_put_back_without_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Origin has no copy of a branch every round of which ran with
+    --skip-push: nothing to fall behind, and nothing to warn of."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": NEWS, REGISTER: BASE_REGISTER})
+    push_model_branch(repo, "a")
+    assert merge(repo, "--yes", "--skip-push", *NO_R).returncode == 0
+    push_model_branch(repo, "c")
+    wt = repo / ".worktrees" / BRANCH
+    tip = git(wt, "rev-parse", "HEAD").strip()
+    env = news_union_crashes(tmp_path)
+    assert merge(repo, "--fold-in", "--yes", "--skip-push", *NO_R, env=env).returncode == 5
+
+    again = merge(repo, "--fold-in", "--yes", "--skip-push", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "WARNING" not in again.stderr
+    assert f"    is back at {tip[:12]}, with the records of the round before it.\n" in again.stdout
+
+
+def test_a_push_origin_rejects_as_not_a_fast_forward_says_so(consolidated: Path) -> None:
+    """A commit pushed to the branch from elsewhere: the push is not the
+    network's fault, and the message says what to do instead."""
+    repo = consolidated
+    git(repo, "checkout", "-q", "-b", "elsewhere", f"origin/{BRANCH}")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "Pushed from elsewhere")
+    git(repo, "push", "-q", "origin", f"elsewhere:{BRANCH}")
+    git(repo, "checkout", "-q", "main")
+    wt = repo / ".worktrees" / BRANCH
+    (wt / "notes.txt").write_text("a hand commit\n")
+    git(wt, "add", "notes.txt")
+    git(wt, "commit", "-qm", "A hand commit")
+
+    proc = merge(repo, "--finish")
+    assert proc.returncode == 7, proc.stdout + proc.stderr
+    assert proc.stderr.endswith(
+        f"ERROR: origin rejected the push as not a fast-forward: origin/{BRANCH} has\n"
+        f"  commits {BRANCH} lacks, pushed since. Fetch and read them\n"
+        f"  (git log {BRANCH}..origin/{BRANCH}), merge what belongs into {BRANCH}\n"
+        f"  in {wt}, or consolidate afresh on a new --branch-name; then run\n"
+        f"     bash {MERGE_BRANCHES} --repo {repo} --branch-name {BRANCH} --finish\n"
+    )
 
 
 def test_a_fold_in_needs_the_round_before_to_have_passed_its_revert_check(

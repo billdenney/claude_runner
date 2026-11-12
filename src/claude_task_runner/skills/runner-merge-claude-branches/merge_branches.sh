@@ -324,25 +324,46 @@ on_exit() {  # <status>: EXIT trap
   remind_hand_union "$rc"
 }
 
-undo_unrepaired_fold_in() {  # <worktree> <report>: a fold-in round that stopped before its repairs completed, undone
-  local wt=$1 report=$2 from kept dropped
-  from="$(stage_get fold-in-from)"
+origin_tip() {  # <worktree>: the branch's tip on origin, fetched; nothing when origin has no such branch
+  local wt=$1 listed=0
+  if ! git -C "$wt" fetch -q origin "+refs/heads/$BRANCH_NAME:refs/remotes/origin/$BRANCH_NAME" 2>/dev/null; then
+    git -C "$wt" ls-remote --exit-code --heads origin "refs/heads/$BRANCH_NAME" >/dev/null 2>&1 || listed=$?
+    # 2: origin answered, and has no such branch.
+    if (( listed == 2 )); then return 0; fi
+    echo "    (fold-in) WARNING: cannot fetch $BRANCH_NAME from origin; comparing with origin/$BRANCH_NAME as last fetched, if it was." >&2
+  fi
+  git -C "$wt" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH_NAME^{commit}" || :
+}
+
+reset_to_round_start() {  # <worktree> <round's base> <how it stopped>: the branch back at the tip a fold-in round started from
+  local wt=$1 from=$2 how=$3 remote dropped
   git -C "$wt" merge-base --is-ancestor "$from" HEAD 2>/dev/null \
-    || die 3 "--fold-in: the fold-in round from ${from:0:12} stopped before its repairs completed, and $BRANCH_NAME no longer contains ${from:0:12}; put it back by hand."
+    || die 3 "--fold-in: the fold-in round from ${from:0:12} $how, and $BRANCH_NAME no longer contains ${from:0:12}; put it back by hand."
+  # Put back behind origin, the branch could not be pushed again.
+  remote="$(origin_tip "$wt")"
+  if [[ -n "$remote" ]] && ! git -C "$wt" merge-base --is-ancestor "$remote" "$from" 2>/dev/null; then
+    die 3 "--fold-in: the fold-in round from ${from:0:12} $how, but origin/$BRANCH_NAME, at ${remote:0:12}, has commits ${from:0:12} lacks: the stopped round was pushed, or other work was. Putting $BRANCH_NAME back at ${from:0:12} would leave it behind origin, so nothing was changed. Consolidate afresh on a new --branch-name, or reconcile $BRANCH_NAME with origin by hand."
+  fi
   dropped="$(git -C "$wt" log --oneline --first-parent "$from..HEAD")"
   git -C "$wt" reset -q --keep "$from" \
     || die 3 "--fold-in: cannot put $BRANCH_NAME back at ${from:0:12} (git reset --keep refused)."
+  echo "    (fold-in) the round from ${from:0:12} $how; $BRANCH_NAME"
+  echo "    is back at ${from:0:12}, with the records of the round before it."
+  if [[ -n "$dropped" ]]; then
+    echo "    Its commits, still in the reflog:"
+    printf '%s\n' "$dropped" | sed 's/^/      /'
+  fi
+}
+
+undo_unrepaired_fold_in() {  # <worktree> <report>: a fold-in round that stopped before its repairs completed, undone
+  local wt=$1 report=$2 from kept
+  from="$(stage_get fold-in-from)"
+  reset_to_round_start "$wt" "$from" "stopped before its repairs completed"
   rm -f "$report" "$INPUTS_FILE" "$STAGES_FILE" \
     "$(git -C "$wt" rev-parse --path-format=absolute --git-path hand-union-report.repairs.md)"
   for kept in "$report" "$INPUTS_FILE" "$STAGES_FILE"; do
     if [[ -e "$(before_round "$kept" "$from")" ]]; then mv "$(before_round "$kept" "$from")" "$kept"; fi
   done
-  {
-    echo "    (fold-in) the round from ${from:0:12} stopped before its repairs completed; $BRANCH_NAME"
-    echo "    is back at ${from:0:12}, with the records of the round before it. Its commits,"
-    echo "    still in the reflog:"
-    printf '%s\n' "$dropped" | sed 's/^/      /'
-  }
 }
 
 undo_fold_in_merges() {  # a fold-in round that stops while merging: the branch back at its tip
@@ -376,8 +397,9 @@ interrupted() {  # <status>: INT/TERM; says how to complete the run when --finis
 
 remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
   local rc=$1
-  if (( FOLD_IN && rc != 0 && rc != 9 )) && [[ -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] \
-    && [[ "$(stage_get repairs)" == pending && "$(stage_get fold-in-from)" != pending ]]; then
+  # This run's round only: not one the fold-in found stopped and could not undo.
+  if (( FOLD_IN && rc != 0 && rc != 9 )) && [[ -n "$FOLD_BASE" && -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] \
+    && [[ "$(stage_get repairs)" == pending && "$(stage_get fold-in-from)" == "$FOLD_BASE" ]]; then
     {
       echo
       echo "NOTE: this fold-in round stopped before its repairs completed. Discard any partial"
@@ -889,9 +911,20 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
   else
     echo
     echo "==> Pushing $BRANCH_NAME to origin"
-    if ! git push -u origin "$BRANCH_NAME" 2>&1 | tail -5; then
+    local pushed push_rc=0
+    pushed="$(git push -u origin "$BRANCH_NAME" 2>&1)" || push_rc=$?
+    printf '%s\n' "$pushed" | tail -5
+    if (( push_rc )); then
       {
-        echo "ERROR: push failed. Fix the remote or the network, then run"
+        # git prints these flags untranslated.
+        if grep -qE '\[rejected\].*\((non-fast-forward|fetch first)\)' <<< "$pushed"; then
+          echo "ERROR: origin rejected the push as not a fast-forward: origin/$BRANCH_NAME has"
+          echo "  commits $BRANCH_NAME lacks, pushed since. Fetch and read them"
+          echo "  (git log $BRANCH_NAME..origin/$BRANCH_NAME), merge what belongs into $BRANCH_NAME"
+          echo "  in $WT_ABS, or consolidate afresh on a new --branch-name; then run"
+        else
+          echo "ERROR: push failed. Fix the remote or the network, then run"
+        fi
         echo "     $(finish_command)$(given_flags)"
       } >&2
       exit 7
