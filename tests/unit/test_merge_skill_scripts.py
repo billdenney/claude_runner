@@ -429,6 +429,42 @@ class TestMergeBranches:
         )
         assert (proc.returncode, proc.stderr) == (0, "")
 
+    @pytest.mark.parametrize("against", ["branch", "base"])
+    def test_a_rename_onto_a_path_counts_as_adding_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, against: str
+    ) -> None:
+        """claude/r renames Old.R onto Ito_2020_x.R, with an edit. With rename
+        detection the survey saw a rename, not an added path, and -X theirs
+        replaced claude/a's model, or main's, without a word."""
+        old = "inst/modeldb/Old_2010_o.R"
+        model = "inst/modeldb/Ito_2020_x.R"
+        body = "".join(f"line {k}\n" for k in range(40))
+        repo = new_repo(tmp_path, monkeypatch, {old: body})
+        git(repo, "checkout", "-q", "-b", "claude/r", "main")
+        git(repo, "mv", old, model)
+        (repo / model).write_text(body + "renamed\n")
+        git(repo, "commit", "-qam", "Rename Old onto Ito 2020")
+        git(repo, "push", "-q", "origin", "claude/r")
+        git(repo, "checkout", "-q", "main")
+        if against == "branch":
+            push_task_branch(repo, "claude/a", {model: "# Ito 2020\n"}, "Add Ito 2020")
+            message = (
+                "ERROR: the same new path is added with different content by more than one"
+                f" branch:\n    {model}  <-  origin/claude/a origin/claude/r\n"
+            )
+        else:
+            update_main(repo, {model: "# Ito 2020\n"}, "Ship Ito 2020")
+            message = (
+                f"ERROR: origin/claude/r adds {model}, which origin/main already has with other"
+                " content.\n"
+            )
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        assert (proc.returncode, proc.stderr) == (
+            4,
+            message + "    -X theirs would keep only the last one merged. Reletter one branch's"
+            " files or --exclude-ref one of them, then re-run.\n",
+        )
+
     def test_unresolvable_base_is_a_preflight_error(self, repo: Path) -> None:
         """It used to make every branch 0 ahead and report nothing to do."""
         proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--base", "origin/nope", "--dry-run")

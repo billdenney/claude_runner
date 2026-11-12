@@ -159,6 +159,31 @@ def test_a_path_the_consolidation_has_with_other_content_stops_the_survey(
     )
 
 
+def test_a_late_branch_renaming_a_file_onto_a_consolidated_path_stops_the_survey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claude/c renames Old.R onto the model claude/a added, with an edit:
+    without rename detection that is an added path, and it collides."""
+    old = "inst/modeldb/Old_2010_o.R"
+    body = "".join(f"line {k}\n" for k in range(40))
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": NEWS, REGISTER: BASE_REGISTER, old: body})
+    push_model_branch(repo, "a")
+    first = merge(repo, "--yes", *NO_R)
+    assert first.returncode == 0, first.stdout + first.stderr
+    git(repo, "checkout", "-q", "-b", "claude/c", "main")
+    git(repo, "mv", old, "inst/modeldb/A_2020_a.R")
+    (repo / "inst/modeldb/A_2020_a.R").write_text(body + "renamed\n")
+    git(repo, "commit", "-qam", "Rename Old onto A 2020")
+    git(repo, "push", "-q", "origin", "claude/c")
+    git(repo, "checkout", "-q", "main")
+    proc = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert proc.stderr.startswith(
+        "ERROR: origin/claude/c adds inst/modeldb/A_2020_a.R, which consolidation already has"
+        " with other content.\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("given", "code", "message"),
     [

@@ -58,7 +58,8 @@ files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. It aborts the same way
 when a branch adds a model or vignette path the base gained, with other
 content, after the branch forked (a branch that was squash-merged or
 cherry-picked to main and then edited there, say): the merge would replace
-main's copy with the branch's. `--exclude-ref`
+main's copy with the branch's. A file a branch renames onto a path counts as
+adding that path: the survey reads branches without rename detection. `--exclude-ref`
 (repeatable) leaves out a branch the pattern matches -- a WIP checkpoint, or a
 branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;

@@ -1016,7 +1016,7 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
   fi
   if ! git diff --staged --quiet; then
     git commit -m "Regenerate modeldb + man docs + pkgdown navbar after merging $SUCCESS branches" >/dev/null
-    echo "    committed regen artifacts: $(git show --stat --format= --name-only HEAD | tr '\n' ' ')"
+    echo "    committed regen artifacts: $(git show --no-renames --format= --name-only HEAD | tr '\n' ' ')"
   fi
   stage_set regen "$(git rev-parse HEAD)"
 }
@@ -1429,13 +1429,15 @@ fi
 
 # What a branch changed since it forked from the base (three dots), not the
 # difference between the two tips: a branch cut from an older main would
-# otherwise count main's later changes as its own files.
+# otherwise count main's later changes as its own files. Without rename
+# detection, so a file a branch renames onto a path counts as adding that path
+# (and deleting the old one), and the collision check below sees it.
 # Called as $(branch_diff ...) || exit $?, so die's exit code survives the
 # subshell instead of tripping the ERR trap.
 branch_diff() {  # <branch> <diff filter, or ""> [path ...]
   local br=$1 filter=$2
   shift 2
-  git diff --name-only ${filter:+"--diff-filter=$filter"} "$BASE...$br" -- "$@" \
+  git diff --no-renames --name-only ${filter:+"--diff-filter=$filter"} "$BASE...$br" -- "$@" \
     || die 3 "cannot diff $br against its merge base with $BASE (no merge base, or a shallow clone?)"
 }
 
