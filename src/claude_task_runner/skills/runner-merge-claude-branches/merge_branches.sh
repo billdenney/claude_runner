@@ -3,7 +3,8 @@
 #
 # End-to-end orchestrator for /runner-merge-claude-branches. Runs:
 #   1. Pre-flight survey (which branches have unmerged commits; stops if two
-#      branches add one path with different content)
+#      branches add one path with different content, or a branch adds a path
+#      the base already has with other content)
 #   2. Worktree creation off the configured base
 #   3. Sequential merge with -X theirs
 #   4. Resurrected-path guard (re-remove files the base deleted that a
@@ -194,9 +195,10 @@
 #      untracked files, or a run that stopped before its repairs completed;
 #      for --finish, no recorded inputs, a merged commit missing from the
 #      objects, or no Rscript while an R step is still pending
-#   4  nothing merged: two branches add one path with different content, or
-#      on --fold-in a branch adds a path the consolidation has with other
-#      content (the survey stops before merging), or every merge failed
+#   4  nothing merged: two branches add one path with different content, or a
+#      branch adds a path the base (on --fold-in, the consolidation) already
+#      has with other content (the survey stops before merging), or every
+#      merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
 #      script crashed, duplicate canonical headers survived dedup (or a
 #      register on --base is missing from the worktree at --finish), the
@@ -1451,8 +1453,10 @@ done
 # silently replaces the earlier one and a whole model disappears (2026-09-24:
 # Wang_2019_tacrolimus.R was added for two different papers). Abort so the
 # operator can reletter one branch's files (<Author>_<Year>a_ / <Year>b_, the
-# Hansson 2013a/b precedent) or pass --exclude-ref for one of them. Runs before
-# the dry-run exit so a dry run reports collisions too.
+# Hansson 2013a/b precedent) or pass --exclude-ref for one of them. A path a
+# branch adds that the base has with other content collides the same way, with
+# the base's copy. Runs before the dry-run exit so a dry run reports collisions
+# too.
 declare -A ADDED_BY
 for br in "${UNMERGED[@]}"; do
   # A diff that fails must stop the survey: skipping the branch would let its
@@ -1467,13 +1471,15 @@ collisions=0
 same_path=0
 for p in "${!ADDED_BY[@]}"; do
   read -r -a brs <<< "${ADDED_BY[$p]}"
-  # On a fold-in, an earlier round may have merged the path already, from
-  # another branch; -X theirs would replace that copy as silently.
-  if (( FOLD_IN )) && git cat-file -e "$BASE:$p" 2>/dev/null; then
+  # The base may have gained the path since the branch forked: main from a
+  # PR merged meanwhile, or, on a fold-in, the consolidation from an earlier
+  # round's branch. -X theirs would replace that copy as silently.
+  if git cat-file -e "$BASE:$p" 2>/dev/null; then
     have=$(git rev-parse "$BASE:$p")
     for b in "${brs[@]}"; do
       if [[ "$(git rev-parse "$b:$p")" != "$have" ]]; then
-        echo "ERROR: $b adds $p, which $BRANCH_NAME already has with other content." >&2
+        if (( FOLD_IN )); then holder=$BRANCH_NAME; else holder=$BASE; fi
+        echo "ERROR: $b adds $p, which $holder already has with other content." >&2
         collisions=$((collisions + 1))
       fi
     done

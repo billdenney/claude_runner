@@ -54,7 +54,11 @@ it are folded into the same branch with `--fold-in` (see "Fold-in rounds"
 below). The survey aborts
 (exit 4) when two branches add a file at the same path with different content,
 because `-X theirs` would silently keep only the last one; reletter one branch's
-files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
+files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. It aborts the same way
+when a branch adds a model or vignette path the base gained, with other
+content, after the branch forked (a branch that was squash-merged or
+cherry-picked to main and then edited there, say): the merge would replace
+main's copy with the branch's. `--exclude-ref`
 (repeatable) leaves out a branch the pattern matches -- a WIP checkpoint, or a
 branch that already has its own PR -- and prints each exclusion in the survey. The flags
 have sensible defaults for the nlmixr2lib popPK ingestion use case;
@@ -915,8 +919,8 @@ round's `--base`):
 - it surveys the `--pattern` branches with commits the consolidation lacks
   (a branch merged in an earlier round and pushed to since included), and
   stops (exit 4) when one adds a model or vignette path the consolidation
-  already has with other content, as well as on the usual same-path
-  collision;
+  already has with other content, as a first round does against its base,
+  as well as on the usual same-path collision;
 - it merges them in the existing worktree, then runs every repair against
   the tip: the NEWS union rebuilds NEWS.md from the consolidation's own copy
   plus the bullets the new branches added, the register union puts back the

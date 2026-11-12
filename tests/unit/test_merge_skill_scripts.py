@@ -403,6 +403,32 @@ class TestMergeBranches:
         ]
         assert proc.stdout.endswith("\n==> Dry-run; stopping before worktree creation.\n")
 
+    def test_dry_run_aborts_when_a_branch_adds_a_path_main_has_with_other_content(
+        self, repo: Path
+    ) -> None:
+        """main gained two models after claude/c and claude/s forked: a PR
+        merged meanwhile, or a branch squash-merged and edited on main.
+        claude/c's copy of its model differs, so -X theirs would replace
+        main's; claude/s's is the same bytes, which is no collision."""
+        model = "inst/modeldb/Ito_2020_x.R"
+        same = "inst/modeldb/Sato_2021_y.R"
+        push_task_branch(repo, "claude/c", {model: "# the branch's copy\n"}, "Add Ito 2020")
+        push_task_branch(repo, "claude/s", {same: "# main's copy\n"}, "Add Sato 2021")
+        update_main(repo, {model: "# main's copy\n", same: "# main's copy\n"}, "Ship both")
+
+        proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--dry-run")
+        assert proc.returncode == 4, proc.stdout
+        assert proc.stderr == (
+            f"ERROR: origin/claude/c adds {model}, which origin/main already has with other"
+            " content.\n"
+            "    -X theirs would keep only the last one merged. Reletter one branch's files or"
+            " --exclude-ref one of them, then re-run.\n"
+        )
+        proc = run(
+            "bash", MERGE_BRANCHES, "--repo", repo, "--dry-run", "--exclude-ref", "origin/claude/c"
+        )
+        assert (proc.returncode, proc.stderr) == (0, "")
+
     def test_unresolvable_base_is_a_preflight_error(self, repo: Path) -> None:
         """It used to make every branch 0 ahead and report nothing to do."""
         proc = run("bash", MERGE_BRANCHES, "--repo", repo, "--base", "origin/nope", "--dry-run")
