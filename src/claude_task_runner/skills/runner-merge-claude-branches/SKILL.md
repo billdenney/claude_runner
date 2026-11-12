@@ -946,7 +946,11 @@ It reads `--pattern`, `--union-file`, the register files and `--extra-ref`
 from the round before (a given `--extra-ref` is added; another input that
 conflicts exits 2), so the command needs only `--repo` and `--branch-name`.
 `--exclude-ref` applies to the round it is given on: give it again. The
-worktree must be clean and its round's repairs complete (exit 3). A
+worktree must be clean, and the round before must have completed its repairs
+and passed its revert check on the registers as they stand (exit 3): a round
+that stopped at the revert check, or whose registers a commit changed after
+it passed, is completed with `--finish` first, which checks again. A fold-in
+on top of reverted base content would take that content as its own base. A
 hand-union report the round before left stops the fold-in (exit 9) until it
 is worked through: `--finish --hand-union-done` on that round records that,
 or pass `--hand-union-done` to the fold-in.

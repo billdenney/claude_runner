@@ -165,7 +165,9 @@
 #                           input exits 2); --base, when given, must be the
 #                           base the PR text counts from. --exclude-ref
 #                           applies to this round only. Needs a clean worktree
-#                           whose round completed its repairs (exit 3), and
+#                           whose round completed its repairs and passed its
+#                           revert check on the registers as they stand
+#                           (exit 3), and
 #                           stops (exit 9) while the round before left a
 #                           hand-union report no --finish --hand-union-done
 #                           confirmed, unless --hand-union-done is given. A
@@ -194,7 +196,9 @@
 #      worktree, a worktree on another branch, one with uncommitted changes or
 #      untracked files, or a run that stopped before its repairs completed;
 #      for --finish, no recorded inputs, a merged commit missing from the
-#      objects, or no Rscript while an R step is still pending
+#      objects, or no Rscript while an R step is still pending; for
+#      --fold-in, a round before that has not passed its revert check on the
+#      registers as they stand
 #   4  nothing merged: two branches add one path with different content, or a
 #      branch adds a path the base (on --fold-in, the consolidation) already
 #      has with other content (the survey stops before merging), or every
@@ -609,12 +613,8 @@ prepare_fold_in() {  # --fold-in: the consolidation's worktree, and its tip as t
     fi
     undo_unrepaired_fold_in "$wt" "$report"
   fi
-  if [[ -s "$INPUTS_FILE" ]]; then
-    read_inputs --fold-in
-  else
-    PR_BASE=$BASE
-    echo "    (fold-in) $wt records no inputs; using the flags given, and $PR_BASE as the base the PR text counts from"
-  fi
+  read_inputs --fold-in
+  require_reverts_passed
   if [[ -s "$report" && "$(stage_get hand-union)" != done ]] && (( ! HAND_UNION_DONE )); then
     {
       cat "$report"
@@ -806,7 +806,10 @@ revert_check() {  # gate: register content the base has that the merge, or a han
       targets+=(--file "$rf")
     fi
   done
-  (( ${#targets[@]} )) || return 0
+  if (( ! ${#targets[@]} )); then
+    stage_set reverts "$(git rev-parse HEAD)"
+    return 0
+  fi
   echo
   echo "==> Checking the registers for base content the merge reverted"
   "$PYTHON3" "$SCRIPT_DIR/verify_no_base_reverts.py" \
@@ -821,6 +824,26 @@ revert_check() {  # gate: register content the base has that the merge, or a han
     exit 5
   elif (( revert_rc != 0 )); then
     die 5 "verify_no_base_reverts.py could not run (exit $revert_rc)."
+  fi
+  # A fold-in builds on the registers as they stand only once this has passed
+  # on them (require_reverts_passed).
+  stage_set reverts "$(git rev-parse HEAD)"
+}
+
+require_reverts_passed() {  # --fold-in: the round before passed its revert check on its registers as they stand
+  local at changed files=()
+  at="$(stage_get reverts)"
+  if [[ "$at" == pending ]]; then
+    die 3 "--fold-in: the round before has not passed its revert check (it stopped at it, or before it). Restore what it reports and run --finish, which checks again, then run --fold-in."
+  fi
+  git -C "$WT_ABS" rev-parse --verify --quiet "$at^{commit}" >/dev/null \
+    || die 3 "--fold-in: the commit the round before's revert check passed at, ${at:0:12}, is gone; run --finish, which checks again."
+  changed="$(git -C "$WT_ABS" diff --no-renames --name-only "$at" HEAD -- \
+    ${UNION_FILE:+"$UNION_FILE"} ${REGISTER_FILES[@]+"${REGISTER_FILES[@]}"})" \
+    || die 3 "--fold-in: cannot tell whether a register changed since the revert check passed: git diff ${at:0:12} HEAD failed."
+  if [[ -n "$changed" ]]; then
+    mapfile -t files <<< "$changed"
+    die 3 "--fold-in: $(join_paths "${files[@]}") changed after the round before's revert check passed at ${at:0:12}; run --finish, which checks again, then run --fold-in."
   fi
 }
 

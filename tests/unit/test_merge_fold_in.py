@@ -494,3 +494,66 @@ def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
         for name, text in records(wt).items()
         if f".before-{tip[:12]}" in name
     } == before
+
+
+def test_a_fold_in_needs_the_round_before_to_have_passed_its_revert_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fold-in round stops at its revert check: claude/c's hunk replaced
+    claude/a's Notes sentence. Another fold-in on top would take the
+    reverted register as its base, so it is refused until --finish has
+    checked again. A union that drops claude/a's sentence still fails the
+    revert check; the natural hand union, both sentences on one line, passes
+    it and the line check, with no flag."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": NEWS, REGISTER: BASE_REGISTER})
+    push_model_branch(repo, "a", notes="Alpha sentence.")
+    assert merge(repo, "--yes", *NO_R).returncode == 0
+    push_model_branch(repo, "c", notes="Gamma sentence.")
+    stopped = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert stopped.returncode == 5, stopped.stdout + stopped.stderr
+    # claude/d leaves WT alone, so its merge cannot revert the Notes line again.
+    news_d = NEWS.replace("\n\n", "\n\n- Add D 2020 d model.\n", 1)
+    push_task_branch(
+        repo, "claude/d", {"NEWS.md": news_d, "inst/modeldb/D_2020_d.R": "# d\n"}, "Add D"
+    )
+    refused = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert (refused.returncode, refused.stderr) == (
+        3,
+        "ERROR: --fold-in: the round before has not passed its revert check (it stopped at it,"
+        " or before it). Restore what it reports and run --finish, which checks again, then run"
+        " --fold-in.\n",
+    )
+    wt = repo / ".worktrees" / BRANCH
+    assert "- **Notes:** Base note. Gamma sentence.\n" in (wt / REGISTER).read_text()
+    git(wt, "commit", "-q", "--allow-empty", "-m", "A union that keeps only Gamma")
+    still = merge(repo, "--finish")
+    assert still.returncode == 5, still.stdout + still.stderr
+    assert "      missing line: - **Notes:** Base note. Alpha sentence.\n" in still.stdout
+    text = (wt / REGISTER).read_text()
+    (wt / REGISTER).write_text(text.replace("Gamma sentence.", "Alpha sentence. Gamma sentence."))
+    git(wt, "commit", "-qam", "Union the Notes sentences by hand")
+    finish = merge(repo, "--finish")
+    assert finish.returncode == 0, finish.stdout + finish.stderr
+    assert "WARNING" not in finish.stdout
+    done = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "- Add D 2020 d model." in (wt / "NEWS.md").read_text()
+    assert (
+        "- **Notes:** Base note. Alpha sentence. Gamma sentence.\n" in (wt / REGISTER).read_text()
+    )
+
+
+def test_a_register_edited_after_the_revert_check_passed_needs_finish_first(
+    consolidated: Path,
+) -> None:
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    text = (wt / REGISTER).read_text()
+    (wt / REGISTER).write_text(text.replace("Base note.", "Edited note."))
+    git(wt, "commit", "-qam", "Edit WT by hand")
+    refused = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert refused.stderr.startswith(
+        f"ERROR: --fold-in: {REGISTER} changed after the round before's revert check passed at "
+    )
+    assert "Merge branch 'claude/c'" not in git(wt, "log", "--format=%s")
