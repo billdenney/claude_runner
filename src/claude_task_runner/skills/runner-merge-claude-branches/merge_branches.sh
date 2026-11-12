@@ -260,6 +260,13 @@ FOLD_BASE=""
 PR_BASE=""
 # --fold-in, while its merges run: an exit puts the branch back at FOLD_BASE.
 FOLD_MERGING=0
+# A round's records in its worktree's git directory.
+ROUND_RECORDS=(hand-union-report.md hand-union-report.repairs.md merge-inputs merge-stages)
+# --fold-in, while its merges run: a file in the worktree's git directory
+# holding FOLD_BASE, so a round killed then (no EXIT trap runs) is undone by
+# the next --fold-in, and refused by --finish.
+FOLD_MARKER_NAME=fold-in-merging
+FOLD_MARKER=""
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -355,24 +362,45 @@ reset_to_round_start() {  # <worktree> <round's base> <how it stopped>: the bran
   fi
 }
 
-undo_unrepaired_fold_in() {  # <worktree> <report>: a fold-in round that stopped before its repairs completed, undone
-  local wt=$1 report=$2 from kept
+restore_round_before() {  # <worktree> <round's base> <moved|all>: the round before's records back from their .before-<base> copies
+  # "moved": only those a stop part-way through the moves had moved; "all":
+  # the moves completed, so a record with no copy is the round's own.
+  local wt=$1 from=$2 which=$3 name kept
+  for name in "${ROUND_RECORDS[@]}"; do
+    kept="$(git -C "$wt" rev-parse --path-format=absolute --git-path "$name")"
+    if [[ -e "$(before_round "$kept" "$from")" ]]; then
+      mv -f "$(before_round "$kept" "$from")" "$kept"
+    elif [[ "$which" == all ]]; then
+      rm -f "$kept"
+    fi
+  done
+}
+
+undo_unrepaired_fold_in() {  # <worktree>: a fold-in round that stopped before its repairs completed, undone
+  local wt=$1 from
   from="$(stage_get fold-in-from)"
   reset_to_round_start "$wt" "$from" "stopped before its repairs completed"
-  rm -f "$report" "$INPUTS_FILE" "$STAGES_FILE" \
-    "$(git -C "$wt" rev-parse --path-format=absolute --git-path hand-union-report.repairs.md)"
-  for kept in "$report" "$INPUTS_FILE" "$STAGES_FILE"; do
-    if [[ -e "$(before_round "$kept" "$from")" ]]; then mv "$(before_round "$kept" "$from")" "$kept"; fi
-  done
+  restore_round_before "$wt" "$from" all
+}
+
+undo_killed_fold_in() {  # <worktree> <marker>: a fold-in round killed while it merged, undone
+  local wt=$1 marker=$2 from
+  from="$(<"$marker")"
+  reset_to_round_start "$wt" "$from" "was killed while it merged"
+  restore_round_before "$wt" "$from" moved
+  rm -f "$marker"
 }
 
 undo_fold_in_merges() {  # a fold-in round that stops while merging: the branch back at its tip
   git merge --abort >/dev/null 2>&1 || :
   if [[ "$(git rev-parse HEAD 2>/dev/null)" == "$FOLD_BASE" ]] \
     || git reset -q --keep "$FOLD_BASE" >/dev/null 2>&1; then
+    restore_round_before "$WT_ABS" "$FOLD_BASE" moved
+    rm -f "$FOLD_MARKER"
     echo "  The fold-in stopped while merging: $BRANCH_NAME is back at ${FOLD_BASE:0:12}, with the round before's records; run --fold-in again." >&2
   else
-    echo "  The fold-in stopped while merging, and $BRANCH_NAME could not be put back at ${FOLD_BASE:0:12} (git reset --keep refused): discard what $WT_ABS has uncommitted, run git reset --keep ${FOLD_BASE:0:12} there, then run --fold-in again." >&2
+    # The marker stays, so --fold-in finishes the undo.
+    echo "  The fold-in stopped while merging, and $BRANCH_NAME could not be put back at ${FOLD_BASE:0:12} (git reset --keep refused): discard what $WT_ABS has uncommitted, then run --fold-in again, which puts it back." >&2
   fi
 }
 
@@ -609,11 +637,17 @@ read_inputs() {  # <--finish|--fold-in>: the recorded inputs; a conflicting one 
 }
 
 prepare_fold_in() {  # --fold-in: the consolidation's worktree, and its tip as the round's base
-  local wt=$REPO/.worktrees/${BRANCH_NAME} dirty report stages inputs
+  local wt=$REPO/.worktrees/${BRANCH_NAME} dirty report stages inputs marker
   [[ -d "$wt" ]] \
     || die 3 "--fold-in: no worktree at $wt; a fold-in adds branches to the consolidation a run made there."
   [[ "$(git -C "$wt" rev-parse --abbrev-ref HEAD)" == "$BRANCH_NAME" ]] \
     || die 3 "--fold-in: $wt is not on branch $BRANCH_NAME."
+  marker="$(git -C "$wt" rev-parse --path-format=absolute --git-path "$FOLD_MARKER_NAME")"
+  # A round killed while it merged can leave its last merge half done.
+  if [[ -f "$marker" ]] && git -C "$wt" rev-parse --quiet --verify MERGE_HEAD >/dev/null; then
+    git -C "$wt" merge --abort \
+      || die 3 "--fold-in: cannot abort the merge a fold-in round killed while merging left in $wt (git merge --abort failed)."
+  fi
   dirty="$(git -C "$wt" status --porcelain)"
   if [[ -n "$dirty" ]]; then
     {
@@ -629,11 +663,12 @@ prepare_fold_in() {  # --fold-in: the consolidation's worktree, and its tip as t
   WT_ABS=$wt
   STAGES_FILE=$stages
   INPUTS_FILE=$inputs
+  if [[ -f "$marker" ]]; then undo_killed_fold_in "$wt" "$marker"; fi
   if [[ -f "$STAGES_FILE" && "$(stage_get repairs)" == pending ]]; then
     if [[ "$(stage_get fold-in-from)" == pending ]]; then
       die 3 "--fold-in: the run that made $wt stopped before its repairs completed, so its merges were never repaired; re-run it on a fresh --branch-name."
     fi
-    undo_unrepaired_fold_in "$wt" "$report"
+    undo_unrepaired_fold_in "$wt"
   fi
   read_inputs --fold-in
   require_reverts_passed
@@ -1405,6 +1440,10 @@ if (( FINISH )); then
   cd "$WT_ABS"
   [[ "$(git rev-parse --abbrev-ref HEAD)" == "$BRANCH_NAME" ]] \
     || die 3 "--finish: $WT_ABS is not on branch $BRANCH_NAME."
+  FOLD_MARKER="$(git rev-parse --path-format=absolute --git-path "$FOLD_MARKER_NAME")"
+  if [[ -f "$FOLD_MARKER" ]]; then
+    die 3 "--finish: the fold-in round from $(cut -c1-12 "$FOLD_MARKER") was killed while it merged, before its repairs, which --finish does not redo. Run --fold-in again: it puts $BRANCH_NAME back at that tip, with the round before's records, and folds in again."
+  fi
   DIRTY="$(git status --porcelain)"
   if [[ -n "$DIRTY" ]]; then
     {
@@ -1713,7 +1752,10 @@ INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
 if (( FOLD_IN )); then
   # The round before's records stay as they are until a merge lands: a round
   # that merges nothing, or is interrupted while merging (the EXIT trap puts
-  # the branch back at its tip), leaves that round as it was.
+  # the branch back at its tip), leaves that round as it was. A kill skips
+  # the EXIT trap; the marker leaves the undo to the next --fold-in.
+  FOLD_MARKER="$(git rev-parse --path-format=absolute --git-path "$FOLD_MARKER_NAME")"
+  echo "$FOLD_BASE" > "$FOLD_MARKER"
   FOLD_MERGING=1
 else
   rm -f "$HAND_UNION_REPORT" "$REPAIRS_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
@@ -1792,18 +1834,20 @@ if (( SUCCESS == 0 )); then
 fi
 if (( FOLD_IN )); then
   # The round before's records stay beside the new round's, named after the
-  # tip this round started from; the new round's start empty. A round that
-  # stops before its repairs complete is undone by the next --fold-in
-  # (prepare_fold_in), which puts these back.
-  for kept in "$HAND_UNION_REPORT" "$INPUTS_FILE" "$STAGES_FILE"; do
+  # tip this round started from; the new round's start empty. A stop before
+  # the marker goes puts them back with the branch (undo_fold_in_merges, or
+  # the next --fold-in after a kill); one after it, before the repairs
+  # complete, is undone by the next --fold-in (prepare_fold_in), which puts
+  # them back too.
+  for kept in "$HAND_UNION_REPORT" "$REPAIRS_REPORT" "$INPUTS_FILE" "$STAGES_FILE"; do
     if [[ -e "$kept" ]]; then mv "$kept" "$(before_round "$kept")"; fi
   done
   if [[ -s "$(before_round "$HAND_UNION_REPORT")" ]]; then
     echo "    the round before's hand-union report is now $(before_round "$HAND_UNION_REPORT")"
   fi
-  rm -f "$REPAIRS_REPORT"
   record_skips
   stage_set fold-in-from "$FOLD_BASE"
+  rm -f "$FOLD_MARKER"
   FOLD_MERGING=0
   # Confirmed for the report just set aside, not for the round's own.
   HAND_UNION_DONE=0

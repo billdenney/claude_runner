@@ -264,6 +264,9 @@ def test_a_report_the_round_before_left_stops_a_fold_in(stopped: Path) -> None:
     wt = stopped / ".worktrees" / BRANCH
     report = path_in_git_dir(wt, "hand-union-report.md")
     held = report.read_text()
+    # The report as the repairs left it, which the line check reads.
+    repairs = path_in_git_dir(wt, "hand-union-report.repairs.md")
+    held_by_repairs = repairs.read_text()
     proc = merge(stopped, "--fold-in", "--yes", *NO_R)
     assert proc.returncode == 9, proc.stdout + proc.stderr
     assert proc.stderr.startswith(held)
@@ -279,6 +282,10 @@ def test_a_report_the_round_before_left_stops_a_fold_in(stopped: Path) -> None:
     done = merge(stopped, "--fold-in", "--hand-union-done", "--yes", *NO_R)
     assert done.returncode == 0, done.stdout + done.stderr
     assert path_in_git_dir(wt, f"hand-union-report.before-{tip[:12]}.md").read_text() == held
+    assert (
+        path_in_git_dir(wt, f"hand-union-report.repairs.before-{tip[:12]}.md").read_text()
+        == held_by_repairs
+    )
     assert not report.exists()
 
 
@@ -451,6 +458,115 @@ def test_a_fold_in_interrupted_while_merging_is_put_back_at_its_tip(
     assert "- Add C 2020 c model." in news and "- Add D 2020 d model." in news
 
 
+def round_before_kept(wt: Path, tip: str) -> dict[str, str]:
+    """The records kept as the round before's, under their own names."""
+    return {
+        name.replace(f".before-{tip[:12]}", ""): text
+        for name, text in records(wt).items()
+        if f".before-{tip[:12]}" in name
+    }
+
+
+def test_a_fold_in_killed_while_merging_is_undone_by_the_next(
+    consolidated: Path, tmp_path: Path
+) -> None:
+    """A kill after claude/c merged runs no EXIT trap: the branch is left a
+    merge ahead, with the round before's records. The marker the round left
+    makes --finish refuse, and the next --fold-in put the branch back and
+    fold in afresh."""
+    repo = consolidated
+    push_model_branch(repo, "d")
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    real = shutil.which("git")
+    assert real is not None
+    env = fake_tool(
+        tmp_path,
+        "git",
+        "#!/bin/bash\n"
+        f'{shlex.quote(real)} "$@"\n'
+        "rc=$?\n"
+        'if [[ "$1 $2" == "merge --no-ff" ]]; then kill -KILL "$PPID"; fi\n'
+        'exit "$rc"\n',
+    )
+    killed = merge(repo, "--fold-in", "--yes", *NO_R, env=env)
+    assert killed.returncode == -9, killed.stdout + killed.stderr
+    assert git(wt, "rev-list", "--count", f"{tip}..HEAD").strip() != "0"
+    assert records(wt) == before
+    assert path_in_git_dir(wt, "fold-in-merging").read_text() == f"{tip}\n"
+
+    finish = merge(repo, "--finish")
+    assert (finish.returncode, finish.stderr) == (
+        3,
+        f"ERROR: --finish: the fold-in round from {tip[:12]} was killed while it merged, before"
+        " its repairs, which --finish does not redo. Run --fold-in again: it puts"
+        f" {BRANCH} back at that tip, with the round before's records, and folds in again.\n",
+    )
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert (
+        f"    (fold-in) the round from {tip[:12]} was killed while it merged; {BRANCH}\n"
+        f"    is back at {tip[:12]}, with the records of the round before it.\n"
+        "    Its commits, still in the reflog:\n"
+    ) in again.stdout
+    merges = git(wt, "log", "--first-parent", "--format=%s", f"{tip}..HEAD")
+    assert merges.count(f"Merge branch 'claude/c' into {BRANCH}") == 1
+    assert merges.count(f"Merge branch 'claude/d' into {BRANCH}") == 1
+    assert round_before_kept(wt, tip) == before
+    assert not path_in_git_dir(wt, "fold-in-merging").exists()
+
+
+def test_a_half_done_merge_a_killed_round_left_is_aborted(consolidated: Path) -> None:
+    """Killed inside git merge: MERGE_HEAD and a staged index are left. The
+    next --fold-in aborts that merge before it reads the worktree as dirty."""
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    path_in_git_dir(wt, "fold-in-merging").write_text(f"{tip}\n")
+    git(wt, "merge", "--no-ff", "--no-commit", "-X", "theirs", "origin/claude/c")
+    assert git(wt, "status", "--porcelain") != ""
+
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert (
+        f"    (fold-in) the round from {tip[:12]} was killed while it merged; {BRANCH}\n"
+        f"    is back at {tip[:12]}, with the records of the round before it.\n"
+        "==> "
+    ) in again.stdout
+    assert "- Add C 2020 c model." in (wt / "NEWS.md").read_text()
+    assert round_before_kept(wt, tip) == before
+
+
+@pytest.mark.parametrize("stop", ["fails", "interrupted"])
+def test_a_fold_in_that_stops_while_moving_the_records_puts_them_back(
+    consolidated: Path, tmp_path: Path, stop: str
+) -> None:
+    """The round's merges landed and the round before's records are being
+    moved aside when the move of merge-stages fails (the ERR trap) or an
+    INT arrives: the branch goes back to its tip and so does every record."""
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    real = shutil.which("mv")
+    assert real is not None
+    if stop == "fails":
+        act = 'if [[ "$1" == */merge-stages ]]; then exit 1; fi\n'
+    else:
+        act = f'if [[ "$1" == */merge-stages ]]; then {shlex.quote(real)} "$@"; kill -INT "$PPID"; exit 0; fi\n'
+    env = fake_tool(tmp_path, "mv", f'#!/bin/bash\n{act}exec {shlex.quote(real)} "$@"\n')
+    proc = merge(repo, "--fold-in", "--yes", *NO_R, env=env)
+    assert proc.returncode == (1 if stop == "fails" else 130), proc.stdout + proc.stderr
+    assert proc.stderr.endswith(
+        f"  The fold-in stopped while merging: {BRANCH} is back at {tip[:12]}, with the round"
+        " before's records; run --fold-in again.\n"
+    )
+    assert (git(wt, "rev-parse", "HEAD").strip(), records(wt)) == (tip, before)
+    assert not path_in_git_dir(wt, "fold-in-merging").exists()
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert round_before_kept(wt, tip) == before
+
+
 def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
     consolidated: Path, tmp_path: Path
 ) -> None:
@@ -485,11 +601,7 @@ def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
     assert "- Add C 2020 c model." in (wt / "NEWS.md").read_text()
     merges = git(wt, "log", "--first-parent", "--format=%s", f"{tip}..HEAD")
     assert merges.count(f"Merge branch 'claude/c' into {BRANCH}") == 1
-    assert {
-        name.replace(f".before-{tip[:12]}", ""): text
-        for name, text in records(wt).items()
-        if f".before-{tip[:12]}" in name
-    } == before
+    assert round_before_kept(wt, tip) == before
 
 
 def test_a_stopped_round_that_was_pushed_is_not_put_back_behind_origin(

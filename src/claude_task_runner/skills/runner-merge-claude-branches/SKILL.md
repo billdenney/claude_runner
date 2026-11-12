@@ -971,14 +971,21 @@ or pass `--hand-union-done` to the fold-in.
 
 The round before's records stay as they are until one of the round's merges
 lands. Once one has, they are kept in the worktree's git directory as
-`hand-union-report.before-<tip>.md`, `merge-inputs.before-<tip>` and
+`hand-union-report.before-<tip>.md`,
+`hand-union-report.repairs.before-<tip>.md`, `merge-inputs.before-<tip>` and
 `merge-stages.before-<tip>`, and the new round's start empty. How a round
 that stops is completed depends on where it stopped:
 
-- **while merging** -- every merge failed (exit 4), or an interrupt or a
-  crash: the branch is put back at its tip (`git reset --keep`), and the
-  round before is as it was, so `--finish` completes it and `--fold-in` runs
-  again (with `--exclude-ref` for a branch that cannot merge);
+- **while merging**, or while moving those records aside -- every merge
+  failed (exit 4), or an interrupt or a crash: the branch is put back at its
+  tip (`git reset --keep`) and the records moved so far are moved back, so
+  the round before is as it was: `--finish` completes it and `--fold-in`
+  runs again (with `--exclude-ref` for a branch that cannot merge). A kill
+  runs nothing on its way out, so the round keeps a marker,
+  `fold-in-merging` (the tip it started from), in the worktree's git
+  directory until the records are moved: while it is there `--finish`
+  refuses (exit 3), and the next `--fold-in` aborts any merge left half
+  done, puts the branch and the records back, and folds in afresh;
 - **after its merges, before its repairs completed** -- a repair that
   crashed, duplicates the dedup left, a gate that could not run, an
   interrupt: `--finish` refuses (exit 3), since it redoes no repair. Discard
