@@ -187,15 +187,21 @@ exists to repair. Repair, then regenerate.
      changed (`git diff --diff-filter=AM` from the base, renames read as
      additions), each loaded with the calls `addFileToModelDb()` makes, so
      the model name the covariate checks see, and the verdict, is the
-     build's. A parse failure or a model named unlike its file counts too.
+     build's. A file the build cannot load (a parse error, a model named
+     unlike its file, an `nlmixr()` failure) is an error; an error raised
+     inside `checkModelConventions()` itself is a warning, since the build
+     ignores it too.
 
    An error stops the run (exit 5) before the regeneration, listing each
    duplicate and each model's errors, with the `--finish` command that runs
    the pre-check and the regeneration again once the fix is committed. A
-   package without `buildModelDb()` has nothing to check; a check function
-   the package lacks is skipped with a warning, since `buildModelDb()` still
-   enforces whatever the package has. The pre-check is part of the
-   regeneration step, so `--skip-r-regen` skips it too.
+   package without `buildModelDb()` has nothing to check. One with
+   `buildModelDb()` but without either check function cannot be checked as
+   the build checks it, which stops the run (exit 5) rather than switching
+   the pre-check off after a rename upstream; so does a crash, which the
+   script reports as one, never as "what buildModelDb would stop on". The
+   pre-check is part of the regeneration step, so `--skip-r-regen` skips it
+   too.
 
    - `buildModelDb()` writes the registry blob (`data/modeldb.rda` plus
      whichever of `inst/modeldb.rds` / `inst/modeldb.qs2` the package
