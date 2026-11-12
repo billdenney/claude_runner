@@ -28,6 +28,7 @@ RUN_BY: dict[str, str] = {
     f"{MERGE_SKILL}/merge_branches.sh": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/merge_set.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/precheck_regen.R": "test_precheck_regen.py",
+    f"{MERGE_SKILL}/register_lines.py": "test_verify_added_lines.py",
     f"{MERGE_SKILL}/restore_dropped_sections.py": "test_restore_dropped_sections_gate.py",
     f"{MERGE_SKILL}/union_merge_lines.py": "test_merge_skill_scripts.py",
     f"{MERGE_SKILL}/union_merge_news.py": "test_union_merge_news.py",

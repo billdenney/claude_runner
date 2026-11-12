@@ -17,8 +17,11 @@ For each ``--file``, and each ref in the merge set (merge_set.py) whose own
 diff touched it, the check reads the file at the ref's fork point and at the
 commit the consolidation merged:
 
-* every non-blank line the merged copy has and the fork point lacks must be a
-  line of the merge result, compared with trailing whitespace stripped;
+* every non-blank line the merged copy adds to a block (the fork point's
+  matching block does not keep it) must be kept in the matching block of the
+  merge result. Blocks match by a name their ``###`` headings share, in any
+  ``##`` section (a hand union may move a canonical), and lines before the
+  first ``###`` of a section by the section's name;
 * lines of an ``**Example models:**`` field are compared entry by entry
   instead, since union_merge_lines.py rewrites those fields: each entry the
   branch added, or whose note it changed, must still be filed under a ``### ``
@@ -27,14 +30,12 @@ commit the consolidation merged:
   under different sections), with a note that says at least what the
   branch's says.
 
-A line counts as present when the result has it, or when one result line of
-the same field (``- **Notes:**``; a line that is no field matches any other
-such line) holds each of its sentences: a hand union that joins two
-branches' sentences into one Notes line keeps both. A line a hand union
-rewords is reported until it is accepted; that is the decision the report
-asks for. A line identical to one elsewhere in the result
-(``- **Type:** covariate``) always counts as present: the check reads lines,
-not blocks.
+Whether a block keeps a line is register_lines.py's rule, which the revert
+check uses too: word for word, or, for a field line (``- **Notes:**``), with
+each of its sentences whole in one line of the same field, so a hand union
+that joins two branches' sentences into one Notes line keeps both. A line a
+hand union rewords is reported until it is accepted; that is the decision the
+report asks for.
 
 ``--set-aside FILE`` names the hand-union report the repairs wrote. A line it
 holds verbatim, or an entry it names with its note, is wording a repair
@@ -54,7 +55,6 @@ crash.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import traceback
 from collections import defaultdict
@@ -64,14 +64,15 @@ from pathlib import Path
 
 import dedup_canonical_headers as register
 import merge_set
+import register_lines
 import union_merge_lines as union
 
 # How much of a long line the report prints.
 SHOWN = 220
-# A field line, ``- **Label:** text``, at any indent.
-FIELD_LINE = re.compile(r"^\s*[-*]\s+\*\*([^*]+?):\*\*(.*)$")
-# Where a sentence ends and the next starts.
-SENTENCE_BREAK = re.compile(r"(?<=[.;!?])\s+")
+
+Key = tuple[str, str]
+"""A block: ``("###", name)`` for each name its heading declares, or
+``("##", section)`` for a section's lines before its first ``###``."""
 
 
 def fail(message: str) -> int:
@@ -83,12 +84,27 @@ def fail(message: str) -> int:
 class Copy:
     """One text of a file, read for this check."""
 
-    lines: frozenset[str]
-    """Its non-blank lines, trailing whitespace stripped."""
-    outside: tuple[str, ...]
-    """Those not part of an Example-models field, in order."""
+    blocks: dict[Key, register_lines.Block]
+    """Its non-blank lines, by block."""
+    outside: tuple[tuple[str, tuple[Key, ...]], ...]
+    """Its lines outside the Example-models fields, in order, with their blocks."""
     entries: union.Entries
     """Its Example-models entries, ``(bucket, filename) -> note``."""
+
+    def holds(self, line: str, keys: tuple[Key, ...]) -> bool:
+        """Whether one of the blocks ``keys`` names keeps ``line``."""
+        return any(key in self.blocks and self.blocks[key].holds(line) for key in keys)
+
+
+def _names(bucket: union.Bucket) -> tuple[str, ...]:
+    """The names the bucket's ``### `` heading declares."""
+    return register.heading_names(bucket[1])[0] or (bucket[1],)
+
+
+def _keys(bucket: union.Bucket) -> tuple[Key, ...]:
+    if bucket[1]:
+        return tuple(("###", name) for name in _names(bucket))
+    return (("##", bucket[0]),)
 
 
 def read_copy(text: str, headings: union.Headings) -> Copy:
@@ -96,20 +112,20 @@ def read_copy(text: str, headings: union.Headings) -> Copy:
     in_field: set[int] = set()
     for _bucket, at, found in union._fields(lines, headings):
         in_field.update(range(at, at + len(found.lines)))
-    stripped = [line.rstrip() for line in lines]
-    outside = tuple(
-        line for index, line in enumerate(stripped) if line.strip() and index not in in_field
-    )
-    return Copy(
-        frozenset(line for line in stripped if line.strip()),
-        outside,
-        union.entry_map(text, headings),
-    )
-
-
-def _names(bucket: union.Bucket) -> tuple[str, ...]:
-    """The names the bucket's ``### `` heading declares."""
-    return register.heading_names(bucket[1])[0] or (bucket[1],)
+    blocks: defaultdict[Key, register_lines.Block] = defaultdict(register_lines.Block)
+    outside: list[tuple[str, tuple[Key, ...]]] = []
+    for index, (raw, bucket) in enumerate(
+        zip(lines, union._sections(lines, headings), strict=True)
+    ):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        keys = _keys(bucket)
+        for key in keys:
+            blocks[key].add([line])
+        if index not in in_field:
+            outside.append((line, keys))
+    return Copy(dict(blocks), tuple(outside), union.entry_map(text, headings))
 
 
 def _filed(entries: union.Entries) -> dict[tuple[str, str], list[str]]:
@@ -132,35 +148,16 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
-def _field(line: str) -> tuple[str, str]:
-    """``(field label, its text)`` for a ``- **Label:** text`` line, else
-    ``("", the line)``; whitespace normalised."""
-    match = FIELD_LINE.match(line)
-    if match:
-        return match.group(1), _norm(match.group(2))
-    return "", _norm(line)
-
-
 class Result:
     """The merge result, read for the lines and entries it holds."""
 
     def __init__(self, text: str, headings: union.Headings) -> None:
-        copy = read_copy(text, headings)
-        self.lines = copy.lines
-        self.by_field: dict[str, list[str]] = defaultdict(list)
-        for line in copy.lines:
-            label, body = _field(line)
-            self.by_field[label].append(body)
-        self.filed = _filed(copy.entries)
+        self.copy = read_copy(text, headings)
+        self.filed = _filed(self.copy.entries)
 
-    def has_line(self, line: str) -> bool:
-        if line in self.lines:
-            return True
-        label, body = _field(line)
-        pieces = [piece for piece in SENTENCE_BREAK.split(body) if piece]
-        return bool(pieces) and any(
-            all(piece in other for piece in pieces) for other in self.by_field.get(label, ())
-        )
+    def has_line(self, line: str, bucket: union.Bucket) -> bool:
+        """Whether the result block matching ``bucket`` keeps ``line``."""
+        return self.copy.holds(line, _keys(bucket))
 
     def has_entry(self, bucket: union.Bucket, filename: str, note: str) -> bool:
         notes = [kept for name in _names(bucket) for kept in self.filed.get((name, filename), [])]
@@ -227,10 +224,10 @@ def missing(
         merged = copy_at(member.merged)
         if merged is None:
             continue
-        fork = copy_at(member.fork) or Copy(frozenset(), (), union.Entries())
+        fork = copy_at(member.fork) or Copy({}, (), union.Entries())
         ref = member.ref.removeprefix("origin/")
-        for line in merged.outside:
-            if line in fork.lines or result.has_line(line):
+        for line, keys in merged.outside:
+            if fork.holds(line, keys) or result.copy.holds(line, keys):
                 continue
             note_loss(line, ref, set_aside is not None and set_aside.has_line(line))
         for (bucket, filename), note in merged.entries.items():

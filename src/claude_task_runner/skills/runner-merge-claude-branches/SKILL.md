@@ -465,17 +465,24 @@ exists to repair. Repair, then regenerate.
    none of them reads those lines.
 
    For each branch in the merge set whose own diff touched the file, every
-   non-blank line its merged commit has and its fork point lacks must be in
-   the result. A line counts as kept when the result has it, or when one
-   result line of the same field (`- **Notes:**`, say) holds each of its
-   sentences, so a hand union that joins two branches' sentences into one
-   line keeps both. Example-models lines are compared entry by entry, since
+   non-blank line its merged commit adds to a block must be kept in the
+   matching block of the result: blocks match by a name their `###` headings
+   share, in any `##` section, and a section's lines before its first `###`
+   by the section's name. Whether a block keeps a line is the rule in
+   `register_lines.py`, which the revert check (7b) uses too: a field line
+   (`- **Notes:**`, say) is kept word for word or with each of its sentences
+   whole in one line of the same field, so a hand union that joins two
+   branches' sentences into one line keeps both; any other line, a heading
+   included, only word for word. A sentence kept under another canonical
+   does not count. Example-models lines are compared entry by entry, since
    the union rewrites them: each entry the branch added, or whose note it
    changed, must be filed under a heading that declares one of its heading's
    names, in any section, with a note that says at least what the branch's
    says. Wording a repair already set aside in the hand-union report (6b,
    6c, 6) is counted, not reported: `--hand-union-done` is the decision for
-   it.
+   it. That exemption matches the report's lines exactly, and holds for the
+   rest of the round, `--finish` included, once `--hand-union-done` is given:
+   the line check does not ask again about wording the report holds.
 
    Each loss goes to the hand-union report and the run stops before the push
    (exit 9), the way the verifier's losses do; `--finish` runs the check
@@ -483,9 +490,7 @@ exists to repair. Repair, then regenerate.
    accepts what is left. Given on the run itself, `--accept-line-losses`
    turns each loss into a WARNING. A hand union that rewords a branch's line
    keeps it reported until it is accepted: that is the decision the report
-   asks for. A line identical to one elsewhere in the register
-   (`- **Type:** covariate`) always counts as present; the check reads
-   lines, not blocks. Exit 2 (it could not run) stops the run with exit 5.
+   asks for. Exit 2 (it could not run) stops the run with exit 5.
 
    Regression tests: `tests/unit/test_verify_added_lines.py`.
 
@@ -590,7 +595,11 @@ exists to repair. Repair, then regenerate.
    never matched across them. Each heading name, the heading's description,
    each Example-models entry and its annotation, and every other non-blank
    line must survive; how many full stops end an Example-models line is not
-   compared. A line cut in two by a pasted block -- its first part kept, the
+   compared. A line survives as `register_lines.py` counts a line kept (the
+   line check's rule, step 6e): word for word, or, for a field line, with
+   each of its sentences whole in one line of the same field in the matching
+   block. So a hand union that joins a base line's sentences with a branch's
+   keeps the base line, and one that drops a sentence does not. A line cut in two by a pasted block -- its first part kept, the
    rest now ending a line of another block -- is reported even though the
    branch's own commit did it, which is what happened to CONMED_RTV_AUC_12H.
 

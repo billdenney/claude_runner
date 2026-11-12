@@ -55,6 +55,7 @@ NOTES_A = "[claude/a] - **Notes:** Base note. Alpha sentence."
 ENTRY_A = "[claude/a] Example models of Exposure / CAV: `A_2020_a.R` (a note)"
 
 v: ModuleType = load_helper("verify_added_lines")
+register_lines: ModuleType = load_helper("register_lines")
 
 
 def check(repo: Path, *args: str | Path) -> tuple[int, str, str]:
@@ -257,32 +258,76 @@ def test_news_bullets_a_later_merge_dropped(
     assert (after.returncode, after.stdout, after.stderr) == (0, ok("NEWS.md"), "")
 
 
-class TestResultHasLine:
-    """How a line counts as kept: whole, or sentence by sentence in one line
-    of the same field."""
+class TestTheSharedRule:
+    """register_lines.py's Block, the rule the line check and the revert check
+    share: a field line is kept word for word or with each of its sentences
+    whole in one line of the same field; any other line only word for word."""
 
-    RESULT = (
-        "## S\n\n### X (**x**)\n\n- **Notes:** One. Two; three.\n- **Description:** Four.\n"
-        "  - `ALKN` -- Thai 2023 Table 3; also `ALP_ULN`.\n"
+    BLOCK = (
+        "### CAV_X (**x**)",
+        "- **Notes:** Fixed-effect on clearance. Scaled to 70 kg; see below.",
+        "- **Description:** Four.",
+        "  - `ALKN` -- Thai 2023 Table 3.",
     )
-
-    @pytest.fixture
-    def result(self) -> object:
-        return v.Result(self.RESULT, {})
 
     @pytest.mark.parametrize(
         ("line", "kept"),
         [
-            ("- **Notes:** One. Two; three.", True),
-            ("- **Notes:** Two; three.", True),
-            ("- **Notes:** Three. One.", False),
-            ("- **Notes:** One. Four.", False),
-            ("- **Description:** One.", False),
-            ("  - `ALKN` -- Thai 2023 Table 3;", True),
-            ("  - `ALKN` -- Thai 2024 Table 3;", False),
-            ("### X (**x**)", True),
-            ("### X (**y**)", False),
+            ("- **Notes:** Fixed-effect on clearance. Scaled to 70 kg; see below.", True),
+            ("- **Notes:**   Scaled to 70 kg;   see below.  ", True),
+            ("- **Notes:** see below. Fixed-effect on clearance.", True),
+            ("- **Notes:** Fixed.", False),
+            ("- **Notes:** Scaled to 70 kg.", False),
+            ("- **Description:** Fixed-effect on clearance.", False),
+            ("### CAV_X (**x**)", True),
+            ("### CAV", False),
+            ("### CAV_X (**y**)", False),
+            ("  - `ALKN` -- Thai 2023 Table 3.", True),
+            ("  - `ALKN` -- Thai 2023", False),
+            ("- `ALKN` -- Thai 2023 Table 3.", False),
         ],
     )
-    def test_kept(self, result: object, line: str, kept: bool) -> None:
-        assert result.has_line(line) is kept  # type: ignore[attr-defined]
+    def test_kept(self, line: str, kept: bool) -> None:
+        assert register_lines.Block(self.BLOCK).holds(line) is kept
+
+
+class TestBlocksAreKeptApart:
+    RESULT = (
+        "## S\n\n### CAV_X (**x**)\n\n- **Notes:** Scaled to 70 kg.\n\n"
+        "### CAV (**c**)\n\n- **Notes:** Other.\n"
+    )
+
+    def test_a_sentence_under_another_canonical_is_not_kept(self) -> None:
+        result = v.Result(self.RESULT, {})
+        assert result.has_line("- **Notes:** Scaled to 70 kg.", ("S", "CAV (**c**)")) is False
+        assert result.has_line("- **Notes:** Scaled to 70 kg.", ("S", "CAV_X (**x**)")) is True
+
+    def test_a_heading_prefix_is_not_kept(self) -> None:
+        result = v.Result(self.RESULT, {})
+        assert result.has_line("### CAV", ("S", "CAV")) is False
+
+    def test_a_canonical_moved_to_another_section_keeps_its_lines(self) -> None:
+        result = v.Result(self.RESULT, {})
+        assert result.has_line("- **Notes:** Other.", ("Elsewhere", "CAV (**c**)")) is True
+
+    def test_a_line_lost_from_one_canonical_and_kept_by_another_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """claude/a extends CAV's Notes line; claude/b rewrites it, and gives
+        VAF a Notes line word for word claude/a's. -X theirs keeps claude/b's
+        CAV line, so claude/a's line is kept only under another canonical."""
+        base = BASE + "\n### VAF (**v**)\n\n- **Notes:** V.\n"
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: base})
+        a = base.replace("Base note.", "Base note. Shared sentence.")
+        b = base.replace("Base note.", "Base note. B.").replace(
+            "- **Notes:** V.", "- **Notes:** Base note. Shared sentence."
+        )
+        push_task_branch(repo, "claude/a", {REGISTER: a}, "a")
+        push_task_branch(repo, "claude/b", {REGISTER: b}, "b")
+        wt = consolidate(repo, ["origin/claude/a", "origin/claude/b"], "consolidation")
+        assert "- **Notes:** Base note. B.\n" in (wt / REGISTER).read_text()
+        assert check(repo) == (
+            1,
+            lost(REGISTER, "[claude/a] - **Notes:** Base note. Shared sentence."),
+            "",
+        )

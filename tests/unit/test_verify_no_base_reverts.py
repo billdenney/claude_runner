@@ -336,3 +336,32 @@ class TestParsing:
         assert self.v.line_atoms("  - `A.R` (a sub-bullet)") == [
             ("line", "  - `A.R` (a sub-bullet)")
         ]
+
+
+class TestALineKeptAsTheLineCheckKeepsIt:
+    """A base line counts as kept by the rule the line check uses
+    (register_lines.py): each of a field line's sentences, whole, in one
+    line of the same field in the matching block."""
+
+    BASE = "## S\n\n### WT (**w**)\n\n- **Notes:** Base note. Alpha sentence.\n"
+    OTHER = "\n### HT (**h**)\n\n- **Notes:** {notes}\n"
+
+    @staticmethod
+    def lost(base: str, result: str) -> list[tuple[str, ...]]:
+        reverts = load_helper("verify_no_base_reverts")
+        index = reverts.Index(reverts.units(result))
+        return [atom for unit in reverts.units(base) for atom in index.lost(unit)[0]]
+
+    def test_a_hand_union_that_adds_a_sentence_keeps_the_line(self) -> None:
+        result = self.BASE.replace("Alpha sentence.", "Alpha sentence. Gamma sentence.")
+        assert self.lost(self.BASE, result) == []
+
+    def test_a_union_that_drops_a_sentence_loses_the_line(self) -> None:
+        result = self.BASE.replace("Alpha sentence.", "Gamma sentence.")
+        assert self.lost(self.BASE, result) == [("line", "- **Notes:** Base note. Alpha sentence.")]
+
+    def test_the_line_under_another_canonical_is_not_kept(self) -> None:
+        result = self.BASE.replace("Base note. Alpha sentence.", "Other.") + self.OTHER.format(
+            notes="Base note. Alpha sentence."
+        )
+        assert self.lost(self.BASE, result) == [("line", "- **Notes:** Base note. Alpha sentence.")]
