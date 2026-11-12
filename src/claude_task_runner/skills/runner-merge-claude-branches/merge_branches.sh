@@ -853,15 +853,20 @@ revert_check() {  # gate: register content the base has that the merge, or a han
 }
 
 require_reverts_passed() {  # --fold-in: the round before passed its revert check on its registers as they stand
-  local at changed files=()
+  local at changed path files=() registers=()
   at="$(stage_get reverts)"
   if [[ "$at" == pending ]]; then
     die 3 "--fold-in: the round before has not passed its revert check (it stopped at it, or before it). Restore what it reports and run --finish, which checks again, then run --fold-in."
   fi
+  for path in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+    if [[ -n "$path" ]]; then registers+=("$path"); fi
+  done
+  # No register: nothing the check guards can have changed since (and an
+  # empty pathspec would compare the whole tree).
+  (( ${#registers[@]} )) || return 0
   git -C "$WT_ABS" rev-parse --verify --quiet "$at^{commit}" >/dev/null \
     || die 3 "--fold-in: the commit the round before's revert check passed at, ${at:0:12}, is gone; run --finish, which checks again."
-  changed="$(git -C "$WT_ABS" diff --no-renames --name-only "$at" HEAD -- \
-    ${UNION_FILE:+"$UNION_FILE"} ${REGISTER_FILES[@]+"${REGISTER_FILES[@]}"})" \
+  changed="$(git -C "$WT_ABS" diff --no-renames --name-only "$at" HEAD -- "${registers[@]}")" \
     || die 3 "--fold-in: cannot tell whether a register changed since the revert check passed: git diff ${at:0:12} HEAD failed."
   if [[ -n "$changed" ]]; then
     mapfile -t files <<< "$changed"

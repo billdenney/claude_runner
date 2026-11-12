@@ -632,6 +632,26 @@ def test_a_fold_in_needs_the_round_before_to_have_passed_its_revert_check(
     )
 
 
+def test_a_commit_after_the_revert_check_passed_is_no_change_when_no_register_is_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no union file and no register files the revert check guards
+    nothing, so a hand commit on the consolidation leaves nothing for
+    --finish to check again before a fold-in."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": NEWS, REGISTER: BASE_REGISTER})
+    push_model_branch(repo, "a")
+    first = merge(repo, "--yes", "--union-file", "", "--no-register-files", *NO_R)
+    assert first.returncode == 0, first.stdout + first.stderr
+    wt = repo / ".worktrees" / BRANCH
+    (wt / "inst" / "unrelated.txt").write_text("x\n")
+    git(wt, "add", "inst/unrelated.txt")
+    git(wt, "commit", "-qm", "An unrelated hand commit")
+    push_model_branch(repo, "c")
+    folded = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert folded.returncode == 0, folded.stdout + folded.stderr
+    assert "- Add C 2020 c model." in (wt / "NEWS.md").read_text()
+
+
 def test_a_register_edited_after_the_revert_check_passed_needs_finish_first(
     consolidated: Path,
 ) -> None:
