@@ -95,11 +95,16 @@ def rscript_with_nlmixr2(rscript: str) -> str:
     return rscript
 
 
-def package(root: Path, r_code: str = FAKE_R, registers: dict[str, str] | None = None) -> Path:
+def package(
+    root: Path,
+    r_code: str = FAKE_R,
+    registers: dict[str, str] | None = None,
+    namespace: str = "export(checkModelConventions)\n",
+) -> Path:
     files = {
         "DESCRIPTION": "Package: fakepkg\nVersion: 0.0.1\nTitle: Fake\nDescription: Fake.\n"
         "License: MIT\n",
-        "NAMESPACE": "export(checkModelConventions)\n",
+        "NAMESPACE": namespace,
         "R/fake.R": r_code,
         **{
             f"inst/references/{name}": text
@@ -176,8 +181,8 @@ class TestPrecheckScript:
         code, out = precheck(rscript_with_nlmixr2, wt, ["inst/modeldb/Name_2020_x.R"], tmp_path)
         assert code == 1, out
         assert (
-            "ERROR: (precheck) inst/modeldb/Name_2020_x.R:\n"
-            "    (model) (load): the model is named Other_2020_x, the file Name_2020_x.R\n"
+            "ERROR: (precheck) inst/modeldb/Name_2020_x.R cannot be loaded, so buildModelDb()"
+            " would stop: the model is named Other_2020_x, the file Name_2020_x.R\n"
         ) in out
 
     def test_a_package_without_buildmodeldb_has_nothing_to_check(
@@ -189,16 +194,63 @@ class TestPrecheckScript:
             "    (precheck) fakepkg has no buildModelDb(); nothing to check\n",
         )
 
-    def test_a_check_the_package_lacks_is_a_warning(self, rscript: str, tmp_path: Path) -> None:
-        """buildModelDb() still runs whatever checks the package has."""
-        code = FAKE_R.split(".referenceDuplicateIssues")[0]
-        code += "checkModelConventions <- function(...) NULL\n"
+    @pytest.mark.parametrize("missing", [".referenceDuplicateIssues", "checkModelConventions"])
+    def test_a_check_the_package_lacks_stops_it(
+        self, rscript: str, tmp_path: Path, missing: str
+    ) -> None:
+        """A rename upstream must not switch the pre-check off silently."""
+        code = FAKE_R.replace(f"{missing} <- function", "renamed_away <- function")
+        exported = "" if missing == "checkModelConventions" else "export(checkModelConventions)\n"
+        wt = package(tmp_path / "pkg", r_code=code, namespace=exported)
+        assert precheck(rscript, wt, [], tmp_path) == (
+            2,
+            f"ERROR: (precheck) fakepkg has buildModelDb() but no {missing}(), so the pre-check"
+            " cannot run the build's checks\n",
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "out"),
+        [
+            (
+                'stop("no ui")',
+                "WARNING: (precheck) inst/modeldb/Good_2021_y.R: checkModelConventions() failed,"
+                " which buildModelDb() ignores too: no ui\n",
+            ),
+            ("NULL", ""),
+        ],
+        ids=["raises", "returns-null"],
+    )
+    def test_a_convention_check_that_fails_or_finds_nothing_does_not_stop_it(
+        self, rscript_with_nlmixr2: str, tmp_path: Path, body: str, out: str
+    ) -> None:
+        """addFileToModelDb() ignores an error raised inside the check."""
+        code = FAKE_R.split("checkModelConventions <- function")[0]
+        code += f"checkModelConventions <- function(model, verbose = TRUE) {body}\n"
+        wt = package(tmp_path / "pkg", r_code=code)
+        path = wt / "inst" / "modeldb" / "Good_2021_y.R"
+        path.parent.mkdir(parents=True)
+        path.write_text(MODEL.format(name="Good_2021_y", theta="lka"))
+        code_, printed = precheck(
+            rscript_with_nlmixr2, wt, ["inst/modeldb/Good_2021_y.R"], tmp_path
+        )
+        assert (code_, printed) == (
+            0,
+            "    (precheck) no canonical is registered twice in 1 register(s)\n"
+            "    (precheck) checking the conventions of 1 model(s) the merge added or changed\n"
+            f"{out}"
+            "    (precheck) no convention error in the models the merge added or changed\n",
+        )
+
+    def test_a_crash_is_not_a_verdict(self, rscript: str, tmp_path: Path) -> None:
+        """Exit 1 means "buildModelDb would stop"; a crash must not read as that."""
+        code = FAKE_R.replace(
+            ".referenceDuplicateIssues <- function(paths) {",
+            '.referenceDuplicateIssues <- function(paths) {\n  stop("register parser broke")',
+        )
         wt = package(tmp_path / "pkg", r_code=code)
         assert precheck(rscript, wt, [], tmp_path) == (
-            0,
-            "WARNING: (precheck) fakepkg has no .referenceDuplicateIssues(); duplicates are left"
-            " to buildModelDb()\n"
-            "    (precheck) the merge added or changed no model file\n",
+            2,
+            "ERROR: (precheck) crashed: register parser broke\n",
         )
 
     @pytest.mark.parametrize(
