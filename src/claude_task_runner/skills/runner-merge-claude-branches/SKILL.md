@@ -766,6 +766,11 @@ exists to repair. Repair, then regenerate.
     git push -u origin <branch-name>
     ```
 
+    A failed push stops the run (exit 7). When origin rejects it as not a
+    fast-forward, the branch on origin has commits pushed since, and the
+    message says so (read them, merge what belongs, or consolidate afresh)
+    instead of blaming the remote or the network.
+
 11. **Print the suggested PR title + body** for the operator to open
     manually. The body lists which branches were folded in,
     categorised as new-model additions / vignette ASCII fixes /
@@ -983,6 +988,13 @@ that stops is completed depends on where it stopped:
 - **after its repairs** -- a hand union (exit 9), the revert check or the
   regeneration (5), check (6), the push (7) or the vignettes (8): `--finish`
   completes it, as it does a first round.
+
+Before it puts a stopped round back, `--fold-in` fetches the branch from
+origin. If origin has commits the round's start lacks (the stopped round was
+pushed, or other work was), putting the branch back would leave it behind
+origin, so it refuses (exit 3) and changes nothing: consolidate afresh on a
+new `--branch-name`, or reconcile the branch with origin by hand. A fetch
+that fails is reported, and the copy of origin last fetched is used.
 
 Regression tests: `tests/unit/test_merge_fold_in.py`, and the fold-in case
 in `tests/unit/test_union_merge_news.py`.
