@@ -6,19 +6,24 @@ check over every register and its convention check over the models the merge
 added or changed, so merge_branches.sh stops in minutes instead.
 
 The script runs against small packages built here, so the cases need R, and
-pkgload, nlmixr2est and rxode2 where a model is checked; CI installs no R.
+pkgload, nlmixr2est and rxode2 where a model is checked; CI installs no R. The
+orchestrator's side runs everywhere, with a stub Rscript.
 """
 
 from __future__ import annotations
 
+import os
+import shlex
 import shutil
 from pathlib import Path
 
 import pytest
 
-from ._merge_skill_repo import SKILL_DIR, run
+from ._git_world import git
+from ._merge_skill_repo import SKILL_DIR, new_repo, push_task_branch, run
 
 PRECHECK = SKILL_DIR / "precheck_regen.R"
+MERGE_BRANCHES = SKILL_DIR / "merge_branches.sh"
 
 FAKE_R = """\
 buildModelDb <- function() NULL
@@ -218,3 +223,85 @@ class TestPrecheckScript:
         given = [arg.format(wt=wt, tmp=tmp_path) for arg in args]
         proc = run(rscript, PRECHECK, *given)
         assert (proc.returncode, proc.stdout) == (2, message.format(wt=wt, tmp=tmp_path))
+
+
+def _stub_rscript(log: Path, fail: Path) -> str:
+    """Logs the pre-check with its model list, and the regeneration; the
+    pre-check fails while ``fail`` exists."""
+    out = shlex.quote(str(log))
+    flag = shlex.quote(str(fail))
+    return f"""#!/bin/bash
+case "$*" in
+  *precheck_regen.R*)
+    while [[ $# -gt 0 ]]; do [[ "$1" == --models ]] && models="$2"; shift; done
+    {{ echo precheck; sed 's/^/  /' "$models"; }} >> {out}
+    if [[ -e {flag} ]]; then echo "ERROR: (precheck) 1 canonical(s) registered twice:"; exit 1; fi ;;
+  *buildModelDb*)
+    echo regen >> {out} ;;
+esac
+"""
+
+
+def test_merge_branches_stops_before_the_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-check gets the model files the merge added or changed, and
+    its error stops the run (exit 5) before buildModelDb() starts. --finish,
+    once it is fixed, runs the pre-check again and then the regeneration."""
+    repo = new_repo(
+        tmp_path, monkeypatch, {"inst/modeldb/Old_2019_o.R": "# old\n", "README.md": "x\n"}
+    )
+    push_task_branch(
+        repo,
+        "claude/a",
+        {"inst/modeldb/A_2020_a.R": "# A\n", "inst/modeldb/Old_2019_o.R": "# old, fixed\n"},
+        "Add A",
+    )
+    push_task_branch(repo, "claude/b", {"inst/modeldb/sub/B_2021_b.R": "# B\n"}, "Add B")
+    log, fail = tmp_path / "r.log", tmp_path / "fail-precheck"
+    fail.touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "Rscript").write_text(_stub_rscript(log, fail))
+    (bin_dir / "Rscript").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    proc = run(
+        "bash",
+        MERGE_BRANCHES,
+        "--repo",
+        repo,
+        "--yes",
+        "--skip-check",
+        "--skip-vignettes",
+        "--skip-push",
+        "--branch-name",
+        "consolidation",
+        env=env,
+    )
+    assert proc.returncode == 5, proc.stdout + proc.stderr
+    assert log.read_text() == (
+        "precheck\n  inst/modeldb/A_2020_a.R\n  inst/modeldb/Old_2019_o.R\n"
+        "  inst/modeldb/sub/B_2021_b.R\n"
+    )
+    assert "==> Pre-checking the registers and the 3 model(s) the merge added or changed\n" in (
+        proc.stdout
+    )
+    wt = repo / ".worktrees" / "consolidation"
+    finish = (
+        f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(repo))}"
+        " --branch-name consolidation --finish"
+    )
+    assert proc.stderr.endswith(
+        "ERROR: the pre-check found what buildModelDb would stop on (listed above): a\n"
+        "  canonical registered twice, or a convention error in a model the merge added\n"
+        f"  or changed. Fix it in {wt} and commit, then run\n"
+        f"     {finish}\n"
+        "  which runs the pre-check and the regeneration again.\n"
+    )
+    fail.unlink()
+    log.unlink()
+    done = run(*shlex.split(finish), env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert log.read_text().splitlines()[0] == "precheck"
+    assert log.read_text().splitlines()[-1] == "regen"
+    assert git(wt, "status", "--porcelain") == ""

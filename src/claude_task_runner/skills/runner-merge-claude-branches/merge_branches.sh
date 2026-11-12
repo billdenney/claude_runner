@@ -8,17 +8,24 @@
 #   3. Sequential merge with -X theirs
 #   4. Resurrected-path guard (re-remove files the base deleted that a
 #      stale branch brought back via -X theirs)
-#   5. Register repairs: union-merge of covariate-columns.md (recovers the
+#   5. Register repairs: union-merge of the Example-models fields of
+#      covariate-columns.md and of every register file (recovers the
 #      annotations -X theirs would have lost), dedup of duplicate canonical
 #      headers, restore of dropped canonical blocks, then the contribution
 #      verifier: a loss it reports goes into the hand-union report and stops
 #      the run before the push (step 10), unless --accept-verifier-losses.
 #      Every repair and verify step reads only the merge set: the branches
 #      this run merged, each at the commit it merged (merge_set.py).
-#   6. Union-merge of NEWS.md, then the revert check: register content the
-#      base has that the merge lost and no merged branch removed stops the
-#      run (verify_no_base_reverts.py)
-#   7. R-side registry regeneration (buildModelDb + document)
+#   6. Union-merge of NEWS.md, then the line check: a line a merged branch
+#      added to a register or NEWS.md that the result lacks goes into the
+#      hand-union report and stops the run before the push, unless
+#      --accept-line-losses (verify_added_lines.py). Then the revert check:
+#      register content the base has that the merge lost and no merged branch
+#      removed stops the run (verify_no_base_reverts.py)
+#   7. R-side registry regeneration (buildModelDb + document), after a
+#      pre-check that stops the run early on what buildModelDb would stop
+#      on: a canonical registered twice in any register, or a convention
+#      error in a model the merge added or changed (precheck_regen.R)
 #   8. devtools::check pre-push gate
 #   9. Parallel vignette validation pre-push gate
 #  10. Push branch + print PR title/body. When a repair set wording aside
@@ -36,6 +43,13 @@
 #      stopped before its repairs completed (a repair that crashed,
 #      duplicates left after the dedup, a verifier that could not run)
 #      cannot be completed: re-run it on a fresh --branch-name.
+#
+# A fold-in round (--fold-in) merges branches pushed since into the
+# consolidation branch a run made, in its worktree, and runs steps 1 and 3-10
+# again with the branch's tip as the base: the repairs rebuild NEWS.md and the
+# registers from the consolidation's own copies plus what the new branches
+# added, and the gates check the new branches' contributions and every line
+# of the consolidation the round's merges lost.
 #
 # Usage:
 #   merge_branches.sh [OPTIONS]
@@ -80,8 +94,12 @@
 #                           losses; a branch it finds whole needs no flag. On
 #                           a run: print a WARNING for each instead of
 #                           recording it and stopping before the push.
-#   --skip-r-regen          Skip step 7 (buildModelDb / document). Use when
-#                           merging into a repo that doesn't have these.
+#   --accept-line-losses    Accept the lines a merged branch added that the line
+#                           check reports missing from a register or NEWS.md,
+#                           as --accept-verifier-losses does for the verifier's.
+#   --skip-r-regen          Skip step 7 (the pre-check, buildModelDb and
+#                           document). Use when merging into a repo that
+#                           doesn't have these.
 #   --skip-check            Skip step 8 (devtools::check). Use for fast
 #                           iteration; the operator runs check separately.
 #   --skip-vignettes        Skip step 9 (parallel vignette validation).
@@ -115,10 +133,11 @@
 #                           changes or untracked files, listing them. It
 #                           prints a pending hand-union report and stops
 #                           (exit 9) unless --hand-union-done is given;
-#                           runs the duplicate check, the revert check and the
-#                           contribution verifier, stopping (exit 9) while the
-#                           verifier reports a loss unless
-#                           --accept-verifier-losses; then runs, each unless
+#                           runs the duplicate check, the revert check, the
+#                           contribution verifier and the line check, stopping
+#                           (exit 9) while either reports a loss unless
+#                           --accept-verifier-losses or --accept-line-losses
+#                           accepts it; then runs, each unless
 #                           skipped, the regeneration and check if they never
 #                           completed or HEAD has moved since they did, and
 #                           the vignettes if they never completed or a commit
@@ -130,7 +149,27 @@
 #                           worked through -- its wording unioned into the
 #                           register and committed, any contribution it lists
 #                           as missing reconciled -- so --finish goes on to
-#                           its gates rather than stopping at the report.
+#                           its gates rather than stopping at the report. With
+#                           --fold-in: the same, for the report of the round
+#                           before, when no --finish confirmed it.
+#   --fold-in               Merge the branches pushed since into the existing
+#                           consolidation worktree of --branch-name, as a new
+#                           round whose base is the branch's tip: survey the
+#                           --pattern branches with commits the branch lacks,
+#                           merge them, run every repair and gate again
+#                           against that tip, the R steps and the push. Reads
+#                           --pattern, --union-file, the register files and
+#                           --extra-ref from the round before (the given
+#                           --extra-ref values are added; a conflicting other
+#                           input exits 2); --base, when given, must be the
+#                           base the PR text counts from. --exclude-ref
+#                           applies to this round only. Needs a clean worktree
+#                           whose round completed its repairs (exit 3), and
+#                           stops (exit 9) while the round before left a
+#                           hand-union report no --finish --hand-union-done
+#                           confirmed, unless --hand-union-done is given. A
+#                           round that stops is completed with --finish, as a
+#                           run is.
 #   --dry-run               Print the survey and exit before creating the worktree.
 #   --yes                   Don't prompt; assume yes to "create worktree".
 #                           Required when stdin is not a terminal, as in an
@@ -143,34 +182,40 @@
 #      operator answering no at the prompt
 #   1  an unexpected command failure
 #   2  bad arguments: an unknown flag, a flag missing its value, a
-#      non-numeric --vignette-jobs / --vignette-timeout, or, for --finish,
-#      an input that conflicts with the one the run recorded
+#      non-numeric --vignette-jobs / --vignette-timeout, --finish with
+#      --fold-in, or, for --finish or --fold-in, an input that conflicts with
+#      the one the run recorded
 #   3  pre-flight failure: --repo is not a git working tree, python3 missing,
 #      Rscript missing while an R step is enabled, git fetch failed, --base or
 #      an --extra-ref does not resolve, no branch matched, a survey diff
 #      failed (no merge base, or a shallow clone), no --yes without a
-#      terminal, or the worktree already exists; for --finish, no worktree,
-#      a worktree on another branch, one with uncommitted changes or
-#      untracked files, no recorded inputs, a run that stopped before its
-#      repairs completed, a merged commit missing from the objects, or no
-#      Rscript while an R step is still pending
-#   4  nothing merged: two branches add one path with different content (the
-#      survey stops before merging), or every merge failed
+#      terminal, or the worktree already exists; for --finish or --fold-in, no
+#      worktree, a worktree on another branch, one with uncommitted changes or
+#      untracked files, or a run that stopped before its repairs completed;
+#      for --finish, no recorded inputs, a merged commit missing from the
+#      objects, or no Rscript while an R step is still pending
+#   4  nothing merged: two branches add one path with different content, or
+#      on --fold-in a branch adds a path the consolidation has with other
+#      content (the survey stops before merging), or every merge failed
 #   5  a repair or verification step failed: a union-merge, dedup or restore
 #      script crashed, duplicate canonical headers survived dedup (or a
 #      register on --base is missing from the worktree at --finish), the
-#      verifier could not run, the revert check found base content the merge
-#      reverted (or could not run), or the R registry regeneration failed
+#      verifier or the line check could not run, the revert check found base
+#      content the merge reverted (or could not run), the pre-check found a
+#      duplicate canonical or a convention error (or could not run), or the R
+#      registry regeneration failed
 #   6  devtools::check failed
 #   7  push failed
 #   8  parallel vignette validation failed, or the validator could not run
-#   9  a hand union is needed: a repair set wording aside, or the verifier
-#      reported a contribution missing, and every step but the push ran; the
-#      message names the worktree, the report of what the register lacks, and
-#      the --finish command to run once the hand union is committed. --finish
-#      also exits 9 while that report holds anything and --hand-union-done is
-#      not given, or while the verifier it runs still reports a loss and
-#      --accept-verifier-losses is not given.
+#   9  a hand union is needed: a repair set wording aside, or the verifier or
+#      the line check reported a contribution missing, and every step but the
+#      push ran; the message names the worktree, the report of what the
+#      register lacks, and the --finish command to run once the hand union is
+#      committed. --finish also exits 9 while that report holds anything and
+#      --hand-union-done is not given, or while the verifier or the line check
+#      it runs still reports a loss and --accept-verifier-losses or
+#      --accept-line-losses is not given. --fold-in exits 9 before merging
+#      while the round before left a report no --hand-union-done confirmed.
 set -Eeuo pipefail
 # errtrace (-E): functions and subshells inherit the ERR trap, so a command
 # that fails inside a function is reported and exits 1 like one at the top
@@ -185,6 +230,9 @@ trap 'remind_hand_union $?' EXIT
 trap 'interrupted 130' INT
 trap 'interrupted 143' TERM
 HAND_UNION_REPORT=""
+# The hand-union report as the repairs left it, before any gate added to it:
+# what the line check leaves to the hand union (verify_lines).
+REPAIRS_REPORT=""
 # Which of steps 7-9 the run skipped, and the commit each completed at
 # (stage_get); kept in the worktree's git directory for --finish.
 STAGES_FILE=""
@@ -198,7 +246,12 @@ PATTERN_GIVEN=0
 UNION_FILE_GIVEN=0
 REGISTERS_GIVEN=0
 VERIFY_LOSS_FILES=()
+LINE_LOSSES=0
 HAND_UNION_DONE=0
+# --fold-in: the consolidation's tip the round started from (the round's
+# base), and the base the PR text counts the whole branch from.
+FOLD_BASE=""
+PR_BASE=""
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -228,7 +281,9 @@ VIGNETTE_TIMEOUT=$DEFAULT_VIGNETTE_TIMEOUT
 VIGNETTE_JOBS_GIVEN=0
 SKIP_PUSH=0
 ACCEPT_VERIFIER_LOSSES=0
+ACCEPT_LINE_LOSSES=0
 FINISH=0
+FOLD_IN=0
 DRY_RUN=0
 ASSUME_YES=0
 EXTRA_REFS=()
@@ -367,6 +422,7 @@ record_inputs() {  # the gates' inputs and every ref merged, at the commit merge
   local item
   {
     printf 'base\t%s\n' "$BASE"
+    printf 'pr-base\t%s\n' "$PR_BASE"
     printf 'pattern\t%s\n' "$PATTERN"
     printf 'union-file\t%s\n' "$UNION_FILE"
     for item in "${EXTRA_REFS[@]:-}"; do
@@ -385,45 +441,74 @@ same_list() {  # <a> <b>: two newline-separated lists hold the same items
   [[ "$(printf '%s\n' "$1" | sort)" == "$(printf '%s\n' "$2" | sort)" ]]
 }
 
-read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given here is refused
-  local key value sha base="" pattern="" union="" extras=() registers=() given
-  [[ -s "$INPUTS_FILE" ]] \
-    || die 3 "--finish: $WT_ABS has no recorded inputs: its run stopped before its merges completed. Re-run on a fresh --branch-name."
+read_inputs() {  # <--finish|--fold-in>: the recorded inputs; a conflicting one given here is refused
+  local mode=$1 key value sha base="" pr_base="" pattern="" union="" extras=() registers=() given
+  if [[ ! -s "$INPUTS_FILE" ]]; then
+    die 3 "$mode: $WT_ABS has no recorded inputs: its run stopped before its merges completed. Re-run on a fresh --branch-name."
+  fi
   while IFS=$'\t' read -r key value sha; do
     case "$key" in
       base) base=$value ;;
+      pr-base) pr_base=$value ;;
       pattern) pattern=$value ;;
       union-file) union=$value ;;
       extra-ref) extras+=("$value") ;;
       register-file) registers+=("$value") ;;
       merged)
-        if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+        if [[ "$mode" == --finish ]] && ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
           die 3 "--finish: the run merged $value at $sha, which is not in this repository's objects; fetch it, then run --finish again."
         fi ;;
     esac
   done < "$INPUTS_FILE"
-  if (( BASE_GIVEN )) && [[ "$BASE" != "$base" ]]; then
+  # A run recorded before the PR base was recorded counted from its base.
+  pr_base=${pr_base:-$base}
+  if [[ "$mode" == --finish ]] && (( BASE_GIVEN )) && [[ "$BASE" != "$base" ]]; then
     die 2 "--finish uses the run's --base '$base'; --base '$BASE' conflicts with it."
   fi
+  if [[ "$mode" == --fold-in ]] && (( BASE_GIVEN )) && [[ "$BASE" != "$pr_base" ]]; then
+    die 2 "--fold-in counts the branch from the run's --base '$pr_base'; --base '$BASE' conflicts with it."
+  fi
   if (( PATTERN_GIVEN )) && [[ "$PATTERN" != "$pattern" ]]; then
-    die 2 "--finish uses the run's --pattern '$pattern'; --pattern '$PATTERN' conflicts with it."
+    die 2 "$mode uses the run's --pattern '$pattern'; --pattern '$PATTERN' conflicts with it."
   fi
   if (( UNION_FILE_GIVEN )) && [[ "$UNION_FILE" != "$union" ]]; then
-    die 2 "--finish uses the run's --union-file '$union'; --union-file '$UNION_FILE' conflicts with it."
+    die 2 "$mode uses the run's --union-file '$union'; --union-file '$UNION_FILE' conflicts with it."
   fi
   given="$(printf '%s\n' "${EXTRA_REFS[@]:-}")"
-  if [[ -n "$given" ]] && ! same_list "$given" "$(printf '%s\n' "${extras[@]:-}")"; then
+  if [[ "$mode" == --finish && -n "$given" ]] && ! same_list "$given" "$(printf '%s\n' "${extras[@]:-}")"; then
     die 2 "--finish uses the run's --extra-ref values ($(join_paths "${extras[@]:-}")); those given conflict with them."
   fi
   if (( REGISTERS_GIVEN )) \
     && ! same_list "$(printf '%s\n' "${REGISTER_FILES[@]:-}")" "$(printf '%s\n' "${registers[@]:-}")"; then
-    die 2 "--finish uses the run's register files ($(join_paths "${registers[@]:-}")); those given conflict with them."
+    die 2 "$mode uses the run's register files ($(join_paths "${registers[@]:-}")); those given conflict with them."
   fi
-  BASE=$base
+  PR_BASE=$pr_base
   PATTERN=$pattern
   UNION_FILE=$union
-  EXTRA_REFS=("${extras[@]}")
   REGISTER_FILES=("${registers[@]}")
+  if [[ "$mode" == --fold-in ]]; then
+    # The round before's extra refs that still resolve (one pruned since has
+    # nothing new to fold in), then any given here. The round's base is the
+    # branch's tip, set by the caller; the earlier rounds' refs are on it.
+    local kept=()
+    for value in "${extras[@]:-}"; do
+      if [[ -n "$value" ]] && git rev-parse --verify --quiet "$value^{commit}" >/dev/null; then
+        kept+=("$value")
+      fi
+    done
+    for value in "${EXTRA_REFS[@]:-}"; do
+      if [[ -n "$value" && " ${kept[*]:-} " != *" $value "* ]]; then kept+=("$value"); fi
+    done
+    EXTRA_REFS=()
+    if (( ${#kept[@]} )); then EXTRA_REFS=("${kept[@]}"); fi
+    EXTRA_REF_ARGS=()
+    for value in "${EXTRA_REFS[@]:-}"; do
+      if [[ -n "$value" ]]; then EXTRA_REF_ARGS+=(--extra-ref "$value"); fi
+    done
+    return 0
+  fi
+  BASE=$base
+  EXTRA_REFS=("${extras[@]}")
   # The gates read each merged ref at the commit recorded for it, so a ref
   # rewritten or pruned since changes nothing; an extra ref gone since is left
   # out of the candidates the gates list.
@@ -436,10 +521,78 @@ read_inputs() {  # --finish: the run's recorded inputs; a conflicting one given 
   done
 }
 
+prepare_fold_in() {  # --fold-in: the consolidation's worktree, and its tip as the round's base
+  local wt=$REPO/.worktrees/${BRANCH_NAME} dirty report stages inputs
+  [[ -d "$wt" ]] \
+    || die 3 "--fold-in: no worktree at $wt; a fold-in adds branches to the consolidation a run made there."
+  [[ "$(git -C "$wt" rev-parse --abbrev-ref HEAD)" == "$BRANCH_NAME" ]] \
+    || die 3 "--fold-in: $wt is not on branch $BRANCH_NAME."
+  dirty="$(git -C "$wt" status --porcelain)"
+  if [[ -n "$dirty" ]]; then
+    {
+      echo "ERROR: --fold-in: $wt has uncommitted changes:"
+      printf '%s\n' "$dirty" | sed 's/^/    /'
+      echo "  Commit what belongs on the branch and discard the rest, then run --fold-in again."
+    } >&2
+    exit 3
+  fi
+  report="$(git -C "$wt" rev-parse --path-format=absolute --git-path hand-union-report.md)"
+  stages="$(git -C "$wt" rev-parse --path-format=absolute --git-path merge-stages)"
+  inputs="$(git -C "$wt" rev-parse --path-format=absolute --git-path merge-inputs)"
+  WT_ABS=$wt
+  STAGES_FILE=$stages
+  INPUTS_FILE=$inputs
+  if [[ -f "$STAGES_FILE" && "$(stage_get repairs)" == pending ]]; then
+    die 3 "--fold-in: the run that made $wt stopped before its repairs completed, so its merges were never repaired; re-run it on a fresh --branch-name."
+  fi
+  if [[ -s "$INPUTS_FILE" ]]; then
+    read_inputs --fold-in
+  else
+    PR_BASE=$BASE
+    echo "    (fold-in) $wt records no inputs; using the flags given, and $PR_BASE as the base the PR text counts from"
+  fi
+  if [[ -s "$report" && "$(stage_get hand-union)" != done ]] && (( ! HAND_UNION_DONE )); then
+    {
+      cat "$report"
+      echo
+      echo "STOP: the round before left the hand-union report above, and no"
+      echo "  --finish --hand-union-done confirmed it:"
+      echo "    $report"
+      echo "  Work it through in $wt and commit (or finish that round first), then run"
+      echo "  --fold-in again with --hand-union-done."
+    } >&2
+    exit 9
+  fi
+  FOLD_BASE="$(git -C "$wt" rev-parse HEAD)"
+  BASE=$FOLD_BASE
+  # The round before's records: until this round sets up its own, a stop says
+  # nothing about finishing that round.
+  STAGES_FILE=""
+  INPUTS_FILE=""
+}
+
 given_flags() {  # the --finish flags given here, for a command printed to resume this one
   local flags=""
   if (( HAND_UNION_DONE )); then flags+=" --hand-union-done"; fi
   if (( ACCEPT_VERIFIER_LOSSES )); then flags+=" --accept-verifier-losses"; fi
+  if (( ACCEPT_LINE_LOSSES )); then flags+=" --accept-line-losses"; fi
+  echo "$flags"
+}
+
+loss_kinds() {  # the losses reported and not accepted, one "  - ..." line each
+  if (( ${#VERIFY_LOSS_FILES[@]} )); then
+    echo "  - the verifier: a model, header or source alias missing from"
+    echo "    $(join_paths "${VERIFY_LOSS_FILES[@]}")"
+  fi
+  if (( LINE_LOSSES )); then
+    echo "  - the line check: lines missing from the result"
+  fi
+}
+
+accept_flags() {  # the flags that accept the losses reported and not accepted
+  local flags=""
+  if (( ${#VERIFY_LOSS_FILES[@]} )); then flags+=" --accept-verifier-losses"; fi
+  if (( LINE_LOSSES )); then flags+=" --accept-line-losses"; fi
   echo "$flags"
 }
 
@@ -533,6 +686,53 @@ verify_contributions() {  # <run|finish>: the contribution verifier on every reg
   done
 }
 
+record_line_losses() {  # <line check output>: into the hand-union report
+  {
+    echo "# Lines missing from the merge result"
+    echo
+    echo "The line check reports each line below, which a merged branch added, missing"
+    echo "from the merge result: a later merge's -X theirs hunk overwrote it, or a repair"
+    echo "reworded it. Put each back, or union it into the line that replaced it, and"
+    echo "commit; --accept-line-losses accepts any you leave."
+    echo
+    echo '````'
+    cat "$1"
+    echo '````'
+    echo
+  } >> "$HAND_UNION_REPORT"
+}
+
+verify_lines() {  # <run|finish>: every line a merged branch added to a register or NEWS.md is in the result
+  local mode=$1 rc=0 out path files=()
+  out="$(git rev-parse --path-format=absolute --git-path line-check-output.txt)"
+  LINE_LOSSES=0
+  for path in "${RESTORE_TARGETS[@]:-}" NEWS.md; do
+    if [[ -n "$path" && -f "$path" ]]; then files+=(--file "$path"); fi
+  done
+  (( ${#files[@]} )) || return 0
+  # Wording a repair already set aside in the report is the hand union's to
+  # settle (--hand-union-done), not a second loss to accept.
+  if [[ -s "$REPAIRS_REPORT" ]]; then files+=(--set-aside "$REPAIRS_REPORT"); fi
+  echo
+  echo "==> Checking that every line a merged branch added is in the result"
+  "$PYTHON3" "$SCRIPT_DIR/verify_added_lines.py" --repo "$REPO" --branch "$BRANCH_NAME" \
+    --base "$BASE" --pattern "$PATTERN" "${EXTRA_REF_ARGS[@]}" \
+    ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} "${files[@]}" | tee "$out" || rc=$?
+  if (( rc == 1 && ACCEPT_LINE_LOSSES )); then
+    echo "WARNING: the line check reported lines a merged branch added missing from the result."
+    echo "         --accept-line-losses: the run goes on. Union them by hand before opening"
+    echo "         the PR, or leave them out on purpose."
+  elif (( rc == 1 )); then
+    LINE_LOSSES=1
+    if [[ "$mode" == run ]]; then
+      record_line_losses "$out"
+      echo "    (lines) the lines missing are in the hand-union report; the run stops before the push."
+    fi
+  elif (( rc != 0 )); then
+    die 5 "verify_added_lines.py could not run (exit $rc)."
+  fi
+}
+
 revert_check() {  # gate: register content the base has that the merge, or a hand edit, lost
   local rf targets=() revert_rc=0
   for rf in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
@@ -561,13 +761,13 @@ revert_check() {  # gate: register content the base has that the merge, or a han
 }
 
 stop_for_hand_union() {
-  if (( ${#VERIFY_LOSS_FILES[@]} )); then
+  if (( ${#VERIFY_LOSS_FILES[@]} || LINE_LOSSES )); then
     {
       echo
-      echo "STOP: every step but the push ran, but the verifier reported a model, header"
-      echo "  or source alias a merged branch added missing from $(join_paths "${VERIFY_LOSS_FILES[@]}"),"
-      echo "  and no repair put it back. Each is in the hand-union report, with any"
-      echo "  wording a repair set aside:"
+      echo "STOP: every step but the push ran, but something a merged branch added is"
+      echo "  missing, and no repair put it back. Reported by"
+      loss_kinds
+      echo "  Each is in the hand-union report, with any wording a repair set aside:"
       echo "    $HAND_UNION_REPORT"
       echo "  (it goes with the worktree, git worktree remove, so copy it to keep it)."
       echo "  1. In the worktree $WT_ABS, reconcile each by hand, union any wording"
@@ -575,7 +775,7 @@ stop_for_hand_union() {
       echo "     commit."
       echo "  2. Then push the branch and print the PR text. --finish runs the checks"
       echo "     again first, and stops while a loss is left unless you add"
-      echo "     --accept-verifier-losses:"
+      echo "    $(accept_flags):"
       echo "     $(finish_command) --hand-union-done"
     } >&2
     exit 9
@@ -611,17 +811,21 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
     fi
   fi
 
-  # Print PR title + body.
+  # Print PR title + body, for the whole branch: on a fold-in round, from the
+  # base the first round started from, not the round's own.
+  local merged
+  merged=$(git log --first-parent --format=%s "$PR_BASE..HEAD" \
+    | grep -c "^Merge branch '.*' into ${BRANCH_NAME}\$" || true)
   PR_TITLE_LIMIT=70
-  NEW_MODELS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
-  ASCII_FIXES=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
-  OTHER_COMMITS=$(git log --no-merges "$BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
+  NEW_MODELS=$(git log --no-merges "$PR_BASE..HEAD" --format='%s' | grep -ciE "Add .* model" || true)
+  ASCII_FIXES=$(git log --no-merges "$PR_BASE..HEAD" --format='%s' | grep -ciE "ASCII|em-dash|non-ASCII" || true)
+  OTHER_COMMITS=$(git log --no-merges "$PR_BASE..HEAD" --format='%s' | grep -civE "Add .* model|ASCII|em-dash|non-ASCII" || true)
 
   # Compose a short title.
   SUFFIX_BITS=()
   [[ "$NEW_MODELS" -gt 0 ]] && SUFFIX_BITS+=("$NEW_MODELS new models")
   [[ "$ASCII_FIXES" -gt 0 ]] && SUFFIX_BITS+=("$ASCII_FIXES ASCII fixes")
-  PR_TITLE="Merge $SUCCESS claude/* branches"
+  PR_TITLE="Merge $merged claude/* branches"
   if [[ ${#SUFFIX_BITS[@]} -gt 0 ]]; then
     PR_TITLE="$PR_TITLE ($(IFS=, ; echo "${SUFFIX_BITS[*]}"))"
   fi
@@ -659,7 +863,7 @@ push_and_report() {  # push the branch (unless --skip-push) and print the PR tex
   cat <<EOF
 ## Summary
 
-Consolidates $SUCCESS unmerged \`claude/<task-id>\` branches from the
+Consolidates $merged unmerged \`claude/<task-id>\` branches from the
 nlmixr2lib popPK ingestion runner queue into one review-ready
 branch.
 
@@ -717,10 +921,44 @@ EOF
   echo "  https://github.com/<org>/<repo>/pull/new/${BRANCH_NAME}"
   echo
   echo "Worktree left at: $WT_ABS"
+  if (( FOLD_IN )); then
+    echo
+    echo "This round folded $SUCCESS branch(es) into $BRANCH_NAME; the PR text above"
+    echo "covers the whole branch. A PR already open for it now has them."
+  fi
   echo
   echo "Source branches were folded in with real merges, so after this PR"
   echo "lands on main they show as \"Merged\" automatically (git branch"
   echo "--merged origin/main lists them). No post-merge advance step needed."
+}
+
+run_precheck() {  # step 7, first: what buildModelDb would stop on, in minutes rather than an hour
+  local models rc=0
+  # The model files this round added or changed, read without rename
+  # detection so a renamed model is checked under its new name.
+  models="$(git rev-parse --path-format=absolute --git-path precheck-models.txt)"
+  git -c core.quotePath=false diff --no-renames --name-only --diff-filter=AM "$BASE" HEAD \
+    -- 'inst/modeldb/*.R' > "$models" \
+    || die 5 "cannot list the models the merge changed: git diff $BASE HEAD failed."
+  echo "==> Pre-checking the registers and the $(grep -c . "$models" || true) model(s) the merge added or changed"
+  Rscript "$SCRIPT_DIR/precheck_regen.R" --worktree "$WT_ABS" --models "$models" 2>&1 || rc=$?
+  if (( rc == 1 )); then
+    {
+      echo "ERROR: the pre-check found what buildModelDb would stop on (listed above): a"
+      echo "  canonical registered twice, or a convention error in a model the merge added"
+      echo "  or changed. Fix it in $WT_ABS and commit, then run"
+      echo "     $(finish_command)"
+      echo "  which runs the pre-check and the regeneration again."
+    } >&2
+    exit 5
+  elif (( rc != 0 )); then
+    {
+      echo "ERROR: the pre-check could not run (exit $rc; its output is above). Fix it, or"
+      echo "  the R library it loads, then run"
+      echo "     $(finish_command)"
+    } >&2
+    exit 5
+  fi
 }
 
 run_regen() {  # step 7: regenerate the registry artifacts and commit them
@@ -740,6 +978,8 @@ run_regen() {  # step 7: regenerate the registry artifacts and commit them
     } >&2
     exit 5
   fi
+  run_precheck
+  echo
   echo "==> Regenerating registry artifacts (Rscript)"
   if ! Rscript -e '
     suppressPackageStartupMessages(library(devtools))
@@ -962,6 +1202,7 @@ while [[ $# -gt 0 ]]; do
     --register-file) need_value "$@"; REGISTER_FILES+=("$2"); REGISTERS_GIVEN=1; shift 2 ;;
     --no-register-files) REGISTER_FILES=(); REGISTERS_GIVEN=1; shift ;;
     --accept-verifier-losses) ACCEPT_VERIFIER_LOSSES=1; shift ;;
+    --accept-line-losses) ACCEPT_LINE_LOSSES=1; shift ;;
     --forbid-path)
       need_value "$@"
       if [[ -z "$2" ]]; then FORBID_PATHS=(); else
@@ -975,6 +1216,7 @@ while [[ $# -gt 0 ]]; do
     --vignette-timeout) need_value "$@"; VIGNETTE_TIMEOUT="$2"; shift 2 ;;
     --skip-push) SKIP_PUSH=1; shift ;;
     --finish) FINISH=1; shift ;;
+    --fold-in) FOLD_IN=1; shift ;;
     --hand-union-done) HAND_UNION_DONE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
@@ -995,8 +1237,11 @@ fi
 [[ "$VIGNETTE_JOBS" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-jobs must be a positive integer, not '$VIGNETTE_JOBS'"
 [[ "$VIGNETTE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 2 "--vignette-timeout must be a positive integer, not '$VIGNETTE_TIMEOUT'"
 
-if (( HAND_UNION_DONE && ! FINISH )); then
-  die 2 "--hand-union-done goes with --finish"
+if (( FINISH && FOLD_IN )); then
+  die 2 "--finish completes a round and --fold-in starts one; give one of them"
+fi
+if (( HAND_UNION_DONE && ! FINISH && ! FOLD_IN )); then
+  die 2 "--hand-union-done goes with --finish or --fold-in"
 fi
 
 # Each input is one line of the recorded inputs (record_inputs), fields split
@@ -1046,9 +1291,10 @@ if (( FINISH )); then
     exit 3
   fi
   HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
+  REPAIRS_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.repairs.md)"
   STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
   INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
-  read_inputs
+  read_inputs --finish
   if [[ "$(stage_get repairs)" == pending ]]; then
     die 3 "--finish: the run that made $WT_ABS stopped before its repairs completed, which --finish does not redo; re-run on a fresh --branch-name."
   fi
@@ -1068,20 +1314,24 @@ if (( FINISH )); then
   fi
   if [[ -s "$HAND_UNION_REPORT" ]]; then
     echo "    hand union confirmed (--hand-union-done); the report stays at $HAND_UNION_REPORT"
+    # So a later --fold-in knows this report was worked through.
+    stage_set hand-union done
   fi
   # The run's gates again, on the branch as the hand edits left it.
   check_no_duplicates
   register_targets
   revert_check
   verify_contributions finish
-  if (( ${#VERIFY_LOSS_FILES[@]} )); then
+  verify_lines finish
+  if (( ${#VERIFY_LOSS_FILES[@]} || LINE_LOSSES )); then
     {
       echo
-      echo "STOP: the verifier still reports a model, header or source alias a merged"
-      echo "  branch added missing from $(join_paths "${VERIFY_LOSS_FILES[@]}") (listed above)."
+      echo "STOP: something a merged branch added is still missing (listed above)."
+      echo "  Reported by"
+      loss_kinds
       echo "  Reconcile each by hand in $WT_ABS and commit, then run --finish again; to"
       echo "  push with what is left, accept it:"
-      echo "     $(finish_command)$( (( HAND_UNION_DONE )) && echo " --hand-union-done") --accept-verifier-losses"
+      echo "     $(finish_command)$(given_flags)$(accept_flags)"
     } >&2
     exit 9
   fi
@@ -1092,17 +1342,29 @@ if (( FINISH )); then
   exit 0
 fi
 
+# A fold-in round's base is the consolidation's tip; the PR text still counts
+# the whole branch, from the base its first round started from.
+if (( FOLD_IN )); then
+  prepare_fold_in
+  BASE_LABEL="$BRANCH_NAME (fold-in)"
+else
+  PR_BASE=$BASE
+  BASE_LABEL=$BASE
+fi
+
 # Fetch so origin refs are current.
-echo "==> Fetching $BASE / source refs (--prune)"
+echo "==> Fetching $BASE_LABEL / source refs (--prune)"
 git fetch origin --prune 2>&1 | tail -5 || die 3 "git fetch origin --prune failed"
 
 # A --base that does not resolve would make every branch "0 ahead" and end the
 # run with "nothing to do".
 git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
+git rev-parse --verify --quiet "$PR_BASE^{commit}" >/dev/null \
+  || die 3 "the base the PR text counts from, '$PR_BASE', does not resolve to a commit"
 
 # Survey.
 echo
-echo "==> Surveying $PATTERN branches with unmerged commits vs $BASE"
+echo "==> Surveying $PATTERN branches with unmerged commits vs $BASE_LABEL"
 echo "    base = $(git rev-parse --short "$BASE")"
 
 # Expand pattern to a concrete list of branches under refs/remotes/,
@@ -1202,12 +1464,24 @@ for br in "${UNMERGED[@]}"; do
   done <<< "$added"
 done
 collisions=0
+same_path=0
 for p in "${!ADDED_BY[@]}"; do
   read -r -a brs <<< "${ADDED_BY[$p]}"
+  # On a fold-in, an earlier round may have merged the path already, from
+  # another branch; -X theirs would replace that copy as silently.
+  if (( FOLD_IN )) && git cat-file -e "$BASE:$p" 2>/dev/null; then
+    have=$(git rev-parse "$BASE:$p")
+    for b in "${brs[@]}"; do
+      if [[ "$(git rev-parse "$b:$p")" != "$have" ]]; then
+        echo "ERROR: $b adds $p, which $BRANCH_NAME already has with other content." >&2
+        collisions=$((collisions + 1))
+      fi
+    done
+  fi
   (( ${#brs[@]} < 2 )) && continue
   nblobs=$(for b in "${brs[@]}"; do git rev-parse "$b:$p"; done | sort -u | wc -l)
   if (( nblobs > 1 )); then
-    (( collisions == 0 )) && echo "ERROR: the same new path is added with different content by more than one branch:" >&2
+    (( same_path++ == 0 )) && echo "ERROR: the same new path is added with different content by more than one branch:" >&2
     echo "    $p  <-  ${brs[*]}" >&2
     collisions=$((collisions + 1))
   fi
@@ -1244,10 +1518,13 @@ if (( ! ASSUME_YES )); then
   esac
 fi
 
-# Create worktree.
+# Create worktree; a fold-in round works in the one its first round made.
 WT_REL=".worktrees/${BRANCH_NAME}"
 WT_ABS="$REPO/$WT_REL"
-if [[ -d "$WT_ABS" ]]; then
+if (( FOLD_IN )); then
+  echo
+  echo "==> Folding into $BRANCH_NAME in $WT_ABS, from its tip ${FOLD_BASE:0:12}"
+elif [[ -d "$WT_ABS" ]]; then
   echo "ERROR: worktree already exists at $WT_ABS" >&2
   pending="$(git -C "$WT_ABS" rev-parse --path-format=absolute --git-path hand-union-report.md 2>/dev/null || true)"
   if [[ -n "$pending" && -s "$pending" ]]; then
@@ -1259,12 +1536,12 @@ if [[ -d "$WT_ABS" ]]; then
   echo "    git -C $REPO worktree remove --force $WT_REL" >&2
   echo "    git -C $REPO branch -D $BRANCH_NAME" >&2
   exit 3
+else
+  mkdir -p .worktrees
+  echo
+  echo "==> Creating worktree $WT_REL on new branch $BRANCH_NAME off $BASE"
+  git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 fi
-
-mkdir -p .worktrees
-echo
-echo "==> Creating worktree $WT_REL on new branch $BRANCH_NAME off $BASE"
-git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 
 # Sequential merge.
 #
@@ -1296,9 +1573,21 @@ git worktree add -b "$BRANCH_NAME" "$WT_REL" "$BASE"
 cd "$WT_ABS"
 # Kept in the worktree's own git directory, so no step can commit it.
 HAND_UNION_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.md)"
+REPAIRS_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-report.repairs.md)"
 STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
 INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
-rm -f "$HAND_UNION_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
+if (( FOLD_IN )); then
+  # The round before's report and inputs stay beside the new round's, named
+  # after the tip this round starts from; the new round's start empty.
+  if [[ -s "$HAND_UNION_REPORT" ]]; then
+    mv "$HAND_UNION_REPORT" "${HAND_UNION_REPORT%.md}.before-${FOLD_BASE:0:12}.md"
+    echo "    the round before's hand-union report is now ${HAND_UNION_REPORT%.md}.before-${FOLD_BASE:0:12}.md"
+  fi
+  if [[ -f "$INPUTS_FILE" ]]; then mv "$INPUTS_FILE" "$INPUTS_FILE.before-${FOLD_BASE:0:12}"; fi
+  # Confirmed for the report just set aside, not for the round's own.
+  HAND_UNION_DONE=0
+fi
+rm -f "$HAND_UNION_REPORT" "$REPAIRS_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
 record_skips
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
@@ -1427,28 +1716,37 @@ fi
 # canonical. Running the regen first therefore aborted the whole pipeline on
 # damage that the very next step exists to repair (observed 2026-08-20:
 # DIS_PH1, ORGVOL_KIDNEY, FORM_ODT, T_FIRSTDOSE). Repair, then regenerate.
-# Union-merge covariate-columns.md (or the configured union-file).
-if [[ -n "$UNION_FILE" ]]; then
+# Union-merge the Example-models fields of covariate-columns.md (the
+# union-file) and of every register file: each register lists models under its
+# canonicals the same way, and -X theirs drops the entries of every branch but
+# the last that edited a field. The union buckets entries by (## section, ###
+# heading), so a token two sections of compartment-names.md both register keeps
+# its entries apart.
+UNIONED=()
+for uf in "$UNION_FILE" "${REGISTER_FILES[@]:-}"; do
+  [[ -n "$uf" ]] || continue
+  [[ " ${UNIONED[*]:-} " == *" $uf "* ]] && continue
+  UNIONED+=("$uf")
   echo
-  echo "==> Union-merging $UNION_FILE"
-  if [[ ! -f "$UNION_FILE" ]]; then
-    echo "    union-file not present on this branch; skipping."
+  echo "==> Union-merging $uf"
+  if [[ ! -f "$uf" ]]; then
+    echo "    not present on this branch; skipping."
   else
     union_args=(
       --repo "$REPO"
       --branch "$BRANCH_NAME"
       --base "$BASE"
       --pattern "$PATTERN"
-      --file "$UNION_FILE"
+      --file "$uf"
     )
     union_args+=("${EXTRA_REF_ARGS[@]}")
     "$PYTHON3" "$SCRIPT_DIR/union_merge_lines.py" "${union_args[@]}" --report "$HAND_UNION_REPORT" \
-      || die 5 "union_merge_lines.py failed on $UNION_FILE"
-    if git diff --quiet -- "$UNION_FILE"; then
+      || die 5 "union_merge_lines.py failed on $uf"
+    if git diff --quiet -- "$uf"; then
       echo "    no diff after union-merge (nothing was lost from -X theirs)."
     else
-      git add "$UNION_FILE"
-      git commit -m "Reconstruct $UNION_FILE: union of all branches' contributions
+      git add "$uf"
+      git commit -m "Reconstruct $uf: union of all branches' contributions
 
 The -X theirs strategy used for the bulk merge clobbers structured-
 markdown lines that multiple branches independently rewrote. This
@@ -1460,7 +1758,7 @@ union-merger script and the procedural rationale." >/dev/null
       echo "    committed union-merge reconstruction"
     fi
   fi
-fi
+done
 
 # Collapse duplicate ### canonical headers the union-merger cannot fix.
 # When two branches each ADD the same brand-new ### CANONICAL block
@@ -1568,6 +1866,8 @@ fi
 # --accept-verifier-losses; given on the run itself, that flag turns each
 # verdict into a WARNING instead. Any other non-zero exit means the verifier
 # could not run at all, and carrying on would ship an unverified merge.
+# The report as the repairs left it, before the verifier adds to it.
+if [[ -s "$HAND_UNION_REPORT" ]]; then cp "$HAND_UNION_REPORT" "$REPAIRS_REPORT"; fi
 verify_contributions run
 
 # Union-merge NEWS.md. It has ONE append point ("# development version"), so
@@ -1590,6 +1890,17 @@ if [[ -f NEWS.md ]]; then
     echo "    committed NEWS.md union"
   fi
 fi
+
+# The line check, after every repair: each line a merged branch added to a
+# register or NEWS.md that the result lacks. A later merge's -X theirs hunk
+# overwrites what an earlier branch added at the same place, a sentence added
+# to a Notes line or a canonical two branches added in different words, and
+# neither the verifier nor the revert check reads those lines. Like the
+# verifier's losses, the lines go to the hand-union report and the run stops
+# before the push, unless --accept-line-losses.
+register_targets
+verify_lines run
+
 # Every repair has run: --finish can complete the run from here, since it
 # runs the gates and the R steps again but none of the repairs.
 stage_set repairs "$(git rev-parse HEAD)"

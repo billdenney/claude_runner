@@ -21,9 +21,11 @@ description: |
     * all eligible ``claude/*`` branches merged in
     * registry artifacts regenerated via R (data/modeldb.rda,
       inst/modeldb.qs2, man/*.Rd, _pkgdown.yml navbar)
-    * inst/references/covariate-columns.md union-merged so per-
-      branch annotations are preserved (the structured-markdown
-      file that ``-X theirs`` clobbers)
+    * the Example-models fields of inst/references/covariate-columns.md
+      and the other registers union-merged so per-branch annotations
+      are preserved (the structured-markdown files that ``-X theirs``
+      clobbers)
+    * later branches folded into the same branch with ``--fold-in``
     * branch pushed to origin
     * suggested PR title + body printed for the operator to open
       manually via the GitHub web UI (the user's ``gh`` CLI is
@@ -47,7 +49,9 @@ bash /home/bill/.claude/skills/runner-merge-claude-branches/merge_branches.sh \
     --branch-name "merge-all-claude-branches-$(date +%F)"
 ```
 
-That single command runs the entire end-to-end pipeline. The survey aborts
+That single command runs the entire end-to-end pipeline; branches pushed after
+it are folded into the same branch with `--fold-in` (see "Fold-in rounds"
+below). The survey aborts
 (exit 4) when two branches add a file at the same path with different content,
 because `-X theirs` would silently keep only the last one; reletter one branch's
 files (`<Author>_<Year>a_` / `<Year>b_`) or exclude it. `--exclude-ref`
@@ -64,10 +68,11 @@ has confirmed the scope (step 2): without it the script stops at its
 confirmation prompt with exit 3 and creates nothing. `merge_branches.sh --help`
 prints every flag and exit code. Each exit code has one meaning; the ones that
 stop a run partway are 5 (a repair or verification step failed, the verifier
-could not run, or the revert check found base content the merge reverted),
+or the line check could not run, the revert check found base content the
+merge reverted, or the pre-check found what `buildModelDb()` would stop on),
 6 (`devtools::check`), 7 (push), 8 (vignettes) and 9 (a hand union is needed
-before the push, for wording a repair set aside or a loss the verifier
-reported, steps 6b and 7). A run whose repairs completed is completed from
+before the push, for wording a repair set aside or a loss the verifier or the
+line check reported, steps 6b, 6e and 7). A run whose repairs completed is completed from
 the same worktree by the `--finish` command its stop prints: it runs the
 gates again on the branch and every R step that is not up to date, then
 pushes (step 6b). A run that stopped before its repairs completed is re-run
@@ -149,7 +154,7 @@ one `<ref> <merged commit> <fork point>` line each.
 
 **ORDER NOTE (changed 2026-08-20).** The register repairs (steps 6, 6b, 6c,
 6d) now run BEFORE the R regeneration (step 5 below), not after, and so do the
-verifier (step 7) and the revert check (step 7b).
+line check (step 6e), the verifier (step 7) and the revert check (step 7b).
 `buildModelDb()` calls `checkModelConventions()`, which treats a duplicate
 register entry as an ERROR -- and duplicate entries are exactly what `-X
 theirs` produces when two branches each add the same new canonical. Running
@@ -161,6 +166,31 @@ exists to repair. Repair, then regenerate.
    ```bash
    Rscript -e 'devtools::load_all("."); nlmixr2lib:::buildModelDb(); devtools::document()'
    ```
+
+   **Pre-check first** (`precheck_regen.R`). A cold `buildModelDb()` parses
+   every model, about an hour, and raises its convention errors only at the
+   end. Before it starts, the script loads the worktree's package with
+   `pkgload::load_all()` and runs, in minutes, the two checks that stop it:
+
+   - the package's own `.referenceDuplicateIssues()` over every
+     `inst/references/*.md`, as `buildModelDb()` runs it: a canonical
+     registered twice under one `- **Type:**` anywhere in a register. It
+     reads each register whole, so it finds a canonical filed under two `##`
+     sections (`carboplatin` as a suffix twice), which the per-section dedup
+     of compartment-names.md and parameter-names.md (step 6b) cannot;
+   - `checkModelConventions()` over each model file the round added or
+     changed (`git diff --diff-filter=AM` from the base, renames read as
+     additions), each loaded with the calls `addFileToModelDb()` makes, so
+     the model name the covariate checks see, and the verdict, is the
+     build's. A parse failure or a model named unlike its file counts too.
+
+   An error stops the run (exit 5) before the regeneration, listing each
+   duplicate and each model's errors, with the `--finish` command that runs
+   the pre-check and the regeneration again once the fix is committed. A
+   package without `buildModelDb()` has nothing to check; a check function
+   the package lacks is skipped with a warning, since `buildModelDb()` still
+   enforces whatever the package has. The pre-check is part of the
+   regeneration step, so `--skip-r-regen` skips it too.
 
    - `buildModelDb()` writes the registry blob (`data/modeldb.rda` plus
      whichever of `inst/modeldb.rds` / `inst/modeldb.qs2` the package
@@ -176,8 +206,15 @@ exists to repair. Repair, then regenerate.
    exist and never staged the one that did, which would have pushed a
    registry blob stale against 181 new model files.
 
-6. **Union-merge covariate-columns.md** via
-   `union_merge_lines.py`. This script:
+6. **Union-merge the Example-models fields** of covariate-columns.md and of
+   every `--register-file` (compartment-names.md and parameter-names.md by
+   default) via `union_merge_lines.py`, one commit per file it changes. Each
+   register lists models under its canonicals the same way, and `-X theirs`
+   drops the entries of every branch but the last that edited a field. The
+   union buckets entries by (`##` section, `###` heading), so a token two
+   sections of compartment-names.md both register (a compartment and a
+   suffix) keeps its entries apart, and the per-section dedup that follows
+   finds no duplicate it made. This script:
    - Reads each branch in the merge set whose own diff touched the file, at
      its merged commit.
    - Takes from each branch only the `**Example models:**` entries it added,
@@ -410,6 +447,42 @@ exists to repair. Repair, then regenerate.
    inherited bullets, or a fifth of them, stops the run (exit 2, so
    `merge_branches.sh` exits 5): that is a truncated file, not deliberate
    deletions.
+
+6e. **Line check** via `verify_added_lines.py`, on the union file, every
+   register file and NEWS.md, after the NEWS union. When two branches add
+   lines at the same place, `-X theirs` keeps the later merge's hunk and the
+   earlier branch's lines vanish: sentences several branches appended to one
+   canonical's Notes line, of which only the last survives, or a canonical
+   two branches added in different words at the same place, of which only
+   the later copy survives under the same heading. The revert check (7b)
+   guards only the base's content, the restore (6c) only blocks whose every
+   name vanished, and the verifier (7) reads filenames, headings and aliases;
+   none of them reads those lines.
+
+   For each branch in the merge set whose own diff touched the file, every
+   non-blank line its merged commit has and its fork point lacks must be in
+   the result. A line counts as kept when the result has it, or when one
+   result line of the same field (`- **Notes:**`, say) holds each of its
+   sentences, so a hand union that joins two branches' sentences into one
+   line keeps both. Example-models lines are compared entry by entry, since
+   the union rewrites them: each entry the branch added, or whose note it
+   changed, must be filed under a heading that declares one of its heading's
+   names, in any section, with a note that says at least what the branch's
+   says. Wording a repair already set aside in the hand-union report (6b,
+   6c, 6) is counted, not reported: `--hand-union-done` is the decision for
+   it.
+
+   Each loss goes to the hand-union report and the run stops before the push
+   (exit 9), the way the verifier's losses do; `--finish` runs the check
+   again and stops while a loss is left, unless `--accept-line-losses`
+   accepts what is left. Given on the run itself, `--accept-line-losses`
+   turns each loss into a WARNING. A hand union that rewords a branch's line
+   keeps it reported until it is accepted: that is the decision the report
+   asks for. A line identical to one elsewhere in the register
+   (`- **Type:** covariate`) always counts as present; the check reads
+   lines, not blocks. Exit 2 (it could not run) stops the run with exit 5.
+
+   Regression tests: `tests/unit/test_verify_added_lines.py`.
 
 7. **Verify no contributions were lost.** Run
    `verify_branch_contributions.sh`, which now applies THREE checks per
@@ -820,8 +893,53 @@ errors or new warnings (beyond the pre-existing `.git` NOTE):
 
 ### When new claude/* branches appear during the merge
 
-Unlikely but possible: a long-running queue could push a new
-branch while this skill is running. The pre-flight survey
-captures the initial set; new branches are not auto-included
-during execution. Re-run the skill for a fresh consolidation
-round if needed.
+The pre-flight survey captures the initial set; branches pushed later are
+not included in that run. Fold them into the same branch with `--fold-in`
+(next section) rather than merging them by hand.
+
+## Fold-in rounds
+
+```bash
+bash /home/bill/.claude/skills/runner-merge-claude-branches/merge_branches.sh \
+    --repo /home/bill/github/nlmixr2/nlmixr2lib \
+    --branch-name merge-all-claude-branches-<date> --fold-in --yes
+```
+
+A late branch forks from main, not from the consolidation, so `-X theirs`
+resolves its NEWS.md hunk to main's development-version block plus its own
+bullet, dropping every bullet the consolidation added, and resolves a
+register line it also edited to main's line plus its own addition. A fold-in
+round is a round whose base is the consolidation's tip (recorded as the
+round's `--base`):
+
+- it surveys the `--pattern` branches with commits the consolidation lacks
+  (a branch merged in an earlier round and pushed to since included), and
+  stops (exit 4) when one adds a model or vignette path the consolidation
+  already has with other content, as well as on the usual same-path
+  collision;
+- it merges them in the existing worktree, then runs every repair against
+  the tip: the NEWS union rebuilds NEWS.md from the consolidation's own copy
+  plus the bullets the new branches added, the register union puts back the
+  entries the new merges dropped, and the dedup keeps the consolidation's
+  copy of a canonical;
+- the gates check the new branches' contributions (verifier, line check)
+  and every line of the consolidation the round's merges lost (the revert
+  check, whose base is now the consolidation's tip), then the pre-check,
+  the R steps and the push run as on a first round, and the PR text counts
+  the whole branch from the first round's `--base`.
+
+It reads `--pattern`, `--union-file`, the register files and `--extra-ref`
+from the round before (a given `--extra-ref` is added; another input that
+conflicts exits 2), so the command needs only `--repo` and `--branch-name`.
+`--exclude-ref` applies to the round it is given on: give it again. The
+worktree must be clean and its round's repairs complete (exit 3). A
+hand-union report the round before left stops the fold-in (exit 9) until it
+is worked through: `--finish --hand-union-done` on that round records that,
+or pass `--hand-union-done` to the fold-in. The round before's report and
+recorded inputs are kept in the worktree's git directory as
+`hand-union-report.before-<tip>.md` and `merge-inputs.before-<tip>`; the new
+round's start empty. A fold-in round that stops is completed with `--finish`,
+as a first round is.
+
+Regression tests: `tests/unit/test_merge_fold_in.py`, and the fold-in case
+in `tests/unit/test_union_merge_news.py`.

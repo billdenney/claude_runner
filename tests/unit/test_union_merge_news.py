@@ -392,3 +392,38 @@ class TestWhatABranchDidToInheritedBullets:
         assert proc.returncode == 2, proc.stdout
         assert "origin/claude/trunc deletes 13 of its 15 inherited bullets" in proc.stderr
         assert "# rebuilt" not in proc.stdout, "it must stop before rewriting NEWS.md"
+
+
+def test_a_fold_in_round_keeps_the_bullets_the_consolidation_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late branch cut from main, merged into a consolidation whose NEWS.md
+    already has claude/a's and claude/b's bullets: -X theirs takes main's
+    development-version block plus the late bullet. With the consolidation's
+    tip as the base, the union puts the late bullet on the consolidation's
+    copy and loses none of it."""
+    repo = new_repo(tmp_path, monkeypatch, {"NEWS.md": BASE_NEWS})
+
+    def news_with(bullet: str) -> str:
+        return BASE_NEWS.replace("\n\n", f"\n\n{bullet}\n\n", 1)
+
+    for name in ("a", "b", "late"):
+        push_task_branch(
+            repo, f"claude/{name}", {"NEWS.md": news_with(f"- Add {name} 2020 x model.")}, name
+        )
+    wt = consolidate(repo, ["origin/claude/a", "origin/claude/b"], "fold")
+    first = run_helper("union_merge_news.py", "--repo", repo, "--branch", "fold")
+    assert first.returncode == 0, first.stdout + first.stderr
+    git(wt, "commit", "-qam", "Union-merge NEWS.md")
+    consolidated = (wt / "NEWS.md").read_text()
+    assert "- Add a 2020 x model." in consolidated and "- Add b 2020 x model." in consolidated
+    tip = git(wt, "rev-parse", "HEAD").strip()
+    git(wt, "merge", "-q", "--no-ff", "--no-edit", "-X", "theirs", "origin/claude/late")
+    assert (wt / "NEWS.md").read_text() == news_with("- Add late 2020 x model."), (
+        "the fixture did not reproduce the loss"
+    )
+    proc = run_helper("union_merge_news.py", "--repo", repo, "--branch", "fold", "--base", tip)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (wt / "NEWS.md").read_text() == consolidated.replace(
+        "# development version\n", "# development version\n\n- Add late 2020 x model.\n", 1
+    )

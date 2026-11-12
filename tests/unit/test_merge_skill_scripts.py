@@ -285,13 +285,15 @@ class TestMergeBranches:
         )
         assert "\nUsage:\n  merge_branches.sh [OPTIONS]\n" in proc.stdout
         assert proc.stdout.endswith(
-            "  9  a hand union is needed: a repair set wording aside, or the verifier\n"
-            "     reported a contribution missing, and every step but the push ran; the\n"
-            "     message names the worktree, the report of what the register lacks, and\n"
-            "     the --finish command to run once the hand union is committed. --finish\n"
-            "     also exits 9 while that report holds anything and --hand-union-done is\n"
-            "     not given, or while the verifier it runs still reports a loss and\n"
-            "     --accept-verifier-losses is not given.\n"
+            "  9  a hand union is needed: a repair set wording aside, or the verifier or\n"
+            "     the line check reported a contribution missing, and every step but the\n"
+            "     push ran; the message names the worktree, the report of what the\n"
+            "     register lacks, and the --finish command to run once the hand union is\n"
+            "     committed. --finish also exits 9 while that report holds anything and\n"
+            "     --hand-union-done is not given, or while the verifier or the line check\n"
+            "     it runs still reports a loss and --accept-verifier-losses or\n"
+            "     --accept-line-losses is not given. --fold-in exits 9 before merging\n"
+            "     while the round before left a report no --hand-union-done confirmed.\n"
         )
 
     def test_unknown_argument_exits_2(self) -> None:
@@ -603,7 +605,9 @@ class TestMergeBranches:
             push_task_branch(repo, f"claude/{name}", files, f"Register LKST ({name})")
 
     @staticmethod
-    def _loss_stop(repo: Path, files: str) -> str:
+    def _loss_stop(repo: Path, files: str | None, lines: bool = True) -> str:
+        """The STOP for losses the verifier reports from ``files`` (None: none)
+        and, with ``lines``, the line check."""
         wt = repo / ".worktrees" / CONSOLIDATION
         report = git(
             wt, "rev-parse", "--path-format=absolute", "--git-path", "hand-union-report.md"
@@ -612,12 +616,21 @@ class TestMergeBranches:
             f"bash {shlex.quote(str(MERGE_BRANCHES))} --repo {shlex.quote(str(repo))}"
             f" --branch-name {CONSOLIDATION} --finish"
         )
+        kinds = accept = ""
+        if files is not None:
+            kinds += (
+                f"  - the verifier: a model, header or source alias missing from\n    {files}\n"
+            )
+            accept += " --accept-verifier-losses"
+        if lines:
+            kinds += "  - the line check: lines missing from the result\n"
+            accept += " --accept-line-losses"
         return (
             "\n"
-            "STOP: every step but the push ran, but the verifier reported a model, header\n"
-            f"  or source alias a merged branch added missing from {files},\n"
-            "  and no repair put it back. Each is in the hand-union report, with any\n"
-            "  wording a repair set aside:\n"
+            "STOP: every step but the push ran, but something a merged branch added is\n"
+            "  missing, and no repair put it back. Reported by\n"
+            f"{kinds}"
+            "  Each is in the hand-union report, with any wording a repair set aside:\n"
             f"    {report.strip()}\n"
             "  (it goes with the worktree, git worktree remove, so copy it to keep it).\n"
             f"  1. In the worktree {wt}, reconcile each by hand, union any wording\n"
@@ -625,7 +638,7 @@ class TestMergeBranches:
             "     commit.\n"
             "  2. Then push the branch and print the PR text. --finish runs the checks\n"
             "     again first, and stops while a loss is left unless you add\n"
-            "     --accept-verifier-losses:\n"
+            f"    {accept}:\n"
             f"     {finish} --hand-union-done\n"
         )
 
@@ -633,10 +646,11 @@ class TestMergeBranches:
     def test_a_loss_the_repairs_cannot_fix_stops_before_the_push_unless_accepted(
         self, repo: Path, tmp_path: Path, accept: bool
     ) -> None:
-        """The loss goes to the hand-union report and every later step runs;
-        the run stops before the push, with the worktree and its branch kept.
-        With --accept-verifier-losses the loss is a warning and the run
-        finishes."""
+        """The loss goes to the hand-union report, from the verifier and from
+        the line check, and every later step runs; the run stops before the
+        push, with the worktree and its branch kept. With
+        --accept-verifier-losses and --accept-line-losses each is a warning and
+        the run finishes."""
         self._lose_lkst(repo)
         proc = self._full_run(
             repo,
@@ -646,7 +660,7 @@ class TestMergeBranches:
             "origin/claude/a",
             "--exclude-ref",
             "origin/claude/b",
-            *(["--accept-verifier-losses"] if accept else []),
+            *(["--accept-verifier-losses", "--accept-line-losses"] if accept else []),
         )
         wt = repo / ".worktrees" / CONSOLIDATION
         report = Path(
@@ -656,14 +670,23 @@ class TestMergeBranches:
         )
         assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in proc.stdout
         assert "==> Checking the registers for base content the merge reverted\n" in proc.stdout
+        lines_lost = (
+            f"ERROR: (lines) 2 line(s) a merged branch added are missing from {REGISTER}:\n"
+            "    [claude/a2] ## Section from a2\n"
+            "    [claude/a2] Example models of Section from a2 / LKST: `A2_2020_x.R` (a2)\n"
+        )
+        assert lines_lost in proc.stdout
         warning = f"WARNING: verifier reported missing contributions in {REGISTER}.\n"
+        line_warning = "WARNING: the line check reported lines a merged branch added missing from the result.\n"
         if accept:
             assert proc.returncode == 0, proc.stdout + proc.stderr
             assert warning in proc.stdout
-            assert not report.exists() or "Contributions missing" not in report.read_text()
+            assert line_warning in proc.stdout
+            assert not report.exists() or "missing" not in report.read_text()
             return
         assert proc.returncode == 9, proc.stdout + proc.stderr
         assert warning not in proc.stdout
+        assert line_warning not in proc.stdout
         assert (
             f"    (verifier) the contributions missing from {REGISTER} are in the hand-union"
             " report; the run stops before the push.\n"
@@ -682,6 +705,17 @@ class TestMergeBranches:
             "````\n"
         )
         assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in text
+        assert (
+            "# Lines missing from the merge result\n"
+            "\n"
+            "The line check reports each line below, which a merged branch added, missing\n"
+            "from the merge result: a later merge's -X theirs hunk overwrote it, or a repair\n"
+            "reworded it. Put each back, or union it into the line that replaced it, and\n"
+            "commit; --accept-line-losses accepts any you leave.\n"
+            "\n"
+            "````\n"
+        ) in text
+        assert lines_lost in text
         assert wt.is_dir()
         assert git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{CONSOLIDATION}")
 
@@ -710,9 +744,10 @@ class TestMergeBranches:
         return proc, finish
 
     def test_finish_pushes_past_a_loss_left_only_when_accepted(self, repo: Path) -> None:
-        """--finish re-runs the verifier: while it still reports the loss,
-        --finish stops, without --hand-union-done and with it, and prints the
-        command with --accept-verifier-losses, which pushes."""
+        """--finish re-runs the verifier and the line check: while either
+        still reports the loss, --finish stops, without --hand-union-done and
+        with it, and prints the command with the flags that accept what is
+        left; accepting only the verifier's losses still stops it."""
         proc, finish = self._stop_on_lost_lkst(repo)
         unconfirmed = run(*finish[:-1])
         assert unconfirmed.returncode == 9, unconfirmed.stdout + unconfirmed.stderr
@@ -722,15 +757,28 @@ class TestMergeBranches:
         assert "    LKST  <-  A2_2020_x.R   (from claude/a2)\n" in left.stdout
         printed = proc.stderr.rstrip("\n").splitlines()[-1].strip()
         assert left.stderr.endswith(
-            "\nSTOP: the verifier still reports a model, header or source alias a merged\n"
-            f"  branch added missing from {REGISTER} (listed above).\n"
+            "\nSTOP: something a merged branch added is still missing (listed above).\n"
+            "  Reported by\n"
+            "  - the verifier: a model, header or source alias missing from\n"
+            f"    {REGISTER}\n"
+            "  - the line check: lines missing from the result\n"
             f"  Reconcile each by hand in {repo / '.worktrees' / CONSOLIDATION} and commit,"
             " then run --finish again; to\n"
             "  push with what is left, accept it:\n"
-            f"     {printed} --accept-verifier-losses\n"
+            f"     {printed} --accept-verifier-losses --accept-line-losses\n"
         )
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
-        done = run(*finish, "--accept-verifier-losses")
+        verifier_only = run(*finish, "--accept-verifier-losses")
+        assert verifier_only.returncode == 9, verifier_only.stdout + verifier_only.stderr
+        assert verifier_only.stderr.endswith(
+            "  - the line check: lines missing from the result\n"
+            f"  Reconcile each by hand in {repo / '.worktrees' / CONSOLIDATION} and commit,"
+            " then run --finish again; to\n"
+            "  push with what is left, accept it:\n"
+            f"     {printed} --accept-verifier-losses --accept-line-losses\n"
+        )
+        assert git(repo, "ls-remote", "origin", CONSOLIDATION) == ""
+        done = run(*finish, "--accept-verifier-losses", "--accept-line-losses")
         assert done.returncode == 0, done.stdout + done.stderr
         assert f"WARNING: verifier reported missing contributions in {REGISTER}.\n" in done.stdout
         assert git(repo, "ls-remote", "origin", CONSOLIDATION) != ""
@@ -960,7 +1008,13 @@ class TestMergeBranches:
             repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes"
         )
         assert proc.returncode == 9, proc.stdout + proc.stderr
-        assert proc.stderr.endswith(self._loss_stop(repo, REGISTER))
+        # The restore set the heading's lost name aside in the report, so the
+        # line check leaves that line to the hand union.
+        assert proc.stderr.endswith(self._loss_stop(repo, REGISTER, lines=False))
+        assert (
+            f"    (lines) 1 more from {REGISTER} a repair set aside in the hand-union report,"
+            " for the hand union\n"
+        ) in proc.stdout
         assert "ERROR:" not in proc.stderr
         assert "NOTE: a hand union is still pending" not in proc.stderr
         wt = repo / ".worktrees" / CONSOLIDATION
@@ -994,6 +1048,48 @@ class TestMergeBranches:
         assert (
             f"    (reverts) OK — nothing origin/main has in {REGISTER} was reverted by the merge\n"
         ) in proc.stdout
+
+    def test_every_register_gets_the_union_and_keeps_its_sections_apart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """compartment-names.md registers ``central`` as a compartment and as
+        a suffix, in two ``##`` sections. claude/a and claude/b each add a
+        model to the compartment's field, and -X theirs keeps claude/b's;
+        claude/c adds one to the suffix's. The union puts claude/a's back in
+        the compartment's field only, and the per-section dedup finds no
+        duplicate."""
+        comp = "inst/references/compartment-names.md"
+        base = (
+            "# Compartment names\n\n## Compartments\n\n### central (**the central compartment**)\n\n"
+            "- **Example models:** `Base_2000_x.R` (base).\n\n## Metabolite suffixes\n\n"
+            "### central (**a metabolite suffix**)\n\n"
+            "- **Example models:** `Base_2000_y.R` (suffix base).\n"
+        )
+        repo = new_repo(tmp_path, monkeypatch, {REGISTER: BASE_REGISTER, comp: base})
+        for name, field, entry in (
+            ("a", "(base).", "`A_2020_a.R` (a)"),
+            ("b", "(base).", "`B_2021_b.R` (b)"),
+            ("c", "(suffix base).", "`C_2022_c.R` (c)"),
+        ):
+            text = base.replace(field, f"{field[:-1]}, {entry}.")
+            push_task_branch(repo, f"claude/{name}", {comp: text}, f"Add {name}")
+        proc = self._full_run(
+            repo, _env_with_first(_bin_dir(tmp_path, "bin", {})), "--skip-vignettes"
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        wt = repo / ".worktrees" / CONSOLIDATION
+        assert (wt / comp).read_text() == base.replace(
+            "(base).", "(base), `B_2021_b.R` (b), `A_2020_a.R` (a)."
+        ).replace("(suffix base).", "(suffix base), `C_2022_c.R` (c).")
+        assert git(wt, "log", "--format=%s", "origin/main..HEAD", "--", comp).splitlines()[0] == (
+            f"Reconstruct {comp}: union of all branches' contributions"
+        )
+        assert f"==> Union-merging {comp}\n" in proc.stdout
+        assert (
+            f"    (lines) OK — every line a merged branch added to {comp} is in the merge result\n"
+        ) in proc.stdout
+        check = run_helper("dedup_canonical_headers.py", "--check", wt / comp)
+        assert check.returncode == 0, check.stdout + check.stderr
 
     def test_register_content_the_merge_reverted_stops_the_run(
         self, repo: Path, tmp_path: Path
@@ -1684,7 +1780,14 @@ class TestMergeBranchesHandUnion:
         proc = self._run(hand_repo, "--yes", "--hand-union-done")
         assert (proc.returncode, proc.stderr) == (
             2,
-            "ERROR: --hand-union-done goes with --finish\n",
+            "ERROR: --hand-union-done goes with --finish or --fold-in\n",
+        )
+
+    def test_finish_and_fold_in_do_not_go_together(self, hand_repo: Path) -> None:
+        proc = self._run(hand_repo, "--finish", "--fold-in")
+        assert (proc.returncode, proc.stderr) == (
+            2,
+            "ERROR: --finish completes a round and --fold-in starts one; give one of them\n",
         )
 
     def test_a_confirmed_finish_whose_push_fails_says_nothing_of_a_pending_union(
