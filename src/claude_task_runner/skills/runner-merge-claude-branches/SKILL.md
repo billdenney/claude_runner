@@ -940,11 +940,27 @@ conflicts exits 2), so the command needs only `--repo` and `--branch-name`.
 worktree must be clean and its round's repairs complete (exit 3). A
 hand-union report the round before left stops the fold-in (exit 9) until it
 is worked through: `--finish --hand-union-done` on that round records that,
-or pass `--hand-union-done` to the fold-in. The round before's report and
-recorded inputs are kept in the worktree's git directory as
-`hand-union-report.before-<tip>.md` and `merge-inputs.before-<tip>`; the new
-round's start empty. A fold-in round that stops is completed with `--finish`,
-as a first round is.
+or pass `--hand-union-done` to the fold-in.
+
+The round before's records stay as they are until one of the round's merges
+lands. Once one has, they are kept in the worktree's git directory as
+`hand-union-report.before-<tip>.md`, `merge-inputs.before-<tip>` and
+`merge-stages.before-<tip>`, and the new round's start empty. How a round
+that stops is completed depends on where it stopped:
+
+- **while merging** -- every merge failed (exit 4), or an interrupt or a
+  crash: the branch is put back at its tip (`git reset --keep`), and the
+  round before is as it was, so `--finish` completes it and `--fold-in` runs
+  again (with `--exclude-ref` for a branch that cannot merge);
+- **after its merges, before its repairs completed** -- a repair that
+  crashed, duplicates the dedup left, a gate that could not run, an
+  interrupt: `--finish` refuses (exit 3), since it redoes no repair. Discard
+  any partial output and run `--fold-in` again: it puts the branch back at
+  the tip the round started from, with the round before's records, lists the
+  commits it drops (they stay in the reflog), and folds in afresh;
+- **after its repairs** -- a hand union (exit 9), the revert check or the
+  regeneration (5), check (6), the push (7) or the vignettes (8): `--finish`
+  completes it, as it does a first round.
 
 Regression tests: `tests/unit/test_merge_fold_in.py`, and the fold-in case
 in `tests/unit/test_union_merge_news.py`.

@@ -226,7 +226,7 @@ set -Eeuo pipefail
 # started it, so a failure is reported once, with that status. A command
 # substitution therefore stops at its first failing command, not only its last.
 trap 'err_rc=$?; (( BASH_SUBSHELL == 0 )) || exit "$err_rc"; echo "ERROR: unexpected failure (exit $err_rc) at line $LINENO" >&2; exit 1' ERR
-trap 'remind_hand_union $?' EXIT
+trap 'on_exit $?' EXIT
 # An interrupt or a kill exits with its own status, so the EXIT trap names a
 # pending report then too, rather than seeing the status of the last command.
 trap 'interrupted 130' INT
@@ -254,6 +254,8 @@ HAND_UNION_DONE=0
 # base), and the base the PR text counts the whole branch from.
 FOLD_BASE=""
 PR_BASE=""
+# --fold-in, while its merges run: an exit puts the branch back at FOLD_BASE.
+FOLD_MERGING=0
 
 # Resolved once: the union-merger, the dedup, the dropped-section restore and
 # the NEWS union all need it, and they no longer all live inside the same
@@ -309,7 +311,54 @@ need_value() {
   [[ $# -ge 2 ]] || die 2 "$1 needs a value"
 }
 
+on_exit() {  # <status>: EXIT trap
+  local rc=$1
+  if (( FOLD_MERGING && rc != 0 )); then
+    undo_fold_in_merges
+    return 0
+  fi
+  remind_hand_union "$rc"
+}
+
+undo_unrepaired_fold_in() {  # <worktree> <report>: a fold-in round that stopped before its repairs completed, undone
+  local wt=$1 report=$2 from kept dropped
+  from="$(stage_get fold-in-from)"
+  git -C "$wt" merge-base --is-ancestor "$from" HEAD 2>/dev/null \
+    || die 3 "--fold-in: the fold-in round from ${from:0:12} stopped before its repairs completed, and $BRANCH_NAME no longer contains ${from:0:12}; put it back by hand."
+  dropped="$(git -C "$wt" log --oneline --first-parent "$from..HEAD")"
+  git -C "$wt" reset -q --keep "$from" \
+    || die 3 "--fold-in: cannot put $BRANCH_NAME back at ${from:0:12} (git reset --keep refused)."
+  rm -f "$report" "$INPUTS_FILE" "$STAGES_FILE" \
+    "$(git -C "$wt" rev-parse --path-format=absolute --git-path hand-union-report.repairs.md)"
+  for kept in "$report" "$INPUTS_FILE" "$STAGES_FILE"; do
+    if [[ -e "$(before_round "$kept" "$from")" ]]; then mv "$(before_round "$kept" "$from")" "$kept"; fi
+  done
+  {
+    echo "    (fold-in) the round from ${from:0:12} stopped before its repairs completed; $BRANCH_NAME"
+    echo "    is back at ${from:0:12}, with the records of the round before it. Its commits,"
+    echo "    still in the reflog:"
+    printf '%s\n' "$dropped" | sed 's/^/      /'
+  }
+}
+
+undo_fold_in_merges() {  # a fold-in round that stops while merging: the branch back at its tip
+  git merge --abort >/dev/null 2>&1 || :
+  if [[ "$(git rev-parse HEAD 2>/dev/null)" == "$FOLD_BASE" ]] \
+    || git reset -q --keep "$FOLD_BASE" >/dev/null 2>&1; then
+    echo "  The fold-in stopped while merging: $BRANCH_NAME is back at ${FOLD_BASE:0:12}, with the round before's records; run --fold-in again." >&2
+  else
+    echo "  The fold-in stopped while merging, and $BRANCH_NAME could not be put back at ${FOLD_BASE:0:12} (git reset --keep refused): discard what $WT_ABS has uncommitted, run git reset --keep ${FOLD_BASE:0:12} there, then run --fold-in again." >&2
+  fi
+}
+
+before_round() {  # <record path> [round's base]: where a fold-in keeps the round before's copy
+  local path=$1 tag=${2:-$FOLD_BASE}
+  tag=${tag:0:12}
+  if [[ "$path" == *.md ]]; then echo "${path%.md}.before-$tag.md"; else echo "$path.before-$tag"; fi
+}
+
 interrupted() {  # <status>: INT/TERM; says how to complete the run when --finish can
+  if (( FOLD_MERGING )); then exit "$1"; fi
   if [[ -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] && [[ "$(stage_get repairs)" != pending ]]; then
     {
       echo
@@ -323,6 +372,16 @@ interrupted() {  # <status>: INT/TERM; says how to complete the run when --finis
 
 remind_hand_union() {  # EXIT trap: a failure after a repair set wording aside says so
   local rc=$1
+  if (( FOLD_IN && rc != 0 && rc != 9 )) && [[ -n "$STAGES_FILE" && -f "$STAGES_FILE" ]] \
+    && [[ "$(stage_get repairs)" == pending && "$(stage_get fold-in-from)" != pending ]]; then
+    {
+      echo
+      echo "NOTE: this fold-in round stopped before its repairs completed. Discard any partial"
+      echo "  output in $WT_ABS, then run --fold-in again: it puts $BRANCH_NAME back at"
+      echo "  ${FOLD_BASE:0:12}, with the round before's records, and folds in again."
+    } >&2
+    return 0
+  fi
   # --hand-union-done: the operator has already unioned the report's wording.
   if (( rc == 0 || rc == 9 || HAND_UNION_DONE )) \
     || [[ -z "$HAND_UNION_REPORT" || ! -s "$HAND_UNION_REPORT" ]]; then
@@ -545,7 +604,10 @@ prepare_fold_in() {  # --fold-in: the consolidation's worktree, and its tip as t
   STAGES_FILE=$stages
   INPUTS_FILE=$inputs
   if [[ -f "$STAGES_FILE" && "$(stage_get repairs)" == pending ]]; then
-    die 3 "--fold-in: the run that made $wt stopped before its repairs completed, so its merges were never repaired; re-run it on a fresh --branch-name."
+    if [[ "$(stage_get fold-in-from)" == pending ]]; then
+      die 3 "--fold-in: the run that made $wt stopped before its repairs completed, so its merges were never repaired; re-run it on a fresh --branch-name."
+    fi
+    undo_unrepaired_fold_in "$wt" "$report"
   fi
   if [[ -s "$INPUTS_FILE" ]]; then
     read_inputs --fold-in
@@ -1298,6 +1360,9 @@ if (( FINISH )); then
   INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
   read_inputs --finish
   if [[ "$(stage_get repairs)" == pending ]]; then
+    if [[ "$(stage_get fold-in-from)" != pending ]]; then
+      die 3 "--finish: the fold-in round from $(stage_get fold-in-from | cut -c1-12) stopped before its repairs completed, which --finish does not redo. Run --fold-in again: it puts $BRANCH_NAME back at that tip, with the round before's records, and folds in again."
+    fi
     die 3 "--finish: the run that made $WT_ABS stopped before its repairs completed, which --finish does not redo; re-run on a fresh --branch-name."
   fi
   git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || die 3 "--base '$BASE' does not resolve to a commit"
@@ -1585,18 +1650,14 @@ REPAIRS_REPORT="$(git rev-parse --path-format=absolute --git-path hand-union-rep
 STAGES_FILE="$(git rev-parse --path-format=absolute --git-path merge-stages)"
 INPUTS_FILE="$(git rev-parse --path-format=absolute --git-path merge-inputs)"
 if (( FOLD_IN )); then
-  # The round before's report and inputs stay beside the new round's, named
-  # after the tip this round starts from; the new round's start empty.
-  if [[ -s "$HAND_UNION_REPORT" ]]; then
-    mv "$HAND_UNION_REPORT" "${HAND_UNION_REPORT%.md}.before-${FOLD_BASE:0:12}.md"
-    echo "    the round before's hand-union report is now ${HAND_UNION_REPORT%.md}.before-${FOLD_BASE:0:12}.md"
-  fi
-  if [[ -f "$INPUTS_FILE" ]]; then mv "$INPUTS_FILE" "$INPUTS_FILE.before-${FOLD_BASE:0:12}"; fi
-  # Confirmed for the report just set aside, not for the round's own.
-  HAND_UNION_DONE=0
+  # The round before's records stay as they are until a merge lands: a round
+  # that merges nothing, or is interrupted while merging (the EXIT trap puts
+  # the branch back at its tip), leaves that round as it was.
+  FOLD_MERGING=1
+else
+  rm -f "$HAND_UNION_REPORT" "$REPAIRS_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
+  record_skips
 fi
-rm -f "$HAND_UNION_REPORT" "$REPAIRS_REPORT" "$STAGES_FILE" "$INPUTS_FILE"
-record_skips
 echo
 echo "==> Sequential merge --no-ff -X theirs (one merge commit per branch;"
 echo "    binaries regenerated and covariate-columns.md union-merged after)"
@@ -1667,6 +1728,24 @@ fi
 if (( SUCCESS == 0 )); then
   echo "ERROR: no merges succeeded; nothing to push." >&2
   exit 4
+fi
+if (( FOLD_IN )); then
+  # The round before's records stay beside the new round's, named after the
+  # tip this round started from; the new round's start empty. A round that
+  # stops before its repairs complete is undone by the next --fold-in
+  # (prepare_fold_in), which puts these back.
+  for kept in "$HAND_UNION_REPORT" "$INPUTS_FILE" "$STAGES_FILE"; do
+    if [[ -e "$kept" ]]; then mv "$kept" "$(before_round "$kept")"; fi
+  done
+  if [[ -s "$(before_round "$HAND_UNION_REPORT")" ]]; then
+    echo "    the round before's hand-union report is now $(before_round "$HAND_UNION_REPORT")"
+  fi
+  rm -f "$REPAIRS_REPORT"
+  record_skips
+  stage_set fold-in-from "$FOLD_BASE"
+  FOLD_MERGING=0
+  # Confirmed for the report just set aside, not for the round's own.
+  HAND_UNION_DONE=0
 fi
 record_inputs
 

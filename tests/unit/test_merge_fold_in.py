@@ -13,8 +13,11 @@ Every case runs merge_branches.sh as an operator does, without the R steps.
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -328,3 +331,166 @@ def test_the_line_check_reads_only_the_rounds_branches(consolidated: Path) -> No
         "    (lines) OK — every line a merged branch added to NEWS.md is in the merge result\n"
     )
     assert "claude/a" not in section.split("==>")[0]
+
+
+def records(wt: Path) -> dict[str, str]:
+    """The round's records in the worktree's git directory, by name."""
+    git_dir = path_in_git_dir(wt, "x").parent
+    return {
+        path.name: path.read_text()
+        for path in sorted(git_dir.iterdir())
+        if path.name.startswith(("merge-inputs", "merge-stages", "hand-union-report"))
+    }
+
+
+def fake_tool(tmp_path: Path, name: str, script: str) -> dict[str, str]:
+    """The environment with ``script`` first on PATH as ``name``."""
+    bin_dir = tmp_path / f"bin-{name}"
+    bin_dir.mkdir()
+    (bin_dir / name).write_text(script)
+    (bin_dir / name).chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def test_a_fold_in_whose_merges_all_fail_leaves_the_round_before_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """claude/c deletes a file claude/a changed: modify/delete, which -X
+    theirs cannot resolve. Nothing merges, so the round before's records
+    stay, and --finish and another --fold-in both still work."""
+    repo = new_repo(
+        tmp_path, monkeypatch, {"NEWS.md": NEWS, REGISTER: BASE_REGISTER, "inst/foo.txt": "x\n"}
+    )
+    push_task_branch(repo, "claude/a", {"inst/foo.txt": "y\n"}, "Change foo")
+    first = merge(repo, "--yes", *NO_R)
+    assert first.returncode == 0, first.stdout + first.stderr
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    git(repo, "checkout", "-q", "-b", "claude/c", "main")
+    git(repo, "rm", "-q", "inst/foo.txt")
+    git(repo, "commit", "-qm", "Delete foo")
+    git(repo, "push", "-q", "origin", "claude/c")
+    git(repo, "checkout", "-q", "main")
+
+    proc = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert proc.stderr == (
+        "ERROR: no merges succeeded; nothing to push.\n"
+        f"  The fold-in stopped while merging: {BRANCH} is back at {tip[:12]}, with the round"
+        " before's records; run --fold-in again.\n"
+    )
+    assert (git(wt, "rev-parse", "HEAD").strip(), records(wt)) == (tip, before)
+    assert git(wt, "status", "--porcelain") == ""
+
+    finish = merge(repo, "--finish")
+    assert finish.returncode == 0, finish.stdout + finish.stderr
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 4, again.stdout + again.stderr
+    push_model_branch(repo, "d")
+    other = merge(repo, "--fold-in", "--yes", "--exclude-ref", "origin/claude/c", *NO_R)
+    assert other.returncode == 0, other.stdout + other.stderr
+    assert "- Add D 2020 d model." in (wt / "NEWS.md").read_text()
+
+
+def test_a_fold_in_interrupted_while_merging_is_put_back_at_its_tip(
+    consolidated: Path, tmp_path: Path
+) -> None:
+    """A TERM while claude/c and claude/d merge: the round's merges go, the
+    round before's records were never touched, and --fold-in runs again."""
+    repo = consolidated
+    push_model_branch(repo, "d")
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    count = tmp_path / "merges"
+    real = shutil.which("git")
+    assert real is not None
+    env = fake_tool(
+        tmp_path,
+        "git",
+        "#!/bin/bash\n"
+        'if [[ "$1 $2" == "merge --no-ff" ]]; then\n'
+        f"  echo x >> {shlex.quote(str(count))}\n"
+        f'  if [[ "$(wc -l < {shlex.quote(str(count))})" -eq 2 ]]; then kill -TERM "$PPID"; fi\n'
+        "fi\n"
+        f'exec {shlex.quote(real)} "$@"\n',
+    )
+    proc = run(
+        "bash",
+        MERGE_BRANCHES,
+        "--repo",
+        repo,
+        "--branch-name",
+        BRANCH,
+        "--fold-in",
+        "--yes",
+        *NO_R,
+        env=env,
+    )
+    assert proc.returncode == 143, proc.stdout + proc.stderr
+    assert proc.stderr.endswith(
+        f"  The fold-in stopped while merging: {BRANCH} is back at {tip[:12]}, with the round"
+        " before's records; run --fold-in again.\n"
+    )
+    assert (git(wt, "rev-parse", "HEAD").strip(), records(wt)) == (tip, before)
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    news = (wt / "NEWS.md").read_text()
+    assert "- Add C 2020 c model." in news and "- Add D 2020 d model." in news
+
+
+def test_a_fold_in_that_stops_before_its_repairs_is_started_again(
+    consolidated: Path, tmp_path: Path
+) -> None:
+    """The NEWS union crashes after the round merged claude/c. --finish
+    cannot complete a round whose repairs never ran, so it says to run
+    --fold-in again, which puts the branch back at the tip, with the round
+    before's records, and folds claude/c in afresh."""
+    repo = consolidated
+    wt = repo / ".worktrees" / BRANCH
+    tip, before = git(wt, "rev-parse", "HEAD").strip(), records(wt)
+    env = fake_tool(
+        tmp_path,
+        "python3",
+        '#!/bin/bash\ncase "$1" in */union_merge_news.py) exit 3 ;; esac\n'
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+    )
+    proc = run(
+        "bash",
+        MERGE_BRANCHES,
+        "--repo",
+        repo,
+        "--branch-name",
+        BRANCH,
+        "--fold-in",
+        "--yes",
+        *NO_R,
+        env=env,
+    )
+    assert proc.returncode == 5, proc.stdout + proc.stderr
+    assert proc.stderr.endswith(
+        "ERROR: union_merge_news.py failed on NEWS.md\n"
+        "\n"
+        "NOTE: this fold-in round stopped before its repairs completed. Discard any partial\n"
+        f"  output in {wt}, then run --fold-in again: it puts {BRANCH} back at\n"
+        f"  {tip[:12]}, with the round before's records, and folds in again.\n"
+    )
+    finish = merge(repo, "--finish")
+    assert (finish.returncode, finish.stderr) == (
+        3,
+        f"ERROR: --finish: the fold-in round from {tip[:12]} stopped before its repairs"
+        " completed, which --finish does not redo. Run --fold-in again: it puts"
+        f" {BRANCH} back at that tip, with the round before's records, and folds in again.\n",
+    )
+    again = merge(repo, "--fold-in", "--yes", *NO_R)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert (
+        f"    (fold-in) the round from {tip[:12]} stopped before its repairs completed; {BRANCH}\n"
+    ) in again.stdout
+    assert "- Add C 2020 c model." in (wt / "NEWS.md").read_text()
+    merges = git(wt, "log", "--first-parent", "--format=%s", f"{tip}..HEAD")
+    assert merges.count(f"Merge branch 'claude/c' into {BRANCH}") == 1
+    assert {
+        name.replace(f".before-{tip[:12]}", ""): text
+        for name, text in records(wt).items()
+        if f".before-{tip[:12]}" in name
+    } == before
