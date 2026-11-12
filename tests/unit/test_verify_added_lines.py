@@ -341,6 +341,22 @@ class TestBlocksAreKeptApart:
         result = v.Result(self.RESULT, {})
         assert result.has_line("- **Notes:** Other.", ("Elsewhere", "CAV (**c**)")) is True
 
+    def test_one_name_in_two_sections_is_one_block(self) -> None:
+        """Blocks are keyed by heading name, not by section, so a canonical
+        that moved between sections keeps its lines. The same pooling counts
+        a line lost from one section's block as kept when a heading of that
+        name in another section holds it: a canonical filed twice is for the
+        duplicate checks to report, not this one."""
+        assert v._keys(("A", "CAV (**c**)")) == v._keys(("B", "CAV (**c**)")) == (("###", "CAV"),)
+        result = v.Result(
+            "## A\n\n### CAV (**c**)\n\n- **Notes:** Alpha.\n\n"
+            "## B\n\n### CAV (**c**)\n\n- **Notes:** Beta.\n",
+            {},
+        )
+        assert result.has_line("- **Notes:** Beta.", ("A", "CAV (**c**)")) is True
+        assert result.has_line("- **Notes:** Alpha.", ("B", "CAV (**c**)")) is True
+        assert result.has_line("- **Notes:** Gamma.", ("A", "CAV (**c**)")) is False
+
     def test_a_line_lost_from_one_canonical_and_kept_by_another_is_reported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

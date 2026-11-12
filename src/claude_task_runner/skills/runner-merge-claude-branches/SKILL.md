@@ -476,22 +476,25 @@ exists to repair. Repair, then regenerate.
    non-blank line its merged commit adds to a block must be kept in the
    matching block of the result: blocks match by a name their `###` headings
    share, in any `##` section, and a section's lines before its first `###`
-   by the section's name. Whether a block keeps a line is the rule in
-   `register_lines.py`, which the revert check (7b) uses too: a field line
-   (`- **Notes:**`, say) is kept word for word or with each of its sentences
-   whole in one line of the same field, so a hand union that joins two
-   branches' sentences into one line keeps both (the full stop of an
-   abbreviation such as e.g., vs. or et al. ends no sentence); any other
-   line, a heading included, only word for word. A sentence kept under another canonical
-   does not count. Example-models lines are compared entry by entry, since
-   the union rewrites them: each entry the branch added, or whose note it
-   changed, must be filed under a heading that declares one of its heading's
-   names, in any section, with a note that says at least what the branch's
-   says. Wording a repair already set aside in the hand-union report (6b,
-   6c, 6) is counted, not reported: `--hand-union-done` is the decision for
-   it. That exemption matches the report's lines exactly, and holds for the
-   rest of the round, `--finish` included, once `--hand-union-done` is given:
-   the line check does not ask again about wording the report holds.
+   by the section's name. Headings of one name in two sections are one
+   block, so a canonical moved between sections keeps its lines, and a line
+   one of them holds counts as kept for both. Whether a block keeps a line
+   is the rule in `register_lines.py`, which the revert check (7b) uses too:
+   a field line (`- **Notes:**`, say) is kept word for word or with each of
+   its sentences whole in one line of the same field, so a hand union that
+   joins two branches' sentences into one line keeps both (the full stop of
+   an abbreviation such as e.g., vs. or et al. ends no sentence); any other
+   line, a heading included, only word for word. A sentence kept under
+   another canonical does not count. Example-models lines are compared entry
+   by entry, since the union rewrites them: each entry the branch added, or
+   whose note it changed, must be filed under a heading that declares one of
+   its heading's names, in any section, with a note that says at least what
+   the branch's says. Wording a repair already set aside in the hand-union
+   report (6b, 6c, 6) is counted, not reported: `--hand-union-done` is the
+   decision for it. That exemption matches the report's lines exactly, and
+   holds for the rest of the round, `--finish` included, once
+   `--hand-union-done` is given: the line check does not ask again about
+   wording the report holds.
 
    Each loss goes to the hand-union report and the run stops before the push
    (exit 9), the way the verifier's losses do; `--finish` runs the check
