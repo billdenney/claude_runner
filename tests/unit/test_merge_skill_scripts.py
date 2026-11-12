@@ -1987,6 +1987,7 @@ class TestVerifyBranchContributions:
         "restore_dropped_sections.py",
         "union_merge_lines.py",
         "union_merge_news.py",
+        "verify_added_lines.py",
         "verify_no_base_reverts.py",
         "verify_register_placement.py",
         "verify_section_headers.py",
@@ -2162,14 +2163,21 @@ WORKTREE_HELPERS = {
     "restore_dropped_sections.py": "restore",
     "union_merge_news.py": "news",
     "verify_no_base_reverts.py": "reverts",
+    "verify_added_lines.py": "lines",
 }
 # These find the worktree with `git worktree list`; the others at
 # <repo>/.worktrees/<branch>.
-_LISTED = {"restore_dropped_sections.py", "union_merge_news.py", "verify_no_base_reverts.py"}
+_LISTED = {
+    "restore_dropped_sections.py",
+    "union_merge_news.py",
+    "verify_no_base_reverts.py",
+    "verify_added_lines.py",
+}
 _VERIFIERS = {
     "verify_section_headers.py",
     "verify_register_placement.py",
     "verify_no_base_reverts.py",
+    "verify_added_lines.py",
 }
 
 
@@ -2248,6 +2256,11 @@ def test_worktree_helpers_refuse_inputs_that_cannot_be_right(
         (
             "verify_no_base_reverts.py",
             "    (reverts) x.md is not on origin/main; nothing to check.\n",
+            "",
+        ),
+        (
+            "verify_added_lines.py",
+            "    (lines) OK — every line a merged branch added to x.md is in the merge result\n",
             "",
         ),
     ],
