@@ -4632,8 +4632,9 @@ title: "gate"
 ```{r}
 library(gatepkg)
 stopifnot(gate_answer() == 42)
-writeLines(c(find.package("gatepkg"), Sys.getenv("R_LIBS"),
-             rxode2::getRxThreads(), data.table::getDTthreads()), "RECORD")
+writeLines(c(normalizePath(find.package("gatepkg")), Sys.getenv("R_LIBS"),
+             rxode2::getRxThreads(), data.table::getDTthreads(),
+             paste(.libPaths(), collapse = .Platform$path.sep)), "RECORD")
 plot(1:3)
 ```
 """
@@ -4667,14 +4668,20 @@ class TestVerifyVignettesParallel:
         proc = run(rscript, "-e", "invisible(parse(file = commandArgs(TRUE)[1]))", VIGNETTES_R)
         assert (proc.returncode, proc.stderr) == (0, "")
 
+    @pytest.mark.parametrize("library", ["description-only", "full"])
     def test_renders_from_a_private_library_and_writes_nothing(
-        self, rscript_with_callr: str, tmp_path: Path
+        self, rscript_with_callr: str, tmp_path: Path, library: str
     ) -> None:
         """The package is installed into the gate's own temporary library,
         never the user's, and the workers find it there through R_LIBS too.
         The worktree is read-only throughout: an install or a render that
         wrote into it would fail the vignette. Each worker runs rxode2 and
-        data.table on 2 threads, as a 4-vCPU CI runner does."""
+        data.table on 2 threads, as a 4-vCPU CI runner does.
+
+        By default the workers see only a library linking what DESCRIPTION
+        declares, the render harness and their dependencies, the private
+        copy of the package included; with --full-lib they see the private
+        library first, then the user's."""
         probe = run(
             rscript_with_callr,
             "-e",
@@ -4689,6 +4696,7 @@ class TestVerifyVignettesParallel:
             "DESCRIPTION": (
                 "Package: gatepkg\nVersion: 0.0.1\nTitle: Gate\nDescription: Gate test.\n"
                 "License: MIT\nAuthor: A\nMaintainer: A <a@example.org>\n"
+                "Suggests: nlmixr2lib, rxode2, knitr, rmarkdown\n"
             ),
             "NAMESPACE": "export(gate_answer)\n",
             "R/answer.R": "gate_answer <- function() 42\n",
@@ -4707,7 +4715,7 @@ class TestVerifyVignettesParallel:
                 VIGNETTES_R,
                 "--worktree",
                 wt,
-                "--full-lib",
+                *(["--full-lib"] if library == "full" else []),
                 "--jobs",
                 "1",
                 "--results",
@@ -4719,12 +4727,19 @@ class TestVerifyVignettesParallel:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "SUMMARY: 1 ok / 0 failed / 1 total\n" in proc.stdout
         assert sorted(str(p.relative_to(wt)) for p in wt.rglob("*")) == before
-        installed_at, r_libs, rx_threads, dt_threads = record.read_text().splitlines()
+        installed_at, r_libs, rx_threads, dt_threads, lib_paths = record.read_text().splitlines()
         assert (rx_threads, dt_threads) == ("2", "2")
         private = Path(installed_at).parent
-        assert private.name == "lib" and private.parent.name.startswith("vignette-gate-")
-        assert r_libs.split(os.pathsep)[0] == str(private)
-        assert not private.exists(), "the gate's temporary library outlived the gate"
+        gate_dir = private.parent
+        assert private.name == "lib" and gate_dir.name.startswith("vignette-gate-")
+        first = gate_dir / ("desc-lib" if library == "description-only" else "lib")
+        assert r_libs.split(os.pathsep)[0] == str(first)
+        assert lib_paths.split(os.pathsep)[0] == str(first)
+        user_lib = run(rscript_with_callr, "-e", "cat(.libPaths()[1])").stdout
+        assert (user_lib in lib_paths.split(os.pathsep)) is (library == "full")
+        if library == "description-only":
+            assert "--- DESCRIPTION-only library path: " in proc.stdout
+        assert not gate_dir.exists(), "the gate's temporary directory outlived the gate"
         user = run(rscript_with_callr, "-e", "cat(nzchar(system.file(package = 'gatepkg')))")
         assert user.stdout == "FALSE"
 
