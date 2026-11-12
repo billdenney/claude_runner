@@ -9,7 +9,9 @@ check finds that block its own way) and both answer with :class:`Block`:
   has it, or when one line of the same field there holds each of its
   sentences, whole: a hand union that joins two branches' sentences into one
   Notes line keeps both, and a sentence that is only a prefix of another
-  (``Fixed.`` in ``Fixed-effect on clearance.``) is not one of them;
+  (``Fixed.`` in ``Fixed-effect on clearance.``) is not one of them. A full
+  stop ends a sentence unless it ends one of :data:`ABBREVIATIONS`, so
+  ``A vs. C.`` is one sentence, not kept by ``A vs. B. Z vs. C.``;
 * every other line, a heading included, is kept only when the block has it
   word for word.
 
@@ -25,8 +27,12 @@ from collections.abc import Iterable
 
 # A field line, ``- **Label:** text``, at any indent.
 FIELD_LINE = re.compile(r"^\s*[-*]\s+\*\*([^*]+?):\*\*(.*)$")
-# Where a sentence ends and the next starts.
+# Where a sentence may end and the next start.
 SENTENCE_BREAK = re.compile(r"(?<=[.;!?])\s+")
+# Abbreviations whose full stop does not end a sentence, lower case.
+ABBREVIATIONS = frozenset({"approx.", "cf.", "e.g.", "et al.", "etc.", "fig.", "i.e.", "vs."})
+# What may open a parenthetical before an abbreviation: ``(e.g. ...``.
+OPENERS = "([{\"'"
 
 
 def _norm(text: str) -> str:
@@ -47,9 +53,22 @@ def field_of(line: str) -> tuple[str, str] | None:
     return match.group(1).strip(), _norm(match.group(2))
 
 
+def _ends_in_abbreviation(piece: str) -> bool:
+    words = piece.lower().split()
+    return any(
+        " ".join(words[-n:]).lstrip(OPENERS) in ABBREVIATIONS for n in (1, 2) if len(words) >= n
+    )
+
+
 def sentences(text: str) -> frozenset[str]:
     """The sentences of ``text``, whitespace normalised."""
-    return frozenset(piece for piece in SENTENCE_BREAK.split(_norm(text)) if piece)
+    found: list[str] = []
+    for piece in SENTENCE_BREAK.split(_norm(text)):
+        if found and _ends_in_abbreviation(found[-1]):
+            found[-1] += f" {piece}"
+        elif piece:
+            found.append(piece)
+    return frozenset(found)
 
 
 class Block:

@@ -480,8 +480,9 @@ exists to repair. Repair, then regenerate.
    `register_lines.py`, which the revert check (7b) uses too: a field line
    (`- **Notes:**`, say) is kept word for word or with each of its sentences
    whole in one line of the same field, so a hand union that joins two
-   branches' sentences into one line keeps both; any other line, a heading
-   included, only word for word. A sentence kept under another canonical
+   branches' sentences into one line keeps both (the full stop of an
+   abbreviation such as e.g., vs. or et al. ends no sentence); any other
+   line, a heading included, only word for word. A sentence kept under another canonical
    does not count. Example-models lines are compared entry by entry, since
    the union rewrites them: each entry the branch added, or whose note it
    changed, must be filed under a heading that declares one of its heading's

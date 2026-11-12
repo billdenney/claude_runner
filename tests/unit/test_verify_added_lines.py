@@ -290,6 +290,37 @@ class TestTheSharedRule:
     def test_kept(self, line: str, kept: bool) -> None:
         assert register_lines.Block(self.BLOCK).holds(line) is kept
 
+    @pytest.mark.parametrize(
+        ("line", "held", "kept"),
+        [
+            # A sentence dropped from a union: "vs." ends no sentence, so the
+            # pieces of two other sentences do not make it up.
+            ("- **Notes:** A vs. C.", "- **Notes:** A vs. B. Z vs. C.", False),
+            ("- **Notes:** A vs. B.", "- **Notes:** Z vs. C. A vs. B.", True),
+            ("- **Notes:** Dose, e.g. 10 mg.", "- **Notes:** Base. Dose, e.g. 10 mg. Other.", True),
+            ("- **Notes:** Dose, e.g. 10 mg.", "- **Notes:** Dose, e.g. 20 mg. 10 mg.", False),
+            ("- **Notes:** Per Smith et al. 2020.", "- **Notes:** Per Jones et al. 2020.", False),
+            ("- **Notes:** See (cf. Fig. 2) here.", "- **Notes:** X. See (cf. Fig. 2) here.", True),
+            ("- **Notes:** See (cf. Fig. 2) here.", "- **Notes:** See (cf. Fig. 3) here.", False),
+            # Sentences that open with an abbreviation reorder like any other.
+            (
+                "- **Notes:** Approx. 5 h; i.e. short.",
+                "- **Notes:** i.e. short. Approx. 5 h;",
+                True,
+            ),
+        ],
+    )
+    def test_an_abbreviation_ends_no_sentence(self, line: str, held: str, kept: bool) -> None:
+        assert register_lines.Block([held]).holds(line) is kept
+
+    def test_sentences_split_after_a_full_stop_but_not_an_abbreviation(self) -> None:
+        assert register_lines.sentences("A vs. B. Z, e.g. Y; per Li et al. 2020. Etc. end.") == {
+            "A vs. B.",
+            "Z, e.g. Y;",
+            "per Li et al. 2020.",
+            "Etc. end.",
+        }
+
 
 class TestBlocksAreKeptApart:
     RESULT = (
