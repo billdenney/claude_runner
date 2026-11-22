@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import itertools
 import re
 import sys
 import traceback
@@ -110,6 +111,19 @@ def bullet_spans(lines: list[str]) -> list[tuple[int, int]]:
     if start is not None:
         spans.append((start, len(lines)))
     return spans
+
+
+def blank_separated(lines: list[str], spans: list[tuple[int, int]]) -> bool:
+    """Whether the file separates neighbouring bullets with a blank line: most
+    pairs of consecutive bullets have only blank lines between them, rather
+    than none. True when no two bullets are neighbours."""
+    blank = adjacent = 0
+    for (_, end), (start, _) in itertools.pairwise(spans):
+        if start == end:
+            adjacent += 1
+        elif not any(line.strip() for line in lines[end:start]):
+            blank += 1
+    return blank >= adjacent
 
 
 def bullets(text: str) -> list[str]:
@@ -345,10 +359,23 @@ def main() -> int:
     else:
         lines = ["# development version", "", *lines]
         insert_at = 1
+    # The new bullets go before the section's first bullet, each followed by
+    # the separator the file puts between bullets; a section with no bullet
+    # yet gets them after its heading, each after a blank line.
+    spans = bullet_spans(lines)
+    lead = next((start for start, _ in spans if start >= insert_at), None)
+    if lead is not None and any(line.startswith("#") for line in lines[insert_at:lead]):
+        lead = None
     payload: list[str] = []
-    for b in added:
-        payload.extend(["", *b.splitlines()])
-    out = "\n".join(lines[:insert_at] + payload + lines[insert_at:]).rstrip("\n") + "\n"
+    if lead is None:
+        for b in added:
+            payload.extend(["", *b.splitlines()])
+        lead = insert_at
+    else:
+        gap = [""] if blank_separated(lines, spans) else []
+        for b in added:
+            payload.extend([*b.splitlines(), *gap])
+    out = "\n".join(lines[:lead] + payload + lines[lead:]).rstrip("\n") + "\n"
     target.write_text(out, encoding="utf-8")
     print(f"# rebuilt {args.file}: {len(base_keys)} base + {len(added)} branch bullets")
     return 0

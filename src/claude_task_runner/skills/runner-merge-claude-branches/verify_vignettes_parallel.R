@@ -17,6 +17,9 @@
 #     --worktree <abs-worktree-path>        # default: $PWD
 #     --jobs <int>                          # default: max(1, parallel::detectCores() - 2)
 #     --timeout <secs>                      # per-vignette ceiling; default: 900
+#     --rx-threads <int>                    # rxode2 and data.table threads in each worker;
+#                                           # default 2, what both give on a 4-vCPU CI
+#                                           # runner; 0 leaves each package's own default
 #     --results <path>                      # JSONL output; default: /tmp/vignette_results.jsonl
 #     --log <path>                          # human-readable log; default: stdout (no -- arg)
 #     --full-lib                            # opt OUT of the DESCRIPTION-only library path
@@ -25,8 +28,18 @@
 #                                           # which can hide a missing CI dependency.
 #     --only a,b,c                          # restrict to these vignettes (see the note at the
 #                                           # call site); unknown names exit 2
-#     --skip-install                        # skip remotes::install_local (worker process loads
-#                                           # via library(); needed when modeldb has changed)
+#     --skip-install                        # do not install the worktree's package; the
+#                                           # workers load whatever copy the library has
+#
+# The package is installed from the worktree into a private library inside the
+# gate's own temporary directory, never into the user's library: an install
+# there would swap the package under every other R session on the host, and
+# the copy there may be one remotes cannot reinstall over (RemoteType git).
+# The workers find it first through their library path and R_LIBS, which a
+# process a vignette starts inherits. Each worker renders with its own
+# temporary directory as rmarkdown's intermediates directory, so the gate
+# writes nothing into the worktree: a concurrent R CMD build of the same
+# worktree reads a tree the gate leaves as it found it.
 #
 # Exit codes:
 #   0  all vignettes rendered successfully
@@ -48,9 +61,12 @@ has_flag <- function(name) name %in% args
 
 WORKTREE <- normalizePath(get_arg("--worktree", getwd()), mustWork = TRUE)
 JOBS     <- as.integer(get_arg("--jobs", max(1L, parallel::detectCores() - 2L)))
-# rxode2 solver threads INSIDE each worker (not the number of workers). Default
-# 2 to mirror a CI runner rather than the dev box; see the long note in the
-# worker. Pass --rx-threads 0 to leave rxode2 at its own default.
+# rxode2 solver threads and data.table threads INSIDE each worker (not the
+# number of workers). Both packages default to half the machine's cores, which
+# is 2 on the 4-vCPU ubuntu-latest runners CI renders on, and 16 here on 32
+# cores: the default of 2 renders as CI does, and keeps --jobs workers at 2
+# threads each instead of 16. See the long note in the worker. Pass
+# --rx-threads 0 to leave both at their own defaults.
 RXTHREADS <- as.integer(get_arg("--rx-threads", "2"))
 if (is.na(RXTHREADS) || RXTHREADS < 1L) RXTHREADS <- NULL
 TIMEOUT  <- as.integer(get_arg("--timeout", 900L))
@@ -60,6 +76,43 @@ SKIP_INSTALL <- has_flag("--skip-install")
 DESC_LIB <- !has_flag("--full-lib")
 
 setwd(WORKTREE)
+
+# Everything the gate writes: the private library, the DESCRIPTION-only
+# library, the package tarball.
+GATE_DIR <- tempfile("vignette-gate-")
+dir.create(GATE_DIR, recursive = TRUE)
+PRIVATE_LIB <- file.path(GATE_DIR, "lib")
+dir.create(PRIVATE_LIB)
+
+# Build the worktree's package into GATE_DIR, then install the tarball into
+# PRIVATE_LIB. R CMD build works on a copy of the source, so the worktree is
+# not written to. Returns NULL on success, else the failing step's output.
+install_private <- function(worktree, gate_dir, lib) {
+  r <- file.path(R.home("bin"), "R")
+  built <- in_dir(gate_dir, system2(
+    r, c("CMD", "build", "--no-build-vignettes", "--no-manual", shQuote(worktree)),
+    stdout = TRUE, stderr = TRUE
+  ))
+  tarball <- list.files(gate_dir, pattern = "\\.tar\\.gz$", full.names = TRUE)
+  if (!is.null(attr(built, "status")) || length(tarball) != 1L) {
+    return(c("R CMD build failed:", built))
+  }
+  installed <- system2(
+    r, c("CMD", "INSTALL", "-l", shQuote(lib), shQuote(tarball)),
+    stdout = TRUE, stderr = TRUE
+  )
+  if (!is.null(attr(installed, "status"))) {
+    return(c("R CMD INSTALL failed:", installed))
+  }
+  NULL
+}
+
+# Evaluate `code` with `dir` as the working directory, then return to the old one.
+in_dir <- function(dir, code) {
+  old <- setwd(dir)
+  on.exit(setwd(old))
+  code
+}
 
 # ---------------------------------------------------------------------------
 # Build a library path containing ONLY what DESCRIPTION declares (plus the
@@ -73,7 +126,7 @@ setwd(WORKTREE)
 # because `units` was present on the dev box and absent in CI. A gate that
 # cannot go red for the thing CI goes red for is not a gate.
 # ---------------------------------------------------------------------------
-build_description_libpath <- function(worktree) {
+build_description_libpath <- function(worktree, gate_dir) {
   descfile <- file.path(worktree, "DESCRIPTION")
   if (!file.exists(descfile)) return(NULL)
   desc <- read.dcf(descfile)
@@ -106,8 +159,8 @@ build_description_libpath <- function(worktree) {
                                                   priority = c("base", "recommended")))
   keep <- setdiff(keep, base_pkgs)
 
-  lib <- file.path(tempdir(), "vignette-gate-desc-lib")
-  unlink(lib, recursive = TRUE); dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+  lib <- file.path(gate_dir, "desc-lib")
+  dir.create(lib, recursive = TRUE, showWarnings = FALSE)
   linked <- 0L
   for (p in keep) {
     src <- suppressWarnings(find.package(p, quiet = TRUE))
@@ -120,20 +173,20 @@ build_description_libpath <- function(worktree) {
 }
 
 if (!SKIP_INSTALL) {
-  cat("--- installing local package (so callr workers see the worktree version) ---\n")
-  ok <- tryCatch({
-    remotes::install_local(WORKTREE, upgrade = "never", force = TRUE, quiet = TRUE)
-    TRUE
-  }, error = function(e) {
-    cat("INSTALL FAILED:", conditionMessage(e), "\n")
-    FALSE
-  })
-  if (!ok) quit(status = 2L, save = "no")
+  cat(sprintf("--- installing the worktree's package into the gate's private library %s ---\n",
+              PRIVATE_LIB))
+  failed <- install_private(WORKTREE, GATE_DIR, PRIVATE_LIB)
+  if (!is.null(failed)) {
+    cat("INSTALL FAILED:", utils::tail(failed, 20L), sep = "\n")
+    quit(status = 2L, save = "no")
+  }
+  # First on the path, so the DESCRIPTION-only library below links this copy.
+  .libPaths(c(PRIVATE_LIB, .libPaths()))
 }
 
 LIBPATH <- .libPaths()
 if (DESC_LIB) {
-  info <- build_description_libpath(WORKTREE)
+  info <- build_description_libpath(WORKTREE, GATE_DIR)
   if (is.null(info)) {
     cat("--- no DESCRIPTION found; falling back to the full library path ---\n")
   } else {
@@ -149,6 +202,15 @@ if (DESC_LIB) {
     cat("    exactly as they would on the CI runner. Pass --full-lib to opt out.\n")
   }
 }
+
+# callr sets the workers' library path but not R_LIBS, which a process a
+# vignette starts (an R subprocess, R CMD SHLIB) reads to find packages; the
+# user library is left off too, as the DESCRIPTION-only path leaves it off.
+WORKER_ENV <- c(
+  callr::rcmd_safe_env(),
+  R_LIBS = paste(LIBPATH, collapse = .Platform$path.sep),
+  R_LIBS_USER = LIBPATH[[1L]]
+)
 
 rmds <- sort(list.files(file.path(WORKTREE, "vignettes/articles"),
                         pattern = "\\.Rmd$", full.names = TRUE))
@@ -210,18 +272,27 @@ render_one <- function(rmd) {
         if (!is.null(rxthreads) && exists("setRxThreads", asNamespace("rxode2"))) {
           try(rxode2::setRxThreads(as.integer(rxthreads)), silent = TRUE)
         }
+        # data.table, which rxode2 and the vignettes use, takes half the
+        # cores too; at its default every worker would run 16 threads.
+        if (!is.null(rxthreads) && requireNamespace("data.table", quietly = TRUE)) {
+          data.table::setDTthreads(as.integer(rxthreads))
+        }
         # FORCE error = FALSE. knitr's default renders a chunk error inline and
         # returns success, so a broken vignette silently "passes" -- the exact
         # false negative that shipped latent-broken vignettes to main before.
         knitr::opts_chunk$set(error = FALSE)
         outfile <- tempfile(fileext = ".html")
+        # The worker's own temporary directory takes the knitted markdown
+        # and the figures, which would otherwise land beside the Rmd.
         rmarkdown::render(rmd, output_file = outfile,
                           output_format = "html_document",
+                          intermediates_dir = tempdir(),
                           quiet = TRUE, envir = new.env())
         list(ok = TRUE, msg = "", outfile = outfile)
       },
       args = list(rmd = rmd, rxthreads = RXTHREADS),
       libpath = LIBPATH,
+      env = WORKER_ENV,
       timeout = TIMEOUT,
       show = FALSE
     )

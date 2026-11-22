@@ -43,7 +43,11 @@ across them. Within a block:
 * an Example-models line is compared entry by entry, model file and
   annotation, since the union merger rewrites those lines and adds to them;
   the full stops that end it are not compared;
-* every other non-blank line must survive verbatim.
+* every other non-blank line must survive as register_lines.py counts a line
+  kept: word for word, or, for a field line (``- **Notes:** ...``), with each
+  of its sentences whole in one line of the same field in the matching
+  block, so a hand union that joins this line's sentences with a branch's
+  keeps it.
 
 Nothing is repaired: which copy of a block is right needs judgement.
 
@@ -69,6 +73,7 @@ from pathlib import Path
 
 import dedup_canonical_headers as register
 import merge_set
+import register_lines
 
 Atom = tuple[str, ...]
 # How much of a long line a report prints.
@@ -146,6 +151,10 @@ class Unit:
         return self.section, self.title, tuple(self.lines)
 
     @cached_property
+    def block(self) -> register_lines.Block:
+        return register_lines.Block(self.lines)
+
+    @cached_property
     def atoms(self) -> Counter[Atom]:
         atoms: Counter[Atom] = Counter()
         if self.title.startswith("### "):
@@ -208,7 +217,12 @@ class Index:
         kept: Counter[Atom] = Counter()
         for i in ids:
             kept.update(self.units[i].atoms)
-        return unit.atoms - kept, not ids
+        gone = unit.atoms - kept
+        blocks = [self.units[i].block for i in ids]
+        for atom in [atom for atom in gone if atom[0] == "line"]:
+            if any(block.holds(atom[1]) for block in blocks):
+                del gone[atom]
+        return gone, not ids
 
     def cut_off(self, unit: Unit, line: str) -> str | None:
         """Where the rest of ``line`` went, if a pasted block cut it in two.
